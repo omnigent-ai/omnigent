@@ -13,7 +13,10 @@ package ai.omnigent.android
  */
 object BlobDownloadScript {
     /** JS that reads [url] (a blob:/data: URL) and posts it to the native side. */
-    fun fetchAsBase64(url: String, suggestedName: String): String {
+    fun fetchAsBase64(
+        url: String,
+        suggestedName: String,
+    ): String {
         val u = jsString(url)
         val name = jsString(suggestedName)
         return """
@@ -42,6 +45,6 @@ object BlobDownloadScript {
                 })
                 .catch(() => {});
             })();
-        """.trimIndent()
+            """.trimIndent()
     }
 }

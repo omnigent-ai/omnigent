@@ -372,3 +372,63 @@ def test_idle_notification_click_navigates_to_chat(
     # Click it: the app's onClick focuses then navigates to the session.
     page.evaluate("window.__notifObjects[0].onclick()")
     page.wait_for_url(f"**/c/{session_id}", timeout=10_000)
+
+
+def test_idle_notification_deferred_until_settle(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A finished turn does NOT notify immediately — it is deferred by a settle
+    window, so a step-by-step agent that resumes right after going idle
+    doesn't fire a notification per milestone. The notification only lands
+    once the session has stayed idle past the settle.
+
+    Flow: open the seeded session, send a real prompt, reach ``running``,
+    background the tab, then wait until app traffic reports ``idle``. For a
+    few seconds after idle is observed the notification must NOT have fired
+    (deferred, well inside the ~10s settle); it lands afterward, exactly once.
+
+    A failure means the settle regressed — either a turn-end notifies
+    immediately (no deferral) or it never lands.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a real session
+        bound to the spawned runner.
+    """
+    base_url, session_id = seeded_session
+    page.add_init_script(_HARNESS_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+    page.mouse.click(5, 5)
+
+    _reset_session_status_probe(page)
+    _send_prompt(page)
+
+    _wait_for_observed_session_status(page, session_id, "running", timeout=30_000)
+
+    # Background the tab so the turn-end is eligible to notify.
+    page.evaluate(
+        "window.__hidden = true;"
+        "document.dispatchEvent(new Event('visibilitychange'));"
+        "window.dispatchEvent(new Event('blur'));"
+    )
+
+    # The real turn finishes off-screen; the client observes idle.
+    _wait_for_observed_session_status(page, session_id, "idle", timeout=90_000)
+
+    # Deferred: a few seconds after idle is observed, nothing has fired yet.
+    # 3s is comfortably inside the ~10s settle (the hook starts its timer off
+    # the same server push the probe observes), so this is robust; a
+    # regression that notifies immediately fails here.
+    page.wait_for_timeout(3_000)
+    assert page.evaluate("window.__notifs.length") == 0, (
+        "turn-end notification should be deferred by the settle window, "
+        f"not fired immediately: {page.evaluate('window.__notifs')}"
+    )
+
+    # After the settle elapses the notification lands, exactly once.
+    page.wait_for_function("window.__notifs.length > 0", timeout=30_000)
+    page.wait_for_timeout(3_000)  # catch a duplicate
+    notifs = page.evaluate("window.__notifs")
+    assert len(notifs) == 1, f"expected exactly one settled notification, got {notifs}"
+    assert notifs[0]["options"]["tag"] == f"omnigent:session:{session_id}", notifs

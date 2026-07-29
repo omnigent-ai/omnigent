@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import type { ToolExecution } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
-import { BUILTIN_SLASH_COMMANDS, isSlashCommandText } from "@/components/SlashCommandMenu";
+import {
+  BUILTIN_SLASH_COMMANDS,
+  isSlashCommandText,
+  slashCommandMatches,
+} from "@/components/SlashCommandMenu";
 import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
@@ -25,6 +29,7 @@ import {
   splitSlashCommand,
   stripPendingElicitations,
   subAgentComposerLabel,
+  WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
 
@@ -631,9 +636,14 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("running", opts({ hasPendingElicitation: true }))).toBe(false);
   });
 
-  it("a known-offline runner suppresses stale working status", () => {
-    expect(computeShowsWorking("running", opts({ runnerOnline: false }))).toBe(false);
-    expect(computeShowsWorking("waiting", opts({ runnerOnline: false }))).toBe(false);
+  it("live running/waiting status wins over a stale offline poll", () => {
+    // The `/health` poll reads stale-offline during the runner's connect
+    // window on a fresh session's first turn (10s poll cadence). A session
+    // actively reporting running/waiting cannot have an offline runner, so its
+    // live status must keep the indicator lit rather than being suppressed by
+    // the lagging poll.
+    expect(computeShowsWorking("running", opts({ runnerOnline: false }))).toBe(true);
+    expect(computeShowsWorking("waiting", opts({ runnerOnline: false }))).toBe(true);
   });
 
   it("unresolved runner health does not suppress active parent work", () => {
@@ -652,9 +662,11 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 0 }))).toBe(false);
   });
 
-  it("a known-offline runner suppresses the indicator even with background shells", () => {
-    // Offline beats every other signal: a stale shell count must not keep a
-    // dead session spinning.
+  it("a known-offline runner suppresses the indicator for an idle session with background shells", () => {
+    // For a session that is NOT actively working, known-offline beats a stale
+    // shell count: a dead session must not keep spinning on a background tally.
+    // (An actively running/waiting session is handled above — its live status
+    // wins over the offline poll.)
     expect(computeShowsWorking("idle", opts({ runnerOnline: false, backgroundTaskCount: 2 }))).toBe(
       false,
     );
@@ -677,7 +689,10 @@ describe("shouldShowWorkingIndicator", () => {
     expect(shouldShowWorkingIndicator(false, [])).toBe(false);
   });
 
-  it("suppresses Working once a streaming assistant bubble is rendering content", () => {
+  it("keeps Working visible while a streaming assistant bubble renders (always-on)", () => {
+    // Always-on: the indicator no longer hides when content starts arriving.
+    // It stays lit for the whole turn so a long tool run or reasoning gap
+    // never looks stalled.
     const bubbles: Bubble[] = [
       {
         kind: "assistant",
@@ -689,23 +704,6 @@ describe("shouldShowWorkingIndicator", () => {
       },
     ];
 
-    expect(shouldShowWorkingIndicator(true, bubbles)).toBe(false);
-  });
-
-  it("lets an empty streaming assistant bubble keep the Working indicator visible", () => {
-    const bubbles: Bubble[] = [
-      {
-        kind: "assistant",
-        responseId: "resp_live",
-        stableId: "resp_live",
-        lifecycle: "streaming",
-        error: null,
-        items: [],
-      },
-    ];
-
-    // Empty assistant shells do not yet prove content is rendering; hiding
-    // Working here would recreate the blank gap this helper avoids.
     expect(shouldShowWorkingIndicator(true, bubbles)).toBe(true);
   });
 
@@ -715,6 +713,24 @@ describe("shouldShowWorkingIndicator", () => {
     expect(
       shouldShowWorkingIndicator(true, [{ kind: "compaction_loading", itemId: "cmp_1" }]),
     ).toBe(false);
+  });
+
+  it("suppresses Working only when compaction is the LAST bubble", () => {
+    // The compaction guard is trailing-bubble-only: a streaming assistant
+    // after an earlier compaction spinner keeps Working lit.
+    const bubbles: Bubble[] = [
+      { kind: "compaction_loading", itemId: "cmp_1" },
+      {
+        kind: "assistant",
+        responseId: "resp_live",
+        stableId: "resp_live",
+        lifecycle: "streaming",
+        error: null,
+        items: [{ kind: "text", itemId: null, text: "partial", final: false }],
+      },
+    ];
+
+    expect(shouldShowWorkingIndicator(true, bubbles)).toBe(true);
   });
 });
 
@@ -737,6 +753,28 @@ describe("workingIndicatorLabel", () => {
 
   it("pluralizes the noun for more than one background task", () => {
     expect(workingIndicatorLabel(3)).toBe("3 background tasks still running");
+  });
+
+  it("pins the first rotation message to 'Working…'", () => {
+    // A fresh tick and the default arg both land on index 0, so this label
+    // must stay "Working…" — the invariant the (0) / (-1) cases rely on.
+    expect(WORKING_MESSAGES[0]).toBe("Working…");
+    expect(workingIndicatorLabel(0, 0)).toBe("Working…");
+  });
+
+  it("rotates through the message pool by tick", () => {
+    expect(workingIndicatorLabel(0, 1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(0, 2)).toBe(WORKING_MESSAGES[2]);
+  });
+
+  it("wraps the rotation modulo the pool length", () => {
+    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length)).toBe("Working…");
+    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
+  });
+
+  it("ignores the tick while background tasks remain", () => {
+    // The count is information, not decoration — it must not rotate away.
+    expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
   });
 });
 
@@ -972,20 +1010,23 @@ describe("buildSlashCommandMap", () => {
     expect(map["/mlflow-bug"]).toBe("File an MLflow bug.");
   });
 
-  it("matches skills via the same prefix filter the menu uses", () => {
-    // The menu (SlashCommandMenu) filters keys whose ``name.slice(1)``
-    // starts with the typed query. Verify the merged map plays nicely
-    // with that filter for a partially-typed skill name.
+  it("matches skills via the shared substring matcher the menu uses", () => {
     const map = buildSlashCommandMap(
       [
-        { name: "triage-issues", description: "Triage issues." },
+        {
+          name: "superpowers:using-superpowers",
+          description: "Establishes how to find and use skills",
+        },
         { name: "mlflow-bug", description: "File an MLflow bug." },
       ],
       true,
       true,
     );
-    const matches = Object.keys(map).filter((name) => name.slice(1).startsWith("tri"));
-    expect(matches).toEqual(["/triage-issues"]);
+    // A namespaced skill is found by its leaf name — the exact bug this fixes.
+    const matches = Object.keys(map).filter((name) =>
+      slashCommandMatches(name, "using-superpowers"),
+    );
+    expect(matches).toEqual(["/superpowers:using-superpowers"]);
   });
 });
 

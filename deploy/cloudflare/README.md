@@ -68,8 +68,8 @@ browser ───────────────►  Worker (src/index.js)
 
 ```bash
 cd deploy/cloudflare
-npm install
-npx wrangler login
+pnpm install
+pnpm exec wrangler login
 ```
 
 ## Deploy

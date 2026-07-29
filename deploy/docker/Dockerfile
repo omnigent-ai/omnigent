@@ -55,7 +55,7 @@
 
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
-ARG NODE_VERSION=20
+ARG NODE_VERSION=22
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the web SPA so `docker build` works from a clean checkout —
@@ -70,12 +70,20 @@ ARG NODE_VERSION=20
 FROM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
-WORKDIR /web/web
-# Manifests first so the install layer caches across pure source edits.
-COPY web/package.json web/package-lock.json ./
-RUN npm install --no-audit --no-fund
-COPY web/ ./
-RUN npm run build
+WORKDIR /web
+
+# Workspace manifests + lockfile first so the install layer caches across pure
+# source edits. The electron package JSON is included so the root workspace is
+# structurally complete, but we --filter web to avoid downloading Electron.
+COPY pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY web/package.json ./web/
+COPY web/electron/package.json ./web/electron/
+
+RUN npm install -g pnpm@11.15.1
+RUN pnpm install --frozen-lockfile --filter web
+
+COPY web/ ./web/
+RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────
 # Installs the package (and its transitive native-extension deps) into
@@ -211,7 +219,7 @@ RUN apt-get update \
 # user-namespace remapping the sandbox user maps to an unprivileged, unused
 # host id. Unused by the root-based providers.
 RUN groupadd -g 1000660000 sandbox \
- && useradd -m -u 1000660000 -g sandbox sandbox
+ && useradd -m -d /sandbox -u 1000660000 -g sandbox sandbox
 
 # Git credential helper for private repositories over HTTPS: answers
 # `git credential get` from GIT_TOKEN / GIT_USERNAME in the
@@ -328,11 +336,14 @@ RUN set -eu; \
     fi; \
     echo "agy ${AGY_VERSION} pinned (sha256 verified)"
 
-# Preserve /build/ — the venv's editable install .pth files reference
-# /build/omnigent and /build/sdks/* by absolute path. Copying these to
-# /app/ would break the import paths silently.
+# Copy the venv and source tree. The editable install's .pth files reference
+# /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
+# policy. Re-install without -e so the package bytes land in the venv's
+# site-packages and imports no longer require /build at runtime.
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
+RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
+ && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV

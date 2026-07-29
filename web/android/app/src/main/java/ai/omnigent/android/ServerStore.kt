@@ -7,7 +7,9 @@ import android.content.Context
  * [ConnectActivity]. Mirrors the iOS shell's `ConnectView` model (entry +
  * recents); the native UI here is intentionally minimal.
  */
-class ServerStore(context: Context) {
+class ServerStore(
+    context: Context,
+) {
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun hasServer(): Boolean = !prefs.getString(KEY_CURRENT, null).isNullOrBlank()
@@ -17,7 +19,8 @@ class ServerStore(context: Context) {
 
     /** Recently-connected servers, most recent first. */
     fun recentServers(): List<String> =
-        prefs.getString(KEY_RECENTS, null)
+        prefs
+            .getString(KEY_RECENTS, null)
             ?.split("\n")
             ?.filter { it.isNotBlank() }
             .orEmpty()
@@ -37,6 +40,7 @@ class ServerStore(context: Context) {
         const val KEY_CURRENT = "current_server_url"
         const val KEY_RECENTS = "recent_server_urls"
         const val MAX_RECENTS = 8
+
         // 10.0.2.2 is the host loopback from the Android emulator.
         const val DEFAULT_DEBUG_SERVER = "http://10.0.2.2:8000"
     }

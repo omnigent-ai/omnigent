@@ -1,0 +1,98 @@
+packages:
+  - 'web'
+  - 'web/electron'
+  - '.github/ci-deps'
+  - 'editors/vscode'
+  - 'deploy/cloudflare'
+
+settings:
+  # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
+  minimumReleaseAge: 10080
+  autoInstallPeers: false
+  strictPeerDependencies: false
+  nodeLinker: hoisted
+
+# jest-dom doesn't declare vitest as a (peer) dependency, so under pnpm's store
+# layout its `declare module "vitest"` matcher-type augmentation can't resolve
+# vitest and silently fails to merge — `tsc` then loses every DOM matcher
+# (toBeInTheDocument, toHaveClass, …) though they work at runtime. Re-enable the
+# peer so the augmentation resolves. Drop once jest-dom ships the peer upstream.
+packageExtensions:
+  '@testing-library/jest-dom':
+    peerDependencies:
+      vitest: '*'
+
+catalog:
+  react: ^18.2.0
+  react-dom: ^18.2.0
+  shiki: 4.2.0
+
+overrides:
+  # Build-tool pins that match the legacy npm lockfile. Removing them allowed pnpm
+  # to resolve newer Vite/Tailwind patches whose new bundler/chunking produced a
+  # broken split of the Shiki bundle and lost the PDF worker asset.
+  vite: 8.1.0
+  tailwindcss: 4.3.1
+  '@tailwindcss/vite': 4.3.1
+  '@tailwindcss/node': 4.3.1
+  '@tailwindcss/postcss': 4.3.1
+  jiti: 2.7.0
+  lightningcss: 1.32.0
+  postcss: 8.5.15
+  linkify-it: 5.0.1
+  shiki: "catalog:"
+  react: "catalog:"
+  react-dom: "catalog:"
+  dompurify: ^3.4.0
+  '@shikijs/core': 4.2.0
+  '@shikijs/engine-javascript': 4.2.0
+  '@shikijs/engine-oniguruma': 4.2.0
+  '@shikijs/langs': 4.2.0
+  '@shikijs/themes': 4.2.0
+  '@shikijs/types': 4.2.0
+  '@shikijs/transformers': 4.2.0
+  '@tiptap/core': 3.23.4
+  '@tiptap/extension-blockquote': 3.23.4
+  '@tiptap/extension-bold': 3.23.4
+  '@tiptap/extension-bubble-menu': 3.23.4
+  '@tiptap/extension-bullet-list': 3.23.4
+  '@tiptap/extension-code': 3.23.4
+  '@tiptap/extension-code-block': 3.23.4
+  '@tiptap/extension-document': 3.23.4
+  '@tiptap/extension-dropcursor': 3.23.4
+  '@tiptap/extension-floating-menu': 3.23.4
+  '@tiptap/extension-gapcursor': 3.23.4
+  '@tiptap/extension-hard-break': 3.23.4
+  '@tiptap/extension-heading': 3.23.4
+  '@tiptap/extension-horizontal-rule': 3.23.4
+  '@tiptap/extension-image': 3.23.4
+  '@tiptap/extension-italic': 3.23.4
+  '@tiptap/extension-link': 3.23.4
+  '@tiptap/extension-list': 3.23.4
+  '@tiptap/extension-list-item': 3.23.4
+  '@tiptap/extension-list-keymap': 3.23.4
+  '@tiptap/extension-ordered-list': 3.23.4
+  '@tiptap/extension-paragraph': 3.23.4
+  '@tiptap/extension-strike': 3.23.4
+  '@tiptap/extension-table': 3.23.4
+  '@tiptap/extension-text': 3.23.4
+  '@tiptap/extension-underline': 3.23.4
+  '@tiptap/extensions': 3.23.4
+  '@tiptap/markdown': 3.23.4
+  '@tiptap/pm': 3.23.4
+  '@tiptap/react': 3.23.4
+  '@tiptap/starter-kit': 3.23.4
+  express-rate-limit>ip-address: ^10.1.1
+
+allowBuilds:
+  '@anthropic-ai/claude-code': true
+  '@google/genai': true
+  '@vscode/vsce-sign': true
+  canvas: true
+  electron-winstaller: true
+  esbuild: true
+  keytar: true
+  msw: true
+  protobufjs: true
+  sharp: true
+  workerd: true

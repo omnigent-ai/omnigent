@@ -1,0 +1,726 @@
+name: Draft feature blogs
+
+# At release CUT (a vX.Y.Z tag is pushed → the "GitHub Release" workflow creates
+# the draft), look over the release's features and DRAFT a feature-blog post on
+# omnigent-site for each one big enough to warrant it — usually none. Blog drafts
+# land alongside the release-notes draft (draft-release-notes.yml, same trigger)
+# so a maintainer reviews both together.
+#
+# Two agents, both running on already-released history from the trusted default
+# branch:
+#   1. feature-blog-scout   — no tools; picks 0–N blog-worthy features (ranked,
+#      capped at 3) from the same PR-range material draft-release-notes.yml
+#      harvests. Most releases → [].
+#   2. feature-blog-drafter — file access; writes one post per selected feature
+#      into an omnigent-site checkout. The workflow opens a DRAFT PR per post.
+#
+# Why `workflow_run` (not extending github-release.yml): that workflow runs NO
+# project code, only `gh release create`, so a malicious tagged commit can't
+# execute anything. We keep that guarantee by running the heavy work (LLM + git
+# harvest) here, from the trusted default branch (workflow_run always does), never
+# from the tagged commit. Same posture as draft-release-notes.yml.
+#
+# The LLM machinery (creds gate, Claude Code CLI, provider config, secret-scan,
+# token-minted-after-agents, artifact redaction) mirrors draft-release-notes.yml.
+# The output is always a DRAFT PR — the mandatory demo (a real recording/
+# screenshot) and hero art / byline are added by a human before merge.
+
+on:
+  workflow_run:
+    workflows: ["GitHub Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to draft blogs for, e.g. v0.3.0
+        required: true
+        type: string
+      base:
+        description: >-
+          Optional range-start override (tag/branch/sha). Needed when `tag` is
+          not a final vX.Y.Z. Providing it makes the run a preview unless
+          dry_run=false.
+        required: false
+        type: string
+      dry_run:
+        description: >-
+          Preview only:
+          auto (default) - preview for dev/rc tags, real PRs for final versions;
+          true - run the scout/drafter, print output, don't open PRs;
+          false - open real DRAFT PRs.
+        required: false
+        type: choice
+        options: [auto, "true", "false"]
+        default: auto
+      max_posts:
+        description: >-
+          Maximum number of blog posts to draft (the scout still only picks
+          features that clear the bar, so it may pick fewer). Default 3.
+        required: false
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feature-blog-${{ github.event.workflow_run.head_branch || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: omnigent-ai/omnigent
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+jobs:
+  draft:
+    name: Scout features and draft blogs
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # --- Resolve the tag and decide whether to proceed (no code run yet) ---
+      - name: Resolve tag and guard
+        id: guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # On tag push, workflow_run.head_branch is the tag name (v0.3.0).
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_MAX_POSTS: ${{ inputs.max_posts }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$RUN_BRANCH}"
+          base="${INPUT_BASE:-}"
+          proceed=false; dry_run=false
+
+          # How many posts to draft at most. Only settable via manual dispatch;
+          # a real release cut (workflow_run) uses the default. Must be a positive
+          # integer, else fall back to the default.
+          max_posts="${INPUT_MAX_POSTS:-3}"
+          case "$max_posts" in
+            ""|*[!0-9]*|0) max_posts=3 ;;
+          esac
+
+          # Does the tag look like a final release (vX.Y.Z, not rc/dev/alpha/beta)?
+          is_version=true
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) is_version=false ;;
+          esac
+          case "$tag" in
+            *rc*|*dev*|*a[0-9]*|*b[0-9]*) is_version=false ;;
+          esac
+
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            # Real release cut: strict — only a final version tag proceeds.
+            [ "$is_version" = "true" ] && proceed=true
+          else
+            # Manual dispatch: proceed for a final version tag OR when a base
+            # override is given (arbitrary-ref preview/real run).
+            if [ "$is_version" = "true" ] || [ -n "$base" ]; then
+              proceed=true
+            fi
+            case "$INPUT_DRY_RUN" in
+              true)  dry_run=true ;;
+              false) dry_run=false ;;
+              *)     if [ "$is_version" != "true" ] || [ -n "$base" ]; then dry_run=true; fi ;;
+            esac
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          echo "proceed=${proceed}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${dry_run}" >> "$GITHUB_OUTPUT"
+          echo "max_posts=${max_posts}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} base=${base:-<none>} proceed=${proceed} dry_run=${dry_run} max_posts=${max_posts}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Trusted default branch, full history + tags for the range computation.
+      - name: Checkout omnigent (main)
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Python
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      # --- Credentials gate: no LLM key → nothing to draft, exit cleanly ---
+      - name: Check LLM credentials
+        id: creds
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "${LLM_API_KEY:-}" ]; then
+            echo "::warning::No LLM credentials — skipping feature-blog drafting."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::add-mask::${LLM_API_KEY}"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- Harvest the same PR-range material as draft-release-notes.yml ---
+      - name: Harvest PR material
+        id: harvest
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.guard.outputs.tag }}
+          BASE: ${{ steps.guard.outputs.base }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check packaging
+          args=(--tag "$TAG" --repo "$SOURCE_REPO"
+                --draft-notes-out /tmp/mechanical_notes.md
+                --pr-list-out /tmp/pr_list.txt
+                --no-changelog-update)
+          [ -n "${BASE:-}" ] && args+=(--base "$BASE")
+          python3 .github/scripts/changelog/generate.py "${args[@]}"
+
+      # --- 1) Scout: which features (if any) are blog-worthy? ---
+      - name: Build scout prompt
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          TAG: ${{ steps.guard.outputs.tag }}
+          MAX_POSTS: ${{ steps.guard.outputs.max_posts }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import os, pathlib
+          tag = os.environ["TAG"]
+          max_posts = int(os.environ.get("MAX_POSTS", "3"))
+          # `omnigent run -p` passes the whole prompt as one argv string, capped at
+          # ~128 KiB on Linux. Cap the PR list well under that.
+          MAX = 100_000
+          pr_list = pathlib.Path("/tmp/pr_list.txt").read_text(encoding="utf-8", errors="replace")
+          mech = pathlib.Path("/tmp/mechanical_notes.md").read_text(encoding="utf-8", errors="replace")
+          truncated = len(pr_list) > MAX
+          pr_list = pr_list[:MAX]
+          note = ("\n> NOTE: the PR list was truncated — select from what's visible.\n"
+                  if truncated else "")
+          prompt = f"""Select the blog-worthy features (if any) from {tag}.
+          Return AT MOST {max_posts} feature(s), ranked strongest-first — pick fewer
+          if fewer clear the bar. This overrides any other cap in your instructions.
+          {note}
+          ## Merged PRs (number, title, and author changelog entries)
+          {pr_list}
+
+          ## Mechanical draft (features grouped into sections — raw material)
+          {mech}
+
+          Produce the BLOG_CANDIDATES block per your instructions."""
+          pathlib.Path("/tmp/scout_prompt.txt").write_text(prompt)
+          PYEOF
+
+      # Sets up uv + Claude CLI + the gateway provider config, runs the tools-less
+      # scout on the prompt file, and secret-scans its stdout — the same runner
+      # scaffold draft-release-notes.yml / publish-changelog.yml share. The env it
+      # sets up (PATH, ~/.omnigent, .venv) persists into the drafter loop below, so
+      # only the scout needs to invoke the action.
+      - name: Run feature-blog scout
+        id: scout
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        uses: ./.github/actions/run-omnigent-agent
+        with:
+          agent: feature-blog-scout
+          prompt-file: /tmp/scout_prompt.txt
+          output-file: /tmp/scout_out.txt
+          stderr-file: ${{ github.workspace }}/scout-stderr.log
+          gateway-base-url: ${{ secrets.GATEWAY_BASE_URL }}
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
+
+      - name: Parse candidates
+        id: candidates
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          MAX_POSTS: ${{ steps.guard.outputs.max_posts }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import json, os, pathlib, re
+          raw = pathlib.Path("/tmp/scout_out.txt").read_text(encoding="utf-8", errors="replace") \
+              if pathlib.Path("/tmp/scout_out.txt").is_file() else ""
+          m = re.search(r"<!--\s*BLOG_CANDIDATES\s*-->(.*?)<!--\s*/BLOG_CANDIDATES\s*-->", raw, re.DOTALL)
+          parsed = []
+          if m:
+              try:
+                  obj = json.loads(m.group(1).strip())
+                  if isinstance(obj, list):
+                      parsed = obj
+              except json.JSONDecodeError as e:
+                  print(f"::warning::Could not parse BLOG_CANDIDATES JSON — treating as none: {e}")
+
+          # The scout is an LLM fed author-written PR prose (an injection surface),
+          # so validate its output before any value becomes a path, branch name, or
+          # PR fetch. `slug` becomes a filesystem path and git branch → must be a
+          # strict kebab-case token (blocks `../`, slashes, spaces). `pr_refs` must
+          # intersect the PRs we actually harvested (blocks arbitrary `gh pr diff`).
+          harvested = set(int(n) for n in re.findall(r"(?m)^#(\d+):",
+              pathlib.Path("/tmp/pr_list.txt").read_text(encoding="utf-8", errors="replace")))
+          slug_re = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+          cands = []
+          for c in parsed:
+              if not isinstance(c, dict):
+                  continue
+              slug = str(c.get("slug", ""))
+              if not slug_re.match(slug) or len(slug) > 80:
+                  print(f"::warning::Dropping candidate with invalid slug {slug!r}.")
+                  continue
+              refs = []
+              for r in c.get("pr_refs", []):
+                  try:
+                      n = int(r)
+                  except (TypeError, ValueError):
+                      continue
+                  if n in harvested:
+                      refs.append(n)
+              if not refs:
+                  print(f"::warning::Dropping candidate {slug!r} — no pr_refs in the harvested range.")
+                  continue
+              c["slug"] = slug
+              c["pr_refs"] = refs
+              cands.append(c)
+
+          # Enforce the post cap defensively (the scout is told the limit too).
+          max_posts = int(os.environ.get("MAX_POSTS", "3"))
+          cands = cands[:max_posts]
+          pathlib.Path("/tmp/candidates.json").write_text(json.dumps(cands))
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a") as f:
+              f.write(f"count={len(cands)}\n")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as f:
+                  if cands:
+                      f.write(f"## {len(cands)} blog candidate(s)\n")
+                      for c in cands:
+                          f.write(f"- **{c.get('headline','?')}** "
+                                  f"(`{c.get('slug','?')}`, {c.get('category','?')}) — "
+                                  f"{c.get('why_worthy','')}\n")
+                  else:
+                      f.write("## No blog-worthy features this release.\n")
+          print(f"Parsed {len(cands)} candidate(s).")
+          PYEOF
+
+      # --- 2) Draft one post per candidate into an omnigent-site checkout ---
+      # Checked out WITHOUT a write token — the drafter runs first; the token is
+      # minted only after all agents finish, then used to push.
+      - name: Checkout omnigent-site (draft target)
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true' && steps.candidates.outputs.count != '0'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: omnigent-ai/omnigent-site
+          ref: main
+          path: site
+          persist-credentials: false
+
+      - name: Draft posts
+        id: draftposts
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true' && steps.candidates.outputs.count != '0'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SITE="${GITHUB_WORKSPACE}/site"
+          VERSION="${TAG#v}"
+          # Release date = the tag's commit date in the omnigent checkout (workspace
+          # root, full history + tags), NOT the site checkout's last-commit date.
+          DATE="$(git -C "${GITHUB_WORKSPACE}" log -1 --format=%cs "$TAG" 2>/dev/null || git -C "${GITHUB_WORKSPACE}" log -1 --format=%cs)"
+
+          # Build a per-feature material file (contributing PRs' entries + diffs),
+          # commit each post to its own LOCAL branch (no push, no token needed).
+          git -C "$SITE" config user.name "omnigent-ci[bot]"
+          git -C "$SITE" config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+
+          count=$(python3 -c "import json;print(len(json.load(open('/tmp/candidates.json'))))")
+          : > /tmp/drafted_branches.txt
+          for i in $(seq 0 $((count - 1))); do
+            slug=$(python3 -c "import json;print(json.load(open('/tmp/candidates.json'))[$i]['slug'])")
+            headline=$(python3 -c "import json;print(json.load(open('/tmp/candidates.json'))[$i]['headline'])")
+            category=$(python3 -c "import json;print(json.load(open('/tmp/candidates.json'))[$i].get('category',''))")
+
+            # Assemble the per-feature material: changelog entries for the
+            # candidate's PRs plus each PR's diff (capped). Quoted heredoc so the
+            # markdown code fences aren't shell-evaluated — index and repo come in
+            # via env (CAND_INDEX / SOURCE_REPO), never interpolated into the body.
+            CAND_INDEX="$i" python3 -u <<'PYEOF'
+          import json, os, pathlib, subprocess
+          repo = os.environ["SOURCE_REPO"]
+          idx = int(os.environ["CAND_INDEX"])
+          cand = json.load(open("/tmp/candidates.json"))[idx]
+          refs = [int(r) for r in cand.get("pr_refs", [])]
+          pr_list = pathlib.Path("/tmp/pr_list.txt").read_text(encoding="utf-8", errors="replace")
+          fence = "```"
+          parts = [f"# Feature: {cand.get('headline','')}", "",
+                   f"Contributing PRs: {refs}", "",
+                   "## Changelog entries (from the release harvest)", pr_list, "",
+                   "## PR diffs"]
+          BUDGET = 60_000
+          # Tally who merged the contributing PRs so we can request review from the
+          # maintainer with the most context on the feature (mirrors doc-sync, but a
+          # blog spans many PRs so we pick the most frequent merger). Authors fall
+          # back for it — outside contributors may lack site access, a maintainer
+          # always merges. Skip bots / the CI identity.
+          from collections import Counter
+          mergers, authors = Counter(), Counter()
+          def _usable(login):
+              return bool(login) and not login.endswith("[bot]") and login != "omnigent-ci"
+          for pr in refs:
+              try:
+                  diff = subprocess.run(
+                      ["gh", "pr", "diff", str(pr), "--repo", repo],
+                      capture_output=True, text=True, timeout=60).stdout
+              except Exception as e:
+                  diff = f"(diff unavailable: {e})"
+              parts += [f"### PR #{pr}", f"{fence}diff", diff[:BUDGET], fence]
+              try:
+                  meta = json.loads(subprocess.run(
+                      ["gh", "pr", "view", str(pr), "--repo", repo,
+                       "--json", "mergedBy,author"],
+                      capture_output=True, text=True, timeout=60).stdout or "{}")
+                  mb = (meta.get("mergedBy") or {}).get("login", "")
+                  au = (meta.get("author") or {}).get("login", "")
+                  if _usable(mb):
+                      mergers[mb] += 1
+                  if _usable(au):
+                      authors[au] += 1
+              except Exception as e:
+                  print(f"::notice::Could not read merger/author for PR #{pr}: {e}")
+          pathlib.Path(f"/tmp/material_{idx}.txt").write_text("\n".join(parts))
+          # Most-frequent merger wins; ties broken by Counter insertion order (PR
+          # order). Fall back to the most-frequent author, then empty.
+          reviewer = (mergers.most_common(1)[0][0] if mergers
+                      else authors.most_common(1)[0][0] if authors else "")
+          pathlib.Path(f"/tmp/reviewer_{idx}.txt").write_text(reviewer)
+          PYEOF
+
+            # Start each candidate from a pristine tree: a prior candidate that
+            # failed AFTER writing its post would otherwise leave an untracked
+            # file that `switch -C` preserves and the next `add -A` would sweep
+            # into the wrong PR.
+            git -C "$SITE" reset --hard >/dev/null
+            git -C "$SITE" clean -fdx >/dev/null
+            branch="auto/blog/${VERSION}-${slug}"
+            git -C "$SITE" switch -C "$branch" origin/main
+
+            prompt="SITE_REPO=${SITE}
+          HEADLINE=${headline}
+          SLUG=${slug}
+          CATEGORY=${category}
+          DATE=${DATE}
+          MATERIAL_FILE=/tmp/material_${i}.txt
+
+          Draft the feature-blog post per your instructions."
+
+            # cwd = workspace root: the drafter reads MATERIAL_FILE (/tmp) and
+            # writes into SITE_REPO. Capture the exit status without aborting so
+            # the secret-scan below runs regardless of whether the drafter failed
+            # (tee already wrote its stdout to the file either way).
+            drafter_rc=0
+            uv run --project "${GITHUB_WORKSPACE}" omnigent run \
+              "${GITHUB_WORKSPACE}/.github/agents/feature-blog-drafter" \
+              -p "$prompt" --no-session \
+              2>>drafter-stderr.log | tee "/tmp/drafter_out_${i}.txt" || drafter_rc=$?
+
+            # Secret-scan the drafter output BEFORE it feeds the PR body, and
+            # fail-closed EVEN ON drafter failure — the drafter runs with
+            # LLM_API_KEY in env and its stdout is embedded in the PR description,
+            # so a hit must abort the whole step (artifact redaction runs only
+            # after PRs are open, too late to un-leak it).
+            if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" "/tmp/drafter_out_${i}.txt" 2>/dev/null; then
+              echo "::error::Drafter output for ${slug} contains LLM_API_KEY — aborting."
+              exit 1
+            fi
+
+            if [ "$drafter_rc" -ne 0 ]; then
+              echo "::warning::drafter failed for ${slug} — skipping"
+              continue
+            fi
+
+            if [ -z "$(git -C "$SITE" status --porcelain)" ]; then
+              echo "::warning::drafter produced no edits for ${slug} — skipping"
+              continue
+            fi
+
+            # Also scan the drafted files (they get committed + pushed) for the
+            # key. --untracked covers the newly-created post, which git grep would
+            # otherwise skip.
+            if [ -n "${LLM_API_KEY:-}" ] && git -C "$SITE" grep --untracked -qF "$LLM_API_KEY" 2>/dev/null; then
+              echo "::error::Drafted content for ${slug} contains LLM_API_KEY — aborting."
+              exit 1
+            fi
+
+            # Append the fixed CTA footer to the drafted post (LLM never writes it).
+            # The post is a new, untracked file — find it via status (git diff
+            # can't see untracked paths). Use -uall: plain porcelain collapses a
+            # brand-new directory to "app/blog/<slug>/" and never names the file
+            # inside it, so grep 'page.mdx' would miss it. Porcelain lines are
+            # "XY path"; take the path field of the first added/modified page.mdx.
+            post="$(git -C "$SITE" status --porcelain -uall | grep -m1 'page.mdx' | awk '{print $NF}' || true)"
+
+            # Fail fast on HTML comments in the MDX: `<!-- ... -->` is invalid in
+            # MDX (only `{/* ... */}` works) and would break the site's `next build`
+            # only after the PR is opened. Catch it here so we never ship a red PR.
+            if [ -n "$post" ] && grep -qF '<!--' "${SITE}/${post}"; then
+              echo "::error::Drafted ${post} contains an HTML comment (<!-- -->); MDX requires {/* */}. Aborting."
+              exit 1
+            fi
+
+            if [ -n "$post" ]; then
+              printf '\n---\n\n**Enjoying Omnigent?** If this is useful to you, [give us a star on GitHub ⭐](https://github.com/omnigent-ai/omnigent). Come say hi on [Discord](https://discord.gg/omnigent), or [check the latest release](https://omnigent.ai/releases).\n' \
+                >> "${SITE}/${post}"
+            fi
+
+            # Generate the hero illustration from the drafter's IMAGE_PROMPT (the
+            # per-feature subject) plus a fixed brand style suffix, via the image
+            # model on the same gateway host. Fail-soft: any error leaves heroArt
+            # blank (the index falls back to a placeholder card), never blocking
+            # the draft. The scene is machine-drawn from the prompt, so no secret
+            # can reach it; the drafted-file secret scan above already ran.
+            image_prompt="$(sed -n 's/^IMAGE_PROMPT:[[:space:]]*//p' "/tmp/drafter_out_${i}.txt" | head -n1)"
+            if [ -n "$post" ] && [ -n "$image_prompt" ]; then
+              # GATEWAY_BASE_URL is scoped to THIS invocation only (not the step
+              # env), so the unsandboxed drafter run above never sees it and it
+              # can't reach the drafter's scanned stdout.
+              GATEWAY_BASE_URL='${{ secrets.GATEWAY_BASE_URL }}' \
+              IMAGE_PROMPT="$image_prompt" SLUG="$slug" SITE="$SITE" POST="$post" \
+              python3 -u <<'PYEOF' || echo "::warning::hero image generation failed for ${slug}; leaving heroArt blank"
+          import base64, json, os, pathlib, re, urllib.request
+          gw = os.environ.get("GATEWAY_BASE_URL", "")
+          key = os.environ.get("LLM_API_KEY", "")
+          if not gw or not key:
+              raise SystemExit("no gateway/key for image generation")
+          # The image model lives on the same workspace host as the anthropic
+          # gateway (GATEWAY_BASE_URL = <host>/anthropic). Derive scheme://host.
+          m = re.match(r"(https?://[^/]+)", gw)
+          if not m:
+              raise SystemExit(f"cannot parse gateway host from {gw!r}")
+          model = os.environ.get("IMAGE_MODEL", "databricks-gemini-3-pro-image")
+          url = f"{m.group(1)}/serving-endpoints/{model}/invocations"
+          style = (" Flat vector illustration, dark navy tech background with subtle "
+                   "circuit lines, teal and pink accents, 16:9 wide, no text, no words, "
+                   "no logos.")
+          body = json.dumps({"messages": [{"role": "user",
+                 "content": os.environ["IMAGE_PROMPT"] + style}], "max_tokens": 4096}).encode()
+          req = urllib.request.Request(url, data=body, method="POST", headers={
+              "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=120) as resp:
+              data = json.load(resp)
+          # The image is the content part of type image_url (a data: URI).
+          uri = None
+          for part in data["choices"][0]["message"]["content"]:
+              if isinstance(part, dict) and part.get("type") == "image_url":
+                  uri = part["image_url"]["url"]
+                  break
+          if not uri or "," not in uri:
+              raise SystemExit("no image in model response")
+          raw = base64.b64decode(uri.split(",", 1)[1])
+          if raw[:8] != b"\x89PNG\r\n\x1a\n":
+              raise SystemExit("model returned non-PNG data")
+          slug = os.environ["SLUG"]
+          # Defense-in-depth: slug is validated as strict kebab-case upstream, but
+          # this is the one place it names a new file — re-check before writing.
+          if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+              raise SystemExit(f"unsafe slug for hero path: {slug!r}")
+          dest = pathlib.Path(os.environ["SITE"], "public", "images", "blog", f"{slug}.png")
+          dest.parent.mkdir(parents=True, exist_ok=True)
+          dest.write_bytes(raw)
+          # Point heroArt at the served path (public/ maps to site root).
+          post_path = pathlib.Path(os.environ["SITE"], os.environ["POST"])
+          text = post_path.read_text(encoding="utf-8")
+          text, n = re.subn(r'heroArt:\s*"[^"]*"', f'heroArt: "/images/blog/{slug}.png"', text, count=1)
+          if not n:
+              # No double-quoted heroArt to rewrite — drop the orphan PNG so we
+              # don't commit an image nothing references.
+              dest.unlink(missing_ok=True)
+              raise SystemExit("no heroArt: \"\" field to rewrite; discarding hero image")
+          post_path.write_text(text, encoding="utf-8")
+          print(f"generated hero image ({len(raw)} bytes) -> /images/blog/{slug}.png")
+          PYEOF
+            fi
+
+            # Prettier the drafter's changed files so they pass the site's
+            # `fmt:check` gate — LLM-generated MDX/JS (and the CTA footer appended
+            # above) are rarely prettier-clean. Run from inside $SITE so prettier
+            # discovers the site's .prettierrc.json + .prettierignore, and pin the
+            # site's major version. Formatting failures are non-fatal: a human
+            # reviews the draft PR and CI still reports any residual issue.
+            mapfile -t changed < <(git -C "$SITE" status --porcelain -uall | awk '{print $NF}')
+            if [ "${#changed[@]}" -gt 0 ]; then
+              ( cd "$SITE" && npx --yes prettier@3 --write --ignore-unknown "${changed[@]}" ) \
+                || echo "::warning::prettier --write failed for ${slug}; committing unformatted (CI will flag)"
+            fi
+
+            # Surface the drafted post itself: copy it to /tmp (uploaded as an
+            # artifact) and, on a dry run, render it into the job summary so the
+            # post body can be reviewed without opening a PR.
+            if [ -n "$post" ] && [ -f "${SITE}/${post}" ]; then
+              cp "${SITE}/${post}" "/tmp/post_${i}.mdx"
+              {
+                echo "<details><summary>Drafted post: ${slug}</summary>"
+                echo
+                echo '```mdx'
+                cat "${SITE}/${post}"
+                echo '```'
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            title=$(sed -n 's/^BLOG_PR_TITLE:[[:space:]]*//p' "/tmp/drafter_out_${i}.txt" | head -n1)
+            [ -z "$title" ] && title="add feature blog: ${headline}"
+
+            git -C "$SITE" add -A
+            git -C "$SITE" commit -m "blog: ${title}"
+            printf '%s\t%s\t%s\n' "$branch" "$title" "$i" >> /tmp/drafted_branches.txt
+          done
+
+          n=$(wc -l < /tmp/drafted_branches.txt | tr -d ' ')
+          echo "drafted=${n}" >> "$GITHUB_OUTPUT"
+          echo "Drafted ${n} post(s)." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # --- 3) Mint the write-token — ONLY now, after the agents have run ---
+      - name: Mint App token (omnigent-site)
+        id: app-token
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outcome == 'success' && steps.draftposts.outputs.drafted != '' && steps.draftposts.outputs.drafted != '0' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent-site
+
+      # Make a misconfigured run (posts drafted but no App to push them) loud, so
+      # it isn't mistaken for a clean "no candidates" outcome.
+      - name: Warn if drafts can't be published
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outcome == 'success' && steps.draftposts.outputs.drafted != '' && steps.draftposts.outputs.drafted != '0' && steps.app-token.outputs.token == ''
+        run: |
+          echo "::warning::Drafted ${{ steps.draftposts.outputs.drafted }} post(s) but no omnigent-site App token (OMNIGENT_BOT_APP_ID unset?) — no PRs opened; drafts discarded." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # --- 4) Push each drafted branch and open a DRAFT PR ---
+      - name: Open draft PRs (omnigent-site)
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outcome == 'success' && steps.draftposts.outputs.drafted != '' && steps.draftposts.outputs.drafted != '0' && steps.app-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SITE_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SITE="${GITHUB_WORKSPACE}/site"
+          SITE_REPO="${GITHUB_REPOSITORY_OWNER}/omnigent-site"
+          PUSH_URL="https://x-access-token:${SITE_TOKEN}@github.com/${SITE_REPO}.git"
+
+          # Ensure the triage label exists (gh pr create --label fails if absent).
+          # Idempotent: a no-op when it already exists.
+          gh label create automated-blog --repo "$SITE_REPO" \
+            --color 5319e7 --description "Auto-drafted feature-blog post" 2>/dev/null || true
+
+          # Request review from the maintainer with the most context on the
+          # feature — the person who merged the most of its contributing PRs
+          # (computed in the Draft posts step). The @-mention in the body is the
+          # durable ping (reaches concealed org members); the --add-reviewer /
+          # --add-assignee calls are best-effort (GitHub 422s non-collaborators),
+          # so tolerate their failure and never let it block the PR.
+          assign_reviewer() {
+            local pr_ref="$1" who="$2"
+            [ -n "$who" ] || return 0
+            gh pr edit "$pr_ref" --repo "$SITE_REPO" --add-reviewer "$who" \
+              || echo "::notice::Could not request review from ${who} (not addable); they're @-mentioned in the PR body."
+            gh pr edit "$pr_ref" --repo "$SITE_REPO" --add-assignee "$who" \
+              || echo "::notice::Could not assign ${who} (not addable); they're @-mentioned in the PR body."
+          }
+
+          echo "## Draft blog PRs" >> "$GITHUB_STEP_SUMMARY"
+          while IFS=$'\t' read -r branch title idx; do
+            [ -z "$branch" ] && continue
+            git -C "$SITE" push --force "$PUSH_URL" "$branch"
+
+            reviewer="$(cat "/tmp/reviewer_${idx}.txt" 2>/dev/null || true)"
+            mention=""
+            [ -n "$reviewer" ] && mention=" · most context @${reviewer}"
+
+            # Build the body once so the update path can refresh it too — the
+            # @-mention is the durable ping (--add-reviewer commonly 422s because
+            # the source-repo maintainer isn't an omnigent-site collaborator), so
+            # it must be written on BOTH the create and force-push-update paths.
+            summary="$(sed -n '/<!-- BLOG_DRAFT_SUMMARY -->/,$p' "/tmp/drafter_out_${idx}.txt" | tail -n +2 || true)"
+            body="$(printf 'Drafts a feature-blog post for **%s**, selected by `feature-blog-scout` at the %s release cut.\n\n> **This is a DRAFT.** Before merging, a human must: record the mandatory demo (replace the `DEMO REQUIRED` marker) and do a final voice pass. The hero image and `author: omnigent` byline are auto-generated — review and optionally replace them.\n\n%s\n\nSource release: %s%s\n<sub>Generated by omnigent `.github/workflows/feature-blog.yml`. Review for accuracy before merging.</sub>' "$title" "$TAG" "$summary" "$TAG" "$mention")"
+
+            existing="$(gh pr list --repo "$SITE_REPO" --head "$branch" --state open --json url --jq '.[].url' | head -n1)"
+            if [ -n "$existing" ]; then
+              gh pr edit "$existing" --repo "$SITE_REPO" --body "$body" \
+                || echo "::notice::Could not refresh body for ${existing}."
+              assign_reviewer "$existing" "$reviewer"
+              echo "- [${title}](${existing})${mention} — updated existing draft (force-pushed)" \
+                >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            url="$(gh pr create \
+              --repo "$SITE_REPO" \
+              --base main \
+              --head "$branch" \
+              --draft \
+              --title "blog: ${title}" \
+              --body "$body" \
+              --label automated-blog)"
+            assign_reviewer "$url" "$reviewer"
+            echo "- [${title}](${url})${mention}" >> "$GITHUB_STEP_SUMMARY"
+          done < /tmp/drafted_branches.txt
+
+      # ::add-mask:: redacts rendered logs, not artifact files — scrub the key
+      # from artifacts (incl. unscanned stderr) before upload.
+      - name: Redact secrets from artifacts
+        if: always() && steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${LLM_API_KEY:-}" ] || exit 0
+          python3 - <<'PYEOF'
+          import os, glob, pathlib
+          key = os.environ.get("LLM_API_KEY", "")
+          files = ["scout-stderr.log", "drafter-stderr.log", "/tmp/scout_out.txt",
+                   "/tmp/scout_prompt.txt"]
+          files += glob.glob("/tmp/drafter_out_*.txt") + glob.glob("/tmp/material_*.txt")
+          files += glob.glob("/tmp/post_*.mdx")
+          for f in files:
+              p = pathlib.Path(f)
+              if not p.is_file() or not key:
+                  continue
+              t = p.read_text(encoding="utf-8", errors="replace")
+              if key in t:
+                  p.write_text(t.replace(key, "***REDACTED***"), encoding="utf-8")
+                  print(f"redacted key from {f}")
+          PYEOF
+
+      - name: Upload logs and drafted posts
+        if: always() && steps.guard.outputs.proceed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: feature-blog-${{ steps.guard.outputs.tag }}-${{ github.run_id }}
+          path: |
+            scout-stderr.log
+            drafter-stderr.log
+            /tmp/scout_out.txt
+            /tmp/candidates.json
+            /tmp/drafter_out_*.txt
+            /tmp/post_*.mdx
+          retention-days: 7
+          if-no-files-found: ignore

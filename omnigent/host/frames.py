@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-HarnessAvailability = bool | str
+from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -38,11 +38,14 @@ class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
+    RUNNER_STATUS = "host.runner_status"
+    RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
     STAT_RESULT = "host.stat_result"
     LIST_DIR = "host.list_dir"
@@ -51,8 +54,20 @@ class HostFrameKind(str, Enum):
     CREATE_WORKTREE_RESULT = "host.create_worktree_result"
     REMOVE_WORKTREE = "host.remove_worktree"
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
+    LIST_WORKTREES = "host.list_worktrees"
+    LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    INSTALL_HARNESS = "host.install_harness"
+    INSTALL_HARNESS_RESULT = "host.install_harness_result"
+    STORE_SECRET = "host.store_secret"
+    STORE_SECRET_RESULT = "host.store_secret_result"
+    DETECT_CREDENTIALS = "host.detect_credentials"
+    DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
+    FS_REQUEST = "host.fs_request"
+    FS_RESULT = "host.fs_result"
+    MODEL_OPTIONS = "host.model_options"
+    MODEL_OPTIONS_RESULT = "host.model_options_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -75,8 +90,9 @@ class HostHelloFrame:
         (see ``omnigent.onboarding.harness_readiness``). Keys
         cover every accepted harness spelling. ``None`` means
         unknown (an older host that doesn't report it) — never
-        treat ``None`` as "nothing is configured". Recomputed on
-        each (re)connect; the launch-time check is authoritative.
+        treat ``None`` as "nothing is configured". Changes arrive in
+        :class:`HostHarnessReadinessFrame`; launch-time checks remain
+        authoritative.
     """
 
     version: str
@@ -84,6 +100,19 @@ class HostHelloFrame:
     name: str
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    telemetry_opt_out: bool = False
+    installation_id: str | None = None
+
+
+@dataclass
+class HostHarnessReadinessFrame:
+    """Host's refreshed per-harness readiness while the tunnel stays open.
+
+    :param configured_harnesses: Current launch readiness keyed by every
+        accepted harness spelling. Sent only when the map changes.
+    """
+
+    configured_harnesses: dict[str, HarnessAvailability]
 
 
 @dataclass
@@ -98,6 +127,9 @@ class HostLaunchRunnerFrame:
     :param workspace: Absolute path on the host machine to use
         as the runner's working directory, e.g.
         ``"/Users/corey/projects/frontend"``.
+    :param session_id: Conversation/session ID the runner is being
+        launched for, e.g. ``"conv_abc123"``. ``None`` means an older
+        server did not include it.
     :param harness: Canonical harness the session will run, e.g.
         ``"claude-sdk"``. The host checks it is configured before
         spawning and refuses with
@@ -109,6 +141,7 @@ class HostLaunchRunnerFrame:
     request_id: str
     binding_token: str
     workspace: str
+    session_id: str | None = None
     harness: str | None = None
 
 
@@ -191,6 +224,48 @@ class HostRunnerExitedFrame:
 
     runner_id: str
     error: str
+
+
+@dataclass
+class HostRunnerStatusFrame:
+    """Server → host: is this runner's process alive, dead, or unknown?
+
+    The host is the authoritative owner of runner-process liveness — it
+    holds each runner's :class:`subprocess.Popen`. The runner tunnel
+    only tells the server "connected right now"; it cannot distinguish a
+    runner that is still booting (will connect) from one that was stopped
+    or died when the host restarted (never will). The message-dispatch
+    path asks this before its connect grace so it waits for a runner that
+    is coming and relaunches immediately for one that is not.
+
+    :param request_id: Unique id for correlating the result, e.g.
+        ``"req_rs_1"``.
+    :param runner_id: Runner to query, e.g. ``"runner_abc123..."``.
+    """
+
+    request_id: str
+    runner_id: str
+
+
+@dataclass
+class HostRunnerStatusResultFrame:
+    """Host → server: liveness of a queried runner.
+
+    :param request_id: Correlates to the :class:`HostRunnerStatusFrame`,
+        e.g. ``"req_rs_1"``.
+    :param status: One of:
+
+        * ``"alive"`` — the host has this runner and its process is
+          running (booting or serving). The runner is coming; wait.
+        * ``"dead"`` — the host has this runner but its process has
+          exited. It will never connect; relaunch now.
+        * ``"unknown"`` — the host has no record of this runner (it was
+          stopped, or a fresh post-restart host never spawned it).
+          Relaunch now.
+    """
+
+    request_id: str
+    status: str
 
 
 @dataclass
@@ -431,6 +506,44 @@ class HostRemoveWorktreeResultFrame:
 
 
 @dataclass
+class HostListWorktreesFrame:
+    """Server → host: list the git worktrees of a repository.
+
+    Backs ``GET /v1/hosts/{id}/worktrees``, used by the Web UI's
+    new-session worktree picker to show worktrees a session can start
+    in directly. Read-only; the host derives the main work tree from
+    ``repo_path`` (so a linked worktree resolves the same list).
+
+    :param request_id: Correlates the result, e.g. ``"req_wt_ls_1"``.
+    :param repo_path: Absolute path inside the repo (the picked dir or
+        a subdir), e.g. ``"/Users/alice/myrepo"``.
+    """
+
+    request_id: str
+    repo_path: str
+
+
+@dataclass
+class HostListWorktreesResultFrame:
+    """Host → server: outcome of a list-worktrees request.
+
+    :param request_id: Correlates to the
+        :class:`HostListWorktreesFrame`, e.g. ``"req_wt_ls_1"``.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param worktrees: One dict per worktree with keys ``path`` (str),
+        ``branch`` (str | None), ``is_main`` (bool), ``detached``
+        (bool), main first. ``None`` on failure.
+    :param error: Error message when ``status`` is ``"failed"``, e.g.
+        ``"not a git repository"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    worktrees: list[dict[str, Any]] | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostCreateDirFrame:
     """Server → host: create a new directory on the host.
 
@@ -474,13 +587,236 @@ class HostCreateDirResultFrame:
     error: str | None = None
 
 
+@dataclass
+class HostInstallHarnessFrame:
+    """Server → host: install a harness CLI on the host.
+
+    Backs ``POST /v1/hosts/{id}/harnesses/{harness}/install``, used by
+    the Web UI's New Chat dialog so a user can install a missing,
+    npm-installable harness onto a connected host without dropping to a
+    terminal. The host runs the same :func:`install_harness_cli` the
+    ``omnigent setup`` wizard uses. Only allowlisted, npm-installable
+    harnesses reach this frame — the server rejects curl/brew and
+    interactive-auth harnesses before sending it.
+
+    :param request_id: Correlates the result, e.g. ``"req_install_1"``.
+    :param harness: Harness identifier to install, e.g. ``"claude"`` or
+        ``"codex"``. The host maps it to its install-spec key.
+    """
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostInstallHarnessResultFrame:
+    """Host → server: outcome of an install request.
+
+    Carries the freshly-recomputed readiness map so the server can
+    update its view and the UI can flip the harness badge without
+    waiting for a reconnect (the ``host.hello`` handshake is the only
+    other readiness carrier, sent once per connect).
+
+    :param request_id: Correlates to the
+        :class:`HostInstallHarnessFrame`, e.g. ``"req_install_1"``.
+    :param status: ``"ok"`` when the installer ran and the binary landed
+        on ``PATH``, ``"failed"`` otherwise. A ``"failed"`` status pairs
+        with a human-readable ``error`` (e.g. ``"npm not found"``).
+    :param configured_harnesses: The host's readiness map recomputed
+        after the install attempt, e.g. ``{"claude-native": True,
+        "codex-native": "needs-auth"}``. ``None`` when the install could
+        not run (the server keeps its prior readiness view).
+    :param error: Why the install failed, e.g. ``"npm not found"`` or
+        ``"install timed out"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostStoreSecretFrame:
+    """Server → host: write a harness provider credential on the host.
+
+    Backs ``POST /v1/hosts/{id}/harnesses/{harness}/credential``, used by the
+    Web UI's setup dialog so a user can configure a Claude / Codex / Pi
+    credential on a connected host without a terminal. The host writes it with
+    the same non-interactive core (:func:`store_harness_credential`) the
+    ``omnigent setup`` wizard's "add a key / gateway" path uses: the secret goes
+    to the OS keychain (else ``~/.omnigent/secrets.json``), and ``config.yaml``
+    gets a ``providers:`` entry referencing it by ``keychain:<name>`` — never
+    the raw secret.
+
+    Security: ``secret_value`` is the only credential-bearing field and is named
+    so telemetry redaction masks it on spans (see ``_REDACT_KEY_SUBSTRINGS``).
+    The server is an authz'd pass-through — it validates ownership + the
+    allowlist, forwards this frame over the (TLS) tunnel, and never persists the
+    secret. The daemon writes it on the runner.
+
+    :param request_id: Correlates the result, e.g. ``"req_cred_1"``.
+    :param harness: Harness identifier being configured, e.g. ``"claude"`` /
+        ``"codex"`` / ``"pi"``. The host maps it to its provider family.
+    :param kind: ``"key"`` (a vendor API key) or ``"gateway"`` (a compatible
+        proxy at ``base_url``) or ``"adopt"`` (reference an existing host env
+        var by name — carries ``env_var``, not ``secret_value``).
+    :param secret_value: The API key / gateway token for ``key`` / ``gateway``;
+        ``None`` for ``adopt`` (which references ``env_var`` instead).
+    :param base_url: The gateway base URL for ``kind="gateway"``; ``None``
+        otherwise.
+    :param default_model: Optional family default model id to pin.
+    :param wire_api: Optional OpenAI wire protocol (``"chat"`` / ``"responses"``).
+    :param env_var: For ``kind="adopt"``, the host env var to reference
+        (``api_key_ref: env:<env_var>``); ``None`` otherwise.
+    """
+
+    request_id: str
+    harness: str
+    kind: str
+    secret_value: str | None = None
+    base_url: str | None = None
+    default_model: str | None = None
+    wire_api: str | None = None
+    env_var: str | None = None
+
+
+@dataclass
+class HostStoreSecretResultFrame:
+    """Host → server: outcome of a store-secret request.
+
+    Carries the freshly-recomputed readiness map so the UI can flip the harness
+    badge (yellow → green) without waiting for a reconnect. Never echoes the
+    secret or the provider name's credential — only the outcome + readiness.
+
+    :param request_id: Correlates to the :class:`HostStoreSecretFrame`.
+    :param status: ``"ok"`` when the credential was written, ``"failed"``
+        otherwise (paired with a non-secret ``error``).
+    :param configured_harnesses: Readiness recomputed after the write, e.g.
+        ``{"claude-native": True}``. ``None`` when the write could not run.
+    :param error: Non-secret failure reason, e.g. ``"a gateway requires a
+        base_url"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostDetectCredentialsFrame:
+    """Server → host: list adoptable credentials already present on the host.
+
+    Backs the setup dialog's "adopt an existing credential" affordance: the host
+    reports which UI-auth-family credentials it already has (env vars, a CLI
+    login) so the UI can offer a one-click "Use it" instead of asking the user
+    to paste a key they already have. Read-only; carries only a request id.
+
+    :param request_id: Correlates the result, e.g. ``"req_detect_1"``.
+    """
+
+    request_id: str
+
+
+@dataclass
+class HostDetectCredentialsResultFrame:
+    """Host → server: the adoptable credentials found, as NON-secret descriptors.
+
+    Carries only metadata — the family and a source label / env var name — never
+    a secret value. The UI shows "Use $ANTHROPIC_API_KEY" and adopts it by
+    reference (``api_key_ref: env:<VAR>``); the value is never read or sent.
+
+    :param request_id: Correlates to the :class:`HostDetectCredentialsFrame`.
+    :param credentials: List of ``{"family": ..., "source": ..., "env_var": ...}``
+        dicts (non-secret). Empty when nothing adoptable was found.
+    """
+
+    request_id: str
+    credentials: list[dict[str, str | None]] = field(default_factory=list)
+
+
+@dataclass
+class HostFsRequestFrame:
+    """Server → host: read-only workspace filesystem request.
+
+    Serves the web UI's file panel (directory browse, changed files,
+    diffs, search, file content) from the host when the session's runner
+    is offline but the host still holds the workspace on disk. The host
+    runs :class:`omnigent.workspace_fs.WorkspaceReader` against
+    ``workspace`` and returns the same JSON the runner's filesystem
+    endpoints would.
+
+    :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
+    :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
+        ``"diff"``, ``"search"``.
+    :param workspace: Absolute path to the session's workspace on the
+        host, e.g. ``"/Users/alice/project"``.
+    :param session_id: Session id, forwarded to the change registry.
+    :param params: Operation-specific arguments (relative path, glob
+        filters, pagination cursors), e.g.
+        ``{"path": "src", "limit": 100, "order": "asc"}``.
+    """
+
+    request_id: str
+    op: str
+    workspace: str
+    session_id: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HostFsResultFrame:
+    """Host → server: outcome of a workspace filesystem request.
+
+    :param request_id: Correlates to the :class:`HostFsRequestFrame`.
+    :param status: ``"ok"`` when ``payload`` carries the runner-shaped
+        result, or ``"error"`` when the read failed.
+    :param payload: The runner-shaped JSON result on success, ``None`` on
+        error.
+    :param error_status: HTTP status the runner would have returned on
+        failure (e.g. ``404``), or ``None`` on success.
+    :param error_code: Machine-readable error code on failure (e.g.
+        ``"not_found"``), or ``None`` on success.
+    :param error: Human-readable error detail on failure, or ``None``.
+    """
+
+    request_id: str
+    status: str
+    payload: dict[str, Any] | None = None
+    error_status: int | None = None
+    error_code: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostModelOptionsFrame:
+    """Server → host: resolve pre-launch model choices for a harness."""
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostModelOptionsResultFrame:
+    """Host → server: pre-launch model choices resolved on that machine."""
+
+    request_id: str
+    status: str
+    models: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
+    | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostRunnerStatusFrame
+    | HostRunnerStatusResultFrame
     | HostStatFrame
     | HostStatResultFrame
     | HostListDirFrame
@@ -489,8 +825,14 @@ HostFrame = (
     | HostCreateWorktreeResultFrame
     | HostRemoveWorktreeFrame
     | HostRemoveWorktreeResultFrame
+    | HostListWorktreesFrame
+    | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostFsRequestFrame
+    | HostFsResultFrame
+    | HostModelOptionsFrame
+    | HostModelOptionsResultFrame
 )
 
 
@@ -537,6 +879,15 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "name": frame.name,
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
+                "telemetry_opt_out": frame.telemetry_opt_out,
+                "installation_id": frame.installation_id,
+            }
+        )
+    if isinstance(frame, HostHarnessReadinessFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_READINESS.value,
+                "configured_harnesses": frame.configured_harnesses,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -546,6 +897,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "binding_token": frame.binding_token,
                 "workspace": frame.workspace,
+                "session_id": frame.session_id,
                 "harness": frame.harness,
             }
         )
@@ -583,6 +935,22 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostRunnerStatusFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUNNER_STATUS.value,
+                "request_id": frame.request_id,
+                "runner_id": frame.runner_id,
+            }
+        )
+    if isinstance(frame, HostRunnerStatusResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUNNER_STATUS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
             }
         )
     if isinstance(frame, HostStatFrame):
@@ -676,6 +1044,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostListWorktreesFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LIST_WORKTREES.value,
+                "request_id": frame.request_id,
+                "repo_path": frame.repo_path,
+            }
+        )
+    if isinstance(frame, HostListWorktreesResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LIST_WORKTREES_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "worktrees": frame.worktrees,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostCreateDirFrame):
         return _encode_payload(
             {
@@ -691,6 +1077,104 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "path": frame.path,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostInstallHarnessFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSTALL_HARNESS.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostInstallHarnessResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSTALL_HARNESS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostStoreSecretFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.STORE_SECRET.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "kind_": frame.kind,
+                "secret_value": frame.secret_value,
+                "base_url": frame.base_url,
+                "default_model": frame.default_model,
+                "wire_api": frame.wire_api,
+                "env_var": frame.env_var,
+            }
+        )
+    if isinstance(frame, HostStoreSecretResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.STORE_SECRET_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostDetectCredentialsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.DETECT_CREDENTIALS.value,
+                "request_id": frame.request_id,
+            }
+        )
+    if isinstance(frame, HostDetectCredentialsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.DETECT_CREDENTIALS_RESULT.value,
+                "request_id": frame.request_id,
+                "credentials": frame.credentials,
+            }
+        )
+    if isinstance(frame, HostFsRequestFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.FS_REQUEST.value,
+                "request_id": frame.request_id,
+                "op": frame.op,
+                "workspace": frame.workspace,
+                "session_id": frame.session_id,
+                "params": frame.params,
+            }
+        )
+    if isinstance(frame, HostFsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.FS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "payload": frame.payload,
+                "error_status": frame.error_status,
+                "error_code": frame.error_code,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostModelOptionsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MODEL_OPTIONS.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostModelOptionsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MODEL_OPTIONS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "models": frame.models,
                 "error": frame.error,
             }
         )
@@ -756,6 +1240,8 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.HARNESS_READINESS:
+            return _decode_harness_readiness(msg)
         case HostFrameKind.LAUNCH_RUNNER:
             return _decode_launch_runner(msg)
         case HostFrameKind.LAUNCH_RUNNER_RESULT:
@@ -766,6 +1252,10 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.RUNNER_STATUS:
+            return _decode_runner_status(msg)
+        case HostFrameKind.RUNNER_STATUS_RESULT:
+            return _decode_runner_status_result(msg)
         case HostFrameKind.STAT:
             return _decode_stat(msg)
         case HostFrameKind.STAT_RESULT:
@@ -782,10 +1272,34 @@ def _decode_known_host_frame(
             return _decode_remove_worktree(msg)
         case HostFrameKind.REMOVE_WORKTREE_RESULT:
             return _decode_remove_worktree_result(msg)
+        case HostFrameKind.LIST_WORKTREES:
+            return _decode_list_worktrees(msg)
+        case HostFrameKind.LIST_WORKTREES_RESULT:
+            return _decode_list_worktrees_result(msg)
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.INSTALL_HARNESS:
+            return _decode_install_harness(msg)
+        case HostFrameKind.INSTALL_HARNESS_RESULT:
+            return _decode_install_harness_result(msg)
+        case HostFrameKind.STORE_SECRET:
+            return _decode_store_secret(msg)
+        case HostFrameKind.STORE_SECRET_RESULT:
+            return _decode_store_secret_result(msg)
+        case HostFrameKind.DETECT_CREDENTIALS:
+            return HostDetectCredentialsFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.DETECT_CREDENTIALS_RESULT:
+            return _decode_detect_credentials_result(msg)
+        case HostFrameKind.FS_REQUEST:
+            return _decode_fs_request(msg)
+        case HostFrameKind.FS_RESULT:
+            return _decode_fs_result(msg)
+        case HostFrameKind.MODEL_OPTIONS:
+            return _decode_model_options(msg)
+        case HostFrameKind.MODEL_OPTIONS_RESULT:
+            return _decode_model_options_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -801,7 +1315,22 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
+        installation_id=_optional_nullable_str(msg, "installation_id"),
     )
+
+
+def _decode_harness_readiness(msg: dict[str, Any]) -> HostHarnessReadinessFrame:
+    """Decode a live harness-readiness refresh frame."""
+    configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
+    if configured_harnesses is None:
+        raise ValueError("harness readiness frame requires a configured_harnesses object")
+    raw = msg["configured_harnesses"]
+    if len(configured_harnesses) != len(raw):
+        raise ValueError("harness readiness frame contains an unsupported availability state")
+    if not configured_harnesses:
+        raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
+    return HostHarnessReadinessFrame(configured_harnesses=configured_harnesses)
 
 
 def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
@@ -814,6 +1343,7 @@ def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
+        session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
     )
 
@@ -871,6 +1401,32 @@ def _decode_runner_exited(msg: dict[str, Any]) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+    )
+
+
+def _decode_runner_status(msg: dict[str, Any]) -> HostRunnerStatusFrame:
+    """Decode a host.runner_status request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.runner_status frame.
+    """
+    return HostRunnerStatusFrame(
+        request_id=_required_str(msg, "request_id"),
+        runner_id=_required_str(msg, "runner_id"),
+    )
+
+
+def _decode_runner_status_result(
+    msg: dict[str, Any],
+) -> HostRunnerStatusResultFrame:
+    """Decode a host.runner_status_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.runner_status_result frame.
+    """
+    return HostRunnerStatusResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
     )
 
 
@@ -1032,6 +1588,41 @@ def _decode_remove_worktree_result(
     )
 
 
+def _decode_list_worktrees(msg: dict[str, Any]) -> HostListWorktreesFrame:
+    """Decode a host.list_worktrees request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.list_worktrees frame.
+    """
+    return HostListWorktreesFrame(
+        request_id=_required_str(msg, "request_id"),
+        repo_path=_required_str(msg, "repo_path"),
+    )
+
+
+def _decode_list_worktrees_result(
+    msg: dict[str, Any],
+) -> HostListWorktreesResultFrame:
+    """Decode a host.list_worktrees_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.list_worktrees_result frame.
+    """
+    raw = msg.get("worktrees")
+    if raw is not None:
+        if not isinstance(raw, list):
+            raise ValueError("frame field must be a list or null: 'worktrees'")
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise ValueError("each entry in 'worktrees' must be a JSON object")
+    return HostListWorktreesResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        worktrees=raw,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
 def _decode_create_dir(msg: dict[str, Any]) -> HostCreateDirFrame:
     """Decode a host.create_dir request frame.
 
@@ -1054,6 +1645,161 @@ def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         path=_optional_nullable_str(msg, "path"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_install_harness(msg: dict[str, Any]) -> HostInstallHarnessFrame:
+    """Decode a host.install_harness request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.install_harness frame.
+    """
+    return HostInstallHarnessFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+    )
+
+
+def _decode_install_harness_result(msg: dict[str, Any]) -> HostInstallHarnessResultFrame:
+    """Decode a host.install_harness_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.install_harness_result frame.
+    """
+    return HostInstallHarnessResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_store_secret(msg: dict[str, Any]) -> HostStoreSecretFrame:
+    """Decode a host.store_secret request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.store_secret frame.
+    """
+    return HostStoreSecretFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+        kind=_required_str(msg, "kind_"),
+        secret_value=_optional_nullable_str(msg, "secret_value"),
+        base_url=_optional_nullable_str(msg, "base_url"),
+        default_model=_optional_nullable_str(msg, "default_model"),
+        wire_api=_optional_nullable_str(msg, "wire_api"),
+        env_var=_optional_nullable_str(msg, "env_var"),
+    )
+
+
+def _decode_store_secret_result(msg: dict[str, Any]) -> HostStoreSecretResultFrame:
+    """Decode a host.store_secret_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.store_secret_result frame.
+    """
+    return HostStoreSecretResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_detect_credentials_result(msg: dict[str, Any]) -> HostDetectCredentialsResultFrame:
+    """Decode a host.detect_credentials_result frame.
+
+    Coerces each credential entry to a ``{family, source, env_var}`` dict of
+    strings (env_var nullable), ignoring malformed entries — a spoofed/garbled
+    payload can never inject a non-string field the UI would trust.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.detect_credentials_result frame.
+    """
+    raw = msg.get("credentials")
+    creds: list[dict[str, str | None]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            family = item.get("family")
+            source = item.get("source")
+            env_var = item.get("env_var")
+            if not isinstance(family, str) or not isinstance(source, str):
+                continue
+            creds.append(
+                {
+                    "family": family,
+                    "source": source,
+                    "env_var": env_var if isinstance(env_var, str) else None,
+                }
+            )
+    return HostDetectCredentialsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        credentials=creds,
+    )
+
+
+def _decode_fs_request(msg: dict[str, Any]) -> HostFsRequestFrame:
+    """Decode a host.fs_request request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.fs_request frame.
+    """
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        raise ValueError("frame field must be a JSON object: 'params'")
+    return HostFsRequestFrame(
+        request_id=_required_str(msg, "request_id"),
+        op=_required_str(msg, "op"),
+        workspace=_required_str(msg, "workspace"),
+        session_id=_required_str(msg, "session_id"),
+        params=params,
+    )
+
+
+def _decode_fs_result(msg: dict[str, Any]) -> HostFsResultFrame:
+    """Decode a host.fs_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.fs_result frame.
+    """
+    payload = msg.get("payload")
+    if payload is not None and not isinstance(payload, dict):
+        raise ValueError("frame field must be a JSON object or null: 'payload'")
+    error_status = msg.get("error_status")
+    if error_status is not None and (
+        not isinstance(error_status, int) or isinstance(error_status, bool)
+    ):
+        raise ValueError("frame field must be an int or null: 'error_status'")
+    return HostFsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        payload=payload,
+        error_status=error_status,
+        error_code=_optional_nullable_str(msg, "error_code"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_model_options(msg: dict[str, Any]) -> HostModelOptionsFrame:
+    """Decode a host.model_options request frame."""
+    return HostModelOptionsFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+    )
+
+
+def _decode_model_options_result(msg: dict[str, Any]) -> HostModelOptionsResultFrame:
+    """Decode a host.model_options_result frame."""
+    models = msg.get("models", [])
+    if not isinstance(models, list) or not all(isinstance(model, dict) for model in models):
+        raise ValueError("frame field must be a list of JSON objects: 'models'")
+    return HostModelOptionsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        models=models,
         error=_optional_nullable_str(msg, "error"),
     )
 
@@ -1125,7 +1871,7 @@ def _optional_str_availability_map(
     Tolerant by design: absent, null, or non-mapping values all decode
     to ``None`` ("unknown") rather than raising, so an older or newer
     peer's hello never breaks the tunnel handshake. Entries with a
-    non-string key or non-bool/string value are dropped for the same reason.
+    non-string key or unsupported readiness value are dropped for the same reason.
 
     :param msg: Decoded frame object.
     :param key: Field name, e.g. ``"configured_harnesses"``.
@@ -1135,7 +1881,7 @@ def _optional_str_availability_map(
     val = msg.get(key)
     if not isinstance(val, dict):
         return None
-    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, (bool, str))}
+    return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
 def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:

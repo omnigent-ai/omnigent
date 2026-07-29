@@ -5,13 +5,14 @@ The endpoint resolves the opaque terminal resource id back to the
 runner-local registry entry and bridges PTY bytes to the
 browser-facing WebSocket via ``tmux attach``. These tests pin the
 route boundary and registry lookup; the actual PTY bridge is
-exercised by stubbing ``pty.fork`` / ``os.execve`` (the bridge
-logic itself is unit-tested elsewhere via the shared helper).
+exercised by stubbing the bridge spawn boundary or PTY fd (the
+bridge logic itself is unit-tested elsewhere via the shared helper).
 """
 
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,19 @@ def _seed_registry(
     slot[(instance.name, instance.session_key)] = instance
 
 
+def _patch_attach_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    on_spawn: Callable[[str, list[str], dict[str, str]], None],
+) -> None:
+    """Patch tmux attach spawn at the bridge boundary."""
+
+    def fake_fork_exec(tmux_path: str, argv: list[str], env: dict[str, str]) -> object:
+        on_spawn(tmux_path, argv, env)
+        raise RuntimeError("child exited")
+
+    monkeypatch.setattr("omnigent.terminals.ws_bridge._fork_exec_pty", fake_fork_exec)
+
+
 def test_runner_resource_attach_spawns_tmux_for_running_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -64,11 +78,9 @@ def test_runner_resource_attach_spawns_tmux_for_running_terminal(
     With a running registry entry, the runner spawns ``tmux attach``
     against the entry's local socket path.
 
-    Intercepts ``pty.fork`` to act as the child branch (returning 0)
-    so ``execve`` runs in the test process; ``execve`` is stubbed to
-    capture argv and the child env. ``_exit`` is raised as an exception so the child
-    branch terminates the test rather than continuing into the
-    parent path.
+    Intercepts the bridge's tmux attach spawn helper to capture argv
+    and child env, then raises so the websocket route unwinds without
+    touching a real PTY or tmux process.
 
     :param tmp_path: Pytest tmp directory.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -85,24 +97,11 @@ def test_runner_resource_attach_spawns_tmux_for_running_terminal(
     # argv (list) and the child env (dict) land under separate keys.
     captured: dict[str, object] = {}
 
-    def fake_fork() -> tuple[int, int]:
-        return 0, 0
-
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+    def record_spawn(_path: str, argv: list[str], env: dict[str, str]) -> None:
         captured["argv"] = argv
         captured["env"] = env
-        raise OSError("stop child path")
 
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    # Production resolves the absolute tmux path and builds the child env
-    # in the parent; the child calls os.execve (no PATH search, explicit
-    # env) — patch execve, not execv/execvp.
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
-    monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
-    )
+    _patch_attach_spawn(monkeypatch, record_spawn)
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
@@ -147,24 +146,11 @@ def test_runner_resource_attach_passes_read_only_to_tmux(
     # argv (list) and the child env (dict) land under separate keys.
     captured: dict[str, object] = {}
 
-    def fake_fork() -> tuple[int, int]:
-        return 0, 0
-
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+    def record_spawn(_path: str, argv: list[str], env: dict[str, str]) -> None:
         captured["argv"] = argv
         captured["env"] = env
-        raise OSError("stop child path")
 
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    # Production resolves the absolute tmux path and builds the child env
-    # in the parent; the child calls os.execve (no PATH search, explicit
-    # env) — patch execve, not execv/execvp.
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
-    monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
-    )
+    _patch_attach_spawn(monkeypatch, record_spawn)
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
@@ -417,32 +403,11 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
 
     attach_argvs: list[list[str]] = []
 
-    def fake_fork() -> tuple[int, int]:
-        """Drive the child branch of ``pty.fork`` in-process.
-
-        :returns: ``(0, 0)`` — pid 0 selects the child path.
-        """
-        return 0, 0
-
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
-        """Capture the tmux attach argv instead of exec'ing.
-
-        :param path: Absolute tmux binary path (unused).
-        :param argv: Full attach argv, recorded per-attach so the
-            test can assert which socket each bridge targeted.
-        :param env: Child env built in the parent (unused here; the
-            TERM pin is asserted by the spawns_tmux test above).
-        """
+    def record_spawn(_path: str, argv: list[str], _env: dict[str, str]) -> None:
+        """Capture the tmux attach argv instead of spawning."""
         attach_argvs.append(argv)
-        raise OSError("stop child path")
 
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
-    monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
-    )
+    _patch_attach_spawn(monkeypatch, record_spawn)
 
     # First attach: dead pane → recreate → bridge the fresh pane.
     with pytest.raises(RuntimeError, match="child exited"):
@@ -559,22 +524,11 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
 
     attach_argvs: list[list[str]] = []
 
-    def fake_fork() -> tuple[int, int]:
-        """Drive the child branch of ``pty.fork`` in-process."""
-        return 0, 0
-
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
-        """Capture the tmux attach argv instead of exec'ing."""
+    def record_spawn(_path: str, argv: list[str], _env: dict[str, str]) -> None:
+        """Capture the tmux attach argv instead of spawning."""
         attach_argvs.append(argv)
-        raise OSError("stop child path")
 
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
-    monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
-    )
+    _patch_attach_spawn(monkeypatch, record_spawn)
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(

@@ -8,6 +8,9 @@ import { KeyboardShortcutsDialog, openKeyboardShortcuts } from "./KeyboardShortc
 const isNativeShell = vi.fn(() => false);
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
+  // DialogContent (rendered here) reads isIOSShell to size modals for the iOS
+  // keyboard; this suite exercises the browser path, so it's always false.
+  isIOSShell: () => false,
 }));
 
 beforeEach(() => {
@@ -32,6 +35,7 @@ describe("KeyboardShortcutsDialog", () => {
 
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
     // General / In chats / Navigation / View / Slash commands — one each.
+    expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();

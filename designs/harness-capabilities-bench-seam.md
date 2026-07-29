@@ -73,9 +73,21 @@ Replaces `manifest._P0_ALL_SUPPORTED`:
 
 | Bench probe | Backing capability | Declared verdict rule |
 |---|---|---|
-| `interrupt` | `interrupt: bool` | `True` → `SUPPORTED`, else `PARTIAL`/`UNSUPPORTED` |
-| `streaming` | `streaming: bool` | `True` → `SUPPORTED` (deltas), else `PARTIAL` (complete-only) |
+| `interrupt` | `interrupt: bool` | `True` → `SUPPORTED`, `False` → `UNSUPPORTED` |
+| `streaming` | `streaming: bool` | `True` → `SUPPORTED` (deltas), `False` → `UNSUPPORTED` (see note) |
 | `model_override` | `SDK_MODEL_OVERRIDE_HARNESSES` (already in the registry via `model_env_keys()`) or `native` metadata | already derivable from #1756; no new field |
+
+> **Correction (implemented, supersedes the original `False → PARTIAL` idea).**
+> `streaming` is **binary**: `False → UNSUPPORTED`, not `PARTIAL`. `PARTIAL`
+> is a *probe observation only* — the streaming probe returns it for the
+> ambiguous coalesced-single-delta case against a `SUPPORTED` declaration — and
+> is **never a declared value**. Declaring a non-streaming harness `PARTIAL`
+> drifts against reality, because the probe reports zero deltas as
+> `UNSUPPORTED`. This was found live: kiro/cursor/qwen-native observe 0 deltas
+> and are declared `False → UNSUPPORTED` (no drift). The rule now: **declare
+> `streaming=False` only from a live observation of 0 deltas** — a static
+> "the forwarder posts no delta" grep is not sufficient (pi-native has no
+> delta-posting forwarder yet streams live).
 
 ### C. Probe-only — no capability backing; leave hand-declared
 These are behaviors with no single trait to key off. Keep them in the manifest

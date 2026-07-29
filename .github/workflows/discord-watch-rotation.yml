@@ -1,0 +1,32 @@
+name: Discord watch rotation
+
+# Wakes up only at the UTC times that are ~08:00 in an assignee's timezone.
+# Note: a single fixed UTC time can't track San Francisco's daylight saving,
+# so the SF ping lands at 08:00 in summer (PDT) and 07:00 in winter (PST).
+on:
+  schedule:
+    - cron: "0 0 * * *" # 08:00 Asia/Singapore (UTC+8, no daylight saving)
+    - cron: "0 15 * * *" # 08:00 SF in summer (PDT); 07:00 in winter (PST)
+  workflow_dispatch: {} # manual "Run workflow" button for testing
+
+# Only needs to check out the repo; nothing is written back.
+permissions:
+  contents: read
+
+# Avoid overlapping runs if one is slow.
+concurrency:
+  group: discord-watch-rotation
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12" # for zoneinfo in the stdlib
+      - name: Send rotation ping
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python .github/scripts/rotation.py

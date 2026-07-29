@@ -24,7 +24,7 @@ spawn: true
 # (`omnigent setup --no-internal-beta`) — an Anthropic API key, a Claude
 # subscription, an OpenAI-compatible gateway, or a Databricks workspace. With
 # no model named the claude-sdk harness resolves the configured provider's
-# default Claude model (the bundled catalog default is claude-opus-4-8).
+# default Claude model.
 executor:
   type: omnigent
   context_window: 1000000
@@ -121,6 +121,16 @@ prompt: |
       pass the diff + contract as text); the reviewer reports issues, never edits.
     - `explore` / `search` — read-only investigation that returns a findings report.
 
+  Goal mode is opt-in for long-running IMPLEMENT dispatches to `claude_code`
+  and `codex`. When a task has an explicit completion condition and benefits
+  from the worker continuing autonomously until it is satisfied, make
+  `args.input` one standalone `/goal <condition>` command. `/goal` must be the
+  first non-whitespace token; put the full `IMPLEMENT` task, worktree path,
+  acceptance contract, required green gates, and PR requirement inside the
+  condition. Do not use child goal mode for `review`, `explore`, or `search`,
+  or for `opencode`, `cursor`, `hermes`, or `pi`. Goal mode is expressed in
+  the input command — do not invent a `sys_session_send` goal parameter.
+
   Treat real investigation as delegated work. If the human asks you to
   investigate, inspect, explain, debug, audit, search, compare, summarize code
   behavior, or answer a repository-specific technical question in any depth,
@@ -177,6 +187,16 @@ prompt: |
   (editing docs / Markdown / text files, authoring a skill). Never use them to
   write or edit source code or tests, run a deep code investigation for your own
   answer, or merge a PR — those go to sub-agents.
+
+  Test-count ground truth must compare the same command, same file set, and same
+  commit the worker reported. For pytest, collected CASES are the count: use
+  `python -m pytest --collect-only -q <same files>` when reconciling a reported
+  total, and never use `grep -c 'def test_'` as a correctness oracle. A single
+  test function can expand into many collected cases via parametrized tests, and
+  a one-file function count cannot be compared to a multi-file gate. Do not record
+  `miscount`, `over-report`, or `fabrication` in `.polly/registry.json` or a
+  handoff unless you have re-collected the same gate at the same commit and the
+  numbers still disagree.
 
   For long-running processes that can't block a single tool call (a local dev
   server on localhost:PORT, file watchers, tailing logs) or ad-hoc shell where
@@ -273,12 +293,21 @@ os_env:
   sandbox:
     type: none
 
-# Generic shell terminal for long-running processes (dev servers, watchers, log
+# Generic shell terminals for long-running processes (dev servers, watchers, log
 # tails) and ad-hoc shell when sys_os_shell's blocking model doesn't fit. NOT
 # for launching coding agents / sub-agents — those go through sys_session_send.
+# bash and zsh are both offered; the "+ New shell" affordance picks between them.
 terminals:
   shell:
     command: bash
+    allow_cwd_override: true
+    os_env:
+      type: caller_process
+      cwd: .
+      sandbox:
+        type: none
+  zsh:
+    command: zsh
     allow_cwd_override: true
     os_env:
       type: caller_process

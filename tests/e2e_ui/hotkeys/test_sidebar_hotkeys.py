@@ -7,8 +7,9 @@ Covers the two hook changes end to end:
   so the browser path owns the Alt chord and matches ``e.code``).
 - ``useSidebarToggleHotkeys`` — ``Ctrl/Cmd+Alt+[`` toggles the left sidebar
   (exercising the handler, AltGraph guard included, on a real keydown). The
-  sidebar collapses to an icon rail rather than unmounting, so the assertion
-  is on the search input's rendered width, not its visibility.
+  sidebar collapses by animating its width to zero rather than unmounting, so
+  the assertion is on the sidebar ``aside``'s rendered width, not its
+  visibility.
 """
 
 from __future__ import annotations
@@ -21,9 +22,13 @@ from playwright.sync_api import Page, expect
 # pins are client-side state, so the test seeds them where the app reads them.
 _PINNED_KEY = "omnigent:pinned-conversation-ids"
 
-_SEARCH_WIDTH_JS = """
+# Width of the sidebar itself — it's what the collapse chord animates (→0),
+# and it's robust to the inner search control's markup. The old search input
+# shrank to zero with the rail; the Search button (a flex item) floors at its
+# content width, so probe the collapsing container instead.
+_SIDEBAR_WIDTH_JS = """
 () => {
-  const el = document.querySelector('input[placeholder="Search sessions"]');
+  const el = document.querySelector('aside[aria-label="Conversations"]');
   return el ? el.getBoundingClientRect().width : -1;
 }
 """
@@ -48,13 +53,13 @@ def test_numeric_chord_jumps_to_pinned_session(
 
 def test_bracket_chord_toggles_left_sidebar(page: Page, live_server: str) -> None:
     page.goto(live_server)
-    expect(page.get_by_placeholder("Search sessions")).to_be_visible(timeout=30_000)
-    expanded_width = page.evaluate(_SEARCH_WIDTH_JS)
+    expect(page.get_by_test_id("sidebar-search-button")).to_be_visible(timeout=30_000)
+    expanded_width = page.evaluate(_SIDEBAR_WIDTH_JS)
     assert expanded_width > 100, f"sidebar unexpectedly narrow at start ({expanded_width}px)"
 
-    # Collapse: the rail shrinks to icon width (input stays mounted).
+    # Collapse: the sidebar animates its width to zero.
     page.keyboard.press("Control+Alt+BracketLeft")
-    page.wait_for_function(f"() => ({_SEARCH_WIDTH_JS})() < 80", timeout=10_000)
+    page.wait_for_function(f"() => ({_SIDEBAR_WIDTH_JS})() < 80", timeout=10_000)
     # Expand again.
     page.keyboard.press("Control+Alt+BracketLeft")
-    page.wait_for_function(f"() => ({_SEARCH_WIDTH_JS})() > 100", timeout=10_000)
+    page.wait_for_function(f"() => ({_SIDEBAR_WIDTH_JS})() > 100", timeout=10_000)

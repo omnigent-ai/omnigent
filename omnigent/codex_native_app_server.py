@@ -12,12 +12,15 @@ import shlex
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import tomlkit
 import websockets
+
+from omnigent import model_catalog
 
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
@@ -36,7 +39,6 @@ from omnigent.inner.codex_executor import (
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
-    _create_subprocess_exec,
     _databricks_codex_auth_command,
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
@@ -44,7 +46,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
-from omnigent.inner.databricks_executor import _read_databrickscfg, _read_databrickscfg_host
+from omnigent.inner.databricks_executor import _databricks_gateway_host
 
 _logger = logging.getLogger(__name__)
 
@@ -54,7 +56,6 @@ CodexParams = dict[str, Any]
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _STDERR_CHUNK_LIMIT = 65536
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -87,84 +88,11 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # — we detect the old version up front and skip registration with a loud
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
-
-# Opt-in flag for the explicit ``--model`` launch flag. Off by default: the
-# per-session ``config.toml`` ``model =`` pin (``_pin_codex_config_model``)
-# already routes the override today, so the explicit flag is a parallel,
-# additive path the operator turns on per deployment. Truthy values mirror
-# the ``_TRUE_VALUES`` convention used across the codebase
-# (``omnigent/_startup_profile.py``, ``omnigent/cli.py``).
-_MODEL_FLAG_ENV_VAR = "OMNIGENT_CODEX_NATIVE_MODEL_FLAG"
-_MODEL_FLAG_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
-# Timeout for the one-shot ``codex --help`` capability probe. Matches the
-# ``codex --version`` probe budget -- a hung help invocation must never block
-# app-server startup.
-_CODEX_HELP_PROBE_TIMEOUT_SECONDS = 5.0
-
-
-def _model_flag_enabled(env: dict[str, str] | None = None) -> bool:
-    """
-    Return whether the explicit ``--model`` launch flag is opted in.
-
-    The flag is parallel to the always-on ``config.toml`` model pin, so it
-    defaults OFF: a deployment enables it by setting
-    :data:`_MODEL_FLAG_ENV_VAR` to a truthy value.
-
-    :param env: Environment mapping to inspect; defaults to ``os.environ``.
-    :returns: ``True`` when the override should also be passed as an
-        explicit ``--model`` launch flag.
-    """
-    source = os.environ if env is None else env
-    return source.get(_MODEL_FLAG_ENV_VAR, "").strip().lower() in _MODEL_FLAG_TRUE_VALUES
-
-
-async def _codex_supports_model_flag(codex_path: str) -> bool:
-    """
-    Detect whether the codex CLI accepts a global ``--model`` flag.
-
-    Runs ``codex --help`` and looks for the ``--model`` long option in the
-    top-level options. Codex exposes ``-m/--model`` as a global flag that
-    precedes the ``app-server`` subcommand; builds that predate it omit the
-    option from ``--help``, so the caller skips the flag (passing an unknown
-    flag would error) and relies on the always-on ``config.toml`` pin.
-
-    :param codex_path: Path to the codex CLI, e.g.
-        ``"/usr/local/bin/codex"``.
-    :returns: ``True`` when ``--model`` appears in ``codex --help`` output;
-        ``False`` when it does not, or the probe cannot be run / times out
-        (treated conservatively as "unsupported" so the flag is not passed).
-    """
-    try:
-        proc = await _create_subprocess_exec(
-            codex_path,
-            "--help",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-    except OSError:
-        return False
-    try:
-        stdout, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=_CODEX_HELP_PROBE_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        # A hung ``codex --help`` must not block startup: kill it and treat
-        # the flag as unsupported (the config.toml pin still carries the model).
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        return False
-    # Match ``--model`` only as an option *definition* line, not anywhere the
-    # word appears in help prose. Clap renders options as an indented line
-    # whose first token is the option, e.g. ``  -m, --model <MODEL>`` (or a
-    # long-only ``      --model <MODEL>``). Anchor to the start of such a line
-    # — optional indent, an optional short alias (``-m, ``), then ``--model``
-    # at an option boundary. This rejects lookalikes (``--model-provider``)
-    # and descriptions that merely mention ``--model`` mid-sentence, either of
-    # which would otherwise pass an unsupported flag to the launch.
-    help_text = stdout.decode("utf-8", errors="replace")
-    return re.search(r"^\s*(?:-\S+,\s+)?--model(?=[\s=<]|$)", help_text, re.MULTILINE) is not None
+# Minimum codex CLI version that accepts ``--dangerously-bypass-hook-trust``.
+# Added in openai/codex PR #21768, shipped in rust-v0.131.0 (2026-05-18).
+# Below this the flag is unknown and codex exits immediately with an error,
+# so we skip it and fall back to the old behaviour (trust prompt may appear).
+_MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 
 
 def _format_codex_version(version: tuple[int, int, int] | None) -> str:
@@ -244,7 +172,8 @@ def _codex_mcp_server_config_section(
     :param python_executable: Python executable for serve-mcp, e.g.
         ``"/path/to/.venv/bin/python"``. ``None`` uses
         :data:`sys.executable`.
-    :returns: TOML text for ``[mcp_servers.omnigent]``.
+    :returns: TOML text for ``[mcp_servers.omnigent]`` and its
+        framework-managed rename-tool approval.
     """
     python = python_executable or sys.executable
     args = [
@@ -256,7 +185,13 @@ def _codex_mcp_server_config_section(
         str(bridge_dir),
     ]
     args_toml = ", ".join(json.dumps(a) for a in args)
-    return f"[mcp_servers.omnigent]\ncommand = {json.dumps(python)}\nargs = [{args_toml}]\n"
+    return (
+        f"[mcp_servers.omnigent]\n"
+        f"command = {json.dumps(python)}\n"
+        f"args = [{args_toml}]\n\n"
+        "[mcp_servers.omnigent.tools.sys_session_rename]\n"
+        'approval_mode = "approve"\n'
+    )
 
 
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
@@ -299,6 +234,69 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     if not replaced:
         lines.insert(0, pin_line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _sync_codex_developer_instructions(
+    codex_home: Path,
+    instructions: str | None,
+) -> None:
+    """Synchronize framework instructions in the private Codex config.
+
+    Codex's top-level ``developer_instructions`` setting is additive to its
+    built-in operating instructions. The collaboration-mode field is not: a
+    non-null value replaces the mode's defaults. The private session config
+    therefore stores the user's original value in a sidecar, then derives the
+    active value from that base on every launch. Fresh sessions append the
+    framework directive; resumed sessions restore the unmodified base.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param instructions: Framework instructions for this launch, or ``None``.
+    :returns: None.
+    """
+    addition = instructions.strip() if instructions else ""
+    config_path = codex_home / "config.toml"
+    base_path = codex_home / ".omnigent-developer-instructions-base"
+    if config_path.is_symlink():
+        target = config_path.resolve()
+        config_path.unlink()
+        if target.is_file():
+            import shutil
+
+            shutil.copy2(target, config_path)
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    try:
+        document = tomlkit.parse(existing) if existing else tomlkit.document()
+    except Exception:  # noqa: BLE001 - title metadata must never block Codex startup.
+        _logger.warning(
+            "Could not synchronize native Codex framework instructions: invalid private config",
+            exc_info=True,
+        )
+        return
+    current = document.get("developer_instructions")
+    if current is not None and not isinstance(current, str):
+        _logger.warning(
+            "Could not synchronize native Codex framework instructions: "
+            "developer_instructions is not a string"
+        )
+        return
+    if base_path.exists():
+        base = base_path.read_text(encoding="utf-8")
+    else:
+        base = current.strip() if isinstance(current, str) else ""
+        # A previous Omnigent build may have appended the same framework
+        # directive without writing the sidecar. Recover the user-authored
+        # prefix instead of permanently capturing the combined value as base.
+        if addition and base == addition:
+            base = ""
+        elif addition and base.endswith(f"\n\n{addition}"):
+            base = base[: -len(addition)].rstrip()
+        base_path.write_text(base, encoding="utf-8")
+    active = f"{base}\n\n{addition}" if base and addition else base or addition
+    if active:
+        document["developer_instructions"] = active
+    elif "developer_instructions" in document:
+        del document["developer_instructions"]
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
 def _inject_mcp_server_config(
@@ -541,6 +539,8 @@ class CodexNativeAppServer:
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param env: Environment for the app-server subprocess.
     :param config_overrides: Codex ``-c`` config override values.
+    :param developer_instructions: Optional framework-owned instructions
+        appended to the private session config before app-server startup.
     :param cwd: Working directory for the app-server process.
     :param bridge_dir: Native Codex bridge directory, e.g.
         ``Path("~/.omnigent/codex-native/<hash>")``. The policy hook
@@ -581,6 +581,7 @@ class CodexNativeAppServer:
     config_overrides: list[str]
     cwd: Path
     bridge_dir: Path
+    developer_instructions: str | None = None
     ap_server_url: str | None = None
     ap_auth_headers: dict[str, str] | None = None
     python_executable: str | None = None
@@ -593,6 +594,7 @@ class CodexNativeAppServer:
     pinned_model: str | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
+    codex_cli_version: tuple[int, int, int] | None = None
 
     async def start(self) -> None:
         """
@@ -615,6 +617,10 @@ class CodexNativeAppServer:
         _inject_mcp_server_config(self.codex_home, self.bridge_dir, self.python_executable)
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
+        _sync_codex_developer_instructions(
+            self.codex_home,
+            self.developer_instructions,
+        )
         # Native policy enforcement needs codex's hook-trust protocol
         # (``currentHash`` / ``trustStatus`` in ``hooks/list``), added in
         # codex 0.129. Below that the hook can never be trusted, so
@@ -625,6 +631,7 @@ class CodexNativeAppServer:
         # never silently disables enforcement — a genuine trust failure is
         # then caught below.
         codex_version = await _codex_cli_version(self.codex_path)
+        self.codex_cli_version = codex_version
         if codex_version is not None and codex_version < _MIN_POLICY_HOOK_CODEX_VERSION:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
@@ -649,30 +656,6 @@ class CodexNativeAppServer:
                 )
         reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
-        proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
-        # Opt-in, additive to the config.toml ``model =`` pin above: when the
-        # operator enables the flag and a model is pinned, ALSO pass it
-        # explicitly. ``-m/--model`` is a codex *global* option, so it must
-        # precede the ``app-server`` subcommand. A codex build that lacks the
-        # flag simply doesn't get it (passing an unknown flag would error) --
-        # the config.toml pin remains the primary route, so the session still
-        # launches on the right model regardless.
-        # Read the opt-in from the omnigent server's OWN process environment
-        # (``os.environ``, the default), NOT ``self.env``: ``self.env`` is the
-        # cleaned codex spawn env from ``_clean_codex_env``, whose prefix
-        # allowlist strips ``OMNIGENT_*`` keys -- so the flag would never be
-        # visible there. The flag is an operator knob for omnigent, not
-        # something codex itself consumes.
-        model_global_args: list[str] = []
-        if (
-            self.pinned_model
-            and _model_flag_enabled()
-            and await _codex_supports_model_flag(self.codex_path)
-        ):
-            model_global_args = ["--model", self.pinned_model]
-        # argv[0] carries the inert crash-reap marker (the real binary is passed
-        # via ``executable=`` below); the model global option rides after it so
-        # codex still parses it ahead of the ``app-server`` subcommand.
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
             f"{Path(self.codex_path).name} "
@@ -680,22 +663,16 @@ class CodexNativeAppServer:
         )
         argv = [
             tagged_argv0,
-            *model_global_args,
             "app-server",
             "--listen",
             resolved_listen,
         ]
         for override in self.config_overrides:
             argv.extend(["-c", override])
+        proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
-            # Spawn through the module-level ``_create_subprocess_exec``
-            # indirection (a transparent passthrough to
-            # ``asyncio.create_subprocess_exec``) so tests can stub the spawn
-            # by patching that name — patching ``…app_server.asyncio.\
-            # create_subprocess_exec`` would walk into the real asyncio
-            # singleton and leak the mock across the process.
-            self.proc = await _create_subprocess_exec(
+            self.proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -976,11 +953,55 @@ def _codex_policy_hooks_settings(
     }
 
 
+def _merge_user_hooks(policy_payload: dict[str, Any], user_hooks_path: Path) -> dict[str, Any]:
+    """
+    Merge user-declared hooks into the policy hooks payload.
+
+    When a symlinked ``hooks.json`` exists in the private ``CODEX_HOME``
+    (the user's real ``~/.codex/hooks.json``), its hook entries are
+    appended after Omnigent's policy hooks for each shared event, and any
+    events declared only by the user are added wholesale. This preserves
+    all user hooks while keeping the Omnigent policy hooks in first
+    position so they always run before user hooks.
+
+    :param policy_payload: The ``hooks.json``-shaped dict built by
+        :func:`_codex_policy_hooks_settings`.
+    :param user_hooks_path: Path to the user's real ``hooks.json``; must
+        be readable.
+    :returns: Merged payload, or *policy_payload* unchanged on any read
+        or parse error (best-effort — policy enforcement must never fail
+        because the user's hooks file is malformed).
+    """
+    try:
+        user_data = json.loads(user_hooks_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return policy_payload
+    user_hooks: dict[str, Any] = user_data.get("hooks", {}) if isinstance(user_data, dict) else {}
+    if not user_hooks:
+        return policy_payload
+    merged: dict[str, Any] = dict(policy_payload)
+    merged["hooks"] = dict(policy_payload["hooks"])
+    for event, entries in user_hooks.items():
+        if not isinstance(entries, list):
+            continue
+        if event in merged["hooks"]:
+            merged["hooks"][event] = list(merged["hooks"][event]) + entries
+        else:
+            merged["hooks"][event] = entries
+    return merged
+
+
 def _write_codex_policy_hooks_file(
     codex_home: Path, bridge_dir: Path, python_executable: str | None
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
+
+    When ``_populate_codex_home_config`` has symlinked the user's
+    ``hooks.json`` into the private home, its entries are merged into the
+    policy hooks payload before the file is written so user hooks fire
+    alongside Omnigent's policy hooks. The symlink is replaced by a
+    regular merged file.
 
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param bridge_dir: Native Codex bridge directory for the hook command.
@@ -990,6 +1011,9 @@ def _write_codex_policy_hooks_file(
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = codex_home / _CODEX_HOOKS_FILE
     payload = _codex_policy_hooks_settings(bridge_dir, python_executable)
+    if path.is_symlink() and path.exists():
+        payload = _merge_user_hooks(payload, path.resolve())
+        path.unlink()
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_CODEX_HOOKS_FILE}.", dir=str(codex_home))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -1180,6 +1204,7 @@ def build_codex_native_server(
     python_executable: str | None = None,
     codex_path: str | None = None,
     extra_config_overrides: list[str] | None = None,
+    developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
 ) -> CodexNativeAppServer:
     """
@@ -1205,6 +1230,8 @@ def build_codex_native_server(
     :param extra_config_overrides: Additional ``-c`` config overrides
         appended after Databricks routing overrides, e.g. MCP server
         registration for the Omnigent tool relay.
+    :param developer_instructions: Optional framework-owned instructions
+        appended to Codex's private per-session config.
     :param bypass_sandbox: When ``True``, append config overrides that put
         the app-server's threads into the full-bypass stance
         (``approval_policy="never"`` + ``sandbox_mode="danger-full-access"``)
@@ -1220,12 +1247,18 @@ def build_codex_native_server(
     """
     resolved_codex = codex_path or _find_codex_cli()
     if not resolved_codex:
-        raise ImportError("Native Codex requires the 'codex' CLI on PATH.")
+        raise ImportError(
+            "Native Codex requires the 'codex' CLI on PATH. If codex is "
+            "installed on a PATH the host daemon didn't inherit (e.g. an "
+            "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
+        )
     env = _clean_codex_env()
     config_overrides: list[str] = []
     if profile is not None:
-        creds = _read_databrickscfg(profile)
-        host = creds.host if creds is not None else _read_databrickscfg_host(profile)
+        # Use the profile's own host so the gateway base URL matches the token
+        # the profile-pinned auth command mints; a DATABRICKS_HOST override in
+        # the runner env must not point the base URL at another workspace.
+        host = _databricks_gateway_host(profile)
         if not host:
             raise OSError(
                 f"Native Codex with Databricks profile {profile!r} (from your "
@@ -1235,7 +1268,8 @@ def build_codex_native_server(
         host = host.rstrip("/")
         config_overrides.extend(
             _databricks_codex_config_overrides(
-                model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,
+                model=model
+                or model_catalog.resolve_catalog_model("databricks", family="openai").model_id,
                 base_url=_databricks_codex_base_url(host),
                 auth_command=_databricks_codex_auth_command(host, profile),
             )
@@ -1262,6 +1296,7 @@ def build_codex_native_server(
         config_overrides=config_overrides,
         cwd=cwd,
         bridge_dir=bridge_dir,
+        developer_instructions=developer_instructions,
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         python_executable=python_executable,
@@ -1283,11 +1318,16 @@ class NativeCodexLaunch:
     :param profile: Databricks profile for the ucode path, or ``None`` (a
         generic provider routes via *config_overrides*; CLI login uses
         neither).
+    :param summary: Human-readable one-line description of the routing
+        outcome (provider / profile / model, or the login-fallback state),
+        set at resolution time and surfaced in the startup-timeout error so
+        hosted users can diagnose without runner-log access (see #2745).
     """
 
     config_overrides: list[str]
     model: str | None
     profile: str | None
+    summary: str = ""
 
 
 def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
@@ -1366,7 +1406,12 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     )
 
     if entry.kind == DATABRICKS_KIND:
-        return NativeCodexLaunch(config_overrides=[], model=model, profile=entry.profile)
+        return NativeCodexLaunch(
+            config_overrides=[],
+            model=model,
+            profile=entry.profile,
+            summary=f"Databricks ucode profile {entry.profile!r}",
+        )
     if entry.kind == CLI_CONFIG_KIND:
         # Pin the config.toml-defined provider by name; its table (and
         # credential) ride along via the bridged config.toml. json.dumps
@@ -1375,6 +1420,9 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
             config_overrides=[f"model_provider={json.dumps(entry.model_provider)}"],
             model=model,
             profile=None,
+            summary=(
+                f"provider {entry.name!r} via cli-config (model_provider={entry.model_provider!r})"
+            ),
         )
     if entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         return None
@@ -1401,7 +1449,12 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
         auth_command=auth_command,
         wire_api=family.wire_api or "responses",
     )
-    return NativeCodexLaunch(config_overrides=overrides, model=pinned, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=overrides,
+        model=pinned,
+        profile=None,
+        summary=f"provider {entry.name!r} (model={pinned})",
+    )
 
 
 def _first_routable_codex_provider(
@@ -1497,7 +1550,10 @@ def _resolve_subscription_launch(
             entry.name,
         )
         return NativeCodexLaunch(
-            config_overrides=subscription_overrides, model=model, profile=None
+            config_overrides=subscription_overrides,
+            model=model,
+            profile=None,
+            summary=f"Codex CLI login (subscription provider {entry.name!r}; Codex is logged in)",
         )
     fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
     if fallback is not None:
@@ -1507,7 +1563,16 @@ def _resolve_subscription_launch(
         "Codex login and no alternative provider is configured)",
         entry.name,
     )
-    return NativeCodexLaunch(config_overrides=subscription_overrides, model=model, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=subscription_overrides,
+        model=model,
+        profile=None,
+        summary=(
+            f"Codex CLI login (subscription provider {entry.name!r} has no usable Codex "
+            "login and no alternative provider is configured) — the TUI likely renders "
+            "the sign-in screen and never starts a thread"
+        ),
+    )
 
 
 def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
@@ -1566,9 +1631,19 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         # (parity with _resolve_provider_for_build).
         global_auth = _load_global_auth()
         if isinstance(global_auth, DatabricksAuth):
-            return NativeCodexLaunch(config_overrides=[], model=model, profile=global_auth.profile)
+            return NativeCodexLaunch(
+                config_overrides=[],
+                model=model,
+                profile=global_auth.profile,
+                summary=f"Databricks ucode profile {global_auth.profile!r} (global auth block)",
+            )
         if global_auth is not None:
-            return NativeCodexLaunch(config_overrides=[], model=model, profile=None)
+            return NativeCodexLaunch(
+                config_overrides=[],
+                model=model,
+                profile=None,
+                summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
+            )
         entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
     if entry is None:
@@ -1577,7 +1652,17 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
             "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
             "through a provider."
         )
-        return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
+        return NativeCodexLaunch(
+            config_overrides=no_provider_overrides,
+            model=model,
+            profile=None,
+            summary=(
+                "Codex CLI login (no provider configured for the codex harness, no "
+                "Databricks profile) — the TUI likely renders the ChatGPT sign-in "
+                "screen and never starts a thread; run `omnigent setup` to route through "
+                "a provider"
+            ),
+        )
     if entry.kind == SUBSCRIPTION_KIND:
         return _resolve_subscription_launch(entry, model, explicit)
 
@@ -1595,7 +1680,16 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         "credential — falling back to Codex's own login.",
         entry.name,
     )
-    return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=no_provider_overrides,
+        model=model,
+        profile=None,
+        summary=(
+            f"Codex CLI login (provider {entry.name!r} is the codex default but has no "
+            "usable openai credential) — the TUI likely renders the sign-in screen "
+            "and never starts a thread"
+        ),
+    )
 
 
 def client_for_transport(
@@ -1629,7 +1723,98 @@ def client_for_transport(
     return CodexAppServerClient(Path(transport), client_name=client_name)
 
 
-async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> None:
+def normalize_codex_permission_launch_args(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Complete legacy Full Access args with their approval policy."""
+    args = list(terminal_launch_args or ())
+    full_access = False
+    has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        assignment: str | None = None
+        if arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
+            has_approval_policy = True
+        elif arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            assignment = args[index]
+        elif arg.startswith(("--config=", "-c=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, _, raw_value = assignment.partition("=")
+            if key.strip() == "approval_policy":
+                has_approval_policy = True
+            elif key.strip() == "default_permissions":
+                full_access = _codex_config_string(raw_value) == ":danger-full-access"
+        index += 1
+    if full_access and not has_approval_policy:
+        args.extend(["-c", 'approval_policy="never"'])
+    return args
+
+
+def _codex_config_string(raw_value: str) -> str:
+    try:
+        value = tomlkit.parse(f"value = {raw_value}")["value"]
+    except Exception:  # noqa: BLE001 - Codex accepts some unquoted CLI config values.
+        value = raw_value.strip().strip('"').strip("'")
+    return value if isinstance(value, str) else ""
+
+
+def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
+    """Convert persisted Codex permission args into thread-resume overrides."""
+    params: CodexParams = {}
+    args = normalize_codex_permission_launch_args(terminal_launch_args)
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        value: str | None = None
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            params.update(approvalPolicy="never", sandbox="danger-full-access")
+        elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
+            if index + 1 < len(args):
+                value = args[index + 1]
+                index += 1
+            if value is not None:
+                field = "approvalPolicy" if arg in {"--ask-for-approval", "-a"} else "sandbox"
+                params[field] = value
+        elif arg.startswith(("--ask-for-approval=", "-a=")):
+            params["approvalPolicy"] = arg.split("=", 1)[1]
+        elif arg.startswith(("--sandbox=", "-s=")):
+            params["sandbox"] = arg.split("=", 1)[1]
+        elif arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            key, _, value = args[index].partition("=")
+            _set_codex_resume_config_param(params, key, value)
+        elif arg.startswith(("--config=", "-c=")):
+            key, _, value = arg.split("=", 1)[1].partition("=")
+            _set_codex_resume_config_param(params, key, value)
+        index += 1
+    if "permissions" in params:
+        params.pop("sandbox", None)
+    return params
+
+
+def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> None:
+    field = {
+        "approval_policy": "approvalPolicy",
+        "approvals_reviewer": "approvalsReviewer",
+        "default_permissions": "permissions",
+        "sandbox_mode": "sandbox",
+    }.get(key.strip())
+    if field is None:
+        return
+    value = _codex_config_string(raw_value)
+    if value:
+        params[field] = value
+
+
+async def preload_codex_thread_for_resume(
+    transport: str,
+    thread_id: str,
+    *,
+    terminal_launch_args: Sequence[str] | None = None,
+) -> None:
     """
     Load an existing Codex thread into a freshly started app-server.
 
@@ -1643,6 +1828,7 @@ async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> Non
         or ``"/tmp/app-server.sock"``.
     :param thread_id: Codex thread id to load, e.g.
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
+    :param terminal_launch_args: Persisted permission overrides for the resumed thread.
     :returns: None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -1654,7 +1840,11 @@ async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> Non
     try:
         await client.request(
             "thread/resume",
-            {"threadId": thread_id, "excludeTurns": True},
+            {
+                "threadId": thread_id,
+                "excludeTurns": True,
+                **_codex_resume_permission_params(terminal_launch_args),
+            },
         )
     finally:
         await client.close()
@@ -1686,6 +1876,7 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # flag because it MUST go, the sandbox flag for hygiene so the launched arg
 # list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+_CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
 # Granular approval/sandbox flags to drop when bypass is on. The "Full
 # access" / "Read only" approval presets emit the long ``--flag value`` form
 # (see web CODEX_NATIVE_APPROVAL_MODES), but ``terminal_launch_args`` is
@@ -1762,6 +1953,7 @@ def build_codex_remote_args(
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
     bypass_sandbox: bool = False,
+    bypass_hook_trust: bool = False,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -1811,6 +2003,14 @@ def build_codex_remote_args(
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
         the granular flags untouched. See issue #657.
+    :param bypass_hook_trust: When ``True``, emit
+        ``--dangerously-bypass-hook-trust`` so the TUI runs all enabled
+        hooks without the interactive "Hooks need review" trust prompt.
+        Intended for runner-owned headless sessions where the private
+        ``CODEX_HOME`` is provisioned by Omnigent and there is no terminal
+        user to answer the prompt. Default ``False`` for interactive
+        ``omnigent codex`` sessions where the user faces the terminal and
+        can accept hooks normally.
     :returns: Codex argv tail after the executable.
     """
     override_args: list[str] = []
@@ -1821,7 +2021,9 @@ def build_codex_remote_args(
         # bypass flag (a global flag, so it precedes any ``resume``).
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
-        passthrough = list(codex_args)
+        passthrough = normalize_codex_permission_launch_args(codex_args)
+    if bypass_hook_trust:
+        passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]

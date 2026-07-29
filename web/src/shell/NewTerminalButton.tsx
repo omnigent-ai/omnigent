@@ -10,10 +10,17 @@
 // never sees the button, and a user-created terminal is always one
 // the agent can list/read/close.
 //
-// One declared name creates directly on click; multiple names open a
-// dropdown to pick which declared terminal to launch.
+// Behavior by declared-terminal shape:
+//   - One declared name → creates it directly on click.
+//   - Native-wrapper session with several names → these are the host's
+//     installed shells (zsh/bash/fish), declared with `$SHELL` first
+//     (see `native_shell_terminal_spec`). Renders a SPLIT button:
+//     clicking the primary opens the default (`declared[0]`, the user's
+//     `$SHELL`), and a caret opens a picker of all installed shells.
+//   - SDK agent with several names → distinct-purpose terminals with no
+//     "default", so a plain dropdown to pick which one to launch.
 
-import { PlusIcon } from "lucide-react";
+import { ChevronDownIcon, PlusIcon } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,6 +30,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { terminalTabKey, useCreateTerminal } from "@/hooks/useTerminals";
+import { useTerminalFirst } from "./TerminalFirstContext";
 
 interface NewTerminalButtonProps {
   conversationId: string;
@@ -50,6 +58,11 @@ export function NewTerminalButton({
 }: NewTerminalButtonProps) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
+  // Native-wrapper sessions declare the host's installed shells as their
+  // terminals (default `$SHELL` first); SDK agents declare distinct-purpose
+  // terminals with no default. Only the native case gets the split-button
+  // shell picker — see the file header.
+  const isNativeWrapper = useTerminalFirst()?.isNativeWrapper ?? false;
   const declared = agent?.terminals ?? [];
   // The iff gate, UI side: no declared terminals → no affordance.
   if (declared.length === 0) return null;
@@ -60,9 +73,18 @@ export function NewTerminalButton({
     });
   };
 
+  const isShellPicker = isNativeWrapper && declared.length > 1;
+
   // Single declared name: create directly on click. Multiple: the
-  // DropdownMenuTrigger wrapper below owns the click instead.
-  const onTriggerClick = declared.length === 1 ? () => launch(declared[0]) : undefined;
+  // DropdownMenuTrigger wrapper below owns the click instead — except the
+  // native shell-picker split button, whose primary segment launches the
+  // default shell directly (`declared[0]`) and whose caret owns the dropdown.
+  const onTriggerClick =
+    declared.length === 1
+      ? () => launch(declared[0])
+      : isShellPicker
+        ? () => launch(declared[0])
+        : undefined;
   const trigger =
     variant === "row" ? (
       <button
@@ -107,16 +129,55 @@ export function NewTerminalButton({
 
   if (declared.length === 1) return withTooltip(trigger);
 
+  // Dropdown listing every declared terminal. In the shell-picker case the
+  // first entry is the `$SHELL` default, so it is labeled as such.
+  const menu = (
+    <DropdownMenuContent align={variant === "row" ? "start" : "end"}>
+      {declared.map((name, i) => (
+        <DropdownMenuItem key={name} onSelect={() => launch(name)}>
+          {isShellPicker && i === 0 ? `${name} (default)` : name}
+        </DropdownMenuItem>
+      ))}
+    </DropdownMenuContent>
+  );
+
+  // SDK agent with multiple distinct-purpose terminals: the whole control is
+  // the dropdown trigger (no privileged default to click).
+  if (!isShellPicker) {
+    return (
+      <DropdownMenu>
+        {withTooltip(<DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>)}
+        {menu}
+      </DropdownMenu>
+    );
+  }
+
+  // Native shell picker: split button. `trigger` (primary) launches the
+  // default shell; the adjacent caret opens the installed-shell picker.
+  const caret = (
+    <DropdownMenuTrigger asChild>
+      <button
+        type="button"
+        aria-label="Choose shell"
+        disabled={create.isPending}
+        className={
+          variant === "row"
+            ? "flex shrink-0 items-center px-2 py-1.5 text-muted-foreground hover:bg-accent/60 hover:text-foreground disabled:cursor-default disabled:opacity-50"
+            : "cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50"
+        }
+      >
+        <ChevronDownIcon className="size-3.5" />
+      </button>
+    </DropdownMenuTrigger>
+  );
+
   return (
     <DropdownMenu>
-      {withTooltip(<DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>)}
-      <DropdownMenuContent align={variant === "row" ? "start" : "end"}>
-        {declared.map((name) => (
-          <DropdownMenuItem key={name} onSelect={() => launch(name)}>
-            {name}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
+      <div className={variant === "row" ? "flex w-full items-center" : "flex items-center"}>
+        {withTooltip(trigger)}
+        {caret}
+      </div>
+      {menu}
     </DropdownMenu>
   );
 }

@@ -22,6 +22,8 @@ prompt: |
     contract.
   - Make the change, then drive it to green: run the relevant tests, lint, and
     typecheck for the code you touched.
+  - When you report test results, include the exact command and file set. If
+    you mention counts, distinguish collected test cases from test functions.
   - Co-sign every commit you author: end each commit message with a blank line
     followed by this exact trailer as its final line —
     `Co-authored-by: omnigent <noreply@omnigent.ai>`

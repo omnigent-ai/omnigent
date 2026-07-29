@@ -24,6 +24,7 @@ Covers:
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,11 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from tests.runtime.policies.conftest import make_fixed_function_policy_spec
+
+
+def _sub_agent_title() -> str:
+    """Return a unique sub-agent title (production sub-agents always have one)."""
+    return f"test-agent:{uuid.uuid4().hex[:8]}"
 
 
 def _write_spec(
@@ -535,15 +541,15 @@ def test_build_sums_subagent_usage_into_parent_engine(
     """
     parent = conversation_store.create_conversation()
     child_a = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     child_b = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     # Grandchild under child_a — proves the walk is transitive, not
     # just direct children.
     grandchild = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=child_a.id
+        kind="sub_agent", parent_conversation_id=child_a.id, title=_sub_agent_title()
     )
     conversation_store.set_session_usage(
         parent.id,
@@ -597,7 +603,7 @@ def test_policy_seed_uses_policy_cost_while_display_uses_total_cost(
 
     parent = conversation_store.create_conversation()
     child = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     # Parent has both costs: S=0.10 frozen for display, enforcement=0.30
     # (a sub-agent is mid-run, so the real-time estimate leads S).
@@ -650,13 +656,13 @@ def test_build_subagent_gates_against_whole_session_not_own_subtree(
     """
     parent = conversation_store.create_conversation()
     child_a = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     child_b = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     grandchild = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=child_a.id
+        kind="sub_agent", parent_conversation_id=child_a.id, title=_sub_agent_title()
     )
     conversation_store.set_session_usage(
         parent.id,
@@ -735,8 +741,12 @@ def test_build_subagent_with_empty_usage_does_not_inflate_parent(
     """
     parent = conversation_store.create_conversation()
     # Two children with no usage recorded at all (empty session_usage).
-    conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
-    conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
     conversation_store.set_session_usage(
         parent.id,
         {"input_tokens": 800, "output_tokens": 150, "total_tokens": 950, "total_cost_usd": 0.58},
@@ -772,7 +782,7 @@ def test_load_session_usage_merges_by_model_across_subtree(
 
     parent = conversation_store.create_conversation()
     child = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     # Parent ran model-a. Child ran a slice of model-a plus a different model-b.
     conversation_store.set_session_usage(
@@ -837,10 +847,10 @@ def test_build_subagent_with_cost_budget_gets_session_wide_usage(
     """
     parent = conversation_store.create_conversation()
     child = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     sibling = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
 
     conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
@@ -870,7 +880,7 @@ def test_build_injects_subtree_usage_only_when_policy_present(
 
     parent = conversation_store.create_conversation()
     child = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
@@ -920,13 +930,13 @@ def test_build_subagent_subtree_usage_excludes_parent_and_siblings(
 
     parent = conversation_store.create_conversation()
     child = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     sibling = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
     )
     grandchild = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=child.id
+        kind="sub_agent", parent_conversation_id=child.id, title=_sub_agent_title()
     )
 
     conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})

@@ -18,6 +18,7 @@ from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
     create_worktree,
+    list_worktrees,
     remove_worktree,
     validate_branch_name,
 )
@@ -313,6 +314,60 @@ def test_remove_worktree_missing_path_fails(git_repo: Path) -> None:
             delete_branch=False,
         )
     assert "does not exist" in exc.value.message
+
+
+def test_list_worktrees_returns_main_first(git_repo: Path) -> None:
+    """With no linked worktrees, only the main tree is listed."""
+    result = list_worktrees(repo_path=str(git_repo))
+    assert len(result) == 1
+    main = result[0]
+    assert main.path == str(git_repo)
+    assert main.branch == "main"
+    assert main.is_main is True
+    assert main.detached is False
+
+
+def test_list_worktrees_includes_linked(git_repo: Path) -> None:
+    """A created worktree shows up with its branch and is not flagged main."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/login")
+    result = list_worktrees(repo_path=str(git_repo))
+    # Main first, then the linked worktree.
+    assert result[0].is_main is True
+    linked = next(w for w in result if not w.is_main)
+    assert linked.path == created.worktree_path
+    assert linked.branch == "feature/login"
+    assert linked.detached is False
+
+
+def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:
+    """Listing from inside a linked worktree resolves the main repo's full list."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
+    # Query from the linked worktree — should still see BOTH worktrees.
+    result = list_worktrees(repo_path=created.worktree_path)
+    paths = {w.path for w in result}
+    assert str(git_repo) in paths
+    assert created.worktree_path in paths
+
+
+def test_list_worktrees_reports_detached_head(git_repo: Path) -> None:
+    """A detached-HEAD worktree lists with ``branch=None`` and ``detached=True``."""
+    head = _rev_parse(git_repo)
+    wt = git_repo.parent / "myrepo-worktrees" / "detached"
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    # Add a worktree checked out at a bare commit → detached HEAD.
+    _git(git_repo, "worktree", "add", "--detach", str(wt), head)
+    result = list_worktrees(repo_path=str(git_repo))
+    detached = next(w for w in result if w.path == str(wt))
+    assert detached.branch is None
+    assert detached.detached is True
+
+
+def test_list_worktrees_non_git_path_fails(tmp_path: Path) -> None:
+    """A non-git directory fails loud (the route maps this to 'no worktrees')."""
+    plain = (tmp_path / "plain").resolve()
+    plain.mkdir()
+    with pytest.raises(WorktreeError):
+        list_worktrees(repo_path=str(plain))
 
 
 @pytest.mark.parametrize(

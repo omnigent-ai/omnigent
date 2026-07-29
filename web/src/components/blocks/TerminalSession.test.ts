@@ -45,6 +45,31 @@ describe("openTerminalLink", () => {
     );
   });
 
+  it("routes same-origin session links in-place without opening a new tab", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const pushSpy = vi.spyOn(window.history, "pushState");
+    const event = new MouseEvent("click");
+    const preventSpy = vi.spyOn(event, "preventDefault");
+
+    openTerminalLink(event, `${window.location.origin}/c/conv_next`);
+
+    expect(preventSpy).toHaveBeenCalledOnce();
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(pushSpy).toHaveBeenCalledWith(null, "", "/c/conv_next");
+  });
+
+  it("does not reopen the current same-origin session link", () => {
+    window.history.replaceState(null, "", "/c/conv_current");
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const pushSpy = vi.spyOn(window.history, "pushState");
+    const event = new MouseEvent("click");
+
+    openTerminalLink(event, `${window.location.origin}/c/conv_current`);
+
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(pushSpy).not.toHaveBeenCalled();
+  });
+
   it("prevents the addon's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");
@@ -396,6 +421,35 @@ describe("TerminalSession", () => {
     const { socket, session } = makeSession();
     const before = socket;
     session.setTheme(true);
+    expect(socket).toBe(before);
+    expect(socket.closed).toBe(false);
+    session.dispose();
+  });
+
+  it("setFont re-fonts + refits in place, tolerating a down socket, no reconnect", () => {
+    // WHY: a code-font change (Settings → Appearance) must re-font the LIVE
+    // terminal — mutating options in place like setTheme, never tearing down the
+    // WebSocket (xterm is a fixed-pixel widget that can't follow a CSS variable).
+    const { socket, session } = makeSession();
+    const { term } = session as unknown as { term: Terminal };
+
+    // Socket-down (pre-open): setFont still applies the size and must not throw
+    // or send — sendResize no-ops until the WS opens, and the reconnect re-fits.
+    session.setFont(16, "");
+    expect(term.options.fontSize).toBe(16);
+    expect(socket.sent).toHaveLength(0);
+
+    // Once open, setFont refits the grid (sendResize) so the new glyph cell size
+    // reflows cols×rows, and applies a custom family with the mono fallback
+    // appended (an uninstalled name degrades to mono, not a serif).
+    socket.open();
+    const before = socket;
+    const sendResize = vi.spyOn(session as unknown as { sendResize: () => void }, "sendResize");
+    session.setFont(18, "Fira Code");
+    expect(sendResize).toHaveBeenCalledTimes(1);
+    expect(term.options.fontSize).toBe(18);
+    expect(term.options.fontFamily).toContain("Fira Code");
+    // Same socket instance, still open — a re-font never reconnects.
     expect(socket).toBe(before);
     expect(socket.closed).toBe(false);
     session.dispose();

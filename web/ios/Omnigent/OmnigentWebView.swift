@@ -123,6 +123,7 @@ struct OmnigentWebView: UIViewRepresentable {
         document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
       }
       const callbacks = new Set();
+      const openPathCallbacks = new Set();
       const viewModeCallbacks = new Set();
       const defineEmit = (name, fn) => {
         Object.defineProperty(window, name, {
@@ -135,6 +136,12 @@ struct OmnigentWebView: UIViewRepresentable {
       defineEmit("__omnigentNativeEmitNotificationActivated", (path) => {
         if (typeof path !== "string" || !path.startsWith("/")) return;
         for (const callback of callbacks) {
+          try { callback(path); } catch {}
+        }
+      });
+      defineEmit("__omnigentNativeEmitOpenPath", (path) => {
+        if (typeof path !== "string" || !path.startsWith("/")) return;
+        for (const callback of openPathCallbacks) {
           try { callback(path); } catch {}
         }
       });
@@ -177,6 +184,13 @@ struct OmnigentWebView: UIViewRepresentable {
       });
       window.omnigentNative = Object.freeze({
         kind: "ios",
+        setColorScheme(scheme) {
+          if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "setColorScheme",
+            scheme,
+          });
+        },
         setBadgeCount(count) {
           window.webkit.messageHandlers.omnigentNative.postMessage({
             method: "setBadgeCount",
@@ -199,6 +213,11 @@ struct OmnigentWebView: UIViewRepresentable {
           if (typeof callback !== "function") return () => {};
           callbacks.add(callback);
           return () => callbacks.delete(callback);
+        },
+        onOpenPath(callback) {
+          if (typeof callback !== "function") return () => {};
+          openPathCallbacks.add(callback);
+          return () => openPathCallbacks.delete(callback);
         },
         onSidebarDrag(callback) {
           if (typeof callback !== "function") return () => {};
@@ -323,6 +342,11 @@ struct OmnigentWebView: UIViewRepresentable {
       else { return }
 
       switch method {
+      case "setColorScheme":
+        guard let scheme = body["scheme"] as? String,
+          let source = ThemeSource(rawValue: scheme)
+        else { return }
+        ThemeController.shared.apply(source)
       case "setBadgeCount":
         let count = (body["count"] as? NSNumber)?.intValue ?? 0
         NativeNotificationManager.shared.setBadgeCount(count)
@@ -441,7 +465,7 @@ struct OmnigentWebView: UIViewRepresentable {
       type: WKMediaCaptureType,
       decisionHandler: @escaping (WKPermissionDecision) -> Void
     ) {
-      guard type == .microphone,
+      guard Self.isAllowedMediaCaptureType(type),
         origin.omnigentOrigin == pinnedOrigin,
         webView.url?.omnigentOrigin == pinnedOrigin
       else {
@@ -449,6 +473,15 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
       decisionHandler(.grant)
+    }
+
+    private static func isAllowedMediaCaptureType(_ type: WKMediaCaptureType) -> Bool {
+      switch type {
+      case .camera, .microphone, .cameraAndMicrophone:
+        return true
+      @unknown default:
+        return false
+      }
     }
 
     private func isTrustedBridgeMessage(_ message: WKScriptMessage) -> Bool {
@@ -579,5 +612,57 @@ extension UIViewController {
       return selected.omnigentTopViewController
     }
     return self
+  }
+}
+
+/// The user-selected theme source. Mirrors the value space the web app sends
+/// through the bridge via `setColorScheme`.
+enum ThemeSource: String, Equatable, CaseIterable {
+  case system
+  case light
+  case dark
+
+  /// UIKit interface style override used for windows and WKWebView.
+  var userInterfaceStyle: UIUserInterfaceStyle {
+    switch self {
+    case .system:
+      return .unspecified
+    case .light:
+      return .light
+    case .dark:
+      return .dark
+    }
+  }
+
+  /// SwiftUI's equivalent for `.preferredColorScheme`. `nil` means "follow the system".
+  var colorScheme: ColorScheme? {
+    switch self {
+    case .system:
+      return nil
+    case .light:
+      return .light
+    case .dark:
+      return .dark
+    }
+  }
+}
+
+/// App-wide theme override. The web layer drives this through the bridge so
+/// native chrome and the WebView track the in-app theme switcher.
+@MainActor
+final class ThemeController: ObservableObject {
+  static let shared = ThemeController()
+
+  @Published private(set) var source: ThemeSource = .system
+
+  private init() {}
+
+  func apply(_ source: ThemeSource) {
+    self.source = source
+    for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+      for window in scene.windows {
+        window.overrideUserInterfaceStyle = source.userInterfaceStyle
+      }
+    }
   }
 }

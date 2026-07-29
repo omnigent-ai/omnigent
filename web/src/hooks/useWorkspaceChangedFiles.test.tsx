@@ -6,12 +6,13 @@ import type { ReactNode } from "react";
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
 }));
 vi.mock("@/store/chatStore", () => ({
   useChatStore: vi.fn(),
 }));
 
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
   MAX_RUNNER_OFFLINE_RETRIES,
@@ -30,6 +31,7 @@ import {
 } from "./useWorkspaceChangedFiles";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
+const hostOnlineMock = vi.mocked(useSessionHostOnline);
 const chatStoreMock = vi.mocked(useChatStore);
 const fetchMock = vi.fn();
 
@@ -164,8 +166,9 @@ afterEach(() => {
 });
 
 describe("useWorkspaceChangedFiles gating", () => {
-  it("does not fetch when the runner is offline", async () => {
+  it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
     fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [] }));
 
     render(
@@ -176,6 +179,46 @@ describe("useWorkspaceChangedFiles gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches when the runner is offline but the host can serve the workspace", async () => {
+    // Runner-offline no longer disables the panel: the server reads the
+    // workspace over the host tunnel, so the query must still fire.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(changedFilesResponse());
+
+    render(
+      <Wrap>
+        <ChangedFilesProbe id="conv_asleep" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/v1/sessions/conv_asleep/resources/environments/default/changes",
+    );
+  });
+
+  it("fetches when the runner is offline but host liveness is still unknown", async () => {
+    // Transient window (e.g. a stream push flipped the runner before host
+    // liveness resolved): host `undefined` stays "unknown → serve" so the
+    // query fires rather than blanking the panel; if the host is really
+    // down it just 503s and shows the reconnect hint.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(undefined);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(changedFilesResponse());
+
+    render(
+      <Wrap>
+        <ChangedFilesProbe id="conv_unknown_host" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   });
 
   it("fetches when the runner is online", async () => {
@@ -285,8 +328,9 @@ describe("useWorkspaceChangedFiles gating", () => {
 });
 
 describe("useWorkspaceAllFiles gating", () => {
-  it("does not fetch when the runner is offline", async () => {
+  it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
 
     render(
       <Wrap>
@@ -440,8 +484,9 @@ describe("useWorkspaceEnvironment gating", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not fetch when the runner is offline", async () => {
+  it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
 
     render(
       <Wrap>
@@ -455,10 +500,11 @@ describe("useWorkspaceEnvironment gating", () => {
 });
 
 describe("useWorkspaceDirectory gating", () => {
-  it("does not fetch when the runner is offline (on-demand expand)", async () => {
-    // Lazy expand path — not poll spam, but still 503s on a dead
-    // runner. Gated for consistency with the other workspace hooks.
+  it("does not fetch when the runner is offline and the host is also down (on-demand expand)", async () => {
+    // Lazy expand path — not poll spam, but still unserveable when both
+    // the runner and host are down. Gated like the other workspace hooks.
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
 
     render(
       <Wrap>

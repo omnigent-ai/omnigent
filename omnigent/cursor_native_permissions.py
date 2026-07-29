@@ -23,7 +23,14 @@ pane scraping — which silently missed any prompt whose wording fell outside a
 regex. The pane is still used only to *deliver* the keystroke verdict. This does
 NOT modify cursor's JS bundle and does NOT suppress cursor's native gate; the
 TUI prompt remains the source of truth and the benign fallback if store
-detection ever fails. See ``docs/cursor-native-elicitation.md`` (and the
+detection ever fails. Sessions launched with ``--yolo`` / ``--force`` / ``-f``
+auto-accept lingering tool gates in-pane (no web card) because cursor's Run
+Everything mode still sometimes leaves a pending marker long enough to stall a
+piloted parent. That accept is deliberately fail-closed: it only fires while
+the pane is live and actually showing cursor's accept hint, it is capped at a
+few attempts, and anything it does not clear falls back to the ordinary web
+card rather than typing ``y`` into the composer forever. See
+``docs/cursor-native-elicitation.md`` (and the
 superseded ``docs/cursor-native-tui-mirror-plan.md`` for the original pane-scrape
 design and why the transcript channel replaced it).
 """
@@ -31,15 +38,17 @@ design and why the transcript channel replaced it).
 from __future__ import annotations
 
 import asyncio
+import enum
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
-from omnigent.cursor_native_bridge import send_cursor_pane_keys
+from omnigent.cursor_native_bridge import capture_cursor_pane, send_cursor_pane_keys
 
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
@@ -115,7 +124,7 @@ async def _park_cursor_elicitation(
     return result if isinstance(result, dict) else None
 
 
-async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> None:
+async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bool:
     """Send tmux keys to the cursor pane ONE AT A TIME, with settle pauses.
 
     A multi-key sequence (the ``AskQuestion`` picker: ``Down``/``Space``/
@@ -125,9 +134,13 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> No
     own call, pause between them, and pause a little longer before ``Enter``.
     A single-key approval (``y`` / ``Escape``) just sends once. Delivery failure
     is logged and aborts the rest of the sequence.
+
+    :returns: Whether every key was handed to tmux. Callers that retry (the
+        yolo auto-accept) must not record an undelivered keystroke as an
+        attempt that landed.
     """
     if not keys:
-        return
+        return True
     for key in keys:
         if key == "Enter":
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
@@ -137,9 +150,10 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> No
             _logger.exception(
                 "failed to send cursor keystroke %r (of %r); session=%s", key, keys, session_id
             )
-            return
+            return False
         await asyncio.sleep(_KEY_INTERVAL_S)
     _logger.debug("cursor keystrokes sent: %r; session=%s", keys, session_id)
+    return True
 
 
 async def _run_one_approval(
@@ -309,6 +323,61 @@ _QUESTION_TOOL_NAMES = frozenset({"askquestion"})
 # Kept short so a genuinely-gated prompt that resolves quickly (e.g. an
 # Auto-review retry) still surfaces a card rather than being suppressed.
 _ELICITATION_SETTLE_S = 0.5
+
+# When a session launched with ``--yolo`` / ``--force`` / ``-f``, cursor still
+# sometimes leaves a pending marker long enough for Omnigent to mirror a card.
+# Auto-accept sends ``y`` into the pane instead of parking a web elicitation.
+# Retry if the call stays pending (keystroke dropped by a TUI re-render), but
+# only a few times: a gate still pending after that is not one ``y`` answers
+# (a stale marker with no prompt on screen, or a prompt needing a different
+# key), so fall back to the ordinary card instead of typing into the composer
+# for the life of the session.
+_YOLO_ACCEPT_RETRY_S = 2.0
+_YOLO_ACCEPT_MAX_ATTEMPTS = 3
+
+# Cursor's approval block advertises its accept key as a parenthesised hint on
+# the chosen option line, e.g. ``→ Run (once) (y)``. Auto-accept requires that
+# hint to be on screen before it sends anything, so a stale pending marker with
+# no prompt rendered never types a literal ``y`` into cursor's composer. A
+# wording change therefore degrades to the visible card, not to a stray
+# keystroke.
+_ACCEPT_KEY_HINT_RE = re.compile(
+    rf"\(\s*{re.escape(_TRANSCRIPT_ACCEPT_KEY)}\s*(?:/[^)\n]*)?\)", re.IGNORECASE
+)
+
+_YOLO_FLAGS = frozenset({"--yolo", "--force", "-f"})
+# Values that turn an explicit ``--yolo=<value>`` back off. Anything else in the
+# value slot counts as on, so an unrecognised truthy spelling does not silently
+# disable the gate the caller asked for.
+_YOLO_FALSEY_VALUES = frozenset({"false", "0", "no", "off"})
+
+
+def cursor_launch_args_enable_yolo(args: list[str] | None) -> bool:
+    """Return whether *args* request cursor-agent's full tool-approval bypass.
+
+    Matches the CLI flags cursor documents as Run Everything: ``--yolo``,
+    ``--force``, and the short ``-f`` form. Used by the runner to decide whether
+    the transcript elicitation supervisor should auto-accept lingering gates
+    instead of mirroring ApprovalCards to a parent that cannot click them.
+
+    This is a safety predicate, so it fails closed: an explicit ``--yolo=false``
+    is off, and a bare ``--`` ends cursor-agent's flags, so a ``-f`` in the
+    prompt text that follows is text, not a request to bypass approvals.
+    """
+    for arg in args or []:
+        if arg == "--":
+            return False
+        if arg in _YOLO_FLAGS:
+            return True
+        name, sep, value = arg.partition("=")
+        if sep and name in _YOLO_FLAGS and value.strip().lower() not in _YOLO_FALSEY_VALUES:
+            return True
+    return False
+
+
+def _pane_shows_accept_prompt(pane: str) -> bool:
+    """Return whether *pane* is showing a prompt that ``y`` can answer."""
+    return bool(_ACCEPT_KEY_HINT_RE.search(pane))
 
 
 @dataclass(frozen=True)
@@ -621,6 +690,106 @@ def _askquestion_keystrokes(args: dict[str, object], content: dict) -> list[str]
     return keys
 
 
+class _YoloAccept(enum.Enum):
+    """What one auto-accept pass over a pending call decided to do."""
+
+    SENT = "sent"
+    """The accept key was delivered to a pane that was showing the prompt."""
+
+    SKIP = "skip"
+    """Nothing to do this pass — pacing, no prompt rendered yet, or another
+    call was already answered (cursor shows one prompt at a time)."""
+
+    SURFACE_CARD = "surface_card"
+    """Auto-accept is not clearing this gate; fall back to the web card."""
+
+
+async def _yolo_auto_accept(
+    call: CursorPendingToolCall,
+    *,
+    bridge_dir: Path,
+    session_id: str,
+    now: float,
+    attempts_by_call: dict[str, tuple[float, int]],
+    allow_send: bool,
+) -> _YoloAccept:
+    """Try to answer one gated call in-pane, or hand it back to the card path.
+
+    Fail-closed on every uncertainty: the accept key goes out only while the
+    pane is live *and* rendering cursor's accept hint, at most
+    :data:`_YOLO_ACCEPT_MAX_ATTEMPTS` times. A gate that survives that budget —
+    a stale marker with no prompt on screen, a prompt ``y`` cannot answer, or a
+    pane that has gone away — returns :attr:`_YoloAccept.SURFACE_CARD` so it
+    ends up visible in the parent instead of drawing a keystroke every couple of
+    seconds for the life of the session.
+
+    :param attempts_by_call: tool_call_id → (loop-time of last attempt, count).
+        Mutated in place; in-memory only, so a runner restart re-tries a call
+        that is still pending.
+    :param allow_send: False once another call has been answered this pass.
+    """
+    last_attempt_at, attempts = attempts_by_call.get(call.tool_call_id, (None, 0))
+    if attempts >= _YOLO_ACCEPT_MAX_ATTEMPTS:
+        _logger.warning(
+            "cursor elicitation: yolo auto-accept did not clear %s after %d attempts; "
+            "surfacing a card; session=%s tool_call_id=%s",
+            call.tool_name,
+            attempts,
+            session_id,
+            call.tool_call_id.splitlines()[0],
+        )
+        return _YoloAccept.SURFACE_CARD
+    if last_attempt_at is not None and (now - last_attempt_at) < _YOLO_ACCEPT_RETRY_S:
+        return _YoloAccept.SKIP
+    if not allow_send:
+        return _YoloAccept.SKIP
+    pane = await asyncio.to_thread(capture_cursor_pane, bridge_dir)
+    if pane is None:
+        # No advertised tmux target, or the pane exited: a keystroke cannot
+        # land, and recording it as delivered would spin here forever.
+        _logger.warning(
+            "cursor elicitation: no live cursor pane to auto-accept %s; surfacing a card; "
+            "session=%s tool_call_id=%s",
+            call.tool_name,
+            session_id,
+            call.tool_call_id.splitlines()[0],
+        )
+        attempts_by_call[call.tool_call_id] = (now, _YOLO_ACCEPT_MAX_ATTEMPTS)
+        return _YoloAccept.SURFACE_CARD
+    if not _pane_shows_accept_prompt(pane):
+        # The store says pending but nothing on screen takes the accept key —
+        # a prompt still painting, or a stale marker. Sending now would type a
+        # literal ``y`` into cursor's composer.
+        attempts_by_call[call.tool_call_id] = (now, attempts + 1)
+        _logger.debug(
+            "cursor elicitation: no accept prompt on screen for %s (attempt %d/%d); "
+            "session=%s tool_call_id=%s",
+            call.tool_name,
+            attempts + 1,
+            _YOLO_ACCEPT_MAX_ATTEMPTS,
+            session_id,
+            call.tool_call_id.splitlines()[0],
+        )
+        return _YoloAccept.SKIP
+    # A call nobody ever sees needs its arguments in the record, or an operator
+    # has no way to tell an auto-approved ``ls`` from an auto-approved ``rm``.
+    _logger.info(
+        "cursor elicitation: auto-accepting %s under yolo (attempt %d/%d); "
+        "session=%s tool_call_id=%s preview=%s",
+        call.tool_name,
+        attempts + 1,
+        _YOLO_ACCEPT_MAX_ATTEMPTS,
+        session_id,
+        call.tool_call_id.splitlines()[0],
+        _preview_for_args(call.args),
+    )
+    if not await _send_cursor_keys(bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY):
+        attempts_by_call[call.tool_call_id] = (now, _YOLO_ACCEPT_MAX_ATTEMPTS)
+        return _YoloAccept.SURFACE_CARD
+    attempts_by_call[call.tool_call_id] = (now, attempts + 1)
+    return _YoloAccept.SENT
+
+
 async def supervise_cursor_transcript_elicitations(
     *,
     base_url: str,
@@ -632,6 +801,7 @@ async def supervise_cursor_transcript_elicitations(
     auth: httpx.Auth | None = None,
     poll_interval_s: float = _POLL_INTERVAL_S,
     settle_s: float = _ELICITATION_SETTLE_S,
+    auto_accept_approvals: bool = False,
 ) -> None:
     """Mirror cursor's gated tool calls to web elicitations via the chat store.
 
@@ -648,6 +818,15 @@ async def supervise_cursor_transcript_elicitations(
     the TUI, or executed after approval) it releases the card via
     ``external_elicitation_resolved``.
 
+    When ``auto_accept_approvals`` is set (sessions launched with ``--yolo`` /
+    ``--force`` / ``-f``), tool-approval gates are accepted in-pane without a
+    web card. Cursor's Run Everything mode still sometimes leaves a pending
+    marker long enough to otherwise stall a piloted parent on mirrored
+    ApprovalCards. ``AskQuestion`` still surfaces — that is intentional human
+    input, not a tool gate. The accept is bounded and fail-closed (see
+    :func:`_yolo_auto_accept`): a gate it does not clear falls back to the same
+    card the non-yolo path would have shown.
+
     Store discovery reuses the forwarder's logic, so this binds to the same chat
     the forwarder mirrors. Detection is keyed by ``toolCallId`` (stable across
     polls and restarts), capturing every gated tool kind without a
@@ -662,12 +841,16 @@ async def supervise_cursor_transcript_elicitations(
     :param auth: Optional httpx auth for the runner's requests.
     :param poll_interval_s: Store poll cadence in seconds.
     :param settle_s: How long a call must stay pending before it is surfaced.
+    :param auto_accept_approvals: When True, accept tool gates in-pane instead
+        of mirroring ApprovalCards (yolo / force launch stance).
     """
     # tool_call_id → {"elicitation_id": str, "task": asyncio.Task} for SURFACED
     # (parked) calls; tool_call_id → loop-time first seen pending, for calls
     # still inside the settle window (not yet surfaced).
     active: dict[str, dict[str, object]] = {}
     first_seen: dict[str, float] = {}
+    # tool_call_id → (loop-time of last auto-accept attempt, attempts) — yolo only.
+    auto_accept_attempts: dict[str, tuple[float, int]] = {}
     store_path: Path | None = None
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
@@ -707,6 +890,13 @@ async def supervise_cursor_transcript_elicitations(
                         session_id,
                         tool_call_id.splitlines()[0],
                     )
+                for tool_call_id in [
+                    tcid for tcid in auto_accept_attempts if tcid not in seen_ids
+                ]:
+                    auto_accept_attempts.pop(tool_call_id, None)
+                # Cursor renders one approval prompt at a time, so at most one
+                # accept key goes out per pass however many calls are pending.
+                auto_accepted_this_pass = False
                 # Surface calls that have now stayed pending past the settle window.
                 for call in pending_calls:
                     if call.tool_call_id in active:
@@ -724,6 +914,21 @@ async def supervise_cursor_transcript_elicitations(
                         )
                     if now - first < settle_s:
                         continue
+                    # Yolo / force: try to accept tool gates in-pane rather than
+                    # mirroring a card a piloted parent cannot click. AskQuestion
+                    # still parks — that is deliberate human input.
+                    if auto_accept_approvals and not _is_question_call(call):
+                        outcome = await _yolo_auto_accept(
+                            call,
+                            bridge_dir=bridge_dir,
+                            session_id=session_id,
+                            now=now,
+                            attempts_by_call=auto_accept_attempts,
+                            allow_send=not auto_accepted_this_pass,
+                        )
+                        if outcome is not _YoloAccept.SURFACE_CARD:
+                            auto_accepted_this_pass |= outcome is _YoloAccept.SENT
+                            continue
                     elicitation_id = cursor_tool_call_elicitation_id(session_id, call.tool_call_id)
                     _logger.debug(
                         "cursor elicitation: surfacing %s; session=%s tool_call_id=%s",

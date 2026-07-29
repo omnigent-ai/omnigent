@@ -306,7 +306,7 @@ def test_get_conversation_missing_returns_none(
     """get_conversation on a non-existent ID returns None,
     not a zero-value Conversation. Must not attempt the
     label fetch for a missing parent (no SELECT error)."""
-    got = conversation_store.get_conversation("conv_does_not_exist")
+    got = conversation_store.get_conversation("1d0b12236c77f69f5073a53583de1a3f")
     assert got is None
 
 

@@ -17,23 +17,5 @@
     <!-- Voice dictation (mic level meter / Web Speech). -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
-    <!-- WebAuthn Touch ID platform authenticator: the keychain access group
-         that stores the Secure Enclave passkeys (app.configureWebAuthn).
-
-         keychain-access-groups is a RESTRICTED entitlement — three pieces
-         must stay in lockstep or AMFI SIGKILLs the app at launch ("Launchd
-         job spawn failed", POSIX error 163):
-           1. this entitlement,
-           2. WEBAUTHN_KEYCHAIN_ACCESS_GROUP in src/main.js (same string),
-           3. the embedded Developer ID provisioning profile
-              (signing/omnigent.provisionprofile, wired via
-              `provisioningProfile` in package.json's `build.mac`), whose
-              allowlist `8RMX4WU6F8.*` authorizes the group. The signing
-              identity must be the same team (package.json pins
-              "Databricks, Inc. (8RMX4WU6F8)"). -->
-    <key>keychain-access-groups</key>
-    <array>
-      <string>8RMX4WU6F8.ai.omnigent.desktop</string>
-    </array>
   </dict>
 </plist>

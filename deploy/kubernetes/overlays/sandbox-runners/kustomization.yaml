@@ -17,13 +17,14 @@ resources:
 # omnigent-creds) is NOT checked in — create it out of band like the base
 # OIDC secret (see README.md "Apply"). Prefer sealed-secrets/external-secrets.
 
-# The base server image lacks the `kubernetes` extra, so a managed launch would
-# fail to import the client. Build the server WITH it
-# (`--build-arg OMNIGENT_EXTRAS=kubernetes`, see deploy/docker) and set it here.
+# Use the server image variant that includes the kubernetes client extra
+# (built by CI with OMNIGENT_EXTRAS=kubernetes). The base image omits it, so a
+# managed launch there fails to import the client. Self-builds must keep
+# `kubernetes` in OMNIGENT_EXTRAS (see deploy/docker); point newName at such a
+# build here if you use one.
 images:
   - name: ghcr.io/omnigent-ai/omnigent-server
-    newName: ghcr.io/REPLACE_ME/omnigent-server
-    newTag: kubernetes
+    newName: ghcr.io/omnigent-ai/omnigent-server-kubernetes
 
 patches:
   - path: deployment-patch.yaml

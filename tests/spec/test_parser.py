@@ -12,6 +12,12 @@ from omnigent.spec.parser import discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
+@pytest.fixture(autouse=True)
+def _clean_container_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure OMNIGENT_CONTAINER_RUNTIME never leaks from the host environment."""
+    monkeypatch.delenv("OMNIGENT_CONTAINER_RUNTIME", raising=False)
+
+
 @pytest.fixture()
 def agent_dir(tmp_path: Path) -> Path:
     """Create a minimal valid agent image directory."""
@@ -268,6 +274,84 @@ def test_parse_expand_env_false_keeps_var_references(
     spec = parse(tmp_path, expand_env=False)
     assert spec.llm is not None
     assert spec.llm.connection == {"api_key": "${MY_API_KEY}"}
+
+
+def test_parse_builtin_tool_config_expands_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``${VAR}`` references in builtin tool config values are expanded."""
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-redacted-test-key")
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "search_provider": "perplexity",
+                    "api_key": "${PERPLEXITY_API_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    builtin = spec.tools.builtins[0]
+    assert builtin.name == "web_search"
+    assert builtin.config == {
+        "search_provider": "perplexity",
+        "api_key": "pplx-redacted-test-key",
+    }
+
+
+def test_parse_builtin_tool_config_expand_env_false_keeps_literals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``expand_env=False`` keeps builtin tool ``${VAR}`` config literal."""
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "search_provider": "perplexity",
+                    "api_key": "${PERPLEXITY_API_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path, expand_env=False)
+
+    assert spec.tools.builtins[0].config == {
+        "search_provider": "perplexity",
+        "api_key": "${PERPLEXITY_API_KEY}",
+    }
+
+
+def test_parse_builtin_tool_config_unresolved_var_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unresolved ``${VAR}`` in builtin tool config raises clearly."""
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {"name": "web_search", "api_key": "${PERPLEXITY_API_KEY}"},
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
+        parse(tmp_path)
 
 
 def test_parse_instructions_multiline_inline(tmp_path: Path) -> None:
@@ -1223,6 +1307,67 @@ def test_parse_tools_sandbox_container_image_precedence(tmp_path: Path) -> None:
     assert spec.tools.sandbox.docker_image == "python:3.12-slim"
 
 
+def test_parse_tools_sandbox_runtime_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_CONTAINER_RUNTIME env var is used when YAML omits container_runtime."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    config = {
+        "spec_version": 1,
+        "name": "env-var-runtime",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_runtime == "podman"
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+
+
+def test_parse_tools_sandbox_yaml_beats_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit YAML container_runtime takes precedence over the env var."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    config = {
+        "spec_version": 1,
+        "name": "yaml-beats-env",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "container_runtime": "docker",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_runtime == "docker"
+
+
+def test_parse_tools_sandbox_null_runtime_rejected(tmp_path: Path) -> None:
+    """``container_runtime: null`` in YAML is rejected, not silently ignored."""
+    config = {
+        "spec_version": 1,
+        "name": "null-runtime",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "container_runtime": None,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(ValueError, match="container_runtime"):
+        parse(tmp_path)
+
+
 def test_parse_inline_mcp_skips_non_mcp_type_entries(tmp_path: Path) -> None:
     """
     Tools-block entries whose ``type`` is not ``"mcp"`` are silently
@@ -2143,6 +2288,90 @@ def test_parse_executor_defaults(tmp_path: Path) -> None:
     assert spec.executor.type == "omnigent"
 
 
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [
+        (
+            {"llm": {"model": "openai/gpt-4o", "request_timeout": True}},
+            r"llm\.request_timeout must be an integer",
+        ),
+        (
+            {"tools": {"timeout": False}},
+            r"tools\.timeout must be an integer",
+        ),
+        (
+            {"llm": {"model": "openai/gpt-4o", "retry": {"max_retries": True}}},
+            r"retry\.max_retries must be an integer",
+        ),
+        (
+            {"llm": {"model": "openai/gpt-4o", "retry": {"backoff_base_s": False}}},
+            r"retry\.backoff_base_s must be a number",
+        ),
+        (
+            {
+                "llm": {
+                    "model": "openai/gpt-4o",
+                    "retry": {"retryable_status_codes": [429, True]},
+                }
+            },
+            r"retry\.retryable_status_codes must be an integer",
+        ),
+        (
+            {"executor": {"timeout": True}},
+            r"executor\.timeout must be an integer",
+        ),
+        (
+            {"executor": {"max_iterations": False}},
+            r"executor\.max_iterations must be an integer",
+        ),
+        (
+            {"executor": {"context_window": True}},
+            r"executor\.context_window must be an integer",
+        ),
+        (
+            {"compaction": {"recent_window": False}},
+            r"compaction\.recent_window must be an integer",
+        ),
+        (
+            {"compaction": {"trigger_threshold": True}},
+            r"compaction\.trigger_threshold must be a number",
+        ),
+        (
+            {"guardrails": {"ask_timeout": True}},
+            r"guardrails\.ask_timeout must be an integer",
+        ),
+    ],
+)
+def test_parse_rejects_boolean_values_for_numeric_config_fields(
+    tmp_path: Path,
+    config: dict[str, object],
+    match: str,
+) -> None:
+    """Boolean YAML values must not be accepted as numeric config."""
+    config = {"spec_version": 1, **config}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_rejects_boolean_terminal_scrollback(tmp_path: Path) -> None:
+    """Terminal scrollback is a line count, not a boolean flag."""
+    config = {
+        "spec_version": 1,
+        "terminals": {
+            "main": {
+                "command": "bash",
+                "scrollback": False,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=r"terminals\.main\.scrollback must be an integer"):
+        parse(tmp_path)
+
+
 def test_parse_executor_config_field(tmp_path: Path) -> None:
     """Executor block with a ``config`` sub-block parses string values.
 
@@ -2218,6 +2447,22 @@ def test_parse_mcp_server_with_timeout_and_retry(
     # Retry max_retries should match the YAML value.
     # Failure means MCP retry fields are not forwarded correctly.
     assert mcp.retry.max_retries == 7
+
+
+def test_parse_rejects_boolean_mcp_timeout(agent_dir: Path) -> None:
+    """MCP timeout is a duration in seconds, not a boolean flag."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "slow-service",
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "timeout": True,
+    }
+    (mcp_dir / "slow.yaml").write_text(yaml.dump(mcp_config))
+
+    with pytest.raises(OmnigentError, match=r"MCP server 'slow-service'\.timeout"):
+        parse(agent_dir)
 
 
 def test_parse_mcp_stdio_minimal(agent_dir: Path) -> None:
@@ -3204,13 +3449,105 @@ def test_parse_credential_proxy_https_env_optional(tmp_path: Path) -> None:
     assert entry.inject_env == []
 
 
+def test_parse_credential_proxy_databricks_cli(tmp_path: Path) -> None:
+    """A ``databricks_cli`` entry parses into a profile-keyed policy.
+
+    Unlike the host-keyed types it lands on ``credential_proxy.databricks``
+    (not ``entries``), preserving the profile list and default. If this
+    broke, the runtime would never materialize the ``.databrickscfg`` or
+    resolve the profiles.
+    """
+    config = _credential_proxy_config(
+        [
+            {
+                "type": "databricks_cli",
+                "profiles": ["dbc-adb7b1a3-9097", "oss"],
+                "default": "dbc-adb7b1a3-9097",
+            }
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    proxy = spec.os_env.sandbox.credential_proxy
+    assert proxy is not None
+    assert proxy.entries == []
+    assert proxy.databricks is not None
+    assert [b.profile for b in proxy.databricks.profiles] == ["dbc-adb7b1a3-9097", "oss"]
+    assert proxy.databricks.default == "dbc-adb7b1a3-9097"
+
+
+@pytest.mark.parametrize(
+    "entry,match",
+    [
+        # ``default`` must name one of the listed profiles.
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "default": "b"},
+            r"'default' 'b' must be one of 'profiles'",
+        ),
+        # Empty ``profiles`` list.
+        ({"type": "databricks_cli", "profiles": []}, r"non-empty 'profiles' list"),
+        # A host-keyed field doesn't apply.
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "target": "h.example.com"},
+            r"databricks_cli does not accept 'target'",
+        ),
+        # ``source`` doesn't apply (resolved from the profile).
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "source": {"env": "X"}},
+            r"databricks_cli does not accept 'source'",
+        ),
+        # Duplicate profile within one entry.
+        (
+            {"type": "databricks_cli", "profiles": ["a", "a"]},
+            r"more than once",
+        ),
+    ],
+)
+def test_parse_credential_proxy_databricks_cli_fail_loud(
+    tmp_path: Path, entry: dict[str, object], match: str
+) -> None:
+    """Malformed ``databricks_cli`` entries fail loudly at parse time."""
+    config = _credential_proxy_config([entry])
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_databricks_cli_rejected_on_macos(tmp_path: Path) -> None:
+    """``databricks_cli`` is rejected on macOS (``darwin_seatbelt``).
+
+    The ``databricks`` CLI is a Go binary and Go on macOS ignores
+    ``SSL_CERT_FILE`` (the var the egress MITM proxy uses to publish its
+    CA), so every call would fail with an opaque TLS error. Fail loud at
+    parse time instead.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-dbx-macos",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "darwin_seatbelt",
+                "egress_rules": ["* corp.example.com/**"],
+                "credential_proxy": [{"type": "databricks_cli", "profiles": ["a"]}],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"databricks_cli' does not work\s+on macOS"):
+        parse(tmp_path)
+
+
 @pytest.mark.parametrize(
     "entries,match",
     [
         # Unknown ``type`` — caught by the pydantic ``Literal``.
         ([{"type": "bogus", "source": {"env": "X"}}], r"type: Input should be"),
-        # Missing ``source`` — pydantic ``Field required``.
-        ([{"type": "https_bearer", "target": "h.example.com"}], r"source: Field required"),
+        # Missing ``source`` — required for the host-keyed types (the
+        # field is optional at the pydantic layer because ``databricks_cli``
+        # forbids it, so the requirement is enforced in the model validator).
+        ([{"type": "https_bearer", "target": "h.example.com"}], r"source is required"),
         # ``source`` as a bare string (the old surface) is now rejected —
         # it must be a nested ``{env|file|command: ...}`` mapping.
         (
@@ -3409,3 +3746,30 @@ def test_parse_credential_proxy_https_primitive_allowed_on_macos(tmp_path: Path)
     proxy = spec.os_env.sandbox.credential_proxy
     assert proxy is not None
     assert proxy.entries[0].scheme == "bearer"
+
+
+def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
+    """``_ConfigYamlLoader`` must not corrupt ``yaml.SafeLoader`` process-wide.
+
+    The loader narrows the YAML 1.1 bool resolver to YAML-1.2 spellings, but it
+    must do so on its OWN copy of ``yaml_implicit_resolvers``. If it mutated the
+    dict it inherits from ``SafeLoader`` by reference, every plain
+    ``yaml.safe_load`` caller in the process would lose bool parsing — e.g.
+    ``safe_load("false")`` would return the string ``"false"``.
+    """
+    import omnigent.spec.parser as parser
+
+    # Importing the module must leave SafeLoader's bool resolver intact.
+    assert yaml.safe_load("false") is False
+    assert yaml.safe_load("true") is True
+    # SafeLoader keeps its own YAML 1.1 behavior (``on`` -> True) untouched.
+    assert yaml.safe_load("on") is True
+
+    # Sharpest guard: the subclass must own a distinct resolver dict. This
+    # fails the instant someone drops the copy, regardless of import order.
+    loader = parser._ConfigYamlLoader
+    assert loader.yaml_implicit_resolvers is not yaml.SafeLoader.yaml_implicit_resolvers
+
+    # The subclass still narrows bools: ``on`` is a plain string, ``false`` a bool.
+    assert yaml.load("on", loader) == "on"
+    assert yaml.load("false", loader) is False

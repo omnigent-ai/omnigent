@@ -97,8 +97,8 @@ def accounts_server(tmp_path: Path) -> Iterator[tuple[str, str]]:
     Accounts mode is selected by ``OMNIGENT_AUTH_PROVIDER=accounts`` plus a
     shared cookie secret; the subprocess handles the full runtime lifecycle
     (migrations, DBOS, auth provider, permission store) exactly as a deployed
-    server does. ``_maybe_prompt_first_admin`` no-ops without a TTY, so the
-    boot is non-interactive.
+    server does. The server boots without prompting; first-admin setup is
+    via the web form or ``--admin-password``.
 
     Deliberately independent of the session-scoped ``live_server`` fixture
     (which spawns a server + runner pair for the harness matrix): this test

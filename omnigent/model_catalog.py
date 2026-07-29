@@ -20,7 +20,11 @@ Enumeration is deterministic per provider kind:
   ``GET <base_url>/v1/models`` with a bearer token (source
   ``"openai-compatible"``).
 - ``subscription`` → a curated static list (source ``"static"``,
-  ``verified: false`` — CLI logins expose no listing API).
+  ``verified: false`` — CLI logins expose no listing API). The cursor
+  harnesses always resolve here: cursor-agent brings its own login.
+- ``cli-config`` → the codex curated static list (source ``"static"``,
+  ``verified: false`` — the credential lives in the CLI's own config
+  file and is resolved by the CLI at launch).
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -33,16 +37,24 @@ import logging
 import os
 import subprocess
 import threading
-from dataclasses import dataclass, replace
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.model_metadata import ModelCapability, ModelCostTier, ModelIntent, ModelMetadata
 from omnigent.model_override import model_family_mismatch
+from omnigent.model_resolver import (
+    ModelResolution,
+    ModelResolutionError,
+    ModelResolutionRequest,
+    resolve_model,
+)
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     KEY_KIND,
     OPENAI_FAMILY,
@@ -50,6 +62,9 @@ from omnigent.onboarding.provider_config import (
     ProviderEntry,
 )
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+if TYPE_CHECKING:
+    from omnigent.onboarding.providers import ModelInfo
 
 _logger = logging.getLogger(__name__)
 
@@ -76,7 +91,14 @@ _LLM_TASK_TOKENS = ("chat", "completion")
 # Subscription CLIs expose no listing API: curated ids matching the bundled
 # catalog pin (claude) and the codex ids the codebase already references.
 _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
-    "claude": ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
+    "claude": (
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ),
     "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
 }
 
@@ -115,6 +137,12 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "native-antigravity": "antigravity",
 }
 
+# cursor-agent always routes through its own stored login — there is no
+# omnigent-side provider config for it to resolve (or fail), so resolution
+# short-circuits to a subscription-style readout instead of reporting the
+# harness as having "no model-provider resolution".
+_CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "native-cursor"})
+
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
@@ -136,13 +164,18 @@ class ModelEntry:
         ``"databricks-claude-sonnet-4-6"`` or ``"gpt-5.4-mini"``.
     :param family: Vendor family token — ``"claude"``, ``"openai"``, or
         ``"other"``.
-    :param context_window: Context window in tokens when the provider
-        reports one (e.g. OpenRouter ``context_length``), else ``None``.
+    :param metadata: Provider-neutral capabilities and limits. Metadata fields
+        remain unknown when the listing API reports only a model id.
     """
 
     id: str
     family: str
-    context_window: int | None = None
+    metadata: ModelMetadata = field(default_factory=ModelMetadata)
+
+    @property
+    def context_window(self) -> int | None:
+        """Return the normalized context window for compatibility callers."""
+        return self.metadata.context_window
 
 
 @dataclass(frozen=True)
@@ -170,8 +203,9 @@ class ResolvedModelProvider:
     """The model provider a worker's spawn/launch path would route through.
 
     :param kind: Provider kind — ``"key"`` / ``"gateway"`` / ``"local"``
-        / ``"subscription"`` / ``"databricks"`` from the provider config
-        layer, or ``"none"`` when no usable provider resolved.
+        / ``"subscription"`` / ``"databricks"`` / ``"cli-config"`` from
+        the provider config layer, or ``"none"`` when no usable provider
+        resolved.
     :param family: ``"anthropic"`` / ``"openai"`` for inline-family
         kinds, else ``None``.
     :param profile: Databricks profile for ``kind="databricks"``, e.g.
@@ -182,7 +216,8 @@ class ResolvedModelProvider:
         Never serialized into tool output.
     :param auth_command: Shell command printing a bearer token, for
         providers configured with a dynamic credential.
-    :param cli: ``"claude"`` / ``"codex"`` for ``kind="subscription"``.
+    :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
+        ``kind="subscription"``; ``"codex"`` for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
     """
@@ -276,6 +311,142 @@ def model_family_token(model_id: str) -> str:
     return "other"
 
 
+def catalog_model_entries(provider_name: str) -> tuple[ModelEntry, ...]:
+    """Load provider chat models as normalized resolver candidates.
+
+    The upstream MLflow catalog is fetched and cached by
+    :func:`omnigent.onboarding.providers.get_chat_models`. This adapter keeps
+    provider discovery separate from selection while preserving catalog order
+    as the resolver's deterministic tie-breaker.
+
+    :param provider_name: MLflow catalog provider, e.g. ``"openai"`` or
+        ``"databricks"``.
+    :returns: Normalized model entries, newest/preferred catalog entries first.
+    """
+    from omnigent.onboarding.providers import get_chat_models
+
+    models = get_chat_models(provider_name)
+    cost_tiers = _catalog_cost_tiers(models)
+    entries: list[ModelEntry] = []
+    for index, model in enumerate(models):
+        supported: set[ModelCapability] = set()
+        unsupported: set[ModelCapability] = set()
+        for capability, value in (
+            (ModelCapability.TOOL_USE, model.supports_function_calling),
+            (ModelCapability.REASONING, model.supports_reasoning),
+            (ModelCapability.VISION, model.supports_vision),
+            (ModelCapability.STRUCTURED_OUTPUT, model.supports_structured_output),
+        ):
+            if value is True:
+                supported.add(capability)
+            elif value is False:
+                unsupported.add(capability)
+        entries.append(
+            ModelEntry(
+                id=model.name,
+                family=model_family_token(model.name),
+                metadata=ModelMetadata(
+                    supported_capabilities=frozenset(supported),
+                    unsupported_capabilities=frozenset(unsupported),
+                    context_window=model.max_input_tokens,
+                    cost_tier=cost_tiers.get(index),
+                ),
+            )
+        )
+    return tuple(entries)
+
+
+def resolve_catalog_model(
+    provider_name: str,
+    *,
+    intent: ModelIntent = ModelIntent.DEFAULT,
+    configured_default: str | None = None,
+    family: str | None = None,
+) -> ModelResolution:
+    """Resolve a model from the live bundled provider catalog.
+
+    Default intent preserves the onboarding provider's general-purpose model
+    policy after family and gateway-routing constraints are applied. Other
+    intents continue to rank all compatible catalog candidates by metadata.
+
+    :param provider_name: MLflow catalog provider name.
+    :param intent: Stable selection intent.
+    :param configured_default: Optional provider-configured model. It is
+        represented as a candidate in *family* so provider configuration keeps
+        precedence even when the remote catalog has not learned the id yet.
+    :param family: Optional normalized catalog family (``"claude"`` /
+        ``"openai"`` / ``"other"``).
+    :returns: The resolver result with source and normalized metadata.
+    :raises ModelResolutionError: When no compatible catalog model exists.
+    """
+    from omnigent.onboarding.providers import default_chat_model
+
+    models = list(catalog_model_entries(provider_name))
+    if provider_name.lower() == "databricks":
+        models = [model for model in models if model.id.lower().startswith("databricks-")]
+
+    if configured_default is None and intent == ModelIntent.DEFAULT:
+        compatible_ids = {model.id for model in models if family is None or model.family == family}
+        preferred_default = default_chat_model(
+            provider_name,
+            allowed_models=compatible_ids,
+        )
+        if preferred_default is not None and (
+            family is None or model_family_token(preferred_default) == family
+        ):
+            configured_default = preferred_default
+
+    if configured_default is not None and all(model.id != configured_default for model in models):
+        models.insert(
+            0,
+            ModelEntry(
+                id=configured_default,
+                family=family or model_family_token(configured_default),
+            ),
+        )
+    try:
+        return resolve_model(
+            ModelResolutionRequest(
+                intent=intent,
+                configured_default=configured_default,
+                allowed_families=(frozenset({family}) if family is not None else frozenset()),
+            ),
+            models,
+        )
+    except ModelResolutionError as exc:
+        family_detail = f" for family {family!r}" if family is not None else ""
+        raise ModelResolutionError(
+            f"no compatible model resolved from provider {provider_name!r}{family_detail}; "
+            "configure an explicit model or retry when catalog discovery is available"
+        ) from exc
+
+
+def _catalog_cost_tiers(models: list[ModelInfo]) -> dict[int, ModelCostTier]:
+    """Assign provider-relative thirds from reported token prices."""
+    priced: list[tuple[int, float]] = []
+    for index, model in enumerate(models):
+        input_price = getattr(model, "input_price", None)
+        output_price = getattr(model, "output_price", None)
+        if isinstance(input_price, (int, float)) and isinstance(output_price, (int, float)):
+            priced.append((index, float(input_price) + float(output_price)))
+    distinct = sorted({price for _, price in priced})
+    if not distinct:
+        return {}
+    if len(distinct) == 1:
+        return {index: ModelCostTier.STANDARD for index, _ in priced}
+    tiers: dict[int, ModelCostTier] = {}
+    price_rank = {price: rank / (len(distinct) - 1) for rank, price in enumerate(distinct)}
+    for index, price in priced:
+        percentile = price_rank[price]
+        if percentile <= 1 / 3:
+            tiers[index] = ModelCostTier.ECONOMY
+        elif percentile >= 2 / 3:
+            tiers[index] = ModelCostTier.PREMIUM
+        else:
+            tiers[index] = ModelCostTier.STANDARD
+    return tiers
+
+
 def spec_harness(spec: Any) -> str | None:  # type: ignore[explicit-any]  # structural spec stubs in tests
     """Resolve the declared harness for a (sub-)agent spec.
 
@@ -341,6 +512,11 @@ def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedMo
     # Imported lazily; workflow.py imports broadly and this module is
     # consumed from the runner's dispatch path.
     from omnigent.runtime.workflow import _resolve_provider_for_build
+
+    if (harness or "") in _CURSOR_HARNESSES:
+        return ResolvedModelProvider(
+            kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
+        )
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
     if harness_type is None:
@@ -533,6 +709,20 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli=entry.cli, detail=f"provider {entry.name!r}"
         )
+    if entry.kind == CLI_CONFIG_KIND:
+        # The provider table (base_url + credential) lives in the CLI's own
+        # config file and the CLI resolves it at launch — there is nothing
+        # to resolve statically here, so the entry is usable as-is. Falling
+        # through to the inline-family loop would misreport it as "no
+        # resolvable credentials" (cli-config entries carry no families).
+        return ResolvedModelProvider(
+            kind=CLI_CONFIG_KIND,
+            cli=entry.cli,
+            detail=(
+                f"provider {entry.name!r} (codex config.toml model provider "
+                f"{entry.model_provider!r})"
+            ),
+        )
     # Inline-family kinds: single-family harnesses get exactly their family;
     # pi takes the first whose credential resolves, anthropic preferred.
     preferred = _KEY_AUTH_FAMILY[harness_type] if harness_type != "pi" else None
@@ -583,7 +773,30 @@ def list_models_for_worker(
     :returns: The worker's :class:`ModelListing`.
     """
     provider = resolve_model_provider(spec, harness)
-    listing = _listing_for_provider(provider, transport=transport)
+    # Pi harnesses use system.ai.* ids (via the Unity Catalog model-services API)
+    # so supervisors see the ids Pi can actually route. Other harnesses use the
+    # serving-endpoints listing which returns databricks-* ids.
+    _pi_harnesses = frozenset({"pi", "pi-native", "native-pi"})
+    canonical = (harness or "").lower().replace("-", "").replace("_", "")
+    use_uc = canonical in {h.replace("-", "").replace("_", "") for h in _pi_harnesses}
+    if use_uc and provider.kind == DATABRICKS_KIND:
+        uc_key = ("uc", *_listing_cache_key(provider))
+        with _listing_cache_lock:
+            cached = _listing_cache.get(uc_key)
+        if cached is not None:
+            listing = cached
+        else:
+            try:
+                listing = _fetch_databricks_uc_listing(provider, transport=transport)
+                with _listing_cache_lock:
+                    _listing_cache[uc_key] = listing
+            except (httpx.HTTPError, OSError):
+                _logger.debug(
+                    "UC model listing failed for pi harness, falling back", exc_info=True
+                )
+                listing = _listing_for_provider(provider, transport=transport)
+    else:
+        listing = _listing_for_provider(provider, transport=transport)
     if harness is None:
         return listing
     filtered = tuple(m for m in listing.models if model_family_mismatch(harness, m.id) is None)
@@ -653,8 +866,23 @@ def _listing_payload(listing: ModelListing) -> dict[str, Any]:  # type: ignore[e
     models: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON-shaped tool payload
     for entry in listing.models:
         row: dict[str, Any] = {"id": entry.id, "family": entry.family}  # type: ignore[explicit-any]
-        if entry.context_window is not None:
-            row["context_window"] = entry.context_window
+        metadata = entry.metadata
+        if metadata.context_window is not None:
+            row["context_window"] = metadata.context_window
+        capabilities = {
+            capability.value: supported
+            for supported, values in (
+                (True, metadata.supported_capabilities),
+                (False, metadata.unsupported_capabilities),
+            )
+            for capability in sorted(values, key=lambda value: value.value)
+        }
+        if capabilities:
+            row["capabilities"] = capabilities
+        if metadata.cost_tier is not None:
+            row["cost_tier"] = metadata.cost_tier.value
+        if metadata.wire_apis:
+            row["wire_apis"] = sorted(wire_api.value for wire_api in metadata.wire_apis)
         models.append(row)
     return {
         "source": listing.source,
@@ -722,6 +950,8 @@ def _listing_for_provider(
         )
     if provider.kind == SUBSCRIPTION_KIND:
         return _static_subscription_listing(provider)
+    if provider.kind == CLI_CONFIG_KIND:
+        return _static_cli_config_listing(provider)
 
     cache_key = _listing_cache_key(provider)
     with _listing_cache_lock:
@@ -759,7 +989,7 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
     :param provider: A ``kind="subscription"`` provider descriptor.
     :returns: A ``source="static"`` listing with ``verified=False``.
     """
-    ids = _SUBSCRIPTION_STATIC_MODELS.get(provider.cli or "", ())
+    ids = _subscription_static_ids(provider.cli or "")
     return ModelListing(
         source="static",
         verified=False,
@@ -768,6 +998,47 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
             f"curated aliases for the {provider.cli or 'unknown'} CLI login "
             "(subscription logins expose no model-listing API; availability "
             "depends on the logged-in plan)"
+        ),
+    )
+
+
+def _subscription_static_ids(cli: str) -> tuple[str, ...]:
+    """Return the curated model ids for a subscription CLI.
+
+    :param cli: The CLI short-name, e.g. ``"claude"`` or ``"cursor-agent"``.
+    :returns: Curated model ids; empty for an unknown CLI.
+    """
+    if cli == "cursor-agent":
+        # Reuse the web picker's curated base-model catalog (derived from
+        # ``cursor-agent models``); imported lazily to keep this module off
+        # the TUI launcher's import path.
+        from omnigent.cursor_native import cursor_base_model_options
+
+        return tuple(str(option["id"]) for option in cursor_base_model_options())
+    return _SUBSCRIPTION_STATIC_MODELS.get(cli, ())
+
+
+def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build the curated static listing for a ``cli-config`` provider.
+
+    A ``cli-config`` provider pins a custom ``[model_providers.X]`` table in
+    the codex CLI's own ``config.toml``; its credential (an auth command /
+    env key in that file) is resolved by codex at launch, so the listing is
+    the codex curated ids with a note saying the credential is the CLI's to
+    resolve — not a "no credentials" preflight failure.
+
+    :param provider: A ``kind="cli-config"`` provider descriptor.
+    :returns: A ``source="static"`` listing with ``verified=False``.
+    """
+    ids = _SUBSCRIPTION_STATIC_MODELS.get(provider.cli or "", ())
+    return ModelListing(
+        source="static",
+        verified=False,
+        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        note=(
+            f"curated ids for {provider.detail}; its credential lives in the "
+            "CLI's own config file and is resolved by the CLI at launch, so "
+            "it cannot be verified from here"
         ),
     )
 
@@ -835,6 +1106,64 @@ def _fetch_databricks_listing(
         models=tuple(models),
         note=(
             "LLM serving endpoints on the Databricks workspace gateway "
+            f"(profile {provider.profile or 'DEFAULT'!r})"
+        ),
+    )
+
+
+def _fetch_databricks_uc_listing(
+    provider: ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None,
+) -> ModelListing:
+    """List LLM model services via the Unity Catalog model-services API.
+
+    Returns ``system.ai.*`` model ids directly — the ids that work with the
+    AI Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
+
+    :param provider: A ``kind="databricks"`` provider descriptor.
+    :param transport: Optional httpx transport override for tests.
+    :returns: A ``source="gateway"`` listing of model service names.
+    :raises httpx.HTTPError: On transport/HTTP failures.
+    :raises OSError: When the profile resolves no credentials.
+    """
+    creds = resolve_databricks_workspace(provider.profile)
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        resp = client.get(
+            f"{creds.host}/api/2.1/unity-catalog/model-services",
+            headers={"Authorization": f"Bearer {creds.token}"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    services = payload.get("model_services") if isinstance(payload, dict) else None
+    models: list[ModelEntry] = []
+    for service in services if isinstance(services, list) else []:
+        if not isinstance(service, dict):
+            continue
+        raw_name = service.get("name", "")
+        name = (
+            raw_name.replace("model-services/", "")
+            if raw_name.startswith("model-services/")
+            else raw_name
+        )
+        if not name:
+            continue
+        api_types = service.get("supported_api_types", [])
+        has_chat = any("chat" in t for t in api_types)
+        has_embed = any("embed" in t.lower() for t in api_types)
+        if not has_chat or has_embed:
+            continue
+        from omnigent.pi_native_credentials import _unsupported_in_pi
+
+        if _unsupported_in_pi(name.lower()):
+            continue
+        models.append(ModelEntry(id=name, family=model_family_token(name)))
+    return ModelListing(
+        source="gateway",
+        verified=True,
+        models=tuple(models),
+        note=(
+            "LLM model services on the Databricks workspace "
             f"(profile {provider.profile or 'DEFAULT'!r})"
         ),
     )
@@ -921,7 +1250,9 @@ def _fetch_openai_compatible_listing(
             ModelEntry(
                 id=model_id,
                 family=model_family_token(model_id),
-                context_window=context_length if isinstance(context_length, int) else None,
+                metadata=ModelMetadata(
+                    context_window=context_length if isinstance(context_length, int) else None
+                ),
             )
         )
     return ModelListing(

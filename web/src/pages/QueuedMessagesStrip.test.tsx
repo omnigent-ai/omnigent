@@ -91,4 +91,22 @@ describe("QueuedMessagesStrip", () => {
     expect(onSteer).toHaveBeenCalledTimes(1);
     expect(onSteer).toHaveBeenCalledWith("q_2");
   });
+
+  it("shows a drag handle per row only when onReorder is provided", () => {
+    const { rerender } = render(
+      <QueuedMessagesStrip messages={[msg("q_1", "first")]} onDelete={vi.fn()} onEdit={vi.fn()} />,
+    );
+    // No reorder handler → no grip (the row shows the clock icon instead).
+    expect(screen.queryByRole("button", { name: "Reorder queued message" })).toBeNull();
+
+    rerender(
+      <QueuedMessagesStrip
+        messages={[msg("q_1", "first"), msg("q_2", "second")]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+        onReorder={vi.fn()}
+      />,
+    );
+    expect(screen.getAllByRole("button", { name: "Reorder queued message" })).toHaveLength(2);
+  });
 });

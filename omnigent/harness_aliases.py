@@ -27,6 +27,12 @@ def canonicalize_harness(harness: str | None) -> str | None:
     """
     if harness is None:
         return None
+    # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to the base
+    # ``acp`` harness for identity / validity / module resolution / model-family
+    # checks. The ``<slug>`` selecting the concrete agent is carried separately in
+    # the spec's ``executor.config`` and read by ``_build_acp_spawn_env``.
+    if harness.startswith("acp:"):
+        return "acp"
     return HARNESS_ALIASES.get(harness, harness)
 
 

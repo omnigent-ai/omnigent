@@ -53,6 +53,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxLauncher,
     host_image_wheel_install_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -187,6 +188,19 @@ class DaytonaSandboxLauncher(SandboxLauncher):
     # Daytona preview links are sandbox→public only; there is no
     # local→sandbox path for the App OAuth callback port.
     supports_local_port_forward: ClassVar[bool] = False
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=True,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=True,
+            streaming_exec=False,
+            foreground_exec=True,
+        )
 
     def __init__(self, *, image: str | None = None, env: Sequence[str] | None = None) -> None:
         """

@@ -7,7 +7,9 @@
 # Generated file -- do not hand-edit; it is replaced wholesale on every sync.
 
 REQUIRED=(
+  "DCO"
   "Pre-commit checks"
+  "Docker build"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
   "Pytest (runtime-core)"
@@ -20,6 +22,8 @@ REQUIRED=(
   "Pytest (server-responses)"
   "Pytest (server-rest)"
   "Pytest (spec-llms)"
+  "Pytest (runner-app)"
+  "Pytest (stores)"
   "Pytest (misc)"
   "Pytest (databricks)"
   "E2E Tests (shard 0/4)"
@@ -29,12 +33,14 @@ REQUIRED=(
   "E2E UI Tests (shard 0/3)"
   "E2E UI Tests (shard 1/3)"
   "E2E UI Tests (shard 2/3)"
+  "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
   "Integration (openai-agents)"
   "Integration (codex)"
 )
 
 ALLOW_SKIP=(
+  "Docker build"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
   "Pytest (runtime-core)"
@@ -47,6 +53,8 @@ ALLOW_SKIP=(
   "Pytest (server-responses)"
   "Pytest (server-rest)"
   "Pytest (spec-llms)"
+  "Pytest (runner-app)"
+  "Pytest (stores)"
   "Pytest (misc)"
   "Pytest (databricks)"
   "E2E Tests (shard 0/4)"
@@ -56,6 +64,7 @@ ALLOW_SKIP=(
   "E2E UI Tests (shard 0/3)"
   "E2E UI Tests (shard 1/3)"
   "E2E UI Tests (shard 2/3)"
+  "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
   "Integration (openai-agents)"
   "Integration (codex)"
@@ -69,9 +78,11 @@ is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
 # workflow is still queued or re-running.
 workflow_for() {
   case "$1" in
+    "Docker build")          echo "Docker build" ;;
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;
+    "UI Snapshot (visual baselines)") echo "UI Snapshot" ;;
     "Integration ("*)        echo "Integration Tests" ;;
     *)                       echo "" ;;
   esac

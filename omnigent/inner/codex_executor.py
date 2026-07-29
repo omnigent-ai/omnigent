@@ -22,16 +22,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent import model_catalog
+from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
+from .async_utils import run_sync_on_thread
+from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .databricks_executor import (
-    _read_databrickscfg,
-    _read_databrickscfg_host,
+    _databricks_gateway_host,
 )
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -97,18 +100,11 @@ _TURN_COMPLETED_DRAIN_SECONDS = 1.0
 _CODEX_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
 _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
-_OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
-# Databricks-specific default model for the Databricks-profile-derivation
-# gateway path (no gateway base URL supplied directly). The neutral
-# generic-provider gateway path never uses this — it requires the Omnigent producer
-# to resolve a concrete model. Used only when constructing the codex config
-# from ~/.databrickscfg credentials with no spec/override model.
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
-
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
@@ -116,6 +112,14 @@ _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
 # shared ``~/.codex/config.toml``. This keeps model selection and cost-policy
 # enforcement isolated between concurrent sessions.
 _CODEX_HOME_COPY_FILES = ("config.toml",)
+# Directories symlinked (not copied) from the real CODEX_HOME into the
+# per-session temp home. ``plugins/cache`` is codex's content-addressed
+# (versioned) plugin store — read-only reference data that codex would
+# otherwise re-materialize tens of MB into every private home. Sharing the
+# one real cache dedupes it across sessions; codex's own writes land in the
+# shared cache exactly as they would without the private home.
+_CODEX_HOME_SYMLINK_DIRS = (Path("plugins") / "cache",)
+_CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -124,7 +128,7 @@ _CODEX_HOME_COPY_FILES = ("config.toml",)
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
 
-def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
+def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any] | None:
     """Map a ``thread/tokenUsage/updated`` payload's ``last`` breakdown
     onto the wire shape that :class:`TurnComplete` consumes.
 
@@ -135,6 +139,16 @@ def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
     out into ``cache_read_input_tokens`` and keep only the remainder in
     ``input_tokens`` — otherwise cached tokens are billed at the full input
     rate. Mirrors the codex-native forwarder split.
+
+    :param model: The resolved model this turn ran with, e.g.
+        ``"gpt-5.4-mini"`` — the ``run_turn`` argument, which carries the
+        harness/provider's resolved default even when the agent spec pins
+        none. Stamped into the returned usage as ``"model"`` so the
+        server's per-model cost/token attribution (``session_usage.by_model``)
+        can key on it instead of silently falling back to an unresolvable
+        spec model and dropping the turn from the per-model breakdown
+        (mirrors ``claude_sdk_executor``'s ``observed_model`` and every
+        other relay executor, all of which already report ``usage.model``).
     """
     if not isinstance(params, dict):
         return None
@@ -147,13 +161,15 @@ def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
     input_total = int(last.get("inputTokens") or 0)
     # Clamp so a malformed cached > total never makes input_tokens negative.
     cached = min(int(last.get("cachedInputTokens") or 0), input_total)
-    usage = {
+    usage: dict[str, Any] = {
         "input_tokens": input_total - cached,  # non-cached portion
         "output_tokens": int(last.get("outputTokens") or 0),
         "total_tokens": int(last.get("totalTokens") or 0),
     }
     if cached:
         usage["cache_read_input_tokens"] = cached
+    if model:
+        usage["model"] = model
     return usage
 
 
@@ -281,8 +297,15 @@ def _kill_process_tree(process: _Process | None) -> None:
     _proc.kill_tree(process)
 
 
+# Env override for an explicit codex binary, mirroring goose's
+# OMNIGENT_GOOSE_PATH. Set this when codex lives on a PATH the host
+# daemon doesn't inherit (e.g. an nvm-managed global bin dir).
+_CODEX_PATH_ENV = "OMNIGENT_CODEX_PATH"
+
+
 def _find_codex_cli() -> str | None:
-    return shutil.which("codex")
+    """Resolve the ``codex`` CLI binary (override → ``PATH`` → global dirs)."""
+    return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -679,34 +702,57 @@ def _codex_home_config_source_from_env() -> Path:
     )
 
 
-def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
+def _populate_codex_home_config(
+    target_dir: Path,
+    source_dir: Path,
+    *,
+    minimal_config: bool | None = None,
+) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
 
     The executor overrides ``CODEX_HOME`` to a per-conversation temp
     directory so session data (conversation history, etc.) stays isolated
     from the user's ``~/.codex/``. However, the codex CLI also reads
-    authentication tokens (``auth.json``) and provider configuration
-    (``config.toml``) from ``$CODEX_HOME``. This helper bridges those
-    files into the temp directory:
+    authentication tokens (``auth.json``), provider configuration
+    (``config.toml``) and instructions (``AGENTS.md``, ``AGENTS.override.md``)
+    from ``$CODEX_HOME``. This helper bridges those files into the temp directory:
 
     - ``auth.json`` is **symlinked** so OAuth token refreshes written to
       the real home propagate to running sessions without delay.
     - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
-      enforcement isolated between concurrent sessions.
+      enforcement isolated between concurrent sessions. Hook-trust keys inside
+      the copy are rewritten to reference the private home's paths so Codex
+      recognises previously-trusted hooks without an interactive prompt.
+    - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
+      available at the same path within the private home that the rewritten
+      trust keys reference.
+    - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
+      are respected.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
     :param source_dir: The primary ``CODEX_HOME`` directory
         (typically ``$CODEX_HOME`` or ``~/.codex``). Missing files are
         skipped.
+    :param minimal_config: Copy only auth and provider-routing config when
+        ``True``. ``None`` preserves the environment-controlled behavior.
     """
     if not source_dir.is_dir():
         return
 
-    for filename in _CODEX_HOME_SYMLINK_FILES:
+    if minimal_config is None:
+        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+    symlink_files = _CODEX_HOME_SYMLINK_FILES
+    if not minimal_config:
+        symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
+    for filename in symlink_files:
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -724,6 +770,28 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
             )
             shutil.copy2(source_file, link_path)
 
+    if not minimal_config:
+        for reldir in _CODEX_HOME_SYMLINK_DIRS:
+            source_subdir = source_dir / reldir
+            if not source_subdir.is_dir():
+                continue
+            link_path = target_dir / reldir
+            if link_path.exists() or link_path.is_symlink():
+                continue
+            link_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                link_path.symlink_to(source_subdir.resolve())
+            except OSError as exc:
+                # Symlink unsupported (some Windows configs) or a race — skip
+                # the dedupe rather than abort session boot; codex re-populates
+                # its own private cache, costing disk but staying correct.
+                logger.warning(
+                    "could not symlink %r into %s (%s); codex will repopulate it",
+                    str(reldir),
+                    target_dir,
+                    exc,
+                )
+
     for filename in _CODEX_HOME_COPY_FILES:
         source_file = source_dir / filename
         if not source_file.is_file():
@@ -731,7 +799,91 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
         dest_path = target_dir / filename
         if dest_path.exists() or dest_path.is_symlink():
             continue
+        if minimal_config and filename == "config.toml":
+            import tomlkit
+
+            # The title worker needs custom-provider routing, but copying the
+            # full user config also starts unrelated MCPs/plugins and can exceed
+            # its timeout. auth.json alone cannot supply these provider tables.
+            source_config = tomlkit.parse(source_file.read_text())
+            minimal_document = tomlkit.document()
+            for key in ("model_provider", "model_providers", "profiles"):
+                if key in source_config:
+                    minimal_document[key] = source_config[key]
+            dest_path.write_text(tomlkit.dumps(minimal_document))
+            continue
         shutil.copy2(source_file, dest_path)
+        if filename == "config.toml":
+            _normalize_copied_codex_effort(dest_path)
+
+
+# Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
+# leading whitespace and a trailing comment. Only applied to lines *before*
+# the first table header so keys inside ``[profiles.*]`` etc. are never
+# rewritten (they may target other providers with different ladders).
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
+
+
+def _normalize_copied_codex_effort(config_path: Path) -> None:
+    """Rewrite a deprecated top-level ``model_reasoning_effort`` in the
+    session's private copy of ``config.toml``.
+
+    The ChatGPT desktop app manages ``~/.codex/config.toml`` on machines
+    where it is installed and writes ``model_reasoning_effort = "ultra"`` —
+    a value the codex CLI maps to the retired ``max`` wire value, which the
+    OpenAI Responses API rejects with ``invalid_value: 'max'`` (its ladder
+    tops out at ``xhigh``). Because this executor copies the user's config
+    verbatim into every per-session ``CODEX_HOME``, that one app-written key
+    fails **every** codex turn on such machines.
+
+    Values already in :data:`CODEX_EFFORTS` are left untouched, as are
+    values with no known alias (codex surfaces its own error for those) and
+    anything below the first table header. Only the session's private copy
+    is modified — never the user's real ``~/.codex/config.toml``.
+
+    :param config_path: The copied ``config.toml`` inside the per-session
+        ``CODEX_HOME``. Unreadable/unwritable files are skipped (best
+        effort — the copy already succeeded, so this only degrades back to
+        the pre-normalization behavior).
+    """
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    lines = text.splitlines(keepends=True)
+    changed = False
+    array_depth = 0  # net unclosed '[' from a top-level multiline array value
+    for index, line in enumerate(lines):
+        content = line.rstrip("\r\n")
+        if array_depth == 0:
+            # At top-level statement position a leading '[' is a real table
+            # header ([table] / [[array-of-tables]]) -- top-level keys end here.
+            if content.lstrip().startswith("["):
+                break
+            match = _EFFORT_KEY_RE.match(content)
+            if match is not None:
+                value = match.group(2)
+                if value not in CODEX_EFFORTS:
+                    replacement = EFFORT_ALIASES.get(value)
+                    if replacement is not None:
+                        line_ending = line[len(content) :]
+                        lines[index] = (
+                            f"{match.group(1)}{replacement}{match.group(3)}{line_ending}"
+                        )
+                        changed = True
+                continue  # an effort-key line never opens an array
+        # Track array nesting (this is a bracket-counting heuristic, not a
+        # full TOML parser, but sufficient for this narrow config shape) so
+        # bracketed *array content* (which may start with '[') is not
+        # mistaken for a table header.
+        array_depth += content.count("[") - content.count("]")
+        if array_depth < 0:
+            array_depth = 0
+    if changed:
+        try:
+            config_path.write_text("".join(lines), encoding="utf-8")
+        except OSError:
+            logger.warning("could not normalize model_reasoning_effort in %s", config_path)
 
 
 def _databricks_codex_base_url(host: str) -> str:
@@ -796,6 +948,7 @@ def _databricks_codex_config_overrides(
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
+        "model_supports_reasoning_summaries=true",
         (
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
@@ -1208,9 +1361,16 @@ class _CodexAppServerSession:
             return
         self._loop = asyncio.get_running_loop()
         codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd:
-            codex_home_root = Path(self._cwd) / ".codex-tmp"
-            codex_home_root.mkdir(parents=True, exist_ok=True)
+        if self._cwd and self._cwd != "/":
+            try:
+                codex_home_root = Path(self._cwd) / ".codex-tmp"
+                codex_home_root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # The cwd may be on a read-only filesystem — e.g. macOS
+                # root ``/`` inherited from a runner whose working
+                # directory was never explicitly set.  Fall back to the
+                # system temp directory so the codex home is still writable.
+                codex_home_root = Path(tempfile.gettempdir())
         self._codex_home_dir = Path(
             tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
         )
@@ -1462,31 +1622,72 @@ class _CodexAppServerSession:
             self._applied_effort = None
 
         assert self.thread_id is not None
-        prompt = _prompt_for_turn(messages, is_new_thread=is_new_thread)
+        latest_user_content = _extract_latest_user_content(messages)
+        goal_objective = _goal_objective_from_content(latest_user_content)
+        prompt_messages = messages
+        if goal_objective is not None:
+            await self._request(
+                "thread/goal/set",
+                {
+                    "threadId": self.thread_id,
+                    "objective": goal_objective,
+                },
+            )
+            # A reset thread still needs prior history, with the command
+            # replaced by the clean objective sent to Codex.
+            prompt_messages = [message.copy() for message in messages]
+            for message in reversed(prompt_messages):
+                if message.get("role") == "user":
+                    message["content"] = goal_objective
+                    break
+        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
             turn_input = [{"type": "text", "text": prompt}]
-        # Apply reasoning effort via ``thread/settings/update``: Codex's
-        # ``TurnStartParams`` has no ``effort`` field, so an ``effort`` set on
-        # ``turn/start`` is silently dropped by serde and never takes effect.
-        # ``ThreadSettingsUpdateParams`` is where ``model``/``effort`` live —
-        # the same path the TUI ``/model`` picker uses. Deduped against the
-        # last value applied on this thread to avoid a redundant per-turn RPC.
+        # Newer Codex app-server builds apply reasoning effort through
+        # ``thread/settings/update``. Older supported builds reject that RPC but
+        # accept the same ``effort`` / ``summary`` fields on ``turn/start``.
+        # Prefer the persistent thread setting and fall back only for that
+        # explicit protocol-version mismatch.
+        effort_via_turn_start = False
         if reasoning_effort and reasoning_effort != self._applied_effort:
-            await self._request(
-                "thread/settings/update",
-                {"threadId": self.thread_id, "effort": reasoning_effort},
-            )
-            self._applied_effort = reasoning_effort
+            try:
+                await self._request(
+                    "thread/settings/update",
+                    {
+                        "threadId": self.thread_id,
+                        "effort": reasoning_effort,
+                        "summary": "detailed",
+                    },
+                )
+            except RuntimeError as exc:
+                error_text = str(exc)
+                unsupported_settings_update = (
+                    "thread/settings/update" in error_text and "unknown variant" in error_text
+                )
+                if not unsupported_settings_update:
+                    raise
+                logger.info(
+                    "Codex app-server does not support thread/settings/update; "
+                    "falling back to turn/start effort."
+                )
+                effort_via_turn_start = True
+            else:
+                self._applied_effort = reasoning_effort
         turn_params: CodexParams = {
             "threadId": self.thread_id,
             "input": turn_input,
         }
+        if effort_via_turn_start:
+            turn_params["effort"] = reasoning_effort
+            turn_params["summary"] = "detailed"
         start_response = await self._request(
             "turn/start",
             turn_params,
         )
+        if effort_via_turn_start:
+            self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
         if not isinstance(raw_active_turn_id, str) or not raw_active_turn_id:
             yield ExecutorError(message="Codex App Server did not return a turn id")
@@ -1727,7 +1928,7 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
-                    self._last_turn_usage = _extract_codex_last_turn_usage(params)
+                    self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
                     continue
 
                 if method == "turn/completed":
@@ -2126,7 +2327,11 @@ class CodexExecutor(Executor):
         self._skills_filter = skills_filter
         resolved_codex = codex_path or _find_codex_cli()
         if not resolved_codex:
-            raise ImportError("CodexExecutor requires the 'codex' CLI on PATH.")
+            raise ImportError(
+                "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
+                "installed on a PATH the host daemon didn't inherit (e.g. an "
+                f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
+            )
         self._codex_path = resolved_codex
         self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
@@ -2166,12 +2371,10 @@ class CodexExecutor(Executor):
             if host is None:
                 # No gateway host supplied directly: derive the transport from
                 # a Databricks profile (the Databricks producer's fallback).
-                creds = _read_databrickscfg(databricks_profile)
-                host = (
-                    creds.host
-                    if creds is not None
-                    else _read_databrickscfg_host(databricks_profile)
-                )
+                # Use the profile's own host so the base URL matches the token
+                # the profile-pinned auth command mints (not a DATABRICKS_HOST
+                # override that would point the base URL at another workspace).
+                host = _databricks_gateway_host(databricks_profile)
                 if not host:
                     raise OSError(
                         "CodexExecutor(gateway=True) requires gateway credentials via "
@@ -2189,9 +2392,13 @@ class CodexExecutor(Executor):
                     if gateway_auth_command is not None
                     else _databricks_codex_auth_command(host, databricks_profile)
                 )
-                # Databricks-profile path: a Databricks default is legitimate.
+                # Databricks-profile path: select a gateway endpoint from the
+                # catalog when no caller supplied one.
                 self._gateway_uses_databricks_profile = True
-                effective_model = model or _DATABRICKS_CODEX_DEFAULT_MODEL
+                effective_model = (
+                    model
+                    or model_catalog.resolve_catalog_model("databricks", family="openai").model_id
+                )
             else:
                 if base_url_override is None:
                     raise OSError(
@@ -2338,20 +2545,17 @@ class CodexExecutor(Executor):
         cfg = config or ExecutorConfig()
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
-        # cfg.model (per-request /model override) wins over the spec
-        # default (HARNESS_CODEX_MODEL → self._model_override). The final
-        # fallback is the Databricks default only on the Databricks-profile
-        # gateway path; the neutral gateway path (and the built-in path) never
-        # select a ``databricks-*`` model.
-        model = (
-            cfg.model
-            or self._model_override
-            or (
-                _DATABRICKS_CODEX_DEFAULT_MODEL
-                if self._gateway_uses_databricks_profile
-                else _OPENAI_CODEX_DEFAULT_MODEL
+        # cfg.model (per-request /model override) wins over the spec default.
+        # An unresolved default comes from the active provider catalog.
+        model = cfg.model or self._model_override
+        if model is None:
+            provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                provider_name,
+                family="openai",
             )
-        )
+            model = resolution.model_id
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )

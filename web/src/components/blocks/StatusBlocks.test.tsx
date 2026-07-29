@@ -1,6 +1,6 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { RoutingDecisionChip } from "./StatusBlocks";
+import { RoutingDecisionCard, RoutingDecisionChip } from "./StatusBlocks";
 
 afterEach(cleanup);
 
@@ -9,7 +9,6 @@ describe("RoutingDecisionChip — intelligent model router", () => {
     render(
       <RoutingDecisionChip
         model="databricks-claude-opus-4-8"
-        tier="expensive"
         applied
         rationale="multi-file refactor needs deep reasoning"
       />,
@@ -32,7 +31,6 @@ describe("RoutingDecisionChip — intelligent model router", () => {
     render(
       <RoutingDecisionChip
         model="databricks-claude-haiku-4-5"
-        tier="cheap"
         applied={false}
         rationale="trivial question"
       />,
@@ -46,14 +44,7 @@ describe("RoutingDecisionChip — intelligent model router", () => {
   });
 
   it("renders nothing for the rationale line when rationale is empty", () => {
-    render(
-      <RoutingDecisionChip
-        model="databricks-claude-sonnet-4-6"
-        tier="medium"
-        applied
-        rationale=""
-      />,
-    );
+    render(<RoutingDecisionChip model="databricks-claude-sonnet-4-6" applied rationale="" />);
     const chip = screen.getByTestId("routing-decision-chip");
     // Empty rationale still renders the primary line, just no second line —
     // a stray empty <span> would add visual noise to the transcript.
@@ -62,19 +53,75 @@ describe("RoutingDecisionChip — intelligent model router", () => {
   });
 
   it("never uses the old 'model control' vocabulary (rename sweep)", () => {
-    render(
-      <RoutingDecisionChip
-        model="databricks-claude-opus-4-8"
-        tier="expensive"
-        applied
-        rationale="x"
-      />,
-    );
+    render(<RoutingDecisionChip model="databricks-claude-opus-4-8" applied rationale="x" />);
     const chip = screen.getByTestId("routing-decision-chip");
     // The feature was renamed from "Intelligent model control"; the chip
     // must carry the new name and never the retired one.
     expect(chip.textContent).toContain("Intelligent model router");
     expect(chip.textContent).not.toContain("model control");
     expect(chip.textContent).not.toContain("Model Control");
+  });
+});
+
+describe("RoutingDecisionCard — session-level auto-routing", () => {
+  it("applied verdict: shows model pill with tier and rationale", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-opus-4-8"
+        applied
+        rationale="Multi-file refactor needs deep reasoning."
+      />,
+    );
+    const card = screen.getByTestId("routing-decision-card");
+    expect(card).toHaveTextContent("Intelligent routing");
+    expect(card).toHaveTextContent("· applied");
+    expect(card).toHaveTextContent("Session");
+    expect(card).toHaveTextContent("opus");
+    expect(card).toHaveTextContent("Multi-file refactor needs deep reasoning.");
+    expect(card.getAttribute("data-applied")).toBe("true");
+  });
+
+  it("advisory verdict: shows '· advisory' and the model that would have been picked", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-haiku-4-5"
+        applied={false}
+        rationale="Trivial question."
+      />,
+    );
+    const card = screen.getByTestId("routing-decision-card");
+    expect(card).toHaveTextContent("· advisory");
+    expect(card).toHaveTextContent("haiku");
+    expect(card.getAttribute("data-applied")).toBe("false");
+  });
+
+  it("shows agent name as row label when mirrored into parent session", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-haiku-4-5"
+        applied
+        rationale="Simple task."
+        agent="claude_code"
+      />,
+    );
+    const card = screen.getByTestId("routing-decision-card");
+    // The agent name replaces the generic "Session" label so the
+    // orchestrator's transcript identifies which sub-agent was routed.
+    expect(card).toHaveTextContent("claude_code");
+    expect(card.textContent).not.toContain("Session");
+  });
+
+  it("expands raw verdict JSON behind the chevron", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-opus-4-8"
+        applied
+        rationale="Deep reasoning required."
+      />,
+    );
+    // Collapsed by default — raw JSON not visible.
+    expect(screen.queryByText(/"rationale"/)).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"rationale"/)).toBeInTheDocument();
   });
 });

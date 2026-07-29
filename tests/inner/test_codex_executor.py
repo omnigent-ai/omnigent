@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import json
 import tempfile
 import unittest
@@ -20,10 +21,10 @@ from omnigent.inner.codex_executor import (
     _CodexAppServerSession,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
+    _goal_objective_from_content,
     _prompt_for_turn,
     _to_codex_input_items,
 )
-from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
@@ -141,6 +142,7 @@ class TestCodexExecutor(unittest.TestCase):
         )
         self.assertIn('model="databricks-gpt-5-4-mini"', overrides)
         self.assertIn('model_provider="omnigent_databricks"', overrides)
+        self.assertIn("model_supports_reasoning_summaries=true", overrides)
         self.assertTrue(any("/ai-gateway/codex/v1" in item for item in overrides))
         self.assertFalse(any("/serving-endpoints" in item for item in overrides))
         self.assertTrue(any('auth={command="sh"' in item for item in overrides))
@@ -177,11 +179,8 @@ class TestCodexExecutor(unittest.TestCase):
         with (
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch(
-                "omnigent.inner.codex_executor._read_databrickscfg",
-                return_value=DatabricksCredentials(
-                    host="https://example.cloud.databricks.com",
-                    token="dapi_test_token",
-                ),
+                "omnigent.inner.codex_executor._databricks_gateway_host",
+                return_value="https://example.cloud.databricks.com",
             ),
         ):
             executor = CodexExecutor(gateway=True)
@@ -209,11 +208,8 @@ class TestCodexExecutor(unittest.TestCase):
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch.dict("os.environ", {}, clear=True),
             patch(
-                "omnigent.inner.codex_executor._read_databrickscfg",
-                return_value=DatabricksCredentials(
-                    host="https://example-profile-workspace.cloud.databricks.com",
-                    token="profile_token",
-                ),
+                "omnigent.inner.codex_executor._databricks_gateway_host",
+                return_value="https://example-profile-workspace.cloud.databricks.com",
             ),
         ):
             executor = CodexExecutor(
@@ -254,7 +250,7 @@ class TestCodexExecutor(unittest.TestCase):
         with (
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch.dict("os.environ", {}, clear=True),
-            patch("omnigent.inner.codex_executor._read_databrickscfg") as read_cfg,
+            patch("omnigent.inner.codex_executor._databricks_gateway_host") as gateway_host,
         ):
             executor = CodexExecutor(
                 gateway=True,
@@ -265,7 +261,7 @@ class TestCodexExecutor(unittest.TestCase):
                 model="databricks-gpt-5-4-mini",
             )
 
-        read_cfg.assert_not_called()
+        gateway_host.assert_not_called()
         self.assertEqual(
             executor._env["DATABRICKS_HOST"],
             "https://example.databricks.com",
@@ -308,8 +304,7 @@ class TestCodexExecutor(unittest.TestCase):
         with (
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch.dict("os.environ", {}, clear=True),
-            patch("omnigent.inner.codex_executor._read_databrickscfg", return_value=None),
-            patch("omnigent.inner.codex_executor._read_databrickscfg_host", return_value=None),
+            patch("omnigent.inner.codex_executor._databricks_gateway_host", return_value=None),
         ):
             with self.assertRaises(EnvironmentError):
                 CodexExecutor(gateway=True)
@@ -351,6 +346,28 @@ class TestCodexExecutor(unittest.TestCase):
         ]
         prompt = _prompt_for_turn(messages, is_new_thread=False)
         self.assertEqual(prompt, "Summarize our conversation.")
+
+    def test_goal_objective_requires_a_standalone_command(self):
+        self.assertEqual(
+            _goal_objective_from_content("  /goal Finish the implementation  "),
+            "Finish the implementation",
+        )
+        self.assertIsNone(_goal_objective_from_content("/goal"))
+        self.assertIsNone(_goal_objective_from_content("Please run /goal now"))
+        self.assertEqual(
+            _goal_objective_from_content(
+                [{"type": "input_text", "text": "/goal Finish from the web"}]
+            ),
+            "Finish from the web",
+        )
+        self.assertIsNone(
+            _goal_objective_from_content(
+                [
+                    {"type": "input_text", "text": "/goal nope"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                ]
+            )
+        )
 
     def test_run_turn_delegates_to_app_server_session(self):
         async def _t():
@@ -396,7 +413,7 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[2], ToolCallComplete)
             self.assertIsInstance(events[3], TurnComplete)
             self.assertEqual(fake_session.calls[0]["system_prompt"], "Be helpful.")
-            self.assertEqual(fake_session.calls[0]["model"], "gpt-5.4-mini")
+            self.assertEqual(fake_session.calls[0]["model"], "catalog-openai-openai-default")
             self.assertEqual(fake_session.calls[0]["tools"][0]["name"], "calculate")
 
         _run(_t())
@@ -405,11 +422,8 @@ class TestCodexExecutor(unittest.TestCase):
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
             with patch(
-                "omnigent.inner.codex_executor._read_databrickscfg",
-                return_value=DatabricksCredentials(
-                    host="https://example.cloud.databricks.com",
-                    token="dapi_test_token",
-                ),
+                "omnigent.inner.codex_executor._databricks_gateway_host",
+                return_value="https://example.cloud.databricks.com",
             ):
                 executor = CodexExecutor(
                     codex_path="/bin/echo",
@@ -427,7 +441,7 @@ class TestCodexExecutor(unittest.TestCase):
             ]
 
             self.assertEqual(events[-1].response, "done")
-            self.assertEqual(fake_session.calls[0]["model"], "databricks-gpt-5-5")
+            self.assertEqual(fake_session.calls[0]["model"], "catalog-databricks-openai-default")
 
         _run(_t())
 
@@ -532,6 +546,127 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_run_turn_starts_goal_before_objective_turn(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"goal": {"objective": "Finish and test"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "/goal Finish and test"}],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            calls = session._request.await_args_list
+            self.assertEqual(
+                [call.args[0] for call in calls],
+                ["thread/start", "thread/goal/set", "turn/start"],
+            )
+            self.assertEqual(
+                calls[1].args[1],
+                {"threadId": "thread-1", "objective": "Finish and test"},
+            )
+            self.assertEqual(
+                calls[2].args[1]["input"],
+                [{"type": "text", "text": "Finish and test"}],
+            )
+
+        _run(_t())
+
+    def test_app_server_new_goal_thread_replays_history_without_command(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"goal": {"objective": "Finish and test"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[
+                    {"role": "user", "content": "Remember the passphrase is ORCHID."},
+                    {"role": "assistant", "content": "I will remember it."},
+                    {"role": "user", "content": "/goal Finish and test"},
+                ],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            calls = session._request.await_args_list
+            self.assertEqual(
+                calls[1].args[1],
+                {"threadId": "thread-1", "objective": "Finish and test"},
+            )
+            self.assertEqual(
+                calls[2].args[1]["input"],
+                [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Conversation so far:\n"
+                            "user: Remember the passphrase is ORCHID.\n"
+                            "assistant: I will remember it.\n"
+                            "user: Finish and test\n\n"
+                            "Respond to the latest user message, using the conversation "
+                            "above as context."
+                        ),
+                    }
+                ],
+            )
+
+        _run(_t())
+
     def test_app_server_run_turn_applies_effort_via_thread_settings_update(self):
         """Reasoning effort rides thread/settings/update, not turn/start.
 
@@ -585,9 +720,67 @@ class TestCodexExecutor(unittest.TestCase):
             # to this turn, and turn/start carries no (dropped) effort field.
             self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
             settings_params = session._request.await_args_list[1].args[1]
-            self.assertEqual(settings_params, {"threadId": "thread-1", "effort": "high"})
+            self.assertEqual(
+                settings_params,
+                {
+                    "threadId": "thread-1",
+                    "effort": "high",
+                    "summary": "detailed",
+                },
+            )
             turn_params = session._request.await_args_list[2].args[1]
             self.assertNotIn("effort", turn_params)
+
+        _run(_t())
+
+    def test_app_server_run_turn_falls_back_when_settings_update_is_unsupported(self):
+        """Older app-server builds accept effort only on ``turn/start``."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    RuntimeError(
+                        "{'code': -32600, 'message': 'Invalid request: unknown variant "
+                        "`thread/settings/update`'}"
+                    ),
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+                reasoning_effort="low",
+            ):
+                pass
+            await inject_task
+
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
+            turn_params = session._request.await_args_list[2].args[1]
+            self.assertEqual(turn_params["effort"], "low")
+            self.assertEqual(turn_params["summary"], "detailed")
+            self.assertEqual(session._applied_effort, "low")
 
         _run(_t())
 
@@ -1210,7 +1403,12 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[0], TurnComplete)
             self.assertEqual(
                 events[0].usage,
-                {"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+                {
+                    "input_tokens": 100,
+                    "output_tokens": 25,
+                    "total_tokens": 125,
+                    "model": "gpt-5.4-mini",
+                },
             )
             # The cached usage must be cleared after consumption so the next
             # turn doesn't inherit stale numbers.
@@ -1950,11 +2148,12 @@ def test_extract_codex_last_turn_usage_splits_cached_out_of_input() -> None:
             "total": {"inputTokens": 100, "outputTokens": 50, "totalTokens": 150},
         },
     }
-    assert _extract_codex_last_turn_usage(params) == {
+    assert _extract_codex_last_turn_usage(params, "gpt-5.4-mini") == {
         "input_tokens": 6,  # 7 total input - 1 cached
         "output_tokens": 3,
         "total_tokens": 10,
         "cache_read_input_tokens": 1,
+        "model": "gpt-5.4-mini",
     }
 
 
@@ -1967,7 +2166,35 @@ def test_extract_codex_last_turn_usage_no_cache_key_when_uncached() -> None:
     from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
 
     params = {"tokenUsage": {"last": {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}}}
-    assert _extract_codex_last_turn_usage(params) == {
+    assert _extract_codex_last_turn_usage(params, "gpt-5.4-mini") == {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+        "model": "gpt-5.4-mini",
+    }
+
+
+def test_extract_codex_last_turn_usage_stamps_resolved_model() -> None:
+    """The turn's resolved model is stamped into the usage dict as ``model``.
+
+    Without this, an agent spec that pins no ``llm.model`` (e.g. Debby's
+    ``gpt`` head, which deliberately runs on whatever model the codex
+    harness/provider resolves by default) has no signal the server can use to
+    attribute this turn's usage to a model — the flat session total still
+    accumulates, but ``session_usage.by_model`` silently never gets an entry
+    for it (see ``_extract_codex_last_turn_usage``'s docstring).
+    """
+    from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
+
+    params = {"tokenUsage": {"last": {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}}}
+    assert _extract_codex_last_turn_usage(params, "databricks-gpt-5-5") == {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+        "model": "databricks-gpt-5-5",
+    }
+    # A falsy/empty resolved model must not synthesize a misleading key.
+    assert _extract_codex_last_turn_usage(params, "") == {
         "input_tokens": 7,
         "output_tokens": 3,
         "total_tokens": 10,
@@ -1978,11 +2205,11 @@ def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
     """Missing or non-dict shapes return None rather than raising."""
     from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
 
-    assert _extract_codex_last_turn_usage(None) is None
-    assert _extract_codex_last_turn_usage("not a dict") is None
-    assert _extract_codex_last_turn_usage({}) is None
-    assert _extract_codex_last_turn_usage({"tokenUsage": None}) is None
-    assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}) is None
+    assert _extract_codex_last_turn_usage(None, "gpt-5.4-mini") is None
+    assert _extract_codex_last_turn_usage("not a dict", "gpt-5.4-mini") is None
+    assert _extract_codex_last_turn_usage({}, "gpt-5.4-mini") is None
+    assert _extract_codex_last_turn_usage({"tokenUsage": None}, "gpt-5.4-mini") is None
+    assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}, "gpt-5.4-mini") is None
 
 
 def _make_skill_dir(root: Path, name: str) -> Path:
@@ -2146,6 +2373,8 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     source.mkdir()
     (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
     (source / "config.toml").write_text('[default]\nmodel = "gpt-5.4"')
+    (source / "AGENTS.md").write_text("global guidance")
+    (source / "AGENTS.override.md").write_text("global override")
     target = tmp_path / "temp_codex_home"
     target.mkdir()
 
@@ -2154,10 +2383,94 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     # auth.json: symlink so live credential refreshes propagate.
     assert (target / "auth.json").is_symlink()
     assert (target / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
+    assert (target / "AGENTS.md").is_symlink()
+    assert (target / "AGENTS.md").read_text() == "global guidance"
+    assert (target / "AGENTS.override.md").is_symlink()
+    assert (target / "AGENTS.override.md").read_text() == "global override"
     # config.toml: independent copy so /model writes stay session-local.
     assert not (target / "config.toml").is_symlink()
     assert (target / "config.toml").is_file()
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
+
+
+def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> None:
+    """``plugins/cache`` is symlinked to the shared home to dedupe it.
+
+    Codex materializes tens of MB of versioned plugin data into every private
+    home; sharing the one real cache keeps each session small. Only the
+    ``cache`` subdir is shared — sibling scratch dirs stay session-local.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "config.toml").write_text("[default]\n")
+    cache = source / "plugins" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "big-plugin.bin").write_text("payload")
+    (source / "plugins" / ".remote-plugin-install-staging").mkdir()
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    link = target / "plugins" / "cache"
+    assert link.is_symlink()
+    assert (link / "big-plugin.bin").read_text() == "payload"
+    # Only cache is shared; the sibling scratch dir is not created here.
+    assert not (target / "plugins" / ".remote-plugin-install-staging").exists()
+
+
+def test_populate_codex_home_config_minimal_mode_skips_plugins_cache(tmp_path: Path) -> None:
+    """Minimal (title-sidecar) mode does not link plugins — it runs no plugins."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "config.toml").write_text("[default]\n")
+    (source / "plugins" / "cache").mkdir(parents=True)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source, minimal_config=True)
+
+    assert not (target / "plugins" / "cache").exists()
+
+
+def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Title sidecars retain auth/provider config without loading extensions."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "AGENTS.md").write_text("global guidance")
+    (source / "config.toml").write_text(
+        'model_provider = "Databricks"\n'
+        '[model_providers.Databricks]\nname = "Databricks"\nbase_url = "https://example"\n'
+        "[plugins.example]\nenabled = true\n"
+        '[mcp_servers.github]\nenabled = true\ncommand = "github-mcp"\n'
+        '[marketplaces.example]\nsource = "https://example"\n'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "1")
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "auth.json").is_symlink()
+    assert not (target / "AGENTS.md").exists()
+    config_text = (target / "config.toml").read_text()
+    assert 'model_provider = "Databricks"' in config_text
+    assert "[model_providers.Databricks]" in config_text
+    assert "plugins" not in config_text
+    assert "mcp_servers" not in config_text
+    assert "marketplaces" not in config_text
 
 
 def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path) -> None:
@@ -2184,6 +2497,94 @@ def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path)
     assert (source / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
+def test_populate_codex_home_config_normalizes_deprecated_effort(tmp_path: Path) -> None:
+    """A ChatGPT-app ``model_reasoning_effort = "ultra"`` becomes ``xhigh``.
+
+    The ChatGPT desktop app writes ``ultra`` into ``~/.codex/config.toml``;
+    the codex CLI maps it to the retired ``max`` wire value, which the
+    OpenAI Responses API rejects (``invalid_value: 'max'``) — failing every
+    codex turn on such machines. The session copy must be normalized while
+    (a) the user's real config stays untouched and (b) keys inside tables
+    are never rewritten.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = (
+        'model = "gpt-5.5"\n'
+        'model_reasoning_effort = "ultra"\n'
+        "[profiles.other]\n"
+        'model_reasoning_effort = "ultra"\n'
+    )
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text()
+    # Top-level deprecated value is normalized in the session copy.
+    assert 'model_reasoning_effort = "xhigh"' in copied.splitlines()[1]
+    # Keys inside tables are left alone — they may target other ladders.
+    assert copied.splitlines()[3] == 'model_reasoning_effort = "ultra"'
+    # The user's real config is never mutated.
+    assert (source / "config.toml").read_text() == original
+
+
+def test_populate_codex_home_config_keeps_valid_effort(tmp_path: Path) -> None:
+    """A supported top-level effort value is copied verbatim."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = 'model = "gpt-5.5"\nmodel_reasoning_effort = "high"\n'
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "config.toml").read_text() == original
+
+
+def test_populate_codex_home_config_normalizes_effort_after_multiline_array(
+    tmp_path: Path,
+) -> None:
+    """A top-level effort key AFTER a multiline array is still normalized.
+
+    A top-level array's continuation lines can start with ``[`` (nested
+    arrays), which must not be mistaken for a table header -- otherwise the
+    still-top-level ``model_reasoning_effort`` past the array is skipped.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = (
+        "value = [\n"
+        '  ["nested"],\n'
+        '  ["deep"],\n'
+        "]\n"
+        'model_reasoning_effort = "ultra"\n'
+        "[profiles.other]\n"
+        'model_reasoning_effort = "ultra"\n'
+    )
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text().splitlines()
+    assert copied[0] == "value = ["
+    assert copied[1] == '  ["nested"],'
+    assert copied[4] == 'model_reasoning_effort = "xhigh"'
+    assert copied[5] == "[profiles.other]"
+    assert copied[6] == 'model_reasoning_effort = "ultra"'
+    assert (source / "config.toml").read_text() == original
+
+
 def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     """When the source ``CODEX_HOME`` dir doesn't exist (fresh install),
     nothing is created in the target.
@@ -2200,6 +2601,41 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     _populate_codex_home_config(target, source)
 
     assert list(target.iterdir()) == []
+
+
+def test_populate_codex_home_config_symlinks_hooks_json(tmp_path: Path) -> None:
+    """``hooks.json`` is symlinked so user hooks fire inside the private home."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "hooks.json").is_symlink()
+    assert (target / "hooks.json").read_text() == '{"hooks": {}}'
+
+
+def test_populate_codex_home_config_hooks_json_skipped_in_minimal_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``hooks.json`` is not symlinked in minimal mode (title worker)."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "1")
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / "hooks.json").exists()
 
 
 def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
@@ -2819,3 +3255,92 @@ def test_declared_passthrough_reads_sandbox_env_passthrough():
     assert _declared_passthrough(None) == ()
     assert _declared_passthrough(OSEnvSpec(sandbox=None)) == ()
     assert _declared_passthrough(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))) == ()
+
+
+def test_find_codex_cli_delegates_to_shared_resolver(monkeypatch):
+    """``_find_codex_cli`` resolves codex via the shared resolver with the
+    OMNIGENT_CODEX_PATH override. (The resolver's own PATH/override/fallback
+    behavior is covered in tests/inner/test_proc_and_platform.py.)"""
+    from omnigent.inner import codex_executor as ce
+
+    captured = {}
+
+    def fake_resolve(name, *, env_var=None):
+        captured["name"] = name
+        captured["env_var"] = env_var
+        return "/opt/homebrew/bin/codex"
+
+    monkeypatch.setattr(ce, "resolve_cli_binary", fake_resolve)
+    assert ce._find_codex_cli() == "/opt/homebrew/bin/codex"
+    assert captured == {"name": "codex", "env_var": "OMNIGENT_CODEX_PATH"}
+
+
+class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
+    """Regression tests for .codex-tmp fallback on read-only cwd."""
+
+    def _run_start_and_capture_mkdtemp_dir(self, cwd: str) -> str:
+        """Run ``_CodexAppServerSession.start()`` with *cwd* and return
+        the ``dir=`` keyword passed to ``tempfile.mkdtemp`` for the
+        codex-home directory.
+
+        ``start()`` is stopped just after ``mkdtemp`` by forcing a
+        ``RuntimeError`` from the subprocess launch; the session's
+        ``close()`` cleans up the temp dir before we can inspect it,
+        so we capture the argument instead.
+        """
+        import tempfile as _tempfile
+
+        mkdtemp_dirs: list[str] = []
+        original_mkdtemp = _tempfile.mkdtemp
+
+        def _capture(**kwargs):
+            mkdtemp_dirs.append(kwargs.get("dir", ""))
+            return original_mkdtemp(**kwargs)
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd=cwd,
+                env={},
+                tool_executor=None,
+            )
+            with (
+                patch("omnigent.inner.codex_executor.populate_codex_skills_from_bundle"),
+                patch("omnigent.inner.codex_executor._populate_codex_home_config"),
+                patch(
+                    "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+                    return_value=None,
+                ),
+                patch(
+                    "omnigent.inner.codex_executor._create_subprocess_exec",
+                    new_callable=AsyncMock,
+                    side_effect=RuntimeError("stop"),
+                ),
+                patch("tempfile.mkdtemp", side_effect=_capture),
+            ):
+                with contextlib.suppress(RuntimeError):
+                    await session.start()
+
+            self.assertTrue(mkdtemp_dirs, "mkdtemp was never called")
+            return mkdtemp_dirs[0]
+
+        return _run(_t())
+
+    def test_start_falls_back_to_tempdir_when_cwd_is_readonly(self):
+        """When cwd is ``/`` (read-only on macOS SSV), the codex home
+        must be placed under the system temp directory, not under
+        ``/.codex-tmp``.
+        """
+        import tempfile as _tempfile
+
+        dir_used = self._run_start_and_capture_mkdtemp_dir("/")
+        self.assertEqual(dir_used, _tempfile.gettempdir())
+
+    def test_start_uses_cwd_when_writable(self):
+        """When cwd is writable, .codex-tmp is placed there as before."""
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as writable_dir:
+            dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
+            expected = str(Path(writable_dir) / ".codex-tmp")
+            self.assertEqual(dir_used, expected)

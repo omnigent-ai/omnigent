@@ -124,6 +124,10 @@ _TMUX_SEND_TIMEOUT_S = 5.0
 # The glyph persists while Claude is busy responding, so its presence
 # means "input box mounted" (not "idle"), which is what injection needs.
 _CLAUDE_PROMPT_GLYPH = "❯"
+# Matches a selected numbered menu row (``❯ 2. No (recommended)``): the glyph
+# followed by a numbered choice, which the chat input never renders. Used to
+# exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
+_SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
 # Box-drawing glyphs Claude Code's input-box frame is made of. A line of
 # these below ``❯`` marks the live input box (see ``_is_box_rule``),
 # distinguishing it from a bare prompt echoed into scrollback.
@@ -135,12 +139,6 @@ _BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
 # people's statuslines run ~3 lines — so the ``❯`` row isn't the last
 # non-empty line.
 _PROMPT_SCAN_TAIL_LINES = 5
-# Injecting a message mid-turn grows the footer with running-state rows
-# (a ``○ Explore …`` subagent line, extra spinners) that push ``❯`` above
-# the window above. We trust a glyph this deep only when it's framed by a
-# box rule (the live input box), so this wider window can't false-match a
-# bare ``❯`` echoed into scrollback output.
-_PROMPT_SCAN_TAIL_LINES_FRAMED = 8
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
@@ -287,11 +285,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # bridge-owned directories below it.
         return _absolute_syntactic_path(kiro_root.parent.parent)
 
+    # Headless ACP harnesses (acp / goose / qwen) put their Omnigent-MCP relay
+    # bridge below ``$TMPDIR/omnigent-<uid>/acp-mcp`` (same uid-scoped shape as
+    # cursor/qwen/hermes-native), so trust the uid-scoped temp dir's parent.
+    acp_root = _absolute_syntactic_path(acp_mcp_bridge_root())
+    if target.is_relative_to(acp_root):
+        return _absolute_syntactic_path(acp_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
         f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s})"
+        f"{kiro_root!s}, {acp_root!s})"
     )
 
 
@@ -308,12 +313,21 @@ class ClaudeTranscriptItem:
     :param data: Item payload shaped like ``SessionEventInput.data``.
     :param response_id: Synthetic response id used to group the
         Claude turn in AP/web UI rendering.
+    :param is_compact_summary: ``True`` when this item was parsed from a
+        Claude ``isCompactSummary: true`` user record — the continuation
+        summary Claude writes immediately after it compacts its own
+        context. The forwarder uses this flag to persist a durable
+        Omnigent compaction boundary (see
+        :func:`omnigent.claude_native_forwarder._forward_available_items`)
+        instead of rendering the summary as a user bubble. Defaults to
+        ``False`` for every ordinary transcript item.
     """
 
     source_id: str
     item_type: str
     data: dict[str, Any]
     response_id: str
+    is_compact_summary: bool = False
 
 
 @dataclass(frozen=True)
@@ -672,8 +686,10 @@ def _ensure_secure_dir(target: Path) -> None:
     each ancestor from that trusted parent down to ``target``,
     creating new ones with mode 0o700 and rejecting any existing
     ancestor that is a symlink, not a directory, owned by a different
-    uid, or has group/other permission bits set. Wrong-but-repairable
-    modes on dirs we own are reset to 0o700.
+    uid, or has group/other permission bits set where POSIX uid/mode
+    semantics are available. Wrong-but-repairable POSIX modes on dirs we own
+    are reset to 0o700. On Windows, where Python exposes no POSIX uid/mode
+    ownership model, directory protection relies on the OS ACLs instead.
 
     :param target: Final bridge directory path to ensure, e.g.
         ``Path("/tmp/omnigent-501/claude-native/abc")``.
@@ -689,7 +705,8 @@ def _ensure_secure_dir(target: Path) -> None:
     if cur != trusted_parent:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
-    my_uid = getattr(os, "getuid", lambda: -1)()
+    getuid = getattr(os, "getuid", None)
+    my_uid = getuid() if getuid is not None else None
     for ancestor in ancestors:
         try:
             os.mkdir(ancestor, mode=0o700)
@@ -701,13 +718,45 @@ def _ensure_secure_dir(target: Path) -> None:
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
         if not stat.S_ISDIR(st.st_mode):
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if st.st_uid != my_uid:
+        if my_uid is not None and st.st_uid != my_uid:
             raise RuntimeError(
                 f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
                 f"{st.st_uid}, not current user ({my_uid})"
             )
-        if (st.st_mode & 0o077) != 0:
+        if my_uid is not None and (st.st_mode & 0o077) != 0:
             os.chmod(ancestor, 0o700)
+
+
+def acp_mcp_bridge_root() -> Path:
+    """Bridge root for the headless ACP harnesses' Omnigent-MCP relay.
+
+    Shares the uid-scoped temp parent with claude-native
+    (``$TMPDIR/omnigent-<uid>/acp-mcp``). Used by the acp / goose / qwen
+    executors' ``OmnigentAcpMcp`` relay so ``serve-mcp``'s bridge dir passes the
+    :func:`_trusted_parent_for_bridge_dir` secure-root check.
+
+    :returns: The ACP-MCP bridge root directory (not created here).
+    """
+    return _BRIDGE_ROOT_PARENT / "acp-mcp"
+
+
+def prepare_acp_mcp_bridge_dir() -> Path:
+    """Create a fresh, secure per-relay bridge dir for an ACP harness.
+
+    Returns a unique owner-only directory under :func:`acp_mcp_bridge_root` with
+    a minimal token-only ``bridge.json`` — so the shared ``serve-mcp`` serves
+    ONLY the relay tools (no raw ``sys_os_*`` filesystem tools; the ACP agent
+    owns those). The caller's relay writes ``tool_relay.json`` here and points
+    ``serve-mcp`` at the directory.
+
+    :returns: The prepared bridge directory path.
+    """
+    bridge_dir = acp_mcp_bridge_root() / secrets.token_hex(8)
+    _ensure_secure_dir(bridge_dir)
+    config_path = bridge_dir / _CONFIG_FILE
+    if not config_path.exists():
+        _write_json_file(config_path, {"token": secrets.token_urlsafe(32)})
+    return bridge_dir
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -1015,6 +1064,26 @@ def read_permission_hook_config(bridge_dir: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def update_permission_hook_auth_headers(
+    bridge_dir: Path,
+    headers: dict[str, str],
+) -> bool:
+    """Atomically replace the permission hook's server auth headers.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param headers: Fresh server request headers.
+    :returns: ``True`` when the hook config existed and was updated.
+    """
+    path = bridge_dir / _PERMISSION_HOOK_FILE
+    payload = _read_json_file(path)
+    if not payload:
+        return False
+    payload["ap_auth_headers"] = dict(headers)
+    payload["updated_at"] = time.time()
+    _write_json_file(path, payload)
+    return True
+
+
 def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> dict[str, Any]:
     """
     Build the Claude Code MCP config for the Omnigent bridge server.
@@ -1053,6 +1122,9 @@ def build_hook_settings(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    launch_model: str | None = None,
+    launch_permission_mode: str | None = None,
+    launch_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Build invocation-local Claude Code hook settings.
@@ -1072,6 +1144,15 @@ def build_hook_settings(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param launch_model: Effective launch model from ``--model``. Mirrored
+        into the invocation-local settings sidecar so a wrapped Claude Code
+        re-exec that preserves ``--settings`` but rebuilds argv cannot fall
+        back to the user's global default model.
+    :param launch_permission_mode: Effective launch permission mode from
+        ``--permission-mode``. Mirrored into ``permissions.defaultMode``
+        for the same re-exec hardening.
+    :param launch_effort: Effective launch effort from ``--effort``.
+        Mirrored into ``effortLevel`` for restart/re-exec parity.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -1257,6 +1338,12 @@ def build_hook_settings(
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
     settings: dict[str, Any] = {"hooks": hooks}
+    if launch_model:
+        settings["model"] = launch_model
+    if launch_permission_mode:
+        settings["permissions"] = {"defaultMode": launch_permission_mode}
+    if launch_effort and launch_effort in CLAUDE_EFFORTS:
+        settings["effortLevel"] = launch_effort
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
     # Override Claude Code's statusLine so we receive its stdin (the
@@ -1312,6 +1399,8 @@ def augment_claude_args(
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    append_system_prompt: str | None = None,
+    allowed_tools: tuple[str, ...] = (),
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1344,6 +1433,10 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
+    :param append_system_prompt: Optional framework-owned instructions to
+        append through Claude Code's native ``--append-system-prompt`` flag.
+    :param allowed_tools: Optional narrowly scoped Claude tool names to merge
+        into ``--allowedTools`` without replacing the user's allowlist.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -1353,8 +1446,12 @@ def augment_claude_args(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=api_key_helper,
+        launch_model=_arg_value(claude_args, "--model"),
+        launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
+        launch_effort=_arg_value(claude_args, "--effort"),
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
+    args = _merge_allowed_tools(args, allowed_tools)
     args.extend(
         [
             "--mcp-config",
@@ -1363,6 +1460,8 @@ def augment_claude_args(
             json.dumps(hook_settings, separators=(",", ":")),
         ]
     )
+    if append_system_prompt:
+        args.extend(["--append-system-prompt", append_system_prompt])
     args.extend(
         claude_native_skill_args(
             bundle_dir,
@@ -1370,6 +1469,54 @@ def augment_claude_args(
             skills_filter=skills_filter,
         )
     )
+    return args
+
+
+def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
+    """Return the effective CLI flag value from ``args``.
+
+    Supports both ``--flag value`` and ``--flag=value`` spellings. When a
+    flag appears more than once, the last valid occurrence wins, matching the
+    usual CLI precedence for repeated long options.
+
+    :param args: Claude CLI args, e.g. ``("--model", "sonnet")``.
+    :param flag: Long flag to read, e.g. ``"--model"``.
+    :returns: The flag value, or ``None`` when absent/empty.
+    """
+    joined_prefix = f"{flag}="
+    value: str | None = None
+    for idx, arg in enumerate(args):
+        if arg.startswith(joined_prefix):
+            candidate = arg[len(joined_prefix) :]
+            if candidate:
+                value = candidate
+            continue
+        if arg == flag and idx + 1 < len(args):
+            candidate = args[idx + 1]
+            if candidate and not candidate.startswith("--"):
+                value = candidate
+    return value
+
+
+def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
+    """Merge framework-approved tools into Claude's ``--allowedTools`` flag.
+
+    :param args: Claude CLI argument list to mutate-and-return.
+    :param extra: Tool names Omnigent may call without an interactive prompt.
+    :returns: ``args`` with a deduplicated, order-preserving allowlist.
+    """
+    if not extra:
+        return args
+    try:
+        idx = args.index("--allowedTools")
+    except ValueError:
+        args.extend(["--allowedTools", ",".join(extra)])
+        return args
+    value_idx = idx + 1
+    if value_idx >= len(args):
+        return args
+    existing = [tool for tool in args[value_idx].split(",") if tool]
+    args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
     return args
 
 
@@ -2464,6 +2611,11 @@ def inject_user_message(
     # Ctrl-U only clears backwards from cursor.
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
+    # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
+    # Claude Code TUI treats them as user text instead of invoking a state
+    # that Omnigent cannot drive. Allowed commands (``/clear``,
+    # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
+    injected_text = _escape_unsupported_slash_command(content)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -2475,7 +2627,7 @@ def inject_user_message(
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(content + "\n"))
+        paste_file.write(_paste_payload_bytes(injected_text + "\n"))
         paste_path = paste_file.name
     try:
         _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
@@ -2843,25 +2995,59 @@ def _claude_prompt_rendered(pane: str) -> bool:
 
     A mid-turn injection grows the footer with running-state rows (a
     ``○ Explore …`` subagent line, extra spinners) that can push ``❯``
-    past that window. To reach it without also matching a scrollback
-    echo, a glyph in the wider :data:`_PROMPT_SCAN_TAIL_LINES_FRAMED`
-    window counts only when it's framed by a box rule — the ``────``
-    closing line the live input box always renders below ``❯`` but a
-    bare echoed prompt never has.
+    past that window — arbitrarily far, since a subagent fan-out adds one
+    row per concurrent subagent. To reach it at any depth without also
+    matching a scrollback echo, a glyph above the window counts only when
+    it's framed by a box rule — the ``────`` closing line the live input
+    box always renders below ``❯`` but a bare echoed prompt never has.
+
+    A bare ``❯`` on a selected numbered menu row is not the chat input. A
+    numbered line with an input-box rule below it still counts, however: the
+    readiness gate runs before every injection, so a restored composer draft
+    may legitimately begin with text such as ``2. buy milk``.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when the input box appears mounted.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    if any(_CLAUDE_PROMPT_GLYPH in line for line in non_empty[-_PROMPT_SCAN_TAIL_LINES:]):
-        return True
-    # Deeper in the tail, trust the glyph only when a box rule sits below
+    tail_start = max(0, len(non_empty) - _PROMPT_SCAN_TAIL_LINES)
+    for idx in range(tail_start, len(non_empty)):
+        line = non_empty[idx]
+        if _CLAUDE_PROMPT_GLYPH not in line:
+            continue
+        if not _is_selected_menu_row(line) or any(
+            _is_box_rule(rule) for rule in non_empty[idx + 1 :]
+        ):
+            return True
+    # Above that window, trust the glyph only when a box rule sits below
     # it — the live input box's closing frame, absent from scrollback.
-    tail = non_empty[-_PROMPT_SCAN_TAIL_LINES_FRAMED:]
-    for idx, line in enumerate(tail):
-        if _CLAUDE_PROMPT_GLYPH in line and any(_is_box_rule(rule) for rule in tail[idx + 1 :]):
+    # The footer height scales with concurrent subagents (a fan-out of
+    # ``○ Explore …`` rows), so no fixed window can bound it; the box rule
+    # is a reliable structural signal at any depth, and `capture-pane -p`
+    # returns only the visible pane, so this stays within one screen.
+    for idx, line in enumerate(non_empty):
+        if _CLAUDE_PROMPT_GLYPH not in line:
+            continue
+        if any(_is_box_rule(rule) for rule in non_empty[idx + 1 :]):
             return True
     return False
+
+
+def _is_selected_menu_row(line: str) -> bool:
+    """
+    Return whether a ``❯`` line is a selected numbered menu row.
+
+    Claude Code's startup menus (e.g. the "Detected a custom API key"
+    confirmation) mark the highlighted choice with the same ``❯`` glyph the
+    chat input uses (``❯ 2. No (recommended)``). The readiness scan must not
+    treat such a row as the chat composer, or the first message gets typed
+    into the menu. A chat prompt never renders a numbered choice after the
+    glyph, so the ``<glyph> <digit>.`` shape distinguishes them.
+
+    :param line: A single pane line, e.g. ``"❯ 2. No (recommended)"``.
+    :returns: ``True`` when the line is a selected numbered menu choice.
+    """
+    return bool(_SELECTED_MENU_ROW_RE.match(line.strip()))
 
 
 def _is_box_rule(line: str) -> bool:
@@ -2992,25 +3178,47 @@ def _wait_for_claude_prompt_ready(
     :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
     :returns: None.
     :raises RuntimeError: If the prompt never renders within
-        *timeout_s* (Claude failed to boot). The message carries the
-        tail of the captured pane (see :func:`_format_terminal_failure_tail`)
-        so Claude Code's own startup output surfaces in the caller's error.
+        *timeout_s* (Claude failed to boot). The message carries a poll
+        count, how many of those polls saw an empty capture, and the tail
+        of the last non-empty capture the loop actually observed (see
+        :func:`_format_terminal_failure_tail`) so the true failure mode —
+        a startup crash, a torn/empty capture under a mid-turn repaint, or
+        a box that never appeared — is diagnosable from the error alone.
     """
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if _claude_prompt_rendered(_capture_pane(socket_path, tmux_target)):
+    polls = 0
+    empty_polls = 0
+    # Keep the last non-empty capture the loop actually saw, not a fresh
+    # capture taken after the deadline. A post-timeout re-capture can show
+    # a different (often healthier-looking) frame than any decision the
+    # loop made — e.g. the input box repainting just as the turn settles —
+    # which misrepresents why the gate failed. Attaching what was observed
+    # while it mattered keeps the error honest.
+    last_nonempty = ""
+    # Poll at least once even at timeout_s=0: a single readiness check is
+    # still meaningful, and it guarantees a capture to attach on failure.
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        if pane.strip():
+            last_nonempty = pane
+        else:
+            empty_polls += 1
+        if _claude_prompt_rendered(pane):
             return
+        if time.monotonic() >= deadline:
+            break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    # Timed out: Claude Code never rendered its input prompt. Capture the
-    # pane one last time and attach its tail so the real cause — often a
-    # startup crash like a ``JSON Parse error`` — surfaces in the web UI
-    # error banner this raises into, instead of only a generic timeout
-    # the user has to open the terminal to diagnose.
-    pane = _capture_pane(socket_path, tmux_target)
+    # Timed out. The poll/empty-capture counts separate the failure modes:
+    # mostly-empty captures point at a torn read under a busy repaint (the
+    # session is alive but capture-pane came back blank); non-empty captures
+    # with no box point at Claude never rendering the prompt (a boot crash,
+    # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     raise RuntimeError(
         f"Claude Code terminal did not become ready within {timeout_s}s "
-        "(input prompt never rendered). The message was not delivered."
-        + _format_terminal_failure_tail(pane)
+        f"(input prompt never rendered in {polls} polls, "
+        f"{empty_polls} empty captures). The message was not delivered."
+        + _format_terminal_failure_tail(last_nonempty)
     )
 
 
@@ -4198,6 +4406,11 @@ _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-std
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 _BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 _BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+_TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
+    "<task-notification>",
+    "<task-id>",
+    "</task-notification>",
+)
 
 # Markers that prefix a ``role=user`` record produced by Claude
 # Code's CLI scaffolding (not user-typed content). ``<command-
@@ -4267,6 +4480,67 @@ _CLAUDE_CLI_SURFACED_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
+# Slash commands that Omnigent lets a user type directly into the native
+# Claude Code terminal. Anything not in this set or not a skill is sent
+# as plain text so Claude Code's TUI does not enter an unsupported state
+# (menu, login prompt, exit, etc.) that Omnigent cannot drive.
+_CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS: frozenset[str] = (
+    _CLAUDE_CLI_SURFACED_COMMANDS | frozenset({"branch", "fork"})
+)
+
+
+def _first_slash_command_name(content: str) -> str | None:
+    """
+    Return the name of a leading ``/<name>`` slash command, if any.
+
+    Leading whitespace is ignored; the command ends at the first
+    whitespace character. Returns ``None`` when the content does not
+    begin with a slash command.
+    """
+    stripped = content.lstrip()
+    if not stripped.startswith("/"):
+        return None
+    remainder = stripped[1:]
+    match = re.match(r"(\S+)", remainder)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _escape_slash_command_text(content: str) -> str:
+    """
+    Return *content* escaped so it is treated as plain user text.
+
+    Inserts a zero-width no-break space (U+FEFF) immediately before the
+    leading slash. Claude Code sees a non-slash first character, so the
+    input is submitted as a regular message, while the user still sees
+    their original slash.
+    """
+    match = re.match(r"^(\s*)(/)(.*)$", content, re.DOTALL)
+    if not match:
+        return content
+    return f"{match.group(1)}\ufeff{match.group(2)}{match.group(3)}"
+
+
+def _escape_unsupported_slash_command(content: str) -> str:
+    """
+    Escape built-in UI slash commands that Omnigent cannot drive.
+
+    If the message starts with a known dropped Claude Code command
+    (e.g. ``/help``, ``/exit``), escapes it so Claude treats it as
+    regular text. Allowed commands (``/clear``, ``/model``, ``/fork``,
+    skills, etc.) pass through unchanged.
+    """
+    name = _first_slash_command_name(content)
+    if name is None:
+        return content
+    if name in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS:
+        return content
+    if name not in _CLAUDE_CLI_DROPPED_COMMANDS:
+        # Unknown name: likely a skill; let Claude Code handle it.
+        return content
+    return _escape_slash_command_text(content)
+
 
 @dataclass(frozen=True)
 class _SlashCommandPayload:
@@ -4312,6 +4586,13 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     stdout_match = _COMMAND_STDOUT_RE.search(content)
     output = stdout_match.group(1) if stdout_match else None
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
+
+
+def _is_task_notification_text(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("<task-notification>") and all(
+        marker in stripped for marker in _TASK_NOTIFICATION_REQUIRED_MARKERS
+    )
 
 
 def _local_command_transcript_items_from_entry(
@@ -4448,6 +4729,35 @@ def _user_transcript_items_from_entry(
     content = message.get("content") if isinstance(message, dict) else None
     source_key = _transcript_source_key(entry, line_number, record_offset)
     fallback_response_id = _response_id_from_source(source_key)
+
+    # ``isCompactSummary: true`` is the continuation-summary user record
+    # Claude writes right after it compacts its own context. It is the
+    # reliable, always-present compaction signal (the post-compaction
+    # ``SessionStart source=compact`` hook that normally persists the
+    # boundary is flaky and sometimes never fires). Surface it as a
+    # single flagged ``message`` item carrying the summary text so the
+    # forwarder can persist a durable compaction boundary instead of
+    # rendering the summary verbatim as a user bubble. Only the flag and
+    # text matter downstream — skip the slash/terminal/scaffolding
+    # detection the ordinary user path runs.
+    if entry.get("isCompactSummary") is True:
+        summary_text = content if isinstance(content, str) else _summary_text_from_blocks(content)
+        return (
+            current_response_id,
+            [
+                ClaudeTranscriptItem(
+                    source_id=_source_id(source_key, 0, "compact_summary"),
+                    item_type="message",
+                    data={
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": summary_text}],
+                    },
+                    response_id=fallback_response_id,
+                    is_compact_summary=True,
+                )
+            ],
+        )
+
     items: list[ClaudeTranscriptItem] = []
 
     if isinstance(content, str):
@@ -4508,6 +4818,20 @@ def _user_transcript_items_from_entry(
         # of leaking as user bubbles.
         if any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS):
             return current_response_id, []
+        if _is_task_notification_text(content):
+            items.append(
+                ClaudeTranscriptItem(
+                    source_id=_source_id(source_key, 0, "message"),
+                    item_type="message",
+                    data={
+                        "role": "user",
+                        "is_meta": True,
+                        "content": [{"type": "input_text", "text": content}],
+                    },
+                    response_id=fallback_response_id,
+                )
+            )
+            return None, items
         items.append(
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, 0, "message"),
@@ -4546,6 +4870,22 @@ def _user_transcript_items_from_entry(
             if "<command-name>" in stripped or any(
                 stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
             ):
+                continue
+            if _is_task_notification_text(text):
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, item_index, "message"),
+                        item_type="message",
+                        data={
+                            "role": "user",
+                            "is_meta": True,
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                        response_id=fallback_response_id,
+                    )
+                )
+                item_index += 1
+                saw_user_text = True
                 continue
             user_blocks.append({"type": "input_text", "text": text})
             saw_user_text = True
@@ -4718,9 +5058,60 @@ def _assistant_message_item(
     )
 
 
+def _stripped_image_placeholder(source: dict[str, Any]) -> str:
+    """
+    Build the placeholder text for a stripped inline image block.
+
+    Names the media type when known and points the agent back at the
+    originating tool call, so it can re-read the file to view the image
+    again instead of the data being silently lost.
+
+    :param source: The image block's ``source`` dict, e.g.
+        ``{"type": "base64", "media_type": "image/png", "data": ...}``.
+    :returns: Human/agent-readable placeholder string.
+    """
+    media_type = source.get("media_type")
+    label = f"{media_type} image" if isinstance(media_type, str) and media_type else "image"
+    return (
+        f"[{label} omitted from history to save context — "
+        "re-run the tool call above (e.g. Read the same path) to view it again]"
+    )
+
+
+def _strip_inline_image_data(value: Any) -> Any:
+    """
+    Replace base64 image payloads with a lightweight placeholder.
+
+    Walks list/dict tool-result content and rewrites any Anthropic
+    ``{"type": "image", "source": {"type": "base64", ...}}`` block to a
+    short text block, dropping the base64 ``data``. A single Read of an
+    image returns a full-resolution base64 PNG; serialized verbatim it
+    costs hundreds of thousands of tokens and is replayed as prompt text
+    on every resume, overflowing the context window and wedging
+    compaction. The model cannot use raw base64 as text anyway, and the
+    placeholder points back at the tool call so the image stays
+    recoverable on demand. Non-image content is returned unchanged.
+
+    :param value: Decoded tool-result content (list, dict, or scalar).
+    :returns: The same structure with image base64 data removed.
+    """
+    if isinstance(value, list):
+        return [_strip_inline_image_data(item) for item in value]
+    if isinstance(value, dict):
+        source = value.get("source")
+        if value.get("type") == "image" and isinstance(source, dict):
+            return {"type": "text", "text": _stripped_image_placeholder(source)}
+        return {key: _strip_inline_image_data(val) for key, val in value.items()}
+    return value
+
+
 def _tool_result_output(entry: dict[str, Any], block: dict[str, Any]) -> str:
     """
     Return the UI-facing output string for a Claude tool result.
+
+    Inline base64 image data (e.g. from reading an image file) is
+    stripped to a placeholder so the stored output stays small and can
+    be replayed on resume without overflowing the context window.
 
     :param entry: Decoded Claude transcript record containing
         optional ``toolUseResult`` metadata.
@@ -4731,12 +5122,12 @@ def _tool_result_output(entry: dict[str, Any], block: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     if content is not None:
-        return json.dumps(content, separators=(",", ":"))
+        return json.dumps(_strip_inline_image_data(content), separators=(",", ":"))
     tool_use_result = entry.get("toolUseResult")
     if isinstance(tool_use_result, str):
         return tool_use_result
     if tool_use_result is not None:
-        return json.dumps(tool_use_result, separators=(",", ":"))
+        return json.dumps(_strip_inline_image_data(tool_use_result), separators=(",", ":"))
     return ""
 
 
@@ -4805,6 +5196,34 @@ def _source_id(source_key: str, item_index: int, item_type: str) -> str:
     :returns: Stable source id string.
     """
     return f"{source_key}:{item_index}:{item_type}"
+
+
+def _summary_text_from_blocks(content: Any) -> str:
+    """
+    Join the text of a compact-summary record's content blocks.
+
+    A Claude ``isCompactSummary`` record usually carries its summary as
+    a plain string, but the JSONL format may also ship list-form
+    ``[{"type": "text", "text": ...}]`` blocks. This flattens the
+    list case to a single string so the compaction summary is preserved
+    regardless of shape.
+
+    :param content: The record's ``message.content`` — a string, a list
+        of content blocks, or anything else.
+    :returns: The concatenated summary text, or ``""`` when no text is
+        present.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts)
 
 
 def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, Any]:

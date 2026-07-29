@@ -68,6 +68,43 @@ class NativeCodingAgent:
 
 
 @dataclass(frozen=True)
+class BackgroundTitleGeneratorSpec:
+    """Lazy background-title generator registration for one harness."""
+
+    generator: str
+    resolver_harness: str | None = None
+
+
+@dataclass(frozen=True)
+class NativeHarnessProvider:
+    """Import paths for a native harness's lifecycle hooks.
+
+    ``NativeCodingAgent`` is pure identity data; behavior lives here as a
+    sibling row keyed by the same ``key``. Every value is a dotted import path
+    (``module:attr`` or ``module.attr``) resolved lazily at dispatch time via
+    :mod:`omnigent.native_dispatch`, so building the registry never imports the
+    runner / CLI / native-harness stack. Optional hooks are ``None`` when the
+    behavior is not yet a module-level function the resolver can reach (e.g.
+    interrupt/stop handlers that are still runner closures, or the inline
+    spawn-env dispatch); those hubs migrate onto the seam in later phases.
+    """
+
+    key: str  # matches NativeCodingAgent.key
+    run_native: str  # CLI + resume launch entry point
+    auto_create_terminal: str  # runner terminal builder
+    spawn_env_builder: str | None = None
+    # Session-label key carrying this harness's bridge id, when its spawn-env
+    # builder takes a ``bridge_id=`` kwarg resolved from session labels
+    # (codex/opencode/antigravity). ``None`` for bare builders and for harnesses
+    # whose bridge id resolves through a different path (e.g. claude).
+    bridge_id_label_key: str | None = None
+    interrupt_handler: str | None = None
+    stop_handler: str | None = None
+    materialize_agent_spec: str | None = None  # built-in agent seeding
+    bridge_dir: str | None = None  # cost-popup bridge-dir lookup
+
+
+@dataclass(frozen=True)
 class HarnessContribution:
     """One package's harness registry contribution."""
 
@@ -77,10 +114,14 @@ class HarnessContribution:
     aliases: dict[str, str] = field(default_factory=dict)
     native_harnesses: frozenset[str] = frozenset()
     native_agents: tuple[NativeCodingAgent, ...] = ()
+    native_providers: tuple[NativeHarnessProvider, ...] = ()
     install_specs: dict[str, HarnessInstallSpec] = field(default_factory=dict)
     harness_install_keys: dict[str, str] = field(default_factory=dict)
     model_env_keys: dict[str, str] = field(default_factory=dict)
     spawn_env_builders: dict[str, str] = field(default_factory=dict)
+    background_title_generators: dict[str, BackgroundTitleGeneratorSpec] = field(
+        default_factory=dict
+    )
     missing_install_package: dict[str, str] = field(default_factory=dict)
     harness_labels: dict[str, str] = field(default_factory=dict)
     # Declared feature set per harness id ("what can this harness do?"). Sparse
@@ -196,6 +237,60 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
     harness="hermes-native",
     wrapper_label=HERMES_NATIVE_WRAPPER_VALUE,
     terminal_name="hermes",
+)
+
+
+# Native harnesses whose spawn-env builder takes a ``bridge_id=`` resolved from
+# a session label. Their label key follows the uniform
+# ``omnigent.<key>_native.bridge_id`` pattern (pinned against the real bridge
+# constants in tests/test_harness_plugins.py). Claude also carries a bridge id
+# but resolves it through a runner helper with a server-side fallback, so it is
+# handled as a spawn-env special case rather than a plain label read.
+_BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "antigravity"})
+
+
+def _builtin_native_provider(key: str) -> NativeHarnessProvider:
+    """Build a built-in provider row from the ``omnigent.<key>_native`` module.
+
+    The built-in native harnesses follow a uniform module layout: each exports
+    ``run_<key>_native`` (CLI + resume launch) and ``_materialize_<key>_agent_spec``
+    (agent seeding), re-exports ``_auto_create_<key>_terminal`` from
+    ``omnigent.runner.native``, and exposes ``build_<key>_native_spawn_env`` in
+    ``omnigent.<key>_native_bridge``. The remaining hooks (interrupt, stop,
+    bridge-dir) are still runner-local closures / inline dispatch, so they stay
+    ``None`` until those hubs migrate onto the seam.
+    """
+    module = f"omnigent.{key}_native"
+    return NativeHarnessProvider(
+        key=key,
+        run_native=f"{module}:run_{key}_native",
+        auto_create_terminal=f"omnigent.runner.native:_auto_create_{key}_terminal",
+        spawn_env_builder=f"{module}_bridge:build_{key}_native_spawn_env",
+        bridge_id_label_key=(f"{module}.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None),
+        materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
+    )
+
+
+# Behavior side-channel for the built-in native agents. One row per
+# NativeCodingAgent above, keyed by the same ``key``; resolved lazily so this
+# module stays import-light. See designs/harness-modular-registry-proposal.md
+# (Phase 1). Populated uniformly because every built-in native harness shares
+# the omnigent.<key>_native module layout.
+_BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
+    _builtin_native_provider(agent.key)
+    for agent in (
+        CLAUDE_NATIVE_CODING_AGENT,
+        CODEX_NATIVE_CODING_AGENT,
+        PI_NATIVE_CODING_AGENT,
+        OPENCODE_NATIVE_CODING_AGENT,
+        CURSOR_NATIVE_CODING_AGENT,
+        KIRO_NATIVE_CODING_AGENT,
+        GOOSE_NATIVE_CODING_AGENT,
+        ANTIGRAVITY_NATIVE_CODING_AGENT,
+        QWEN_NATIVE_CODING_AGENT,
+        KIMI_NATIVE_CODING_AGENT,
+        HERMES_NATIVE_CODING_AGENT,
+    )
 )
 
 
@@ -417,6 +512,20 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    # Generic ACP harness — drives any user-configured ACP agent command. Same
+    # profile as goose/qwen (own-auth, cold resume, SSE permission), but its
+    # interrupt IS implemented (ACP ``session/cancel``), not just declared.
+    "acp": _C(
+        _IM.ACP_SUBPROCESS,
+        _EL.SSE_PERMISSION,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    ),
     "goose": _C(
         _IM.ACP_SUBPROCESS,
         _EL.SSE_PERMISSION,
@@ -495,6 +604,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
     valid_harnesses=frozenset(
         {
+            "acp",
             "antigravity",
             "antigravity-native",
             "claude-native",
@@ -521,6 +631,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         }
     ),
     harness_modules={
+        "acp": "omnigent.inner.acp_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
@@ -601,7 +712,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
     ),
+    native_providers=_BUILTIN_NATIVE_PROVIDERS,
     model_env_keys={
+        "acp": "HARNESS_ACP_MODEL",
         "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
         "claude-sdk": "HARNESS_CLAUDE_SDK_MODEL",
         "codex": "HARNESS_CODEX_MODEL",
@@ -613,6 +726,21 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "pi": "HARNESS_PI_MODEL",
         "qwen": "HARNESS_QWEN_MODEL",
     },
+    background_title_generators={
+        "claude-sdk": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.sdk:generate_background_title"
+        ),
+        "claude-native": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.claude_native:generate_background_title",
+            resolver_harness="claude-sdk",
+        ),
+        "codex": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.sdk:generate_background_title"
+        ),
+        "codex-native": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.codex_native:generate_background_title"
+        ),
+    },
     harness_labels={
         "antigravity": "Antigravity",
         "claude-sdk": "Claude SDK",
@@ -620,7 +748,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "Copilot",
         "cursor": "Cursor",
         "hermes": "Hermes",
-        "openai-agents": "OpenAI Agents SDK",
+        # openai-agents is intentionally omitted from the picker catalog: it
+        # stays a valid harness for YAML specs (and the credential-free
+        # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
     },
     capabilities=_BUILTIN_CAPABILITIES,
@@ -644,6 +774,7 @@ def _community_paths(contribution: HarnessContribution) -> list[str]:
     paths: list[str] = []
     paths.extend(contribution.harness_modules.values())
     paths.extend(contribution.spawn_env_builders.values())
+    paths.extend(spec.generator for spec in contribution.background_title_generators.values())
     return paths
 
 
@@ -656,6 +787,7 @@ def _harness_spellings(contribution: HarnessContribution) -> set[str]:
         | set(contribution.native_harnesses)
         | set(contribution.harness_install_keys)
         | set(contribution.model_env_keys)
+        | set(contribution.background_title_generators)
         | set(contribution.missing_install_package)
         | set(contribution.harness_labels)
         | set(contribution.capabilities)
@@ -733,6 +865,17 @@ def _validate_community_contribution(
         )
 
     allowed_targets = set(contribution.valid_harnesses)
+    for harness, spec in contribution.background_title_generators.items():
+        if harness not in allowed_targets:
+            return (
+                f"community harness plugin {entry_point_name!r} registers background "
+                f"titles for undeclared harness {harness!r}"
+            )
+        if spec.resolver_harness is not None and spec.resolver_harness not in allowed_targets:
+            return (
+                f"community harness plugin {entry_point_name!r} background title resolver "
+                f"{spec.resolver_harness!r} is not contributed by the plugin"
+            )
     for alias, target in contribution.aliases.items():
         if target not in allowed_targets:
             return (
@@ -828,6 +971,22 @@ def native_agents() -> tuple[NativeCodingAgent, ...]:
     return tuple(agents)
 
 
+def native_providers() -> tuple[NativeHarnessProvider, ...]:
+    """Return native-harness behavior provider rows, merged across contributions."""
+    providers: list[NativeHarnessProvider] = []
+    for contribution in plugin_state().contributions:
+        providers.extend(contribution.native_providers)
+    return tuple(providers)
+
+
+def native_provider_for_key(key: str) -> NativeHarnessProvider | None:
+    """Return the provider row whose ``key`` matches, or ``None``."""
+    for provider in native_providers():
+        if provider.key == key:
+            return provider
+    return None
+
+
 def harness_modules() -> dict[str, str]:
     """Return runtime harness module mapping, aliases included."""
     modules = _merge_dict("harness_modules")
@@ -846,6 +1005,11 @@ def model_env_keys() -> dict[str, str]:
 def spawn_env_builders() -> dict[str, str]:
     """Return harness-to-spawn-env-builder import paths."""
     return _merge_dict("spawn_env_builders")
+
+
+def background_title_generators() -> dict[str, BackgroundTitleGeneratorSpec]:
+    """Return harness-to-background-title-generator registrations."""
+    return _merge_dict("background_title_generators")
 
 
 def install_specs() -> dict[str, HarnessInstallSpec]:
@@ -883,11 +1047,20 @@ def harness_catalog() -> list[dict[str, Any]]:
 
     Each row carries ``id`` and ``label``; rows for harnesses with declared
     capabilities also carry a ``capabilities`` object (see
-    :meth:`HarnessCapabilities.as_dict`), so the ``/v1/harnesses`` catalog can
-    surface the feature matrix to clients.
+    :meth:`HarnessCapabilities.as_dict`). ``setup_steps`` lists the ordered
+    requirements to get the harness ready on a host (install + auth), so the
+    web UI can render a "set up this agent" checklist that mirrors
+    ``omnigent setup``; the host reports each step's status in its readiness map.
     """
     labels = harness_labels()
     capabilities = harness_capabilities()
+    # Lazy import for the same reason as the acp rows below: keep this registry
+    # importable without pulling in the onboarding/config stack at module load.
+    try:
+        from omnigent.onboarding.harness_install import ui_setup_steps
+    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+        _logger.debug("setup-step metadata unavailable", exc_info=True)
+        ui_setup_steps = None  # type: ignore[assignment]
     rows: list[dict[str, Any]] = []
     for harness in sorted(labels, key=lambda key: labels[key].lower()):
         if harness not in valid_harnesses():
@@ -896,8 +1069,55 @@ def harness_catalog() -> list[dict[str, Any]]:
         capability = capabilities.get(harness)
         if capability is not None:
             row["capabilities"] = capability.as_dict()
+        if ui_setup_steps is not None:
+            row["setup_steps"] = [step.as_dict() for step in ui_setup_steps(harness)]
         rows.append(row)
+
+    # Dynamic rows: one per user-configured generic-ACP agent, id ``acp:<slug>``.
+    # The base ``acp`` harness deliberately has no ``harness_labels`` entry, so it
+    # is not a standalone picker row — only the configured agents surface. Read
+    # lazily so importing this registry never pulls in the onboarding/config
+    # stack, and never let a malformed ``acp:`` block break the whole catalog.
+    acp_capability = capabilities.get("acp")
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents
+
+        for agent in acp_agents():
+            acp_row: dict[str, Any] = {"id": f"acp:{agent.slug}", "label": agent.name}
+            if acp_capability is not None:
+                acp_row["capabilities"] = acp_capability.as_dict()
+            rows.append(acp_row)
+    except Exception:  # noqa: BLE001 — a malformed acp: block must never break the catalog
+        _logger.debug("acp catalog rows skipped", exc_info=True)
     return rows
+
+
+def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, Any]]]:
+    """Map every harness spelling to its ordered UI setup steps.
+
+    The web setup dialog looks steps up by the harness a *session* declares —
+    which is often a native wrapper (``codex-native``) or an installable id
+    that is not a picker row (``opencode``/``qwen``), neither of which appears
+    in :func:`harness_catalog`. Keying by spelling here lets the dialog resolve
+    steps for whatever id it holds. Values mirror ``harness_catalog``'s
+    ``setup_steps`` (same :func:`ui_setup_steps` source), so the two can't
+    drift.
+
+    :returns: ``{spelling: [step.as_dict(), ...]}`` for every accepted spelling;
+        empty when the onboarding stack can't be imported (fail-open).
+    """
+    try:
+        from omnigent.onboarding.harness_install import ui_installable_harnesses, ui_setup_steps
+    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+        _logger.debug("setup-step metadata unavailable", exc_info=True)
+        return {}
+    # Cover the picker ids (catalog rows) plus every installable spelling
+    # (bare + native), so a session's declared harness always resolves.
+    spellings: set[str] = set(valid_harnesses())
+    spellings.update(ui_installable_harnesses())
+    return {
+        spelling: [step.as_dict() for step in ui_setup_steps(spelling)] for spelling in spellings
+    }
 
 
 def load_object(import_path: str) -> Any:

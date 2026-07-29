@@ -102,6 +102,32 @@ def _strip_trailing_slash(host: str) -> str:
     return host.rstrip("/")
 
 
+def _databricks_sdk_importable() -> bool:
+    """
+    Report whether the ``databricks-sdk`` Python package can be imported.
+
+    The SDK ships only in the ``databricks`` / ``all`` install extras,
+    not the base install. When it is absent, the OAuth resolution path
+    (:func:`_try_resolve_via_sdk`) is unavailable and the resolver can
+    only see plaintext ``token`` profiles. Callers use this to tailor
+    the failure message: "install the extra" vs. "fix your OAuth
+    session".
+
+    :returns: ``True`` when ``databricks.sdk.config`` actually imports,
+        else ``False``.
+    """
+    # A real import (not importlib.util.find_spec): find_spec can return
+    # a spec for an SDK whose transitive deps are missing, and can even
+    # raise on a partial ``databricks`` install where the ``sdk``
+    # subpackage is absent. Import-and-catch matches what the resolver
+    # itself does and never escapes as an uncaught error.
+    try:
+        import databricks.sdk.config  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def _databrickscfg_path() -> Path:
     """
     Return the path to the Databricks config file.
@@ -145,16 +171,45 @@ class _SectionPresentButInvalid(Exception):
     """
 
 
+class _SectionNeedsSdk(Exception):
+    """
+    Raised by :func:`_read_section` when a named section EXISTS and is
+    a well-formed OAuth profile (a non-``pat`` ``auth_type`` and no
+    static ``token``) that the raw configparser path cannot resolve.
+
+    Such a profile is NOT malformed — a missing ``token`` is expected
+    for OAuth. Only the SDK path (:func:`_try_resolve_via_sdk`) can
+    mint a bearer for it, and reaching this fallback means that path
+    already failed. Signaling this separately from
+    :class:`_SectionPresentButInvalid` lets the resolver emit an
+    honest, actionable error rather than telling the user to "fix or
+    remove" a perfectly valid profile.
+
+    Carries the offending section's ``auth_type`` so the resolver can
+    tailor remediation: ``databricks-cli`` (OAuth-U2M) is fixed with
+    ``databricks auth login``, whereas other SDK-only auth types
+    (``azure-cli``, metadata-service, etc.) are not.
+    """
+
+    def __init__(self, message: str, auth_type: str) -> None:
+        super().__init__(message)
+        self.auth_type = auth_type
+
+
 def _read_section(config: configparser.ConfigParser, section: str) -> WorkspaceCreds | None:
     """
     Read ``host`` and ``token`` from a named section of a parsed config.
 
-    Three outcomes for named (non-DEFAULT) sections:
+    Four outcomes for named (non-DEFAULT) sections:
 
     - Section absent → raises :class:`_SectionAbsent`.
     - Section present and complete → returns :class:`WorkspaceCreds`.
-    - Section present but missing ``host`` or ``token`` → raises
-      :class:`_SectionPresentButInvalid`.
+    - Section present, no static ``token``, but a non-``pat``
+      ``auth_type`` (an OAuth profile) → raises
+      :class:`_SectionNeedsSdk`. Not malformed — just unresolvable by
+      this plaintext path.
+    - Section present but missing ``host`` or ``token`` with no OAuth
+      ``auth_type`` → raises :class:`_SectionPresentButInvalid`.
 
     For ``DEFAULT``: absent or incomplete → returns ``None`` (no
     further fallback exists).
@@ -167,8 +222,11 @@ def _read_section(config: configparser.ConfigParser, section: str) -> WorkspaceC
         has both fields, or ``None`` for an absent/incomplete
         ``[DEFAULT]``.
     :raises _SectionAbsent: When a named section does not exist.
+    :raises _SectionNeedsSdk: When the section is a well-formed OAuth
+        profile (non-``pat`` ``auth_type``, no static ``token``) that
+        only the SDK path can resolve.
     :raises _SectionPresentButInvalid: When the section exists but
-        is missing ``host`` or ``token``.
+        is missing ``host`` or ``token`` and is not an OAuth profile.
     """
     # ConfigParser exposes DEFAULT via .defaults(); named sections via
     # __getitem__. Read via the appropriate API to avoid accidentally
@@ -205,6 +263,13 @@ def _read_section(config: configparser.ConfigParser, section: str) -> WorkspaceC
     # falls through to None — there's nowhere further to fall back.
     if section == DEFAULT_SECTION:
         return None
+    # An OAuth profile (non-``pat`` auth_type) legitimately has no
+    # static ``token`` — only the SDK path can resolve it. Don't
+    # defame it as malformed; signal separately so the resolver emits
+    # an actionable error about the SDK path having failed.
+    auth_type = values.get("auth_type", "").strip().lower()
+    if host and not token and auth_type and auth_type != "pat":
+        raise _SectionNeedsSdk(f"auth_type={auth_type!r}, no static token", auth_type)
     missing = [k for k in ("host", "token") if not values.get(k)]
     raise _SectionPresentButInvalid(
         f"section [{section}] is missing required field(s) {missing}; "
@@ -312,7 +377,9 @@ def _try_resolve_from_cfg(profile: str | None, cfg_path: Path) -> WorkspaceCreds
        to ``[DEFAULT]`` (which could be a different workspace).
     3. If the named section is PRESENT but missing required fields,
        :class:`_SectionPresentButInvalid` propagates — same fail-loud
-       treatment.
+       treatment. Exception: a well-formed OAuth profile (non-``pat``
+       ``auth_type``, no static ``token``) raises :class:`_SectionNeedsSdk`
+       instead, since it is not malformed — only the SDK path resolves it.
     4. If ``profile`` is ``None``, skip straight to ``[DEFAULT]``.
 
     :param profile: The profile name to look up, e.g. ``"dev"``.
@@ -428,6 +495,41 @@ def resolve_databricks_workspace(profile: str | None) -> WorkspaceCreds:
             "Check that the section name matches exactly (case-sensitive) "
             "and that the file exists."
         ) from None
+    except _SectionNeedsSdk as exc:
+        # Well-formed SDK-only profile the plaintext path can't resolve.
+        # Reaching here means the SDK path (step 1) already failed. The
+        # fix differs by cause: if databricks-sdk isn't even installed
+        # (it lives in the `databricks` extra, not the base install),
+        # tell the user to install it; otherwise the SDK is present but
+        # couldn't complete auth.
+        if not _databricks_sdk_importable():
+            remediation = (
+                "the databricks-sdk package is not installed — it ships in the "
+                "`databricks` extra, not the base install. Reinstall with the extra "
+                "(e.g. `pip install 'omnigent[databricks]'`, or `uv run --extra "
+                "databricks ...`) so this profile can be resolved."
+            )
+        elif exc.auth_type == "databricks-cli":
+            # OAuth-U2M: the CLI-managed session is the thing to refresh.
+            remediation = (
+                "the databricks-sdk path could not mint a token for it. Ensure the "
+                "`databricks` CLI is installed and on PATH, and that the OAuth "
+                f"session is valid (run `databricks auth login --profile "
+                f"{effective_profile}`). See the cli-*.log for the underlying SDK error."
+            )
+        else:
+            # Other SDK-only auth types (azure-cli, metadata-service,
+            # oauth-m2m, etc.) — `databricks auth login` does NOT apply.
+            remediation = (
+                "the databricks-sdk path could not mint a token for it. Ensure the "
+                f"credentials for auth_type={exc.auth_type!r} are valid and available "
+                "in this environment. See the cli-*.log for the underlying SDK error."
+            )
+        raise OSError(
+            f"Databricks profile [{effective_profile}] in {cfg_path} is a token-less "
+            f"profile ({exc}) that only the databricks-sdk can resolve, and "
+            f"{remediation}"
+        ) from exc
     except _SectionPresentButInvalid as exc:
         raise OSError(
             f"Databricks profile [{effective_profile}] in {cfg_path} is malformed: {exc}"

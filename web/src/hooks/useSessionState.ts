@@ -14,9 +14,7 @@
 import type { Conversation } from "@/hooks/useConversations";
 
 export type SessionState =
-  | { kind: "awaiting"; count: number }
-  | { kind: "running" }
-  | { kind: "unseen" };
+  { kind: "awaiting"; count: number } | { kind: "running" } | { kind: "unseen" };
 
 export function getSessionState(
   conversation: Pick<Conversation, "status" | "pending_elicitations_count"> | undefined | null,

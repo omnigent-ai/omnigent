@@ -322,7 +322,7 @@ async def test_two_arg_callable_receives_config() -> None:
     policy = FunctionPolicy(spec, fn)
     await policy.evaluate(
         EvaluationContext(phase=Phase.REQUEST, content="x"),
-        {"labels": {"integrity": "1"}, "conversation_id": "conv_42"},
+        {"labels": {"integrity": "1"}, "conversation_id": "27516b8b4fee85f40b55fac38c353546"},
     )
     # The callable observed the spec's static config, not the
     # engine's runtime label/conversation bundle.

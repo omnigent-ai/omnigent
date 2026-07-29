@@ -384,6 +384,8 @@ def _resp(status: int, location: str | None = None) -> httpx.Response:
     ("response", "expected"),
     [
         (_resp(401), True),
+        # Databricks Apps returns 403 "Invalid Token" for an expired bearer.
+        (_resp(403), True),
         (_resp(302, "https://w.example.com/oidc/oauth2/v2.0/authorize"), True),
         (_resp(302, "https://omnigents.example.databricksapps.com/.auth/callback"), True),
         # Unrelated redirect / success must NOT trigger a wasted token round-trip.
@@ -468,7 +470,7 @@ def test_post_evaluate_with_retry_reauths_on_login_redirect(
         reauth_calls.append(1)
         return {"Authorization": "Bearer fresh", "X-Databricks-Org-Id": "o1"}
 
-    resp = post_evaluate_with_retry(
+    resp, error = post_evaluate_with_retry(
         "https://ap/x",
         {"Authorization": "Bearer stale"},
         {"event": {}},
@@ -478,9 +480,57 @@ def test_post_evaluate_with_retry_reauths_on_login_redirect(
     )
 
     assert resp is ok
+    assert error is None
     assert reauth_calls == [1]  # re-minted exactly once
     assert seen_headers[0]["Authorization"] == "Bearer stale"  # first attempt: lapsed token
     assert seen_headers[1]["Authorization"] == "Bearer fresh"  # retry: fresh token
+
+
+def test_post_evaluate_with_retry_reauths_on_403_invalid_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 403 "Invalid Token" re-mints the bearer and retries, returning the verdict.
+
+    Databricks Apps returns 403 (not 401) for an expired bearer. Guards the fix
+    that added 403 to the re-auth signal set alongside 401 and 302→/oidc/.
+    """
+    seen_headers: list[dict[str, str]] = []
+    forbidden = httpx.Response(
+        403,
+        text="Invalid Token",
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=forbidden, ok=ok),
+    )
+    reauth_calls: list[int] = []
+
+    def _reauth() -> dict[str, str]:
+        reauth_calls.append(1)
+        return {"Authorization": "Bearer fresh"}
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x",
+        {"Authorization": "Bearer stale"},
+        {"event": {}},
+        5.0,
+        "evaluate-policy hook",
+        reauth=_reauth,
+    )
+
+    assert resp is ok
+    assert error is None
+    assert reauth_calls == [1]
+    assert seen_headers[0]["Authorization"] == "Bearer stale"
+    assert seen_headers[1]["Authorization"] == "Bearer fresh"
 
 
 def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
@@ -505,8 +555,11 @@ def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
         "Client",
         _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
     )
-    resp = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "evaluate-policy hook")
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 5.0, "evaluate-policy hook"
+    )
     assert resp is None
+    assert error is not None
     assert len(seen_headers) == 1  # one attempt; a 302 is not retried without reauth
 
 
@@ -532,7 +585,7 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
         "Client",
         _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
     )
-    resp = post_evaluate_with_retry(
+    resp, error = post_evaluate_with_retry(
         "https://ap/x",
         {"Authorization": "Bearer stale"},
         {"event": {}},
@@ -541,6 +594,7 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
         reauth=lambda: None,
     )
     assert resp is None
+    assert error is not None
     assert len(seen_headers) == 1  # one attempt only; no retry loop
 
 

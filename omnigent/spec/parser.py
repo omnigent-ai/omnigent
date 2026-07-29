@@ -18,6 +18,8 @@ from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
+    DatabricksProfileBinding,
+    DatabricksProxySpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
     TerminalEnvSpec,
@@ -89,7 +91,14 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS = frozenset({"cost_optimize"})
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+
+# Copy the resolver dict onto the subclass before mutating — it's inherited
+# from SafeLoader by reference, so in-place edits below would strip
+# SafeLoader's bool resolver process-wide.
+_ConfigYamlLoader.yaml_implicit_resolvers = {
+    key: value[:] for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
         (tag, regexp)
@@ -109,6 +118,49 @@ _ConfigYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
     _YAML_1_2_BOOL_RE,
     list("tTfF"),
 )
+
+
+def _parse_int_field(raw: object, field_name: str) -> int:
+    """
+    Coerce an integer config field while rejecting YAML booleans.
+
+    Python treats ``bool`` as a subclass of ``int``. Without this guard,
+    values like ``false`` silently become ``0`` for fields such as
+    ``executor.max_iterations``.
+    """
+    if isinstance(raw, bool):
+        raise OmnigentError(
+            f"{field_name} must be an integer, got boolean {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise OmnigentError(
+            f"{field_name} must be an integer, got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
+def _parse_float_field(raw: object, field_name: str) -> float:
+    """
+    Coerce a numeric config field while rejecting YAML booleans.
+
+    ``float(True)`` becomes ``1.0`` in Python, which is not a useful
+    interpretation for timing and threshold fields.
+    """
+    if isinstance(raw, bool):
+        raise OmnigentError(
+            f"{field_name} must be a number, got boolean {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise OmnigentError(
+            f"{field_name} must be a number, got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
 
 
 def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
@@ -151,7 +203,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     raw_tools = raw.get("tools")
     llm = _parse_llm(raw_llm, expand_env=expand_env)
     interaction = _parse_interaction(raw.get("interaction"))
-    tools_config = _parse_tools_config(raw_tools)
+    tools_config = _parse_tools_config(raw_tools, expand_env=expand_env)
     executor = _parse_executor(raw_executor, expand_env=expand_env)
     # ── Consolidate llm: → executor ────────────────────────────────
     # ``executor.model`` and ``executor.connection`` are the primary
@@ -299,9 +351,34 @@ def _parse_llm(
         connection = expand_env_vars(raw_dict) if expand_env else raw_dict
     profile_raw = raw.get("profile")
     profile = str(profile_raw) if profile_raw is not None else None
-    request_timeout = int(raw["request_timeout"]) if "request_timeout" in raw else 300
+    request_timeout = (
+        _parse_int_field(raw["request_timeout"], "llm.request_timeout")
+        if "request_timeout" in raw
+        else 300
+    )
     retry = _parse_retry(raw.get("retry"))
-    reserved = {"model", "connection", "profile", "request_timeout", "retry"}
+    fallback_models_raw = raw.get("fallback_models")
+    if fallback_models_raw is None:
+        fallback_models = []
+    elif isinstance(fallback_models_raw, list):
+        fallback_models = [str(m) for m in fallback_models_raw]
+    else:
+        # A non-list value (e.g. a bare string) is almost certainly a
+        # config typo — a bare string would iterate per-character, so
+        # reject it loudly rather than silently dropping the fallbacks.
+        _log.warning(
+            "llm.fallback_models must be a list, got %s; ignoring it",
+            type(fallback_models_raw).__name__,
+        )
+        fallback_models = []
+    reserved = {
+        "model",
+        "connection",
+        "profile",
+        "request_timeout",
+        "retry",
+        "fallback_models",
+    }
     extra = {k: v for k, v in raw.items() if k not in reserved}
     return LLMConfig(
         model=str(model),
@@ -310,6 +387,7 @@ def _parse_llm(
         profile=profile,
         request_timeout=request_timeout,
         retry=retry,
+        fallback_models=fallback_models,
     )
 
 
@@ -346,6 +424,8 @@ def _parse_interaction(
 
 def _parse_tools_config(
     raw: dict[str, Any] | None,
+    *,
+    expand_env: bool = True,
 ) -> ToolsConfig:
     """
     Parse the ``tools:`` block from config.yaml into a
@@ -360,9 +440,9 @@ def _parse_tools_config(
     """
     if raw is None:
         return ToolsConfig()
-    timeout = int(raw["timeout"]) if "timeout" in raw else 60
+    timeout = _parse_int_field(raw["timeout"], "tools.timeout") if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
-    builtins = _parse_builtin_tools(raw.get("builtins", []))
+    builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
     return ToolsConfig(
         agents=raw.get("agents", []),
@@ -386,7 +466,7 @@ def _parse_sandbox_config(
 
         sandbox:
           container_image: python:3.12-slim
-          container_runtime: podman  # optional, defaults to docker
+          container_runtime: podman  # optional, defaults to OMNIGENT_CONTAINER_RUNTIME or docker
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).
@@ -394,20 +474,23 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
-    runtime = raw.get("container_runtime", "docker")
-    if runtime not in ("docker", "podman"):
-        raise ValueError(
-            f"Unsupported container_runtime {runtime!r}; expected 'docker' or 'podman'."
-        )
     image = raw.get("container_image") or raw.get("docker_image")
-    return SandboxConfig(
-        container_image=image,
-        container_runtime=runtime,
-    )
+    kwargs: dict[str, Any] = {"container_image": image}
+    if "container_runtime" in raw:
+        runtime = raw["container_runtime"]
+        if runtime not in SandboxConfig.ALLOWED_RUNTIMES:
+            raise ValueError(
+                f"Unsupported container_runtime {runtime!r}; "
+                f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
+            )
+        kwargs["container_runtime"] = runtime
+    return SandboxConfig(**kwargs)
 
 
 def _parse_builtin_tools(
     raw: list[str | dict[str, Any]],
+    *,
+    expand_env: bool = True,
 ) -> list[BuiltinToolConfig]:
     """
     Parse the ``tools.builtins`` list into
@@ -423,6 +506,8 @@ def _parse_builtin_tools(
             engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
 
     :param raw: The raw ``builtins`` list from config.yaml.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        tool-specific config fields. ``False`` keeps literals as-is.
     :returns: A list of :class:`BuiltinToolConfig` instances.
     :raises OmnigentError: If a dict entry is missing ``name``.
     """
@@ -438,7 +523,8 @@ def _parse_builtin_tools(
                     code=ErrorCode.INVALID_INPUT,
                 )
             # Everything except 'name' is tool-specific config.
-            config = {str(k): str(v) for k, v in entry.items() if k != "name"}
+            raw_config = {str(k): str(v) for k, v in entry.items() if k != "name"}
+            config = expand_env_vars(raw_config) if expand_env else raw_config
             result.append(
                 BuiltinToolConfig(
                     name=str(name),
@@ -469,17 +555,27 @@ def _parse_retry(
         return RetryPolicy()
     defaults = RetryPolicy()
     return RetryPolicy(
-        max_retries=int(raw.get("max_retries", defaults.max_retries)),
-        backoff_base_s=float(raw.get("backoff_base_s", defaults.backoff_base_s)),
-        backoff_max_s=float(raw.get("backoff_max_s", defaults.backoff_max_s)),
+        max_retries=_parse_int_field(
+            raw.get("max_retries", defaults.max_retries),
+            "retry.max_retries",
+        ),
+        backoff_base_s=_parse_float_field(
+            raw.get("backoff_base_s", defaults.backoff_base_s),
+            "retry.backoff_base_s",
+        ),
+        backoff_max_s=_parse_float_field(
+            raw.get("backoff_max_s", defaults.backoff_max_s),
+            "retry.backoff_max_s",
+        ),
         jitter=bool(raw.get("jitter", defaults.jitter)),
         timeout_per_request_s=(
-            float(raw["timeout_per_request_s"])
+            _parse_float_field(raw["timeout_per_request_s"], "retry.timeout_per_request_s")
             if raw.get("timeout_per_request_s") is not None
             else defaults.timeout_per_request_s
         ),
         retryable_status_codes=tuple(
-            int(c) for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
+            _parse_int_field(c, "retry.retryable_status_codes")
+            for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
         ),
     )
 
@@ -512,9 +608,6 @@ def _parse_executor(
     # type. Scalar values are coerced to strings so YAML booleans /
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
-    # Structured keys whose consumer needs the nested shape are kept
-    # verbatim: ``cost_optimize`` is the cost advisor's tier config (a
-    # nested mapping), which ``parse_advisor_config`` reads as a Mapping.
     raw_config = raw.get("config")
     config: dict[str, Any] = {}
     if isinstance(raw_config, dict):
@@ -534,7 +627,9 @@ def _parse_executor(
     if etype == "omnigent" and profile is not None and "profile" not in config:
         config["profile"] = profile
     raw_cw = raw.get("context_window")
-    context_window: int | None = int(raw_cw) if raw_cw is not None else None
+    context_window: int | None = (
+        _parse_int_field(raw_cw, "executor.context_window") if raw_cw is not None else None
+    )
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
     # Parse ``executor.connection:`` — same shape as ``llm.connection:``
@@ -549,8 +644,11 @@ def _parse_executor(
     auth = _parse_executor_auth(raw, expand_env=expand_env)
     return ExecutorSpec(
         type=etype,
-        timeout=int(raw.get("timeout", 3600)),
-        max_iterations=int(raw.get("max_iterations", 1000)),
+        timeout=_parse_int_field(raw.get("timeout", 3600), "executor.timeout"),
+        max_iterations=_parse_int_field(
+            raw.get("max_iterations", 1000),
+            "executor.max_iterations",
+        ),
         profile=profile,
         config=config,
         model=model,
@@ -761,7 +859,10 @@ def _parse_terminals(
             allow_cwd_override=bool(entry.get("allow_cwd_override", False)),
             allow_sandbox_override=bool(entry.get("allow_sandbox_override", False)),
             log_file=entry.get("log_file"),
-            scrollback=int(entry.get("scrollback", 10000)),
+            scrollback=_parse_int_field(
+                entry.get("scrollback", 10000),
+                f"terminals.{name}.scrollback",
+            ),
             session_prefix=str(entry.get("session_prefix", "omni_")),
             tmux_allow_passthrough=bool(entry.get("tmux_allow_passthrough", False)),
             tmux_start_on_attach=bool(entry.get("tmux_start_on_attach", False)),
@@ -829,7 +930,10 @@ def _parse_os_env_sandbox(
             "(Linux) or sandbox.type=darwin_seatbelt (macOS) for hard "
             "network enforcement: those backends restrict network access "
             "at spawn time so the MITM proxy is the only egress path. "
-            f"Got sandbox.type={sandbox_type!r}.",
+            f"Got sandbox.type={sandbox_type!r}. "
+            "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
+            "darwin_seatbelt on macOS; do not use sandbox.type=none with "
+            "egress_rules.",
             code=ErrorCode.INVALID_INPUT,
         )
     credential_proxy = _parse_credential_proxy(raw.get("credential_proxy"))
@@ -1202,12 +1306,14 @@ class _CredentialProxyItemModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["https_bearer", "https_basic", "git_https", "gh_basic"]
-    source: _CredentialSourceModel
+    type: Literal["https_bearer", "https_basic", "git_https", "gh_basic", "databricks_cli"]
+    source: _CredentialSourceModel | None = None
     target: str | None = None
     targets: list[str] | None = None
     env: str | None = None
     username: str | None = None
+    profiles: list[str] | None = None
+    default: str | None = None
 
     @field_validator("env")
     @classmethod
@@ -1246,12 +1352,23 @@ class _CredentialProxyItemModel(BaseModel):
         ``targets``; ``gh_basic`` allows neither (it defaults to the
         GitHub git + API hosts) but not both. The ``env`` shim is only
         meaningful for the ``https_*`` primitives, and ``username`` only
-        applies to the Basic schemes.
+        applies to the Basic schemes. ``databricks_cli`` is profile-keyed:
+        it takes ``profiles`` (+ optional ``default``) and none of the
+        host-keyed fields (``source`` is implicit — the profile).
 
         :returns: ``self`` once validated.
         :raises ValueError: On a cardinality violation or a per-type
             option that does not apply.
         """
+        if self.type == "databricks_cli":
+            return self._check_databricks_cli()
+        # The host-keyed types resolve their secret from an explicit source.
+        if self.source is None:
+            raise ValueError("source is required")
+        if self.profiles is not None:
+            raise ValueError(f"{self.type} does not accept 'profiles'")
+        if self.default is not None:
+            raise ValueError(f"{self.type} does not accept 'default'")
         has_target = self.target is not None
         has_targets = self.targets is not None
         if has_targets and not self.targets:
@@ -1265,6 +1382,44 @@ class _CredentialProxyItemModel(BaseModel):
             raise ValueError(f"{self.type} does not accept an 'env' injection shim")
         if self.username is not None and self.type == "https_bearer":
             raise ValueError("https_bearer does not accept a 'username'")
+        return self
+
+    def _check_databricks_cli(self) -> _CredentialProxyItemModel:
+        """
+        Validate a ``databricks_cli`` entry.
+
+        The Databricks CLI is profile-keyed: it takes a non-empty
+        ``profiles`` list and an optional ``default`` (which must be one of
+        the listed profiles). The host-keyed fields (``source`` — resolved
+        from the profile — ``target``/``targets``, ``env``, ``username``)
+        do not apply and are rejected so typos fail loud.
+
+        :returns: ``self`` once validated.
+        :raises ValueError: On a missing/empty/duplicate profile, a
+            ``default`` outside ``profiles``, or a host-keyed field set.
+        """
+        for name, value in (
+            ("source", self.source),
+            ("target", self.target),
+            ("targets", self.targets),
+            ("env", self.env),
+            ("username", self.username),
+        ):
+            if value is not None:
+                raise ValueError(f"databricks_cli does not accept {name!r}")
+        if not self.profiles:
+            raise ValueError("databricks_cli requires a non-empty 'profiles' list")
+        seen: set[str] = set()
+        for profile in self.profiles:
+            if not profile or not profile.strip():
+                raise ValueError("databricks_cli 'profiles' entries must be non-empty strings")
+            if profile in seen:
+                raise ValueError(f"databricks_cli lists profile {profile!r} more than once")
+            seen.add(profile)
+        if self.default is not None and self.default not in self.profiles:
+            raise ValueError(
+                f"databricks_cli 'default' {self.default!r} must be one of 'profiles'"
+            )
         return self
 
 
@@ -1338,6 +1493,9 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
     if not raw:
         return None
     entries: list[CredentialProxyEntry] = []
+    databricks_profiles: list[DatabricksProfileBinding] = []
+    databricks_default: str | None = None
+    databricks_seen: set[str] = set()
     for i, item in enumerate(raw):
         try:
             model = _CredentialProxyItemModel.model_validate(item)
@@ -1347,6 +1505,16 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
                 f"{_format_validation_error(exc)}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        if model.type == "databricks_cli":
+            databricks_default = _merge_databricks_cli(
+                model,
+                profiles=databricks_profiles,
+                seen=databricks_seen,
+                current_default=databricks_default,
+                index=i,
+            )
+            continue
+        assert model.source is not None  # guaranteed by the model validator
         source = model.source.to_spec()
         if model.type == "gh_basic":
             entries.extend(_normalize_gh_basic(model, source=source, index=i))
@@ -1356,12 +1524,11 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
             entries.extend(_normalize_https_basic(model, source=source, index=i))
         else:  # git_https
             entries.extend(_normalize_git_https(model, source=source, index=i))
-    if not entries:
-        return None
     # Fail loud on conflicting host bindings. The egress proxy keys its
     # rewrite table by host, so two entries binding the same host would
     # silently last-win (one credential dropped). Reject it at parse time
-    # rather than picking a binding nondeterministically.
+    # rather than picking a binding nondeterministically. (Databricks
+    # hosts are resolved at runtime, so their collision guard lives there.)
     seen_hosts: dict[str, str] = {}
     for entry in entries:
         host_key = entry.host.lower()
@@ -1374,7 +1541,65 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
                 code=ErrorCode.INVALID_INPUT,
             )
         seen_hosts[host_key] = entry.host
-    return CredentialProxySpec(entries=entries)
+    databricks = (
+        DatabricksProxySpec(profiles=databricks_profiles, default=databricks_default)
+        if databricks_profiles
+        else None
+    )
+    if not entries and databricks is None:
+        return None
+    return CredentialProxySpec(entries=entries, databricks=databricks)
+
+
+def _merge_databricks_cli(
+    model: _CredentialProxyItemModel,
+    *,
+    profiles: list[DatabricksProfileBinding],
+    seen: set[str],
+    current_default: str | None,
+    index: int,
+) -> str | None:
+    """
+    Merge one validated ``databricks_cli`` entry into the shared profile list.
+
+    Multiple ``databricks_cli`` entries are allowed and coalesced into a
+    single :class:`DatabricksProxySpec`. Profile names must be unique
+    across every entry (each profile maps to one materialized cfg section
+    and one workspace-host binding), and at most one ``default`` may be
+    declared in total.
+
+    :param model: The validated entry; ``profiles`` is non-empty and
+        ``default`` (if set) is one of them.
+    :param profiles: Accumulator of bindings, mutated in place.
+    :param seen: Accumulator of profile names already claimed.
+    :param current_default: The default declared by a prior entry, or
+        ``None``.
+    :param index: Entry index for error messages.
+    :returns: The (possibly updated) default profile name.
+    :raises OmnigentError: On a duplicate profile across entries or a
+        second conflicting ``default``.
+    """
+    assert model.profiles is not None  # guaranteed by the model validator
+    for profile in model.profiles:
+        if profile in seen:
+            raise OmnigentError(
+                f"os_env.sandbox.credential_proxy[{index}] lists Databricks "
+                f"profile {profile!r} which is already proxied by another "
+                "databricks_cli entry; each profile may appear once.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        seen.add(profile)
+        profiles.append(DatabricksProfileBinding(profile=profile))
+    if model.default is not None:
+        if current_default is not None and current_default != model.default:
+            raise OmnigentError(
+                "os_env.sandbox.credential_proxy declares conflicting "
+                f"databricks_cli defaults ({current_default!r} and "
+                f"{model.default!r}); declare at most one default profile.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return model.default
+    return current_default
 
 
 def _credential_proxy_macos_unsupported_reason(
@@ -1400,16 +1625,30 @@ def _credential_proxy_macos_unsupported_reason(
     the original ``type`` keeps this check independent of how the presets
     normalize into bindings.
 
+    ``databricks_cli`` fails on macOS for the same reason — the ``databricks``
+    CLI is also a Go binary — so it is rejected here too.
+
     :param credential_proxy: Parsed credential-proxy spec, or ``None`` when the
         ``credential_proxy:`` field is absent.
     :param sandbox_type: Resolved sandbox backend, e.g. ``"darwin_seatbelt"``
         (macOS) or ``"linux_bwrap"`` (Linux).
     :returns: A human-readable rejection message when a ``gh_basic`` (i.e. a
-        ``token``-scheme) binding is configured on ``darwin_seatbelt``, else
-        ``None``.
+        ``token``-scheme) binding or a ``databricks_cli`` policy is configured
+        on ``darwin_seatbelt``, else ``None``.
     """
     if credential_proxy is None or sandbox_type != "darwin_seatbelt":
         return None
+    if credential_proxy.databricks is not None:
+        return (
+            "os_env.sandbox.credential_proxy type 'databricks_cli' does not work "
+            "on macOS (sandbox.type=darwin_seatbelt). The 'databricks' CLI is a Go "
+            "binary, and Go on macOS verifies TLS against the system keychain "
+            "(Security.framework) and ignores SSL_CERT_FILE -- the environment "
+            "variable the egress MITM proxy uses to publish its CA to sandboxed "
+            "tools. Every 'databricks' call would fail with 'certificate is not "
+            "trusted'. Use sandbox.type=linux_bwrap (Go honors SSL_CERT_FILE on "
+            "Linux)."
+        )
     if not any(entry.scheme == "token" for entry in credential_proxy.entries):
         return None
     return (
@@ -1666,8 +1905,14 @@ def _parse_compaction(
     if raw is None:
         return None
     return CompactionConfig(
-        trigger_threshold=float(raw.get("trigger_threshold", 0.8)),
-        recent_window=int(raw.get("recent_window", 5)),
+        trigger_threshold=_parse_float_field(
+            raw.get("trigger_threshold", 0.8),
+            "compaction.trigger_threshold",
+        ),
+        recent_window=_parse_int_field(
+            raw.get("recent_window", 5),
+            "compaction.recent_window",
+        ),
     )
 
 
@@ -2367,7 +2612,11 @@ def _parse_http_mcp_server(
             expand_env_vars(raw.get("headers", {})) if expand_env else raw.get("headers", {})
         ),
         description=raw.get("description"),
-        timeout=int(raw["timeout"]) if "timeout" in raw else None,
+        timeout=(
+            _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
+            if "timeout" in raw
+            else None
+        ),
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
     )
 
@@ -2459,7 +2708,11 @@ def _parse_stdio_mcp_server(
         args=[str(a) for a in raw_args],
         env={str(k): str(v) for k, v in env.items()},
         description=raw.get("description"),
-        timeout=int(raw["timeout"]) if "timeout" in raw else None,
+        timeout=(
+            _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
+            if "timeout" in raw
+            else None
+        ),
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
     )
 
@@ -2632,13 +2885,7 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
     :raises OmnigentError: On non-integer or non-positive
         values.
     """
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise OmnigentError(
-            f"guardrails.ask_timeout must be an integer, got {raw!r}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+    value = _parse_int_field(raw, "guardrails.ask_timeout")
     if value <= 0:
         raise OmnigentError(
             "guardrails.ask_timeout must be > 0 "
@@ -3218,13 +3465,7 @@ def _parse_policy_ask_timeout(
     """
     if raw is None:
         return None
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `ask_timeout` must be an integer, got {raw!r}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+    value = _parse_int_field(raw, f"policy {policy_name!r}: `ask_timeout`")
     if value <= 0:
         raise OmnigentError(
             f"policy {policy_name!r}: `ask_timeout` must be > 0 "

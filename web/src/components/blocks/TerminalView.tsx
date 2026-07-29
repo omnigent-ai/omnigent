@@ -13,6 +13,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { resolveWebSocketUrl } from "@/lib/host";
+import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import {
+  readTerminalThemeMode,
+  resolveTerminalIsDark,
+  subscribeTerminalTheme,
+  type TerminalThemeMode,
+} from "@/lib/terminalThemePreferences";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -106,7 +113,15 @@ export function TerminalView({
   // (reset the budget) from "re-dial died straight away" (burn it).
   const connectedAtRef = useRef<number | null>(null);
   const { resolvedTheme } = useTheme();
-  const isDark = resolvedTheme === "dark";
+  // Terminal theme is independent of the app theme: "auto" follows the app's
+  // resolved appearance, while "light"/"dark" pin the terminal. Reading the
+  // pref as state (seeded at mount, updated via the pub/sub) lets a Settings
+  // change re-theme a live terminal through the existing setTheme effect below.
+  const [terminalMode, setTerminalMode] = useState<TerminalThemeMode>(() =>
+    readTerminalThemeMode(),
+  );
+  useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
+  const isDark = resolveTerminalIsDark(terminalMode, resolvedTheme === "dark");
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
   // reconnect the WebSocket on every theme change).
@@ -214,6 +229,18 @@ export function TerminalView({
     sessionRef.current?.setTheme(isDark);
   }, [isDark]);
 
+  // Push code-font changes (Settings → Appearance) into the live session the
+  // same way — xterm is a fixed-pixel widget, so it can't follow a CSS variable
+  // like the chrome font and must be told imperatively. The subscription
+  // outlives individual re-dials (sessionRef is swapped in place), and a fresh
+  // session reads the current pref at construction, so a change made while
+  // disconnected still lands on reconnect.
+  useEffect(() => {
+    return subscribeCodeFont((font) => {
+      sessionRef.current?.setFont(font.sizePx, font.family);
+    });
+  }, []);
+
   // Auto-reconnect on transport-level drops (background-tab freezes,
   // server restarts — see isUnexpectedTerminalClose). Deliberate
   // closes keep the dead-end overlay so a terminal the server ended
@@ -278,6 +305,7 @@ export function TerminalView({
       data-testid="terminal-view"
       data-state={state.kind}
       data-terminal-id={terminalId}
+      data-terminal-theme={isDark ? "dark" : "light"}
       className="relative flex min-h-0 flex-1 flex-col"
     >
       {/* `p-1` lives on the wrapper, not the xterm mount node: FitAddon

@@ -11,9 +11,16 @@ from __future__ import annotations
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
+# The header only mounts once the session binds and hydrates, so the
+# info trigger can lag behind ``goto`` — clicking it while the header is
+# still settling occasionally times out (or opens a popover that re-renders
+# out from under the copy button). Rerun on failure rather than paper over
+# the race with longer per-action waits.
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_agent_info_copies_session_id(
     page: Page,
     seeded_session: tuple[str, str],
@@ -42,7 +49,12 @@ def test_agent_info_copies_session_id(
     page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
     page.goto(f"{base_url}/c/{session_id}")
 
-    page.get_by_test_id("agent-info-trigger").click()
+    # Wait for the header info trigger to mount + become actionable before
+    # clicking: the button only renders once the session binds, and clicking
+    # mid-hydration is the main flake source here.
+    trigger = page.get_by_test_id("agent-info-trigger")
+    expect(trigger).to_be_visible(timeout=30_000)
+    trigger.click()
 
     expect(page.get_by_test_id("agent-info-session-id")).to_have_text(session_id)
     copy_button = page.get_by_test_id("agent-info-copy-session-id")

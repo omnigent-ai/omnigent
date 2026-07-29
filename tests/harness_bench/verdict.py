@@ -1,10 +1,4 @@
-"""Verdict vocabulary, priorities, and the observed-vs-declared reconciler.
-
-The verdicts map onto the glyphs of the hand-maintained harness support
-matrix so a rendered bench report reads like the spreadsheet it replaces,
-plus two operational states (``SKIPPED``) and the drift alarm (``DRIFT``)
-that the spreadsheet cannot express.
-"""
+"""Verdict types and observed-versus-declared reconciliation."""
 
 from __future__ import annotations
 
@@ -57,10 +51,7 @@ _GLYPHS: dict[Verdict, str] = {
     Verdict.DRIFT: "!!",
 }
 
-# Verdicts that assert a concrete, comparable fact. Reconciliation only
-# fires drift when BOTH sides are concrete — an UNKNOWN/SKIPPED on either
-# side means we never claimed or never observed, so there is nothing to
-# disagree about.
+# Unknown or skipped results cannot establish drift.
 _CONCRETE: frozenset[Verdict] = frozenset(
     {Verdict.SUPPORTED, Verdict.UNSUPPORTED, Verdict.PARTIAL, Verdict.NOT_APPLICABLE}
 )

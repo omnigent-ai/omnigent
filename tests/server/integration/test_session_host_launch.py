@@ -31,6 +31,8 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -53,7 +55,7 @@ from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_weblaunch_test"
+_HOST_ID = "c2d81b1a6812ae1cf32221c5a2a70ba0"
 _WORKSPACE = "/work/repo"
 
 
@@ -341,6 +343,56 @@ async def _wait_for_launch(
                 continue
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
+                return frame
+    except asyncio.TimeoutError:
+        return None
+    return None
+
+
+async def _answer_runner_status_then_wait_for_launch(
+    comm: ApplicationCommunicator,
+    *,
+    status: str,
+    budget_s: float,
+) -> HostLaunchRunnerFrame | None:
+    """Reply to a ``host.runner_status`` query, then return the launch frame.
+
+    Models the host-owned liveness race: reads the host's outbound frames
+    (skipping interleaved pings), answers the first
+    :class:`HostRunnerStatusFrame` with *status* so the dispatch gate's
+    query resolves, and then returns the first
+    :class:`HostLaunchRunnerFrame` the relaunch sends. Used to prove that a
+    ``dead``/``unknown`` verdict cuts the connect grace short — the launch
+    arrives well inside *budget_s* even though the grace is much longer.
+
+    :param comm: Connected host communicator.
+    :param status: Verdict to answer the query with (``"alive"`` /
+        ``"dead"`` / ``"unknown"``).
+    :param budget_s: Seconds to wait on each receive, e.g. ``2.0``.
+    :returns: The launch frame the relaunch sent, or ``None`` if none
+        arrived within the budget.
+    """
+    answered = False
+    try:
+        for _ in range(40):
+            output = await comm.receive_output(timeout=budget_s)
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostRunnerStatusFrame) and not answered:
+                answered = True
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostRunnerStatusResultFrame(
+                                request_id=frame.request_id,
+                                status=status,
+                            )
+                        ),
+                    }
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
                 return frame
     except asyncio.TimeoutError:
         return None
@@ -674,7 +726,7 @@ async def _stop_host_session(
 
     :param client: Test HTTP client.
     :param comm: Connected host communicator.
-    :param session_id: Session to stop, e.g. ``"conv_abc123"``.
+    :param session_id: Session to stop, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     :returns: The ``runner_id`` the host was told to stop.
     """
     from omnigent.runtime import set_runner_client
@@ -855,6 +907,75 @@ async def test_stopped_host_session_message_relaunches_runner(
     )
 
 
+async def test_host_reports_runner_unknown_skips_connect_grace(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host verdict of ``unknown`` relaunches without burning the grace.
+
+    This is the host-restart / non-sticky-Stop case: the runner is gone
+    (the host has no record of it), so the pinned ``runner_id`` will never
+    connect. With a generously long connect grace, the ``host.runner_status``
+    query must race the wait and cut it short — the ``host.launch_runner``
+    relaunch has to arrive far inside the grace window, not after it.
+
+    The grace is set to 5s while the launch is expected within a 2s
+    per-receive budget: comfortably longer than the sub-second query
+    round-trip but far shorter than the full grace, so a regression that
+    reinstated the blind wait (ignoring the verdict) would blow the budget
+    and fail here.
+
+    Mutation check: make the dispatch gate ignore the ``dead``/``unknown``
+    verdict (always wait the full grace) and the launch arrives ~5s later —
+    ``_answer_runner_status_then_wait_for_launch`` times out and returns
+    ``None``, failing the assertion.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    # Long grace: a blind wait would take this long; the verdict must beat it.
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 5.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    # No runner client resolves: the message path enters the grace/relaunch
+    # block, where the liveness race runs.
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    )
+    try:
+        launch_frame = await _answer_runner_status_then_wait_for_launch(
+            comm, status="unknown", budget_s=2.0
+        )
+    finally:
+        # No runner ever connects, so the post would otherwise ride the
+        # ~30s relaunch wait — cancel once we've seen the launch frame.
+        post_task.cancel()
+        # return_exceptions drains the cancelled POST without re-raising.
+        await asyncio.gather(post_task, return_exceptions=True)
+
+    assert launch_frame is not None, (
+        "an 'unknown' host verdict must cut the connect grace short and "
+        "relaunch immediately; no host.launch_runner arrived within the "
+        "budget, so the dispatch gate is still waiting out the full grace"
+    )
+    assert launch_frame.workspace == _WORKSPACE
+    # The relaunch mints a fresh runner_id (runner_id rotation itself is
+    # pinned by test_stopped_host_session_message_relaunches_runner); here
+    # the point is purely that the verdict cut the grace short.
+    assert launch_frame.binding_token, "relaunch frame should carry a fresh binding token"
+
+
 async def test_host_session_message_relaunches_offline_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -999,7 +1120,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     async def _staged_get_runner_client(sid: str, router: object) -> httpx.AsyncClient | None:
         """Simulate the pinned runner becoming routable during grace.
 
-        :param sid: Session id being routed, e.g. ``"conv_abc123"``.
+        :param sid: Session id being routed, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
         :param router: Real app runner router (unused in this staged
             resolver).
         :returns: ``None`` first, then the fake runner client.
@@ -1162,7 +1283,7 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
         """Return the fake runner after the relaunch helper runs.
 
         :param session_id_arg: Session id being routed, e.g.
-            ``"conv_abc123"``.
+            ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
         :param runner_router_arg: Real app runner router (unused here).
         :param tunnel_registry_arg: Real app tunnel registry (unused here).
         :param runner_id: Relaunched runner id expected to connect.
@@ -1230,6 +1351,165 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     )
     # The handshake targets this session (proves it's the real init call,
     # not an unrelated POST): the body carries the session id.
+    assert init_bodies and init_bodies[0]["session_id"] == session_id, (
+        f"handshake body should target session {session_id!r}; got {init_bodies!r}"
+    )
+
+
+async def test_codex_goal_relaunch_posts_session_init_before_goal_event(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opening the Goal dialog on a slept Codex-native session runs the
+    session-init handshake (POST /v1/sessions) on the woken runner BEFORE
+    forwarding the goal control event.
+
+    Codex goal state lives in the Codex app-server bridge, which only
+    exists after ``create_session`` runs on the runner. When the Goal
+    dialog wakes a host-bound session whose runner had slept, the goal
+    route relaunches a runner and must run the session-init handshake
+    first — otherwise the goal event lands on a runner with no bridge and
+    is lost. This is the codex-goal sibling of
+    ``test_relaunch_posts_session_init_before_forwarding_message``; the
+    invariant (handshake precedes the forward) is the same, only the
+    triggering path differs.
+
+    The runner-resolution helpers are staged so the route deterministically
+    enters its relaunch branch: no live runner, no already-bound runner,
+    a successful host launch, and a relaunched runner that resolves to the
+    recording client. ``_initialize_codex_goal_runner`` (and the handshake
+    it drives) run for real against that client.
+
+    Regression / mutation check: dropping the ``conversation_store`` arg
+    from the ``_ensure_runner_session_initialized`` call in
+    ``_initialize_codex_goal_runner`` (the exact pre-fix state) makes that
+    call raise ``TypeError`` before any handshake POST — ``runner_paths``
+    loses its ``/v1/sessions`` entry (first assertion fails) and the route
+    500s. Moving the init after the goal-event forward fails the ordering
+    assertion.
+    """
+    from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+    from omnigent.server.routes.codex import sessions as codex_sessions_module
+
+    # Inline-launch a host-bound session (the goal relaunch path bails early
+    # unless ``conv.host_id`` is set), then mark it codex-native so the goal
+    # route accepts it (``_require_codex_native_goal_session`` keys off this
+    # label). Its runner is treated as slept — the resolution helpers below
+    # are staged to force the relaunch branch.
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session_id, {WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE}
+    )
+
+    # Record runner POSTs in arrival order so we can assert the handshake
+    # precedes the goal-event forward.
+    runner_paths: list[str] = []
+    init_bodies: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Record runner POSTs in arrival order and accept them.
+
+        :param request: Request the server sent to the relaunched runner —
+            a POST to ``/v1/sessions`` (handshake) or
+            ``/v1/sessions/<id>/events`` (goal-event forward).
+        :returns: A 2xx so the route proceeds past each step; the /events
+            reply is a valid ``CodexGoalResponse`` body.
+        """
+        if request.method == "POST":
+            runner_paths.append(request.url.path)
+            if request.url.path == "/v1/sessions":
+                init_bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json={"goal": None})
+        return httpx.Response(200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _no_live_runner(
+        session_id_arg: str, runner_router_arg: object, event: dict[str, Any]
+    ) -> None:
+        """Return ``None`` so the goal route enters its relaunch branch.
+
+        :param session_id_arg: Session being routed (unused; one session).
+        :param runner_router_arg: App runner router (unused — staged here).
+        :param event: Goal control event (unused; branch is unconditional).
+        :returns: ``None``.
+        """
+        del session_id_arg, runner_router_arg, event
+
+    async def _no_bound_runner(**kwargs: Any) -> None:
+        """Report no already-bound runner so a relaunch is attempted.
+
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: ``None``.
+        """
+        del kwargs
+
+    async def _launched(**kwargs: Any) -> str:
+        """Stand in for a successful host launch.
+
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: The runner id expected to connect.
+        """
+        del kwargs
+        return "runner_token_codexgoal"
+
+    async def _relaunched_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        """Return the recording fake runner as the relaunched client.
+
+        :param args: Positional args from the call site (unused).
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: The recording fake runner client.
+        """
+        del args, kwargs
+        return fake_runner
+
+    monkeypatch.setattr(
+        codex_sessions_module, "_forward_session_change_to_runner", _no_live_runner
+    )
+    monkeypatch.setattr(
+        codex_sessions_module, "_wait_for_existing_codex_goal_runner", _no_bound_runner
+    )
+    monkeypatch.setattr(codex_sessions_module, "_start_codex_goal_runner_on_bound_host", _launched)
+    monkeypatch.setattr(codex_sessions_module, "_wait_for_runner_client", _relaunched_client)
+
+    try:
+        resp = await client.put(
+            f"/v1/sessions/{session_id}/codex_goal",
+            json={"objective": "keep tests green"},
+        )
+    finally:
+        # Always close the recording client so a regression can't leak the
+        # AsyncClient / emit unclosed-client warnings.
+        await fake_runner.aclose()
+
+    assert resp.status_code < 300, resp.text
+
+    # Handshake must be recorded AND precede the goal-event forward.
+    # Pre-fix: the missing ``conversation_store`` arg raises TypeError
+    # before the handshake POST, so there is no "/v1/sessions" entry.
+    assert "/v1/sessions" in runner_paths, (
+        f"goal relaunch must POST /v1/sessions (session-init handshake) to the "
+        f"runner before forwarding the goal event; recorded runner POSTs were "
+        f"{runner_paths!r}"
+    )
+    event_paths = [p for p in runner_paths if p.endswith("/events")]
+    assert event_paths, (
+        f"the goal control event should still be forwarded to the runner's "
+        f"/events; recorded runner POSTs were {runner_paths!r}"
+    )
+    assert runner_paths.index("/v1/sessions") < runner_paths.index(event_paths[0]), (
+        f"session-init handshake must precede the goal-event forward so the "
+        f"Codex app-server bridge is loaded first; got order {runner_paths!r}"
+    )
+    # The handshake targets this session (proves it's the real init call).
     assert init_bodies and init_bodies[0]["session_id"] == session_id, (
         f"handshake body should target session {session_id!r}; got {init_bodies!r}"
     )
@@ -1310,3 +1590,206 @@ async def test_health_reports_online_for_host_on_other_replica(
         "registry instead of the hosts DB."
     )
     assert batch.json()["sessions"][session_id]["runner_online"] is False
+
+
+async def _serve_fs_requests(
+    comm: ApplicationCommunicator,
+    workspace_root: str,
+    *,
+    max_frames: int = 60,
+) -> None:
+    """Answer the host's ``host.fs_request`` round-trips from a real dir.
+
+    Runs the production :class:`omnigent.workspace_fs.WorkspaceReader`
+    against ``workspace_root`` — a real on-disk directory the test
+    controls — for each fs request the server proxies, replying with the
+    same ``host.fs_result`` shape the real host daemon sends. This is the
+    fake host standing in for a machine that still holds the workspace on
+    disk after its runner died.
+
+    Runs until cancelled; drive it as a background task while issuing the
+    filesystem requests, then cancel it.
+
+    :param comm: The connected host communicator.
+    :param workspace_root: Absolute path to a real directory to read.
+    :param max_frames: Frame budget so a routing bug fails fast.
+    """
+    from pathlib import Path
+
+    from omnigent.host.frames import HostFsRequestFrame, HostFsResultFrame
+    from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+
+    reader = WorkspaceReader(Path(workspace_root))
+    for _ in range(max_frames):
+        output = await comm.receive_output(timeout=3.0)
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if not isinstance(frame, HostFsRequestFrame):
+            continue
+        params = frame.params or {}
+        try:
+            if frame.op == "list_or_read":
+                payload = reader.list_or_read(
+                    str(params.get("path", "")),
+                    limit=int(params.get("limit", 20)),
+                    after=params.get("after"),
+                    before=params.get("before"),
+                    order=str(params.get("order", "desc")),
+                )
+            elif frame.op == "changes":
+                payload = reader.changes(frame.session_id)
+            elif frame.op == "diff":
+                payload = reader.diff(frame.session_id, str(params.get("path", "")))
+            elif frame.op == "search":
+                payload = reader.search(
+                    str(params.get("q", "")),
+                    include=params.get("include"),
+                    exclude=params.get("exclude"),
+                    limit=int(params.get("limit", 500)),
+                )
+            else:  # pragma: no cover - defensive
+                raise AssertionError(f"unexpected fs op {frame.op!r}")
+        except WorkspaceReaderError as exc:
+            result = HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=exc.status,
+                error_code=exc.code,
+                error=exc.message,
+            )
+        else:
+            result = HostFsResultFrame(request_id=frame.request_id, status="ok", payload=payload)
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(result)})
+
+
+async def test_offline_runner_serves_file_content_and_changes_from_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    tmp_path,
+) -> None:
+    """With the runner offline but the host alive, the filesystem panel
+    is served from the host over the tunnel — no runner, no wake-up.
+
+    End-to-end: a real host over the WS tunnel, a real inline-launched
+    session (host_id + a token-bound runner_id that never connects, so
+    resource access raises ``RUNNER_UNAVAILABLE``), and a real git
+    workspace on disk. Asserts that ``/changes``, the file-content read,
+    and ``/diff`` all return host-served data with the same shapes the
+    runner would return — the passive "agent asleep, files from host"
+    experience. Mutation check: drop the host fallback in
+    ``_fs_get_with_host_fallback`` and every request 503s.
+    """
+    import subprocess
+
+    # A real git workspace on disk: committed baseline + a modification,
+    # so git-mode changes/diff have something to report from disk alone.
+    ws = tmp_path / "hostws"
+    ws.mkdir()
+    env = {
+        **__import__("os").environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@e.com",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@e.com",
+    }
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "hello.txt").write_text("original\n")
+    subprocess.run(["git", "add", "."], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "hello.txt").write_text("changed on disk\n")
+    (ws / "new.txt").write_text("brand new\n")
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    # The inline-launched runner never connected, so its RunnerRouter would
+    # raise RUNNER_UNAVAILABLE (the host-fallback trigger). The test client
+    # runs no lifespan, so install a router that reproduces that signal.
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(self, session_id: str) -> object:
+            del session_id
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    prior_router = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+
+    # The server must fall back to reading the workspace over the still-open
+    # host tunnel.
+    responder = asyncio.create_task(_serve_fs_requests(comm, str(ws)))
+    try:
+        env_id = "default"
+        base = f"/v1/sessions/{session_id}/resources/environments/{env_id}"
+
+        # 1. Changed files: the git working-tree diff, served from disk.
+        changes = await client.get(f"{base}/changes")
+        assert changes.status_code == 200, changes.text
+        by_path = {e["path"]: e for e in changes.json()["data"]}
+        assert by_path["hello.txt"]["status"] == "modified"
+        assert by_path["new.txt"]["status"] == "created"
+
+        # 2. File content: the actual bytes on disk (the bug we fixed —
+        #    an offline runner used to leave this blank).
+        content = await client.get(f"{base}/filesystem/hello.txt")
+        assert content.status_code == 200, content.text
+        body = content.json()
+        assert body["encoding"] == "utf-8"
+        assert body["content"] == "changed on disk\n"
+
+        # 3. Diff: committed baseline vs current on-disk content.
+        diff = await client.get(f"{base}/diff/hello.txt")
+        assert diff.status_code == 200, diff.text
+        assert diff.json()["before"] == "original\n"
+        assert diff.json()["after"] == "changed on disk\n"
+    finally:
+        set_runner_router(prior_router)
+        responder.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await responder
+
+
+async def test_offline_runner_no_host_still_returns_503(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """With the runner offline AND no host connected, the panel 503s.
+
+    The resolver's last link: when neither the runner nor a host can read
+    the workspace, the original runner-offline error surfaces (503) so the
+    client shows its reconnect affordance rather than a blank success.
+    Guards against the fallback masking a genuinely unreachable workspace.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(self, session_id: str) -> object:
+            del session_id
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    prior_router = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+
+    # Drop the host tunnel so no fallback source remains.
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is not None:
+        await asyncio.sleep(0.01)
+
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/default/changes"
+        )
+    finally:
+        set_runner_router(prior_router)
+    assert resp.status_code == 503, resp.text

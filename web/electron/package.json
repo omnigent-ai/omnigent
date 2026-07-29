@@ -1,11 +1,19 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
-  "author": "Databricks, Inc.",
+  "homepage": "https://omnigent.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omnigent-ai/omnigent.git"
+  },
+  "author": {
+    "name": "Databricks, Inc.",
+    "email": "support@omnigent.ai"
+  },
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
@@ -14,7 +22,15 @@
     "build:mac": "electron-builder --mac",
     "build:mac:release": "electron-builder --mac -c.mac.notarize=true",
     "build:linux": "electron-builder --linux",
-    "build:win": "electron-builder --win"
+    "build:win": "electron-builder --win",
+    "build:overlay": "pnpm --filter web run build:overlay",
+    "predev": "pnpm run build:overlay",
+    "prestart": "pnpm run build:overlay",
+    "prebuild": "pnpm run build:overlay",
+    "prebuild:mac": "pnpm run build:overlay",
+    "prebuild:mac:release": "pnpm run build:overlay",
+    "prebuild:linux": "pnpm run build:overlay",
+    "prebuild:win": "pnpm run build:overlay"
   },
   "devDependencies": {
     "electron": "^42.3.2",
@@ -26,12 +42,27 @@
     "directories": {
       "output": "dist"
     },
+    "protocols": [
+      {
+        "name": "Omnigent session link",
+        "schemes": [
+          "omnigent"
+        ]
+      }
+    ],
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://omnigent.ai/_desktop/updates/"
+      }
+    ],
     "afterPack": "build/afterPack.js",
     "files": [
       "src/**/*",
       "setup/**/*",
       "find/**/*",
-      "icons/**/*"
+      "icons/**/*",
+      "overlay/**/*"
     ],
     "extraResources": [
       {
@@ -45,8 +76,8 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "icons/icon.icns",
+      "artifactName": "${productName}-${version}-${arch}-mac.${ext}",
       "identity": "Databricks, Inc. (8RMX4WU6F8)",
-      "provisioningProfile": "signing/omnigent.provisionprofile",
       "hardenedRuntime": true,
       "entitlements": "signing/entitlements.mac.plist",
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
@@ -59,6 +90,12 @@
       "target": [
         "dmg",
         "zip"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://omnigent.ai/_desktop/updates/"
+        }
       ]
     },
     "dmg": {
@@ -85,19 +122,33 @@
     "linux": {
       "icon": "icons/icon.png",
       "category": "Development",
+      "maintainer": "Databricks, Inc. <support@omnigent.ai>",
       "target": [
         "AppImage",
         "deb"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://omnigent.ai/_desktop/updates/"
+        }
       ]
     },
     "win": {
       "icon": "icons/icon.ico",
       "target": [
         "nsis"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://omnigent.ai/_desktop/updates/"
+        }
       ]
     }
   },
   "dependencies": {
-    "js-yaml": "^4.2.0"
+    "electron-updater": "^6.3.9",
+    "js-yaml": "^4.3.0"
   }
 }

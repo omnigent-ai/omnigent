@@ -26,11 +26,13 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
+from omnigent import model_catalog
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
+from .async_utils import run_sync_on_thread
 from .executor import (
     Executor,
     ExecutorConfig,
@@ -53,9 +55,6 @@ from .open_responses_sdk import (
 )
 
 logger = logging.getLogger(__name__)
-
-_OPENAI_AGENTS_DEFAULT_MODEL = "gpt-5.3-codex"
-_DATABRICKS_OPENAI_AGENTS_DEFAULT_MODEL = "databricks-gpt-5-5"
 
 # Total run attempts per turn (1 initial + retries). The Databricks
 # gateway occasionally returns a completed-but-empty turn (status
@@ -434,11 +433,10 @@ def _get_openai_async_client(
     :param databricks_auth_command: Shell command from ucode state that
         prints a bearer token, e.g.
         ``"databricks auth token --host https://example.databricks.com ..."``.
-    :param model: The model name that will be used. When set to a
-        non-Databricks model (i.e. does not start with ``"databricks-"``),
-        both the explicit ``profile`` block and the ambient Databricks
-        credential fallback are skipped — the caller must supply
-        ``OPENAI_API_KEY`` (and optionally ``OPENAI_BASE_URL``) instead.
+    :param model: The model or model-service name that will be used. An
+        explicit ``profile`` selects Databricks regardless of this value.
+        Without a profile, only legacy ``"databricks-"`` names enable
+        ambient Databricks credential fallback.
     :raises DatabricksAuthError: When an explicit ``profile`` is given,
         authentication fails, and no ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY``
         env-var fallbacks are available.
@@ -498,11 +496,11 @@ def _get_openai_async_client(
             **retry_kwargs,
         )
 
-    is_databricks_model = model is None or model.startswith("databricks-")
+    allow_ambient_databricks = model is None or model.startswith("databricks-")
 
-    # Databricks profile auth only applies when the model is Databricks-hosted.
-    # An explicit spec/provider profile wins over ambient env vars.
-    if is_databricks_model and profile:
+    # An explicit Databricks profile is authoritative; model-service names
+    # are opaque Unity Catalog identifiers such as catalog.schema.service.
+    if profile:
         from .databricks_executor import DatabricksAuthError, _resolve_databricks_auth
 
         try:
@@ -547,17 +545,17 @@ def _get_openai_async_client(
     if api_key:
         return AsyncOpenAI(api_key=api_key, **retry_kwargs)
 
-    # Non-Databricks model with no OpenAI credentials — fail loudly rather
-    # than silently routing to the Databricks AI Gateway, which will 404.
-    if not is_databricks_model:
+    # Without an explicit profile, only legacy Databricks model names opt in
+    # to ambient Databricks credentials.
+    if not profile and not allow_ambient_databricks:
         raise ValueError(
-            f"Model {model!r} is not a Databricks-hosted model but no OpenAI "
-            "credentials were found. Set OPENAI_API_KEY (and optionally "
-            "OPENAI_BASE_URL) to use this model, or use a 'databricks-' "
-            "prefixed model name to route through Databricks."
+            f"No provider credentials were configured for model {model!r}. "
+            "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
+            "Databricks profile, or use a 'databricks-' prefixed model name "
+            "for legacy automatic Databricks routing."
         )
 
-    # No profile, no env — final fallback via ambient Databricks credentials.
+    # No env client: use the explicit profile or legacy ambient Databricks auth.
     try:
         from .databricks_executor import _resolve_databricks_auth
 
@@ -1443,15 +1441,15 @@ class OpenAIAgentsSDKExecutor(Executor):
         # cfg.model (per-request /model override; agent name no longer
         # leaks here) wins over the spec default
         # (HARNESS_OPENAI_AGENTS_MODEL → self._model_override).
-        model = (
-            cfg.model
-            or self._model_override
-            or (
-                _DATABRICKS_OPENAI_AGENTS_DEFAULT_MODEL
-                if self._databricks
-                else _OPENAI_AGENTS_DEFAULT_MODEL
+        model = cfg.model or self._model_override
+        if model is None:
+            provider_name = "databricks" if self._databricks else "openai"
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                provider_name,
+                family="openai",
             )
-        )
+            model = resolution.model_id
         agents_sdk = cast(_AgentsSDK, _ensure_agents_sdk())
         session_key = self._session_key(messages)
         try:

@@ -154,6 +154,10 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
         env_var = det.source[1:] if det.source.startswith("$") else det.source
         api_key_ref = f"env:{env_var}"
         vendor = key_provider_endpoint(det.name)
+        # No pinned model by default — the spec / catalog default picks it;
+        # /model then shows "(no model pinned)" rather than a fabricated one.
+        # A companion gateway ``*_MODEL`` env var overrides it below.
+        default_model: str | None = None
         if vendor is not None:
             # A third-party OpenAI-compatible vendor (OpenRouter, …): its
             # OWN base_url + Chat wire, not api.openai.com.
@@ -176,9 +180,25 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
                 env_base_url = getenv_nonempty_with_omnigent_prefix("OPENAI_BASE_URL")
                 if env_base_url is not None:
                     base_url = env_base_url[1]
-        # No pinned model — the spec / catalog default picks it; /model then
-        # shows "(no model pinned)" rather than a fabricated one.
-        return build_key_provider_entry(det.family, base_url, api_key_ref, None, wire_api=wire_api)
+            # An ``ANTHROPIC_API_KEY`` detection honors companion
+            # ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_MODEL`` the same way: an
+            # Anthropic-compatible gateway (LiteLLM, …) issues a gateway-scoped
+            # key that 401s against ``api.anthropic.com`` and serves a non-default
+            # model, so both the endpoint and the model pin must ride the entry —
+            # else native Claude routes to the real API or launches model-less.
+            elif det.family == ANTHROPIC_FAMILY and env_var in (
+                "ANTHROPIC_API_KEY",
+                "OMNIGENT_ANTHROPIC_API_KEY",
+            ):
+                env_base_url = getenv_nonempty_with_omnigent_prefix("ANTHROPIC_BASE_URL")
+                if env_base_url is not None:
+                    base_url = env_base_url[1]
+                env_model = getenv_nonempty_with_omnigent_prefix("ANTHROPIC_MODEL")
+                if env_model is not None:
+                    default_model = env_model[1]
+        return build_key_provider_entry(
+            det.family, base_url, api_key_ref, default_model, wire_api=wire_api
+        )
 
     if det.kind == "local":
         # A self-hosted OpenAI-compatible server (Ollama). ``det.source`` is

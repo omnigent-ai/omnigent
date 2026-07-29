@@ -131,6 +131,51 @@ describe("UserBubble copy button", () => {
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("copy me please"));
   });
 
+  it("falls back to execCommand when the async clipboard is unavailable", async () => {
+    // The iOS webview / non-secure origins expose no navigator.clipboard, which
+    // is exactly where the old direct-writeText guard made this button a silent
+    // no-op. copyText() must fall through to the execCommand path instead.
+    vi.stubGlobal("navigator", {});
+    const realExecCommand = document.execCommand;
+    const execCommand = vi.fn().mockReturnValue(true);
+    document.execCommand = execCommand;
+
+    try {
+      renderBubble(userBubble("copy via fallback"));
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("copy"));
+    } finally {
+      document.execCommand = realExecCommand;
+    }
+  });
+
+  it("shows a toast confirmation on a mobile viewport", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const real = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: /max-width/.test(query),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    const onToast = vi.fn();
+    window.addEventListener("omnigent:toast", onToast);
+
+    try {
+      renderBubble(userBubble("copy me please"));
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      await waitFor(() => expect(onToast).toHaveBeenCalled());
+    } finally {
+      window.removeEventListener("omnigent:toast", onToast);
+      window.matchMedia = real;
+    }
+  });
+
   it("does not render a copy button for an attachments-only message (no text)", () => {
     renderBubble(
       userBubble("", {

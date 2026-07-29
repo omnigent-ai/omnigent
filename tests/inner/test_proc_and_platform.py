@@ -8,11 +8,13 @@ file runs on both Linux CI and a Windows box.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from omnigent import _platform
@@ -42,6 +44,79 @@ def test_default_shell_argv_runs_an_echo() -> None:
     argv = _platform.default_shell_argv("echo omnigent-shell-ok")
     out = subprocess.run(argv, capture_output=True, text=True, check=True)
     assert "omnigent-shell-ok" in out.stdout
+
+
+@pytest.mark.posix_only
+def test_default_interactive_shell_honors_known_shell_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``$SHELL`` naming a known shell that resolves on PATH is kept.
+
+    Returns the basename (not the ``$SHELL`` path) so it stays resolvable
+    when the terminal launches under a runner on a different host.
+    """
+    # Patch shutil.which on the shared module so the function's local
+    # ``import shutil`` sees the fake; make every known shell "installed".
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    for shell_path, expected in (
+        ("/bin/zsh", "zsh"),
+        ("/usr/local/bin/fish", "fish"),
+        ("/bin/bash", "bash"),
+    ):
+        monkeypatch.setenv("SHELL", shell_path)
+        assert _platform.default_interactive_shell() == expected
+
+
+@pytest.mark.posix_only
+def test_default_interactive_shell_falls_back_to_bash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset / unknown / not-on-PATH ``$SHELL`` all fall back to bash."""
+    # Unset $SHELL → bash (known shells resolve on PATH here).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.delenv("SHELL", raising=False)
+    assert _platform.default_interactive_shell() == "bash"
+    # An unknown shell name is never honored, even if on PATH.
+    monkeypatch.setenv("SHELL", "/opt/weird/nushell")
+    assert _platform.default_interactive_shell() == "bash"
+    # A known shell that does not resolve on PATH also falls back.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    assert _platform.default_interactive_shell() == "bash"
+
+
+@pytest.mark.posix_only
+def test_installed_interactive_shells_lists_default_first_then_alternatives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default ($SHELL) leads; installed alternatives follow, deduped."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    # zsh is the default → first; bash/fish follow in offer order; no dupes.
+    assert _platform.installed_interactive_shells() == ["zsh", "bash", "fish"]
+
+
+@pytest.mark.posix_only
+def test_installed_interactive_shells_skips_uninstalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Alternatives that don't resolve on PATH are omitted."""
+    # Only bash and zsh installed; fish absent.
+    monkeypatch.setattr(
+        "shutil.which", lambda name: f"/usr/bin/{name}" if name in {"bash", "zsh"} else None
+    )
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    assert _platform.installed_interactive_shells() == ["bash", "zsh"]
+
+
+@pytest.mark.posix_only
+def test_installed_interactive_shells_always_nonempty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With nothing resolvable the bash fallback is still offered alone."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.delenv("SHELL", raising=False)
+    assert _platform.installed_interactive_shells() == ["bash"]
 
 
 def test_stable_user_id_is_stable_and_path_safe() -> None:
@@ -93,6 +168,10 @@ def test_spawn_kwargs_shape_matches_platform() -> None:
 
 def test_process_alive_is_a_nondestructive_probe() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    # Bind to the live PID so psutil pins its creation time; a recycled PID
+    # after teardown can't masquerade as the reaped child, so the final
+    # liveness check is free of the process_alive(pid) TOCTOU race.
+    handle = psutil.Process(proc.pid)
     try:
         assert _proc.process_alive(proc.pid) is True
         # Probing repeatedly must NOT kill the process (the os.kill(pid, 0)
@@ -102,7 +181,9 @@ def test_process_alive_is_a_nondestructive_probe() -> None:
     finally:
         _proc.kill_tree(proc)
         proc.wait(timeout=5)
-    assert _proc.process_alive(proc.pid) is False
+    # A reaped PID raises NoSuchProcess, which also means it isn't running.
+    with contextlib.suppress(psutil.NoSuchProcess):
+        assert not handle.is_running() or handle.status() == psutil.STATUS_ZOMBIE
 
 
 def test_process_alive_false_for_bogus_pid() -> None:
@@ -112,9 +193,15 @@ def test_process_alive_false_for_bogus_pid() -> None:
 
 def test_terminate_tree_stops_the_process() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    # Bind to the live PID so psutil pins its creation time; a recycled PID
+    # after teardown can't masquerade as the reaped child, so the final
+    # liveness check is free of the process_alive(pid) TOCTOU race.
+    handle = psutil.Process(proc.pid)
     _proc.terminate_tree(proc, grace=5)
     proc.wait(timeout=5)
-    assert _proc.process_alive(proc.pid) is False
+    # A reaped PID raises NoSuchProcess, which also means it isn't running.
+    with contextlib.suppress(psutil.NoSuchProcess):
+        assert not handle.is_running() or handle.status() == psutil.STATUS_ZOMBIE
 
 
 # --------------------------------------------------------------------------
@@ -269,3 +356,100 @@ def test_host_runner_env_lets_child_import_asyncio_and_resolve_home() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# resolve_cli_binary — CLIs that may live off the daemon's frozen PATH
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_cli_binary_prefers_path(monkeypatch):
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == "/usr/bin/tool"
+
+
+def test_resolve_cli_binary_env_override_wins(monkeypatch, tmp_path):
+    override = tmp_path / "tool"
+    override.write_text("#!/bin/sh\n")
+    override.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_TESTCLI_PATH", str(override))
+    # PATH would resolve elsewhere, but the override takes precedence.
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(override)
+
+
+def test_resolve_cli_binary_falls_back_to_global_dir(monkeypatch, tmp_path):
+    """A binary off PATH is still found in a common global install dir.
+
+    This is the nvm case: the host daemon's frozen PATH omits the bin dir,
+    but the binary is present on disk.
+    """
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    tool = fallback_dir / "tool"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(tool)
+
+
+def test_resolve_cli_binary_returns_none_when_absent(monkeypatch, tmp_path):
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path / "empty",))
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") is None
+
+
+def test_resolve_cli_binary_warns_on_bad_override(monkeypatch, tmp_path, caplog):
+    """A set-but-unresolvable override warns (so a misconfig surfaces) and then
+    falls back to PATH rather than launching nothing."""
+    monkeypatch.setenv("OMNIGENT_TESTCLI_PATH", str(tmp_path / "does-not-exist"))
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    with caplog.at_level("WARNING"):
+        resolved = _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH")
+    assert resolved == "/usr/bin/tool"
+    assert "OMNIGENT_TESTCLI_PATH" in caplog.text
+
+
+def test_resolve_cli_binary_no_env_var(monkeypatch):
+    """Without an env_var, resolution is PATH then fallback dirs only."""
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: "/usr/bin/tool")
+    assert _platform.resolve_cli_binary("tool") == "/usr/bin/tool"
+
+
+def test_cli_fallback_dirs_includes_nvm_version_bins(monkeypatch, tmp_path):
+    """nvm keeps global bins under ~/.nvm/versions/node/<ver>/bin; the ladder
+    must include those (newest first) since that's the reported nvm case.
+
+    Ordering is by parsed numeric version, so double-digit majors (v10) beat
+    single-digit ones (v9) — a lexicographic sort would get this backwards.
+    """
+    nvm = tmp_path / ".nvm" / "versions" / "node"
+    for ver in ("v9.11.0", "v10.2.0", "v20.5.0"):
+        (nvm / ver / "bin").mkdir(parents=True)
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    dirs = _platform._cli_fallback_dirs()
+    for ver in ("v9.11.0", "v10.2.0", "v20.5.0"):
+        assert nvm / ver / "bin" in dirs
+    # newest → oldest, numerically: v20 > v10 > v9 (not the lexicographic
+    # order where "v9" would sort after "v10"/"v20").
+    order = [dirs.index(nvm / v / "bin") for v in ("v20.5.0", "v10.2.0", "v9.11.0")]
+    assert order == sorted(order)
+
+
+def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
+    """Absent ~/.nvm, the ladder still returns the static dirs without error."""
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    dirs = _platform._cli_fallback_dirs()
+    assert tmp_path / ".local" / "bin" in dirs

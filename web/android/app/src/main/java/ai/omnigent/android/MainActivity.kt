@@ -5,10 +5,13 @@ import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.MimeTypeMap
@@ -16,15 +19,21 @@ import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebView
-import androidx.activity.ComponentActivity
+import android.widget.FrameLayout
+import android.widget.PopupMenu
+import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
+import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 
@@ -36,7 +45,7 @@ import androidx.webkit.WebViewFeature
  * Server URL comes from [ServerStore]; when none is set yet, launch routes to
  * [ConnectActivity] first. Sidebar edge-swipe is intentionally absent (README).
  */
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
@@ -48,8 +57,15 @@ class MainActivity : ComponentActivity() {
     private var pendingNavigatePath: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
+    private var bridgeTransportInstalled = false
+    private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
+
+    // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
+    // visible so it's always available as a recovery path (backward compatible
+    // with older web builds). Theme-aware via brand colors (light/dark XML).
+    private lateinit var switchButton: View
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -60,9 +76,12 @@ class MainActivity : ComponentActivity() {
     private var pendingMicRequest: PermissionRequest? = null
 
     private val requestNotifications =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-            // Granted or not: notify() no-ops when notifications are disabled and
-            // the web layer keeps working without OS toasts.
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            // Denied: notify() no-ops when notifications are disabled and the
+            // web layer keeps working without OS toasts. Granted: replay the
+            // badge the web layer may have computed (and deduped) while the
+            // permission dialog was still open — its post was silently dropped.
+            if (granted) notifications.replayBadge()
         }
 
     private val requestMic =
@@ -120,6 +139,9 @@ class MainActivity : ComponentActivity() {
                 webViewClient =
                     OmnigentWebViewClient(
                         pinnedOrigin = { pinnedOrigin },
+                        shouldInjectBridgeAtPageReady = {
+                            bridgeTransportInstalled && bridgeScriptHandler == null
+                        },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
                     )
@@ -132,7 +154,39 @@ class MainActivity : ComponentActivity() {
                     downloadFile(downloadUrl, contentDisposition, mimeType)
                 }
             }
-        setContentView(webView)
+        // Wrap the WebView in a FrameLayout so the floating server-switcher
+        // pill can sit on top of it. The pill uses the app's brand palette
+        // (values/values-night colors.xml) so it adapts to light/dark mode.
+        val container = FrameLayout(this)
+        container.addView(webView)
+        val dp = resources.displayMetrics.density
+        switchButton =
+            TextView(this).apply {
+                text = hostLabelOf(serverUrl)
+                background =
+                    ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_floating_switch)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.brand_foreground))
+                textSize = 12f
+                setPadding((12 * dp).toInt(), (6 * dp).toInt(), (12 * dp).toInt(), (6 * dp).toInt())
+                elevation = 6 * dp
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { showServerSwitcherMenu(it) }
+            }
+        switchButton.layoutParams =
+            FrameLayout
+                .LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+                ).apply {
+                    // Initial position below the status bar; corrected by the
+                    // insets listener once system bar insets are measured.
+                    topMargin = (8 * dp).toInt()
+                }
+        container.addView(switchButton)
+        setContentView(container)
+        applySystemBarContrast()
         installBridge()
 
         // Measure the OS safe area and push it into the page as CSS custom
@@ -168,6 +222,12 @@ class MainActivity : ComponentActivity() {
             // keyboard covers the nav bar). Top/left/right are IME-independent.
             val bottom = if (ime.bottom > 0) 0 else bars.bottom
             lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
+            // Push the floating switch button below the status bar so it doesn't
+            // disappear under the notch/status icons on edge-to-edge layouts.
+            (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.topMargin = bars.top + (8 * dp).toInt()
+                switchButton.layoutParams = lp
+            }
             emitInsets()
             insets
         }
@@ -195,7 +255,13 @@ class MainActivity : ComponentActivity() {
                             if (webView.canGoBack()) webView.goBack() else finish()
                         }
                     }
-                    val fallback = Runnable { if (!acted) { acted = true; navigate() } }
+                    val fallback =
+                        Runnable {
+                            if (!acted) {
+                                acted = true
+                                navigate()
+                            }
+                        }
                     webView.postDelayed(fallback, BACK_FALLBACK_MS)
                     webView.evaluateJavascript(
                         "!!(window.__omnigentNativeHandleBack && window.__omnigentNativeHandleBack())",
@@ -214,6 +280,15 @@ class MainActivity : ComponentActivity() {
         webView.loadUrl(serverUrl)
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        applySystemBarContrast()
+        if (::webView.isInitialized) {
+            // Notify matchMedia listeners without reloading the SPA.
+            webView.dispatchConfigurationChanged(newConfig)
+        }
+    }
+
     /**
      * Install the web -> native bridge as an origin-allowlisted web message
      * listener (NOT addJavascriptInterface): the transport object reaches only
@@ -230,10 +305,37 @@ class MainActivity : ComponentActivity() {
                 webView,
                 OmnigentBridgeListener.JS_OBJECT_NAME,
                 setOf(origin),
-                OmnigentBridgeListener(notifications, blobSaver),
+                OmnigentBridgeListener(
+                    notifications = notifications,
+                    blobSaver = blobSaver,
+                ),
             )
         } catch (_: IllegalArgumentException) {
             // Malformed origin rule — leave the bridge absent; the web layer falls back.
+            return
+        }
+        bridgeTransportInstalled = true
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            try {
+                bridgeScriptHandler =
+                    WebViewCompat.addDocumentStartJavaScript(
+                        webView,
+                        NativeBridgeScript.source,
+                        setOf(origin),
+                    )
+            } catch (_: IllegalArgumentException) {
+                // Keep the transport; onPageFinished will inject the facade instead.
+            }
+        }
+    }
+
+    private fun applySystemBarContrast() {
+        val isLightMode =
+            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+                Configuration.UI_MODE_NIGHT_YES
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = isLightMode
+            isAppearanceLightNavigationBars = isLightMode
         }
     }
 
@@ -298,18 +400,24 @@ class MainActivity : ComponentActivity() {
         val secure = origin.startsWith("https://")
         // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
         val name = if (secure) "__Host-ap_session" else "ap_session"
-        val cookie = buildString {
-            append(name).append('=').append(token).append("; Path=/")
-            if (secure) append("; Secure")
-            append("; SameSite=Lax")
-        }
+        val cookie =
+            buildString {
+                append(name).append('=').append(token).append("; Path=/")
+                if (secure) append("; Secure")
+                append("; SameSite=Lax")
+            }
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
         cookies.setCookie(origin, cookie) { accepted ->
             // setCookie's callback is async — re-check the WebView is still alive.
             if (isDestroyed || !::webView.isInitialized) return@setCookie
-            authLog("setCookie accepted=$accepted present=${cookies.getCookie(origin)?.contains(name) == true}")
+            authLog(
+                "setCookie accepted=$accepted present=${cookies
+                    .getCookie(
+                        origin,
+                    )?.contains(name) == true}",
+            )
             // A rejected cookie means the reload would land unauthenticated,
             // bounce to login, and re-launch the browser — burning the retry
             // budget on a failure that retrying can't fix. Stay put instead.
@@ -345,6 +453,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Extract a short host[:port] label from a URL for the server switcher pill.
+     * Mirrors the iOS `URL.omnigentHostLabel` in `URL+Omnigent.swift`.
+     */
+    private fun hostLabelOf(url: String): String {
+        val uri = Uri.parse(url)
+        val host = uri.host ?: return url
+        val port = uri.port
+        return if (port != -1 &&
+            !(
+                (uri.scheme?.lowercase() == "https" && port == 443) ||
+                    (uri.scheme?.lowercase() == "http" && port == 80)
+            )
+        ) {
+            "$host:$port"
+        } else {
+            host
+        }
+    }
+
     override fun onDestroy() {
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
@@ -353,17 +481,118 @@ class MainActivity : ComponentActivity() {
         pendingMicRequest = null
         loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
-        if (::webView.isInitialized) webView.destroy() // releases the bridge chain
+        if (::webView.isInitialized) {
+            removeBridge()
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+
+        // Detect a server change: ConnectActivity re-enters us via
+        // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
+        // bridge is origin-allowlisted, so a server switch without re-registering
+        // leaves the bridge dead for the new origin.
+        val store = ServerStore(this)
+        val newServerUrl = store.currentServerUrl()
+        val newOrigin = originOf(newServerUrl)
+        if (newOrigin != null && newOrigin != pinnedOrigin) {
+            reloadWithNewServer(newServerUrl, newOrigin)
+        }
+
         val path = navigatePathOf(intent) ?: return
         pendingNavigatePath = path
         // Replay now if the page is up; otherwise onPageReady will flush it.
         if (pageLoaded) flushPendingActivation()
+    }
+
+    /**
+     * Swap to a new pinned server: remove the old bridge (allowlisted to the
+     * old origin), update [pinnedOrigin], re-install the bridge for the new
+     * origin, reset page state, and reload. Called from [onNewIntent] when
+     * ConnectActivity returns with a different server.
+     */
+    private fun reloadWithNewServer(
+        serverUrl: String,
+        newOrigin: String,
+    ) {
+        removeBridge()
+        pinnedOrigin = newOrigin
+        pageLoaded = false
+        historyCleared = false
+        loginAttempts = 0
+        (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
+        installBridge()
+        webView.loadUrl(serverUrl)
+    }
+
+    private fun removeBridge() {
+        bridgeScriptHandler?.remove()
+        bridgeScriptHandler = null
+        bridgeTransportInstalled = false
+        try {
+            WebViewCompat.removeWebMessageListener(
+                webView,
+                OmnigentBridgeListener.JS_OBJECT_NAME,
+            )
+        } catch (_: Exception) {
+            // Not registered (feature unsupported, or already removed) — no-op.
+        }
+    }
+
+    /**
+     * Show the server-switcher dropdown menu, mirroring the iOS `ServerSwitcher`
+     * `Menu`. Lists the current server (disabled header), other recent servers,
+     * Reload, and Connect to New Server. Tapping a recent server switches
+     * directly without leaving the app; "Connect to New Server" opens
+     * [ConnectActivity] for manual URL entry.
+     */
+    private fun showServerSwitcherMenu(anchor: View) {
+        val store = ServerStore(this)
+        val currentUrl = store.currentServerUrl()
+        val otherServers = store.recentServers().filter { originOf(it) != pinnedOrigin }
+
+        val popup = PopupMenu(this, anchor, Gravity.TOP)
+        MenuCompat.setGroupDividerEnabled(popup.menu, true)
+        popup.menu.apply {
+            // Group 0: current server — disabled header.
+            add(0, 0, 0, hostLabelOf(currentUrl)).isEnabled = false
+            // Group 1: other recent servers (divider before this group).
+            otherServers.forEachIndexed { i, url ->
+                add(1, 100 + i, 0, hostLabelOf(url))
+            }
+            // Group 2: actions (divider before this group).
+            add(2, 3, 0, getString(R.string.menu_reload))
+            add(2, 4, 0, getString(R.string.menu_connect_new))
+        }
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                3 -> {
+                    webView.reload()
+                    true
+                }
+
+                4 -> {
+                    startActivity(Intent(this@MainActivity, ConnectActivity::class.java))
+                    true
+                }
+
+                in 100..Int.MAX_VALUE -> {
+                    val url = otherServers[item.itemId - 100]
+                    store.connect(url)
+                    originOf(url)?.let { reloadWithNewServer(url, it) }
+                    true
+                }
+
+                else -> {
+                    false
+                }
+            }
+        }
+        popup.show()
     }
 
     /** Run bridge-dependent work once a pinned-origin page has finished loading. */
@@ -398,7 +627,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun navigatePathOf(intent: Intent?): String? =
-        intent?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
+        intent
+            ?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
             ?.takeIf { it.startsWith("/") }
 
     private fun emitNotificationActivation(path: String?) {
@@ -450,19 +680,28 @@ class MainActivity : ComponentActivity() {
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
     private fun ensureNotificationPermission() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return // granted at install < API 33
+        // Notification permission is granted at install time below API 33.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
         if (!hasPermission(Manifest.permission.POST_NOTIFICATIONS)) {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
     /** Back [OmnigentWebChromeClient.onShowFileChooser] with a document picker. */
-    private fun chooseFiles(callback: ValueCallback<Array<Uri>>, acceptTypes: Array<String>): Boolean {
+    private fun chooseFiles(
+        callback: ValueCallback<Array<Uri>>,
+        acceptTypes: Array<String>,
+    ): Boolean {
         pendingFileCallback?.onReceiveValue(null) // cancel any in-flight chooser
         pendingFileCallback = callback
         // Keep MIME types as-is; resolve ".pdf"-style extension tokens to MIME so
         // the declared accept constraint isn't silently widened to */*.
-        val mimeTypes = acceptTypes.mapNotNull(::mimeTypeFor).toTypedArray().ifEmpty { arrayOf("*/*") }
+        val mimeTypes =
+            acceptTypes
+                .mapNotNull(
+                    ::mimeTypeFor,
+                ).toTypedArray()
+                .ifEmpty { arrayOf("*/*") }
         return try {
             pickFiles.launch(mimeTypes)
             true
@@ -477,11 +716,20 @@ class MainActivity : ComponentActivity() {
     private fun mimeTypeFor(accept: String): String? {
         val token = accept.trim()
         return when {
-            token.isEmpty() -> null
-            token.contains('/') -> token // already a MIME type / wildcard
-            else ->
-                MimeTypeMap.getSingleton()
+            token.isEmpty() -> {
+                null
+            }
+
+            token.contains('/') -> {
+                token
+            }
+
+            // already a MIME type / wildcard
+            else -> {
+                MimeTypeMap
+                    .getSingleton()
                     .getMimeTypeFromExtension(token.removePrefix(".").lowercase())
+            }
         }
     }
 
@@ -501,7 +749,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun downloadFile(url: String, contentDisposition: String?, mimeType: String?) {
+    private fun downloadFile(
+        url: String,
+        contentDisposition: String?,
+        mimeType: String?,
+    ) {
         val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
 
         // Agent-generated files arrive as blob:/data: URLs, which DownloadManager

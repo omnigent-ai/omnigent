@@ -18,8 +18,9 @@ and recency. Relevant wire events:
   → a user message.
 - ``{"type": "context.append_loop_event", "event": {"type": "content.part",
   "part": {"type": "text", "text": …}, "uuid": …}}`` → an assistant message.
-  (``part.type == "think"`` is reasoning and is skipped for v1; ``tool.call`` /
-  ``tool.result`` events are likewise skipped — the embedded terminal shows them.)
+  (``part.type == "think"`` is reasoning, mirrored as a transient
+  ``external_output_reasoning_delta`` from ``part["think"]``; ``tool.call`` /
+  ``tool.result`` events are still skipped — the embedded terminal shows them.)
 
 Each mirrored turn is POSTed as an ``external_conversation_item`` to
 ``/v1/sessions/{id}/events`` (the same shape :mod:`omnigent.kimi_native_hook`
@@ -60,13 +61,20 @@ class _ForwardState:
 
 
 @dataclass
-class _MirrorItem:
-    """One conversation item to POST, plus the line index it came from."""
+class KimiWireItem:
+    """Stable parsed-wire contract shared by forwarding and offline import."""
 
     line_no: int
     role: str
     text: str
     response_id: str
+    # "message" (a user/assistant turn → external_conversation_item),
+    # "reasoning" (a think block → external_output_reasoning_delta), or
+    # "turn_end" (an ``end_turn`` step → external_session_status: idle).
+    kind: str = "message"
+
+
+_MirrorItem = KimiWireItem
 
 
 def clear_kimi_bridge_state(bridge_dir: Path) -> None:
@@ -106,7 +114,7 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         tmp.replace(bridge_dir / _STATE_FILE)
 
 
-def _workdirs_for_sessions(kimi_home: Path) -> dict[str, str]:
+def workdirs_for_kimi_sessions(kimi_home: Path) -> dict[str, str]:
     """Map each session dir → its ``workDir`` from ``session_index.jsonl``.
 
     Returns ``{}`` when the index is absent/unreadable (a brand-new home before
@@ -134,6 +142,9 @@ def _workdirs_for_sessions(kimi_home: Path) -> dict[str, str]:
     return mapping
 
 
+_workdirs_for_sessions = workdirs_for_kimi_sessions
+
+
 def _discover_wire(kimi_home: Path, workspace: str, launch_epoch_ms: int) -> Path | None:
     """Locate the wire log for *workspace*'s newest session created at/after launch.
 
@@ -146,7 +157,7 @@ def _discover_wire(kimi_home: Path, workspace: str, launch_epoch_ms: int) -> Pat
     sessions_root = kimi_home / "sessions"
     if not sessions_root.exists():
         return None
-    workdirs = _workdirs_for_sessions(kimi_home)
+    workdirs = workdirs_for_kimi_sessions(kimi_home)
     floor_s = (launch_epoch_ms - _DISCOVER_SKEW_MS) / 1000.0
     best: tuple[float, Path] | None = None
     for wire in sessions_root.glob("*/session_*/agents/main/wire.jsonl"):
@@ -181,7 +192,7 @@ def _input_text(blocks: object) -> str:
     return "".join(parts)
 
 
-def _row_to_item(line_no: int, row: dict[str, object]) -> _MirrorItem | None:
+def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
     """Map one wire-log row to a conversation item, or ``None`` to skip it."""
     row_type = row.get("type")
     if row_type == "turn.prompt":
@@ -191,7 +202,7 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> _MirrorItem | None:
         text = _input_text(row.get("input"))
         if not text:
             return None
-        return _MirrorItem(
+        return KimiWireItem(
             line_no=line_no,
             role="user",
             text=text,
@@ -199,22 +210,61 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> _MirrorItem | None:
         )
     if row_type == "context.append_loop_event":
         event = row.get("event")
-        if not isinstance(event, dict) or event.get("type") != "content.part":
+        if not isinstance(event, dict):
+            return None
+        event_type = event.get("type")
+        if event_type == "step.end":
+            # kimi's agent loop keeps stepping while a step stops for ``tool_use``;
+            # ``end_turn`` is the only finish reason that ends the turn. Without
+            # this edge a native sub-agent never reports terminal status, so a
+            # parent orchestrator waits on it forever.
+            if event.get("finishReason") != "end_turn":
+                return None
+            return KimiWireItem(
+                line_no=line_no,
+                role="assistant",
+                text="",
+                response_id=f"kimi:turn_end:{line_no}",
+                kind="turn_end",
+            )
+        if event_type != "content.part":
             return None
         part = event.get("part")
-        if not isinstance(part, dict) or part.get("type") != "text":
-            return None
-        text = part.get("text")
-        if not isinstance(text, str) or not text:
+        if not isinstance(part, dict):
             return None
         uuid = event.get("uuid")
         response_id = f"kimi:{uuid}" if isinstance(uuid, str) and uuid else f"kimi:line:{line_no}"
-        return _MirrorItem(line_no=line_no, role="assistant", text=text, response_id=response_id)
+        part_type = part.get("type")
+        if part_type == "text":
+            part_text = part.get("text")
+            if not isinstance(part_text, str) or not part_text:
+                return None
+            return KimiWireItem(
+                line_no=line_no,
+                role="assistant",
+                text=part_text,
+                response_id=response_id,
+            )
+        if part_type == "think":
+            # Reasoning lives in ``part["think"]`` (not ``part["text"]``). Mirror it
+            # as a transient reasoning event so the web UI paints a thinking block —
+            # the kimi analogue of codex-native's #1254 reasoning fix.
+            think = part.get("think")
+            if not isinstance(think, str) or not think:
+                return None
+            return KimiWireItem(
+                line_no=line_no,
+                role="assistant",
+                text=think,
+                response_id=response_id,
+                kind="reasoning",
+            )
+        return None
     return None
 
 
-def _read_new_items(wire_path: Path, last_line: int) -> list[_MirrorItem]:
-    """Parse wire-log lines beyond *last_line* into conversation items.
+def read_kimi_wire_items(wire_path: Path, last_line: int) -> list[KimiWireItem]:
+    """Parse wire-log lines beyond *last_line* into the stable shared contract.
 
     The wire log is append-only JSONL, so a line count is a stable high-water
     mark. Non-JSON / unrecognized lines advance the cursor without emitting.
@@ -223,7 +273,7 @@ def _read_new_items(wire_path: Path, last_line: int) -> list[_MirrorItem]:
         lines = wire_path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-    items: list[_MirrorItem] = []
+    items: list[KimiWireItem] = []
     for idx in range(last_line, len(lines)):
         line = lines[idx].strip()
         if not line or not line.startswith("{"):
@@ -240,13 +290,16 @@ def _read_new_items(wire_path: Path, last_line: int) -> list[_MirrorItem]:
     return items
 
 
+_read_new_items = read_kimi_wire_items
+
+
 async def _post_conversation_item(
     client: httpx.AsyncClient,
     *,
     base_url: str,
     headers: dict[str, str],
     session_id: str,
-    item: _MirrorItem,
+    item: KimiWireItem,
     agent_name: str,
 ) -> None:
     """POST one mirrored turn as an external conversation item."""
@@ -264,6 +317,57 @@ async def _post_conversation_item(
             "item_data": item_data,
             "response_id": item.response_id,
         },
+    }
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(url, headers=headers, json=body)
+    resp.raise_for_status()
+
+
+async def _post_external_session_status(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    status: str,
+    output: str,
+) -> None:
+    """POST one ``external_session_status`` event to the Sessions API.
+
+    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
+    completion that wakes the parent orchestrator's inbox — the SAME contract
+    claude-/codex-/opencode-/cursor-native use. ``output`` carries the turn's
+    final assistant text, since the runner delivers an empty result when an idle
+    edge forwards none.
+
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(
+        url,
+        headers=headers,
+        json={"type": "external_session_status", "data": {"status": status, "output": output}},
+    )
+    resp.raise_for_status()
+
+
+async def _post_reasoning_item(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    item: KimiWireItem,
+) -> None:
+    """POST one mirrored think block as a transient reasoning event.
+
+    Mirrors codex-native (#1254): a one-shot ``external_output_reasoning_delta``
+    with ``started: true`` opens a reasoning block in the web UI. Kimi persists
+    completed think parts (not streamed deltas), so one delta per part is correct.
+    """
+    body = {
+        "type": "external_output_reasoning_delta",
+        "data": {"delta": item.text, "started": True},
     }
     url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
     resp = await client.post(url, headers=headers, json=body)
@@ -290,6 +394,9 @@ async def forward_kimi_wire_to_session(
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0
+    # Final assistant text of the turn in flight, forwarded on the ``end_turn``
+    # edge so the parent's inbox gets the real result instead of an empty one.
+    last_assistant_text = ""
     async with httpx.AsyncClient(timeout=15.0) as client:
         while True:
             if wire_path is None or not wire_path.exists():
@@ -301,17 +408,38 @@ async def forward_kimi_wire_to_session(
                     last_line = 0
                     _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
             if wire_path is not None and wire_path.exists():
-                items = await asyncio.to_thread(_read_new_items, wire_path, last_line)
+                items = await asyncio.to_thread(read_kimi_wire_items, wire_path, last_line)
                 for item in items:
                     try:
-                        await _post_conversation_item(
-                            client,
-                            base_url=base_url,
-                            headers=headers,
-                            session_id=session_id,
-                            item=item,
-                            agent_name=agent_name,
-                        )
+                        if item.kind == "turn_end":
+                            await _post_external_session_status(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                status="idle",
+                                output=last_assistant_text,
+                            )
+                            last_assistant_text = ""
+                        elif item.kind == "reasoning":
+                            await _post_reasoning_item(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                item=item,
+                            )
+                        else:
+                            await _post_conversation_item(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                item=item,
+                                agent_name=agent_name,
+                            )
+                            if item.role == "assistant":
+                                last_assistant_text = item.text
                     except httpx.HTTPError as exc:
                         _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
                         break

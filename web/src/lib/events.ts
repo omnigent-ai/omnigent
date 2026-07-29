@@ -141,6 +141,13 @@ export interface ToolResult {
   responseId: string;
 }
 
+/** `response.function_call_output.delta` — live output from a running tool. */
+export interface ToolOutputDelta {
+  type: "tool_output_delta";
+  callId: string;
+  delta: string;
+}
+
 /**
  * A server-initiated elicitation, MCP shape.
  *
@@ -323,12 +330,15 @@ export interface RoutingDecision {
   type: "routing_decision";
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
-  /** Difficulty tier the router assigned. */
-  tier: "cheap" | "medium" | "expensive";
   /** `true` when the brain ran on `model`; `false` = "would have picked". */
   applied: boolean;
   /** The router's one-line rationale. */
   rationale: string;
+  /**
+   * Sub-agent name when this decision is mirrored into the parent session,
+   * e.g. `"claude_code"`. Absent for session-local routing decisions.
+   */
+  agent?: string;
   itemId: string;
   responseId: string;
 }
@@ -448,6 +458,8 @@ export interface SessionStatusEvent {
   status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
   backgroundTaskCount?: number;
+  /** Structured failure detail; only present when `status === "failed"`. */
+  error?: { code: string; message: string };
 }
 
 /**
@@ -587,6 +599,29 @@ export interface SessionSandboxStatusEvent {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error: string | null;
+}
+
+/** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */
+export type McpServerStartupState = "starting" | "ready" | "failed" | "cancelled";
+
+/** One MCP server's latest startup record within `session.mcp_startup`. */
+export interface McpServerStartup {
+  status: McpServerStartupState;
+  /** Failure detail when `status === "failed"`; `null` otherwise. */
+  error: string | null;
+}
+
+/**
+ * `session.mcp_startup` — per-MCP-server startup progress for a native
+ * harness session (codex-native today). Emitted while the harness boots
+ * its configured MCP servers, carrying the full latest map each time.
+ * Drives the MCP startup band on the session page so a slow or failing
+ * MCP server reads as live progress instead of a hung session.
+ */
+export interface SessionMcpStartupEvent {
+  type: "session_mcp_startup";
+  conversationId: string;
+  servers: Record<string, McpServerStartup>;
 }
 
 /**
@@ -752,9 +787,8 @@ export interface SessionSkillsEvent {
 }
 
 /**
- * `session.model_options` — the Codex app-server model catalog just
- * resolved for a session. Consumers refetch the session snapshot and apply
- * its now-populated `codexModelOptions`.
+ * `session.model_options` — a runner-owned native model catalog just resolved.
+ * Consumers refetch the session snapshot and apply its now-populated options.
  */
 export interface SessionModelOptionsEvent {
   type: "session_model_options";
@@ -804,6 +838,22 @@ export interface SessionSupersededEvent {
   reason: "clear";
 }
 
+/**
+ * `browser.action_request` — the agent's `browser_*` tool asks the desktop shell
+ * to run a browser action against this conversation's WebContentsView. Every
+ * renderer sees the event, but the relay (`useBrowserAgentRelay`) claims it first
+ * so only one executes; non-Electron renderers ignore it.
+ */
+export interface BrowserActionRequestEvent {
+  type: "browser_action_request";
+  /** Server-minted id; echoed on claim + result to resolve the parked Future. */
+  actionId: string;
+  /** The bare verb: "navigate" | "snapshot" | "click" | "type" | "screenshot". */
+  action: string;
+  /** Action-specific args (url, ref, selector, text, …); shape validated per-action. */
+  args: Record<string, unknown>;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -820,6 +870,7 @@ export type StreamEvent =
   | ReasoningSummaryDelta
   | ToolCall
   | ToolResult
+  | ToolOutputDelta
   | NativeToolCall
   | SlashCommand
   | RoutingDecision
@@ -844,6 +895,7 @@ export type StreamEvent =
   | SessionTodosEvent
   | SessionTerminalPendingEvent
   | SessionSandboxStatusEvent
+  | SessionMcpStartupEvent
   | SessionInputConsumedEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent
@@ -855,4 +907,5 @@ export type StreamEvent =
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
   | SessionModelOptionsEvent
-  | SessionPresenceEvent;
+  | SessionPresenceEvent
+  | BrowserActionRequestEvent;

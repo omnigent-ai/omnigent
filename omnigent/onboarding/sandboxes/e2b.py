@@ -56,6 +56,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxLauncher,
     host_image_wheel_install_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -248,6 +249,19 @@ class _E2BRemoteProcess(RemoteProcess):
     queue — the queue is the combined-output stream the
     :class:`RemoteProcess` contract wants.
     """
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=True,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=True,
+            streaming_exec=True,
+            foreground_exec=True,
+        )
 
     def __init__(self, handle: CommandHandle) -> None:
         """

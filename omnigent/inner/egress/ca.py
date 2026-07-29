@@ -168,21 +168,69 @@ def _is_expired(cert_path: Path) -> bool:
         return True
 
 
+def _capath_ca_bytes(capath: str | None) -> bytes:
+    """Return the concatenated PEM bytes of every cert in *capath*.
+
+    Corporate MDM / IT-managed roots are commonly installed as loose
+    files under the OpenSSL ``capath`` directory (with hashed symlinks)
+    rather than merged into the single ``cafile`` bundle. Reads each
+    regular file, keeping only those that look like PEM certificates.
+    Hashed symlinks alias the same underlying files, so duplicates are
+    dropped by resolved path; extra identical certs would be harmless
+    but this keeps the bundle tidy.
+    """
+    if not capath:
+        return b""
+    directory = Path(capath)
+    if not directory.is_dir():
+        return b""
+    parts: list[bytes] = []
+    seen: set[Path] = set()
+    for entry in sorted(directory.iterdir()):
+        try:
+            resolved = entry.resolve()
+            if resolved in seen or not resolved.is_file():
+                continue
+            data = resolved.read_bytes()
+        except OSError:
+            continue
+        if b"-----BEGIN CERTIFICATE-----" not in data:
+            continue
+        seen.add(resolved)
+        parts.append(data)
+    return b"\n".join(parts)
+
+
 def _system_ca_bundle() -> bytes:
     """Return the system CA bundle as PEM bytes.
 
-    Prefers the OS trust store (``ssl.get_default_verify_paths``) so
-    that CAs added by corporate MDM, IT policy, or the user are
-    included. Falls back to the certifi (Mozilla) bundle when the OS
-    path doesn't exist or is empty.
+    Combines the OS trust store from ``ssl.get_default_verify_paths``
+    so that CAs added by corporate MDM, IT policy, or the user are
+    included: both the consolidated ``cafile`` bundle AND the loose
+    certs under ``capath`` (where MDM roots often live). Falls back to
+    the certifi (Mozilla) bundle only when neither yields any certs.
     """
     paths = ssl.get_default_verify_paths()
+
+    cafile_bytes = b""
     for candidate in (paths.cafile, paths.openssl_cafile):
         if candidate:
             p = Path(candidate)
             if p.is_file() and p.stat().st_size > 0:
                 logger.debug("Using system CA bundle: %s", p)
-                return p.read_bytes()
+                cafile_bytes = p.read_bytes()
+                break
+
+    capath_bytes = b""
+    for candidate in (paths.capath, paths.openssl_capath):
+        capath_bytes = _capath_ca_bytes(candidate)
+        if capath_bytes:
+            logger.debug("Including loose CA certs from capath: %s", candidate)
+            break
+
+    combined = b"\n".join(part for part in (cafile_bytes, capath_bytes) if part)
+    if combined:
+        return combined
 
     import certifi
 

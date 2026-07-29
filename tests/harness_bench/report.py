@@ -1,18 +1,4 @@
-"""Render a :class:`BenchMatrix` as a terminal table, Markdown, or JSON.
-
-Three renderers for three audiences:
-
-- :func:`render_table` — an aligned, optionally ANSI-colored grid for
-  reading in a terminal (the CLI default). Pipes-and-dashes Markdown reads
-  as raw noise in a shell, so this is what a human sees.
-- :func:`render_markdown` — the GitHub-flavored table for docs / PRs,
-  reproducing the hand-maintained support matrix.
-- :func:`render_json` — the machine-readable form for regenerating docs or
-  diffing runs.
-
-Each verdict maps to a spreadsheet glyph plus a DRIFT callout the
-spreadsheet cannot express.
-"""
+"""Render bench matrices as terminal, Markdown, or JSON reports."""
 
 from __future__ import annotations
 
@@ -20,7 +6,6 @@ import json
 from typing import Any
 
 from tests.harness_bench.bench import BenchMatrix, CellResult, HarnessReport
-from tests.harness_bench.probes import ALL_PROBES
 from tests.harness_bench.verdict import Verdict
 
 # ANSI colors per verdict, applied only when writing to a TTY.
@@ -37,6 +22,32 @@ _ANSI: dict[Verdict, str] = {
 # The offline placeholder note; suppressed from the Notes section so a dry
 # render is not 24 identical lines.
 _OFFLINE_NOTE = "offline (declared shown)"
+
+# Short transport labels for the harness column, so each row is self-describing
+# about which transport produced it (e.g. `claude-sdk [full-server]`). The
+# native-tui driver is abbreviated to `native` to match how it is spoken about.
+_TRANSPORT_LABEL = {"native-tui": "native"}
+
+
+def _matrix_dimensions(matrix: BenchMatrix) -> list[tuple[str, str]]:
+    """Return selected dimensions in their report order."""
+    for report in matrix.reports:
+        if report.cells:
+            return [(cell.probe_name, cell.title) for cell in report.cells]
+    return []
+
+
+def _harness_label(report: HarnessReport) -> str:
+    """Harness name plus its resolved transport, e.g. ``codex [full-server]``.
+
+    Uses the transport that actually ran (``report.transport``), which for an
+    SDK harness on the default is ``full-server`` — not ``profile.transport``,
+    the family marker. Falls back to the bare name when unknown (never resolved).
+    """
+    transport = report.transport
+    if not transport:
+        return report.profile.harness
+    return f"{report.profile.harness} [{_TRANSPORT_LABEL.get(transport, transport)}]"
 
 
 def _colorize(text: str, verdict: Verdict, color: bool) -> str:
@@ -64,7 +75,9 @@ def _cell_glyph_for_grid(cell: CellResult, declared: bool = False) -> str:
     return cell.verdict.glyph
 
 
-def render_table(matrix: BenchMatrix, *, color: bool = False, declared: bool = False) -> str:
+def render_table(
+    matrix: BenchMatrix, *, color: bool = False, declared: bool = False, grid: bool = True
+) -> str:
     """Render *matrix* as an aligned column grid for terminal reading.
 
     :param color: When true, colorize each glyph with ANSI (green supported,
@@ -73,12 +86,18 @@ def render_table(matrix: BenchMatrix, *, color: bool = False, declared: bool = F
     :param declared: When true (offline mode), render each cell's *declared*
         verdict glyph instead of the observed/reconciled one, so the dry
         matrix shows the capabilities the profile claims rather than ``·``.
+    :param grid: When false, omit the heading + glyph grid and emit only the
+        footer (legend, drift, notes, skips). The CLI uses this when the rich
+        live table already painted the grid to the same terminal, so the report
+        adds the per-cell explanations without re-printing the grid.
     """
-    titles = [p.title for p in ALL_PROBES]
-    names = [p.name for p in ALL_PROBES]
+    dimensions = _matrix_dimensions(matrix)
+    names = [name for name, _ in dimensions]
+    titles = [title for _, title in dimensions]
 
     # Column widths from the visible (uncolored) content.
-    harness_w = max(len("Harness"), *(len(r.profile.harness) for r in matrix.reports))
+    labels = {id(r): _harness_label(r) for r in matrix.reports}
+    harness_w = max([len("Harness"), *(len(v) for v in labels.values())])
     glyphs: dict[tuple[int, str], str] = {}
     verdicts: dict[tuple[int, str], Verdict] = {}
     for r in matrix.reports:
@@ -107,15 +126,20 @@ def render_table(matrix: BenchMatrix, *, color: bool = False, declared: bool = F
     rule = "  ".join(["-" * harness_w, *["-" * w for w in col_w]])
     lines = [header, rule]
     for r in matrix.reports:
-        row = [r.profile.harness.ljust(harness_w)]
+        row = [labels[id(r)].ljust(harness_w)]
         row += [
             _center(glyphs[(id(r), n)], w, verdicts[(id(r), n)])
             for n, w in zip(names, col_w, strict=False)
         ]
         lines.append("  ".join(row))
 
-    heading = "Harness capability matrix" + (" (declared, not observed)" if declared else "")
-    out = [heading, "", *lines, "", _legend()]
+    if grid:
+        heading = "Harness capability matrix" + (" (declared, not observed)" if declared else "")
+        out = [heading, "", *lines, "", _legend()]
+    else:
+        # The rich live table already showed the grid on this terminal; emit
+        # only the footer so we add the legend + explanations, not a duplicate.
+        out = [_legend()]
 
     drift = _drift_lines(matrix)
     if drift:
@@ -153,8 +177,9 @@ def render_markdown(matrix: BenchMatrix, *, declared: bool = False) -> str:
     :param declared: When true (offline mode), render declared glyphs so the
         table shows the claimed matrix rather than a grid of skips.
     """
-    columns = [p.title for p in ALL_PROBES]
-    names = [p.name for p in ALL_PROBES]
+    dimensions = _matrix_dimensions(matrix)
+    names = [name for name, _ in dimensions]
+    columns = [title for _, title in dimensions]
 
     header = "| Harness | " + " | ".join(columns) + " |"
     sep = "| --- | " + " | ".join("---" for _ in columns) + " |"
@@ -163,7 +188,7 @@ def render_markdown(matrix: BenchMatrix, *, declared: bool = False) -> str:
     for report in matrix.reports:
         by_name = {c.probe_name: c for c in report.cells}
         cells = [_cell_glyph(by_name[n], declared) if n in by_name else "?" for n in names]
-        lines.append(f"| `{report.profile.harness}` | " + " | ".join(cells) + " |")
+        lines.append(f"| `{_harness_label(report)}` | " + " | ".join(cells) + " |")
 
     heading = "# Harness capability matrix" + (" (declared, not observed)" if declared else "")
     out = [heading, "", *lines, "", _legend()]
@@ -236,7 +261,10 @@ def render_json(matrix: BenchMatrix) -> str:
 def _report_json(report: HarnessReport) -> dict[str, Any]:
     return {
         "harness": report.profile.harness,
+        # The family marker the profile declares, plus the transport that
+        # actually ran (differs for an SDK harness on the full-server default).
         "transport": report.profile.transport,
+        "resolved_transport": report.transport,
         "model": report.profile.model,
         "owner": report.profile.owner,
         "auth": report.profile.auth,

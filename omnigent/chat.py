@@ -58,6 +58,13 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native_dispatch import resolve_hook_for_key
+from omnigent.process_logging import (
+    PROCESS_LOG_FILE_ENV_VAR,
+    child_logging_popen_kwargs,
+    logs_root,
+    open_process_log_file,
+)
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
@@ -1048,55 +1055,27 @@ def _redirect_native_resume_if_needed(
     native_agent = native_coding_agent_for_wrapper_label(wrapper_label)
     if native_agent is None:
         return False
-    if native_agent.key == "claude":
-        _run_claude_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "codex":
-        _run_codex_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "pi":
-        _run_pi_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "kiro":
-        _run_kiro_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "cursor":
-        _run_cursor_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "kimi":
-        _run_kimi_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    return False
+    run_native = resolve_hook_for_key(native_agent.key, "run_native")
+    if run_native is None:
+        return False
+    # The native TUI owns the turns; resuming through the Omnigent REPL would run
+    # an Omnigent turn per message *and* let the transcript forwarder mirror the
+    # same message from the native store, double-posting each user turn. Redirect
+    # to `omnigent <key> --resume`'s direct tmux attach instead — the wrapper
+    # label is `<key>-native` and the CLI command is `<key>`.
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name=native_agent.harness,
+        native_command=native_agent.key,
+    )
+    run_native(
+        server=base_url,
+        session_id=conversation_id,
+        extra_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+    return True
 
 
 def _finish_native_redirect_progress(
@@ -1124,208 +1103,6 @@ def _finish_native_redirect_progress(
             f"session — redirecting to `omnigent {native_command} --resume`.\n"
         ),
         err=True,
-    )
-
-
-def _run_claude_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a claude-native conversation back to ``omnigent claude``.
-
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricksapps.com"``.
-    :param conversation_id: Omnigent conversation id, e.g.
-        ``"conv_abc123"``.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="claude-native",
-        native_command="claude",
-    )
-    from omnigent.claude_native import run_claude_native
-
-    run_claude_native(
-        server=base_url,
-        session_id=conversation_id,
-        claude_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_codex_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a codex-native conversation back to ``omnigent codex``.
-
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricksapps.com"``.
-    :param conversation_id: Omnigent conversation id, e.g.
-        ``"conv_abc123"``.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="codex-native",
-        native_command="codex",
-    )
-    from omnigent.codex_native import run_codex_native
-
-    run_codex_native(
-        server=base_url,
-        session_id=conversation_id,
-        codex_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_pi_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a pi-native conversation back to ``omnigent pi``.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="pi-native",
-        native_command="pi",
-    )
-    from omnigent.pi_native import run_pi_native
-
-    run_pi_native(
-        server=base_url,
-        session_id=conversation_id,
-        pi_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_kiro_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """Hand a kiro-native conversation back to ``omnigent kiro``."""
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="kiro-native",
-        native_command="kiro",
-    )
-    from omnigent.kiro_native import run_kiro_native
-
-    run_kiro_native(
-        server=base_url,
-        session_id=conversation_id,
-        kiro_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_cursor_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a cursor-native conversation back to ``omnigent cursor``.
-
-    The cursor-native session is driven by the ``cursor-agent`` TUI in a
-    runner-owned tmux pane, and the forwarder mirrors that transcript back
-    into the conversation. Resuming through the Omnigent REPL would instead
-    run an Omnigent turn per message (which persists its own user item) *and*
-    leave the forwarder mirroring the same message from the cursor store —
-    recording each user message twice. Redirecting to ``omnigent cursor``'s
-    direct tmux attach keeps the TUI the single source of turns.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="cursor-native",
-        native_command="cursor",
-    )
-    from omnigent.cursor_native import run_cursor_native
-
-    run_cursor_native(
-        server=base_url,
-        session_id=conversation_id,
-        cursor_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_kimi_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a kimi-native conversation back to ``omnigent kimi``.
-
-    The kimi-native session is driven by the ``kimi`` TUI in a runner-owned
-    tmux pane. Resuming through the Omnigent REPL would run an Omnigent turn
-    per message instead of attaching to the live TUI; redirecting to
-    ``omnigent kimi``'s direct tmux attach keeps the TUI the single source of
-    turns. Mirrors :func:`_run_cursor_native_resume_redirect`.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="kimi-native",
-        native_command="kimi",
-    )
-    from omnigent.kimi_native import run_kimi_native
-
-    run_kimi_native(
-        server=base_url,
-        session_id=conversation_id,
-        kimi_args=(),
-        auto_open_conversation=auto_open_conversation,
     )
 
 
@@ -3223,6 +3000,19 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
         executor_block["model"] = overrides.model
     if overrides.harness is not None:
         _apply_harness_override_to_executor(raw, executor_block, overrides.harness)
+        # A harness-only override drops any prior model pin so the new
+        # harness resolves its provider default — e.g. ``omnigent run
+        # examples/polly --harness pi`` must not keep Polly's Claude-only
+        # a Claude-only ``executor.model``. An explicit ``--model``
+        # (applied above) wins and is left alone.
+        if overrides.model is None:
+            executor_block.pop("model", None)
+            llm_block = raw.get("llm")
+            if isinstance(llm_block, dict):
+                llm_block.pop("model", None)
+            env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
+            if env_model is not None:
+                executor_block["model"] = env_model
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)
@@ -3420,7 +3210,7 @@ def _omnigent_log_dir() -> Path:
 
     :returns: ``~/.omnigent/logs``, created if needed.
     """
-    log_dir = Path.home() / ".omnigent" / "logs"
+    log_dir = logs_root()
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
@@ -3489,11 +3279,7 @@ def _start_local_server(
     :returns: The server handle bundling the subprocess and
         the path to its captured stdout/stderr log file.
     """
-    log_dir = _omnigent_log_dir() / "server"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_fd, log_name = tempfile.mkstemp(prefix="server-", suffix=".log", dir=log_dir)
-    log_path = Path(log_name)
-    log_fh = os.fdopen(log_fd, "wb")
+    log_path, log_fh = open_process_log_file("server", root=_omnigent_log_dir())
     if ephemeral:
         data_tmpdir = tempfile.mkdtemp(prefix="ap-chat-data-")
         db_path = Path(data_tmpdir) / "chat.db"
@@ -3534,6 +3320,7 @@ def _start_local_server(
     child_env = {
         **os.environ,
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
+        PROCESS_LOG_FILE_ENV_VAR: str(log_path),
         # Single-user loopback runtime — see ensure_local_omnigent_server for why
         # this lets the host tunnel re-own this machine's host_id across an
         # auth-mode flip without weakening the deployed multi-user boundary.
@@ -3566,28 +3353,30 @@ def _start_local_server(
             child_env["DATABRICKS_CONFIG_PROFILE"] = _spec.executor.profile
 
     try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{db_path}",
-                "--artifact-location",
-                str(artifact_path),
-                "--agent",
-                str(agent_path),
-            ],
-            env=child_env,
-            stdout=log_fh,
-            stderr=log_fh,
-            **_proc.spawn_kwargs(),
-        )
+        with child_logging_popen_kwargs(child_env) as logging_kwargs:
+            server_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "omnigent.cli",
+                    "server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--database-uri",
+                    f"sqlite:///{db_path}",
+                    "--artifact-location",
+                    str(artifact_path),
+                    "--agent",
+                    str(agent_path),
+                ],
+                env=child_env,
+                stdout=log_fh,
+                stderr=log_fh,
+                **_proc.spawn_kwargs(),
+                **logging_kwargs,
+            )
     finally:
         log_fh.close()
 

@@ -21,6 +21,7 @@ subprocess spawn, no real CLI.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml as _yaml
@@ -44,6 +45,13 @@ from omnigent.spec.types import (
     ProviderAuth,
 )
 
+_CATALOG_DEFAULTS = {
+    ("anthropic", "claude"): "catalog-anthropic-default",
+    ("openai", "openai"): "catalog-openai-default",
+    ("databricks", "claude"): "catalog-databricks-claude-default",
+    ("databricks", "openai"): "catalog-databricks-openai-default",
+}
+
 
 @pytest.fixture(autouse=True)
 def _clear_ambient_keys(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -59,6 +67,16 @@ def _clear_ambient_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DATABRICKS_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_catalog_default_model",
+        lambda provider_name, family, *, context: _CATALOG_DEFAULTS[(provider_name, family)],
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=_CATALOG_DEFAULTS[(provider_name, family)]
+        ),
+    )
 
 
 @pytest.fixture
@@ -94,6 +112,7 @@ def _make_spec(
     harness: str,
     model: str | None = None,
     profile: str | None = None,
+    use_responses: object | None = None,
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None,
     os_env: object | None = None,
 ) -> AgentSpec:
@@ -105,6 +124,8 @@ def _make_spec(
     :param model: Spec-level model, e.g. ``"my-model"``. ``None`` omits it
         so the provider family's ``models.default`` supplies the model.
     :param profile: Legacy ``executor.config["profile"]``. ``None`` omits it.
+    :param use_responses: ``executor.config["use_responses"]``. ``None`` omits
+        it; strings model values produced by standard bundle parsing.
     :param auth: Typed auth on ``spec.executor.auth``. ``None`` omits it, so
         the no-auth global-default provider path applies.
     :returns: A populated :class:`AgentSpec`.
@@ -114,6 +135,8 @@ def _make_spec(
         config["model"] = model
     if profile is not None:
         config["profile"] = profile
+    if use_responses is not None:
+        config["use_responses"] = use_responses
     return AgentSpec(
         spec_version=1,
         name=f"test-{harness}",
@@ -426,6 +449,26 @@ def test_openai_agents_uses_openai_global_default(config_home: Path) -> None:
     assert "HARNESS_OPENAI_AGENTS_DATABRICKS" not in env
 
 
+@pytest.mark.parametrize(
+    ("use_responses", "expected"),
+    [("False", "false"), ("True", "true")],
+)
+def test_openai_agents_provider_preserves_use_responses_flag(
+    config_home: Path, use_responses: str, expected: str
+) -> None:
+    """The provider early-return path also interprets stringified flags."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(
+        harness="openai-agents",
+        model="gpt-test",
+        use_responses=use_responses,
+    )
+
+    env = _build_openai_agents_sdk_spawn_env(spec)
+
+    assert env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] == expected
+
+
 def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     """
     A ``default: true`` anthropic provider routes the pi harness.
@@ -600,8 +643,6 @@ def test_claude_sdk_falls_back_to_catalog_default_model(config_home: Path) -> No
     a real model. The base_url assertion proves the provider branch fired
     (not a vacuous pass).
     """
-    from omnigent.onboarding.providers import default_chat_model
-
     config: dict[str, object] = {
         "providers": {
             "anthropic": {
@@ -616,9 +657,7 @@ def test_claude_sdk_falls_back_to_catalog_default_model(config_home: Path) -> No
 
     env = _build_claude_sdk_spawn_env(spec, workdir=None)
 
-    catalog_default = default_chat_model("anthropic")
-    assert catalog_default is not None  # the catalog knows anthropic
-    assert catalog_default.startswith("claude-")  # a real anthropic model
+    catalog_default = _CATALOG_DEFAULTS[("anthropic", "claude")]
     # The provider branch fired (gateway base_url set) AND the model came
     # from the catalog, not from a provider/spec default and not a failure.
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://api.anthropic.com"
@@ -643,8 +682,6 @@ def test_codex_falls_back_to_catalog_default_model(config_home: Path) -> None:
     ``HARNESS_CODEX_MODEL`` equal to the catalog's default openai model
     (a ``gpt-*`` flagship, not an audio/realtime specialty variant).
     """
-    from omnigent.onboarding.providers import default_chat_model
-
     config: dict[str, object] = {
         "providers": {
             "openai": {
@@ -659,9 +696,7 @@ def test_codex_falls_back_to_catalog_default_model(config_home: Path) -> None:
 
     env = _build_codex_spawn_env(spec, workdir=None)
 
-    catalog_default = default_chat_model("openai")
-    assert catalog_default is not None
-    assert catalog_default.startswith("gpt-")  # a real general-purpose openai model
+    catalog_default = _CATALOG_DEFAULTS[("openai", "openai")]
     assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://api.openai.com/v1"
     assert env["HARNESS_CODEX_MODEL"] == catalog_default
 
@@ -673,8 +708,6 @@ def test_openai_agents_falls_back_to_catalog_default_model(config_home: Path) ->
 
     Proves the analogous fallback in :func:`_apply_provider_to_openai_agents`.
     """
-    from omnigent.onboarding.providers import default_chat_model
-
     config: dict[str, object] = {
         "providers": {
             "openai": {
@@ -689,8 +722,7 @@ def test_openai_agents_falls_back_to_catalog_default_model(config_home: Path) ->
 
     env = _build_openai_agents_sdk_spawn_env(spec)
 
-    catalog_default = default_chat_model("openai")
-    assert catalog_default is not None
+    catalog_default = _CATALOG_DEFAULTS[("openai", "openai")]
     assert env["HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL"] == "https://api.openai.com/v1"
     assert env["HARNESS_OPENAI_AGENTS_MODEL"] == catalog_default
 
@@ -758,8 +790,6 @@ def test_qwen_falls_back_to_catalog_default_model(config_home: Path) -> None:
 
     Proves the analogous fallback in :func:`_build_qwen_spawn_env`.
     """
-    from omnigent.onboarding.providers import default_chat_model
-
     config: dict[str, object] = {
         "providers": {
             "openai": {
@@ -774,8 +804,7 @@ def test_qwen_falls_back_to_catalog_default_model(config_home: Path) -> None:
 
     env = _build_qwen_spawn_env(spec, workdir=None)
 
-    catalog_default = default_chat_model("openai")
-    assert catalog_default is not None
+    catalog_default = _CATALOG_DEFAULTS[("openai", "openai")]
     # qwen uses the single gateway base URL (not JSON object like pi)
     assert env["HARNESS_QWEN_GATEWAY_BASE_URL"] == "https://api.openai.com/v1"
     assert env["HARNESS_QWEN_MODEL"] == catalog_default
@@ -789,8 +818,6 @@ def test_pi_falls_back_to_catalog_default_model(config_home: Path) -> None:
     pi prefers the anthropic family for auth, so the model fallback must
     come from the anthropic catalog default.
     """
-    from omnigent.onboarding.providers import default_chat_model
-
     config: dict[str, object] = {
         "providers": {
             "anthropic": {
@@ -805,8 +832,7 @@ def test_pi_falls_back_to_catalog_default_model(config_home: Path) -> None:
 
     env = _build_pi_spawn_env(spec, workdir=None)
 
-    catalog_default = default_chat_model("anthropic")
-    assert catalog_default is not None
+    catalog_default = _CATALOG_DEFAULTS[("anthropic", "claude")]
     assert env["HARNESS_PI_MODEL"] == catalog_default
 
 
@@ -819,8 +845,6 @@ def test_provider_default_beats_catalog_default(config_home: Path) -> None:
     catalog. Failure means the precedence (provider default > catalog
     default) regressed.
     """
-    from omnigent.onboarding.providers import default_chat_model
-
     _write_config(config_home, _anthropic_default_config())  # declares "claude-default-model"
     spec = _make_spec(harness="claude-sdk")
 
@@ -828,7 +852,7 @@ def test_provider_default_beats_catalog_default(config_home: Path) -> None:
 
     # The provider's explicit default is used, not the catalog's.
     assert env["HARNESS_CLAUDE_SDK_MODEL"] == "claude-default-model"
-    assert env["HARNESS_CLAUDE_SDK_MODEL"] != default_chat_model("anthropic")
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] != _CATALOG_DEFAULTS[("anthropic", "claude")]
 
 
 def test_spec_model_beats_catalog_default(config_home: Path) -> None:
@@ -1110,8 +1134,8 @@ def test_pi_cli_config_databricks_default_routes_gateway(
     # table (the "!" Pi-models.json prefix is stripped for the transport var).
     # The fixture's [auth] declares command="jq" with no args, so it is "jq".
     assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "jq"
-    # Default model is the Databricks gateway default (no spec/override model).
-    assert env["HARNESS_PI_MODEL"] == "databricks-claude-sonnet-4-6"
+    # No spec/override model: use the Databricks Claude catalog selection.
+    assert env["HARNESS_PI_MODEL"] == _CATALOG_DEFAULTS[("databricks", "claude")]
 
 
 _DISMISSIBLE_CODEX_CONFIG_TOML = """
@@ -1299,3 +1323,145 @@ def test_kimi_os_env_serialized(config_home: Path) -> None:
     assert "HARNESS_KIMI_OS_ENV" in env
     decoded = _json.loads(env["HARNESS_KIMI_OS_ENV"])
     assert decoded["sandbox"]["type"] == "darwin_seatbelt"
+
+
+# ---------------------------------------------------------------------------
+# harness.<canonical>.command → OMNIGENT_<NAME>_PATH (spawn-env builders)
+# ---------------------------------------------------------------------------
+
+
+def _call_builder(builder: object, spec: AgentSpec) -> dict[str, str]:  # type: ignore[explicit-any]
+    """Invoke a spawn-env builder, papering over the ``workdir`` signature split.
+
+    ``_build_kimi_spawn_env`` takes only ``cwd``; the others accept ``workdir``
+    too. Pass ``cwd=None`` / ``workdir=None`` as appropriate so the path-override
+    tests don't depend on the bundle-dir plumbing.
+    """
+    import inspect
+
+    params = inspect.signature(builder).parameters  # type: ignore[arg-type]
+    kwargs: dict[str, object] = {"cwd": None}
+    if "workdir" in params:
+        kwargs["workdir"] = None
+    return builder(spec, **kwargs)  # type: ignore[operator, return-value]
+
+
+@pytest.mark.parametrize(
+    ("harness", "builder", "env_var"),
+    [
+        ("codex", _build_codex_spawn_env, "OMNIGENT_CODEX_PATH"),
+        ("pi", _build_pi_spawn_env, "OMNIGENT_PI_PATH"),
+        ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
+        ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
+        ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+    ],
+)
+def test_spawn_env_threads_config_command_to_path(
+    config_home: Path,
+    harness: str,
+    builder: object,
+    env_var: str,
+) -> None:
+    """A config ``harness.<canonical>.command`` lands as ``OMNIGENT_<NAME>_PATH``."""
+    cfg = _openai_default_config()
+    cfg["harness"] = {harness: {"command": "/custom/bin"}}
+    _write_config(config_home, cfg)
+    spec = _make_spec(harness=harness)
+
+    env = _call_builder(builder, spec)
+
+    assert env[env_var] == "/custom/bin"
+
+
+@pytest.mark.parametrize(
+    ("harness", "builder", "env_var"),
+    [
+        ("codex", _build_codex_spawn_env, "OMNIGENT_CODEX_PATH"),
+        ("pi", _build_pi_spawn_env, "OMNIGENT_PI_PATH"),
+        ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
+        ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
+        ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+    ],
+)
+def test_spawn_env_ambient_env_wins_over_config_command(
+    monkeypatch: pytest.MonkeyPatch,
+    config_home: Path,
+    harness: str,
+    builder: object,
+    env_var: str,
+) -> None:
+    """The ambient ``OMNIGENT_<NAME>_PATH`` env var wins over config ``command``."""
+    cfg = _openai_default_config()
+    cfg["harness"] = {harness: {"command": "/config/bin"}}
+    _write_config(config_home, cfg)
+    monkeypatch.setenv(env_var, "/ambient/bin")
+    spec = _make_spec(harness=harness)
+
+    env = _call_builder(builder, spec)
+
+    # The builder does not override the ambient env var; config is skipped.
+    assert env_var not in env or env[env_var] != "/config/bin"
+
+
+@pytest.mark.parametrize(
+    ("harness", "builder"),
+    [
+        ("codex", _build_codex_spawn_env),
+        ("pi", _build_pi_spawn_env),
+        ("kimi", _build_kimi_spawn_env),
+        ("goose", _build_goose_spawn_env),
+        ("qwen", _build_qwen_spawn_env),
+    ],
+)
+def test_spawn_env_no_command_emits_no_path(
+    config_home: Path,
+    harness: str,
+    builder: object,
+) -> None:
+    """With no config ``command`` and no ambient env var, no ``*_PATH`` is emitted."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness=harness)
+
+    env = _call_builder(builder, spec)
+
+    suffix = harness.upper()
+    # Neither the canonical OMNIGENT_* nor the legacy HARNESS_* is emitted.
+    assert f"OMNIGENT_{suffix}_PATH" not in env
+    assert f"HARNESS_{suffix}_PATH" not in env
+
+
+@pytest.mark.parametrize(
+    ("harness", "builder"),
+    [
+        ("codex", _build_codex_spawn_env),
+        ("pi", _build_pi_spawn_env),
+        ("kimi", _build_kimi_spawn_env),
+        ("goose", _build_goose_spawn_env),
+        ("qwen", _build_qwen_spawn_env),
+    ],
+)
+def test_spawn_env_legacy_env_wins_over_config_command(
+    monkeypatch: pytest.MonkeyPatch,
+    config_home: Path,
+    harness: str,
+    builder: object,
+) -> None:
+    """A deprecated ``HARNESS_<NAME>_PATH`` env var wins over config ``command``.
+
+    Per ``env > config``, the legacy env var must not be shadowed by config.
+    """
+    from omnigent.harness_startup_config import _LEGACY_PATH_WARNED
+
+    legacy_var = f"HARNESS_{harness.upper()}_PATH"
+    _LEGACY_PATH_WARNED.discard(legacy_var)
+    monkeypatch.delenv(f"OMNIGENT_{harness.upper()}_PATH", raising=False)
+    monkeypatch.setenv(legacy_var, "/legacy/bin")
+    cfg = _openai_default_config()
+    cfg["harness"] = {harness: {"command": "/config/bin"}}
+    _write_config(config_home, cfg)
+    spec = _make_spec(harness=harness)
+
+    env = _call_builder(builder, spec)
+
+    # The builder must not set OMNIGENT_* from config when the legacy env wins.
+    assert f"OMNIGENT_{harness.upper()}_PATH" not in env

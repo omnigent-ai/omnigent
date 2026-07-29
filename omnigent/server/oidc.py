@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import time
@@ -19,6 +20,8 @@ from dataclasses import dataclass
 
 import httpx
 import jwt
+
+_logger = logging.getLogger(__name__)
 
 # ── PKCE helpers (RFC 7636) ──────────────────────────────────────
 
@@ -156,6 +159,14 @@ class OIDCConfig:
     :param userinfo_endpoint: Userinfo URL for providers that
         don't issue ``id_token`` (GitHub). ``None`` for standard
         OIDC providers.
+    :param skip_email_verification: When ``True``, accept the
+        ``id_token`` email claim without requiring
+        ``email_verified``. Only affects the generic-OIDC path;
+        GitHub always requires a verified primary email.
+    :param email_claim: Name of the ``id_token`` claim that carries
+        the user's email identity, e.g. ``"preferred_username"`` for
+        IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
+        ``"email"``. Only affects the generic-OIDC path.
     """
 
     issuer: str
@@ -173,6 +184,8 @@ class OIDCConfig:
     jwks_uri: str | None
     userinfo_endpoint: str | None
     allow_invites: bool
+    skip_email_verification: bool = False
+    email_claim: str = "email"
 
     @property
     def base_url(self) -> str:
@@ -283,6 +296,40 @@ class OIDCConfig:
 
         allow_invites = env_var_is_truthy("OMNIGENT_OIDC_ALLOW_INVITES")
 
+        # Some IdPs (e.g. Okta without custom API Access Management)
+        # omit ``email_verified`` for directory-provisioned users even
+        # though the directory is authoritative for the address. This
+        # opt-out trusts any signed email claim from the IdP — only
+        # enable it when the issuer is a trusted enterprise directory.
+        skip_email_verification = env_var_is_truthy("OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION")
+        if skip_email_verification:
+            _logger.warning(
+                "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set: the "
+                "email_verified claim will not be required on OIDC "
+                "id_tokens. Any signed email claim from %s will be "
+                "trusted as the user's identity.",
+                issuer,
+            )
+
+        # Some IdPs carry the email identity in a claim other than
+        # ``email`` (Microsoft Entra ID commonly issues only
+        # ``preferred_username``, the UPN).
+        email_claim = (os.environ.get("OMNIGENT_OIDC_EMAIL_CLAIM") or "email").strip()
+        if email_claim != "email":
+            _logger.warning(
+                "OMNIGENT_OIDC_EMAIL_CLAIM is set: the user identity "
+                "will be read from the %r claim of id_tokens issued by "
+                "%s instead of ``email``.",
+                email_claim,
+                issuer,
+            )
+            if not skip_email_verification:
+                _logger.warning(
+                    "A custom email claim carries no email_verified "
+                    "marker, so logins will be rejected unless "
+                    "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is also set."
+                )
+
         # Determine provider type and resolve endpoints.
         is_github = issuer.rstrip("/") == _GITHUB_ISSUER
 
@@ -305,6 +352,7 @@ class OIDCConfig:
                 jwks_uri=None,
                 userinfo_endpoint=_GITHUB_USERINFO_ENDPOINT,
                 allow_invites=allow_invites,
+                skip_email_verification=skip_email_verification,
             )
 
         # Standard OIDC: fetch discovery document.
@@ -346,4 +394,6 @@ class OIDCConfig:
             jwks_uri=jwks_uri,
             userinfo_endpoint=doc.get("userinfo_endpoint"),
             allow_invites=allow_invites,
+            skip_email_verification=skip_email_verification,
+            email_claim=email_claim,
         )

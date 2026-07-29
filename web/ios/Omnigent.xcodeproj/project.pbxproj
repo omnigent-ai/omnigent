@@ -13,6 +13,7 @@
 		B10000000000000000000004 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* DesignTokens.swift */; };
 		B10000000000000000000005 /* SettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* SettingsStore.swift */; };
 		B10000000000000000000006 /* ServerURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* ServerURL.swift */; };
+		B10000000000000000000014 /* DeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* DeepLink.swift */; };
 		B10000000000000000000007 /* WorkspaceURLExpander.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000007 /* WorkspaceURLExpander.swift */; };
 		B10000000000000000000008 /* NativeNotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* NativeNotificationManager.swift */; };
 		B10000000000000000000009 /* WebShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* WebShellView.swift */; };
@@ -23,12 +24,17 @@
 		B10000000000000000000012 /* SafariView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* SafariView.swift */; };
 		B1000000000000000000000D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000D /* Assets.xcassets */; };
 		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
-		B10000000000000000000012 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* PrivacyInfo.xcprivacy */; };
+		B10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* PrivacyInfo.xcprivacy */; };
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
+		B20000000000000000000004 /* DeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* DeepLinkTests.swift */; };
+		B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */; };
+		B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* MockHTTPServer.swift */; };
+		B40000000000000000000004 /* MockHTTPServer.swift in Sources (OmnigentUITests) */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* MockHTTPServer.swift */; };
 		B40000000000000000000001 /* OmnigentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000001 /* OmnigentUITests.swift */; };
 		B40000000000000000000002 /* SnapshotHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000002 /* SnapshotHelper.swift */; };
+		B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000003 /* RedirectConsentUITests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -55,6 +61,7 @@
 		A10000000000000000000004 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
 		A10000000000000000000005 /* SettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000006 /* ServerURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURL.swift; sourceTree = "<group>"; };
+		A10000000000000000000014 /* DeepLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLink.swift; sourceTree = "<group>"; };
 		A10000000000000000000007 /* WorkspaceURLExpander.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpander.swift; sourceTree = "<group>"; };
 		A10000000000000000000008 /* NativeNotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeNotificationManager.swift; sourceTree = "<group>"; };
 		A10000000000000000000009 /* WebShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebShellView.swift; sourceTree = "<group>"; };
@@ -67,13 +74,17 @@
 		A1000000000000000000000E /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; name = AppIcon.icon; path = "../platform-assets/AppIcon.icon"; sourceTree = "<group>"; };
 		A1000000000000000000000F /* Info-Debug.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Debug.plist"; sourceTree = "<group>"; };
 		A10000000000000000000010 /* Info-Release.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Release.plist"; sourceTree = "<group>"; };
-		A10000000000000000000012 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		A10000000000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		A20000000000000000000001 /* ServerURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURLTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* SettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStoreTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000004 /* DeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderRedirectTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000006 /* MockHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockHTTPServer.swift; sourceTree = "<group>"; };
 		A30000000000000000000003 /* OmnigentUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A40000000000000000000001 /* OmnigentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentUITests.swift; sourceTree = "<group>"; };
 		A40000000000000000000002 /* SnapshotHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotHelper.swift; sourceTree = "<group>"; };
+		A40000000000000000000003 /* RedirectConsentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RedirectConsentUITests.swift; sourceTree = "<group>"; };
 		A30000000000000000000001 /* Omnigent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Omnigent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A30000000000000000000002 /* OmnigentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -133,6 +144,7 @@
 				A10000000000000000000004 /* DesignTokens.swift */,
 				A10000000000000000000005 /* SettingsStore.swift */,
 				A10000000000000000000006 /* ServerURL.swift */,
+				A10000000000000000000014 /* DeepLink.swift */,
 				A10000000000000000000007 /* WorkspaceURLExpander.swift */,
 				A10000000000000000000008 /* NativeNotificationManager.swift */,
 				A10000000000000000000009 /* WebShellView.swift */,
@@ -142,7 +154,7 @@
 				A10000000000000000000011 /* ChatTerminalBar.swift */,
 				A10000000000000000000012 /* SafariView.swift */,
 				A1000000000000000000000D /* Assets.xcassets */,
-				A10000000000000000000012 /* PrivacyInfo.xcprivacy */,
+				A10000000000000000000013 /* PrivacyInfo.xcprivacy */,
 				A1000000000000000000000F /* Info-Debug.plist */,
 				A10000000000000000000010 /* Info-Release.plist */,
 			);
@@ -155,6 +167,9 @@
 				A20000000000000000000001 /* ServerURLTests.swift */,
 				A20000000000000000000002 /* SettingsStoreTests.swift */,
 				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
+				A20000000000000000000004 /* DeepLinkTests.swift */,
+				A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */,
+				A20000000000000000000006 /* MockHTTPServer.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -164,6 +179,7 @@
 			children = (
 				A40000000000000000000001 /* OmnigentUITests.swift */,
 				A40000000000000000000002 /* SnapshotHelper.swift */,
+				A40000000000000000000003 /* RedirectConsentUITests.swift */,
 			);
 			path = OmnigentUITests;
 			sourceTree = "<group>";
@@ -282,7 +298,7 @@
 			files = (
 				B1000000000000000000000D /* Assets.xcassets in Resources */,
 				B1000000000000000000000E /* AppIcon.icon in Resources */,
-				B10000000000000000000012 /* PrivacyInfo.xcprivacy in Resources */,
+				B10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -313,6 +329,7 @@
 				B10000000000000000000004 /* DesignTokens.swift in Sources */,
 				B10000000000000000000005 /* SettingsStore.swift in Sources */,
 				B10000000000000000000006 /* ServerURL.swift in Sources */,
+				B10000000000000000000014 /* DeepLink.swift in Sources */,
 				B10000000000000000000007 /* WorkspaceURLExpander.swift in Sources */,
 				B10000000000000000000008 /* NativeNotificationManager.swift in Sources */,
 				B10000000000000000000009 /* WebShellView.swift in Sources */,
@@ -331,6 +348,9 @@
 				B20000000000000000000001 /* ServerURLTests.swift in Sources */,
 				B20000000000000000000002 /* SettingsStoreTests.swift in Sources */,
 				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
+				B20000000000000000000004 /* DeepLinkTests.swift in Sources */,
+				B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */,
+				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -340,6 +360,8 @@
 			files = (
 				B40000000000000000000001 /* OmnigentUITests.swift in Sources */,
 				B40000000000000000000002 /* SnapshotHelper.swift in Sources */,
+				B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */,
+				B40000000000000000000004 /* MockHTTPServer.swift in Sources (OmnigentUITests) */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

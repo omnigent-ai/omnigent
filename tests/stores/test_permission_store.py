@@ -276,13 +276,14 @@ def test_list_for_session_returns_all_grants(
     store.grant("alice@test.com", conv_id, level=1)
     store.grant("bob@test.com", conv_id, level=3)
 
-    grants = store.list_for_session(conv_id)
+    grants, next_cursor = store.list_for_session(conv_id)
 
     # Both grants must be present.
     assert len(grants) == 2, (
         f"Expected 2 grants for session, got {len(grants)}. "
         "list_for_session is not returning all grants."
     )
+    assert next_cursor is None
     user_ids = {g.user_id for g in grants}
     assert user_ids == {"alice@test.com", "bob@test.com"}, (
         f"Expected users alice and bob, got {user_ids}"
@@ -297,9 +298,10 @@ def test_list_for_session_empty(store: SqlAlchemyPermissionStore, db_uri: str) -
     """``list_for_session`` returns [] for a session with no grants."""
     conv_id = _create_conversation(db_uri)
 
-    result = store.list_for_session(conv_id)
+    grants, next_cursor = store.list_for_session(conv_id)
 
-    assert result == [], f"Expected [] for a session with no grants, got {result!r}"
+    assert grants == [], f"Expected [] for a session with no grants, got {grants!r}"
+    assert next_cursor is None
 
 
 def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
@@ -313,11 +315,37 @@ def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: st
 
     store.grant("alice@test.com", conv_a, level=2)
 
-    b_grants = store.list_for_session(conv_b)
+    b_grants, next_cursor = store.list_for_session(conv_b)
     assert b_grants == [], (
         f"Expected no grants for conv_b, got {b_grants}. "
         "Grants are leaking across session boundaries."
     )
+    assert next_cursor is None
+
+
+def test_list_for_session_pagination(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """``list_for_session`` pages through grants via the user_id cursor."""
+    conv_id = _create_conversation(db_uri)
+    # Zero-padded so lexical order is deterministic and predictable.
+    user_ids = [f"user{i:02d}@test.com" for i in range(5)]
+    for uid in user_ids:
+        _ensure_user(store, uid)
+        store.grant(uid, conv_id, level=1)
+
+    # First page: limit=2 → 2 grants + a cursor (the last returned user_id).
+    page1, cursor1 = store.list_for_session(conv_id, limit=2)
+    assert [g.user_id for g in page1] == user_ids[:2]
+    assert cursor1 == user_ids[1]
+
+    # Second page continues after the cursor.
+    page2, cursor2 = store.list_for_session(conv_id, limit=2, after_user_id=cursor1)
+    assert [g.user_id for g in page2] == user_ids[2:4]
+    assert cursor2 == user_ids[3]
+
+    # Final page returns the remainder with a null cursor.
+    page3, cursor3 = store.list_for_session(conv_id, limit=2, after_user_id=cursor2)
+    assert [g.user_id for g in page3] == user_ids[4:]
+    assert cursor3 is None
 
 
 # ── list_for_user ────────────────────────────────────────────────────────────
@@ -551,14 +579,13 @@ def test_has_any_grants_false_after_revoke(store: SqlAlchemyPermissionStore, db_
 # ── cascade delete ───────────────────────────────────────────────────────────
 
 
-def test_cascade_delete_removes_permissions_when_conversation_deleted(
+def test_permissions_not_auto_deleted_when_conversation_deleted(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
-    """When a conversation row is deleted, FK CASCADE removes permission rows.
+    """Without DB FK cascade, deleting a conversation leaves its permission rows intact.
 
-    The session_permissions table has ``ON DELETE CASCADE`` on
-    ``conversation_id``. Deleting the conversation must clean up all
-    associated grants without explicit permission-store calls.
+    The application (delete_conversation) is responsible for explicitly
+    deleting session_permissions rows when a conversation is removed.
     """
     _ensure_user(store, "alice@test.com")
     _ensure_user(store, "bob@test.com")
@@ -567,10 +594,9 @@ def test_cascade_delete_removes_permissions_when_conversation_deleted(
     store.grant("alice@test.com", conv_id, level=2)
     store.grant("bob@test.com", conv_id, level=1)
 
-    # Verify grants exist before delete.
     assert store.has_any_grants(conv_id) is True, "Pre-condition: grants must exist"
 
-    # Delete the conversation directly via SQLAlchemy to trigger FK CASCADE.
+    # Delete the conversation directly — no FK cascade fires.
     from sqlalchemy import delete as sa_delete
 
     from omnigent.db.db_models import SqlConversation
@@ -581,13 +607,9 @@ def test_cascade_delete_removes_permissions_when_conversation_deleted(
     with session_maker() as session:
         session.execute(sa_delete(SqlConversation).where(SqlConversation.id == conv_id))
 
-    # All grants on the deleted conversation must be gone.
-    assert store.has_any_grants(conv_id) is False, (
-        "Expected no grants after conversation CASCADE delete, but "
-        "grants still exist. The FK ON DELETE CASCADE is not working."
-    )
-    assert store.list_for_session(conv_id) == [], (
-        "Expected [] after CASCADE delete, but grants remain."
+    # Grants remain — the application must clean them up explicitly.
+    assert store.has_any_grants(conv_id) is True, (
+        "Without FK cascade, permission rows must persist after conversation deletion."
     )
 
 
@@ -989,7 +1011,7 @@ def test_check_access_public_grant_fallback(store: SqlAlchemyPermissionStore, db
 
 def test_check_access_none_user(store: SqlAlchemyPermissionStore) -> None:
     """check_access returns False when user_id is None."""
-    assert store.check_access(None, "conv_any", required_level=1) is False
+    assert store.check_access(None, "483e55280c4ee1d3ddf0492148f9eeb5", required_level=1) is False
 
 
 def test_check_access_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
@@ -1039,7 +1061,7 @@ def test_get_permission_level_public_fallback(
 
 def test_get_permission_level_none_user(store: SqlAlchemyPermissionStore) -> None:
     """get_permission_level returns None for None user_id."""
-    assert store.get_permission_level(None, "conv_any") is None
+    assert store.get_permission_level(None, "483e55280c4ee1d3ddf0492148f9eeb5") is None
 
 
 def test_get_permission_level_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:

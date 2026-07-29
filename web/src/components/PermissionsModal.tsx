@@ -15,7 +15,8 @@ import {
   useRef,
   useState,
 } from "react";
-import { CheckIcon, LinkIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -41,11 +42,20 @@ import {
   useRevokePermission,
 } from "@/hooks/usePermissions";
 import { useUserSearch } from "@/hooks/useUserSearch";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
 const PUBLIC_USER = "__public__";
+
+/** Numeric permission level → display label for fixed (non-editable) rows. */
+const LEVEL_LABELS: Record<number, string> = {
+  1: "Read",
+  2: "Edit",
+  3: "Manage",
+  4: "Owner",
+};
 
 interface PermissionsModalProps {
   sessionId: string;
@@ -54,13 +64,31 @@ interface PermissionsModalProps {
 }
 
 export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsModalProps) {
-  const { data: permissions, isLoading } = usePermissions(open ? sessionId : null);
+  // Server sharing policy. While the boot probe is in flight we treat the
+  // server as "on" (fail open) so the modal renders its full controls; the
+  // server-side gate is the real enforcement point regardless.
+  const info = useServerInfo();
+  const sharingMode = info === "loading" ? "on" : info.sharing_mode;
+  const sharingOff = sharingMode === "off";
+  // Both read-capped tiers present the read-only UI. Under
+  // "restricted_read_only" the server additionally blocks home/root-cwd
+  // sessions entirely; that per-session rule is enforced server-side and
+  // surfaces here as an error on the grant attempt.
+  const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
+  // Public (anyone-with-the-link) access is a separate server switch from the
+  // sharing tiers; when off, hide the toggle (the server rejects the grant too).
+  const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
+  // In "off" mode never fetch the grant list — the modal short-circuits to a
+  // notice below, so the request would be wasted (and the server rejects any
+  // grant anyway).
+  const { data: permissions, isLoading } = usePermissions(open && !sharingOff ? sessionId : null);
   const grant = useGrantPermission(sessionId);
   const revoke = useRevokePermission(sessionId);
 
   const [newUserId, setNewUserId] = useState("");
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
+  const [showQr, setShowQr] = useState(false);
 
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
@@ -106,31 +134,59 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
     }
   }
 
+  // "off" short-circuit: sharing is disabled server-wide, so skip the whole
+  // grant UI and show a plain notice instead. Mirrors the server's 403.
+  if (sharingOff) {
+    return (
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">Sharing unavailable</DialogTitle>
+            <DialogDescription>
+              Sharing has been disabled for this Omnigent server.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => onOpenChange(false)}>
+              Done
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
           <DialogDescription>
-            Invite others to view or collaborate on this session.
+            {sharingReadOnly
+              ? "This server allows read-only sharing — invite others to view this session."
+              : "Invite others to view or collaborate on this session."}
           </DialogDescription>
         </DialogHeader>
 
-        {/* Public toggle */}
-        <div className="flex items-center justify-between rounded-lg border px-3 py-2">
-          <div>
-            <p className="text-sm font-medium">Public access</p>
-            <p className="text-xs text-muted-foreground">Anyone can view this session</p>
+        {/* Public toggle — hidden when the server disables public access. */}
+        {publicSharingEnabled && (
+          <div className="flex items-center justify-between rounded-lg border px-3 py-2">
+            <div>
+              <p className="text-sm font-medium">Public access</p>
+              <p className="text-xs text-muted-foreground">Anyone can view this session</p>
+            </div>
+            <Switch
+              checked={isPublic}
+              onCheckedChange={handlePublicToggle}
+              disabled={grant.isPending || revoke.isPending}
+            />
           </div>
-          <Switch
-            checked={isPublic}
-            onCheckedChange={handlePublicToggle}
-            disabled={grant.isPending || revoke.isPending}
-          />
-        </div>
+        )}
 
-        {/* Current grants */}
-        <div>
+        {/* Current grants. DialogContent is a grid, and grid items default to
+            min-width:auto — without min-w-0 a long nowrap email sets the whole
+            track's min-content and pushes every row past the dialog edge. */}
+        <div className="min-w-0" data-testid="share-grants">
           {isLoading ? (
             <p className="text-sm text-muted-foreground py-2">Loading…</p>
           ) : userGrants.length === 0 ? (
@@ -155,6 +211,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
                     onRevoke={handleRevoke}
                     onChangeLevel={handleChangeLevel}
                     busy={grant.isPending || revoke.isPending}
+                    readOnly={sharingReadOnly}
                   />
                 ))}
               </div>
@@ -180,7 +237,8 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="1">Read</SelectItem>
-                <SelectItem value="2">Edit</SelectItem>
+                {/* Read-only sharing caps new grants at view; hide Edit. */}
+                {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
               </SelectContent>
             </Select>
           </div>
@@ -193,12 +251,26 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         {error && <p className="text-xs text-destructive">{error}</p>}
 
         <DialogFooter className="flex-row justify-between sm:justify-between">
-          <CopyLinkButton sessionId={sessionId} />
+          <div className="flex items-center gap-2">
+            <CopyLinkButton sessionId={sessionId} />
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowQr(true)}
+              className="gap-1.5 text-primary"
+            >
+              <QrCodeIcon className="size-3.5" />
+              Open in mobile app
+            </Button>
+          </div>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Done
           </Button>
         </DialogFooter>
       </DialogContent>
+
+      {/* Separate modal for the QR code so the share dialog stays compact. */}
+      <QrCodeDialog sessionId={sessionId} open={showQr} onOpenChange={setShowQr} />
     </Dialog>
   );
 }
@@ -387,6 +459,25 @@ function getShareableLink(sessionId: string, rebasePath: (path: string) => strin
   return transform ? transform(path) : `${window.location.origin}${path}`;
 }
 
+/**
+ * The `omnigent://<host>/c/<session_id>` deep link encoded into the share QR
+ * code. The host (with port when non-default) is parsed from the same shareable
+ * URL `getShareableLink` resolves — so standalone and embedded (host-transformed)
+ * origins agree on the same server the desktop shell's deep-link handler keys
+ * off of (see `electron/src/deepLink.js`). The path is always basename-less
+ * `/c/<id>`; the workspace mount is server-determined and intentionally absent.
+ */
+function getDeepLink(sessionId: string, rebasePath: (path: string) => string): string {
+  const url = getShareableLink(sessionId, rebasePath);
+  try {
+    const { host } = new URL(url);
+    return `omnigent://${host}/c/${sessionId}`;
+  } catch {
+    // Unparseable transform output: fall back to the current origin's host.
+    return `omnigent://${window.location.host}/c/${sessionId}`;
+  }
+}
+
 function CopyLinkButton({ sessionId }: { sessionId: string }) {
   const [copied, setCopied] = useState(false);
   const rebasePath = useRebasePath();
@@ -415,31 +506,95 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   );
 }
 
+/**
+ * A separate modal showing a QR code encoding the session's
+ * `omnigent://<host>/c/<id>` deep link so a user can scan it with their phone
+ * to open the session in the Omnigent app. The code is rendered on a fixed
+ * white tile so it stays scannable regardless of the app's dark/light theme
+ * (a dark-on-dark QR won't read). Error correction is bumped to M for
+ * resilience against partial occlusion.
+ */
+function QrCodeDialog({
+  sessionId,
+  open,
+  onOpenChange,
+}: {
+  sessionId: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const rebasePath = useRebasePath();
+  const deepLink = getDeepLink(sessionId, rebasePath);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <QrCodeIcon className="size-4" />
+            Open in mobile app
+          </DialogTitle>
+          <DialogDescription>
+            Scan with your phone's camera to open this session in the Omnigent app.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex justify-center">
+          <div className="rounded-lg bg-white p-3">
+            <QRCodeSVG
+              value={deepLink}
+              size={200}
+              level="M"
+              // White tile + explicit module colors keep the code scannable in dark
+              // mode; the padding also serves as the QR quiet zone.
+              bgColor="#ffffff"
+              fgColor="#000000"
+              aria-label="QR code to open this session in the Omnigent app"
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Close
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function GrantRow({
   permission,
   onRevoke,
   onChangeLevel,
   busy,
+  readOnly,
 }: {
   permission: Permission;
   onRevoke: (userId: string) => void;
   onChangeLevel: (userId: string, level: number) => void;
   busy: boolean;
+  readOnly: boolean;
 }) {
   const isOwner = permission.level === 4;
   // Manage is not grantable from the UI, so a pre-existing manage grant
   // renders as a fixed label rather than a dropdown choice. Unlike the
   // owner row it can still be revoked.
   const isManage = permission.level === 3;
+  // Read-only sharing mode: existing grants can't be re-leveled, so the level
+  // shows as a fixed label (like owner/manage) — but the row stays revocable.
+  const fixedLevel = isOwner || isManage || readOnly;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
+      {/* Tail truncation keeps the local part — the distinguishing half when
+          every grantee shares one company domain — and the title tooltip
+          carries the full id. */}
       <span className="flex-1 truncate text-sm" title={permission.user_id}>
         {permission.user_id}
       </span>
-      {isOwner || isManage ? (
+      {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
-          {isOwner ? "Owner" : "Manage"}
+          {LEVEL_LABELS[permission.level] ?? "Read"}
         </span>
       ) : (
         <Select

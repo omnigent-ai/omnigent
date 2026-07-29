@@ -12,6 +12,7 @@ fail-loud behavior with a stubbed runner (no real harness needed).
 
 from __future__ import annotations
 
+import unittest.mock
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -93,7 +94,6 @@ class _CaptureRunnerClient:
 async def test_function_call_output_forwarded_as_tool_result(
     auth_client: httpx.AsyncClient,
     db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The route translates function_call_output → tool_result verbatim.
 
@@ -109,17 +109,18 @@ async def test_function_call_output_forwarded_as_tool_result(
     async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
         return _CaptureRunnerClient(calls)
 
-    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
     session_id = _seed_session(db_uri)
-
-    resp = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "function_call_output",
-            "data": {"call_id": "call_x", "output": "calc-result"},
-        },
-        headers={"X-Forwarded-Email": _ALICE},
-    )
+    # Use unittest.mock.patch so cleanup is guaranteed even when pytest-asyncio
+    # fixture teardown ordering leaves monkeypatch undo too late (CI flake).
+    with unittest.mock.patch.object(sessions_mod, "_get_runner_client", _stub):
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "function_call_output",
+                "data": {"call_id": "call_x", "output": "calc-result"},
+            },
+            headers={"X-Forwarded-Email": _ALICE},
+        )
 
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": True, "item_id": "call_x"}
@@ -138,7 +139,6 @@ async def test_function_call_output_forwarded_as_tool_result(
 async def test_function_call_output_no_runner_returns_503(
     auth_client: httpx.AsyncClient,
     db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No bound runner → 503 (the result can't be delivered)."""
     from omnigent.server.routes import sessions as sessions_mod
@@ -146,14 +146,13 @@ async def test_function_call_output_no_runner_returns_503(
     async def _stub_none(*_: Any, **__: Any) -> None:
         return None
 
-    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub_none)
     session_id = _seed_session(db_uri)
-
-    resp = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "function_call_output", "data": {"call_id": "c", "output": "o"}},
-        headers={"X-Forwarded-Email": _ALICE},
-    )
+    with unittest.mock.patch.object(sessions_mod, "_get_runner_client", _stub_none):
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "function_call_output", "data": {"call_id": "c", "output": "o"}},
+            headers={"X-Forwarded-Email": _ALICE},
+        )
 
     assert resp.status_code == 503, resp.text
 
@@ -162,7 +161,6 @@ async def test_function_call_output_no_runner_returns_503(
 async def test_function_call_output_runner_error_returns_503(
     auth_client: httpx.AsyncClient,
     db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A transport failure forwarding the tool_result fails loud (503).
 
@@ -182,13 +180,12 @@ async def test_function_call_output_runner_error_returns_503(
     async def _stub_failing(*_: Any, **__: Any) -> _FailingRunnerClient:
         return _FailingRunnerClient()
 
-    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub_failing)
     session_id = _seed_session(db_uri)
-
-    resp = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "function_call_output", "data": {"call_id": "c", "output": "o"}},
-        headers={"X-Forwarded-Email": _ALICE},
-    )
+    with unittest.mock.patch.object(sessions_mod, "_get_runner_client", _stub_failing):
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "function_call_output", "data": {"call_id": "c", "output": "o"}},
+            headers={"X-Forwarded-Email": _ALICE},
+        )
 
     assert resp.status_code == 503, resp.text

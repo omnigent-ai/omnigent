@@ -303,6 +303,11 @@ class SessionResourceRegistry:
         # lifecycle relationship so the runner can decide whether the owning
         # session should fail.
         self._terminal_exit_publisher: Callable[[TerminalExitEvent], None] | None = None
+        # Strong reference to the fire-and-forget terminal-exit cleanup tasks,
+        # plus an event so loop-side callers can await scheduling/completion
+        # instead of polling. Entries self-remove on completion.
+        self._terminal_exit_tasks: set[asyncio.Task[None]] = set()
+        self._terminal_exit_scheduled: asyncio.Event = asyncio.Event()
 
     def set_terminal_activity_publisher(
         self,
@@ -359,6 +364,18 @@ class SessionResourceRegistry:
         :param publisher: Callable receiving a :class:`TerminalExitEvent`.
         """
         self._terminal_exit_publisher = publisher
+
+    async def wait_for_terminal_exit_cleanup(self) -> None:
+        """Await the scheduled terminal-exit cleanup to completion so its
+        ``session.resource.deleted`` publish is observable without polling.
+
+        Single-shot: the "scheduled" event is never cleared, so this
+        synchronizes on one terminal exit, not a sequence of them.
+        """
+        await self._terminal_exit_scheduled.wait()
+        tasks = list(self._terminal_exit_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
 
     def _set_session_status_memo(self, session_id: str, status: str) -> None:
         """Record the session's latest PTY status for exit classification."""
@@ -1062,6 +1079,9 @@ class SessionResourceRegistry:
                         instance=instance,
                     )
                 )
+                self._terminal_exit_tasks.add(task)
+                self._terminal_exit_scheduled.set()
+                task.add_done_callback(self._terminal_exit_tasks.discard)
                 task.add_done_callback(_log_terminal_exit_task_result)
 
             try:
