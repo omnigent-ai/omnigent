@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent import harness_startup_config
 from omnigent.harness_startup_config import (
     resolve_harness_args,
     resolve_harness_command,
     resolve_harness_config,
     resolve_harness_path,
 )
+
+
+@pytest.fixture(autouse=True)
+def _every_command_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin executable resolution so precedence assertions don't depend on
+    what happens to be installed on the machine running the tests. The
+    stale-override tests re-pin ``_which`` per case."""
+    monkeypatch.setattr(harness_startup_config, "_which", lambda cmd: f"/resolved/{cmd}")
+
 
 # ── resolve_harness_config ───────────────────────────────────────────
 
@@ -198,6 +208,73 @@ def test_command_empty_explicit_falls_through(
     # An empty --command flag should not shadow the env var.
     assert (
         resolve_harness_command("codex", default="codex", explicit="   ", cfg={}) == "/env/codex"
+    )
+
+
+# ── stale-override fallback ─────────────────────────────────────────
+
+
+def _only_default_resolves(default: str):
+    """A ``_which`` where nothing but *default* is an executable."""
+    return lambda cmd: f"/resolved/{cmd}" if cmd == default else None
+
+
+def test_command_stale_config_override_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A config pin to a deleted binary is skipped for a working default.
+
+    The motivating incident: ``harness.claude-native.command`` pinned to
+    a versioned Claude install path that a reinstall deleted, killing
+    every launch in preflight.
+    """
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_CODEX_PATH", raising=False)
+    monkeypatch.setattr(harness_startup_config, "_which", _only_default_resolves("codex"))
+    cfg = {"harness": {"codex": {"command": "/gone/versions/1.2.3/codex"}}}
+    with caplog.at_level("WARNING"):
+        assert resolve_harness_command("codex", default="codex", explicit=None, cfg=cfg) == "codex"
+    assert "stale config command override" in caplog.text
+
+
+def test_command_stale_env_override_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/gone/codex")
+    monkeypatch.setattr(harness_startup_config, "_which", _only_default_resolves("codex"))
+    with caplog.at_level("WARNING"):
+        assert resolve_harness_command("codex", default="codex", explicit=None, cfg={}) == "codex"
+    assert "stale env command override" in caplog.text
+
+
+def test_command_stale_override_kept_when_default_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When neither resolves, keep the override so the launch error names
+    the operator's configured value rather than a default they never chose."""
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_CODEX_PATH", raising=False)
+    monkeypatch.setattr(harness_startup_config, "_which", lambda cmd: None)
+    cfg = {"harness": {"codex": {"command": "/gone/codex"}}}
+    with caplog.at_level("WARNING"):
+        assert (
+            resolve_harness_command("codex", default="codex", explicit=None, cfg=cfg)
+            == "/gone/codex"
+        )
+    assert "stale" not in caplog.text
+
+
+def test_command_stale_explicit_flag_never_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-invocation ``--command`` should fail loudly, not be second-guessed."""
+    monkeypatch.setattr(harness_startup_config, "_which", _only_default_resolves("codex"))
+    assert (
+        resolve_harness_command("codex", default="codex", explicit="/gone/codex", cfg={})
+        == "/gone/codex"
     )
 
 
