@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -10,7 +10,11 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { AgentCard } from "@/components/AgentCard";
-import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { createSession } from "@/lib/sessionsApi";
 
@@ -63,20 +67,23 @@ export function AddAgentDialog({
   const modelValue = model ?? selectedAgent?.model ?? "";
 
   // Session-discovered rows reach the catalog with only scan data; their
-  // declared model arrives via this enrichment. Without it the picker's
-  // model input stays empty for exactly the agents this dialog surfaces.
-  useEffect(() => {
-    if (!open) return;
-    for (const agent of agentList) {
-      void prefetchAvailableAgentDetails(agent, queryClient);
-    }
-  }, [open, agentList, queryClient]);
+  // declared model (plus description and harness glyph) arrives via this
+  // enrichment. One row at a time, driven by hover / focus / selection, so
+  // opening the dialog doesn't fan out a GET per discovered agent.
+  function enrichAgent(agent: AvailableAgent): void {
+    void prefetchAvailableAgentDetails(agent, queryClient);
+  }
 
   function selectAgent(agentId: string): void {
     setSelectedAgentId(agentId);
     // Back to following the newly picked agent's declared model.
     setModel(null);
     setError(null);
+    // Selection is the path that must enrich: the Model input pre-fills from
+    // the picked agent's declared model, which a session-discovered row only
+    // carries once this fetch lands.
+    const picked = agentList.find((a) => a.id === agentId);
+    if (picked) enrichAgent(picked);
   }
 
   function handleOpenChange(next: boolean): void {
@@ -106,7 +113,8 @@ export function AddAgentDialog({
         parentSessionId,
         subAgentName: null,
         title,
-        // Empty model → null → harness default (no override).
+        // Empty model sends `model_override: null`, which the server reads
+        // the same as an absent field — no override, harness default.
         modelOverride: trimmedModel || null,
       });
       // Refresh the rail so the new child appears immediately, then jump
@@ -145,13 +153,20 @@ export function AddAgentDialog({
               </p>
             ) : (
               agentList.map((agent) => (
-                <AgentCard
+                // Pointer/keyboard landing on a row enriches that row alone,
+                // so its details are ready before the user picks it.
+                <div
                   key={agent.id}
-                  agent={agent}
-                  selected={agent.id === selectedAgentId}
-                  onSelect={() => selectAgent(agent.id)}
-                  hover
-                />
+                  onMouseEnter={() => enrichAgent(agent)}
+                  onFocus={() => enrichAgent(agent)}
+                >
+                  <AgentCard
+                    agent={agent}
+                    selected={agent.id === selectedAgentId}
+                    onSelect={() => selectAgent(agent.id)}
+                    hover
+                  />
+                </div>
               ))
             )}
           </div>

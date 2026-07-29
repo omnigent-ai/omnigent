@@ -6,7 +6,11 @@ import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { AddAgentDialog } from "./AddAgentDialog";
-import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { createSession } from "@/lib/sessionsApi";
 
 const navigateMock = vi.fn();
@@ -21,6 +25,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
 vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn() }));
 
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
+const prefetchMock = vi.mocked(prefetchAvailableAgentDetails);
 const createSessionMock = vi.mocked(createSession);
 
 const AGENTS: AvailableAgent[] = [
@@ -65,6 +70,8 @@ function renderDialog(parentSessionId = "conv_parent") {
 
 beforeEach(() => {
   useAvailableAgentsMock.mockReset();
+  prefetchMock.mockReset();
+  prefetchMock.mockResolvedValue(undefined);
   createSessionMock.mockReset();
   navigateMock.mockReset();
   mockAgents(AGENTS);
@@ -247,6 +254,68 @@ describe("AddAgentDialog", () => {
       title: "ui:databricks-coding-agent:reviewer",
       modelOverride: null,
     });
+  });
+
+  // A session-discovered row: the sessions scan supplies only id/name, so
+  // its declared model (and description / harness) is null until enriched.
+  const SCANNED_AGENT: AvailableAgent = {
+    id: "ag_scanned",
+    name: "hello_world",
+    display_name: "Hello world",
+    description: null,
+    harness: null,
+    model: null,
+    skills: [],
+    sessionId: "conv_seed",
+  };
+
+  it("enriches only the row focus lands on when the dialog opens", () => {
+    // Enrichment is one GET /v1/sessions/{id}/agent per row, so fetching the
+    // whole list on open bursts on servers with many discovered agents.
+    // Radix moves focus into the dialog, which lands on the first card — that
+    // row enriches, and nothing else does.
+    mockAgents([SCANNED_AGENT, ...AGENTS]);
+    renderDialog();
+    expect(prefetchMock).toHaveBeenCalledTimes(1);
+    expect(prefetchMock.mock.calls[0][0]).toEqual(SCANNED_AGENT);
+  });
+
+  it("enriches a single row on hover and on keyboard focus", () => {
+    mockAgents([SCANNED_AGENT, ...AGENTS]);
+    renderDialog();
+    // Drop the open-time enrichment of the auto-focused row.
+    prefetchMock.mockClear();
+
+    fireEvent.mouseOver(screen.getByTestId("agent-card-ag_codex"));
+    expect(prefetchMock).toHaveBeenCalledTimes(1);
+    expect(prefetchMock.mock.calls[0][0]).toEqual(AGENTS[1]);
+
+    // Tabbing onto a row enriches it too, so keyboard users get the same
+    // pre-fill without a pointer ever touching the card.
+    fireEvent.focusIn(screen.getByTestId("agent-card-ag_claude"));
+    expect(prefetchMock).toHaveBeenCalledTimes(2);
+    expect(prefetchMock.mock.calls[1][0]).toEqual(AGENTS[0]);
+  });
+
+  it("enriches the picked row so a discovered agent's model still pre-fills", () => {
+    // Selection is what the model pre-fill hangs on: the Model input only
+    // appears after a pick, and a session-discovered row carries no model
+    // until this fetch patches the catalog.
+    mockAgents([SCANNED_AGENT]);
+    renderDialog();
+    prefetchMock.mockClear();
+    prefetchMock.mockImplementation((agent) => {
+      mockAgents([
+        { ...(agent as AvailableAgent), harness: "openai-agents", model: "gpt-4o-mini" },
+      ]);
+      return Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByTestId("agent-card-ag_scanned"));
+
+    expect(prefetchMock).toHaveBeenCalledTimes(1);
+    expect(prefetchMock.mock.calls[0][0]).toEqual(SCANNED_AGENT);
+    expect(screen.getByTestId("add-agent-model-input")).toHaveValue("gpt-4o-mini");
   });
 
   it("shows an empty-state and a disabled submit when no agents are available", () => {
