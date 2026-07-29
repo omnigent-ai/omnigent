@@ -1814,6 +1814,8 @@ interface LandingDraft {
   sandboxRepoUrl: string;
   sandboxRepoBranch: string;
   workspace: string;
+  /** Whether `workspace` came from the user's own pick, not a default. */
+  workspaceTouched: boolean;
   branchName: string;
   prefilledBranch: string;
   permissionMode: string;
@@ -2140,6 +2142,13 @@ export function NewChatLandingScreen() {
   // Harness-config modal, opened from the composer's gear icon.
   const [configOpen, setConfigOpen] = useState(false);
 
+  // Tracks whether the user has picked the working directory themselves — from
+  // the file browser or the worktree list. Once set, the agent-cwd default
+  // below stops firing so that pick is never clobbered — not by switching
+  // agents, and not by a host switch that re-seeds the field. Restored with the
+  // draft so returning to the composer keeps the pick standing.
+  const workspaceTouchedRef = useRef(landingDraft?.workspaceTouched ?? false);
+
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
   // `submittedRef` is flipped once the draft is sent to a create, so the
@@ -2159,6 +2168,7 @@ export function NewChatLandingScreen() {
     sandboxRepoUrl,
     sandboxRepoBranch,
     workspace,
+    workspaceTouched: workspaceTouchedRef.current,
     branchName,
     prefilledBranch,
     permissionMode,
@@ -2310,6 +2320,8 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     seededConfigSigRef.current = prefillConfigSig;
+    // A fresh visit: an earlier pick is gone, so re-arm the agent-cwd default.
+    workspaceTouchedRef.current = false;
     setPrefill(initialPrefillState(projectParam));
   }, [projectParam, prefill.project, prefillConfigSig]);
 
@@ -2509,13 +2521,6 @@ export function NewChatLandingScreen() {
     generateBranchName,
   ]);
 
-  // Tracks whether the user has manually picked a working directory from the
-  // file browser. Once set, the agent-cwd default below stops firing so a
-  // manual pick is never clobbered — not by switching agents, and not by a
-  // host switch that re-seeds the field. The intent the user expressed with
-  // that pick is respected for the life of the composer (#509).
-  const workspaceTouchedRef = useRef(false);
-
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
   // The pending custom agent sentinel also wins when set.
@@ -2545,7 +2550,7 @@ export function NewChatLandingScreen() {
   );
   // The selected agent's configured working directory (spec.os_env.cwd), if
   // any. Defaulting the workspace field to it (below) saves the user from
-  // having to already know the agent's required path (#509). Agents without
+  // having to already know the agent's required path. Agents without
   // an os_env.cwd (and older servers that don't expose the field) report
   // null, leaving the host-seeded value in place.
   const defaultWorkspace = selectedAgent?.default_workspace ?? null;
@@ -4522,11 +4527,12 @@ export function NewChatLandingScreen() {
                         initialPath={
                           isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
                         }
-                        onNavigate={(path) => {
-                          // The user manually chose a directory — pin the
-                          // field so a later agent switch's cwd default
-                          // doesn't clobber it (#509).
-                          workspaceTouchedRef.current = true;
+                        onNavigate={(path, { userInitiated }) => {
+                          // Only a real navigation is a choice — the picker
+                          // also reports the directory it opened at, and
+                          // merely opening the browser must not pin the field
+                          // against the agent-cwd default.
+                          if (userInitiated) workspaceTouchedRef.current = true;
                           setWorkspace(path);
                         }}
                         // Warn when browsing into a directory other live agents
@@ -4659,6 +4665,12 @@ export function NewChatLandingScreen() {
                                       // though blur is about to hide the list.
                                       onMouseDown={(e) => {
                                         e.preventDefault();
+                                        // Binding to a worktree is an explicit
+                                        // directory choice, so pin the field:
+                                        // an agent switch's cwd default would
+                                        // otherwise drop the worktree (and the
+                                        // branch prefilled from it).
+                                        workspaceTouchedRef.current = true;
                                         setWorkspace(w.path);
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);
