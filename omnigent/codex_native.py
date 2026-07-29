@@ -13,6 +13,7 @@ import shutil
 import socket
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,12 +38,12 @@ from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
-    _find_codex_cli,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
     codex_session_meta_model_provider,
     codex_terminal_env,
+    normalize_codex_permission_launch_args,
     preload_codex_thread_for_resume,
     resolve_native_codex_launch,
 )
@@ -64,6 +65,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
+    HARNESS_VERSION_TOO_LOW,
     HarnessUnavailableReason,
 )
 from omnigent.host.daemon_launch import (
@@ -84,6 +86,9 @@ from omnigent.native_terminal import (
 )
 from omnigent.native_terminal import (
     bind_session_runner as _bind_session_runner,
+)
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
@@ -188,6 +193,17 @@ def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
     return False
 
 
+def _find_codex_cli() -> str | None:
+    """Return the resolved path to the Codex CLI binary, if any."""
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.onboarding.harness_install import OPENAI_FAMILY, harness_install_spec
+
+    spec = harness_install_spec(OPENAI_FAMILY)
+    if spec is None:
+        return None
+    return resolve_cli_binary(spec.binary)
+
+
 def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     """
     Return why local Codex is unavailable, or ``None`` when available.
@@ -216,8 +232,15 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         Token *validity* (revoked/expired refresh, an unreachable gateway) is
         not judged locally — it surfaces at the first turn via the executor.
     """
+    from omnigent.onboarding.harness_install import (
+        OPENAI_FAMILY,
+        harness_cli_installed,
+    )
+
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
+    if not harness_cli_installed(OPENAI_FAMILY):
+        return HARNESS_VERSION_TOO_LOW
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
     try:
@@ -328,7 +351,8 @@ def run_codex_native(
     *,
     server: str | None,
     session_id: str | None,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    codex_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str = _DEFAULT_CODEX_COMMAND,
     model: str | None = None,
@@ -352,6 +376,9 @@ def run_codex_native(
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup fails.
     """
+    codex_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=codex_args, legacy_param="codex_args"
+    )
     resolved_command = command.strip()
     if not resolved_command:
         raise click.ClickException("Codex command must not be empty.")
@@ -1083,6 +1110,7 @@ async def _prepare_codex_terminal(
                 workspace=Path.cwd().resolve(),
                 model_provider=codex_session_meta_model_provider(_codex_launch),
                 codex_path=command,
+                terminal_launch_args=codex_args,
             )
         # Listen on a loopback WebSocket, mirroring the host-spawned
         # runner (``runner/app.py`` ``_auto_create_codex_terminal``).
@@ -1118,7 +1146,11 @@ async def _prepare_codex_terminal(
                 )
                 await event_client.connect()
             else:
-                await preload_codex_thread_for_resume(codex_ws_url, thread_id)
+                await preload_codex_thread_for_resume(
+                    codex_ws_url,
+                    thread_id,
+                    terminal_launch_args=codex_args,
+                )
                 write_bridge_state(
                     bridge_dir,
                     CodexNativeBridgeState(
@@ -1714,6 +1746,7 @@ async def _ensure_local_codex_resume_rollout(
     workspace: Path,
     model_provider: str,
     codex_path: str | None,
+    terminal_launch_args: Sequence[str] | None = None,
 ) -> Path:
     """
     Ensure Codex has a local rollout JSONL for cold resume.
@@ -1747,6 +1780,7 @@ async def _ensure_local_codex_resume_rollout(
         codex >= 0.133 requires the field to be *present* to parse the
         rollout, but treats the value as informational, so a flaky probe
         must not cost the carried history.
+    :param terminal_launch_args: Persisted Codex approval/sandbox launch args.
     :returns: Path to the existing or written rollout.
     :raises click.ClickException: If Omnigent history cannot be fetched or the
         rollout cannot be written, or if the persisted Codex thread id is
@@ -1776,6 +1810,7 @@ async def _ensure_local_codex_resume_rollout(
         cwd=workspace,
         model_provider=model_provider,
         cli_version=cli_version or "0.0.0",
+        terminal_launch_args=terminal_launch_args,
     )
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
@@ -1880,6 +1915,7 @@ def _codex_rollout_records_from_session_items(
     cwd: Path,
     model_provider: str,
     cli_version: str,
+    terminal_launch_args: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Convert Omnigent session items into Codex rollout JSONL records.
@@ -1909,9 +1945,13 @@ def _codex_rollout_records_from_session_items(
         e.g. ``"omnigent_databricks"``.
     :param cli_version: Codex CLI version string for
         ``session_meta.cli_version``, e.g. ``"0.136.0"``.
+    :param terminal_launch_args: Persisted Codex approval/sandbox launch args.
     :returns: Codex rollout record dictionaries.
     """
     timestamp = _codex_rollout_timestamp()
+    turn_context_policy_fields = _codex_turn_context_policy_fields_from_launch_args(
+        terminal_launch_args
+    )
     records: list[dict[str, Any]] = [
         {
             "timestamp": timestamp,
@@ -1972,7 +2012,7 @@ def _codex_rollout_records_from_session_items(
                     "payload": {
                         "turn_id": turn_id,
                         "cwd": str(cwd),
-                        "approval_policy": "on-request",
+                        **turn_context_policy_fields,
                     },
                 }
             )
@@ -1988,6 +2028,48 @@ def _codex_rollout_records_from_session_items(
         if event_msg is not None:
             records.append(event_msg)
     return records
+
+
+def _codex_turn_context_policy_fields_from_launch_args(
+    terminal_launch_args: Sequence[str] | None,
+) -> dict[str, Any]:
+    """Return rollout policy fields matching persisted Codex launch args."""
+    approval_policy = "on-request"
+    sandbox_mode: str | None = None
+    args = normalize_codex_permission_launch_args(terminal_launch_args)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            approval_policy = "never"
+            sandbox_mode = "danger-full-access"
+        elif arg in ("--ask-for-approval", "-a") and i + 1 < len(args):
+            approval_policy = args[i + 1]
+            i += 1
+        elif arg.startswith("--ask-for-approval="):
+            approval_policy = arg.split("=", 1)[1]
+        elif arg in ("--sandbox", "-s") and i + 1 < len(args):
+            sandbox_mode = args[i + 1]
+            i += 1
+        elif arg.startswith("--sandbox="):
+            sandbox_mode = arg.split("=", 1)[1]
+        elif arg in ("--config", "-c") and i + 1 < len(args):
+            key, _, value = args[i + 1].partition("=")
+            if key == "approval_policy":
+                approval_policy = value.strip().strip('"')
+            elif key == "sandbox_mode":
+                sandbox_mode = value.strip().strip('"')
+            elif (
+                key == "default_permissions"
+                and value.strip().strip('"').strip("'") == ":danger-full-access"
+            ):
+                sandbox_mode = "danger-full-access"
+            i += 1
+        i += 1
+    fields: dict[str, Any] = {"approval_policy": approval_policy}
+    if sandbox_mode in {"read-only", "workspace-write", "danger-full-access"}:
+        fields["sandbox_policy"] = {"type": sandbox_mode}
+    return fields
 
 
 def _codex_event_msg_record_for_message(

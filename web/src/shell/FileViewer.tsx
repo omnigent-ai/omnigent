@@ -89,6 +89,7 @@ import {
   type SaveStatus,
   detectLang,
   isImageFile,
+  isModelFile,
   isNotebookPath,
   isPdfFile,
   openHtmlArtifactInNewTab,
@@ -627,9 +628,16 @@ function FileViewerBody({
   // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
   const isPdf = isPdfFile(path, fileQuery.data?.content_type);
+  // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
+  // they have no meaningful source/diff/preview text representation, so diff is
+  // suppressed and they always resolve to the (viewer-owning) source surface.
+  const isModel = isModelFile(path, fileQuery.data?.content_type);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
-    !isImage && !isPdf && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+    !isImage &&
+    !isPdf &&
+    !isModel &&
+    (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 

@@ -238,22 +238,26 @@ jobs:
         # executor adapters import at collection time.
         run: uv sync --extra all --extra dev
 
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
+
       - name: Install binary dependencies
         # Mirrors e2e.yml. ripgrep: Grep fallback for inner tests. tmux +
         # bubblewrap: the e2e runner runs real agents under the linux_bwrap
         # sandbox, which fails loud if `bwrap` is missing. The apparmor
         # sysctl mirrors ci.yml (Ubuntu 24.04 blocks unprivileged user
-        # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs). npm install
-        # with --ignore-scripts blocks postinstall; the claude-code stub needs
-        # its audited install.cjs run explicitly (platform detect + same-tree
-        # hardlink, no network/exec) for claude-sdk harness rows.
-        working-directory: .github/ci-deps
+        # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs). pnpm
+        # install with --ignore-scripts blocks postinstall; the claude-code
+        # stub needs its audited install.cjs run explicitly (platform detect +
+        # same-tree hardlink, no network/exec) for claude-sdk harness rows.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep tmux bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          npm install --ignore-scripts
-          node node_modules/@anthropic-ai/claude-code/install.cjs
+          pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
+          node .github/ci-deps/node_modules/@anthropic-ai/claude-code/install.cjs
           echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Run pytest target

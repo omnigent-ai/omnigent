@@ -35,6 +35,7 @@ from fastapi import FastAPI
 
 from omnigent.runtime import pending_elicitations, session_stream
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
 from omnigent.server.app import create_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -173,6 +174,20 @@ async def _attach_ask_policy(
     return body["id"]
 
 
+async def _attach_global_ask_policy(client: httpx.AsyncClient) -> str:
+    """Create the same ASK policy as a UI-managed global policy."""
+    resp = await client.post(
+        "/v1/policies",
+        json={
+            "name": "test_global_ask_policy",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
+        },
+    )
+    assert resp.status_code == 200, f"attach policy failed: {resp.status_code} {resp.text}"
+    return resp.json()["id"]
+
+
 def _tool_call_request(
     tool_name: str = "Bash",
     arguments: dict[str, Any] | None = None,
@@ -222,22 +237,27 @@ async def _drain_elicitation_id(
 # ── Tests ───────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("scope", ["session", "global"])
 async def test_ask_policy_approve_flow(
     client: httpx.AsyncClient,
+    scope: str,
 ) -> None:
     """
-    Attach ASK policy, evaluate, approve → ALLOW.
+    Attach a session or global ASK policy, evaluate, approve → ALLOW.
 
     Full journey: create session → attach ``ask_on_os_tools`` policy
     → trigger evaluate with a Bash tool call → observe pending
     elicitation in the session snapshot → resolve with accept →
-    evaluate returns ``POLICY_ACTION_ALLOW``. Proves the session-
-    attached policy fires, parks a real server-side Future, and the
+    evaluate returns ``POLICY_ACTION_ALLOW``. Proves both policy scopes
+    survive the native-evaluation fast path, park a real server-side Future, and the
     URL-based resolve wakes it with the correct verdict.
     """
     agent = await create_test_agent(client, "test-ask-approve")
     session_id = await _create_session(client, agent["id"])
-    await _attach_ask_policy(client, session_id)
+    if scope == "global":
+        await _attach_global_ask_policy(client)
+    else:
+        await _attach_ask_policy(client, session_id)
 
     drain = asyncio.create_task(_drain_elicitation_id(session_id))
     evaluate = None
@@ -281,6 +301,8 @@ async def test_ask_policy_approve_flow(
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
         pending_elicitations.reset_for_tests()
+        if scope == "global":
+            invalidate_default_policy_specs_cache()
 
 
 async def test_ask_policy_refuse_flow(

@@ -87,6 +87,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -1452,23 +1453,27 @@ def create_app(
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 
-            on_fire = build_on_fire(
-                FireDeps(
-                    scheduled_task_store=scheduled_task_store,
-                    agent_store=agent_store,
-                    conversation_store=conversation_store,
-                    permission_store=permission_store,
-                    host_store=host_store,
-                    host_registry=host_registry,
-                    agent_cache=agent_cache,
-                    runner_router=runner_router,
-                    tunnel_registry=tunnel_registry,
-                    file_store=file_store,
-                    artifact_store=artifact_store,
-                )
+            fire_deps = FireDeps(
+                scheduled_task_store=scheduled_task_store,
+                agent_store=agent_store,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                agent_cache=agent_cache,
+                runner_router=runner_router,
+                tunnel_registry=tunnel_registry,
+                file_store=file_store,
+                artifact_store=artifact_store,
             )
+            on_fire = build_on_fire(fire_deps)
+            # The manual "run now" trigger reuses the same fire path (dispatch /
+            # preflight / in-flight guard) as the scheduler; it only differs in
+            # allowing a paused task to fire. Exposed on app.state for the
+            # POST /v1/scheduled-tasks/{id}/run route.
+            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
                 on_fire=on_fire,
@@ -2148,9 +2153,9 @@ def create_app(
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
         # smart_routing_enabled: true when the server can route — either
-        # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
-        # + llm: config) or the managed deployment registered a
-        # policy_llm_connection_factory (which means it has LLM capability
+        # a RoutingClient is configured (a server llm: block, or a
+        # routing.provider=external block) or the managed deployment registered
+        # a policy_llm_connection_factory (which means it has LLM capability
         # and will supply its own RoutingClient).
         try:
             from omnigent.runtime._globals import _caps
@@ -2295,6 +2300,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["imports"],
+    )
+    # Per-user LLM cost report (omni usage). User-scoped, not session-scoped,
+    # so it gets its own router rather than living under /sessions.
+    app.include_router(
+        create_usage_router(
+            conversation_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["usage"],
     )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
@@ -2779,6 +2794,21 @@ def create_app(
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
+            # Multi-user server with a PUBLIC device-authorize endpoint: without
+            # the shared client secret, anyone who can reach the server can
+            # initiate a device flow, so the only phishing defense is the
+            # consent-page warning + short TTL. Warn loudly so an operator opts
+            # into OMNIGENT_DEVICE_CLIENT_SECRET (which closes initiation to
+            # unauthorized callers) rather than leaving it off unknowingly. See
+            # designs/DEVICE_AUTH.md § "Device-code phishing".
+            if not os.environ.get("OMNIGENT_DEVICE_CLIENT_SECRET", "").strip():
+                _logger.warning(
+                    "device-grant: OMNIGENT_DEVICE_CLIENT_SECRET is not set — the "
+                    "/oauth/device/authorize endpoint is PUBLIC (any caller may "
+                    "initiate a login flow). Set OMNIGENT_DEVICE_CLIENT_SECRET on "
+                    "the server and its trusted client(s) to restrict initiation "
+                    "to authorized clients. See designs/DEVICE_AUTH.md.",
+                )
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite

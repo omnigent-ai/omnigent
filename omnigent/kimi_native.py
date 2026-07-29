@@ -51,6 +51,9 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
 
 _DEFAULT_KIMI_COMMAND = "kimi"
@@ -157,7 +160,8 @@ def run_kimi_native(
     *,
     server: str | None,
     session_id: str | None,
-    kimi_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    kimi_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -172,6 +176,9 @@ def run_kimi_native(
         conversation URL after launch.
     :returns: None after the terminal attach session ends.
     """
+    kimi_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=kimi_args, legacy_param="kimi_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(

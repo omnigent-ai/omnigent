@@ -69,11 +69,13 @@ import {
 } from "@/components/ui/select";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from "@/components/ui/dialog";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
@@ -101,6 +103,7 @@ import {
   readUiFontFamily,
   readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
+  UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
   UI_FONT_SIZE_STEP,
@@ -108,17 +111,9 @@ import {
   writeUiFontSizePx,
 } from "@/lib/uiFontPreferences";
 import {
-  applySidebarFontSize,
-  clampSidebarFontSizePx,
-  readSidebarFontSizePx,
-  SIDEBAR_FONT_SIZE_MAX,
-  SIDEBAR_FONT_SIZE_MIN,
-  SIDEBAR_FONT_SIZE_STEP,
-  writeSidebarFontSizePx,
-} from "@/lib/sidebarFontPreferences";
-import {
   clampCodeFontSizePx,
   CODE_FONT_FAMILY_DEFAULT,
+  CODE_FONT_SIZE_DEFAULT,
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
   CODE_FONT_SIZE_STEP,
@@ -129,21 +124,25 @@ import {
 } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
+  TERMINAL_THEME_DEFAULT,
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
   readWorkspacePanelDefault,
+  WORKSPACE_PANEL_DEFAULT,
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
+  DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
   applyThemePalette,
+  DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
   type PaletteSwatch,
@@ -155,6 +154,7 @@ import {
   applyCustomTheme,
   createCustomThemeFromPalette,
   customThemeSwatches,
+  DEFAULT_CUSTOM_THEME,
   readCustomTheme,
   type CustomTheme,
   writeCustomTheme,
@@ -816,10 +816,68 @@ function AppearanceSection() {
   // theme and the font controls are per-device prefs that don't conflict with
   // host theming, so they stay visible.
   const isEmbedded = useIsEmbedded();
+  const { setTheme } = useTheme();
+  const [resetKey, setResetKey] = useState(0);
+  const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
+
+  const resetAppearance = () => {
+    // Reset every appearance preference back to the product default.
+    setTheme("system");
+
+    writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
+
+    writeThemePalette(DEFAULT_PALETTE);
+    applyThemePalette(DEFAULT_PALETTE);
+    writeCustomTheme(DEFAULT_CUSTOM_THEME);
+    applyCustomTheme(DEFAULT_CUSTOM_THEME);
+
+    writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
+
+    writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
+
+    applyUiFontScale(UI_FONT_SIZE_DEFAULT);
+    applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
+
+    writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
+    writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
+
+    // Remove the persisted keys so this device has no appearance overrides at
+    // all. Some write helpers already remove the key for the default value;
+    // clearing the list here makes the intent explicit and keeps the reset
+    // behavior consistent even if a helper changes later.
+    if (typeof window !== "undefined") {
+      try {
+        for (const key of [
+          "omnigent:ui-font-size",
+          "omnigent:ui-font-family",
+          "omnigent:code-font-size",
+          "omnigent:code-font-family",
+          "omnigent:terminal-theme",
+          "omnigent:ui-theme-palette",
+          "omnigent:custom-theme",
+          "omnigent:default-workspace-panel",
+          "omnigent:hide-unconfigured-harnesses",
+        ]) {
+          window.localStorage.removeItem(key);
+        }
+      } catch {
+        // localStorage access errors are non-fatal.
+      }
+    }
+
+    // Remount the controls so they re-read the freshly-cleared defaults from
+    // localStorage rather than keeping their stale seeded state.
+    setResetKey((k) => k + 1);
+  };
+
+  const confirmResetAppearance = () => {
+    resetAppearance();
+    setIsResetDialogOpen(false);
+  };
 
   return (
     <Section title="Appearance" description="Choose how Omnigent looks on this device.">
-      <div className="flex flex-col gap-8">
+      <div key={resetKey} className="flex flex-col gap-8">
         {isEmbedded ? (
           <div className="flex flex-col gap-3">
             <span className="text-sm font-medium">Theme</span>
@@ -839,8 +897,6 @@ function AppearanceSection() {
 
         <HideUnconfiguredHarnessesControl />
 
-        <SidebarAppearanceGroup />
-
         <UiFontSizeControl />
 
         <UiFontFamilyControl />
@@ -852,6 +908,39 @@ function AppearanceSection() {
         <UiCodeFontSizeControl />
 
         <UiCodeFontFamilyControl />
+      </div>
+
+      <div className="flex items-center justify-end">
+        <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
+          <DialogTrigger asChild>
+            <Button variant="outline" size="sm" data-testid="reset-appearance-button">
+              Reset to defaults
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Reset appearance?</DialogTitle>
+              <DialogDescription>
+                This will reset every appearance choice back to its default.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="outline" size="sm">
+                  Cancel
+                </Button>
+              </DialogClose>
+              <Button
+                variant="default"
+                size="sm"
+                onClick={confirmResetAppearance}
+                data-testid="reset-appearance-confirm"
+              >
+                Reset
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     </Section>
   );
@@ -902,108 +991,6 @@ function DefaultBaseBranchControl() {
         value={branch}
         onChange={(e) => update(e.target.value)}
       />
-    </div>
-  );
-}
-
-function SidebarAppearanceGroup() {
-  return (
-    <section
-      role="group"
-      aria-label="Sidebar settings"
-      className="rounded-xl border border-border bg-muted/30 p-4"
-    >
-      <div className="mb-5 flex flex-col gap-1 border-b border-border/70 pb-4">
-        <h2 className="text-base font-semibold">Sidebar</h2>
-        <p className="text-sm text-muted-foreground">
-          Tune navigation readability without changing conversation or code text.
-        </p>
-      </div>
-      <SidebarFontSizeControl />
-    </section>
-  );
-}
-
-function SidebarFontSizeControl() {
-  const [px, setPx] = useState(() => readSidebarFontSizePx());
-  const [draft, setDraft] = useState(() => String(px));
-
-  const commit = useCallback((next: number) => {
-    const clamped = clampSidebarFontSizePx(next);
-    setPx(clamped);
-    setDraft(String(clamped));
-    writeSidebarFontSizePx(clamped);
-    applySidebarFontSize(clamped);
-  }, []);
-
-  const onDraftChange = useCallback((text: string) => {
-    setDraft(text);
-    if (/^\d+$/.test(text)) {
-      const value = Number(text);
-      if (value >= SIDEBAR_FONT_SIZE_MIN && value <= SIDEBAR_FONT_SIZE_MAX) {
-        setPx(value);
-        writeSidebarFontSizePx(value);
-        applySidebarFontSize(value);
-      }
-    }
-  }, []);
-
-  const commitDraft = useCallback(() => {
-    const value = Number(draft);
-    commit(Number.isFinite(value) && draft.trim() !== "" ? value : px);
-  }, [commit, draft, px]);
-
-  return (
-    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-sm font-medium">Font size</span>
-        <span className="text-sm text-muted-foreground">
-          Adjust session names, project labels, and navigation rows.
-        </span>
-      </div>
-      <div
-        role="group"
-        aria-label="Sidebar font size"
-        className={cn(
-          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
-          "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
-        )}
-      >
-        <StepperButton
-          label="Decrease sidebar font size"
-          testId="sidebar-font-size-dec"
-          disabled={px <= SIDEBAR_FONT_SIZE_MIN}
-          onClick={() => commit(px - SIDEBAR_FONT_SIZE_STEP)}
-        >
-          <MinusIcon className="size-4" />
-        </StepperButton>
-        <div className="flex items-center border-x border-input px-2 tabular-nums">
-          <input
-            type="number"
-            inputMode="numeric"
-            min={SIDEBAR_FONT_SIZE_MIN}
-            max={SIDEBAR_FONT_SIZE_MAX}
-            step={SIDEBAR_FONT_SIZE_STEP}
-            aria-label="Sidebar font size in pixels"
-            data-testid="sidebar-font-size-input"
-            className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-            value={draft}
-            onChange={(e) => onDraftChange(e.target.value)}
-            onBlur={commitDraft}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") e.currentTarget.blur();
-            }}
-          />
-        </div>
-        <StepperButton
-          label="Increase sidebar font size"
-          testId="sidebar-font-size-inc"
-          disabled={px >= SIDEBAR_FONT_SIZE_MAX}
-          onClick={() => commit(px + SIDEBAR_FONT_SIZE_STEP)}
-        >
-          <PlusIcon className="size-4" />
-        </StepperButton>
-      </div>
     </div>
   );
 }

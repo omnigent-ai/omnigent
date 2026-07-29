@@ -103,12 +103,34 @@ def test_command_line_redacts_tokens_in_argv(
 def test_save_report_writes_and_rotates(data_dir: Path) -> None:
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent", keep_reports=2)
     paths = [ch._save_report(f"report {i}\n") for i in range(5)]
-    assert all(p.exists() for p in paths)
+    # The newest report always survives its own rotation pass. Earlier paths
+    # may legitimately be gone: rotation prunes between saves, which also frees
+    # those names for reuse — so this deliberately does not assert 5 distinct
+    # paths (see test_save_report_keeps_every_same_second_report, which pins
+    # the no-overwrite guarantee with rotation held wide).
+    assert paths[-1].exists()
     # Only the newest 2 remain on disk.
     remaining = sorted((data_dir / "crashes").glob("crash-*.md"))
     assert len(remaining) == 2
     # Permissions are tight.
     assert all((p.stat().st_mode & 0o077) == 0 for p in remaining)
+
+
+def test_save_report_keeps_every_same_second_report(data_dir: Path) -> None:
+    """Repeated crashes inside one second/process must not overwrite each other.
+
+    The regression: the same-second fallback disambiguated by pid alone, so a
+    process crashing more than twice per second reused one filename and every
+    report but the last was silently destroyed. Rotation is held wide here so
+    only overwriting could lose a report.
+    """
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent", keep_reports=10)
+    paths = [ch._save_report(f"report {i}\n") for i in range(5)]
+
+    assert len(set(paths)) == 5
+    assert {p.read_text(encoding="utf-8").strip() for p in paths} == {
+        f"report {i}" for i in range(5)
+    }
 
 
 def test_save_report_collision_disambiguates(data_dir: Path) -> None:

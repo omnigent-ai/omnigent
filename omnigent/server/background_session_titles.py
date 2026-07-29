@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -13,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.entities.conversation import synthesize_conversation_title
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_plugins import background_title_generators
 from omnigent.stores.conversation_store import ConversationStore
 
 if TYPE_CHECKING:
@@ -22,21 +22,13 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Start with harnesses whose isolated title-generation paths are verified;
-# additional harnesses can be added once they have equivalent coverage.
-_SUPPORTED_BACKGROUND_TITLE_HARNESSES = frozenset({"claude-sdk", "claude-native", "codex"})
-
-
-def background_session_titles_enabled() -> bool:
-    """Return whether automatic background titles are explicitly enabled."""
-    return os.environ.get("OMNIGENT_SESSION_RENAME") == "1"
-
 
 def _background_session_title_harness_supported(harness: str | None) -> bool:
     """Return whether a known session harness may run automatic title inference."""
     if harness is None:
         return True
-    return canonicalize_harness(harness) in _SUPPORTED_BACKGROUND_TITLE_HARNESSES
+    canonical = canonicalize_harness(harness)
+    return canonical is not None and canonical in background_title_generators()
 
 
 @dataclass(frozen=True)
@@ -286,7 +278,6 @@ def prepare_background_session_title(
     """Prepare a guarded first-turn title attempt for a top-level session."""
     if (
         coordinator is None
-        or not background_session_titles_enabled()
         or conversation.title is not None
         or conversation.parent_conversation_id is not None
         or not _background_session_title_harness_supported(conversation.harness_override)

@@ -12,6 +12,7 @@ import {
   deleteScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
+  runScheduledTaskNow,
   updateScheduledTask,
   type CreateScheduledTaskInput,
   type ScheduledTask,
@@ -99,6 +100,23 @@ export function useDeleteScheduledTask() {
     mutationFn: (id: string) => deleteScheduledTask(id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+    },
+  });
+}
+
+/**
+ * Trigger an immediate ("run now") fire of a task, then refresh the list and
+ * that task's run history so the completion badge (last-run status) reflects
+ * the new run. The server launches the run in the background (202), so the
+ * badge lands on the next list poll / invalidation rather than synchronously.
+ */
+export function useRunScheduledTaskNow() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => runScheduledTaskNow(id),
+    onSuccess: (_data, id) => {
+      void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(id) });
     },
   });
 }

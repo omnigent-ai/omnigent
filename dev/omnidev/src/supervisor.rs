@@ -217,7 +217,7 @@ impl Supervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(false);
         // Become a session/group leader so we can signal the whole tree
-        // (uvicorn workers, npm -> vite children) via the negative pgid.
+        // (uvicorn workers, pnpm -> vite children) via the negative pgid.
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
@@ -272,23 +272,23 @@ impl Supervisor {
         });
     }
 
-    /// Run `npm install` to completion before Vite starts, but only when deps
+    /// Run `pnpm install` to completion before Vite starts, but only when deps
     /// are missing or stale — otherwise Vite's dependency scan fails on an
     /// unresolved import (e.g. a dep added to package.json but not installed).
     /// Output streams into the Vite pane. A failed/absent install is logged but
-    /// non-fatal: we still let Vite try, so a transient npm hiccup doesn't block
+    /// non-fatal: we still let Vite try, so a transient pnpm hiccup doesn't block
     /// the whole session.
     async fn prepare_vite(&self) {
-        if !self.pod.needs_npm_install() {
+        if !self.pod.needs_pnpm_install() {
             return;
         }
         self.set_status(ProcId::Vite, ProcStatus::Starting);
         self.shared.lock().unwrap().log_proc(
             ProcId::Vite,
-            "web deps missing or stale — running npm install".into(),
+            "web deps missing or stale — running pnpm install".into(),
         );
 
-        let spec = ProcSpec::npm_install(&self.pod);
+        let spec = ProcSpec::pnpm_install(&self.pod);
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
@@ -304,7 +304,7 @@ impl Supervisor {
                 self.shared
                     .lock()
                     .unwrap()
-                    .log_proc(ProcId::Vite, format!("failed to run npm install: {e}"));
+                    .log_proc(ProcId::Vite, format!("failed to run pnpm install: {e}"));
                 return;
             }
         };
@@ -315,9 +315,7 @@ impl Supervisor {
             self.pump(ProcId::Vite, err);
         }
 
-        // `--loglevel http` streams a line per package fetch, but npm still
-        // goes quiet during the final tree-build/link phase. A slow heartbeat
-        // covers those gaps so the pane never looks frozen.
+        // A slow heartbeat covers quiet phases so the pane never looks frozen.
         let started = Instant::now();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
         heartbeat.tick().await; // the first tick fires immediately; skip it
@@ -329,17 +327,17 @@ impl Supervisor {
                     self.shared
                         .lock()
                         .unwrap()
-                        .log_proc(ProcId::Vite, format!("… npm install running ({secs}s)"));
+                        .log_proc(ProcId::Vite, format!("… pnpm install running ({secs}s)"));
                 }
             }
         };
         match status {
             Ok(s) if s.success() => self.event(format!(
-                "npm install complete ({}s)",
+                "pnpm install complete ({}s)",
                 started.elapsed().as_secs()
             )),
-            Ok(s) => self.event(format!("npm install exited {s} — starting Vite anyway")),
-            Err(e) => self.event(format!("npm install wait error: {e}")),
+            Ok(s) => self.event(format!("pnpm install exited {s} — starting Vite anyway")),
+            Err(e) => self.event(format!("pnpm install wait error: {e}")),
         }
     }
 

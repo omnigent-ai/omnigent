@@ -108,7 +108,11 @@
    * browser default; the root `html` rules multiply it into their font-size so
    * the whole rem-based UI scales. Overridden at runtime on documentElement. */
   --ui-font-scale: 1;
-  --sidebar-font-size: 13px;
+  /* Compact sidebar text size. In `rem` so it rides the root font-size (which
+   * folds in --ui-font-scale and the mobile bump) — 0.8125rem = 13px at the
+   * 16px default, matching the design while still scaling with the Appearance
+   * font-size setting. */
+  --sidebar-font-size: 0.8125rem;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -254,7 +258,7 @@
   --sidebar-accent-foreground: #04355d;
   --sidebar-border: #e8ecf0;
   --sidebar-ring: #2272b4;
-  --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 5%, transparent);
+  --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 3%, transparent);
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
 }
@@ -338,7 +342,6 @@
 
 .sidebar-compact-text {
   font-size: var(--sidebar-font-size);
-  line-height: calc(var(--sidebar-font-size) + 7px);
 }
 
 /* App-shell canvas gradient. Copied verbatim from the brand mock
@@ -879,6 +882,18 @@
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
   cursor: pointer;
+}
+
+/* Streamdown renders links with `wrap-anywhere` (overflow-wrap: anywhere),
+ * which also shrinks the element's min-content width to a single character.
+ * In an auto-layout table that lets a link-only column collapse to ~2ch, so
+ * a short link like "#3090" stacks one or two characters per line while the
+ * prose columns hog the width. `break-word` still wraps overlong URLs, but
+ * keeps min-content at the longest unbreakable run so the column can't be
+ * squeezed below it. */
+:is([data-streamdown="table-cell"], [data-streamdown="table-header-cell"])
+  [data-streamdown="link"] {
+  overflow-wrap: break-word;
 }
 
 /* Flatten Streamdown's loud heading ramp (text-3xl..xl) to em sizes proportional to body. */

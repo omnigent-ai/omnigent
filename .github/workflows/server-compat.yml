@@ -4,7 +4,7 @@ name: Backwards-Compat
 # suites, over the FULL pairwise (server, runner) version matrix.
 #
 # The version universe is `main` (the checked-out code = client + tests, always)
-# plus every non-rc release tag; we cross every server version with every runner
+# plus every final (non-prerelease) release tag; we cross every server version with every runner
 # version. Each cell pins the server and/or runner subprocess to that build
 # (a "main" axis value leaves that component on the checked-out code) while the
 # client and tests stay on main. The (main, main) cell is omitted — it pins
@@ -18,13 +18,13 @@ name: Backwards-Compat
 #
 # Triggers:
 #   workflow_dispatch   manual; optional `versions` CSV overrides the set.
-#   schedule            every 12h; full pairwise over main + all non-rc tags.
+#   schedule            every 12h; full pairwise over main + all final tags.
 
 on:
   workflow_dispatch:
     inputs:
       versions:
-        description: "Comma-separated version set for BOTH axes (e.g. 'main,v0.2.0'). Empty = main + all non-rc tags."
+        description: "Comma-separated version set for BOTH axes (e.g. 'main,v0.2.0'). Empty = main + all final (non-prerelease) tags."
         required: false
         default: ""
   schedule:

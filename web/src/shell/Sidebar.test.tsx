@@ -24,6 +24,7 @@ const {
   createProjectSpy,
   fetchProjectSessionIdsMock,
   conversationsRef,
+  pinnedIdsRef,
   projectSessionsMock,
   useHostsMock,
 } = vi.hoisted(() => ({
@@ -41,6 +42,10 @@ const {
   // ?project= filter — so tests that seed project sessions via the global list
   // keep working without a separate per-project fixture.
   conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  // Server-authoritative pinned ids. Kept in a ref (not the legacy localStorage
+  // key, which the one-time migration clears on mount) so a seeded pin survives
+  // the first render. `seedPins` sets it; the toggle mock mutates it.
+  pinnedIdsRef: { current: [] as string[] },
   // Per-project override: when a test sets projectSessionsMock[name], the folder
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
@@ -62,7 +67,31 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversationBackfill: () => [],
+  // Pins are server-authoritative now. Derive the pinned set from the seeded
+  // ref intersected with the loaded conversations, so tests that seed via
+  // `seedPins` exercise the Pinned section without a separate fixture.
+  usePinnedConversations: () => {
+    const idSet = new Set(pinnedIdsRef.current);
+    return {
+      data: {
+        conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
+        filterHonored: true,
+      },
+      isSuccess: true,
+    };
+  },
+  // Reflect the toggle into the seeded ref so a test that clicks quick-pin then
+  // re-renders sees the updated Pinned set.
+  useTogglePinnedConversation: () => ({
+    mutate: ({ id, pinned }: { id: string; pinned: boolean }) => {
+      const ids = pinnedIdsRef.current;
+      pinnedIdsRef.current = pinned
+        ? [id, ...ids.filter((x) => x !== id)]
+        : ids.filter((x) => x !== id);
+    },
+  }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   // Project feature: the sidebar reads the project list to build project
@@ -103,6 +132,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
   useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
   useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: fetchProjectSessionIdsMock,
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -206,12 +237,39 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockReset();
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
+  pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
 });
+
+/** Seed the server-authoritative pinned set (replaces the old localStorage seed). */
+function seedPins(ids: string[]) {
+  pinnedIdsRef.current = ids;
+}
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
+  it("keeps the session list scrollable without visible scrollbar chrome", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
+    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
+    expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
+    expect(scroller.className).not.toContain("scrollbar-gutter");
+  });
+
+  it("uses balanced title padding until row actions are revealed", () => {
+    mockConversations([conv("conv_balanced", "Codex", { title: "Balanced row title" })]);
+    renderSidebar();
+
+    const row = screen.getByText("Balanced row title").closest("a")!;
+    expect(row).toHaveClass("pr-28", "md:pr-2");
+    expect(row.className).toContain("md:group-hover:pr-14");
+    expect(row.className).toContain("md:group-focus-within:pr-14");
+    expect(row.className).not.toMatch(/(?:^|\s)md:pr-14(?:\s|$)/);
+  });
+
   it("renders no filter funnel and requests the list with archived included", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -264,6 +322,7 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
+    expect(headerActions.parentElement).toHaveClass("h-12");
     const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
 
@@ -286,14 +345,78 @@ describe("Sidebar session list", () => {
     const primaryNav = screen.getByTestId("sidebar-primary-nav");
     const inbox = within(primaryNav).getByTestId("inbox-button");
 
+    expect(primaryNav).toHaveClass("px-2", "pt-0", "pb-3");
+    expect(primaryNav).not.toHaveClass("-mt-0.5");
     expect(inbox).toHaveAttribute("href", "/inbox");
     expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
-    expect(within(primaryNav).getByTestId("toggle-selection-mode")).toBeInTheDocument();
+    expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
 
-  it("does NOT close the sidebar when the header Settings is tapped", () => {
-    // No onNavClick on the header Settings link: on mobile the overlay stays
+  it("reveals session selection as an icon action on the Sessions header", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const sessionsSection = screen.getByText("Sessions").closest("section");
+    expect(sessionsSection).not.toBeNull();
+
+    const selectSessions = within(sessionsSection!).getByRole("button", {
+      name: "Select sessions",
+    });
+    expect(selectSessions).toHaveAttribute("data-testid", "toggle-selection-mode");
+    expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
+    expect(selectSessions).not.toHaveTextContent("Select sessions");
+    expect(selectSessions.parentElement).toHaveClass(
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:group-focus-within/header:opacity-100",
+    );
+
+    fireEvent.click(selectSessions);
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+    expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
+  });
+
+  it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const scheduled = screen.getByTestId("scheduled-tasks-nav");
+    // Full-width nav ROW (a link), labeled "Automations", pointing at /tasks —
+    // not the old top-right icon button.
+    expect(scheduled).toHaveAttribute("href", "/tasks");
+    expect(scheduled).toHaveTextContent("Automations");
+    // The removed icon-button version must be gone.
+    expect(screen.queryByTestId("scheduled-tasks-button")).toBeNull();
+
+    // It sits in the primary nav group right after "New session" and before
+    // the "Inbox" row. Compare document order. (The search box now renders
+    // above this nav group upstream, so we anchor to New session + Inbox — the
+    // two items actually adjacent to Scheduled — rather than the search box.)
+    const newSession = screen.getByTestId("new-chat-button");
+    const inbox = screen.getByTestId("inbox-button");
+    expect(newSession.compareDocumentPosition(scheduled) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(scheduled.compareDocumentPosition(inbox) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("marks the 'Automations' nav row active when on /tasks", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/tasks");
+
+    // Active/selected state uses the SAME shared active-highlight as the sibling
+    // nav rows (New session / Inbox) — the `--sidebar-active` pill, not an
+    // ad-hoc bg-muted.
+    expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
+      "bg-[var(--sidebar-active)]",
+    );
+  });
+
+  it("does NOT close the sidebar when the footer Settings is tapped", () => {
+    // No onNavClick on the footer Settings link: on mobile the overlay stays
     // open and swaps to the settings section list rather than collapsing onto
     // the default section's content.
     mockConversations(THREE_TYPE_CONVERSATIONS);
@@ -412,14 +535,58 @@ describe("Sidebar session list", () => {
     await waitFor(() => {
       const tooltip = screen.getByTestId("session-tooltip-content");
       expect(tooltip).toHaveTextContent(title);
-      expect(tooltip.className).toContain("bg-card-solid");
-      expect(tooltip.className).not.toContain("bg-popover");
+      // The tooltip mirrors the pinned-project flyout's compact HoverCard look
+      // (bg-popover surface), not the old wide card.
+      expect(tooltip.className).toContain("bg-popover");
+      expect(tooltip.className).not.toContain("bg-card-solid");
+      // The title is sized to match the sidebar row name
+      // (`sidebar-compact-text`, 13px at the default), not the larger text-sm.
+      const tooltipTitle = tooltip.querySelector("p.sidebar-compact-text");
+      expect(tooltipTitle).not.toBeNull();
+      expect(tooltipTitle).toHaveTextContent(title);
       expect(tooltip).toHaveTextContent("2d");
       expect(within(tooltip).getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(
         "Local machine",
       );
     });
     nowSpy.mockRestore();
+  });
+
+  it("keeps title-only and worktree session rows the same centered height", () => {
+    mockConversations([
+      conv("conv_plain", "Codex", { title: "Plain session" }),
+      conv("conv_worktree", "Codex", {
+        title: "Worktree session",
+        git_branch: "fix/sidebar-row-height",
+      }),
+    ]);
+    renderSidebar();
+
+    const plainRow = screen.getByText("Plain session").closest("a")!;
+    const worktreeRow = screen.getByText("Worktree session").closest("a")!;
+
+    expect(plainRow).toHaveClass("h-7", "justify-center");
+    expect(worktreeRow).toHaveClass("h-7", "justify-center");
+    expect(within(worktreeRow).queryByText("fix/sidebar-row-height")).toBeNull();
+  });
+
+  it("reveals git branch metadata in the session tooltip on hover", async () => {
+    const branch = "fix/sidebar-row-height";
+    mockConversations([
+      conv("conv_branch_tooltip", "Codex", {
+        title: "Worktree session",
+        git_branch: branch,
+      }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByText("Worktree session").closest("a")!;
+    expect(within(row).queryByText(branch)).toBeNull();
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    await waitFor(() => {
+      expect(screen.getAllByTestId("session-tooltip-branch")[0]).toHaveTextContent(branch);
+    });
   });
 
   it("shares one hosts observer across multiple ordinary session rows", () => {
@@ -571,7 +738,7 @@ describe("Sidebar tabs", () => {
       conv("conv_mine", "Claude Code"),
       conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_shared"]));
+    seedPins(["conv_shared"]);
     renderSidebar();
 
     // My sessions tab: owned session is unpinned (no Pinned section), and the
@@ -904,7 +1071,7 @@ describe("Sidebar project sections", () => {
       conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     // Pin one of the filed sessions via localStorage (client-side pins).
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    seedPins(["conv_pinned"]);
     renderSidebar();
 
     // Pinned takes precedence over Project: the pinned session leaves the
@@ -1125,7 +1292,7 @@ describe("Sidebar collapsed project marker", () => {
 // persists across reloads.
 describe("Sidebar default section collapse", () => {
   it("expands Pinned and Sessions by default when there is no stored preference", () => {
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
+    seedPins(["conv_pin"]);
     mockConversations([conv("conv_pin", "Claude Code"), conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
@@ -1158,9 +1325,22 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     localStorage.setItem("omnigent:collapsed-sidebar-sections", JSON.stringify(["Pinned"]));
     // Start with one already-pinned session (so the Pinned section renders) and
     // one unpinned session to pin.
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    seedPins(["conv_pinned"]);
     mockConversations([conv("conv_pinned", "Claude Code"), conv("conv_plain", "Claude Code")]);
-    renderSidebar();
+    // A stable tree so the rerender keeps the same Sidebar instance — the
+    // auto-expand effect compares against the PREVIOUS pinned set, which only
+    // works if the component (and its ref) survive the pinned-set change.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree());
 
     // Collapsed to start: the header reports collapsed and the pinned row hides.
     expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute(
@@ -1168,9 +1348,11 @@ describe("Sidebar auto-expand Pinned on pin", () => {
       "false",
     );
 
-    // Pin the plain row via its quick-pin control.
-    const plainRow = screen.getByRole("link", { name: /conv_plain/ }).closest("li")!;
-    fireEvent.click(within(plainRow).getByTestId("quick-pin-conversation"));
+    // A new session becomes pinned server-side (as if the toggle landed and the
+    // pinned query refetched); re-render the same tree so the effect sees the
+    // transition and auto-expands.
+    seedPins(["conv_pinned", "conv_plain"]);
+    rerender(tree());
 
     // The Pinned section auto-expands so the freshly-pinned session is visible,
     // and the expansion is persisted (dropped from the collapsed list).
@@ -1188,7 +1370,7 @@ describe("Sidebar auto-expand Pinned on pin", () => {
 describe("Sidebar pin marker visibility", () => {
   it("hover-reveals an unpin control on a pinned row (no persistent marker)", () => {
     mockConversations([conv("conv_pin", "Claude Code")]);
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
+    seedPins(["conv_pin"]);
     renderSidebar();
 
     const pinned = screen.getByText("Pinned").closest("section")!;

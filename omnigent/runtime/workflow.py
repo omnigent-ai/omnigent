@@ -1519,9 +1519,9 @@ def _build_acp_spawn_env(
 ) -> dict[str, str]:
     """Build the env-var dict the generic ACP harness wrap reads.
 
-    Resolves the picked ``acp:<slug>`` (carried in ``spec.executor.config`` — the
-    slug is the addressable half of the harness id) to a user-configured agent in
-    the ``acp:`` config block, and forwards its command + protocol knobs as the
+    Prefers a one-shot agent embedded in ``spec.executor.config``; otherwise
+    resolves the picked ``acp:<slug>`` to a user-configured agent in the global
+    ``acp:`` block. The selected command + protocol knobs become the
     ``HARNESS_ACP_*`` env vars defined in ``omnigent/inner/acp_harness.py``.
 
     Like Goose, a generic ACP agent owns its own auth, so this wires **no**
@@ -1544,12 +1544,34 @@ def _build_acp_spawn_env(
 
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
-    from omnigent.onboarding.acp_auth import acp_agents, resolve_acp_agent
+    from omnigent.onboarding.acp_auth import (
+        AcpAgentEntry,
+        acp_agents,
+        resolve_acp_agent,
+    )
 
-    agent = resolve_acp_agent(slug) if slug else None
-    if agent is None:
-        agents = acp_agents()
-        agent = agents[0] if agents else None
+    has_embedded = isinstance(cfg, dict) and "acp_agent" in cfg
+    embedded = cfg.get("acp_agent") if has_embedded else None
+    agent: AcpAgentEntry | None = None
+    if has_embedded:
+        if not isinstance(embedded, dict):
+            raise ValueError("executor acp_agent must be a mapping with name and command")
+        name = embedded.get("name")
+        command = embedded.get("command")
+        if not (
+            isinstance(name, str) and name.strip() and isinstance(command, str) and command.strip()
+        ):
+            raise ValueError("executor acp_agent requires non-empty string name and command")
+        agent = AcpAgentEntry(
+            slug=slug or "agent",
+            name=name.strip(),
+            command=command.strip(),
+        )
+    else:
+        agent = resolve_acp_agent(slug) if slug else None
+        if agent is None:
+            agents = acp_agents()
+            agent = agents[0] if agents else None
 
     if agent is not None:
         env["HARNESS_ACP_COMMAND"] = agent.command

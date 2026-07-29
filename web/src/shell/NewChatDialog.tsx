@@ -12,7 +12,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   MonitorIcon,
   MonitorCloudIcon,
-  CheckIcon,
   CircleHelpIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -25,10 +24,8 @@ import {
   ImageIcon,
   PaperclipIcon,
   PlusIcon,
-  SearchIcon,
   SettingsIcon,
   ShuffleIcon,
-  TagIcon,
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
@@ -51,6 +48,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
+  CLAUDE_NATIVE_EFFORTS,
   ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
@@ -78,6 +76,7 @@ import {
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
   isCodexHarness,
+  isNativeCursorHarness,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -97,6 +96,7 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl } from "@/lib/host";
@@ -144,11 +144,7 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import {
-  useNewestProjectSession,
-  useProjects,
-  moveConversationToProject,
-} from "@/hooks/useConversations";
+import { useProjectConfig, useProjects, moveConversationToProject } from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -190,16 +186,6 @@ const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
 // session's terminal_launch_args. Keep in sync with `claude --help`.
-// Harnesses for which server-side smart routing is available.
-const _ROUTABLE_HARNESSES = new Set([
-  "claude-sdk",
-  "claude_sdk",
-  "claude-native",
-  "codex",
-  "codex-native",
-  "pi",
-]);
-
 const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
   { value: "default", label: "Default", description: "Prompts before edits and commands" },
@@ -220,22 +206,6 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
     label: "Bypass permissions",
     description: "Runs everything; no prompts or safety checks",
   },
-];
-
-// Claude-native reasoning-effort options for the new-session model/effort
-// picker. There is deliberately no hardcoded model/effort default: a fresh
-// session leaves both unselected and omits `model_override` / `reasoning_effort`
-// from the create, so Claude Code falls back to its own configured model — the
-// same "no override" semantics the in-session picker's `null` state and the
-// `/model default` / `/effort default` commands use. Effort levels mirror
-// CLAUDE_NATIVE_EFFORT_LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS
-// server-side).
-const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "xhigh", label: "xHigh" },
-  { value: "max", label: "Max" },
 ];
 
 // Cursor execution modes. "default" sends no flags; other values map to CLI
@@ -564,13 +534,13 @@ export async function describeCreateError(res: Response): Promise<string> {
 }
 
 /**
- * The pre-feature "run omnigent setup" guidance (ReactNode), shown under the
+ * The pre-feature "run omni setup" guidance (ReactNode), shown under the
  * composer when the UI-driven setup feature is OFF.
  *
  * The ``needs-auth`` / ``binary-missing`` copy is Codex-specific ("run codex
  * login" / "set OMNIGENT_CODEX_PATH"), so it's gated on {@link isCodexHarness}.
  * Other harnesses that report those structured reasons (claude-native /
- * opencode-native now do) fall through to the generic "run omnigent setup"
+ * opencode-native now do) fall through to the generic "run omni setup"
  * message — matching the pre-feature behavior, where only Codex ever produced
  * these reasons and everything else showed the generic text.
  */
@@ -580,15 +550,6 @@ function harnessWarningMessage(
   reason: string | null,
   harness: string | null | undefined,
 ): ReactNode {
-  if (reason === "cursor-cli-missing") {
-    return (
-      <>
-        {agentName} needs cursor-agent on {hostName} — install it with{" "}
-        <code>curl https://cursor.com/install -fsS | bash</code>, then run{" "}
-        <code>cursor-agent login</code>.
-      </>
-    );
-  }
   const isCodex = !!harness && isCodexHarness(harness);
   if (reason === "needs-auth" && isCodex) {
     return (
@@ -598,19 +559,28 @@ function harnessWarningMessage(
       </>
     );
   }
-  if (reason === "binary-missing" && isCodex) {
+  if (reason === "needs-auth" && !!harness && isNativeCursorHarness(harness)) {
     return (
       <>
-        {agentName} can&apos;t find the Codex binary on {hostName} — if codex is installed, restart
-        the host with <code>omnigent host</code> so it picks up your PATH, or set{" "}
-        <code>OMNIGENT_CODEX_PATH</code>. Otherwise run <code>omnigent setup</code>.
+        {agentName} needs Cursor login on {hostName} — run <code>cursor-agent login</code> on that
+        machine.
+      </>
+    );
+  }
+  // ``version-too-low`` is a uniform state across all CLI harnesses now that
+  // the server checks supported version ranges. Keep the message generic so
+  // the user is nudged toward setup rather than being told the CLI is missing.
+  if (reason === "version-too-low") {
+    return (
+      <>
+        {agentName} has an outdated CLI on {hostName} — run <code>omni setup</code>, or upgrade the
+        CLI directly on that machine.
       </>
     );
   }
   return (
     <>
-      {agentName} isn&apos;t configured on {hostName} — run <code>omnigent setup</code> on that
-      machine.
+      {agentName} isn&apos;t configured on {hostName} — run <code>omni setup</code> on that machine.
     </>
   );
 }
@@ -798,139 +768,6 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
 }
 
 /**
- * The composer's "Project" chip — files the to-be-created session under a
- * named project (an implicit collection stored as a ``conversation_labels``
- * row with the reserved key ``omni_project``). Mirrors the sidebar kebab's
- * project picker: a search box, the existing projects, a "No project" reset,
- * and an inline "New project…" input. Selection is local state on the landing
- * composer; the label is applied right after the session is created.
- */
-function LandingProjectPicker({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (project: string) => void;
-}) {
-  const { data: projects = [] } = useProjects();
-  const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState("");
-  const [creatingNew, setCreatingNew] = useState(false);
-  const [newName, setNewName] = useState("");
-  const newRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (creatingNew) newRef.current?.focus();
-  }, [creatingNew]);
-
-  const filtered = search
-    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
-    : projects;
-
-  function pick(project: string) {
-    onChange(project);
-    setOpen(false);
-    setSearch("");
-    setCreatingNew(false);
-    setNewName("");
-  }
-
-  function commitNew() {
-    const name = newName.trim();
-    if (name) pick(name);
-  }
-
-  const itemClass =
-    "flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground";
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
-          data-testid="new-chat-landing-project-chip"
-        >
-          <TagIcon className="size-4 shrink-0" />
-          {/* Label collapses to icon-only on narrow viewports (mobile),
-              matching the host/workspace/worktree chips. */}
-          <span className={`hidden max-w-32 truncate sm:block ${value ? "text-foreground" : ""}`}>
-            {value || "No project"}
-          </span>
-          <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        align="start"
-        className="w-56 p-1"
-        // Don't snap focus back to the chip when the popover closes after a
-        // pick — that programmatic refocus paints the browser's focus outline
-        // on the chip. Keyboard users still get the ring when they tab to it.
-        onCloseAutoFocus={(e) => e.preventDefault()}
-      >
-        {/* Combobox-style search: a leading magnifier inside a borderless
-            input, with a divider beneath separating it from the results. */}
-        <div className="flex items-center gap-2 border-b px-2 py-1.5">
-          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-          <input
-            className="w-full bg-transparent text-xs outline-none placeholder:text-muted-foreground"
-            placeholder="Search projects"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-        </div>
-        <div className="max-h-48 overflow-y-auto">
-          <button type="button" className={itemClass} onClick={() => pick("")}>
-            <span className="flex-1 truncate">No project</span>
-            {value === "" && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
-          </button>
-          {filtered.map((p) => (
-            <button key={p.name} type="button" className={itemClass} onClick={() => pick(p.name)}>
-              <span className="flex-1 truncate">{p.name}</span>
-              {value === p.name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
-            </button>
-          ))}
-          {filtered.length === 0 && !creatingNew && (
-            <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
-          )}
-        </div>
-        <div className="border-t pt-1">
-          {creatingNew ? (
-            <div className="flex items-center gap-1 px-2 py-1">
-              <input
-                ref={newRef}
-                className="flex-1 bg-transparent text-xs outline-none"
-                placeholder="Project name…"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                onKeyDown={(e) => {
-                  // Don't commit while an IME composition Enter is being
-                  // confirmed (e.g. Japanese conversion). Mirrors #132/#243.
-                  if (isImeCompositionKeyEvent(e)) return;
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    commitNew();
-                  }
-                  if (e.key === "Escape") {
-                    setCreatingNew(false);
-                    setNewName("");
-                  }
-                }}
-              />
-            </div>
-          ) : (
-            <button type="button" className={itemClass} onClick={() => setCreatingNew(true)}>
-              <PlusIcon className="size-3.5 shrink-0" />
-              New project…
-            </button>
-          )}
-        </div>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-/**
  * The home-page ("/") landing composer.
  *
  * Owns session creation end-to-end: the textarea is the first message and the
@@ -970,7 +807,7 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
  * BEFORE selecting, so the harness-switch reseed effect in the screen reads it
  * back as the same value and doesn't clobber the choice.
  */
-function AgentHarnessPicker({
+export function AgentHarnessPicker({
   agentEntries,
   harnessEntries,
   effectiveAgentId,
@@ -983,6 +820,13 @@ function AgentHarnessPicker({
   onSelectPending,
   onCreateCustomAgent,
   sandboxSelected,
+  allowCreateCustomAgent = true,
+  onOpenChange,
+  dropdownModal = true,
+  contentClassName,
+  contentAlign = "end",
+  triggerClassName,
+  triggerLabelClassName,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -996,6 +840,31 @@ function AgentHarnessPicker({
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
   sandboxSelected: boolean;
+  /** Whether to offer the "Create custom agent" action. Defaults true; an
+   *  embedder that only picks an existing agent (e.g. project settings) can
+   *  hide it since it has no interactive create flow. */
+  allowCreateCustomAgent?: boolean;
+  // ── Optional reuse hooks (all default-undefined) ─────────────────────────
+  // These let a host OTHER than the composer footer embed the picker without
+  // changing its default behavior. The interactive New Chat call site passes
+  // none of them, so it renders exactly as before. The scheduled-task create
+  // dialog passes them to: forward the dropdown open/close into its own
+  // outside-click dismiss guard (`onOpenChange`), bound + left-align the menu
+  // in a tall modal (`contentClassName` / `contentAlign`), and style the
+  // trigger to match sibling <Select> fields (`triggerClassName` /
+  // `triggerLabelClassName`).
+  /** Notified when the picker dropdown opens/closes. */
+  onOpenChange?: (open: boolean) => void;
+  /** Whether the Radix dropdown should modal-block outside content. Defaults true. */
+  dropdownModal?: boolean;
+  /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
+  contentClassName?: string;
+  /** Dropdown alignment. Defaults to "end" (composer footer). */
+  contentAlign?: "start" | "center" | "end";
+  /** Extra classes merged onto the trigger Button. */
+  triggerClassName?: string;
+  /** Extra classes merged onto the trigger's label span. */
+  triggerLabelClassName?: string;
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
@@ -1101,8 +970,9 @@ function AgentHarnessPicker({
   // least one custom / pending agent to group.
   const hasCustomAgents = customEntries.length > 0 || pendingAgent != null;
   // "Create custom agent" is reachable on any non-sandbox target (a managed
-  // sandbox has no create path for an uploaded bundle).
-  const canCreateAgent = !sandboxSelected;
+  // sandbox has no create path for an uploaded bundle), unless the embedder
+  // opts out (it has no create flow to route the action to).
+  const canCreateAgent = !sandboxSelected && allowCreateCustomAgent;
   const createAgentItem = canCreateAgent ? (
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
@@ -1154,9 +1024,11 @@ function AgentHarnessPicker({
 
   return (
     <DropdownMenu
+      modal={dropdownModal}
       open={open}
       onOpenChange={(next) => {
         setOpen(next);
+        onOpenChange?.(next);
         if (next) {
           // Prefetch harness/description/skills for all session-discovered
           // agents so the list is stable before the user reads it.
@@ -1175,23 +1047,36 @@ function AgentHarnessPicker({
           disabled={!hasAgents}
           data-testid="new-chat-landing-agent-select"
           // Drop the Button's focus-visible ring/border that otherwise shows
-          // when focus returns to the trigger after a pick.
-          className="h-8 gap-1.5 pr-1 pl-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0"
+          // when focus returns to the trigger after a pick. `triggerClassName`
+          // (default undefined) lets an embedder override sizing/border to match
+          // its own form fields; tailwind-merge lets the passed classes win.
+          className={cn(
+            "h-8 gap-1.5 pr-1 pl-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0",
+            triggerClassName,
+          )}
         >
-          <span className="max-w-[12rem] truncate text-xs text-foreground">
+          <span
+            className={cn("max-w-[12rem] truncate text-xs text-foreground", triggerLabelClassName)}
+          >
             {hasAgents ? agentLabel : "No agents"}
           </span>
           <ChevronDownIcon className="size-3.5 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
-        align="end"
+        align={contentAlign}
         // Keep the menu inside the viewport on short mobile screens: pad the
         // collision box so the available-height cap leaves room below the
         // status bar, and let it flip/scroll rather than run off the top.
         collisionPadding={12}
         avoidCollisions
-        className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
+        // `contentClassName` (default undefined) lets an embedder tighten the
+        // height cap / pin a width; tailwind-merge lets the passed max-h/width
+        // override the defaults.
+        className={cn(
+          "max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1",
+          contentClassName,
+        )}
       >
         {showMore ? (
           // Mobile drill-in page for the "needs setup" harnesses.
@@ -1739,7 +1624,9 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
-  const { data: hosts, isLoading: hostsLoading } = useHosts();
+  // refetchOnFocus: returning from a terminal `omni setup` must clear the
+  // readiness badge even if the live push was missed while the tab was hidden.
+  const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
 
   const agentList = useMemo(
     () =>
@@ -1833,7 +1720,7 @@ export function NewChatLandingScreen() {
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Gates the whole UI-driven setup experience (Set up affordance + dialog +
   // collapsed badge). OFF → the composer/picker fall back to the original
-  // "run omnigent setup" guidance, so a disabled flag is a no-op on the UI.
+  // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
   const harnessInstallEnabled = info !== "loading" && info.harness_install_enabled;
   const brainHarnessLabels = useBrainHarnessLabels(smartRoutingEnabled);
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
@@ -2079,35 +1966,50 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Project prefill: a project-driven visit reuses the project's newest
-  // session — its host, source repo, and agent — so the composer is ready
-  // to send without re-picking anything.
-  const { data: projectNewest, isError: projectNewestFailed } = useNewestProjectSession(
-    projectParam !== "" ? projectParam : null,
+  // Project prefill: a project-driven visit seeds the composer from the
+  // project's stored defaults (host / working directory / agent / worktree).
+  // `?project=` carries the project NAME, so resolve it to the first-class id
+  // the config endpoint needs; a label-only folder (id null) or plain visit
+  // has no config to read.
+  const { data: projectList, isLoading: projectListLoading } = useProjects();
+  const configProjectId = useMemo(
+    () =>
+      projectParam !== ""
+        ? ((projectList ?? []).find((p) => p.name === projectParam)?.id ?? null)
+        : null,
+    [projectList, projectParam],
   );
-  // That session may have run in a linked worktree (git_branch set), where
-  // its workspace is the worktree dir, not the repo. Listing that path's
-  // worktrees returns the whole set, including the `is_main` source repo.
-  const needsSourceRepoResolve =
-    projectNewest != null &&
-    projectNewest.git_branch != null &&
-    projectNewest.workspace != null &&
-    projectNewest.host_id != null;
-  const {
-    data: sourceWorktreesData,
-    isError: projectSourceWorktreesFailed,
-    isPlaceholderData: sourceWorktreesArePlaceholder,
-  } = useHostWorktrees(
-    needsSourceRepoResolve ? (projectNewest.host_id ?? null) : null,
-    needsSourceRepoResolve ? (projectNewest.workspace ?? null) : null,
-  );
-  // The hook serves the previous query's data as a placeholder while a new
-  // fetch is in flight — that would be another repo's worktrees here.
-  const projectSourceWorktrees = sourceWorktreesArePlaceholder ? undefined : sourceWorktreesData;
-  // State machine driving the project prefill: a location track (host →
-  // workspace → branch → settled) plus an independent agent seed. The
-  // generic host/workspace defaults below hold off until the location
-  // track settles so they can't win the race against the project's values.
+  const { data: storedProjectConfig, isLoading: projectConfigLoading } =
+    useProjectConfig(configProjectId);
+  // Normalize into the machine's shape. `undefined` = still loading (the machine
+  // waits so a generic default can't win the race); `{}` = nothing to wait for
+  // (plain visit / label-only folder / genuinely empty config), so it settles
+  // immediately and the generic defaults take over.
+  const prefillConfig = useMemo<ProjectPrefillConfig | undefined>(() => {
+    // A project-scoped visit must resolve name → id via the projects list
+    // before we know whether there's a config to read — until it loads, the id
+    // is falsely null, so wait rather than settle prematurely.
+    if (projectParam !== "" && projectListLoading) return undefined;
+    if (configProjectId !== null && projectConfigLoading) return undefined;
+    const c = storedProjectConfig;
+    if (!c) return {};
+    return {
+      hostId: c.host_id,
+      workspace: c.workspace,
+      agentId: c.agent_id,
+      useWorktree: c.use_worktree,
+    };
+  }, [
+    projectParam,
+    projectListLoading,
+    configProjectId,
+    projectConfigLoading,
+    storedProjectConfig,
+  ]);
+  // State machine driving the project prefill: a location seed (host +
+  // workspace from config) plus an independent agent seed. The generic
+  // host/workspace defaults below hold off until it settles so they can't win
+  // the race against the project's stored values.
   const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
     initialPrefillState(projectParam),
   );
@@ -2117,6 +2019,9 @@ export function NewChatLandingScreen() {
   // Host whose workspace was already seeded once, so a host re-pick doesn't
   // clobber the field (used by the per-host seeding effect below).
   const seededHostRef = useRef<string | null>(null);
+  // Workspace the opt-in worktree effect already acted on, so it fires at most
+  // once per settled workspace (and can't loop once it sets a branch name).
+  const worktreeSeededForRef = useRef<string | null>(null);
 
   // The landing screen stays mounted while `?project=` changes (clicking
   // another project's pencil), so re-create a fresh visit by hand: clear
@@ -2130,6 +2035,7 @@ export function NewChatLandingScreen() {
     setWorkspace("");
     setBranchName("");
     seededHostRef.current = null;
+    worktreeSeededForRef.current = null;
     setPrefill(initialPrefillState(projectParam));
   }, [projectParam, prefill.project]);
 
@@ -2254,13 +2160,9 @@ export function NewChatLandingScreen() {
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Smart routing is offered in the config modal — as a Model choice for Claude,
-  // a standalone toggle otherwise — when the server enables it and the selected
-  // harness is routable. Use the EFFECTIVE harness (a bundle agent's brain-
-  // harness override wins over its spec harness), so overriding Polly/Debby to a
-  // non-routable harness (e.g. Cursor) correctly drops routing eligibility.
-  const effectiveHarness = pickedHarness ?? selectedAgent?.harness ?? "";
-  const smartRoutingEligible = smartRoutingEnabled && _ROUTABLE_HARNESSES.has(effectiveHarness);
+  // Smart Routing (per-session model selection) is superseded by the Auto
+  // harness which handles both harness + model. Hide it entirely for now.
+  const smartRoutingEligible = false;
   // Whether the gear config modal has anything to show for the selected agent
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
@@ -2459,11 +2361,7 @@ export function NewChatLandingScreen() {
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
   const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
-  const {
-    data: hostWorktrees,
-    isPlaceholderData: hostWorktreesArePlaceholder,
-    isError: hostWorktreesFailed,
-  } = useHostWorktrees(
+  const { data: hostWorktrees, isPlaceholderData: hostWorktreesArePlaceholder } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
@@ -2543,33 +2441,26 @@ export function NewChatLandingScreen() {
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
     setBranchName(`worktree-${suffix}`);
   }, []);
-  // Project prefill: advance the machine one step per render as its data
-  // arrives. It steps rather than loops in one pass because the "branch"
-  // phase needs `hostWorktrees` for the workspace the "workspace" phase
-  // just wrote, and that listing only reflects the seeded repo one render
-  // after the write applies.
+  // Project prefill: seed host / workspace / agent from the project's stored
+  // config, then settle so the generic defaults fill any slot the config left
+  // unset. An opt-in worktree is generated by the dedicated effect below once
+  // the workspace is in place.
   useEffect(() => {
     if (prefill.project !== projectParam || prefillDone(prefill)) return;
     const step = projectPrefillStep(prefill, {
-      newest: projectNewest,
-      newestFailed: projectNewestFailed,
       hosts,
       // The pickable list, not the raw one — a hidden agent's id would seed
       // a pick that effectiveAgentId rejects. Raw undefined = still loading.
       agents: agents === undefined ? undefined : agentList,
       sandboxSelected,
+      managedSandboxesEnabled,
       selectedHostId,
       lastAgentId: readLastAgentId(),
-      sourceWorktrees: projectSourceWorktrees,
-      sourceWorktreesFailed: projectSourceWorktreesFailed,
-      workspaceTrimmed,
-      branchName,
-      prefilledBranch,
-      hostWorktrees: hostWorktreesArePlaceholder ? undefined : hostWorktrees,
-      hostWorktreesFailed,
+      config: prefillConfig,
     });
     if (step === null) return;
     const { writes } = step;
+    if (writes.selectSandbox) setSandboxSelected(true);
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
@@ -2578,31 +2469,50 @@ export function NewChatLandingScreen() {
     if (writes.workspace !== undefined) {
       setWorkspace((cur) => (cur === "" ? writes.workspace! : cur));
     }
-    if (writes.branch !== undefined && prefilledBranch === "") {
-      // Functional fill-empty-only, like the other slots: a branch typed
-      // between the qualifying render and this effect must not be clobbered.
-      setBranchName((cur) => (cur === "" ? writes.branch! : cur));
-    }
     setPrefill(step.state);
   }, [
     prefill,
     projectParam,
-    projectNewest,
-    projectNewestFailed,
     hosts,
     agents,
     agentList,
     sandboxSelected,
+    managedSandboxesEnabled,
     selectedHostId,
-    projectSourceWorktrees,
-    projectSourceWorktreesFailed,
+    pickedAgentId,
+    prefillConfig,
+  ]);
+
+  // Opt-in worktree from the project's stored config. The inference machine
+  // settles a config-driven location without touching the branch, so this
+  // effect creates the fresh worktree once the workspace is fully in place —
+  // whether it came from the config's own workspace or the composer's
+  // home-fallback (which runs after the machine settles). Fires at most once
+  // per settled workspace (ref-guarded) and only into an empty branch, so a
+  // typed branch / existing-worktree prefill is never clobbered.
+  useEffect(() => {
+    if (prefillConfig?.useWorktree !== true) return;
+    if (prefill.project !== projectParam || !prefillDone(prefill)) return;
+    if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
+    if (branchName !== "" || prefilledBranch !== "") return;
+    if (worktreeSeededForRef.current === workspaceTrimmed) return;
+    // Need the git-ness probe for the CURRENT workspace resolved (not the
+    // anti-flicker placeholder from a previous path).
+    if (hostWorktreesArePlaceholder || hostWorktrees === undefined) return;
+    worktreeSeededForRef.current = workspaceTrimmed;
+    if (hostWorktrees.some((w) => w.is_main)) generateBranchName();
+  }, [
+    prefillConfig,
+    prefill,
+    projectParam,
+    sandboxSelected,
+    selectedHostId,
     workspaceTrimmed,
     branchName,
     prefilledBranch,
     hostWorktrees,
     hostWorktreesArePlaceholder,
-    hostWorktreesFailed,
-    pickedAgentId,
+    generateBranchName,
   ]);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
@@ -2706,17 +2616,15 @@ export function NewChatLandingScreen() {
     if (mentionFsQuery.isPlaceholderData) return [];
     const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
-      .map(
-        (e): WorkspaceFile => ({
-          path: e.path.startsWith(workspaceRoot)
-            ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
-            : e.name,
-          name: e.name,
-          type: e.type === "directory" ? "directory" : "file",
-          bytes: e.bytes,
-          modified_at: e.modified_at,
-        }),
-      );
+      .map((e): WorkspaceFile => ({
+        path: e.path.startsWith(workspaceRoot)
+          ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
+          : e.name,
+        name: e.name,
+        type: e.type === "directory" ? "directory" : "file",
+        bytes: e.bytes,
+        modified_at: e.modified_at,
+      }));
     return rankMentionEntries(rows, mentionFilter);
   }, [
     mentionEnabled,
@@ -2987,13 +2895,17 @@ export function NewChatLandingScreen() {
             model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
-            // Smart routing toggle — server-side. Only send it when routing is
-            // actually eligible for the effective harness, so a stale "on" (from
-            // a since-overridden harness, or the server flag flipping off) can't
-            // ride along invisibly with no control to clear it.
-            cost_control_mode_override: smartRoutingEligible
-              ? (costControlMode ?? undefined)
-              : undefined,
+            // Smart routing toggle — server-side. The "Auto" harness always
+            // routes (harness + model), so send "on" to keep the persisted
+            // state consistent with the lit routing icon. Otherwise only send
+            // it when routing is eligible for the effective harness, so a stale
+            // "on" can't ride along invisibly with no control to clear it.
+            cost_control_mode_override:
+              pickedHarness === AUTO_HARNESS_ID
+                ? "on"
+                : smartRoutingEligible
+                  ? (costControlMode ?? undefined)
+                  : undefined,
             harness_override: pickedHarness ?? undefined,
           }),
         });
@@ -3017,9 +2929,6 @@ export function NewChatLandingScreen() {
           // session shows up immediately (the folder fetches via
           // useProjectSessions, separate from the global conversations list).
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-          // The just-created session is now the project's newest; without this
-          // a pencil click within staleTime prefills from the previous one.
-          void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
         } catch {
           // Leave the session unfiled; the user can file it from the sidebar.
         }
@@ -3103,10 +3012,20 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex flex-col items-center gap-3.5 sm:flex-row">
-          <OttoEyes className="h-18 w-auto shrink-0" />
-          <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
-            What should we do?
+        <div className="flex w-full flex-col items-center justify-center gap-3.5 sm:flex-row">
+          {selectedProject ? (
+            // Landing inside a project: swap Otto's eyes for the same folder
+            // icon the sidebar uses for a project, and name the project. Sized
+            // to Otto's h-18 box so the centered composer doesn't shift when
+            // toggling between the two landings.
+            <span className="flex h-18 shrink-0 items-center">
+              <FolderIcon className="size-12 text-muted-foreground" />
+            </span>
+          ) : (
+            <OttoEyes className="h-18 w-auto shrink-0" />
+          )}
+          <h1 className="min-w-0 break-words text-center text-3xl font-medium tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+            {selectedProject || "What should we do?"}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
@@ -3960,14 +3879,9 @@ export function NewChatLandingScreen() {
                 </Popover>
               )}
 
-              {/* Project chip — files the session under a named project on
-                create. Sits after the worktree chip. Only shown when a project
-                is already selected (e.g. quick-starting from an existing
-                project's "new session" pencil, which passes `?project=`);
-                otherwise the new-session flow stays unfiled. */}
-              {selectedProject && (
-                <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
-              )}
+              {/* The session's project membership (from a `?project=` landing)
+                is shown in the hero heading instead of a tray chip; filing on
+                create still uses `selectedProject`. */}
             </div>
             {/* The agent / harness picker moved out of the tray and into the
                 composer's right action cluster (next to Send) — see

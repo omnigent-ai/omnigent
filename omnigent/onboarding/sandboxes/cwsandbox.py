@@ -42,6 +42,7 @@ from omnigent.onboarding.sandboxes.base import (
     foreground_record_prefix,
     host_image_wheel_install_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -91,6 +92,19 @@ def _ensure_sdk() -> None:
 
 class _CWRemoteProcess(RemoteProcess):
     """:class:`RemoteProcess` over a cwsandbox ``Process`` (combined output)."""
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=True,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=True,
+            streaming_exec=True,
+            foreground_exec=True,
+        )
 
     def __init__(self, process: Process) -> None:
         self._process = process

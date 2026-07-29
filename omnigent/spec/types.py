@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -773,19 +774,25 @@ class SandboxConfig:
     :param docker_image: Deprecated alias for ``container_image``.
         If both are set, ``container_image`` takes precedence.
     :param container_runtime: The container CLI to use, either
-        ``"docker"`` (default) or ``"podman"``.
+        ``"docker"`` (default) or ``"podman"``.  Can also be set
+        via the ``OMNIGENT_CONTAINER_RUNTIME`` environment variable;
+        the constructor argument takes precedence.
     """
+
+    _ENV_VAR = "OMNIGENT_CONTAINER_RUNTIME"
+    ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
+    _DEFAULT_RUNTIME: ClassVar[str] = "docker"
 
     container_image: str | None = None
     docker_image: str | None = None
-    container_runtime: Literal["docker", "podman"] = "docker"
-
-    _ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
+    container_runtime: Literal["docker", "podman"] | None = None
 
     def __post_init__(self) -> None:
-        if self.container_runtime not in self._ALLOWED_RUNTIMES:
+        if self.container_runtime is None:
+            self.container_runtime = os.environ.get(self._ENV_VAR, self._DEFAULT_RUNTIME)  # type: ignore[assignment]
+        if self.container_runtime not in self.ALLOWED_RUNTIMES:
             raise ValueError(
-                f"container_runtime must be one of {sorted(self._ALLOWED_RUNTIMES)}, "
+                f"container_runtime must be one of {sorted(self.ALLOWED_RUNTIMES)}, "
                 f"got {self.container_runtime!r}"
             )
         # Resolve the deprecated docker_image alias: if only

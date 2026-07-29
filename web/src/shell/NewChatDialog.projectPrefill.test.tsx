@@ -8,21 +8,21 @@ import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { useNewestProjectSession } from "@/hooks/useConversations";
-import type { Conversation } from "@/hooks/useConversations";
+import { useProjectConfig, useProjects } from "@/hooks/useConversations";
+import type { ProjectConfig } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { NewChatLandingScreen } from "./NewChatDialog";
 
-// A `?project=` visit prefills the composer from the project's newest
-// session (host, source repo, agent, fresh worktree branch). These tests
-// pin the seeding rules and the fallbacks to the generic defaults.
+// A `?project=` visit prefills the composer from the project's STORED config
+// (host / working directory / agent / worktree). A field the config leaves
+// unset falls through to the composer's generic defaults (last host, recent
+// workspace, last-used agent). These tests pin those seeding rules.
 const navigateMock = vi.fn();
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 const RECENT_WORKSPACE = "/Users/corey/universe/src/foo";
 const REPO = "/Users/corey/projects/alpha";
-const WORKTREE = "/Users/corey/projects/alpha-worktrees/feature-x";
 
 // Mutable so a test can simulate clicking another project's pencil (the
 // screen stays mounted; only the param changes).
@@ -41,6 +41,7 @@ vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
@@ -56,12 +57,12 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
 }));
-// The newest-session lookup is the unit under test's input — stub the hook
-// itself so each case controls it without HTTP-layer plumbing.
+// The project list + config are the unit under test's inputs — stub the hooks
+// so each case controls them without HTTP-layer plumbing.
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
-  useProjects: () => ({ data: ["Alpha"] }),
-  useNewestProjectSession: vi.fn(),
+  useProjects: vi.fn(),
+  useProjectConfig: vi.fn(),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
@@ -93,37 +94,29 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
   };
 }
 
-function conversation(overrides: Partial<Conversation> = {}): Conversation {
-  return {
-    id: "conv_prev",
-    object: "conversation",
-    title: "Previous",
-    created_at: 0,
-    updated_at: 9,
-    labels: { omni_project: "Alpha" },
-    host_id: "host_1",
-    workspace: REPO,
-    git_branch: null,
-    agent_id: "ag_hello",
-    ...overrides,
-  } as Conversation;
-}
-
-function setNewestSession(value: Conversation | null): void {
-  vi.mocked(useNewestProjectSession).mockReturnValue({ data: value } as ReturnType<
-    typeof useNewestProjectSession
+function setProjectConfig(config: ProjectConfig | undefined, isLoading = false): void {
+  vi.mocked(useProjectConfig).mockReturnValue({ data: config, isLoading } as ReturnType<
+    typeof useProjectConfig
   >);
 }
 
-/** Serve the repo's worktree set for any path inside it; [] elsewhere. */
-function setRepoWorktrees(): void {
-  const worktrees: HostWorktree[] = [
-    { path: REPO, branch: "main", is_main: true, detached: false },
-    { path: WORKTREE, branch: "feature-x", is_main: false, detached: false },
-  ];
+function setProjects(
+  data: { id: string | null; name: string }[] | undefined,
+  isLoading = false,
+): void {
+  vi.mocked(useProjects).mockReturnValue({ data, isLoading } as ReturnType<typeof useProjects>);
+}
+
+/** Serve a git repo (has an is_main worktree) at REPO; [] elsewhere. */
+function setRepoIsGit(): void {
   vi.mocked(useHostWorktrees).mockImplementation((hostId, path) => {
-    const known = hostId === "host_1" && (path === REPO || path === WORKTREE);
-    return { data: known ? worktrees : [], isError: false } as ReturnType<typeof useHostWorktrees>;
+    const known = hostId === "host_1" && path === REPO;
+    return {
+      data: known
+        ? ([{ path: REPO, branch: "main", is_main: true, detached: false }] as HostWorktree[])
+        : ([] as HostWorktree[]),
+      isError: false,
+    } as ReturnType<typeof useHostWorktrees>;
   });
 }
 
@@ -155,11 +148,17 @@ beforeEach(() => {
   vi.mocked(authenticatedFetch).mockReset();
   searchParams = new URLSearchParams("project=Alpha");
   localStorage.clear();
-  // A recent on the host that would win under the generic seeding rules —
-  // the project prefill must beat it.
+  // A recent on the host that the generic seeding would use when the config
+  // sets no workspace.
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [RECENT_WORKSPACE] }));
   setHostsAndAgents();
-  setRepoWorktrees();
+  setRepoIsGit();
+  setProjects([
+    { id: "proj_alpha", name: "Alpha" },
+    { id: "proj_beta", name: "Beta" },
+  ]);
+  // No stored config by default.
+  setProjectConfig({});
 });
 
 function setHostsAndAgents(): void {
@@ -175,8 +174,8 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen project prefill", () => {
-  it("seeds host, repo, agent and a fresh worktree branch from the newest session", async () => {
-    setNewestSession(conversation({ agent_id: "ag_other" }));
+  it("seeds host / workspace / agent from the stored config", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
     renderLanding();
 
     await waitFor(() =>
@@ -186,34 +185,31 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(REPO);
     expect(body.agent_id).toBe("ag_other");
+    // No opt-in worktree → no git block.
+    expect(body.git).toBeUndefined();
+  });
+
+  it("creates a fresh worktree when the config opts in", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    renderLanding();
+
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe(REPO);
     expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
   });
 
-  it("resolves a worktree-born session back to the main work tree", async () => {
-    setNewestSession(conversation({ workspace: WORKTREE, git_branch: "feature-x" }));
+  it("does NOT create a worktree when the config omits use_worktree", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO });
     renderLanding();
 
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
-    // A fresh branch, not the previous session's.
-    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
-  });
-
-  it("skips the branch when the seeded directory is not a git repo", async () => {
-    setNewestSession(conversation({ workspace: "/Users/corey/notes" }));
-    vi.mocked(useHostWorktrees).mockReturnValue({
-      data: [] as HostWorktree[],
-      isError: false,
-    } as ReturnType<typeof useHostWorktrees>);
-    renderLanding();
-
-    const body = await submitAndReadBody();
-    expect(body.workspace).toBe("/Users/corey/notes");
     expect(body.git).toBeUndefined();
   });
 
-  it("falls back to the generic defaults when the project has no sessions", async () => {
-    setNewestSession(null);
+  it("falls back to the generic defaults when the project has no config", async () => {
+    setProjectConfig({});
     renderLanding();
 
     const body = await submitAndReadBody();
@@ -223,24 +219,39 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.git).toBeUndefined();
   });
 
+  it("seeds only the host from config, leaving the workspace to the generic default", async () => {
+    setProjectConfig({ host_id: "host_1" });
+    renderLanding();
+
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+  });
+
+  it("waits for the projects list before settling, so a config agent isn't lost to a race", async () => {
+    // The projects list resolves name → id; until it loads the id is falsely
+    // null. The prefill must WAIT rather than settle from the generic default,
+    // or the stored default agent would never apply.
+    setProjects(undefined, true); // still loading
+    setProjectConfig({ host_id: "host_1", agent_id: "ag_other" });
+    const rerender = renderLanding();
+
+    // Projects finish loading → config resolves and the agent seeds.
+    setProjects([{ id: "proj_alpha", name: "Alpha" }]);
+    rerender(<NewChatLandingScreen />);
+
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe("ag_other");
+  });
+
   it("reseeds from the new project when another pencil is clicked while mounted", async () => {
     const BETA_REPO = "/Users/corey/projects/beta";
-    vi.mocked(useNewestProjectSession).mockImplementation((project) => {
+    vi.mocked(useProjectConfig).mockImplementation((id) => {
       const data =
-        project === "Beta"
-          ? conversation({ workspace: BETA_REPO, agent_id: "ag_other" })
-          : conversation();
-      return { data } as ReturnType<typeof useNewestProjectSession>;
-    });
-    vi.mocked(useHostWorktrees).mockImplementation((hostId, path) => {
-      const main = path === REPO || path === BETA_REPO ? path : null;
-      return {
-        data:
-          hostId === "host_1" && main !== null
-            ? [{ path: main, branch: "main", is_main: true, detached: false }]
-            : [],
-        isError: false,
-      } as ReturnType<typeof useHostWorktrees>;
+        id === "proj_beta"
+          ? { host_id: "host_1", workspace: BETA_REPO, agent_id: "ag_other" }
+          : { host_id: "host_1", workspace: REPO };
+      return { data, isLoading: false } as ReturnType<typeof useProjectConfig>;
     });
     const rerender = renderLanding();
     await waitFor(() =>
@@ -255,66 +266,17 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(BETA_REPO);
     expect(body.agent_id).toBe("ag_other");
-    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
   });
 
-  it("replaces the generic auto-defaults when arriving from the plain landing page", async () => {
-    setNewestSession(conversation({ agent_id: "ag_other" }));
-    searchParams = new URLSearchParams();
-    const rerender = renderLanding();
-    // The generic defaults claim host + recent workspace first.
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
-    );
-
-    searchParams = new URLSearchParams("project=Alpha");
-    rerender(<NewChatLandingScreen />);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
-    );
-    const body = await submitAndReadBody();
-    expect(body.workspace).toBe(REPO);
-    expect(body.agent_id).toBe("ag_other");
-    expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
-  });
-
-  it("falls back to the generic defaults when the newest-session lookup fails", async () => {
-    vi.mocked(useNewestProjectSession).mockReturnValue({
-      data: undefined,
-      isError: true,
-    } as ReturnType<typeof useNewestProjectSession>);
-    renderLanding();
-
-    const body = await submitAndReadBody();
-    expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(RECENT_WORKSPACE);
-    expect(body.agent_id).toBe("ag_hello");
-  });
-
-  it("falls back to the generic defaults when the session's host is gone", async () => {
-    // A distinct agent on the unusable session: the WHOLE template falls
-    // back, agent included — not just host and workspace.
-    setNewestSession(conversation({ host_id: "host_gone", agent_id: "ag_other" }));
-    renderLanding();
-
-    const body = await submitAndReadBody();
-    expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(RECENT_WORKSPACE);
-    expect(body.agent_id).toBe("ag_hello");
-  });
-
-  it("falls back to the generic defaults when the session's host is offline", async () => {
-    // The host is still listed (the picker shows it disabled) but can't take
-    // a session — the prefill must not seed it, its workspace, or its agent.
+  it("does not seed an offline config host (falls back to the generic default)", async () => {
     vi.mocked(useHosts).mockReturnValue({
       data: [host(), host({ host_id: "host_off", name: "sleepy", status: "offline" })],
     } as ReturnType<typeof useHosts>);
-    setNewestSession(conversation({ host_id: "host_off", agent_id: "ag_other" }));
+    setProjectConfig({ host_id: "host_off", workspace: "/somewhere" });
     renderLanding();
 
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
-    expect(body.agent_id).toBe("ag_hello");
   });
 });

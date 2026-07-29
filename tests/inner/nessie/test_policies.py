@@ -112,11 +112,21 @@ def test_blast_radius_gates_pi_native_bash_tool() -> None:
     assert _result(evaluate(_tool_call("bash", command="git status"), {})) == "ALLOW"
 
 
+@pytest.mark.parametrize("tool", ["Shell", "terminal", "developer__shell"])
+def test_blast_radius_gates_other_native_shell_tools(tool: str) -> None:
+    """Cursor, Hermes, and Goose shell calls receive the same push gate."""
+    evaluate = blast_radius()
+
+    assert _result(evaluate(_tool_call(tool, command="git push origin main"), {})) == "ASK"
+    assert (
+        _result(evaluate(_tool_call(tool, command="git push --force origin main"), {})) == "DENY"
+    )
+
+
 def test_blast_radius_ignores_non_shell_tools() -> None:
     """
-    Non-shell tool calls pass through ALLOW — blast_radius only inspects
-    ``sys_os_shell`` and ``Bash``. A failure here means the guard is matching
-    on the wrong tool and would corrupt unrelated tool dispatch.
+    Non-shell tool calls pass through ALLOW. A failure means the guard is
+    matching the wrong tool and would corrupt unrelated tool dispatch.
     """
     evaluate = blast_radius()
     assert _result(evaluate(_tool_call("sys_session_send", agent="impl_claude"), {})) == "ALLOW"
@@ -135,6 +145,21 @@ def test_blast_radius_gate_pushes_false_allows_recoverable_not_catastrophic() ->
         == "ALLOW"
     )
     assert _result(evaluate(_tool_call("sys_os_shell", command="rm -rf /"), {})) == "DENY"
+
+
+def test_blast_radius_risky_action_can_deny() -> None:
+    """``risky_action=DENY`` blocks ordinary pushes and other risky commands."""
+    evaluate = blast_radius(risky_action="DENY")
+
+    assert _result(evaluate(_tool_call("Bash", command="git push origin main"), {})) == "DENY"
+    assert _result(evaluate(_tool_call("Bash", command="terraform apply"), {})) == "DENY"
+    assert _result(evaluate(_tool_call("Bash", command="git status"), {})) == "ALLOW"
+
+
+def test_blast_radius_rejects_unknown_risky_action() -> None:
+    """Invalid actions fail at policy construction instead of silently allowing."""
+    with pytest.raises(ValueError, match="risky_action must be 'ASK' or 'DENY'"):
+        blast_radius(risky_action="ALLOW")
 
 
 # Catastrophic commands that the previous single-regex DENY set MISSED — each
@@ -195,6 +220,7 @@ def test_blast_radius_denies_destructive_variants(command: str) -> None:
         "rm -r node_modules",  # recursive, no force, relative
         "rm -rf /home/u/proj/build",  # scoped path under /home, not a system dir
         "git push origin main",  # ordinary outward push (also asserts the gate=False ALLOW)
+        "git push --dry-run origin HEAD",  # dry-run still exercises the push gate
         "git push -u origin main",  # set-upstream is outward, not force/delete
         "git push -o ci.skip origin main",  # push-option value is not a destructive flag
         "git push -o=fast origin main",  # attached push-option value must not over-match `f`

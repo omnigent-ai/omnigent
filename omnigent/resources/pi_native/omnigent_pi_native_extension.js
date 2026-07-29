@@ -1776,6 +1776,28 @@ module.exports = function (pi) {
     // assistant message per LLM call); fold its token counts into the
     // cumulative session totals and flush to the server for pricing.
     if (accumulateUsage(message)) await postSessionUsage();
+    // Surface Pi-reported errors (e.g. 404 for unknown model ids, 400 for
+    // unsupported API types) as visible error items in the web UI so users
+    // aren't left staring at an empty turn.
+    const stopReason =
+      message && typeof message.stopReason === "string" ? message.stopReason : "";
+    const errorMessage =
+      message && typeof message.errorMessage === "string" ? message.errorMessage : "";
+    if (stopReason === "error" && errorMessage) {
+      await postEvent(config, {
+        type: "external_conversation_item",
+        data: {
+          response_id: responseId,
+          item_type: "error",
+          item_data: {
+            source: "execution",
+            code: "RuntimeError",
+            message: `Pi model error: ${errorMessage}`,
+          },
+        },
+      });
+      return;
+    }
     const text = textFromMessage(message);
     if (!text) return;
     // The authoritative assistant item. The web UI retires + replaces the

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -550,6 +551,57 @@ async def test_already_trusted_hook_skips_batchwrite() -> None:
     client = _FakeCodexClient(hooks=[_hook("k1", _OUR_COMMAND, "trusted")])
     await trust_native_policy_hooks(client, cwd=_CWD)
     assert _batchwrite_calls(client) == []  # nothing to trust → no write
+
+
+def test_write_codex_policy_hooks_file_merges_user_hooks(tmp_path: Path) -> None:
+    """User hooks symlinked into the private home are merged into hooks.json.
+
+    _write_codex_policy_hooks_file replaces the symlink with a merged
+    regular file containing both the Omnigent policy hooks and the user's
+    hooks, so user hooks fire alongside policy enforcement.
+    """
+    from omnigent.codex_native_app_server import _write_codex_policy_hooks_file
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    # Simulate what _populate_codex_home_config does: symlink the user's hooks.json
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text(
+        '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo hi"}]}]}}'
+    )
+    (codex_home / "hooks.json").symlink_to(user_hooks)
+
+    _write_codex_policy_hooks_file(codex_home, bridge_dir, sys.executable)
+
+    hooks_path = codex_home / "hooks.json"
+    assert not hooks_path.is_symlink(), "symlink must be replaced by a regular file"
+    payload = json.loads(hooks_path.read_text())
+    hooks = payload["hooks"]
+    # Policy hooks present
+    assert "PreToolUse" in hooks
+    assert "PostToolUse" in hooks
+    assert "UserPromptSubmit" in hooks
+    # User's SessionStart hook merged in
+    assert "SessionStart" in hooks
+    assert hooks["SessionStart"][0]["hooks"][0]["command"] == "echo hi"
+
+
+def test_write_codex_policy_hooks_file_no_symlink_unchanged(tmp_path: Path) -> None:
+    """Without a symlink, hooks.json is written with only policy hooks."""
+    from omnigent.codex_native_app_server import _write_codex_policy_hooks_file
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    _write_codex_policy_hooks_file(codex_home, bridge_dir, sys.executable)
+
+    payload = json.loads((codex_home / "hooks.json").read_text())
+    assert set(payload["hooks"]) == {"PreToolUse", "PostToolUse", "UserPromptSubmit"}
 
 
 async def test_missing_hook_raises() -> None:

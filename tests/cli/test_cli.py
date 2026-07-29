@@ -432,7 +432,7 @@ def test_claude_command_resume_binds_session_and_passes_unknown_args(
     # there).
     assert captured["server"] == "https://example.com"
     assert captured["session_id"] == "conv_abc"
-    assert captured["claude_args"] == ("--resume", "claude-session", "-p", "say hi")
+    assert captured["extra_args"] == ("--resume", "claude-session", "-p", "say hi")
     # No picker requested when ``--resume`` carries a value.
     assert captured["resume_picker"] is False
     # Default: Databricks auth is active (``--use-native-config`` not set) —
@@ -465,7 +465,7 @@ def test_claude_command_short_r_binds_omnigent_session(
     assert result.exit_code == 0, result.output
     assert captured["session_id"] == "conv_abc"
     # ``-r <conv_id>`` consumes both tokens; no leftover claude args.
-    assert captured["claude_args"] == ()
+    assert captured["extra_args"] == ()
     assert captured["resume_picker"] is False
 
 
@@ -662,7 +662,7 @@ def test_codex_command_resume_binds_session_and_passes_unknown_args(
     assert result.exit_code == 0, result.output
     assert captured["server"] == "https://example.com"
     assert captured["session_id"] == "conv_abc"
-    assert captured["codex_args"] == ("-c", "approval_policy=on-request")
+    assert captured["extra_args"] == ("-c", "approval_policy=on-request")
     assert captured["model"] == "gpt-test"
     assert captured["prompt"] == "say hi"
     assert captured["resume_picker"] is False
@@ -876,7 +876,7 @@ def test_codex_config_args_form_base_cli_args_append(
     result = CliRunner().invoke(cli, ["codex", "--dangerously-skip-permissions"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == (
+    assert captured["extra_args"] == (
         "--config",
         "k=v",
         "--dangerously-skip-permissions",
@@ -901,7 +901,7 @@ def test_codex_config_args_only_when_no_cli_args(
     result = CliRunner().invoke(cli, ["codex"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == ("--verbose",)
+    assert captured["extra_args"] == ("--verbose",)
 
 
 def test_codex_args_no_config_is_cli_args_only(
@@ -919,7 +919,7 @@ def test_codex_args_no_config_is_cli_args_only(
     result = CliRunner().invoke(cli, ["codex", "--flag"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == ("--flag",)
+    assert captured["extra_args"] == ("--flag",)
 
 
 def test_pi_config_args_form_base_cli_args_append(
@@ -940,7 +940,7 @@ def test_pi_config_args_form_base_cli_args_append(
     result = CliRunner().invoke(cli, ["pi", "--cli-flag"])
 
     assert result.exit_code == 0, result.output
-    assert captured["pi_args"] == ("--base", "--cli-flag")
+    assert captured["extra_args"] == ("--base", "--cli-flag")
 
 
 def test_kiro_command_is_registered_in_click_help() -> None:
@@ -988,7 +988,7 @@ def test_kiro_command_parses_native_options_and_prompt(
     assert captured["resume_picker"] is False
     assert captured["model"] == "auto"
     assert captured["prompt"] == "hi"
-    assert captured["kiro_args"] == (
+    assert captured["extra_args"] == (
         "--effort",
         "high",
         "--agent",
@@ -2918,6 +2918,125 @@ def test_materialize_harness_launcher_file_acp_slug() -> None:
     assert raw["executor"]["harness"] == "acp:qwenacp"  # slug preserved for the runner
     assert raw["name"] == "acp-qwenacp"
     assert re.fullmatch(r"[a-zA-Z0-9_-]+", raw["name"])  # passes the agent-name validator
+
+
+def test_run_from_openclaw_dispatches_ephemeral_acp_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-shot OpenClaw launch reaches ACP spawn env without writing config."""
+    from omnigent.onboarding.openclaw_config import (
+        OpenClawAgentEntry,
+        OpenClawDiscovery,
+    )
+    from omnigent.runtime.workflow import _build_acp_spawn_env
+    from omnigent.spec import load
+
+    source_path = tmp_path / "config.json"
+    discovery = OpenClawDiscovery(
+        agents=(
+            OpenClawAgentEntry(
+                name="Gemini CLI",
+                command="gemini",
+                args=("--experimental-acp",),
+                source="acpx",
+                path=source_path,
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.openclaw_config.discover_openclaw_agents",
+        lambda: discovery,
+    )
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    config_home = tmp_path / "omnigent-config"
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--from-openclaw", "Gemini CLI", "-p", "hello"],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_chat.assert_called_once()
+    generated = Path(run_chat.call_args.kwargs["target"])
+    raw = yaml.safe_load(generated.read_text())
+    assert raw["executor"] == {
+        "harness": "acp:gemini-cli",
+        "acp_agent": {
+            "name": "Gemini CLI",
+            "command": "gemini --experimental-acp",
+        },
+    }
+    env = _build_acp_spawn_env(load(generated))
+    assert env["HARNESS_ACP_COMMAND"] == "gemini --experimental-acp"
+    assert env["HARNESS_ACP_NAME"] == "Gemini CLI"
+    assert not (config_home / "config.yaml").exists()
+
+
+def test_run_from_openclaw_agent_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.onboarding.openclaw_config import OpenClawDiscovery
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.openclaw_config.discover_openclaw_agents",
+        lambda: OpenClawDiscovery(agents=()),
+    )
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(cli, ["run", "--from-openclaw", "missing"])
+
+    assert result.exit_code != 0
+    assert "OpenClaw/acpx agent 'missing' was not found" in result.output
+    assert "No agents were discovered" in result.output
+    run_chat.assert_not_called()
+
+
+def test_run_from_openclaw_forwards_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.onboarding.openclaw_config import (
+        OpenClawAgentEntry,
+        OpenClawDiscovery,
+    )
+
+    discovery = OpenClawDiscovery(
+        agents=(
+            OpenClawAgentEntry(
+                name="Gemini CLI",
+                command="gemini",
+                args=("--experimental-acp",),
+                source="acpx",
+                path=tmp_path / "config.json",
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.openclaw_config.discover_openclaw_agents",
+        lambda: discovery,
+    )
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run",
+            "--from-openclaw",
+            "Gemini CLI",
+            "--server",
+            "https://example.com",
+            "-p",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert run_chat.call_args.kwargs["server_url"] == "https://example.com"
 
 
 def test_materialize_harness_launcher_file_kimi_gets_os_env() -> None:
@@ -5334,57 +5453,57 @@ def test_native_terminal_dispatch_specs_cover_registered_native_agents() -> None
         (
             "claude-native",
             "omnigent.claude_native.run_claude_native",
-            {"claude_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "codex-native",
             "omnigent.codex_native.run_codex_native",
-            {"codex_args": (), "model": "native-model"},
+            {"extra_args": (), "model": "native-model"},
         ),
         (
             "pi-native",
             "omnigent.pi_native.run_pi_native",
-            {"pi_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "opencode-native",
             "omnigent.opencode_native.run_opencode_native",
-            {"opencode_args": (), "model": "native-model"},
+            {"extra_args": (), "model": "native-model"},
         ),
         (
             "cursor-native",
             "omnigent.cursor_native.run_cursor_native",
-            {"cursor_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "kimi-native",
             "omnigent.kimi_native.run_kimi_native",
-            {"kimi_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "kiro-native",
             "omnigent.kiro_native.run_kiro_native",
-            {"kiro_args": (), "model": "native-model", "prompt": None},
+            {"extra_args": (), "model": "native-model", "prompt": None},
         ),
         (
             "goose-native",
             "omnigent.goose_native.run_goose_native",
-            {"goose_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "antigravity-native",
             "omnigent.antigravity_native.run_antigravity_native",
-            {"antigravity_args": (), "model": "native-model"},
+            {"extra_args": (), "model": "native-model"},
         ),
         (
             "qwen-native",
             "omnigent.qwen_native.run_qwen_native",
-            {"qwen_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "hermes-native",
             "omnigent.hermes_native.run_hermes_native",
-            {"hermes_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
     ],
 )
@@ -5451,7 +5570,7 @@ def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
         "session_id": "conv_abc123",
         "resume_picker": False,
         "auto_open_conversation": True,
-        "cursor_args": ("--model", "composer-2.5"),
+        "extra_args": ("--model", "composer-2.5"),
     }
 
 
@@ -5481,7 +5600,7 @@ def test_dispatch_native_terminal_harness_kiro_launches_wrapper(
         "session_id": None,
         "resume_picker": True,
         "auto_open_conversation": True,
-        "kiro_args": (),
+        "extra_args": (),
         "model": "auto",
         "prompt": None,
     }
@@ -5509,9 +5628,9 @@ def test_dispatch_native_terminal_harness_kiro_forwards_prompt(
 @pytest.mark.parametrize(
     ("harness", "target", "args_param"),
     [
-        ("goose-native", "omnigent.goose_native.run_goose_native", "goose_args"),
-        ("qwen-native", "omnigent.qwen_native.run_qwen_native", "qwen_args"),
-        ("hermes-native", "omnigent.hermes_native.run_hermes_native", "hermes_args"),
+        ("goose-native", "omnigent.goose_native.run_goose_native", "extra_args"),
+        ("qwen-native", "omnigent.qwen_native.run_qwen_native", "extra_args"),
+        ("hermes-native", "omnigent.hermes_native.run_hermes_native", "extra_args"),
     ],
 )
 @pytest.mark.parametrize(
