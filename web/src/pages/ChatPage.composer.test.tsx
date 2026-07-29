@@ -2785,4 +2785,17 @@ describe("shouldQueueSend", () => {
   it("ignores queued messages belonging to a different conversation", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
   });
+
+  it("sends directly while busy when alwaysSteer is on", () => {
+    // The whole point of the preference: a mid-turn follow-up is POSTed now
+    // (steered) instead of parking in the queue strip.
+    expect(shouldQueueSend("conv_a", "streaming", "idle", [], true)).toBe(false);
+    expect(shouldQueueSend("conv_a", "idle", "running", [], true)).toBe(false);
+  });
+
+  it("still queues under alwaysSteer when this conversation has a queued message", () => {
+    // The ordering guard outranks always-steer: draining must stay in order, so
+    // a direct send can't overtake a still-queued earlier one.
+    expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
+  });
 });
