@@ -3847,6 +3847,36 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
 
 
 @pytest.mark.asyncio
+async def test_sys_list_models_dispatch_applies_filters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Runner-local dispatch honors worker and model-id filters."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    _isolate_model_providers(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  claude:\n    kind: subscription\n    cli: claude\n    default: true\n",
+    )
+    output = await execute_tool(
+        tool_name="sys_list_models",
+        arguments=json.dumps(
+            {
+                "workers": ["worker"],
+                "model_ids": ["claude-sonnet-4-6"],
+            }
+        ),
+        agent_spec=_spec_with_real_subagent("claude-native"),
+        conversation_id="conv_list_models_filtered",
+    )
+
+    payload = json.loads(output)
+    assert set(payload) == {"worker"}
+    assert [model["id"] for model in payload["worker"]["models"]] == ["claude-sonnet-4-6"]
+
+
+@pytest.mark.asyncio
 async def test_sys_list_models_requires_agent_spec() -> None:
     """
     ``sys_list_models`` with no resolvable spec fails loud, not empty.

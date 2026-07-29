@@ -17,6 +17,45 @@ from typing import Any
 
 from omnigent.spec.types import AgentSpec
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
+
+
+def filter_model_catalog(
+    catalog: dict[str, Any],
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Apply optional worker and model-id filters to a model catalog.
+
+    Filtering is deliberately shared by the in-process tool and the
+    runner-local dispatch path so both expose the same contract.
+
+    :param catalog: Full ``sys_list_models`` payload.
+    :param arguments: Parsed tool arguments.
+    :returns: A filtered copy of the catalog.
+    """
+    workers = arguments.get("workers")
+    worker_names = set(workers) if isinstance(workers, list) else None
+    model_ids = arguments.get("model_ids")
+    selected_models = set(model_ids) if isinstance(model_ids, list) else None
+
+    filtered: dict[str, Any] = {}
+    for worker, raw_row in catalog.items():
+        if worker_names is not None and worker not in worker_names:
+            continue
+        if not isinstance(raw_row, dict):
+            filtered[worker] = raw_row
+            continue
+
+        row = dict(raw_row)
+        if selected_models is not None and isinstance(row.get("models"), list):
+            row["models"] = [
+                model
+                for model in row["models"]
+                if isinstance(model, dict) and model.get("id") in selected_models
+            ]
+        filtered[worker] = row
+    return filtered
 
 
 class SysListModelsTool(Tool):
@@ -66,7 +105,7 @@ class SysListModelsTool(Tool):
 
     def get_schema(self) -> dict[str, Any]:
         """
-        Return the OpenAI-format tool schema (no parameters).
+        Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
             ``"function"`` sub-dict.
@@ -78,7 +117,26 @@ class SysListModelsTool(Tool):
                 "description": SysListModelsTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "workers": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "uniqueItems": True,
+                            "description": (
+                                "Optional worker names to include, such as "
+                                "'self' or a declared sub-agent name."
+                            ),
+                        },
+                        "model_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "uniqueItems": True,
+                            "description": (
+                                "Optional exact model ids to retain in each "
+                                "selected worker's models list."
+                            ),
+                        },
+                    },
                     "required": [],
                     "additionalProperties": False,
                 },
@@ -89,12 +147,17 @@ class SysListModelsTool(Tool):
         """
         Enumerate per-worker model availability (in-process path).
 
-        :param arguments: Ignored — the tool takes no parameters.
+        :param arguments: JSON with optional ``workers`` and
+            ``model_ids`` arrays.
         :param ctx: Tool execution context (unused).
         :returns: JSON mapping of worker name (plus ``"self"``) to its
-            ``{source, verified, models, note}`` row.
+            ``{source, verified, models, note}`` row, optionally filtered.
         """
-        del arguments, ctx
+        del ctx
         from omnigent.model_catalog import catalog_for_spec
 
-        return json.dumps(catalog_for_spec(self._spec))
+        args, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return json.dumps({"error": error})
+        assert args is not None
+        return json.dumps(filter_model_catalog(catalog_for_spec(self._spec), args))
