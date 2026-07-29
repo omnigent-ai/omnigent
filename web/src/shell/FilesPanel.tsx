@@ -12,7 +12,7 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
+import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
   onFileSelect: (path: string) => void;
@@ -249,17 +250,6 @@ function SearchFilterInput({
 }
 
 // ---------------------------------------------------------------------------
-// Scroll-position persistence
-// ---------------------------------------------------------------------------
-
-/**
- * Module-level cache so the file list's scroll position survives switching
- * conversations (and unmount/remount). Keyed per conversation and per view
- * (Changed vs All) since the two lists have independent heights.
- */
-const scrollTopCache = new Map<string, number>();
-
-// ---------------------------------------------------------------------------
 // Panel
 // ---------------------------------------------------------------------------
 
@@ -371,50 +361,17 @@ export function FilesPanel({
   // Highlight the filters toggle when include/exclude carry a value.
   const treeFiltersActive = treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
 
-  // Restore the saved scroll position after a conversation/view switch.
-  // While the new conversation loads, the list is a short placeholder and
-  // the browser clamps scrollTop to 0 — and the content then grows in
-  // steps (environment → files → tree re-expansion), each of which can
-  // clamp again. So restoration re-asserts the target on every render
-  // until the container is tall enough to hold it (or its height stops
-  // changing), and saving stays off until then so clamp-induced scroll
-  // events can't overwrite the cached value. Gated on the active view's
-  // data being present rather than `isLoading` — the files queries are
-  // disabled (not loading) until the environment query resolves.
+  // Persist/restore the list's scroll position across conversation and view
+  // switches. Keyed per conversation + view (Changed vs All) since the two
+  // lists have independent heights. Readiness is data presence rather than
+  // `isLoading` — the files queries are disabled (not loading) until the
+  // environment query resolves.
   const scrollRef = useRef<HTMLElement>(null);
-  const scrollKey = conversationId ? `${conversationId}:${flatView ? "changed" : "all"}` : null;
+  const scrollKey = conversationId
+    ? `files:${conversationId}:${flatView ? "changed" : "all"}`
+    : null;
   const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
-  const pendingRestoreRef = useRef<{ target: number; lastHeight: number } | null>(null);
-  const scrollKeyRef = useRef<string | null>(null);
-  if (scrollKey !== scrollKeyRef.current) {
-    scrollKeyRef.current = scrollKey;
-    pendingRestoreRef.current = scrollKey
-      ? { target: scrollTopCache.get(scrollKey) ?? 0, lastHeight: -1 }
-      : null;
-  }
-  // No dependency array: intentionally runs after every render — each
-  // content-growth step is another chance to reach the saved offset. The
-  // animation-frame loop finishes the job between renders: it keeps
-  // re-asserting until the container is tall enough, and gives up (accepting
-  // the clamp) once the content's height stops changing.
-  useLayoutEffect(() => {
-    const el = scrollRef.current;
-    const pending = pendingRestoreRef.current;
-    if (!el || !pending || !dataReady) return;
-    let frame = 0;
-    const attempt = () => {
-      el.scrollTop = pending.target;
-      const maxScroll = el.scrollHeight - el.clientHeight;
-      if (maxScroll >= pending.target || el.scrollHeight === pending.lastHeight) {
-        pendingRestoreRef.current = null;
-        return;
-      }
-      pending.lastHeight = el.scrollHeight;
-      frame = requestAnimationFrame(attempt);
-    };
-    attempt();
-    return () => cancelAnimationFrame(frame);
-  });
+  const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
 
   return (
     <div
@@ -554,11 +511,7 @@ export function FilesPanel({
           flatView ? "pt-1" : "pt-2",
           fillHeight ? "min-h-0 flex-1" : "max-h-72",
         )}
-        onScroll={(event) => {
-          if (scrollKey && pendingRestoreRef.current === null) {
-            scrollTopCache.set(scrollKey, event.currentTarget.scrollTop);
-          }
-        }}
+        onScroll={handleScroll}
       >
         {flatView ? (
           <FlatFileList

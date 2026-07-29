@@ -95,6 +95,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
@@ -715,6 +716,18 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+  // Persist where the reader was in the content area (markdown source, plain
+  // text). The view mode is part of the key because each mode renders a
+  // different height, so sharing one offset across modes would drop the reader
+  // at an unrelated place after a toggle; the namespace is separate from the
+  // `viewer:` keys Monaco writes for its own internal scroller.
+  const contentScrollKey =
+    conversationId && path ? `viewer-content:${conversationId}:${viewMode}:${path}` : null;
+  const handleContentScroll = useScrollRestore(
+    contentAreaRef,
+    contentScrollKey,
+    fileQuery.data !== undefined,
+  );
   // Measure the content area so the split toggle can hide when there isn't
   // enough room for side-by-side. Only observe while the diff is shown — the
   // ref element only exists then, and it's the only mode that cares.
@@ -1328,7 +1341,11 @@ function FileViewerBody({
       </div>
 
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
-        <div ref={contentAreaRef} className="flex-1 overflow-y-auto min-w-0">
+        <div
+          ref={contentAreaRef}
+          onScroll={handleContentScroll}
+          className="flex-1 overflow-y-auto min-w-0"
+        >
           {isDeletedFile && viewMode !== "diff" ? (
             <div className="flex flex-col items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
               <Trash2Icon className="size-5 opacity-40" />

@@ -54,6 +54,7 @@ vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
 
 import { MonacoDiffViewer } from "./MonacoDiffViewer";
 import { codeFontFamilyForEditor, writeCodeFontSizePx } from "@/lib/codeFontPreferences";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
 function renderDiff(props: {
   before: string | null;
@@ -76,6 +77,15 @@ function renderDiff(props: {
       onSetActiveSelection={() => {}}
     />,
   );
+}
+
+// The modified editor's scroll API, used by the viewer to persist the reader's
+// place in the diff.
+function scrollStubs() {
+  return {
+    setScrollTop: vi.fn(),
+    onDidScrollChange: vi.fn(() => ({ dispose: () => {} })),
+  };
 }
 
 beforeEach(() => {
@@ -145,7 +155,7 @@ describe("MonacoDiffViewer", () => {
 
   it("wires getModifiedEditor() into the comment layer on mount", async () => {
     const setEOL = vi.fn();
-    const fakeModified = { getModel: () => ({ setEOL }) };
+    const fakeModified = { getModel: () => ({ setEOL }), ...scrollStubs() };
     renderDiff({ before: "a", after: "b\r\n", layout: "split" });
     await waitFor(() => expect(h.onMount).not.toBeNull());
 
@@ -170,9 +180,40 @@ describe("MonacoDiffViewer", () => {
     expect(setEOL).toHaveBeenCalledWith(1);
   });
 
+  it("restores and records the modified side's scroll offset", async () => {
+    saveScrollTop("viewer-diff:conv_1:src/a.ts", 260);
+    const setScrollTop = vi.fn();
+    const onDidScrollChange = vi.fn(() => ({ dispose: () => {} }));
+    const fakeModified = {
+      getModel: () => ({ setEOL: vi.fn() }),
+      setScrollTop,
+      onDidScrollChange,
+    };
+    renderDiff({ before: "a", after: "b", layout: "split" });
+    await waitFor(() => expect(h.onMount).not.toBeNull());
+
+    act(() => {
+      h.onMount?.(
+        { getModifiedEditor: () => fakeModified } as unknown as Parameters<DiffOnMount>[0],
+        {
+          editor: { EndOfLineSequence: { LF: 0, CRLF: 1 } },
+        } as unknown as Parameters<DiffOnMount>[1],
+      );
+    });
+
+    // The reader's place in the diff is restored, and further scrolling is
+    // cached under the diff's own key.
+    expect(setScrollTop).toHaveBeenCalledWith(260);
+    const handler = onDidScrollChange.mock.calls[0]?.[0] as unknown as (e: {
+      scrollTop: number;
+    }) => void;
+    handler({ scrollTop: 88 });
+    expect(getSavedScrollTop("viewer-diff:conv_1:src/a.ts")).toBe(88);
+  });
+
   it("re-fonts the mounted diff editor when the code-font preference changes", async () => {
     const updateOptions = vi.fn();
-    const fakeModified = { getModel: () => ({ setEOL: vi.fn() }) };
+    const fakeModified = { getModel: () => ({ setEOL: vi.fn() }), ...scrollStubs() };
     const fakeDiff = { getModifiedEditor: () => fakeModified, updateOptions };
     renderDiff({ before: "a", after: "b", layout: "split" });
     await waitFor(() => expect(h.onMount).not.toBeNull());

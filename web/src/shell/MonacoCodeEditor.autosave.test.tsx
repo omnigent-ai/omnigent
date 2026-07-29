@@ -19,6 +19,8 @@ const h = vi.hoisted(() => ({
   onChange: null as ((value: string | undefined, ev: unknown) => void) | null,
   cmdS: null as (() => void) | null,
   blur: null as (() => void) | null,
+  scrollTops: [] as number[],
+  scroll: null as ((e: { scrollTop: number }) => void) | null,
 }));
 
 // Minimal Monaco namespace: only the members handleMount touches.
@@ -34,6 +36,8 @@ interface FakeEditor {
   getModel: () => { setEOL: () => void };
   addCommand: (binding: number, handler: () => void) => void;
   onDidBlurEditorWidget: (handler: () => void) => { dispose: () => void };
+  setScrollTop: (top: number) => void;
+  onDidScrollChange: (handler: (e: { scrollTop: number }) => void) => { dispose: () => void };
   saveViewState: () => null;
   restoreViewState: () => void;
   getAction: () => { run: () => void };
@@ -59,6 +63,13 @@ function makeFakeEditor(initial: string): FakeEditor {
     },
     onDidBlurEditorWidget: (handler) => {
       h.blur = handler;
+      return { dispose: () => {} };
+    },
+    setScrollTop: (top) => {
+      h.scrollTops.push(top);
+    },
+    onDidScrollChange: (handler) => {
+      h.scroll = handler;
       return { dispose: () => {} };
     },
     saveViewState: () => null,
@@ -109,6 +120,7 @@ vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }))
 vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
 
 import { MonacoCodeEditor } from "./MonacoCodeEditor";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
 
@@ -166,6 +178,8 @@ beforeEach(() => {
   h.onChange = null;
   h.cmdS = null;
   h.blur = null;
+  h.scrollTops = [];
+  h.scroll = null;
   mockWrite();
   // Online → auto-save enabled.
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
@@ -288,5 +302,34 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
       rerender(makeEditor());
     });
     expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
+  });
+});
+
+// Monaco scrolls internally, so the viewer drives the shared scroll cache from
+// the editor's own scroll events rather than the DOM restore hook.
+describe("MonacoCodeEditor scroll position persistence", () => {
+  const KEY = `viewer:conv_monaco_autosave:${PATH}`;
+
+  it("restores the saved offset on mount", async () => {
+    saveScrollTop(KEY, 320);
+    await renderMounted(makeEditor());
+    expect(h.scrollTops).toContain(320);
+  });
+
+  it("records the editor's offset as the user scrolls", async () => {
+    saveScrollTop(KEY, 0);
+    await renderMounted(makeEditor());
+    expect(h.scroll).not.toBeNull();
+    h.scroll?.({ scrollTop: 210 });
+    expect(getSavedScrollTop(KEY)).toBe(210);
+  });
+
+  it("keeps offsets separate per file", async () => {
+    saveScrollTop(KEY, 320);
+    saveScrollTop("viewer:conv_monaco_autosave:src/other.ts", 15);
+    await renderMounted(makeEditor());
+    h.scroll?.({ scrollTop: 44 });
+    expect(getSavedScrollTop(KEY)).toBe(44);
+    expect(getSavedScrollTop("viewer:conv_monaco_autosave:src/other.ts")).toBe(15);
   });
 });
