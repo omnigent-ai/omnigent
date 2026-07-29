@@ -1256,6 +1256,94 @@ async def test_forward_kiro_session_restart_rebinds_known_session_under_ambiguit
     assert any(i["item_type"] == "function_call_output" for i in items)
 
 
+@pytest.mark.asyncio
+async def test_forward_kiro_session_no_duplicate_on_mid_record_post_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A POST that fails partway through a multi-item record does not re-post the
+    items that already landed when the poll retries.
+
+    The 2nd tool call's POST 503s once; the record re-reads on the next poll and
+    only the failed call is re-sent. Prose and the first call post exactly once.
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            _prompt_record("user-1", "run it"),
+            _assistant_record(
+                "a1",
+                text="Let me check",
+                tool_uses=[
+                    {"tool_use_id": "tooluse_A", "name": "read", "input": {}},
+                    {"tool_use_id": "tooluse_B", "name": "shell", "input": {}},
+                ],
+            ),
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    posted_items: list[tuple[str, str]] = []
+    fail_once = {"b": True}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            payload = json.loads(request.content)
+            if payload["type"] == "external_conversation_item":
+                data = payload["data"]
+                idata = data["item_data"]
+                ident = idata.get("call_id") or "".join(
+                    b.get("text", "") for b in idata.get("content", [])
+                )
+                # The 2nd tool call fails exactly once (transient 503).
+                if (
+                    data["item_type"] == "function_call"
+                    and ident == "tooluse_B"
+                    and fail_once["b"]
+                ):
+                    fail_once["b"] = False
+                    return httpx.Response(503, json={})
+                posted_items.append((data["item_type"], ident))
+        return httpx.Response(200, json={})
+
+    real = forwarder.httpx.AsyncClient
+
+    def _factory(*a: Any, **k: Any) -> httpx.AsyncClient:
+        k.pop("transport", None)
+        return real(*a, transport=httpx.MockTransport(_handler), **k)
+
+    monkeypatch.setattr(forwarder.httpx, "AsyncClient", _factory)
+
+    polls = {"n": 0}
+
+    async def _cancel_after_two(_seconds: float) -> None:
+        polls["n"] += 1
+        if polls["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_after_two)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    # Each item lands exactly once despite the mid-record failure + retry.
+    assert posted_items.count(("message", "Let me check")) == 1
+    assert posted_items.count(("function_call", "tooluse_A")) == 1
+    assert posted_items.count(("function_call", "tooluse_B")) == 1
+
+
 def test_forward_state_round_trips_turn_fields(tmp_path: Path) -> None:
     """The persisted cursor carries the open turn's card state across restarts."""
     state = forwarder._ForwardState(

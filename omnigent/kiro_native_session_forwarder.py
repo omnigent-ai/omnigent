@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -82,6 +83,12 @@ class _ForwardState:
     turn_response_id: str | None = None
     turn_live: bool = False
     pending_call_ids: set[str] = field(default_factory=set)
+    # Keys of conversation items already posted for the record currently being
+    # mirrored, persisted after each post and cleared when the cursor advances
+    # past the record. Conversation items are not server-deduped, so a POST that
+    # throws partway through a multi-item record must not re-post the items that
+    # already landed on the in-process retry or a restart mid-record.
+    posted_item_keys: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -147,6 +154,7 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
     byte_offset = data.get("byte_offset")
     turn_response_id = data.get("turn_response_id")
     pending = data.get("pending_call_ids")
+    posted = data.get("posted_item_keys")
     return _ForwardState(
         session_id=session_id if isinstance(session_id, str) and session_id else None,
         byte_offset=byte_offset if isinstance(byte_offset, int) and byte_offset >= 0 else 0,
@@ -157,6 +165,11 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
         pending_call_ids=(
             {entry for entry in pending if isinstance(entry, str) and entry}
             if isinstance(pending, list)
+            else set()
+        ),
+        posted_item_keys=(
+            {entry for entry in posted if isinstance(entry, str) and entry}
+            if isinstance(posted, list)
             else set()
         ),
     )
@@ -176,6 +189,7 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
                 "turn_response_id": state.turn_response_id,
                 "turn_live": state.turn_live,
                 "pending_call_ids": sorted(state.pending_call_ids),
+                "posted_item_keys": sorted(state.posted_item_keys),
             }
         ),
         encoding="utf-8",
@@ -833,6 +847,27 @@ async def _post_session_cost(
     resp.raise_for_status()
 
 
+async def _post_item_once(
+    *,
+    state: _ForwardState,
+    bridge_dir: Path,
+    key: str,
+    poster: Callable[[], Awaitable[None]],
+) -> None:
+    """Post a conversation item unless its key already landed.
+
+    Conversation items are not server-deduped, so on an in-process retry or a
+    restart mid-record an already-posted item must not repeat. The key is added
+    and the state persisted only after the post succeeds, so a failed post is
+    retried (never skipped) and a succeeded one is never re-sent.
+    """
+    if key in state.posted_item_keys:
+        return
+    await poster()
+    state.posted_item_keys.add(key)
+    _write_state(bridge_dir, state)
+
+
 async def _mirror_record(
     client: httpx.AsyncClient,
     *,
@@ -840,6 +875,7 @@ async def _mirror_record(
     agent_name: str,
     record: KiroTranscriptRecord,
     state: _ForwardState,
+    bridge_dir: Path,
 ) -> None:
     """Mirror one transcript record, advancing the turn's card lifecycle.
 
@@ -850,6 +886,13 @@ async def _mirror_record(
     the turn's final message (none emitted, none outstanding); prose posts
     before the record's tool calls so the web spinner sits on the trailing
     item.
+
+    Each conversation item posts through :func:`_post_item_once`, which skips an
+    item whose key already landed and persists the posted-key set after each
+    post, so a POST that throws partway through a multi-item record does not
+    re-post the earlier items on the in-process retry or a restart mid-record.
+    Status edges (running/idle) carry no key: ``running`` is already gated by
+    ``turn_live`` and a repeated ``idle`` for the same id is benign.
     """
     if record.kind == "Prompt":
         # A new user turn authoritatively closes the previous one.
@@ -865,8 +908,13 @@ async def _mirror_record(
         state.pending_call_ids.clear()
         message = _record_to_message(record)
         if message is not None:
-            await _post_conversation_message(
-                client, session_id=session_id, agent_name=agent_name, message=message
+            await _post_item_once(
+                state=state,
+                bridge_dir=bridge_dir,
+                key=f"msg:{record.message_id}",
+                poster=lambda: _post_conversation_message(
+                    client, session_id=session_id, agent_name=agent_name, message=message
+                ),
             )
         return
 
@@ -886,21 +934,31 @@ async def _mirror_record(
     if record.kind == "AssistantMessage":
         message = _record_to_message(record)
         if message is not None:
-            await _post_conversation_message(
-                client,
-                session_id=session_id,
-                agent_name=agent_name,
-                message=message,
-                response_id=response_id,
+            await _post_item_once(
+                state=state,
+                bridge_dir=bridge_dir,
+                key=f"msg:{record.message_id}",
+                poster=lambda: _post_conversation_message(
+                    client,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    message=message,
+                    response_id=response_id,
+                ),
             )
         for call in record.tool_calls:
             state.pending_call_ids.add(call.call_id)
-            await _post_function_call(
-                client,
-                session_id=session_id,
-                agent_name=agent_name,
-                response_id=response_id,
-                call=call,
+            await _post_item_once(
+                state=state,
+                bridge_dir=bridge_dir,
+                key=f"call:{call.call_id}",
+                poster=lambda call=call: _post_function_call(
+                    client,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    response_id=response_id,
+                    call=call,
+                ),
             )
         # Kiro's agent loop keeps stepping while the model returns tool uses
         # and stops on a plain reply, so an assistant prose record with no tool
@@ -915,8 +973,13 @@ async def _mirror_record(
 
     for result in record.tool_results:
         state.pending_call_ids.discard(result.call_id)
-        await _post_function_call_output(
-            client, session_id=session_id, response_id=response_id, result=result
+        await _post_item_once(
+            state=state,
+            bridge_dir=bridge_dir,
+            key=f"out:{result.call_id}",
+            poster=lambda result=result: _post_function_call_output(
+                client, session_id=session_id, response_id=response_id, result=result
+            ),
         )
 
 
@@ -1022,26 +1085,29 @@ async def forward_kiro_session_to_omnigent(
                         #
                         # The cursor advances once per record, AFTER its items
                         # post. A POST that throws partway through a multi-item
-                        # record (e.g. the 2nd of two tool calls) unwinds to the
-                        # poll's outer handler without advancing the cursor, so
-                        # the next poll re-reads the record and re-posts its
-                        # earlier items: delivery is at-least-once, matching the
-                        # goose forwarder's per-row cursor (accepted there as a
-                        # non-blocking duplicate window). No record is lost and
-                        # the turn id/running edge do not duplicate; only items
-                        # within the failed record can repeat.
+                        # record unwinds to the poll's outer handler without
+                        # advancing the cursor, so the next poll re-reads the
+                        # record; _post_item_once (via state.posted_item_keys,
+                        # persisted per item) skips the items that already landed
+                        # so the retry posts only the failed one. Delivery is
+                        # exactly-once across in-process retry and restart.
                         await _mirror_record(
                             client,
                             session_id=session_id,
                             agent_name=agent_name,
                             record=record,
                             state=state,
+                            bridge_dir=bridge_dir,
                         )
                         if state.turn_response_id is not None:
                             # Any transcript record while a turn is open proves
                             # kiro is alive; only true silence trips the backstop.
                             last_turn_activity_ts = _turn_monotonic()
                         state.byte_offset = record_end_offset
+                        # The record is fully mirrored and the cursor has moved
+                        # past it, so its posted-item keys are dead weight; drop
+                        # them to bound the set to the in-flight record.
+                        state.posted_item_keys.clear()
                         _write_state(bridge_dir, state)
                     if batch_end_offset != state.byte_offset:
                         # Skipped tail bytes (unparseable/foreign records) still
