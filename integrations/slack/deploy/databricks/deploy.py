@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Deploy the Omnigent Slack bot to a Databricks App via Asset Bundles.
 
-Mirrors the server deploy (``deploy/databricks/deploy.py``): builds a wheel
-for the ``omnigent-slack`` package, generates an app-level ``pyproject.toml`` +
-``uv.lock`` that point at that wheel, copies the wheel into ``src/``, then wraps
-``databricks bundle deploy`` + ``databricks bundle run``. The Databricks Apps
-runtime installs the source directory with ``uv sync``, so the app imports
-``omnigent_slack`` from the built wheel — not from loose source files.
+Builds a wheel for the ``omnigent-slack`` package, generates an app-level
+``pyproject.toml`` that depends on that wheel (with the bot's runtime deps
+inlined from the source ``pyproject.toml``), copies the wheel into ``src/``,
+then wraps ``databricks bundle deploy`` + ``databricks bundle run``.
+
+No lockfile is generated or committed: the app starts with ``uv run``, so the
+Databricks Apps runtime resolves dependencies in-container at boot (the same
+pattern as the ``databricks/app-templates`` examples). This keeps the deploy
+step offline-simple — no ``uv lock``, no registry normalization, no
+``--exclude-newer`` juggling to match the runtime's pinned cutoff.
 
 Simpler than the server deploy: one wheel, pure-PyPI deps, no Lakebase / UC
 volume and no cross-package version lockstep.
@@ -26,13 +30,14 @@ creation, user-authorization enablement, and the enrollment flow).
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import tomllib
 
 # Must match resources.apps.<key> and bundle.name in databricks.yml.
 _BUNDLE_RESOURCE_KEY = "omnigent-slack"
@@ -42,9 +47,6 @@ _DIST_NAME = "omnigent-slack"
 _WHEEL_PREFIX = "omnigent_slack-"
 
 _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
-# Public PyPI by default. Set UV_INDEX_URL to lock against a private mirror or
-# proxy (e.g. the Databricks internal proxy) instead.
-_UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
 
 
 def _log(msg: str) -> None:
@@ -135,21 +137,28 @@ def _toml_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _write_uv_dependency_files(
-    wheel: Path,
-    deploy_version: str,
-    index_url: str | None = None,
-    exclude_newer: str | None = None,
-) -> None:
-    """Copy the wheel into src/ and write the app pyproject.toml + uv.lock.
+def _read_runtime_dependencies() -> list[str]:
+    """Read the bot's runtime deps from its source pyproject.toml.
 
-    The Apps runtime runs ``uv sync`` in the synced source directory, so it
-    needs a ``pyproject.toml`` whose only dependency is the bot, sourced from
-    the co-located wheel, plus a matching ``uv.lock``.
+    Inlining them into the generated app pyproject (rather than relying on the
+    wheel's own metadata) keeps the app's dependency set visible and in lockstep
+    with the package: ``uv run`` resolves this list plus the wheel in-container.
+    """
+    data = tomllib.loads((_slack_root() / "pyproject.toml").read_text())
+    deps = data.get("project", {}).get("dependencies", [])
+    if not deps:
+        _fail("no [project.dependencies] found in integrations/slack/pyproject.toml")
+    return list(deps)
 
-    :param index_url: Optional index URL forwarded to the lock step.
-    :param exclude_newer: Optional uv ``--exclude-newer`` cutoff forwarded to
-        the lock step.
+
+def _write_app_pyproject(wheel: Path, deploy_version: str) -> None:
+    """Copy the wheel into src/ and write the app pyproject.toml (no lockfile).
+
+    The app starts with ``uv run``, so the Apps runtime resolves this project
+    in-container at boot — no ``uv.lock`` is generated or shipped. The generated
+    project pins the bot to the co-located wheel and inlines its runtime deps
+    (read from the source pyproject) so the resolved set is explicit and stays in
+    sync with the package.
     """
     src = _src_dir()
     _sweep_src_wheels()
@@ -160,72 +169,42 @@ def _write_uv_dependency_files(
     requirements = src / "requirements.txt"
     if requirements.exists():
         requirements.unlink()
+    # A stale lockfile from an older wheel-and-lock deploy would pin the wrong
+    # version; drop it so `uv run` resolves fresh in-container.
+    lockfile = src / "uv.lock"
+    if lockfile.exists():
+        lockfile.unlink()
 
+    deps = [f"{_DIST_NAME}=={deploy_version}", *_read_runtime_dependencies()]
+    dep_lines = "".join(f"  {_toml_string(d)},\n" for d in deps)
     pyproject = (
         "[project]\n"
         'name = "omnigent-slack-databricks-app"\n'
         'version = "0.0.0"\n'
         f"requires-python = {_toml_string(_APP_REQUIRES_PYTHON)}\n"
         "dependencies = [\n"
-        f'  "{_DIST_NAME}=={deploy_version}",\n'
+        f"{dep_lines}"
         "]\n\n"
+        # Not an installable package itself — just an environment for `uv run`.
+        "[tool.uv]\n"
+        "package = false\n\n"
         "[tool.uv.sources]\n"
         f"{_DIST_NAME} = {{ path = {_toml_string('./' + wheel.name)} }}\n"
     )
     (src / "pyproject.toml").write_text(pyproject)
     _log("src/pyproject.toml:\n" + pyproject)
-    _run_uv_lock(src, index_url, exclude_newer)
-
-
-def _run_uv_lock(
-    src: Path, index_url: str | None = None, exclude_newer: str | None = None
-) -> None:
-    """Generate src/uv.lock, then normalize its registry to public PyPI.
-
-    Locking honors the index override (``--index-url`` or ``UV_INDEX_URL``,
-    default public PyPI) so a Databricks-network machine can resolve via the
-    internal proxy; the normalize step then rewrites every registry URL back to
-    public PyPI so the uploaded lock is canonical, mirroring the server deploy.
-
-    :param index_url: Explicit index URL (from ``--index-url``); falls back to
-        ``UV_INDEX_URL`` then public PyPI.
-    :param exclude_newer: Optional uv ``--exclude-newer`` cutoff. The Apps runtime
-        pins a global cutoff; passing the same one keeps the in-container
-        re-resolve from refetching (and timing out) on PyPI. Omitted → no cutoff.
-    """
-    index_url = index_url or os.environ.get("UV_INDEX_URL") or _UV_DEFAULT_INDEX_URL
-    env = os.environ.copy()
-    env.pop("UV_INDEX", None)
-    env.pop("UV_DEFAULT_INDEX", None)
-    env["UV_INDEX_URL"] = index_url
-    cmd = ["uv", "lock", "--python", "3.12", "--index-url", index_url]
-    if exclude_newer:
-        cmd += ["--exclude-newer", exclude_newer]
-    _log(f"$ {' '.join(cmd)}")
-    subprocess.run(cmd, cwd=src, env=env, check=True)
-    # Rewrite proxy/registry URLs to public PyPI so the uploaded lock is
-    # reproducible regardless of the machine that generated it.
-    normalize = _repo_root() / "scripts" / "normalize_uv_lock_registry.py"
-    if normalize.exists():
-        _log("normalizing uv.lock registry → public PyPI")
-        subprocess.run([sys.executable, str(normalize), str(src / "uv.lock")], env=env)
-
-
-def _repo_root() -> Path:
-    # integrations/slack/deploy/databricks/deploy.py → repo root (4 parents up).
-    return Path(__file__).resolve().parents[4]
 
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
     # The app's own URL isn't known until it exists — empty on the first
-    # deploy, then passed via --webauth-base-url on the second (see main()).
-    webauth_base_url = args.webauth_base_url or ""
+    # deploy, then passed via --app-url on the second (see main()).
+    app_url = args.app_url or ""
     pairs = {
         "app_name": args.app_name,
         "secret_scope": args.secret_scope,
         "oauth_client_id": args.oauth_client_id,
         "server_url": args.server_url.rstrip("/"),
-        "webauth_base_url": webauth_base_url.rstrip("/"),
+        "app_url": app_url.rstrip("/"),
     }
     out: list[str] = []
     for key, value in pairs.items():
@@ -268,7 +247,7 @@ def main() -> None:
         help="Custom U2M OAuth app client id (public; passed inline, not a secret).",
     )
     parser.add_argument(
-        "--webauth-base-url",
+        "--app-url",
         default=None,
         help=(
             "This app's own public URL (the enrollment link base). Unknown "
@@ -283,29 +262,9 @@ def main() -> None:
         help="Explicit PEP 440 version to stamp. Default: <base>.post<unix-ts>.",
     )
     parser.add_argument(
-        "--index-url",
-        default=None,
-        help=(
-            "PyPI index URL for the uv lock step. Overrides UV_INDEX_URL; "
-            "defaults to public PyPI. On the Databricks network use the proxy: "
-            "https://pypi-proxy.cloud.databricks.com/simple (the lock is "
-            "normalized back to public PyPI afterward)."
-        ),
-    )
-    parser.add_argument(
-        "--exclude-newer",
-        default=None,
-        help=(
-            "uv --exclude-newer cutoff (e.g. 2026-07-19T00:00:00Z) for the lock "
-            "step. Match the Apps runtime's pinned cutoff so the in-container "
-            "re-resolve doesn't refetch (and time out) on PyPI — read it from "
-            "/logz. Omit for no cutoff."
-        ),
-    )
-    parser.add_argument(
         "--skip-build",
         action="store_true",
-        help="Reuse the existing src/ wheel + lock — skip the wheel build.",
+        help="Reuse the existing src/ wheel + pyproject — skip the wheel build.",
     )
     parser.add_argument(
         "--skip-run",
@@ -314,11 +273,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.webauth_base_url:
+    if not args.app_url:
         _log(
-            "WARNING: --webauth-base-url not set. The enrollment link needs this "
+            "WARNING: --app-url not set. The enrollment link needs this "
             "app's public URL, which only exists after the first deploy. Re-run "
-            "with --webauth-base-url once you can read it: "
+            "with --app-url once you can read it: "
             f"databricks apps get {args.app_name} -o json | jq -r .url"
         )
 
@@ -327,12 +286,12 @@ def main() -> None:
         original_pyproject = _stamp_version(deploy_version)
         try:
             wheel = _build_wheel()
-            _write_uv_dependency_files(wheel, deploy_version, args.index_url, args.exclude_newer)
+            _write_app_pyproject(wheel, deploy_version)
         finally:
             # Restore the working-tree version so the deploy leaves no diff.
             (_slack_root() / "pyproject.toml").write_text(original_pyproject)
     else:
-        _log("--skip-build: reusing existing src/ wheel + lock")
+        _log("--skip-build: reusing existing src/ wheel + pyproject")
         if not list(_src_dir().glob(f"{_WHEEL_PREFIX}*.whl")):
             _fail("no wheel in src/ to reuse; run without --skip-build first")
 

@@ -49,6 +49,31 @@ def test_fork_drops_import_provenance_labels(
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_per_user_pin_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork is a NEW conversation, so it must not inherit the source's pins:
+    neither the forker's nor any other user's per-user pin key rides along
+    (those keys have a dynamic suffix, so a prefix drop is required)."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {
+            pinned_label_key("alice"): "1721760000000",
+            pinned_label_key("bob"): "1700000000000",
+            "kept": "yes",
+        },
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert pinned_label_key("alice") not in fork.labels
+    assert pinned_label_key("bob") not in fork.labels
+
+
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     assert len(conv.id) == 32
@@ -4861,6 +4886,56 @@ def test_list_conversations_filters_by_project_name_dual_read(
     assert unfiled.id in unfiled_ids
     assert first_class.id not in unfiled_ids
     assert labelled.id not in unfiled_ids
+
+
+def test_list_conversations_filters_by_pinned_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``list_conversations(pinned=True, pinned_owner=<user>)`` returns only the
+    sessions THAT user has pinned — matched by their per-user
+    ``omnigent.pinned.<user>`` label, not a shared key (see ``pinned_label_key``).
+    Key-presence based (the value is the epoch-ms pin time). Another user's pin
+    on the same session does not match; clearing the label drops it."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    pinned = conversation_store.create_conversation(title="pinned")
+    other = conversation_store.create_conversation(title="other")
+    also_pinned_by_bob = conversation_store.create_conversation(title="bob's pin")
+    # Alice pins one; Bob pins a different one — each under their own key.
+    conversation_store.set_labels(pinned.id, {pinned_label_key("alice"): "1721760000000"})
+    conversation_store.set_labels(
+        also_pinned_by_bob.id, {pinned_label_key("bob"): "1721760000000"}
+    )
+
+    alice_page = conversation_store.list_conversations(pinned=True, pinned_owner="alice")
+    alice_ids = {c.id for c in alice_page.data}
+    assert alice_ids == {pinned.id}
+    # Bob's pin and the never-pinned row must not surface for Alice.
+    assert also_pinned_by_bob.id not in alice_ids
+    assert other.id not in alice_ids
+
+    # Unpin (Alice's key deleted) removes it from her pinned filter.
+    conversation_store.delete_label(pinned.id, pinned_label_key("alice"))
+    assert conversation_store.list_conversations(pinned=True, pinned_owner="alice").data == []
+
+
+def test_pinned_label_key_fits_column_for_long_user_ids() -> None:
+    """The per-user pin key must never overflow the ``String(128)`` label-key
+    column. Short ids stay verbatim (DB-readable); an over-long id (e.g. a long
+    SSO subject) falls back to a fixed-width hash suffix, deterministic in the
+    id so writes and the pinned filter still agree."""
+    from omnigent.stores.conversation_store import PINNED_LABEL_KEY, pinned_label_key
+
+    # A normal email is used verbatim.
+    assert pinned_label_key("alice@example.com") == f"{PINNED_LABEL_KEY}.alice@example.com"
+
+    # A 200-char id can't fit raw; the key must still be ≤ 128 and deterministic.
+    long_id = "u" * 200
+    key = pinned_label_key(long_id)
+    assert len(key) <= 128
+    assert key == pinned_label_key(long_id)  # deterministic
+    # Distinct long ids don't collide.
+    assert pinned_label_key("u" * 200) != pinned_label_key("v" * 200)
 
 
 def test_list_projects_owned_by_excludes_shared_only_projects(

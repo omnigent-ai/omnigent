@@ -72,6 +72,7 @@ from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
     from omnigent.update_check import _InstalledWheelInfo
 
 
@@ -1135,17 +1136,16 @@ def _apply_bind_auth_defaults(host: str) -> None:
         os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
     # Non-loopback + no explicit auth → accounts (login) mode.
-    _raw_auth_enabled = os.environ.get("OMNIGENT_AUTH_ENABLED", "").strip()
-    _auth_enabled_explicit = bool(
-        _raw_auth_enabled or os.environ.get("OMNIGENT_ACCOUNTS_ENABLED", "").strip()
-    )
+    _auth_enabled_explicit = bool(os.environ.get("OMNIGENT_AUTH_ENABLED", "").strip())
     if not _is_loopback_bind and not _auth_provider_explicit and not _auth_enabled_explicit:
         os.environ.setdefault("OMNIGENT_AUTH_ENABLED", "1")
         click.echo(
             f"  ⚠ Binding to non-local interface {host}: enabling accounts "
             "(login) mode to prevent unauthorized access.\n"
             "    Open the server URL in a browser to create the first admin "
-            "account.",
+            "account.\n"
+            "    Set OMNIGENT_AUTH_ENABLED=0 first to override and stay in "
+            "single-user mode.",
             err=True,
         )
 
@@ -3409,20 +3409,19 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the routing client when the feature is enabled via
-    # OMNIGENT_SMART_ROUTING=1. Two mutually-exclusive providers, chosen
-    # by ``routing.provider``:
-    #   - ``external``: call an external ``routes:select`` service.
-    #   - ``llm`` (default): the built-in judge using the ``llm:`` block.
-    # Hidden by default — managed deployments override
+    # Build the routing client from configuration alone — no opt-in env needed.
+    # Two mutually-exclusive providers, chosen by ``routing.provider``:
+    #   - ``external``: call an external ``routes:select`` service (built when a
+    #     ``routing:`` block declares ``provider: external``).
+    #   - ``llm`` (default): the built-in judge using the ``llm:`` block (built
+    #     whenever a server ``llm:`` block is configured).
+    # Stays None when neither is configured. Managed deployments override
     # RuntimeCaps.routing_client with their own implementation.
-    routing_client = None
-    if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
-        routing_cfg = cfg.get("routing")
-        if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
-            routing_client = _build_external_routing_client(routing_cfg)
-        else:
-            routing_client = _build_local_llm_routing_client(server_llm)
+    routing_cfg = cfg.get("routing")
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+        routing_client = _build_external_routing_client(routing_cfg)
+    else:
+        routing_client = _build_local_llm_routing_client(server_llm)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
@@ -3560,14 +3559,16 @@ def server(
     # Warn loudly when the SPA bundle is absent: the server still boots
     # but serves an API-only JSON landing at "/", so the operator hits
     # http://host:port expecting the web UI and gets JSON with no clue
-    # why. The bundle is npm-build output (not tracked in git); a dev
-    # checkout that never ran `npm run build` has an empty static dir.
+    # why. The bundle is Vite build output (not tracked in git); a dev
+    # checkout that never ran `pnpm --filter web run build` has an empty
+    # static dir.
     from omnigent.server.app import _WEB_UI_DIST
 
     if not (_WEB_UI_DIST / "index.html").is_file():
         click.echo(
             "  ⚠ web UI not built — serving API only. "
-            "Run `cd web && npm install && npm run build`, "
+            "Run `pnpm install --frozen-lockfile --filter web && "
+            "pnpm --filter web run build`, "
             "then restart (or install a release wheel/image).",
             err=True,
         )
@@ -5468,6 +5469,9 @@ _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
     f"Harness to use: {_HARNESS_CHOICES_HELP}. Without AGENT, launches that harness directly."
 )
+_FROM_OPENCLAW_HELP = (
+    "Launch one agent from the OpenClaw/acpx registry without saving it to Omnigent config."
+)
 _MODEL_HELP = "Model to use for the agent."
 _PROMPT_HELP = "Send this as the first message when the REPL starts."
 _SYSTEM_PROMPT_HELP = "Instructions to use for the agent."
@@ -5545,11 +5549,34 @@ def _default_harness_prompt(harness: str) -> str:
     return _DEFAULT_HARNESS_PROMPTS.get(harness, _DEFAULT_HARNESS_PROMPT)
 
 
+def _resolve_openclaw_run_agent(identifier: str) -> AcpAgentEntry:
+    """Resolve one OpenClaw/acpx agent for an ephemeral ``run`` launch."""
+    from omnigent.onboarding.openclaw_config import (
+        discover_openclaw_agents,
+        openclaw_agents_to_acp_entries,
+        resolve_openclaw_acp_agent,
+    )
+
+    discovery = discover_openclaw_agents()
+    entry = resolve_openclaw_acp_agent(identifier, discovery=discovery)
+    if entry is not None:
+        return entry
+
+    available = openclaw_agents_to_acp_entries(discovery.agents)
+    hint = ", ".join(f"{entry.name} ({entry.slug})" for entry in available)
+    detail = f" Available agents: {hint}." if hint else " No agents were discovered."
+    if discovery.errors:
+        paths = ", ".join(str(error.path) for error in discovery.errors)
+        detail += f" Unreadable config: {paths}."
+    raise click.ClickException(f"OpenClaw/acpx agent {identifier!r} was not found.{detail}")
+
+
 def _materialize_harness_launcher_file(
     *,
     harness: str,
     model: str | None,
     system_prompt: str | None,
+    acp_agent: AcpAgentEntry | None = None,
 ) -> Path:
     """
     Create a temporary standalone Omnigent YAML for no-AGENT ``run``.
@@ -5569,6 +5596,8 @@ def _materialize_harness_launcher_file(
     :param model: Optional model value to bake into ``executor``.
     :param system_prompt: Optional instructions text to use as the
         YAML's top-level ``prompt``.
+    :param acp_agent: Optional one-shot ACP agent embedded in the temporary
+        spec instead of resolved from global config.
     :returns: Path to the generated ``*.yaml`` file.
     :raises click.ClickException: If *harness* is unsupported.
     """
@@ -5591,9 +5620,16 @@ def _materialize_harness_launcher_file(
     tmpdir = Path(tempfile.mkdtemp(prefix="omnigent-harness-launcher-"))
     yaml_path = tmpdir / f"{effective_harness.replace(':', '-')}.yaml"
 
-    executor: dict[str, str] = {"harness": effective_harness}
+    executor: dict[str, object] = {"harness": effective_harness}
     if model is not None:
         executor["model"] = model
+    if acp_agent is not None:
+        if canonical != "acp":
+            raise click.ClickException("An ephemeral ACP agent requires the acp harness.")
+        executor["acp_agent"] = {
+            "name": acp_agent.name,
+            "command": acp_agent.command,
+        }
 
     raw = {
         "name": display_name,
@@ -5730,64 +5766,64 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
     "claude": _NativeTerminalDispatchSpec(
         module="omnigent.claude_native",
         function="run_claude_native",
-        args_param="claude_args",
+        args_param="extra_args",
     ),
     "codex": _NativeTerminalDispatchSpec(
         module="omnigent.codex_native",
         function="run_codex_native",
-        args_param="codex_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "pi": _NativeTerminalDispatchSpec(
         module="omnigent.pi_native",
         function="run_pi_native",
-        args_param="pi_args",
+        args_param="extra_args",
     ),
     "opencode": _NativeTerminalDispatchSpec(
         module="omnigent.opencode_native",
         function="run_opencode_native",
-        args_param="opencode_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "cursor": _NativeTerminalDispatchSpec(
         module="omnigent.cursor_native",
         function="run_cursor_native",
-        args_param="cursor_args",
+        args_param="extra_args",
     ),
     "kimi": _NativeTerminalDispatchSpec(
         module="omnigent.kimi_native",
         function="run_kimi_native",
-        args_param="kimi_args",
+        args_param="extra_args",
     ),
     "kiro": _NativeTerminalDispatchSpec(
         module="omnigent.kiro_native",
         function="run_kiro_native",
-        args_param="kiro_args",
+        args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
     ),
     "goose": _NativeTerminalDispatchSpec(
         module="omnigent.goose_native",
         function="run_goose_native",
-        args_param="goose_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
         module="omnigent.antigravity_native",
         function="run_antigravity_native",
-        args_param="antigravity_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "qwen": _NativeTerminalDispatchSpec(
         module="omnigent.qwen_native",
         function="run_qwen_native",
-        args_param="qwen_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "hermes": _NativeTerminalDispatchSpec(
         module="omnigent.hermes_native",
         function="run_hermes_native",
-        args_param="hermes_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
 }
@@ -5962,6 +5998,7 @@ def _dispatch_run(
     auto_open_conversation: bool = False,
     server_from_cli: bool = False,
     model_from_cli: bool = False,
+    acp_agent: AcpAgentEntry | None = None,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -6006,6 +6043,8 @@ def _dispatch_run(
         mode from a configured default server.
     :param model_from_cli: ``True`` when ``--model`` was explicitly provided
         on the command line rather than loaded from config.
+    :param acp_agent: Optional one-shot ACP agent carried in the generated
+        temporary spec instead of loaded from global config.
     """
     if target is not None and _is_server_url(target):
         raise click.ClickException(
@@ -6123,6 +6162,7 @@ def _dispatch_run(
                 harness=harness,
                 model=model,
                 system_prompt=system_prompt,
+                acp_agent=acp_agent,
             )
         )
         harness = None
@@ -6390,6 +6430,13 @@ def attach(
     help="Client-side tool set name (e.g. 'coding') for shell access.",
 )
 @click.option("--harness", default=None, help=_RUN_HARNESS_HELP)
+@click.option(
+    "--from-openclaw",
+    "from_openclaw",
+    default=None,
+    metavar="AGENT",
+    help=_FROM_OPENCLAW_HELP,
+)
 @click.option("--model", default=None, help=_MODEL_HELP)
 @click.option("-p", "--prompt", default=None, help=_PROMPT_HELP)
 @click.option("--system-prompt", "system_prompt", default=None, help=_SYSTEM_PROMPT_HELP)
@@ -6444,6 +6491,7 @@ def run(
     target: str | None,
     tools: str | None,
     harness: str | None,
+    from_openclaw: str | None,
     model: str | None,
     prompt: str | None,
     system_prompt: str | None,
@@ -6472,6 +6520,7 @@ def run(
     Examples:
       omnigent run --harness claude-sdk
       omnigent run --harness codex -p "review the last commit"
+      omnigent run --from-openclaw "Gemini CLI" -p "review the last commit"
       omnigent run examples/hello_world.yaml
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
       omnigent run --server http://localhost:6767
@@ -6486,12 +6535,24 @@ def run(
     model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
     harness_from_cli = harness_source is not None and harness_source.name == "COMMANDLINE"
+    acp_agent: AcpAgentEntry | None = None
+    if from_openclaw is not None:
+        if target is not None:
+            raise click.ClickException("--from-openclaw cannot be combined with an AGENT path.")
+        if harness_from_cli:
+            raise click.ClickException("--from-openclaw cannot be combined with --harness.")
+        acp_agent = _resolve_openclaw_run_agent(from_openclaw)
+        harness = f"acp:{acp_agent.slug}"
     direct_server_cli = (
-        target is None and server_from_cli and server is not None and not harness_from_cli
+        target is None
+        and server_from_cli
+        and server is not None
+        and not harness_from_cli
+        and acp_agent is None
     )
 
     _global_cfg = _load_effective_config()
-    if target is None and not direct_server_cli:
+    if target is None and not direct_server_cli and acp_agent is None:
         # Harness-aware default-agent resolution (this branch) under main's
         # direct-`--server` guard: skip the configured default_agent when the
         # invocation is a bare `--server` (no AGENT, no --harness), else pick
@@ -6558,6 +6619,7 @@ def run(
         auto_open_conversation=auto_open_conversation,
         server_from_cli=server_from_cli,
         model_from_cli=model_from_cli,
+        acp_agent=acp_agent,
     )
 
 

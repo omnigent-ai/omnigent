@@ -30,6 +30,7 @@ from omnigent.spec.types import RetryPolicy
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
+from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -109,7 +110,7 @@ _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
-_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
+_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
@@ -117,6 +118,13 @@ _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
 # shared ``~/.codex/config.toml``. This keeps model selection and cost-policy
 # enforcement isolated between concurrent sessions.
 _CODEX_HOME_COPY_FILES = ("config.toml",)
+# Directories symlinked (not copied) from the real CODEX_HOME into the
+# per-session temp home. ``plugins/cache`` is codex's content-addressed
+# (versioned) plugin store — read-only reference data that codex would
+# otherwise re-materialize tens of MB into every private home. Sharing the
+# one real cache dedupes it across sessions; codex's own writes land in the
+# shared cache exactly as they would without the private home.
+_CODEX_HOME_SYMLINK_DIRS = (Path("plugins") / "cache",)
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 
 # Environment variables explicitly excluded from the codex subprocess even
@@ -126,7 +134,7 @@ _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
 
-def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
+def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any] | None:
     """Map a ``thread/tokenUsage/updated`` payload's ``last`` breakdown
     onto the wire shape that :class:`TurnComplete` consumes.
 
@@ -137,6 +145,16 @@ def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
     out into ``cache_read_input_tokens`` and keep only the remainder in
     ``input_tokens`` — otherwise cached tokens are billed at the full input
     rate. Mirrors the codex-native forwarder split.
+
+    :param model: The resolved model this turn ran with, e.g.
+        ``"gpt-5.4-mini"`` — the ``run_turn`` argument, which carries the
+        harness/provider's resolved default even when the agent spec pins
+        none. Stamped into the returned usage as ``"model"`` so the
+        server's per-model cost/token attribution (``session_usage.by_model``)
+        can key on it instead of silently falling back to an unresolvable
+        spec model and dropping the turn from the per-model breakdown
+        (mirrors ``claude_sdk_executor``'s ``observed_model`` and every
+        other relay executor, all of which already report ``usage.model``).
     """
     if not isinstance(params, dict):
         return None
@@ -149,13 +167,15 @@ def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
     input_total = int(last.get("inputTokens") or 0)
     # Clamp so a malformed cached > total never makes input_tokens negative.
     cached = min(int(last.get("cachedInputTokens") or 0), input_total)
-    usage = {
+    usage: dict[str, Any] = {
         "input_tokens": input_total - cached,  # non-cached portion
         "output_tokens": int(last.get("outputTokens") or 0),
         "total_tokens": int(last.get("totalTokens") or 0),
     }
     if cached:
         usage["cache_read_input_tokens"] = cached
+    if model:
+        usage["model"] = model
     return usage
 
 
@@ -688,7 +708,12 @@ def _codex_home_config_source_from_env() -> Path:
     )
 
 
-def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
+def _populate_codex_home_config(
+    target_dir: Path,
+    source_dir: Path,
+    *,
+    minimal_config: bool | None = None,
+) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
 
@@ -704,7 +729,12 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
-      enforcement isolated between concurrent sessions.
+      enforcement isolated between concurrent sessions. Hook-trust keys inside
+      the copy are rewritten to reference the private home's paths so Codex
+      recognises previously-trusted hooks without an interactive prompt.
+    - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
+      available at the same path within the private home that the rewritten
+      trust keys reference.
     - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
       are respected.
 
@@ -713,15 +743,18 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     :param source_dir: The primary ``CODEX_HOME`` directory
         (typically ``$CODEX_HOME`` or ``~/.codex``). Missing files are
         skipped.
+    :param minimal_config: Copy only auth and provider-routing config when
+        ``True``. ``None`` preserves the environment-controlled behavior.
     """
     if not source_dir.is_dir():
         return
 
-    minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    if minimal_config is None:
+        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
     symlink_files = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
@@ -742,6 +775,28 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
                 exc,
             )
             shutil.copy2(source_file, link_path)
+
+    if not minimal_config:
+        for reldir in _CODEX_HOME_SYMLINK_DIRS:
+            source_subdir = source_dir / reldir
+            if not source_subdir.is_dir():
+                continue
+            link_path = target_dir / reldir
+            if link_path.exists() or link_path.is_symlink():
+                continue
+            link_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                link_path.symlink_to(source_subdir.resolve())
+            except OSError as exc:
+                # Symlink unsupported (some Windows configs) or a race — skip
+                # the dedupe rather than abort session boot; codex re-populates
+                # its own private cache, costing disk but staying correct.
+                logger.warning(
+                    "could not symlink %r into %s (%s); codex will repopulate it",
+                    str(reldir),
+                    target_dir,
+                    exc,
+                )
 
     for filename in _CODEX_HOME_COPY_FILES:
         source_file = source_dir / filename
@@ -1042,25 +1097,6 @@ def _extract_latest_user_content(
                 return content
             return json.dumps(content)
     return ""
-
-
-def _goal_objective_from_content(content: str | list[dict[str, Any]]) -> str | None:
-    """Return the objective from a standalone ``/goal`` user command."""
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for block in content:
-            if block.get("type") not in {"input_text", "text"}:
-                return None
-            text = block.get("text")
-            if not isinstance(text, str):
-                return None
-            text_parts.append(text)
-        content = "".join(text_parts)
-    command, separator, objective = content.strip().partition(" ")
-    if command != "/goal" or not separator:
-        return None
-    objective = objective.strip()
-    return objective or None
 
 
 def _build_initial_prompt(
@@ -1898,7 +1934,7 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
-                    self._last_turn_usage = _extract_codex_last_turn_usage(params)
+                    self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
                     continue
 
                 if method == "turn/completed":

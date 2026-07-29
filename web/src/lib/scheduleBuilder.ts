@@ -80,6 +80,42 @@ export function buildRRule(model: ScheduleModel): string {
   }
 }
 
+export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
+  const parts = parseRuleParts(rrule);
+  if (parts === null) return null;
+  const freq = parts.get("FREQ");
+  const interval = parts.get("INTERVAL");
+  if (interval !== undefined && interval !== "1") return null;
+
+  const hour = parseNumberPart(parts.get("BYHOUR"), 0, 23);
+  const minute = parseNumberPart(parts.get("BYMINUTE"), 0, 59);
+  if (minute === null) return null;
+
+  if (freq === "HOURLY") {
+    if (hasUnsupportedParts(parts, ["FREQ", "INTERVAL", "BYMINUTE"])) return null;
+    return { ...DEFAULT_SCHEDULE_MODEL, preset: "hourly", minute };
+  }
+
+  if (hour === null) return null;
+
+  if (freq === "DAILY") {
+    if (hasUnsupportedParts(parts, ["FREQ", "INTERVAL", "BYHOUR", "BYMINUTE"])) return null;
+    return { ...DEFAULT_SCHEDULE_MODEL, preset: "daily", hour, minute };
+  }
+
+  if (freq === "WEEKLY") {
+    if (hasUnsupportedParts(parts, ["FREQ", "INTERVAL", "BYDAY", "BYHOUR", "BYMINUTE"])) {
+      return null;
+    }
+    const weekdays = parseWeekdaysPart(parts.get("BYDAY"));
+    if (weekdays === null || weekdays.length === 0) return null;
+    const preset = weekdays.join(",") === "MO,TU,WE,TH,FR" ? "weekdays" : "weekly";
+    return { ...DEFAULT_SCHEDULE_MODEL, preset, hour, minute, weekdays };
+  }
+
+  return null;
+}
+
 function buildCustomRRule(model: ScheduleModel): string {
   const { hour, minute } = model;
   const interval = clampInterval(model.interval);
@@ -107,6 +143,45 @@ function buildCustomRRule(model: ScheduleModel): string {
   }
 }
 
+function parseRuleParts(rrule: string): Map<string, string> | null {
+  const body = rrule.startsWith("RRULE:") ? rrule.slice("RRULE:".length) : rrule;
+  const parts = new Map<string, string>();
+  for (const segment of body.split(";")) {
+    const [rawKey, rawValue] = segment.split("=");
+    if (!rawKey || rawValue == null || rawValue === "") return null;
+    parts.set(rawKey.toUpperCase(), rawValue.toUpperCase());
+  }
+  return parts;
+}
+
+function hasUnsupportedParts(parts: Map<string, string>, supported: string[]): boolean {
+  const supportedSet = new Set(supported);
+  for (const key of parts.keys()) {
+    if (!supportedSet.has(key)) return true;
+  }
+  return false;
+}
+
+function parseNumberPart(value: string | undefined, min: number, max: number): number | null {
+  if (value == null) return null;
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) return null;
+  return parsed;
+}
+
+function parseWeekdaysPart(value: string | undefined): WeekdayCode[] | null {
+  if (value == null) return null;
+  const rawCodes = value.split(",");
+  if (rawCodes.length === 0) return null;
+  const codes: WeekdayCode[] = [];
+  for (const rawCode of rawCodes) {
+    if (!WEEKDAY_CODES.includes(rawCode as WeekdayCode)) return null;
+    codes.push(rawCode as WeekdayCode);
+  }
+  return normalizeWeekdays(codes);
+}
+
 /**
  * Validate the schedule model against the form's constraints. Returns a
  * human-readable error string when invalid (shown inline + gates submit), or
@@ -114,6 +189,16 @@ function buildCustomRRule(model: ScheduleModel): string {
  * schedule fails fast in the form rather than as a 400.
  */
 export function validateSchedule(model: ScheduleModel): string | null {
+  if (!Number.isInteger(model.minute) || model.minute < 0 || model.minute > 59) {
+    return model.preset === "hourly" ? "Enter a valid minute from 0 to 59." : "Enter a valid time.";
+  }
+  if (
+    model.preset !== "hourly" &&
+    (!Number.isInteger(model.hour) || model.hour < 0 || model.hour > 23)
+  ) {
+    return "Enter a valid time.";
+  }
+
   // Multi-selects must have at least one selection.
   if (model.preset === "weekly" && model.weekdays.length === 0) {
     return "Pick at least one day of the week.";
@@ -173,4 +258,33 @@ function clampMonthDay(day: number): number | null {
 function clampMonth(m: number): number {
   if (!Number.isFinite(m)) return 1;
   return Math.min(12, Math.max(1, Math.trunc(m)));
+}
+
+export function parseTimeOfDayInput(input: string): { hour: number; minute: number } | null {
+  const value = input.trim().toUpperCase().replace(/\s+/g, " ");
+  const match = value.match(/^(\d{1,2})(?::(\d{1,2}))?\s*(AM|PM)?$/);
+  if (!match) return null;
+
+  const rawHour = Number(match[1]);
+  const minute = match[2] == null ? 0 : Number(match[2]);
+  const meridiem = match[3];
+  if (!Number.isInteger(rawHour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+    return null;
+  }
+
+  if (meridiem != null) {
+    if (rawHour < 1 || rawHour > 12) return null;
+    const hour = (rawHour % 12) + (meridiem === "PM" ? 12 : 0);
+    return { hour, minute };
+  }
+
+  if (rawHour < 0 || rawHour > 23) return null;
+  return { hour: rawHour, minute };
+}
+
+export function parseMinuteOfHourInput(input: string): number | null {
+  const value = input.trim().replace(/^:/, "");
+  if (!/^\d{1,2}$/.test(value)) return null;
+  const minute = Number(value);
+  return Number.isInteger(minute) && minute >= 0 && minute <= 59 ? minute : null;
 }

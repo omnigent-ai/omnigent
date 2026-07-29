@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import and_, asc, delete, desc, or_, select, tuple_
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
 
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
@@ -475,3 +475,38 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             rows = session.execute(stmt).scalars().all()
             return [_run_to_entity(r) for r in rows]
+
+    def list_latest_run_status_for_tasks(self, scheduled_task_ids: list[str]) -> dict[str, str]:
+        """Return ``{task_id: latest_run_status}`` for the given tasks.
+
+        One windowed query: ``row_number()`` partitioned by ``scheduled_task_id``
+        and ordered ``scheduled_at DESC, id DESC`` (the same order as
+        :meth:`list_runs`) picks each task's single most-recent run, decoded to
+        its status name. Tasks with no runs are absent from the map. Both SQLite
+        (>= 3.25) and PostgreSQL support window functions, matching the
+        conversation store's ``row_number()`` usage.
+        """
+        if not scheduled_task_ids:
+            return {}
+        with self._session() as session:
+            ranked = (
+                select(
+                    SqlScheduledTaskRun.scheduled_task_id.label("task_id"),
+                    SqlScheduledTaskRun.status.label("status"),
+                    func.row_number()
+                    .over(
+                        partition_by=SqlScheduledTaskRun.scheduled_task_id,
+                        order_by=(
+                            desc(SqlScheduledTaskRun.scheduled_at),
+                            desc(SqlScheduledTaskRun.id),
+                        ),
+                    )
+                    .label("row_num"),
+                )
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.scheduled_task_id.in_(scheduled_task_ids))
+                .subquery()
+            )
+            stmt = select(ranked.c.task_id, ranked.c.status).where(ranked.c.row_num == 1)
+            rows = session.execute(stmt).all()
+            return {task_id: decode_scheduled_task_run_status(status) for task_id, status in rows}

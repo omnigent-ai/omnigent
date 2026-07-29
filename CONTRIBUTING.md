@@ -28,7 +28,9 @@ Install local prerequisites first:
 - `bubblewrap` (`bwrap`), **Linux only**, used to OS-sandbox those native
   Claude/Codex/Pi terminals (`apt install bubblewrap` on Debian/Ubuntu). macOS
   uses the built-in `seatbelt` sandbox and needs nothing extra.
-- Node.js 22 LTS or newer with `npm` when working on `web/`.
+- Node.js 22 LTS or newer with `pnpm` (install via `corepack enable` or
+  `npm install -g pnpm`) when working on `web/`.
+- A Rust toolchain for the recommended `omnidev` local development supervisor.
 
 ```bash
 git clone https://github.com/omnigent-ai/omnigent.git
@@ -51,24 +53,73 @@ uv run pre-commit run --all-files
 When touching `web/`:
 
 ```bash
-cd web && npm install && npm run lint && npm run build
+cd web && pnpm install && pnpm run lint && pnpm run build
 ```
 
 ## Running locally
 
-To try your changes, start a local server, register your machine as a host,
-and run the frontend dev server. Use three separate terminals:
+Start with the smallest relevant automated test described in [Tests](#tests).
+For full-stack manual testing, use `omnidev`.
+
+### Recommended: worktree-safe testing with `omnidev`
+
+`omnidev` runs the current checkout's server, host, and Vite frontend in one
+terminal. Each checkout path, including each worktree, gets isolated state,
+configuration, database, artifacts, logs, and automatically allocated ports,
+so it can run alongside your normal Omnigent installation and other worktrees.
+
+Install the supervisor once from an up-to-date checkout:
+
+```bash
+cargo install --path dev/omnidev --force
+```
+
+Then run it from anywhere inside the branch checkout or worktree you want to
+test. A fresh worktree needs its own Python environment first:
+
+```bash
+cd /path/to/omnigent-worktree
+uv sync --extra all --extra dev
+omnidev
+```
+
+Open the exact `ui` URL displayed in the header; do not assume the Vite port is
+`5173`. Python changes under `omnigent/` reload the server and host, while
+frontend changes use Vite HMR.
+
+Run CLI commands against the development pod through the passthrough so they
+use that checkout and its isolated state instead of a globally installed
+`omnigent`:
+
+```bash
+omnidev omnigent config show
+omnidev omnigent agent list
+```
+
+Keep `omnidev` in the foreground and quit with `q` or `Ctrl-C` so it tears down
+all three processes. An interactive terminal inside an existing Omnigent
+session also works; use `git rev-parse --show-toplevel` to confirm that its
+current checkout is the one you intend to test.
+
+See [`dev/omnidev/README.md`](dev/omnidev/README.md) for log controls,
+clean-state testing, backend-only and LAN modes, and other options.
+
+### Manual three-terminal fallback
+
+Use the manual flow when you need to run or debug each component separately.
+Unlike `omnidev`, it does not isolate state or allocate ports. These commands
+assume the default ports are free:
 
 ```bash
 # Terminal 1: local server on :6767
-omnigent server
+uv run omnigent server
 
 # Terminal 2: register your machine as a host
-omnigent host --server http://localhost:6767
+uv run omnigent host --server http://localhost:6767
 
 # Terminal 3: frontend dev server
 cd web
-npm run dev
+pnpm run dev
 ```
 
 Open the Vite URL from the frontend dev server, usually
@@ -81,7 +132,7 @@ The host URL can also be passed positionally (`omnigent host
 http://localhost:6767`). See the [README](README.md) for more on hosts,
 harnesses, and credentials.
 
-### Backend-only local development validation
+### Disposable backend-only validation
 
 Use this when you want to validate the Python backend and local API server from
 a source checkout without building the web UI, configuring provider
@@ -169,7 +220,7 @@ Two cross-cutting suites sit on top of these:
 Frontend changes follow the same expectation with a different toolchain:
 
 - Add or update a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file
-  next to the component or module you changed — and run it with `npm test`.
+  next to the component or module you changed — and run it with `pnpm test`.
 - A change to **user-facing UI behaviour** also needs a Playwright test under
   `tests/e2e_ui/`. This one is enforced mechanically by the `E2E UI Required`
   check, so a UI PR won't merge without a covering test (or a maintainer
@@ -177,10 +228,27 @@ Frontend changes follow the same expectation with a different toolchain:
 - Styling/formatting-only changes, copy tweaks with no flow change, and
   refactors with no behaviour change are exempt, same as the backend.
 
+## Developer Certificate of Origin
+
+To contribute to this repository, you must sign off your commits to certify
+that you have the right to contribute the code and that it complies with the
+open source license. If you can certify the contents of the [DCO](DCO), add a
+`Signed-off-by` line to each commit message:
+
+```
+Signed-off-by: Joe Smith <joe.smith@email.com>
+```
+
+Please use your real name — pseudonymous/anonymous contributions are not
+accepted. If your `user.name` and `user.email` git configs are set, `git
+commit -s` adds the sign-off automatically. The DCO check on every pull
+request enforces this, so unsigned commits will block merging.
+
 ## Pull requests
 
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
-- Sign off your commits with `git commit -s` (Developer Certificate of Origin).
+- Sign off your commits with `git commit -s` (see
+  [Developer Certificate of Origin](#developer-certificate-of-origin) above).
 - Fill in the PR template. For **UI / frontend changes**, check the
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking

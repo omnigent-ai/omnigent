@@ -178,6 +178,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -2128,6 +2129,82 @@ async def _persist_external_codex_collaboration_mode_change(
         {_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: mode},
     )
     _publish_collaboration_mode(session_id, mode)
+
+
+async def _persist_external_codex_approval_mode_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Merge Codex's terminal-observed permission launch args."""
+    raw_args = body.data.get("terminal_launch_args")
+    if not isinstance(raw_args, list):
+        raise OmnigentError(
+            "external_codex_approval_mode_change requires data.terminal_launch_args list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        permission_args = _validate_terminal_launch_args(raw_args)
+        terminal_launch_args = _validate_terminal_launch_args(
+            _merge_codex_permission_launch_args(conv.terminal_launch_args, permission_args or [])
+        )
+    except ValueError as exc:
+        raise OmnigentError(
+            f"invalid terminal_launch_args: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    if conv.terminal_launch_args == terminal_launch_args:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        terminal_launch_args=terminal_launch_args,
+    )
+
+
+def _merge_codex_permission_launch_args(
+    existing_args: Sequence[str] | None,
+    permission_args: Sequence[str],
+) -> list[str]:
+    """Replace Codex permission arguments while preserving other launch args."""
+    config_keys = {
+        "approval_policy",
+        "approvals_reviewer",
+        "default_permissions",
+        "sandbox_mode",
+    }
+    value_options = {"--ask-for-approval", "-a", "--sandbox", "-s"}
+    merged: list[str] = []
+    args = list(existing_args or ())
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            index += 1
+            continue
+        if arg in value_options:
+            index += 2
+            continue
+        if arg.startswith(("--ask-for-approval=", "-a=", "--sandbox=", "-s=")):
+            index += 1
+            continue
+        if arg in {"--config", "-c"} and index + 1 < len(args):
+            key = args[index + 1].partition("=")[0].strip()
+            if key in config_keys:
+                index += 2
+                continue
+            merged.extend(args[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith(("--config=", "-c=")):
+            key = arg.split("=", 1)[1].partition("=")[0].strip()
+            if key in config_keys:
+                index += 1
+                continue
+        merged.append(arg)
+        index += 1
+    return [*merged, *permission_args]
 
 
 def _handle_external_session_todos(
@@ -4310,7 +4387,14 @@ async def _proxy_get_session_resources_to_runner(
         ) from exc
 
 
-async def _reset_runner_resources_after_switch(session_id: str) -> None:
+async def _reset_runner_resources_after_switch(*args: Any, **kwargs: Any) -> None:
+    """Call-time proxy so a facade patch of this symbol is honored here."""
+    from omnigent.server.routes import sessions as _facade
+
+    return await _facade._reset_runner_resources_after_switch(*args, **kwargs)
+
+
+async def _reset_runner_resources_after_switch_impl(session_id: str) -> None:
     """Best-effort reset of the session's runner-side state after a switch.
 
     Run as a fire-and-forget background task by the switch-agent route. Calls
@@ -6018,12 +6102,19 @@ def _agent_provider_family(agent: Agent) -> str | None:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:  # noqa: BLE001 — unloadable bundle → unknown family
+    except Exception:  # noqa: BLE001
         return None
     return provider_family_for_harness(spec.executor.harness_kind)
 
 
-def _same_provider_family(a: Agent, b: Agent) -> bool:
+def _same_provider_family(*args: Any, **kwargs: Any) -> bool:
+    """Call-time proxy so a facade patch of this symbol is honored here."""
+    from omnigent.server.routes import sessions as _facade
+
+    return _facade._same_provider_family(*args, **kwargs)
+
+
+def _same_provider_family_impl(a: Agent, b: Agent) -> bool:
     """Return whether two agents share a (known) provider family.
 
     ``False`` when either family is undeterminable, so a fork that can't
@@ -6039,7 +6130,14 @@ def _same_provider_family(a: Agent, b: Agent) -> bool:
     return family_a is not None and family_a == _agent_provider_family(b)
 
 
-def _agent_is_native(agent: Agent) -> bool:
+def _agent_is_native(*args: Any, **kwargs: Any) -> bool:
+    """Call-time proxy so a facade patch of this symbol is honored here."""
+    from omnigent.server.routes import sessions as _facade
+
+    return _facade._agent_is_native(*args, **kwargs)
+
+
+def _agent_is_native_impl(agent: Agent) -> bool:
     """Return whether an agent runs a native CLI harness.
 
     Loads the agent's spec to read its ``harness_kind``. Native targets run
@@ -6060,12 +6158,19 @@ def _agent_is_native(agent: Agent) -> bool:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-native
+    except Exception:  # noqa: BLE001
         return False
     return is_native_harness(spec.executor.harness_kind)
 
 
-def _agent_carries_native_fork_history(agent: Agent) -> bool:
+def _agent_carries_native_fork_history(*args: Any, **kwargs: Any) -> bool:
+    """Call-time proxy so a facade patch of this symbol is honored here."""
+    from omnigent.server.routes import sessions as _facade
+
+    return _facade._agent_carries_native_fork_history(*args, **kwargs)
+
+
+def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
     """Return whether *agent*'s native harness rebuilds a fork's transcript.
 
     claude-native / codex-native / pi-native each record a resumable native
@@ -6089,7 +6194,7 @@ def _agent_carries_native_fork_history(agent: Agent) -> bool:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-carrying
+    except Exception:  # noqa: BLE001
         return False
     return canonicalize_harness(spec.executor.harness_kind) in _FORK_HISTORY_NATIVE_HARNESSES
 
@@ -6115,7 +6220,7 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:  # noqa: BLE001 — unloadable bundle → treat as non-carrying
+    except Exception:  # noqa: BLE001
         return False
     return canonicalize_harness(spec.executor.harness_kind) in _CURSOR_FORK_HISTORY_HARNESSES
 
@@ -6133,12 +6238,19 @@ def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:  # noqa: BLE001 — unloadable bundle → non-native presentation
+    except Exception:  # noqa: BLE001
         return None
     return native_coding_agent_for_harness(spec.executor.harness_kind)
 
 
-def _presentation_labels_for_agent(agent: Agent) -> dict[str, str]:
+def _presentation_labels_for_agent(*args: Any, **kwargs: Any) -> dict[str, str]:
+    """Call-time proxy so a facade patch of this symbol is honored here."""
+    from omnigent.server.routes import sessions as _facade
+
+    return _facade._presentation_labels_for_agent(*args, **kwargs)
+
+
+def _presentation_labels_for_agent_impl(agent: Agent) -> dict[str, str]:
     """Return the Web UI presentation labels for an agent's harness.
 
     A native-CLI agent runs **terminal-first** (the inline terminal is the
@@ -6385,9 +6497,18 @@ def _build_evaluation_context(
         text = data.get("text") or data.get("content") or str(data)
     else:
         text = str(data)
+    text_str = text if isinstance(text, str) else json.dumps(text)
+    # REQUEST content is the structured dict ({"user_content", "attachments"}) so
+    # every request reaches policies in one shape, whatever the entry point. This
+    # native/terminal path carries no uploads, so ``attachments`` is always empty;
+    # the web input gate (_evaluate_input_policy) is what populates it. RESPONSE
+    # stays a plain string — attachments are an input-only concern.
+    request_or_response_content: Any = (
+        {"user_content": text_str, "attachments": []} if phase == Phase.REQUEST else text_str
+    )
     return EvaluationContext(
         phase=phase,
-        content=text if isinstance(text, str) else json.dumps(text),
+        content=request_or_response_content,
         actor=actor,
         model=hook_model,
         harness=hook_harness,
@@ -7110,7 +7231,7 @@ def _resolve_subagent_spec(
         parent_spec = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         ).spec
-    except Exception:  # noqa: BLE001 -- create-time resolution is best-effort; never block create.
+    except Exception:  # noqa: BLE001
         # A bundle that fails to load here must not break session
         # creation; the session still works, just without the
         # derived labels / launch args.
@@ -7307,12 +7428,29 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     :param labels: The client-supplied label mapping, or ``None``.
     :raises OmnigentError: 400 when any reserved key is present.
     """
-    if not labels or _TURN_ACTOR_LABEL not in labels:
+    if not labels:
         return
-    raise OmnigentError(
-        f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
-        code=ErrorCode.INVALID_INPUT,
+    if _TURN_ACTOR_LABEL in labels:
+        raise OmnigentError(
+            f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Pins are per-user: the client may only write the bare canonical
+    # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
+    # key). A suffixed ``omnigent.pinned.<user>`` is server-derived — accepting
+    # one from a client would let a caller pin/unpin a shared session for
+    # another user, or forge arbitrary per-user pin rows, defeating the per-user
+    # isolation. Reject any suffixed form; only the bare key is client-writable.
+    suffixed_pin = next(
+        (k for k in labels if k.startswith(f"{PINNED_LABEL_KEY}.")),
+        None,
     )
+    if suffixed_pin is not None:
+        raise OmnigentError(
+            f"label {suffixed_pin!r} is server-derived; set the bare "
+            f"{PINNED_LABEL_KEY!r} key to pin for yourself",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _require_cost_control_label_authority(
@@ -7469,7 +7607,7 @@ def _delete_stored_session_bundle_after_failure(
     """
     try:
         artifact_store.delete(agent_bundle_location)
-    except Exception:  # noqa: BLE001 - cleanup must not mask the original failure.
+    except Exception:  # noqa: BLE001
         _logger.warning(
             "Failed to delete uploaded session bundle %s after rollback",
             agent_bundle_location,
@@ -7716,7 +7854,12 @@ def _child_session_summary_from_conversation(
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
-    labels = labels_with_closed_status(conv.labels, conv.title)
+    # Child sessions aren't pinnable (the pin affordance lives on top-level
+    # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
+    # defensively so a shared child's summary can never expose another viewer's
+    # pin key. No collapse-to-canonical here: there's no pin to surface.
+    raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
+    labels = labels_with_closed_status(raw_labels, conv.title)
     tool: str | None
     session_name: str | None
     if _is_codex_native_subagent(conv):
@@ -8312,7 +8455,9 @@ __all__ = [
     "_add_model_usage_delta",
     "_agent_carries_cursor_fork_history",
     "_agent_carries_native_fork_history",
+    "_agent_carries_native_fork_history_impl",
     "_agent_is_native",
+    "_agent_is_native_impl",
     "_agent_provider_family",
     "_allow_all_edits_eligible",
     "_allow_remember_eligible",
@@ -8402,6 +8547,7 @@ __all__ = [
     "_pending_elicitation_snapshot_for_session",
     "_permission_level_from_grants",
     "_persist_external_assistant_message",
+    "_persist_external_codex_approval_mode_change",
     "_persist_external_codex_collaboration_mode_change",
     "_persist_external_model_change",
     "_persist_external_model_options",
@@ -8414,6 +8560,7 @@ __all__ = [
     "_policy_notice_from_ensure_response",
     "_poll_request_disconnect",
     "_presentation_labels_for_agent",
+    "_presentation_labels_for_agent_impl",
     "_priced_cost_for_display",
     "_provision_managed_sandbox",
     "_proxy_get_session_resources_to_runner",
@@ -8463,6 +8610,7 @@ __all__ = [
     "_require_external_status_forward",
     "_require_host_conn_for_worktree",
     "_reset_runner_resources_after_switch",
+    "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",
     "_resolve_llm_model",
     "_resolve_skill_meta_text_via_runner",
@@ -8471,6 +8619,7 @@ __all__ = [
     "_routing_decision_item_from_sse",
     "_run_compact_locked",
     "_same_provider_family",
+    "_same_provider_family_impl",
     "_seed_missing_title",
     "_seed_missing_title_from_user_message",
     "_session_status_from_cache",

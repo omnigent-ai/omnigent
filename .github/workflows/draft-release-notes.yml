@@ -89,14 +89,14 @@ jobs:
           base="${INPUT_BASE:-}"
           proceed=false; dry_run=false
 
-          # Does the tag look like a final release (vX.Y.Z, not rc/dev/alpha/beta)?
+          # Does the tag look like a final release (vX.Y.Z, not a pre-release)?
           is_version=true
           case "$tag" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) is_version=false ;;
           esac
           case "$tag" in
-            *rc*|*dev*|*a[0-9]*|*b[0-9]*) is_version=false ;;
+            *rc[0-9]*|*dev[0-9]*|*pre[0-9]*) is_version=false ;;
           esac
 
           if [ "$EVENT_NAME" = "workflow_run" ]; then

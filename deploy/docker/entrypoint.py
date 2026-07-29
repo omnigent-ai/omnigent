@@ -254,6 +254,25 @@ def _select_artifact_store(resolved_config: _ResolvedConfig) -> ArtifactStore:
     return LocalArtifactStore(str(resolved_config.artifact_dir))
 
 
+def _build_local_llm_routing_client(
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> Any | None:  # type: ignore[explicit-any]  # LLMRoutingClient | None
+    if server_llm is None:
+        return None
+    from omnigent.runtime.policies.builder import (
+        _build_policy_llm_client,
+        _resolve_server_llm_connection,
+    )
+
+    conn = _resolve_server_llm_connection(server_llm)
+    policy_client = _build_policy_llm_client(server_llm, conn)
+    if policy_client is None:
+        return None
+    from omnigent.server.smart_routing import LLMRoutingClient
+
+    return LLMRoutingClient(policy_client)
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -315,9 +334,56 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         cache_dir=artifact_dir / ".cache",
     )
 
+    from omnigent.spec import parse_default_policies, parse_server_llm
+
+    server_llm = parse_server_llm(cfg.get("llm"))
+
+    routing_cfg = cfg.get("routing")
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+        from omnigent.server.smart_routing import ExternalRoutingClient, _bearer_auth
+
+        base_url = (routing_cfg.get("base_url") or "").strip()
+        router_name = (routing_cfg.get("router_name") or "").strip()
+        api_key_raw = (routing_cfg.get("api_key") or "").strip()
+        profile = (routing_cfg.get("profile") or "").strip()
+        raw_prefixes = routing_cfg.get("model_prefix")
+        if isinstance(raw_prefixes, str):
+            raw_prefixes = [raw_prefixes]
+        model_prefixes = (
+            [p.strip() for p in raw_prefixes if isinstance(p, str) and p.strip()]
+            if isinstance(raw_prefixes, list)
+            else []
+        )
+        if base_url and router_name:
+            auth = None
+            databricks_profile: str | None = None
+            if api_key_raw:
+                from omnigent.spec import expand_env_vars
+
+                auth = _bearer_auth(expand_env_vars({"api_key": api_key_raw})["api_key"])
+            elif profile:
+                databricks_profile = profile
+            routing_client = ExternalRoutingClient(
+                base_url=base_url,
+                router_name=router_name,
+                auth=auth,
+                databricks_profile=databricks_profile,
+                model_prefixes=model_prefixes,
+            )
+        else:
+            routing_client = None
+    else:
+        routing_client = _build_local_llm_routing_client(server_llm)
+
+    caps = RuntimeCaps(
+        default_policies=parse_default_policies(cfg.get("policies")),
+        llm=server_llm,
+        routing_client=routing_client,
+    )
+
     init_runtime(
         agent_cache=agent_cache,
-        caps=RuntimeCaps(),
+        caps=caps,
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,

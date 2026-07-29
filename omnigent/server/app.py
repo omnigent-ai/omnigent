@@ -1453,23 +1453,27 @@ def create_app(
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 
-            on_fire = build_on_fire(
-                FireDeps(
-                    scheduled_task_store=scheduled_task_store,
-                    agent_store=agent_store,
-                    conversation_store=conversation_store,
-                    permission_store=permission_store,
-                    host_store=host_store,
-                    host_registry=host_registry,
-                    agent_cache=agent_cache,
-                    runner_router=runner_router,
-                    tunnel_registry=tunnel_registry,
-                    file_store=file_store,
-                    artifact_store=artifact_store,
-                )
+            fire_deps = FireDeps(
+                scheduled_task_store=scheduled_task_store,
+                agent_store=agent_store,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                agent_cache=agent_cache,
+                runner_router=runner_router,
+                tunnel_registry=tunnel_registry,
+                file_store=file_store,
+                artifact_store=artifact_store,
             )
+            on_fire = build_on_fire(fire_deps)
+            # The manual "run now" trigger reuses the same fire path (dispatch /
+            # preflight / in-flight guard) as the scheduler; it only differs in
+            # allowing a paused task to fire. Exposed on app.state for the
+            # POST /v1/scheduled-tasks/{id}/run route.
+            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
                 on_fire=on_fire,
@@ -2149,9 +2153,9 @@ def create_app(
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
         # smart_routing_enabled: true when the server can route — either
-        # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
-        # + llm: config) or the managed deployment registered a
-        # policy_llm_connection_factory (which means it has LLM capability
+        # a RoutingClient is configured (a server llm: block, or a
+        # routing.provider=external block) or the managed deployment registered
+        # a policy_llm_connection_factory (which means it has LLM capability
         # and will supply its own RoutingClient).
         try:
             from omnigent.runtime._globals import _caps

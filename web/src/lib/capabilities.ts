@@ -99,8 +99,8 @@ export interface ServerInfo {
    */
   server_version: string | null;
   /**
-   * True when the server has a routing client configured
-   * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
+   * True when the server has a routing client configured — a server ``llm:``
+   * block, or a ``routing.provider=external`` block.
    */
   smart_routing_enabled: boolean;
   /**

@@ -55,48 +55,27 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Set up Node
-        uses: ./.github/actions/setup-node
-        with:
-          # Node 22.x per web/electron/README.md ("Prerequisites").
-          node-version: "22"
-          cache-dependency-path: web/electron/package-lock.json
-
-      - name: Verify lockfile uses public registry
-        # Fail fast (in seconds, not minutes) if any package-lock.json
-        # resolved URL points at an internal proxy that public CI runners
-        # can't reach — e.g. npm-proxy.cloud.databricks.com. Without this
-        # guard, npm ci silently times out mid-install on Windows/Linux.
-        # Uses the shared normalize_package_lock_registry.py script (same
-        # one wired into pre-commit) so CI and local checks stay in sync.
-        working-directory: web/electron
-        shell: bash
-        run: |
-          python3 ../../scripts/normalize_package_lock_registry.py --check package-lock.json
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
 
       - name: Install dependencies
-        working-directory: web/electron
-        run: npm ci --no-audit --no-fund
-
-      # The shell-owned update overlay reuses the web UpdateBanner component; it
-      # is built from the web app into electron/overlay/ (gitignored) and shipped
-      # by electron-builder (build.files). The build:<platform> scripts run it
-      # automatically via their `prebuild:*` hook (see web/electron/package.json)
-      # — this step only needs to install the web app's deps so that hook works.
-      - name: Install web deps (for the update overlay build)
-        working-directory: web
-        run: npm ci --legacy-peer-deps --no-audit --no-fund
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |-
+          pnpm install --frozen-lockfile --filter @omnigent/electron
+          pnpm install --frozen-lockfile --filter web
 
       - name: Build ${{ matrix.platform }} app
         working-directory: web/electron
         env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
           # No signing credentials in CI: force an unsigned build instead of
           # letting electron-builder fail hunting for a certificate.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           # electron-builder downloads Electron/tooling from GitHub; the token
           # lifts the anonymous rate limit that otherwise flakes downloads.
           GH_TOKEN: ${{ github.token }}
-        run: npm run ${{ matrix.build-script }} -- --publish never
+        run: pnpm run ${{ matrix.build-script }} -- --publish never
 
       # One artifact per platform bundling the COMPLETE electron-updater feed —
       # the installer(s), the .blockmap electron-updater needs for differential

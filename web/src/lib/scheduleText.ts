@@ -27,6 +27,12 @@ import { RRule, rrulestr } from "rrule";
 // date makes BY* rules fully determine the schedule. Matches the server's
 // fixed-deterministic-anchor approach.
 const OCCURRENCE_ANCHOR = new Date(Date.UTC(2000, 0, 1, 0, 0, 0));
+const FIXED_PERIOD_SAFETY_MARGIN = 2;
+
+// Millisecond units for the compact relative next-run delta (formatNextRunAt).
+const MIN_MS = 60_000;
+const HOUR_MS = 60 * MIN_MS;
+const DAY_MS = 24 * HOUR_MS;
 
 /** Days-of-week bit set helpers. RRule weekday order is MO..SU (0..6). */
 const WEEKDAYS = [RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR].map((d) => d.weekday);
@@ -54,6 +60,60 @@ export function formatClockTime(hour: number, minute: number): string {
   const h12 = hour % 12 === 0 ? 12 : hour % 12;
   const mm = minute.toString().padStart(2, "0");
   return `${h12}:${mm} ${period}`;
+}
+
+/**
+ * Format the time until the SERVER's authoritative next-run instant as a
+ * relative delta in full words, e.g. `in 8 mins`, `in 3 hours`, `in 2 days`,
+ * or `soon`. This is the user-facing next-run label in the Tasks list.
+ *
+ * `iso` is the server's `next_run_at` (the live scheduler's authoritative next
+ * fire). We compute ONLY the delta (`nextRunAt − now`) and format how far away
+ * it is — the instant itself stays server-authoritative. This is NOT the old
+ * client-recomputed countdown that was removed: that one recomputed WHICH
+ * instant is next on the client (and couldn't match the server anchor for
+ * INTERVAL>1 rules); here the instant comes from the server and only the
+ * "how far away" is derived, so the removal rule is not violated.
+ *
+ * Buckets (rounded to the nearest of the chosen unit — the closest "about how
+ * long" reading), with a singular noun when the value is exactly 1:
+ *   < 60 min → `in N min(s)` (minimum `in 1 min`), < 24 h → `in N hour(s)`,
+ *   else `in N day(s)`. Each threshold uses the already-rounded value so a delta
+ *   that rounds up to a full unit promotes to the next unit (never `in 60 mins`
+ *   or `in 24 hours`).
+ * A delta at or below ~0 (imminent / just passed due to clock skew) → `soon`.
+ * Returns `null` for a null / unparseable `iso` so the caller renders nothing.
+ *
+ * @param iso The server's `next_run_at` ISO string, or `null`.
+ * @param now Injectable clock for deterministic tests; defaults to `new Date()`.
+ */
+export function formatNextRunAt(
+  iso: string | null | undefined,
+  now: Date = new Date(),
+): string | null {
+  if (!iso) return null;
+  const instant = new Date(iso);
+  if (Number.isNaN(instant.getTime())) return null;
+
+  const deltaMs = instant.getTime() - now.getTime();
+  // Imminent or just-passed (timing skew): don't render a "0 mins" / negative delta.
+  if (deltaMs < MIN_MS) return "soon";
+  // Round to nearest — the closest approximation of "about how long" (a 1h49m
+  // delta reads "in 2 hours", not the floored "in 1 hour"). Each guard tests the
+  // ALREADY-ROUNDED value so a delta that rounds up to a full unit PROMOTES to
+  // the next unit rather than printing "in 60 mins" / "in 24 hours" (e.g. 59m40s
+  // → "in 1 hour", 23h40m → "in 1 day").
+  const mins = Math.round(deltaMs / MIN_MS);
+  if (mins < 60) return `in ${pluralize(mins, "min")}`;
+  const hours = Math.round(deltaMs / HOUR_MS);
+  if (hours < 24) return `in ${pluralize(hours, "hour")}`;
+  const days = Math.round(deltaMs / DAY_MS);
+  return `in ${pluralize(days, "day")}`;
+}
+
+/** `1 min` / `8 mins` — singular noun only when the count is exactly 1. */
+function pluralize(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
 /** Parse an RRULE string into an `RRule`, or `null` if it can't be parsed. */
@@ -197,18 +257,21 @@ export function nextRunAtMs(
 ): number | null {
   const base = tryParse(rrule);
   if (!base) return null;
-  // Rebuild with a fixed dtstart so occurrence generation is anchored
-  // deterministically (see OCCURRENCE_ANCHOR) rather than to import-time now.
-  let rule: RRule;
-  try {
-    rule = new RRule({ ...base.origOptions, dtstart: OCCURRENCE_ANCHOR });
-  } catch {
-    return null;
-  }
   // rrule's `.after` treats the DTSTART/occurrences as UTC-naive wall times.
   // Query against a "now" that is itself the current wall time in the task's
   // timezone, so the comparison happens in the rule's frame.
   const nowInTz = shiftWallClock(now, timezone);
+  // Rebuild with a fixed dtstart so occurrence generation is anchored
+  // deterministically (see OCCURRENCE_ANCHOR) rather than to import-time now.
+  // For fixed-period rules, move that anchor forward by whole periods so rrule
+  // only iterates near "now" while preserving the original 2000-based phase.
+  const dtstart = occurrenceAnchorNear(base, nowInTz);
+  let rule: RRule;
+  try {
+    rule = new RRule({ ...base.origOptions, dtstart });
+  } catch {
+    return null;
+  }
   let occurrence: Date | null;
   try {
     occurrence = rule.after(nowInTz, false);
@@ -227,6 +290,40 @@ export function nextRunAtMs(
 function firstOf(v: number | number[] | null | undefined): number | null {
   if (v == null) return null;
   return Array.isArray(v) ? (v.length > 0 ? v[0]! : null) : v;
+}
+
+function occurrenceAnchorNear(rule: RRule, nowInRuleFrame: Date): Date {
+  const periodMs = fixedPeriodMs(rule);
+  if (periodMs == null) return OCCURRENCE_ANCHOR;
+
+  const elapsedMs = nowInRuleFrame.getTime() - OCCURRENCE_ANCHOR.getTime();
+  if (elapsedMs <= 0) return OCCURRENCE_ANCHOR;
+
+  const periodsSinceAnchor = Math.floor(elapsedMs / periodMs);
+  const periodsToAdvance = Math.max(0, periodsSinceAnchor - FIXED_PERIOD_SAFETY_MARGIN);
+  return new Date(OCCURRENCE_ANCHOR.getTime() + periodsToAdvance * periodMs);
+}
+
+function fixedPeriodMs(rule: RRule): number | null {
+  const interval =
+    typeof rule.origOptions.interval === "number" && rule.origOptions.interval > 1
+      ? rule.origOptions.interval
+      : 1;
+
+  switch (rule.origOptions.freq) {
+    case RRule.SECONDLY:
+      return interval * 1000;
+    case RRule.MINUTELY:
+      return interval * 60_000;
+    case RRule.HOURLY:
+      return interval * 3_600_000;
+    case RRule.DAILY:
+      return interval * 86_400_000;
+    case RRule.WEEKLY:
+      return interval * 604_800_000;
+    default:
+      return null;
+  }
 }
 
 /** Normalize a scalar-or-array RRULE option (e.g. bymonthday, bymonth) to a

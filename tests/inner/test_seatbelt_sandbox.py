@@ -1150,6 +1150,77 @@ def test_helper_boots_when_interpreter_lives_under_home_uv_layout(
         _shutil.rmtree(fake_install_root, ignore_errors=True)
 
 
+def test_ensure_executable_visible_two_hop_proxy_finds_cpython_install_root(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression for uv tool-install two-hop symlink layout (issue #3237).
+
+    ``uv tool install omnigent`` creates:
+      ~/.local/share/uv/tools/omnigent/bin/python  →  (proxy symlink)
+          ~/.local/share/uv/python/cpython-3.12.X-.../bin/python3.12
+
+    The LITERAL path grandparent (``tools/omnigent/``) has no CPython
+    ``lib/`` markers.  The RESOLVED target grandparent
+    (``cpython-3.12.X-.../``) does.  Pre-fix, ``_interpreter_install_root``
+    was called only on the literal path, returned ``None``, and
+    ``_add_topmost`` raised OSError.  Post-fix, the resolved path is retried
+    as a fallback, and the narrow CPython install root is returned.
+
+    This test uses ``_ensure_executable_visible`` directly (not the full
+    wrap) so we can construct a fully fake three-layer layout under
+    ``tmp_path`` without touching the real ``sys.executable``.
+    """
+    import uuid
+
+    home = Path.home()
+
+    # Layer 1 — CPython install root (the real target).  Lives under HOME
+    # so topmost ancestor is in _UNSAFE_WIDEN_ANCESTORS and the narrow-
+    # fallback path is exercised.
+    cpython_root = home / f".omnigent-test-cpython-{uuid.uuid4().hex}"
+    (cpython_root / "bin").mkdir(parents=True)
+    py_major_minor = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    (cpython_root / "lib" / py_major_minor).mkdir(parents=True)
+
+    # Layer 2 — tool-venv proxy root (no CPython markers — this is the
+    # layout that causes the literal-path check to return None).
+    tool_root = home / f".omnigent-test-tool-{uuid.uuid4().hex}"
+    (tool_root / "bin").mkdir(parents=True)
+    # Deliberately no lib/python* here.
+
+    import shutil as _shutil
+
+    try:
+        # Fake interpreter binary in the CPython install root.
+        cpython_exe = cpython_root / "bin" / "python3"
+        cpython_exe.touch()
+
+        # Proxy symlink: tool_root/bin/python → cpython_root/bin/python3
+        tool_exe = tool_root / "bin" / "python"
+        tool_exe.symlink_to(cpython_exe)
+
+        cwd = tmp_path
+        argv = [str(tool_exe), "-c", "pass"]
+        extras = _ensure_executable_visible(argv, cwd.resolve(strict=False))
+
+        cpython_resolved = cpython_root.resolve(strict=False)
+        assert cpython_resolved in extras, (
+            f"Expected the CPython install root {cpython_resolved!r} in extras "
+            f"({extras!r}). The two-hop proxy fallback did not resolve to the "
+            "real CPython install root; without this grant the kernel EPERMs "
+            "the exec inside the sandbox."
+        )
+        for extra in extras:
+            assert str(extra) not in _UNSAFE_WIDEN_ANCESTORS, (
+                f"_ensure_executable_visible granted an unsafe broad ancestor "
+                f"{extra!r} instead of the narrow CPython install root."
+            )
+    finally:
+        _shutil.rmtree(cpython_root, ignore_errors=True)
+        _shutil.rmtree(tool_root, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Security hardening regression tests
 #
@@ -1498,7 +1569,7 @@ def test_ensure_executable_visible_still_raises_for_non_python_home_layouts(
             _ensure_executable_visible(argv, cwd)
 
     msg = str(exc.value)
-    assert "Auto-detection of a narrow Python install root" in msg, (
+    assert "Auto-detection of a narrow CPython install root" in msg, (
         f"OSError should explain that the install-root fallback was "
         f"attempted; got message: {msg!r}. Without this hint, an "
         "operator hitting a near-miss layout (e.g. they forgot to "

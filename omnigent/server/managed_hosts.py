@@ -2307,7 +2307,11 @@ def host_resume_supported(
         host with no recorded ``sandbox_id``.
     """
     launcher = _launcher_for_teardown(host, config)
-    return launcher is not None and launcher.can_resume and host.sandbox_id is not None
+    return (
+        launcher is not None
+        and launcher.capabilities.resume_stopped
+        and host.sandbox_id is not None
+    )
 
 
 def host_sandbox_is_running(
@@ -2386,7 +2390,7 @@ async def resume_managed_host(
     # Resume needs a reattachable volume; others (e.g. Modal) fall through to
     # the caller's host-offline path (the user starts a new session).
     launcher = _launcher_for_teardown(host, config)
-    if launcher is None or not launcher.can_resume or host.sandbox_id is None:
+    if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
         return
     sandbox_id = host.sandbox_id
     # Single-flight per host (see _resume_locks).

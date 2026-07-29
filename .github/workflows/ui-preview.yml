@@ -106,7 +106,7 @@ jobs:
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: true
-      - uses: ./.github/actions/setup-node
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Build wheels (no UI)
         # Build the wheels WITHOUT the SPA so they stay small (Databricks Apps
@@ -120,10 +120,11 @@ jobs:
         run: bash deploy/databricks/build.sh
 
       - name: Build UI
-        working-directory: web
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          npm ci --legacy-peer-deps --no-audit --no-fund
-          npm run build
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build
 
       - name: Package UI assets
         run: |

@@ -18,6 +18,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
+  useRunScheduledTaskNow: vi.fn(),
 }));
 
 // Stub the create dialog — its internals are covered separately; here we only
@@ -28,16 +29,20 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     open,
     initialName,
     initialPrompt,
+    editingTask,
   }: {
     open: boolean;
     initialName?: string;
     initialPrompt?: string;
+    editingTask?: ScheduledTask | null;
   }) =>
     open ? (
       <div
         data-testid="manual-dialog-open"
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
+        data-editing-task-id={editingTask?.id ?? ""}
+        data-editing-task-name={editingTask?.name ?? ""}
       />
     ) : null,
 }));
@@ -59,13 +64,16 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     hostId: null,
     state: "active",
     lastRunAt: null,
+    lastRunStatus: null,
     lastRunConversationId: null,
+    nextRunAt: null,
     ...overrides,
   };
 }
 
 const mutate = vi.fn();
 const deleteMutate = vi.fn();
+const runNowMutate = vi.fn();
 
 function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?: boolean } = {}) {
   vi.mocked(hooks.useScheduledTasks).mockReturnValue({
@@ -79,6 +87,7 @@ function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?
 beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
+  runNowMutate.mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
     isPending: false,
@@ -89,6 +98,11 @@ beforeEach(() => {
     isPending: false,
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useDeleteScheduledTask>);
+  vi.mocked(hooks.useRunScheduledTaskNow).mockReturnValue({
+    mutate: runNowMutate,
+    isPending: false,
+    variables: undefined,
+  } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
 });
 
 afterEach(() => cleanup());
@@ -105,7 +119,7 @@ describe("TasksPage list", () => {
   it("renders the title, subtitle and task rows with schedule text", () => {
     setTasks([task()]);
     renderPage();
-    expect(screen.getByText("Scheduled tasks")).toBeInTheDocument();
+    expect(screen.getByText("Automations")).toBeInTheDocument();
     expect(screen.getByText(/Run agent sessions on a recurring schedule/i)).toBeInTheDocument();
     const row = screen.getByTestId("scheduled-task-row");
     expect(within(row).getByText("Nightly triage")).toBeInTheDocument();
@@ -148,7 +162,7 @@ describe("TasksPage list", () => {
     setTasks([]);
     renderPage();
     expect(screen.getByTestId("tasks-empty-state")).toBeInTheDocument();
-    expect(screen.getByText("No scheduled tasks yet")).toBeInTheDocument();
+    expect(screen.getByText("No automations yet")).toBeInTheDocument();
     expect(
       screen.getByText(
         "Create a task to run an agent session automatically on a recurring schedule.",
@@ -200,7 +214,7 @@ describe("TasksPage list", () => {
     expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("tasks-filter-paused"));
-    expect(screen.getByText("No scheduled tasks found")).toBeInTheDocument();
+    expect(screen.getByText("No automations found")).toBeInTheDocument();
     expect(screen.queryByText("No tasks match your filters")).toBeNull();
     expect(screen.queryByText("Try a different search or filter.")).toBeNull();
     expect(screen.getByTestId("tasks-filter-all")).toBeInTheDocument();
@@ -334,6 +348,17 @@ describe("suggestion prefill", () => {
 });
 
 describe("row actions", () => {
+  it("opens edit mode for a task from the row menu", () => {
+    setTasks([task({ id: "st_edit", name: "Morning brief" })]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("task-edit"));
+    const dialog = screen.getByTestId("manual-dialog-open");
+    expect(dialog.getAttribute("data-editing-task-id")).toBe("st_edit");
+    expect(dialog.getAttribute("data-editing-task-name")).toBe("Morning brief");
+    expect(dialog.getAttribute("data-initial-name")).toBe("");
+  });
+
   it("pauses an active task via the row menu (Pause label reflects state)", () => {
     setTasks([task({ id: "st_1", state: "active" })]);
     renderPage();

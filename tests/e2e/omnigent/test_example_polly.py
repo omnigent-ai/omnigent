@@ -166,6 +166,11 @@ def test_subagent_dispatch_text_advertises_task_titles_and_purpose(
     assert "Every `sys_session_send` MUST set both" in config
     assert "Name the sub-agent session for the work it is doing" in config
     assert "Bad titles are `claude_code`, `claude-code`, `codex`" in config
+    assert "Goal mode is opt-in for long-running IMPLEMENT dispatches" in config
+    assert "one standalone `/goal <condition>` command" in config
+    assert "do not invent a `sys_session_send` goal parameter" in config
+    assert "long-running `claude_code` or `codex` implementation" in fanout
+    assert "Do not use child goal mode for other workers" in fanout
     assert 'purpose: "implement"' in fanout
     assert 'title="<task_slug>"' in fanout
     assert 'title="review-<task_slug>"' in cross_review

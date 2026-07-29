@@ -23,6 +23,7 @@ import pytest
 from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
     _claude_prompt_rendered,
+    _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
     augment_claude_args,
@@ -737,6 +738,46 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
         "is_meta": True,
         "content": [{"type": "input_text", "text": task_notification}],
     }
+
+
+def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
+    """
+    An ``isCompactSummary`` user record is flagged, not rendered as a bubble.
+
+    Claude writes an ``isCompactSummary: true`` user record carrying the
+    continuation summary right after it compacts. The bridge must surface it
+    as a single ``message`` item with ``is_compact_summary=True`` (so the
+    forwarder can persist a durable compaction boundary) and preserve the
+    summary text — never drop it or route it through slash/scaffolding
+    detection.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "compact-summary-1",
+                "isCompactSummary": True,
+                "message": {
+                    "role": "user",
+                    "content": "This session is being continued. Prior summary: …",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(items) == 1
+    assert items[0].is_compact_summary is True
+    assert items[0].item_type == "message"
+    assert items[0].data["content"][0]["text"].startswith("This session is being continued")
 
 
 @pytest.mark.parametrize(
@@ -2703,6 +2744,78 @@ def test_inject_user_message_pastes_content_then_submits(
         "claude:0.0",
         "Enter",
     ]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("plain text", "plain text"),
+        ("/help", "\ufeff/help"),
+        ("/exit", "\ufeff/exit"),
+        ("/quit now", "\ufeff/quit now"),
+        ("  /help", "  \ufeff/help"),
+        ("/clear", "/clear"),
+        ("/compact", "/compact"),
+        ("/model sonnet-4", "/model sonnet-4"),
+        ("/effort high", "/effort high"),
+        ("/ultrareview", "/ultrareview"),
+        ("/branch", "/branch"),
+        ("/fork", "/fork"),
+        ("/my-skill some args", "/my-skill some args"),
+    ],
+)
+def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
+    """
+    Dropped Claude Code commands are escaped so they become plain text;
+    supported commands and skills are left untouched.
+    """
+    assert _escape_unsupported_slash_command(content) == expected
+
+
+def test_inject_user_message_escapes_unsupported_slash_command_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Unsupported slash commands land in the tmux buffer with a leading
+    zero-width escape so Claude Code treats them as user text.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    loaded_payloads: list[bytes] = []
+    tui = {"pane": "❯ "}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record buffer payloads and simulate a ready TUI.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = "❯ [Pasted text #1 +2 lines]"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "❯ "
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    inject_user_message(bridge_dir, content="/help")
+    assert loaded_payloads[0].startswith("\ufeff/help".encode("utf-8"))
+
+    inject_user_message(bridge_dir, content="/clear")
+    assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
 
 
 def test_inject_user_message_raises_when_tmux_target_never_published(

@@ -27,7 +27,13 @@ vi.mock("@/hooks/useConversations", () => ({
     isPending: false,
     isError: false,
   }),
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
@@ -48,6 +54,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -133,6 +141,7 @@ describe("project folder header icon/chevron", () => {
 
     const folder = header.querySelector(".lucide-folder") as HTMLElement;
     expect(folder).not.toBeNull();
+    expect(folder).toHaveClass("text-muted-foreground");
 
     // The folder icon sits in a wrapper that fades out on desktop hover/focus.
     const folderWrapper = folder.parentElement as HTMLElement;

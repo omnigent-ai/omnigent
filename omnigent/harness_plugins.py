@@ -68,6 +68,38 @@ class NativeCodingAgent:
 
 
 @dataclass(frozen=True)
+class BackgroundTitleGeneratorSpec:
+    """Lazy background-title generator registration for one harness."""
+
+    generator: str
+    resolver_harness: str | None = None
+
+
+@dataclass(frozen=True)
+class NativeHarnessProvider:
+    """Import paths for a native harness's lifecycle hooks.
+
+    ``NativeCodingAgent`` is pure identity data; behavior lives here as a
+    sibling row keyed by the same ``key``. Every value is a dotted import path
+    (``module:attr`` or ``module.attr``) resolved lazily at dispatch time via
+    :mod:`omnigent.native_dispatch`, so building the registry never imports the
+    runner / CLI / native-harness stack. Optional hooks are ``None`` when the
+    behavior is not yet a module-level function the resolver can reach (e.g.
+    interrupt/stop handlers that are still runner closures, or the inline
+    spawn-env dispatch); those hubs migrate onto the seam in later phases.
+    """
+
+    key: str  # matches NativeCodingAgent.key
+    run_native: str  # CLI + resume launch entry point
+    auto_create_terminal: str  # runner terminal builder
+    spawn_env_builder: str | None = None
+    interrupt_handler: str | None = None
+    stop_handler: str | None = None
+    materialize_agent_spec: str | None = None  # built-in agent seeding
+    bridge_dir: str | None = None  # cost-popup bridge-dir lookup
+
+
+@dataclass(frozen=True)
 class HarnessContribution:
     """One package's harness registry contribution."""
 
@@ -77,10 +109,14 @@ class HarnessContribution:
     aliases: dict[str, str] = field(default_factory=dict)
     native_harnesses: frozenset[str] = frozenset()
     native_agents: tuple[NativeCodingAgent, ...] = ()
+    native_providers: tuple[NativeHarnessProvider, ...] = ()
     install_specs: dict[str, HarnessInstallSpec] = field(default_factory=dict)
     harness_install_keys: dict[str, str] = field(default_factory=dict)
     model_env_keys: dict[str, str] = field(default_factory=dict)
     spawn_env_builders: dict[str, str] = field(default_factory=dict)
+    background_title_generators: dict[str, BackgroundTitleGeneratorSpec] = field(
+        default_factory=dict
+    )
     missing_install_package: dict[str, str] = field(default_factory=dict)
     harness_labels: dict[str, str] = field(default_factory=dict)
     # Declared feature set per harness id ("what can this harness do?"). Sparse
@@ -196,6 +232,48 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
     harness="hermes-native",
     wrapper_label=HERMES_NATIVE_WRAPPER_VALUE,
     terminal_name="hermes",
+)
+
+
+def _builtin_native_provider(key: str) -> NativeHarnessProvider:
+    """Build a built-in provider row from the ``omnigent.<key>_native`` module.
+
+    The built-in native harnesses follow a uniform module layout: each exports
+    ``run_<key>_native`` (CLI + resume launch) and ``_materialize_<key>_agent_spec``
+    (agent seeding), and re-exports ``_auto_create_<key>_terminal`` from
+    ``omnigent.runner.native``. The remaining hooks (spawn-env, interrupt, stop,
+    bridge-dir) are still runner-local closures / inline dispatch, so they stay
+    ``None`` until those hubs migrate onto the seam.
+    """
+    module = f"omnigent.{key}_native"
+    return NativeHarnessProvider(
+        key=key,
+        run_native=f"{module}:run_{key}_native",
+        auto_create_terminal=f"omnigent.runner.native:_auto_create_{key}_terminal",
+        materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
+    )
+
+
+# Behavior side-channel for the built-in native agents. One row per
+# NativeCodingAgent above, keyed by the same ``key``; resolved lazily so this
+# module stays import-light. See designs/harness-modular-registry-proposal.md
+# (Phase 1). Populated uniformly because every built-in native harness shares
+# the omnigent.<key>_native module layout.
+_BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
+    _builtin_native_provider(agent.key)
+    for agent in (
+        CLAUDE_NATIVE_CODING_AGENT,
+        CODEX_NATIVE_CODING_AGENT,
+        PI_NATIVE_CODING_AGENT,
+        OPENCODE_NATIVE_CODING_AGENT,
+        CURSOR_NATIVE_CODING_AGENT,
+        KIRO_NATIVE_CODING_AGENT,
+        GOOSE_NATIVE_CODING_AGENT,
+        ANTIGRAVITY_NATIVE_CODING_AGENT,
+        QWEN_NATIVE_CODING_AGENT,
+        KIMI_NATIVE_CODING_AGENT,
+        HERMES_NATIVE_CODING_AGENT,
+    )
 )
 
 
@@ -617,6 +695,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
     ),
+    native_providers=_BUILTIN_NATIVE_PROVIDERS,
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",
         "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
@@ -629,6 +708,21 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",
         "qwen": "HARNESS_QWEN_MODEL",
+    },
+    background_title_generators={
+        "claude-sdk": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.sdk:generate_background_title"
+        ),
+        "claude-native": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.claude_native:generate_background_title",
+            resolver_harness="claude-sdk",
+        ),
+        "codex": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.sdk:generate_background_title"
+        ),
+        "codex-native": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.codex_native:generate_background_title"
+        ),
     },
     harness_labels={
         "antigravity": "Antigravity",
@@ -662,6 +756,7 @@ def _community_paths(contribution: HarnessContribution) -> list[str]:
     paths: list[str] = []
     paths.extend(contribution.harness_modules.values())
     paths.extend(contribution.spawn_env_builders.values())
+    paths.extend(spec.generator for spec in contribution.background_title_generators.values())
     return paths
 
 
@@ -674,6 +769,7 @@ def _harness_spellings(contribution: HarnessContribution) -> set[str]:
         | set(contribution.native_harnesses)
         | set(contribution.harness_install_keys)
         | set(contribution.model_env_keys)
+        | set(contribution.background_title_generators)
         | set(contribution.missing_install_package)
         | set(contribution.harness_labels)
         | set(contribution.capabilities)
@@ -751,6 +847,17 @@ def _validate_community_contribution(
         )
 
     allowed_targets = set(contribution.valid_harnesses)
+    for harness, spec in contribution.background_title_generators.items():
+        if harness not in allowed_targets:
+            return (
+                f"community harness plugin {entry_point_name!r} registers background "
+                f"titles for undeclared harness {harness!r}"
+            )
+        if spec.resolver_harness is not None and spec.resolver_harness not in allowed_targets:
+            return (
+                f"community harness plugin {entry_point_name!r} background title resolver "
+                f"{spec.resolver_harness!r} is not contributed by the plugin"
+            )
     for alias, target in contribution.aliases.items():
         if target not in allowed_targets:
             return (
@@ -846,6 +953,22 @@ def native_agents() -> tuple[NativeCodingAgent, ...]:
     return tuple(agents)
 
 
+def native_providers() -> tuple[NativeHarnessProvider, ...]:
+    """Return native-harness behavior provider rows, merged across contributions."""
+    providers: list[NativeHarnessProvider] = []
+    for contribution in plugin_state().contributions:
+        providers.extend(contribution.native_providers)
+    return tuple(providers)
+
+
+def native_provider_for_key(key: str) -> NativeHarnessProvider | None:
+    """Return the provider row whose ``key`` matches, or ``None``."""
+    for provider in native_providers():
+        if provider.key == key:
+            return provider
+    return None
+
+
 def harness_modules() -> dict[str, str]:
     """Return runtime harness module mapping, aliases included."""
     modules = _merge_dict("harness_modules")
@@ -864,6 +987,11 @@ def model_env_keys() -> dict[str, str]:
 def spawn_env_builders() -> dict[str, str]:
     """Return harness-to-spawn-env-builder import paths."""
     return _merge_dict("spawn_env_builders")
+
+
+def background_title_generators() -> dict[str, BackgroundTitleGeneratorSpec]:
+    """Return harness-to-background-title-generator registrations."""
+    return _merge_dict("background_title_generators")
 
 
 def install_specs() -> dict[str, HarnessInstallSpec]:

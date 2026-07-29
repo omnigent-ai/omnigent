@@ -24,8 +24,22 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     binary's presence/absence; stub the fallback dirs to empty too so a
     developer's real claude/codex install can't flip a ``which``-returns-None
     assertion.
+
+    Also stub ``--version`` probes so tests that simply need "binary present"
+    are not tripped up by an unexpected subprocess call once a harness spec
+    declares a version floor. Tests that care about the version can override
+    the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+
+    def _stub_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="9.9.9\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess in harness_install tests: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _stub_version_run)
 
 
 @pytest.mark.parametrize(
@@ -139,11 +153,11 @@ def test_hermes_install_spec_has_actionable_vendor_installer() -> None:
     ]
 
 
-def test_antigravity_install_spec_status_only_no_npm() -> None:
-    """Antigravity (agy) ships via a shell installer (no npm) and has no login
-    subcommand — the user signs in by launching ``agy`` once. It DOES expose a
-    status check (``agy models``), so the spec carries ``status_args`` +
-    ``install_hint`` but no ``package`` / ``login_args`` / ``logout_args``.
+def test_antigravity_install_spec_launches_auth_service_no_npm() -> None:
+    """Antigravity (agy) ships via a shell installer (no npm) and signs in by
+    launching ``agy`` once. It also exposes a status check (``agy models``), so
+    the spec carries empty ``login_args`` plus ``status_args`` + ``install_hint``
+    but no ``package`` / ``logout_args``.
 
     Drift here (a package sneaking in, or losing ``status_args``) would make the
     setup menu offer a bogus ``npm install`` or fall back to a file-only login
@@ -156,16 +170,16 @@ def test_antigravity_install_spec_status_only_no_npm() -> None:
     assert spec.install_hint is not None
     assert "antigravity.google/cli/install.sh" in spec.install_hint
     assert spec.status_args == ("models",)
-    assert spec.login_args is None
+    assert spec.login_args == ()
     assert spec.logout_args is None
     assert spec.login_status_key is None
     assert spec.auth_hint is not None
 
 
 def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
-    """A not-yet-signed-in agy can't be fixed by ``agy login`` (no such
-    command), so the launch hint names the installer AND the "run agy to sign
-    in" step — otherwise a user who already has agy installed gets a misleading
+    """A not-yet-signed-in agy is fixed by launching ``agy`` itself, so the
+    launch hint names the installer AND the "run agy to sign in" step —
+    otherwise a user who already has agy installed gets a misleading
     install-only hint.
     """
     hint = hi.harness_setup_hint("antigravity-native")
@@ -235,7 +249,7 @@ def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
 @pytest.mark.parametrize("harness", ["cursor-native", "native-cursor"])
 def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -> None:
     """Native Cursor's "not configured" hint names the curl installer + login,
-    never ``omnigent setup`` — which only configures the SDK ``cursor`` harness
+    never ``omni setup`` — which only configures the SDK ``cursor`` harness
     (``cursor-sdk`` + ``CURSOR_API_KEY``) and never installs ``cursor-agent``.
 
     A regression to the generic hint sends a native-Cursor user down a dead end
@@ -245,7 +259,7 @@ def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -
     assert "cursor-agent" in hint
     assert "cursor.com/install" in hint
     assert "cursor-agent login" in hint
-    assert "omnigent setup" not in hint
+    assert "omni setup" not in hint
 
 
 @pytest.mark.parametrize("harness", ["kiro-native", "native-kiro"])
@@ -254,15 +268,15 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     hint = hi.harness_setup_hint(harness)
     assert "kiro-cli" in hint
     assert "cli.kiro.dev/install" in hint
-    assert "omnigent setup" not in hint
+    assert "omni setup" not in hint
 
 
 @pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
 def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
-    """Harnesses whose CLI ``omnigent setup`` installs (npm CLIs) — and the
-    SDK / unknown / ``None`` cases — route to the ``omnigent setup`` hint."""
+    """Harnesses whose CLI ``omni setup`` installs (npm CLIs) — and the
+    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint."""
     hint = hi.harness_setup_hint(harness)
-    assert "omnigent setup" in hint
+    assert "omni setup" in hint
 
 
 @pytest.mark.parametrize("harness", ["cursor", "claude-sdk", "openai-agents"])
@@ -457,11 +471,14 @@ def test_try_install_harness_cli_success_when_binary_off_path(
     # npm is on PATH; the installed codex binary never is — only the ladder finds it.
     monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
-    )
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            out = "9.9.9\n"
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
 
     # Install verdict agrees with readiness: both see it installed.
     assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
@@ -624,6 +641,7 @@ def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPa
     [
         (ANTHROPIC_FAMILY, ["claude", "auth", "login", "--claudeai"]),
         (OPENAI_FAMILY, ["codex", "login"]),
+        (GEMINI_FAMILY, ["/usr/bin/agy"]),
     ],
 )
 def test_harness_login_runs_cli_login_then_verifies(
@@ -654,6 +672,30 @@ def test_harness_login_runs_cli_login_then_verifies(
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_login(key) is True
     assert calls == [expected_argv]
+
+
+def test_harness_login_resolves_agy_outside_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Antigravity sign-in launches agy's resolved fallback install path."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda name: "/home/user/.local/bin/agy")
+    monkeypatch.setattr(hi.sys.stdin, "isatty", lambda: True)
+    state = {"logged_in": False}
+    monkeypatch.setattr(
+        hi,
+        "harness_cli_logged_in",
+        lambda key: state["logged_in"],
+    )
+    calls: list[list[str]] = []
+
+    def _run(argv: list[str], **kwargs: object):
+        calls.append(argv)
+        state["logged_in"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.harness_login(GEMINI_FAMILY) is True
+    assert calls == [["/home/user/.local/bin/agy"]]
 
 
 def test_harness_login_wires_dev_tty_when_stdin_not_a_tty(
@@ -917,7 +959,7 @@ def test_harness_cli_logged_in_agy_uses_exit_code(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["agy", "models"]  # the status subcommand
+        assert argv == ["/usr/bin/agy", "models"]  # the status subcommand
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -973,15 +1015,18 @@ def test_ui_installable_harnesses_includes_native_spellings() -> None:
     assert "claude-sdk" not in installable
 
 
-def test_ui_setup_steps_install_then_command_auth_for_codex() -> None:
-    """Codex: one-click install, then a status-tracked login command."""
+def test_ui_setup_steps_install_then_ui_auth_for_codex() -> None:
+    """Codex: one-click install, then a UI-authable auth step. The step opens
+    the credential form (action ``"auth"``) whose options include the ``codex
+    login`` subscription; it stays status-tracked (``"authed"``)."""
     steps = hi.ui_setup_steps("codex")
     assert [s.kind for s in steps] == ["install", "auth"]
     install, auth = steps
     assert install.action == "install"
     assert install.status_key == "installed"
     assert install.command is None
-    assert auth.action == "command"
+    assert auth.action == "auth"
+    assert auth.title == "Set up authentication"
     assert auth.command == "codex login"
     assert auth.status_key == "authed"
 
@@ -993,13 +1038,25 @@ def test_ui_setup_steps_native_spelling_matches_bare() -> None:
     ]
 
 
-def test_ui_setup_steps_pi_auth_is_untracked_setup_fallback() -> None:
-    """Pi's credential (API key / gateway) can't be driven from the UI yet, so
-    its auth step points at ``omnigent setup`` and is not status-tracked."""
+def test_ui_setup_steps_pi_auth_is_ui_authable_and_tracked() -> None:
+    """Pi is UI-authable: its auth step opens the credential form (action
+    ``"auth"``), carries no CLI login command (no subscription), and is
+    status-tracked (``"authed"``) so the dialog can't drop it as "unknown"
+    and wrongly read "ready"."""
     steps = hi.ui_setup_steps("pi")
     assert [s.kind for s in steps] == ["install", "auth"]
+    assert steps[1].action == "auth"
+    assert steps[1].command is None
+    assert steps[1].status_key == "authed"
+
+
+def test_ui_setup_steps_qwen_auth_stays_untracked_setup_fallback() -> None:
+    """Qwen is env-auth (not UI-authable), so its auth step stays an untracked
+    ``omni setup`` signpost — the case that must NOT gain the form."""
+    steps = hi.ui_setup_steps("qwen")
+    assert [s.kind for s in steps] == ["install", "auth"]
     assert steps[1].action == "setup"
-    assert steps[1].command == "omnigent setup"
+    assert steps[1].command == "omni setup"
     assert steps[1].status_key is None
 
 
@@ -1009,5 +1066,226 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         steps = hi.ui_setup_steps(harness)
         assert len(steps) == 1
         assert steps[0].action == "setup"
-        assert steps[0].command == "omnigent setup"
+        assert steps[0].command == "omni setup"
         assert steps[0].status_key is None
+
+
+# ── Version-aware installed check ────────────────────────
+
+
+@pytest.mark.parametrize(
+    "key,min_version,max_version_exclusive",
+    [
+        (hi.OPENCODE_KEY, "1.17.7", "1.18.0"),
+        (hi.CURSOR_KEY, "2026.06.02", None),
+        (hi.KIMI_KEY, "1.47.0", None),
+        (ANTHROPIC_FAMILY, "2.1.161", None),
+        (OPENAI_FAMILY, "0.137.0", None),
+        (hi.PI_KEY, "0.79.0", None),
+        (hi.QWEN_KEY, "0.18.1", None),
+        (hi.GOOSE_KEY, "1.38.0", None),
+        (hi.HERMES_KEY, "2026.06.05", None),
+        (hi.KIRO_KEY, "2.10.0", None),
+    ],
+)
+def test_versioned_specs_declare_bounds(
+    key: str, min_version: str, max_version_exclusive: str | None
+) -> None:
+    """Version-bounded harness specs expose the same floors setup enforces."""
+    spec = hi.harness_install_spec(key)
+    assert spec is not None
+    assert spec.min_version == min_version
+    assert spec.max_version_exclusive == max_version_exclusive
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ("1.17.6", False),  # below min
+        ("1.18.0", False),  # at max exclusive
+        ("2.0.0", False),  # above max
+        ("1.17.8", True),  # inside range
+    ],
+)
+def test_harness_cli_installed_checks_version_for_versioned_specs(
+    monkeypatch: pytest.MonkeyPatch, version: str, expected: bool
+) -> None:
+    """A present CLI whose ``--version`` is outside the declared range reads as
+    not installed, so setup prompts for an upgrade before the runtime gate."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            # OpenCode's supported range is [1.17.7, 1.18.0).
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.OPENCODE_KEY) is expected
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        hi.CURSOR_KEY,
+        hi.KIMI_KEY,
+        ANTHROPIC_FAMILY,
+        OPENAI_FAMILY,
+        hi.PI_KEY,
+        hi.QWEN_KEY,
+        hi.GOOSE_KEY,
+        hi.HERMES_KEY,
+        hi.KIRO_KEY,
+    ],
+)
+def test_harness_cli_installed_checks_minimum_for_other_versioned_specs(
+    monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Version-bounded harnesses treat a CLI older than their declared floor as
+    not installed, so setup prompts for an upgrade."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            out = "0.0.1\n"
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(key) is False
+
+
+def test_harness_cli_installed_true_when_version_in_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present CLI with a satisfying version reads as installed."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            out = "1.17.8\n"
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.OPENCODE_KEY) is True
+
+
+def test_harness_cli_installed_ignores_upper_bound_for_unversioned_specs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Harnesses without a version declaration are not probed with ``--version``."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _explode(*a: object, **k: object) -> None:
+        raise AssertionError("version probe spawned for an unversioned harness")
+
+    monkeypatch.setattr(hi.subprocess, "run", _explode)
+    assert hi.harness_cli_installed(GEMINI_FAMILY) is True
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("cursor-agent 2026.07.01-777f564", "2026.07.01"),
+        ("2026.06.19-20-24-33-653a7fb", "2026.06.19"),
+        ("2026.05.24.1.dda726e", "2026.05.24"),
+        ("kimi version 1.47.0", "1.47.0"),
+        ("1.17.7-rc1", "1.17.7-rc1"),
+    ],
+)
+def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: str) -> None:
+    """Date-shaped Cursor versions are stripped to ``YYYY.MM.DD`` so PEP 440 can
+    compare them; normal semver versions stay unchanged."""
+    assert hi._parse_harness_cli_version(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "key,outdated,satisfying",
+    [
+        (hi.CURSOR_KEY, "2026.05.24", "2026.06.22"),
+        (hi.KIMI_KEY, "1.46.0", "1.48.0"),
+        (hi.HERMES_KEY, "2026.05.29", "2026.06.19"),
+    ],
+)
+def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    outdated: str,
+    satisfying: str,
+) -> None:
+    """Cursor and Kimi default to the first release after 2026-06-01."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{outdated}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(key) is False
+
+    def _run_ok(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{satisfying}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run_ok)
+    assert hi.harness_cli_installed(key) is True
+
+
+def test_harness_cli_installed_false_when_version_unparseable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present CLI whose ``--version`` output contains no parseable version is
+    treated as not installed, so setup prompts for an upgrade."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="dev-SNAPSHOT\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.OPENCODE_KEY) is False
+
+
+def test_harness_cli_version_satisfies_short_circuits_when_binary_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``harness_cli_version_satisfies`` returns False when the binary is absent
+    without shelling out to a missing executable."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+
+    def _explode(*a: object, **k: object) -> None:
+        raise AssertionError("version probe spawned despite missing binary")
+
+    monkeypatch.setattr(hi.subprocess, "run", _explode)
+    assert hi.harness_cli_version_satisfies(hi.OPENCODE_KEY) is False
+
+
+def test_missing_harness_cli_flags_outdated_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI present but outside its declared version range is treated as
+    missing by the dispatch preflight, so the runner fails loud before launch."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            out = "1.16.0\n"
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    spec = hi.missing_harness_cli("opencode-native")
+    assert spec is not None
+    assert spec.binary == "opencode"

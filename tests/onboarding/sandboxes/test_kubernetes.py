@@ -24,7 +24,6 @@ from omnigent.host.identity import (
     HOST_TOKEN_ENV_VAR,
 )
 from omnigent.onboarding.sandboxes.base import (
-    SandboxCapabilityError,
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.kubernetes import (
@@ -684,12 +683,15 @@ def test_terminate_retries_transient_then_gives_up_best_effort(
     assert fake_core.deleted_secrets == ["omnigent-pod-8-token"]
 
 
-def test_provision_reserves_pod_name_and_run_is_unsupported() -> None:
-    """provision reserves a Pod name (no Pod created); run has no exec transport."""
+def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
+    """provision reserves a Pod name (no Pod created); no exec transport."""
     launcher = _launcher()
     # provision reserves the id — it does NOT create a Pod and does NOT raise.
     name = launcher.provision("managed-abc")
     assert name.startswith("omnigent-managed-abc-")
-    # run is unsupported: the host is the Pod entrypoint, there is no exec-in.
-    with pytest.raises(SandboxCapabilityError):
-        launcher.run("sb", "echo hi")
+    # Kubernetes is an entrypoint-as-host provider: it has no ``run()`` method
+    # at all (no exec transport), unlike exec-model providers that inherit
+    # ``ExecModelHostLauncher``.
+    assert not hasattr(launcher, "run")
+    # CLI bootstrap is not supported.
+    assert launcher.capabilities.cli_bootstrap is False

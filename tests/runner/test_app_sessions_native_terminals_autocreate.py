@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -205,6 +206,97 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["spec"].command == "pi"
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_surfaces_credential_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider with an unresolved credential posts a visible session notice.
+
+    Without this, a Pi session whose Databricks token can't be refreshed
+    launches but every message silently fails to reach the model — no reply,
+    no reason. The warning is delivered as an ``error`` item (which the web UI
+    renders as a distinct banner) via ``external_conversation_item``.
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+
+    provider = pi_native_credentials.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://wkspc.example.com/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="databricks-claude-sonnet-4-6",
+        api_key="!databricks auth token --profile demo-staging",
+        auth_header=True,
+        credential_warning="⚠️ Couldn't authenticate to `demo-staging`; run databricks auth login.",
+    )
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
+    )
+    # Avoid touching the real Pi settings/models writer; the launch env is not
+    # under test here — the credential-warning surfacing is.
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "pi_native_provider_launch",
+        lambda _agent_dir, _provider: ({}, []),
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, terminal_name: str, **_kwargs: Any
+        ) -> SessionResourceView:
+            del terminal_name, _kwargs
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            posts.append((url, kwargs.get("json") or {}))
+            return self._Response()
+
+    await _auto_create_pi_terminal(
+        "47f049b9d13df4db397c7f46859b825f",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+    )
+
+    warning_posts = [
+        body
+        for url, body in posts
+        if "/events" in url and body.get("type") == "external_conversation_item"
+    ]
+    assert len(warning_posts) == 1
+    data = warning_posts[0]["data"]
+    assert data["item_type"] == "error"
+    assert data["item_data"]["code"] == "pi_credentials_unresolved"
+    assert "databricks auth login" in data["item_data"]["message"]
 
 
 @pytest.mark.asyncio
@@ -968,8 +1060,8 @@ async def _run_auto_create_cursor_terminal(
     monkeypatch: pytest.MonkeyPatch,
     agent_spec: AgentSpec | None,
     terminal_launch_args: list[str] | None,
-) -> Any:
-    """Drive ``_auto_create_cursor_terminal`` and return the captured launch spec.
+) -> dict[str, Any]:
+    """Drive ``_auto_create_cursor_terminal`` and return what it wired up.
 
     Stubs the cursor-agent binary lookup, the transcript forwarder, and the
     runner auth factory so the model-injection branch runs without a real
@@ -977,6 +1069,10 @@ async def _run_auto_create_cursor_terminal(
     (workspace + ``terminal_launch_args``) is served from an in-memory
     ``httpx.MockTransport``, and a fake registry records the ``spec`` passed to
     ``launch_required_terminal`` so the test can assert on ``spec.args``.
+
+    :returns: ``{"spec": <launch spec>, "elicitation_kwargs": <kwargs>}``, the
+        latter captured from the elicitation supervisor the forwarder task
+        gathers (empty if that task never got to start it).
     """
     from omnigent.runner import _entry as _runner_entry
 
@@ -993,11 +1089,25 @@ async def _run_auto_create_cursor_terminal(
         "omnigent.cursor_native_forwarder.supervise_cursor_forwarder",
         _no_op_forwarder,
     )
+    monkeypatch.setattr(
+        "omnigent.cursor_native_usage.supervise_cursor_usage_forwarder",
+        _no_op_forwarder,
+    )
     # The forwarder is stubbed, so the auth it would carry is never used — keep
     # the factory from reaching for ambient Databricks credentials in tests.
     monkeypatch.setattr(_runner_entry, "_make_auth_token_factory", lambda *a, **k: None)
 
-    captured: dict[str, Any] = {}
+    captured: dict[str, Any] = {"elicitation_kwargs": {}}
+    started = asyncio.Event()
+
+    async def _capture_elicitation_supervisor(**kwargs: Any) -> None:
+        captured["elicitation_kwargs"] = kwargs
+        started.set()
+
+    monkeypatch.setattr(
+        "omnigent.cursor_native_permissions.supervise_cursor_transcript_elicitations",
+        _capture_elicitation_supervisor,
+    )
 
     class _FakeResourceRegistry:
         """Captures the launched terminal spec; no real terminal registry."""
@@ -1039,9 +1149,13 @@ async def _run_auto_create_cursor_terminal(
             ensure_comment_relay=None,
             agent_spec=agent_spec,
         )
+        # The bridge supervisors are gathered in a background task, so give it
+        # a beat to record the kwargs the wiring derived.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(started.wait(), timeout=2.0)
     finally:
         await fake_client.aclose()
-    return captured["spec"]
+    return captured
 
 
 @pytest.mark.asyncio
@@ -1055,7 +1169,7 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
     session's ``executor.model`` (from ``--model`` or config.yaml ``model:``)
     must reach the TUI as ``--model <id>`` — the regression #933 fixes.
     """
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1063,6 +1177,7 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
         ),
         terminal_launch_args=None,
     )
+    spec = captured["spec"]
     assert spec.command == "cursor-agent"
     assert "--model" in spec.args
     assert spec.args[spec.args.index("--model") + 1] == "sonnet-4-thinking"
@@ -1087,7 +1202,7 @@ async def test_auto_create_cursor_terminal_user_model_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A user-pinned passthrough model wins; the spec model is not injected."""
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1095,6 +1210,7 @@ async def test_auto_create_cursor_terminal_user_model_wins(
         ),
         terminal_launch_args=passthrough,
     )
+    spec = captured["spec"]
     # Exactly the user's args survive — no second ``--model`` / spec model added.
     assert spec.args.count("--model") == passthrough.count("--model")
     assert "sonnet-4-thinking" not in spec.args
@@ -1116,7 +1232,7 @@ async def test_auto_create_cursor_terminal_omits_model_when_unusable(
     Gateway-routed ``databricks-*`` ids are not cursor-agent model ids, so they
     are dropped rather than passed through (which would error on launch).
     """
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1124,7 +1240,42 @@ async def test_auto_create_cursor_terminal_omits_model_when_unusable(
         ),
         terminal_launch_args=None,
     )
-    assert "--model" not in spec.args
+    assert "--model" not in captured["spec"].args
+
+
+@pytest.mark.parametrize(
+    ("terminal_launch_args", "expected"),
+    [
+        (None, False),
+        (["--auto-review"], False),
+        (["--yolo=false"], False),
+        (["--yolo"], True),
+        (["--force"], True),
+        (["-f"], True),
+    ],
+    ids=["none", "auto-review", "yolo-off", "yolo", "force", "short-force"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_wires_yolo_auto_accept(
+    terminal_launch_args: list[str] | None,
+    expected: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The elicitation supervisor's yolo stance is derived from the launch args.
+
+    This wiring is the only thing that turns the in-pane auto-accept on. It is
+    a single kwarg in a large auto-create function, so without this assertion a
+    rebase can drop it and leave the feature inert with the rest of the suite
+    green.
+    """
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=None,
+        terminal_launch_args=terminal_launch_args,
+    )
+    assert captured["elicitation_kwargs"]["auto_accept_approvals"] is expected
 
 
 @pytest.mark.parametrize(

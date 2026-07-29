@@ -9,8 +9,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/lib/scheduledTasksApi";
 import {
   SCHEDULED_TASKS_KEY,
+  scheduledTaskRunsKey,
   useCreateScheduledTask,
   useDeleteScheduledTask,
+  useRunScheduledTaskNow,
   useScheduledTasks,
   useUpdateScheduledTask,
 } from "./useScheduledTasks";
@@ -20,6 +22,7 @@ vi.mock("@/lib/scheduledTasksApi", () => ({
   createScheduledTask: vi.fn(),
   updateScheduledTask: vi.fn(),
   deleteScheduledTask: vi.fn(),
+  runScheduledTaskNow: vi.fn(),
 }));
 
 const TASK: api.ScheduledTask = {
@@ -38,7 +41,9 @@ const TASK: api.ScheduledTask = {
   hostId: null,
   state: "active",
   lastRunAt: null,
+  lastRunStatus: null,
   lastRunConversationId: null,
+  nextRunAt: null,
 };
 
 function makeWrapper() {
@@ -55,6 +60,7 @@ beforeEach(() => {
   vi.mocked(api.createScheduledTask).mockResolvedValue(TASK);
   vi.mocked(api.updateScheduledTask).mockResolvedValue({ ...TASK, state: "paused" });
   vi.mocked(api.deleteScheduledTask).mockResolvedValue(undefined);
+  vi.mocked(api.runScheduledTaskNow).mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -98,5 +104,17 @@ describe("mutations invalidate the list", () => {
     const { result } = renderHook(() => useDeleteScheduledTask(), { wrapper });
     await result.current.mutateAsync("st_1");
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
+  });
+
+  it("run-now calls the API and invalidates the list + that task's runs", async () => {
+    const { queryClient, wrapper } = makeWrapper();
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
+    await result.current.mutateAsync("st_1");
+    expect(api.runScheduledTaskNow).toHaveBeenCalledWith("st_1");
+    // Refreshes the list (so the completion badge updates)…
+    expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
+    // …and the fired task's run history.
+    expect(spy).toHaveBeenCalledWith({ queryKey: scheduledTaskRunsKey("st_1") });
   });
 });

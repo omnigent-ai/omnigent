@@ -137,7 +137,7 @@ export function CommandPalette({
       },
       {
         id: "go-tasks",
-        label: "Go to Scheduled tasks",
+        label: "Go to Automations",
         icon: CalendarClockIcon,
         keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
         run: () => navigate("/tasks"),

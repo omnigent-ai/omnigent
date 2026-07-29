@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.entities.conversation import synthesize_conversation_title
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_plugins import background_title_generators
 from omnigent.stores.conversation_store import ConversationStore
 
 if TYPE_CHECKING:
@@ -21,16 +22,13 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Start with harnesses whose isolated title-generation paths are verified;
-# additional harnesses can be added once they have equivalent coverage.
-_SUPPORTED_BACKGROUND_TITLE_HARNESSES = frozenset({"claude-sdk", "claude-native", "codex"})
-
 
 def _background_session_title_harness_supported(harness: str | None) -> bool:
     """Return whether a known session harness may run automatic title inference."""
     if harness is None:
         return True
-    return canonicalize_harness(harness) in _SUPPORTED_BACKGROUND_TITLE_HARNESSES
+    canonical = canonicalize_harness(harness)
+    return canonical is not None and canonical in background_title_generators()
 
 
 @dataclass(frozen=True)

@@ -19,8 +19,17 @@ import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
-vi.mock("@/hooks/useScheduledTasks", () => ({ useCreateScheduledTask: vi.fn() }));
+// useHostModelOptions is consumed by the ModelEffortFields sub-form (model
+// dropdown source). Returning no data makes it fall back to the static Claude
+// alias list, which is what a no-host-pinned scheduled task uses anyway.
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  useHostModelOptions: vi.fn(() => ({ data: undefined })),
+}));
+vi.mock("@/hooks/useScheduledTasks", () => ({
+  useCreateScheduledTask: vi.fn(),
+  useUpdateScheduledTask: vi.fn(),
+}));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
@@ -134,9 +143,11 @@ const AGENTS: AvailableAgent[] = [
 ];
 
 const mutateAsync = vi.fn();
+const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
+  updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
     data: AGENTS,
   } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
@@ -147,6 +158,10 @@ beforeEach(() => {
     mutateAsync,
     isPending: false,
   } as unknown as ReturnType<typeof scheduledHooks.useCreateScheduledTask>);
+  vi.mocked(scheduledHooks.useUpdateScheduledTask).mockReturnValue({
+    mutateAsync: updateMutateAsync,
+    isPending: false,
+  } as unknown as ReturnType<typeof scheduledHooks.useUpdateScheduledTask>);
 });
 
 afterEach(() => cleanup());
@@ -155,12 +170,42 @@ function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
   return render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
 }
 
+function scheduledTask(overrides: Partial<import("@/lib/scheduledTasksApi").ScheduledTask> = {}) {
+  return {
+    id: "st_1",
+    name: "Morning brief",
+    prompt: "Summarize overnight activity",
+    rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=30",
+    ownerUserId: null,
+    agentId: "ag_1",
+    timezone: "America/Los_Angeles",
+    createdAt: 1,
+    updatedAt: 2,
+    modelOverride: null,
+    reasoningEffort: null,
+    workspace: null,
+    hostId: null,
+    state: "active",
+    lastRunAt: null,
+    lastRunStatus: null,
+    lastRunConversationId: null,
+    nextRunAt: null,
+    ...overrides,
+  } satisfies import("@/lib/scheduledTasksApi").ScheduledTask;
+}
+
 describe("agent picker readiness (needs-setup badges)", () => {
-  it("explains that scheduled tasks use the selected agent's runtime defaults", () => {
+  it("shows the model + effort controls for the default (Claude-native) agent", () => {
     renderDialog();
+    // The default effective agent is claude-native-ui (a capable native coding
+    // agent), so the model/effort pickers render and the "uses defaults" hint —
+    // shown only when the controls are hidden — is absent.
+    expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
+    expect(screen.getByTestId("task-model-trigger")).toBeInTheDocument();
+    expect(screen.getByTestId("task-effort-trigger")).toBeInTheDocument();
     expect(
-      screen.getByText("Uses this agent's default model, effort, and permission settings"),
-    ).toBeInTheDocument();
+      screen.queryByText("Uses this agent's default model, effort, and permission settings"),
+    ).not.toBeInTheDocument();
   });
 
   it("feeds the picker a fallback online host so 'needs setup' badges show with no host pinned", () => {
@@ -242,6 +287,81 @@ describe("CreateScheduledTaskDialog prefill (seed-on-open + reset)", () => {
   });
 });
 
+describe("CreateScheduledTaskDialog edit mode", () => {
+  it("seeds fields from the scheduled task and uses edit copy", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "ag_1" })}
+      />,
+    );
+    expect(screen.getByText("Edit automation")).toBeInTheDocument();
+    expect(screen.getByText(/Update this recurring agent session/i)).toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toHaveTextContent("Save changes");
+    expect((screen.getByTestId("task-name-input") as HTMLInputElement).value).toBe("Morning brief");
+    expect((screen.getByTestId("task-prompt-input") as HTMLTextAreaElement).value).toBe(
+      "Summarize overnight activity",
+    );
+    expect(screen.getByTestId("task-agent-readonly")).toHaveTextContent("Polly");
+    expect(screen.queryByTestId("agent-picker-stub")).not.toBeInTheDocument();
+    expect(screen.getByTestId("schedule-time")).toHaveValue("08:30 AM");
+  });
+
+  it("round-trips non-quarter-hour edit times through the update payload", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=17;BYMINUTE=7" })}
+      />,
+    );
+    expect(screen.getByTestId("schedule-time")).toHaveValue("05:07 PM");
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    expect(screen.getByTestId("schedule-hour-05")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("schedule-minute-07")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("schedule-period-PM")).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
+  });
+
+  it("submits supported edits through the update mutation without changing agent defaults", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+    fireEvent.change(screen.getByTestId("task-name-input"), {
+      target: { value: "Updated brief" },
+    });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: "Updated prompt" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(updateMutateAsync.mock.calls[0][0]).toEqual({
+      id: "st_1",
+      input: {
+        name: "Updated brief",
+        prompt: "Updated prompt",
+        rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=30",
+        timezone: "America/Los_Angeles",
+      },
+    });
+  });
+
+  it("blocks update when the existing RRULE cannot be represented by the form", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0" })}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  });
+});
+
 describe("CreateScheduledTaskDialog submit", () => {
   it("submits required fields with the built RRULE and omits host/workspace when unset", async () => {
     renderDialog();
@@ -271,9 +391,9 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(arg.timezone.length).toBeGreaterThan(0);
   });
 
-  // Model/effort controls are not offered, so the create
-  // body carries agent_id and NEVER model_override / reasoning_effort, whether
-  // the pick is a bare harness (claude-native) or a plain agent (polly).
+  // With the model/effort controls left at their Default (unselected) state, the
+  // create body carries agent_id and NO model_override / reasoning_effort,
+  // whether the pick is a bare harness (claude-native) or a plain agent (polly).
   it("maps a bare-harness pick to its agent_id, never sends model/effort", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
@@ -305,42 +425,213 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.queryByTestId("task-timezone-trigger")).toBeNull();
   });
 
-  it("renders the Time field as a 15-minute-slot dropdown (96 options, no free input)", async () => {
+  it("renders the Time field as an input with a compact picker trigger", () => {
     renderDialog();
     const timeField = screen.getByTestId("schedule-time");
-    // It's a Select trigger (combobox), not a free-form <input type=time>.
-    expect(timeField.getAttribute("type")).not.toBe("time");
-    fireEvent.keyDown(timeField, { key: "Enter" });
-    const options = await screen.findAllByRole("option");
-    expect(options).toHaveLength(96);
-    // First and last slots span the day at 15-min granularity.
-    expect(options[0]).toHaveTextContent("12:00 AM");
-    expect(options[options.length - 1]).toHaveTextContent("11:45 PM");
+    expect(timeField.tagName).toBe("INPUT");
+    expect(timeField).toHaveAttribute("placeholder", "5:00 PM");
+    expect(timeField).toHaveClass("text-sm");
+    expect(screen.getByTestId("schedule-time-picker-trigger")).toBeInTheDocument();
   });
 
-  it("picking a time slot flows into the submitted RRULE", async () => {
+  it("lays out Frequency and Time in one compact row", () => {
+    renderDialog();
+    const row = screen.getByTestId("schedule-frequency-time-row");
+    expect(row).toContainElement(screen.getByText("Frequency"));
+    expect(row).toContainElement(screen.getByText("Time"));
+    expect(row).toContainElement(screen.getByTestId("schedule-preset-trigger"));
+    expect(row).toContainElement(screen.getByTestId("schedule-time"));
+    expect(row).toHaveClass("sm:grid-cols-2", "sm:gap-6");
+    expect(screen.getByTestId("schedule-frequency-control")).toHaveClass("w-full");
+    expect(screen.getByTestId("schedule-time-control")).toHaveClass("w-full");
+    expect(screen.getByTestId("schedule-preset-trigger")).toHaveClass("w-full");
+  });
+
+  it("lays out Host full-width like the other top-level fields", () => {
+    renderDialog();
+    const hostField = screen.getByTestId("task-host-field");
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    expect(hostField).not.toHaveClass("sm:w-64");
+    expect(hostField).toContainElement(hostTrigger);
+    expect(hostTrigger).toHaveClass("w-full");
+  });
+
+  it("keeps the footer visible by letting only the dialog body scroll", () => {
+    renderDialog();
+    expect(screen.getByTestId("create-scheduled-task-dialog")).toHaveClass("flex", "flex-col");
+    expect(screen.getByTestId("scheduled-task-dialog-body")).toHaveClass(
+      "min-h-0",
+      "flex-1",
+      "overflow-y-auto",
+    );
+    expect(document.querySelector('[data-slot="dialog-footer"]')).toHaveClass("shrink-0");
+  });
+
+  it("chooses a non-quarter-hour time from the compact picker", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
-    // Agent defaults to the first (polly); just pick 2:30 PM from the Time dropdown.
-    fireEvent.keyDown(screen.getByTestId("schedule-time"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "2:30 PM" }));
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    fireEvent.click(await screen.findByTestId("schedule-hour-05"));
+    fireEvent.click(screen.getByTestId("schedule-minute-07"));
+    fireEvent.click(screen.getByTestId("schedule-period-PM"));
+    expect(screen.getByTestId("schedule-time")).toHaveValue("05:07 PM");
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
+  });
+
+  it("shows all minute choices in the compact picker", async () => {
+    renderDialog();
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    const minuteColumn = await screen.findByTestId("schedule-minute-column");
+    expect(minuteColumn.querySelectorAll('[data-testid^="schedule-minute-"]')).toHaveLength(60);
+    expect(screen.getByTestId("schedule-minute-00")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-01")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-15")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-30")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-45")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-59")).toBeInTheDocument();
+  });
+
+  it("makes overflowing picker columns scrollable without closing the picker", async () => {
+    renderDialog();
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    const hourColumn = await screen.findByTestId("schedule-hour-column");
+    expect(hourColumn).toHaveClass("overflow-y-auto", "overscroll-contain");
+    expect(screen.getByTestId("schedule-minute-column")).toHaveClass("overflow-y-auto");
+
+    fireEvent.wheel(hourColumn, { deltaY: 120 });
+    expect(screen.getByTestId("schedule-time-picker")).toBeInTheDocument();
+  });
+
+  it("renders all minute values and selects a non-quarter-hour minute", async () => {
+    renderDialog();
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    const minuteColumn = screen.getByTestId("schedule-minute-column");
+    expect(minuteColumn.querySelectorAll('[data-testid^="schedule-minute-"]')).toHaveLength(60);
+    expect(screen.getByTestId("schedule-minute-00")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-37")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-59")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("schedule-minute-37"));
+    expect(screen.getByTestId("schedule-time")).toHaveValue("09:37 AM");
+
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=9;BYMINUTE=37");
+  });
+
+  it("round-trips the current non-quarter-hour minute as the selected picker value", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=7" })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    expect(screen.getByTestId("schedule-minute-00")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-07")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("schedule-minute-15")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-30")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-45")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-08")).toBeInTheDocument();
+  });
+
+  it("typing a non-quarter-hour time flows into the submitted RRULE", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.change(screen.getByTestId("schedule-time"), { target: { value: "5:07 PM" } });
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
     fireEvent.click(submit);
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    // Default preset is Daily → 14:30.
-    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=14;BYMINUTE=30");
+    // Default preset is Daily -> 17:07.
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
   });
 
-  it("Hourly preset shows a minute-only dropdown of 15-min slots", async () => {
+  it("does not canonicalize partial time input while the field is focused", () => {
+    renderDialog();
+    const timeField = screen.getByTestId("schedule-time");
+
+    timeField.focus();
+    fireEvent.change(timeField, { target: { value: "" } });
+    fireEvent.change(timeField, { target: { value: "1" } });
+    expect(timeField).toHaveValue("1");
+    fireEvent.change(timeField, { target: { value: "1:" } });
+    expect(timeField).toHaveValue("1:");
+    fireEvent.change(timeField, { target: { value: "1:15" } });
+    expect(timeField).toHaveValue("1:15");
+    expect(screen.queryByTestId("schedule-error")).toBeNull();
+
+    fireEvent.blur(timeField);
+    expect(timeField).toHaveValue("01:15 AM");
+  });
+
+  it("canonicalizes typed time on blur", () => {
+    renderDialog();
+    const timeField = screen.getByTestId("schedule-time");
+    fireEvent.change(timeField, { target: { value: "17:07" } });
+    fireEvent.blur(timeField);
+    expect(timeField).toHaveValue("05:07 PM");
+  });
+
+  it("uses text-sm for dialog text fields that wrap shared primitives", () => {
+    renderDialog();
+    expect(screen.getByTestId("task-name-input")).toHaveClass("text-sm");
+    expect(screen.getByTestId("task-prompt-input")).toHaveClass("text-sm");
+  });
+
+  it("blocks submit while the typed time is invalid", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.change(screen.getByTestId("schedule-time"), { target: { value: "25:99" } });
+    expect(screen.getByTestId("schedule-error")).toHaveTextContent("Enter a valid time");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  });
+
+  it("Hourly preset shows a minute-only text input", async () => {
     renderDialog();
     fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
-    fireEvent.keyDown(screen.getByTestId("schedule-minute"), { key: "Enter" });
-    const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
-    expect(options).toEqual([":00", ":15", ":30", ":45"]);
+    const minuteField = screen.getByTestId("schedule-minute");
+    expect(minuteField.tagName).toBe("INPUT");
+    expect(minuteField).toHaveClass("text-sm");
+    expect(minuteField).toHaveAttribute("placeholder", "0");
+    expect(screen.queryByTestId("schedule-time-picker-trigger")).toBeNull();
+    fireEvent.change(minuteField, { target: { value: "7" } });
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=HOURLY;BYMINUTE=7");
+  });
+
+  it("Hourly preset strips non-digits, caps to two digits, and clamps above 59", async () => {
+    renderDialog();
+    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
+    const minuteField = screen.getByTestId("schedule-minute");
+
+    fireEvent.change(minuteField, { target: { value: "a:-" } });
+    expect(minuteField).toHaveValue("");
+    fireEvent.change(minuteField, { target: { value: "3a" } });
+    expect(minuteField).toHaveValue("3");
+    fireEvent.blur(minuteField);
+    expect(minuteField).toHaveValue("3");
+    fireEvent.change(minuteField, { target: { value: "75" } });
+    expect(minuteField).toHaveValue("59");
+    fireEvent.change(minuteField, { target: { value: "123" } });
+    expect(minuteField).toHaveValue("12");
   });
 
   it("offers exactly the four frequency presets with no Custom entry point", async () => {
@@ -360,6 +651,95 @@ describe("CreateScheduledTaskDialog submit", () => {
     renderDialog();
     expect(screen.queryByTestId("schedule-preview")).toBeNull();
     expect(screen.queryByText(/Reads as:/i)).toBeNull();
+  });
+});
+
+describe("CreateScheduledTaskDialog model + effort controls", () => {
+  it("renders model + effort for a capable (Claude-native) agent, hides them for a plain agent", () => {
+    renderDialog();
+    // Default effective agent is the capable claude-native harness → controls show.
+    expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
+
+    // Switch to Polly (claude-sdk, no permissionMode capability) → controls hide.
+    fireEvent.click(screen.getByTestId("pick-agent-polly"));
+    expect(screen.queryByTestId("task-model-effort-field")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    // The "uses defaults" hint returns when the controls are hidden.
+    expect(
+      screen.getByText("Uses this agent's default model, effort, and permission settings"),
+    ).toBeInTheDocument();
+  });
+
+  it("sends the selected model + effort on create for a capable agent", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+
+    // Pick a model (keyboard is the reliable jsdom path for Radix Select).
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Opus" }));
+    // Pick an effort.
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const arg = mutateAsync.mock.calls[0][0];
+    expect(arg.modelOverride).toBe("opus");
+    expect(arg.reasoningEffort).toBe("high");
+  });
+
+  it("omits model + effort on create when both are left at Default", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const arg = mutateAsync.mock.calls[0][0];
+    expect(arg).not.toHaveProperty("modelOverride");
+    expect(arg).not.toHaveProperty("reasoningEffort");
+  });
+
+  it("prefills model + effort in edit mode from the loaded task", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          modelOverride: "sonnet",
+          reasoningEffort: "medium",
+        })}
+      />,
+    );
+    // Prefilled selections surface as the trigger's shown value.
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet 4.6");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+  });
+
+  it("threads model + effort through update on edit, nulling a cleared override", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          modelOverride: "opus",
+          reasoningEffort: "high",
+        })}
+      />,
+    );
+    // Reset the model back to Default; leave effort at "high".
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    // Cleared model → null; untouched effort → the prefilled value.
+    expect(input.modelOverride).toBeNull();
+    expect(input.reasoningEffort).toBe("high");
   });
 });
 

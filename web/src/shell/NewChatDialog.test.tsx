@@ -22,7 +22,13 @@ import {
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
-import { useHostModelOptions, useHosts, useInstallHarness, type Host } from "@/hooks/useHosts";
+import {
+  useHostModelOptions,
+  useHosts,
+  useInstallHarness,
+  useInstallingHarnesses,
+  type Host,
+} from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -43,9 +49,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
-  // The setup dialog mounts these; default to an inert mutation + not-installing
-  // so tests that don't exercise install don't need to wire them up.
+  // The setup dialog mounts these; default to inert so tests that don't
+  // exercise install / credential-write don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useInstallingHarnesses: vi.fn(() => new Set<string>()),
+  useStoreCredential: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useDetectedCredentials: vi.fn(() => ({ data: [] })),
 }));
 // The setup dialog's copyable command rows call copyText; stub it so a click
 // can be asserted without touching the real clipboard.
@@ -79,10 +88,9 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // the create-POST call-count / call-order assertions below).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  // Empty projects list → no ?project= name resolves to an id, so the project
+  // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
-  // "No newest session" keeps the project prefill inert so the generic
-  // host/workspace defaults under test still apply on ?project= visits.
-  useNewestProjectSession: () => ({ data: null, isError: false }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -110,9 +118,9 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
       },
       {
         kind: "auth",
-        title: "Sign in to Codex",
-        detail: "Uses your ChatGPT subscription — sign in on the host.",
-        action: "command",
+        title: "Set up authentication",
+        detail: "Sign in with your ChatGPT subscription, an API key, or a gateway.",
+        action: "auth",
         command: "codex login",
         status_key: "authed",
       },
@@ -491,9 +499,9 @@ describe("harnessUnconfiguredOnHost", () => {
     expect(harnessUnavailableReasonOnHost("codex-native", testHost)).toBe("binary-missing");
   });
 
-  it("ignores unknown future reason strings", () => {
+  it("falls back to a generic warning for unknown reason strings", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future-reason" }))).toBe(
-      null,
+      "unconfigured",
     );
   });
 
@@ -605,6 +613,15 @@ function setupLandingMocks() {
   useHostWorktreesMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
+  // Reset the install hooks to their inert defaults: per-test overrides
+  // (a pending install set, a callback-firing mutate) must not leak into the
+  // next test — a stale pending set would disable the Install button and make
+  // a later click a silent no-op.
+  vi.mocked(useInstallHarness).mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+  } as unknown as ReturnType<typeof useInstallHarness>);
+  vi.mocked(useInstallingHarnesses).mockReturnValue(new Set<string>());
   setOmnigentHostConfig({});
   resetLandingDraft();
   localStorage.clear();
@@ -1135,23 +1152,21 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
-    // Land with `?project=` so the (otherwise-hidden) project chip renders and
-    // its truncate cap can be asserted alongside the other chips.
+    // Land with `?project=` so the branch chip (worktree) renders alongside the
+    // others for the truncate-cap assertions.
     renderLanding({}, "/?project=docs");
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
-    // The host / working-directory / project / worktree chips each clamp their
-    // label to a fixed max width and `truncate` it, so a long value (a deep
-    // working-directory path, a long project or branch name) is ellipsized
-    // rather than growing the chip and pushing the tray onto a second row.
-    // Dropping `truncate` or the `max-w-*` cap would regress the single-row
-    // layout this guards.
+    // The host / working-directory / worktree chips each clamp their label to a
+    // fixed max width and `truncate` it, so a long value (a deep working-directory
+    // path, a long branch name) is ellipsized rather than growing the chip and
+    // pushing the tray onto a second row. Dropping `truncate` or the `max-w-*`
+    // cap would regress the single-row layout this guards.
     const label = (testid: string) => screen.getByTestId(testid).querySelector("span.truncate");
 
     expect(label("new-chat-landing-workspace-chip")?.className).toContain("max-w-40");
     expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-32");
-    expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
   });
 
@@ -1180,15 +1195,54 @@ describe("NewChatLandingScreen", () => {
     expect(installMutate).toHaveBeenCalledWith("codex-native", expect.anything());
   });
 
+  it("gates Set up auth until the harness is installed (no auth-before-install)", () => {
+    // codex-native not installed: the credential form must NOT be available
+    // yet — the auth row shows a DISABLED "Set up auth" (install first).
+    // Clicking it does nothing / the form doesn't expand, so an auth-first write
+    // (which would leave the dot red) can't happen.
+    mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectUnconfiguredAgent("a2");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+
+    // Install is offered; the auth row's control is present but disabled.
+    expect(screen.getByTestId("harness-setup-install")).toBeTruthy();
+    const setUpAuth = screen.getByTestId("harness-setup-add-credential") as HTMLButtonElement;
+    expect(setUpAuth.textContent).toBe("Set up auth");
+    expect(setUpAuth.disabled).toBe(true);
+    fireEvent.click(setUpAuth);
+    expect(screen.queryByTestId("harness-credential-form")).toBeNull();
+  });
+
+  it("enables Set up auth once the harness is installed (needs-auth)", () => {
+    // Installed but no credential → the auth row's "Set up auth" is enabled and
+    // expands the credential form.
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
+    ]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectUnconfiguredAgent("a2");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+
+    const setUpAuth = screen.getByTestId("harness-setup-add-credential") as HTMLButtonElement;
+    expect(setUpAuth.textContent).toBe("Set up auth");
+    expect(setUpAuth.disabled).toBe(false);
+    fireEvent.click(setUpAuth);
+    expect(screen.getByTestId("harness-credential-form")).toBeTruthy();
+  });
+
   it("marks its Install button loading while THIS harness's install is pending", () => {
-    // The dialog tracks in-flight installs in a local set driven by mutate()'s
-    // onSettled. Hold the mutation pending (never settle) → clicking Install
-    // flips this harness's button to the loading/disabled state.
-    vi.mocked(useInstallHarness).mockReturnValue({
-      // mutate never invokes its options callbacks → install stays in flight.
-      mutate: vi.fn(),
-      isPending: false,
-    } as unknown as ReturnType<typeof useInstallHarness>);
+    // The dialog derives the in-flight indicator from React Query's mutation
+    // state via useInstallingHarnesses (observer-independent, so a concurrent
+    // install can't strand it). When that reports codex-native pending, the
+    // button shows the loading/disabled state.
+    vi.mocked(useInstallingHarnesses).mockReturnValue(new Set(["codex-native"]));
     mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
     renderLanding({
       harness_install_enabled: true,
@@ -1197,18 +1251,19 @@ describe("NewChatLandingScreen", () => {
     selectUnconfiguredAgent("a2");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
-    const button = screen.getByTestId("harness-setup-install") as HTMLButtonElement;
-    expect(button.disabled).toBe(false);
-    // Clicking starts the install; the button shows the pending state (disabled)
-    // because codex-native was added to the dialog's installing set.
-    fireEvent.click(button);
     expect((screen.getByTestId("harness-setup-install") as HTMLButtonElement).disabled).toBe(true);
+    // The "Installing…" caption sits INSIDE the install step row (next to what
+    // it describes), not stranded at the dialog footer.
+    const installStep = screen.getByTestId("harness-setup-step-install");
+    const installingCaption = screen.getByTestId("harness-setup-installing");
+    expect(installStep.contains(installingCaption)).toBe(true);
   });
 
-  it("copies the login command (no Install) for a codex needs-auth state", async () => {
-    // Binary present, just not logged in → dialog shows the `codex login`
-    // instruction as a click-to-copy command, never an Install button (a
-    // reinstall wouldn't add the login).
+  it("offers the inline credential form (not an install) for codex needs-auth", async () => {
+    // Binary present, just not authed → the auth step offers "Set up auth",
+    // which expands the inline credential form. Never an Install button (a
+    // reinstall wouldn't add the credential). The subscription `codex login` is
+    // one option inside the form (the UI can't drive browser OAuth).
     copyTextMock.mockClear();
     mockHosts([
       { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
@@ -1220,11 +1275,15 @@ describe("NewChatLandingScreen", () => {
     selectUnconfiguredAgent("a2");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
-    const command = screen.getByTestId("harness-setup-command");
-    expect(command.textContent).toContain("codex login");
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
-
-    fireEvent.click(command);
+    // Open the inline form.
+    fireEvent.click(screen.getByTestId("harness-setup-add-credential"));
+    expect(screen.getByTestId("harness-credential-form")).toBeTruthy();
+    expect(screen.getByTestId("harness-credential-key")).toBeTruthy();
+    // The subscription login is a copy signpost inside the form.
+    const loginCopy = screen.getByTestId("harness-credential-login-copy");
+    expect(loginCopy.textContent).toContain("codex login");
+    fireEvent.click(loginCopy);
     await waitFor(() => expect(copyTextMock).toHaveBeenCalledWith("codex login"));
   });
 
@@ -1309,13 +1368,13 @@ describe("NewChatLandingScreen", () => {
     selectAgent("a1");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
-    expect(screen.getByTestId("harness-setup-empty").textContent).toContain("omnigent setup");
+    expect(screen.getByTestId("harness-setup-empty").textContent).toContain("omni setup");
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
   });
 
   it("falls back to the original setup guidance when the feature is off", () => {
     // Flag OFF (renderLanding default) → the pre-feature UI: the warning shows
-    // the descriptive "run omnigent setup" message, NOT the "Set up" action or
+    // the descriptive "run omni setup" message, NOT the "Set up" action or
     // dialog. This is the no-op-when-disabled contract.
     mockHosts([
       { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
@@ -1739,16 +1798,17 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
   });
 
-  it("hides the project chip in the normal new-session flow (no project pre-selected)", async () => {
-    // Without a `?project=` param the session is unfiled, so the chip is
-    // hidden entirely — the fresh new-session flow stays project-free.
+  it("shows the default hero heading in the normal new-session flow (no project)", async () => {
+    // Without a `?project=` param the session is unfiled — the hero keeps its
+    // generic prompt, and there is no project chip in the tray.
     renderLanding();
 
     await screen.findByTestId("new-chat-landing-input");
+    expect(screen.getByText("What should we do?")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
   });
 
-  it("files a pre-filled project chip's selection, and invalidates project sessions", async () => {
+  it("files a pre-selected project, and invalidates project sessions", async () => {
     // Sequence: create POST → list projects (resolve name→id) → PATCH project_id.
     authenticatedFetchMock
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "conv_new" }) } as Response)
@@ -1758,13 +1818,11 @@ describe("NewChatLandingScreen", () => {
       } as Response)
       .mockResolvedValue({ ok: true, json: async () => ({ id: "conv_new" }) } as Response);
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
-    // The chip only renders when a project is pre-selected (e.g. via the
-    // sidebar's per-project pencil), so land with `?project=`.
+    // A `?project=` landing (e.g. via the sidebar's per-project pencil) names the
+    // project in the hero heading rather than a tray chip.
     renderLanding({}, "/?project=docs");
 
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
-    );
+    await waitFor(() => expect(screen.getByText("docs")).toBeTruthy());
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "write the docs" },
@@ -1793,25 +1851,9 @@ describe("NewChatLandingScreen", () => {
     invalidateSpy.mockRestore();
   });
 
-  it("hides the chip again when a pre-filled project is cleared to 'No project'", async () => {
-    // When shown, the picker still lets the user clear the selection; doing so
-    // empties `selectedProject` and the chip disappears (consistent with the
-    // "only show when selected" rule).
-    renderLanding({}, "/?project=docs");
-
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
-    );
-
-    fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
-    fireEvent.click(screen.getByText("No project"));
-
-    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull());
-  });
-
-  it("pre-fills the project chip from the ?project= query param", async () => {
+  it("names the project in the hero heading from the ?project= query param", async () => {
     // The sidebar's per-project "new session" pencil lands here with the
-    // project pre-selected — the chip reflects it with no interaction.
+    // project pre-selected — the hero heading reflects it with no interaction.
     authenticatedFetchMock
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "conv_new" }) } as Response)
       .mockResolvedValueOnce({
@@ -1821,11 +1863,7 @@ describe("NewChatLandingScreen", () => {
       .mockResolvedValue({ ok: true, json: async () => ({ id: "conv_new" }) } as Response);
     renderLanding({}, "/?project=Sprint%2042");
 
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain(
-        "Sprint 42",
-      ),
-    );
+    await waitFor(() => expect(screen.getByText("Sprint 42")).toBeTruthy());
 
     // Creating a session files it under that pre-filled project.
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -1840,6 +1878,24 @@ describe("NewChatLandingScreen", () => {
       project_id: string;
     };
     expect(patchBody.project_id).toBe("p_sprint");
+  });
+
+  it("clamps a long project name in the hero heading so it can't overflow the row", async () => {
+    // Project names are capped at 100 chars server-side, which at text-3xl is
+    // far wider than the centered container. The heading must wrap + clamp
+    // rather than render at full width on one line (jsdom can't lay out, so we
+    // assert the class contract that guards this — dropping any of these would
+    // regress to the overflow the old max-w-32 chip prevented).
+    const longName = "A".repeat(100);
+    renderLanding({}, `/?project=${encodeURIComponent(longName)}`);
+
+    const heading = await screen.findByRole("heading", { level: 1 });
+    expect(heading.textContent).toBe(longName);
+    // min-w-0 lets the heading shrink inside the flex row; line-clamp-2 +
+    // break-words wrap/ellipsize instead of overflowing.
+    expect(heading.className).toContain("min-w-0");
+    expect(heading.className).toContain("line-clamp-2");
+    expect(heading.className).toContain("break-words");
   });
 
   it.each([

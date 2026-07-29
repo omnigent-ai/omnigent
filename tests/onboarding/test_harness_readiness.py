@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
+from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -47,6 +49,29 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     # Follow test_harness_install.py's convention: patch the module's
     # shutil.which (reverted by monkeypatch after the test).
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    # Some harnesses (OpenCode) now validate the CLI's ``--version``. Stub a
+    # satisfying version so tests that simply need "binary present" are not
+    # tripped up by an unexpected subprocess probe.
+    def _stub_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            # OpenCode's declared range is [1.17.7, 1.18.0); Cursor uses calendar
+            # versions and needs a build after 2026-06-01; everything else is
+            # fine with a generous semver placeholder.
+            if argv[0].endswith("opencode"):
+                version = "1.17.7\n"
+            elif argv[0].endswith("cursor-agent") or argv[0].endswith("hermes"):
+                version = "2026.07.01\n"
+            else:
+                version = "9.9.9\n"
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=version, stderr="")
+        raise AssertionError(f"unexpected subprocess during readiness tests: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _stub_run)
+    # Auth-aware native harnesses (now including Cursor native) check login state
+    # in the picker map. Treat them as logged in when the test just needs
+    # "binary present".
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key: True)
 
 
 def _no_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -352,8 +377,6 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # binary it reads False before its credential check is even reached.
     for cli in (
         "kimi",
-        "cursor-native",
-        "native-cursor",
         "kiro-native",
         "native-kiro",
         "antigravity-native",
@@ -363,11 +386,13 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "qwen",
         "hermes",
     ):
-        assert result[cli] is False, f"{cli} should be gated on its CLI binary"
-    # Auth-aware harnesses (codex, claude, opencode, pi) carry a two-step signal
-    # in the picker map, so a missing binary is the structured ``"binary-missing"``
-    # (step 1 to-do), not a bare ``False``. Pi joined this group — it now reports
-    # the credential axis (no CLI login; its credential is a provider).
+        assert result[cli] is not True, f"{cli} should be gated on its CLI binary"
+    # Auth-aware harnesses (codex, claude, opencode, cursor, pi) carry a
+    # two-step signal in the picker map, so a missing binary is the structured
+    # ``"binary-missing"`` (step 1 to-do), not a bare ``False``. Cursor joined
+    # this group — it is now auth-aware like the other native CLI harnesses, so
+    # its missing binary surfaces as ``"binary-missing"`` too. Pi is also here —
+    # it reports the credential axis (no CLI login; its credential is a provider).
     for missing in (
         "codex",
         "codex-native",
@@ -375,6 +400,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "claude-native",
         "native-claude",
         "opencode-native",
+        "cursor-native",
+        "native-cursor",
         "pi",
         "pi-native",
     ):
@@ -512,3 +539,49 @@ def test_native_cursor_keys_off_binary_not_api_key(
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     assert harness_is_configured("cursor-native") is True
     assert harness_is_configured("native-cursor") is True
+
+
+def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outdated CLI for major native harnesses is flagged ``version-too-low``.
+
+    This exercises the readiness-layer wiring, which is where the binary is
+    on ``PATH`` but does not satisfy the declared ``min_version`` of the spec.
+    The core promise of the feature is that users see an upgrade prompt instead
+    of being told the binary is missing.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda _key: False)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key: True)
+    result = configured_harness_map()
+    for harness in (
+        "claude-native",
+        "native-claude",
+        "opencode-native",
+        "native-opencode",
+        "cursor-native",
+        "native-cursor",
+        "kiro-native",
+        "native-kiro",
+    ):
+        assert result[harness] == HARNESS_VERSION_TOO_LOW, (
+            f"{harness} should report version-too-low, not binary-missing"
+        )
+
+
+def test_antigravity_native_requires_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``antigravity-native`` needs both the ``agy`` binary and a stored credential."""
+    import omnigent.onboarding.gemini_auth as _ga
+
+    _all_clis_installed(monkeypatch)
+    # Binary installed but no credential → not ready.
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: False)
+    assert harness_is_configured("antigravity-native") is False
+    assert harness_is_configured("native-antigravity") is False
+    # Stored credential present → ready.
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
+    assert harness_is_configured("antigravity-native") is True
+    assert harness_is_configured("native-antigravity") is True

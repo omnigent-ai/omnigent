@@ -44,6 +44,7 @@ from omnigent.onboarding.sandboxes.base import (
     foreground_record_prefix,
     host_image_wheel_install_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -207,6 +208,19 @@ class _ModalRemoteProcess(RemoteProcess):
     The handle's stdout stream carries the combined output (the spawn
     site merges stderr in-shell or via a PTY).
     """
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=True,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=True,
+            streaming_exec=True,
+            foreground_exec=True,
+        )
 
     def __init__(self, process: modal.container_process.ContainerProcess[str]) -> None:
         """

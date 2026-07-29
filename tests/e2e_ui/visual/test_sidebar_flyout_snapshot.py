@@ -19,7 +19,6 @@ timers still fire), so a plain ``hover`` opens it without advancing a fake clock
 
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime, timezone
 
@@ -28,11 +27,13 @@ from playwright.sync_api import Page, expect
 
 _HOST_ID = "host_e2e"
 
-# Anchored so it matches `/v1/sessions` (+ query) but NOT `/v1/sessions/projects`
-# or the per-session `/v1/sessions/{id}/...` sub-paths — same split as the
-# populated-sidebar baseline.
-_SESSIONS_RE = re.compile(r"/v1/sessions(\?(?!.*\bproject=)[^/]*)?$")
+# Anchored so it matches `/v1/sessions` (+ query) but NOT `/v1/sessions/projects`,
+# the per-session `/v1/sessions/{id}/...` sub-paths, or the `?project=` /
+# `?pinned=` filtered variants — same split as the populated-sidebar baseline.
+_SESSIONS_RE = re.compile(r"/v1/sessions(\?(?!.*\b(?:project|pinned)=)[^/]*)?$")
 _PROJECT_SESSIONS_RE = re.compile(r"/v1/sessions\?[^/]*\bproject=")
+# Pinned list — `?pinned=true` drives the server-authoritative Pinned section.
+_PINNED_SESSIONS_RE = re.compile(r"/v1/sessions\?[^/]*\bpinned=")
 _PROJECTS_RE = re.compile(r"/v1/sessions/projects$")
 _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 
@@ -85,11 +86,20 @@ def _row(
     }
 
 
-# One pinned, project-owned row: pinned (via localStorage) so it peels into the
-# always-expanded "Pinned" section, and labelled so hovering it opens the
-# project flyout. It also appears in its project's `?project=` list.
+# Canonical pin label the client reads (the server collapses each viewer's
+# per-user key back to this bare key on the wire); value is the epoch-ms pin time.
+_PINNED_LABEL_KEY = "omnigent.pinned"
+_PINNED_AT_MS = str(_NOW_S * 1000)
+
+# One pinned, project-owned row: it carries the pin label (so it peels into the
+# always-expanded "Pinned" section and the `?pinned=true` query returns it) and
+# the project label (so hovering it opens the project flyout). It also appears
+# in its project's `?project=` list.
 _PINNED_ROW = _row(
-    _PINNED_ID, _PINNED_TITLE, updated_at=_NOW_S - _HOUR, labels={"omni_project": _PROJECT}
+    _PINNED_ID,
+    _PINNED_TITLE,
+    updated_at=_NOW_S - _HOUR,
+    labels={"omni_project": _PROJECT, _PINNED_LABEL_KEY: _PINNED_AT_MS},
 )
 _SESSIONS_BODY = {
     "object": "list",
@@ -98,6 +108,8 @@ _SESSIONS_BODY = {
     "last_id": _PINNED_ID,
     "has_more": False,
 }
+# Both the per-project `?project=` list and the `?pinned=true` list return the
+# same single row.
 _PROJECT_SESSIONS_BODY = {
     "object": "list",
     "data": [_PINNED_ROW],
@@ -105,6 +117,7 @@ _PROJECT_SESSIONS_BODY = {
     "last_id": _PINNED_ID,
     "has_more": False,
 }
+_PINNED_SESSIONS_BODY = _PROJECT_SESSIONS_BODY
 # One label-only project folder holding the pinned session.
 _PROJECTS_BODY = [{"id": None, "name": _PROJECT}]
 
@@ -143,18 +156,19 @@ def test_pinned_project_flyout_matches_baseline(
     page.route("**/v1/agents", lambda r: fulfill_json(r, _AGENTS_BODY))
     page.route("**/v1/hosts", lambda r: fulfill_json(r, _HOSTS_BODY))
     page.route(_FILESYSTEM_RE, lambda r: fulfill_json(r, _EMPTY_LIST_BODY))
-    # Order matters: register the narrower project routes before the bare list.
+    # Order matters: register the narrower project/pinned routes before the bare
+    # list.
     page.route(_PROJECTS_RE, lambda r: fulfill_json(r, _PROJECTS_BODY))
     page.route(_PROJECT_SESSIONS_RE, lambda r: fulfill_json(r, _PROJECT_SESSIONS_BODY))
+    page.route(_PINNED_SESSIONS_RE, lambda r: fulfill_json(r, _PINNED_SESSIONS_BODY))
     page.route(_SESSIONS_RE, lambda r: fulfill_json(r, _SESSIONS_BODY))
 
-    # Seed the working-dir chip and pin the session before the SPA boots so the
-    # Pinned section renders on first paint.
+    # Seed the working-dir chip before the SPA boots. Pins are no longer a
+    # localStorage pref — the Pinned section is driven by the `?pinned=true`
+    # route stubbed above.
     page.add_init_script(
         f'window.localStorage.setItem("omnigent:recent-workspaces",'
         f' JSON.stringify({{"{_HOST_ID}": ["/work/repo"]}}));'
-        f'window.localStorage.setItem("omnigent:pinned-conversation-ids",'
-        f" {json.dumps(json.dumps([_PINNED_ID]))});"
     )
 
     page.goto(f"{live_server}/")
