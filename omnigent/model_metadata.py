@@ -39,7 +39,8 @@ class ModelWireAPI(str, Enum):
     ANTHROPIC_MESSAGES = "anthropic-messages"
     OPENAI_CHAT = "openai-chat"
     OPENAI_RESPONSES = "openai-responses"
-    GEMINI = "gemini"
+    GEMINI_GENERATE_CONTENT = "gemini-generate-content"
+    BEDROCK_CONVERSE = "bedrock-converse"
 
 
 @dataclass(frozen=True)

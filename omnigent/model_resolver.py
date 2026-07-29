@@ -58,7 +58,11 @@ class ModelResolutionRequest:
 
 @dataclass(frozen=True)
 class ModelResolution:
-    """Resolved model plus the metadata and precedence branch used."""
+    """Resolved model plus known metadata and the precedence branch used.
+
+    ``family`` is unavailable when an explicit or configured model is absent
+    from the supplied catalogs.
+    """
 
     model_id: str
     source: ModelResolutionSource
@@ -106,7 +110,9 @@ class MetadataPreferencePolicy:
 
     Provider catalog order remains the stable tie-breaker. Providers can pass
     their own :class:`ModelPreferencePolicy` when their preference rules are
-    richer than the normalized metadata.
+    richer than the normalized metadata. Intent is a best-effort ordering hint,
+    not a hard cost-tier requirement; the selected tier remains available on
+    the resolution metadata.
     """
 
     def rank(
@@ -143,11 +149,12 @@ def resolve_model(
 ) -> ModelResolution:
     """Resolve a model using explicit, configured, live, then static precedence.
 
-    An explicit user/session model always wins, even when it is absent from the
-    catalog. A configured default wins when its known metadata satisfies the
-    request; an unlisted configured default can satisfy requests with no
-    capability, context, family, or wire constraints. Catalog and fallback
-    candidates must have positive metadata for every requested constraint.
+    An explicit user/session model always wins and intentionally bypasses
+    capability, context, family, and wire constraints, even when it is absent
+    from the catalog. A configured default wins when its known metadata
+    satisfies the request; an unlisted configured default can satisfy requests
+    with no metadata constraints. Catalog and fallback candidates must have
+    positive metadata for every requested constraint.
     """
     all_models = (*live_models, *static_fallbacks)
     if request.explicit_model is not None:

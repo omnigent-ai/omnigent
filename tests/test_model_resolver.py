@@ -47,10 +47,14 @@ def _candidate(
     )
 
 
-def test_explicit_model_wins_without_catalog_metadata() -> None:
+def test_explicit_model_bypasses_constraints_without_catalog_metadata() -> None:
     resolution = resolve_model(
         ModelResolutionRequest(
             explicit_model="user-choice",
+            required_capabilities=frozenset({ModelCapability.TOOL_USE}),
+            minimum_context_window=200_000,
+            required_wire_api=ModelWireAPI.BEDROCK_CONVERSE,
+            allowed_families=frozenset({"required-family"}),
         ),
         [_candidate("catalog-choice")],
     )
@@ -58,6 +62,7 @@ def test_explicit_model_wins_without_catalog_metadata() -> None:
     assert resolution.model_id == "user-choice"
     assert resolution.source == ModelResolutionSource.EXPLICIT
     assert resolution.metadata == ModelMetadata()
+    assert resolution.family is None
 
 
 def test_configured_default_wins_before_live_catalog() -> None:
@@ -123,6 +128,26 @@ def test_cost_intents_rank_by_normalized_tier(intent: ModelIntent, expected: str
     resolution = resolve_model(ModelResolutionRequest(intent=intent), models)
 
     assert resolution.model_id == expected
+
+
+def test_cost_intent_returns_best_available_tier() -> None:
+    resolution = resolve_model(
+        ModelResolutionRequest(intent=ModelIntent.FAST),
+        [_candidate("premium", cost_tier=ModelCostTier.PREMIUM)],
+    )
+
+    assert resolution.model_id == "premium"
+    assert resolution.metadata.cost_tier == ModelCostTier.PREMIUM
+
+
+def test_wire_api_vocabulary_covers_model_endpoint_adapters() -> None:
+    assert {wire_api.value for wire_api in ModelWireAPI} == {
+        "anthropic-messages",
+        "bedrock-converse",
+        "gemini-generate-content",
+        "openai-chat",
+        "openai-responses",
+    }
 
 
 def test_constraints_filter_family_context_capability_and_wire_api() -> None:

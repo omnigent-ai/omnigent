@@ -95,8 +95,16 @@ The first migration building block lives in `omnigent/model_metadata.py` and
   provider that reports only ids does not accidentally claim support.
 - Resolution follows explicit user/session choice, configured provider default,
   live catalog, then documented static fallback precedence.
+- Explicit user/session choices intentionally bypass compatibility requirements.
+  When an explicit model is absent from the catalog, its metadata and family
+  remain unknown rather than being inferred from its id.
 - Capability, context, family, and wire requirements filter discovered models;
   unknown metadata does not satisfy a requirement.
+- Intents provide best-effort ranking rather than hard tier guarantees. Callers
+  can inspect the selected metadata when they need to report the actual tier.
+- Wire metadata distinguishes Anthropic Messages, OpenAI Chat Completions,
+  OpenAI Responses, Gemini/Vertex `generateContent`, and Bedrock Converse. It
+  does not describe native CLI, ACP, or other harness transport protocols.
 - Provider catalog order is the default tie-breaker. Providers with richer
   preference rules can supply a `ModelPreferencePolicy` without changing
   callers or the precedence contract.
