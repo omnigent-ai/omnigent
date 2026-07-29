@@ -133,11 +133,21 @@ export function useDeleteScheduledTask() {
   });
 }
 
-// Max attempts and interval for the post-run-now accelerated poll. The poll
-// stops when the newest run reaches a terminal status, or after the cap (~20s
-// ceiling — enough to cover the typical ~5s running→succeeded transition).
-const RUN_NOW_POLL_MAX = 20;
-const RUN_NOW_POLL_INTERVAL_MS = 1_000;
+// Post-run-now accelerated poll tuning. The poll uses EXPONENTIAL BACKOFF rather
+// than a fixed interval: it starts fast (to resolve the common ~5-8s run quickly)
+// and slows down, so a slow run still settles without spamming the server. The
+// interval starts at ~750ms, multiplies by ~1.7 each tick, and is capped per-tick
+// at ~4s; a total time budget of ~20s (plus an attempt safety cap) bounds it,
+// roughly matching the old fixed-1s/20-attempt ceiling but with far fewer
+// requests in the common case (~4 ticks vs ~8).
+const RUN_NOW_POLL_INITIAL_MS = 750;
+const RUN_NOW_POLL_BACKOFF_FACTOR = 1.7;
+const RUN_NOW_POLL_MAX_INTERVAL_MS = 4_000;
+const RUN_NOW_POLL_CEILING_MS = 20_000;
+// Hard safety cap on attempts, independent of the time budget (which is the
+// primary bound). With backoff the budget is reached in well under this many
+// ticks; this only guards against a degenerate timing schedule.
+const RUN_NOW_POLL_MAX = 12;
 
 const TERMINAL_STATUSES = new Set(["succeeded", "failed", "skipped"]);
 
@@ -168,10 +178,26 @@ export function cancelRunNowPoll(id: string): void {
  * the run row in the background as status "running", then transitions it to a
  * terminal status ("succeeded"/"failed"/"skipped") a few seconds later. A
  * single invalidate would miss both transitions. We kick off a bounded
- * accelerated poll: refetch every 1s until the newest run reaches a terminal
- * status, or after the 20-attempt cap (~20s ceiling), then final-invalidate and
- * stop. This ensures the spinner resolves and the unread dot appears once the
- * run completes.
+ * accelerated poll and stop only once the fired run is fully settled.
+ *
+ * STOP CONDITION — two-part, because the run row and its conversation settle at
+ * different times. The run row flips to a terminal status (succeeded/failed/
+ * skipped) a beat BEFORE its conversation leaves "running" and bumps
+ * updated_at. The unread dot (`isConversationUnseen`) keys off the CONVERSATION,
+ * not the run row, and stays grey while the conversation is still "running". So
+ * stopping on run-terminal alone would end the poll one step too early — the
+ * final /runs fetch would still observe a "running" conversation, leaving the
+ * dot grey until a remount refetched the now-idle conversation. We therefore
+ * keep polling until BOTH (a) the fired run row is terminal AND (b) its
+ * conversation has left "running" (or the run has no conversation at all — a
+ * host-less skipped/failed run never gets one, so there is nothing to wait for).
+ * That way the last fetch happens while the page is mounted and the dot flips to
+ * pink WITHOUT navigating away.
+ *
+ * INTERVAL — exponential backoff (see the RUN_NOW_POLL_* constants) rather than
+ * a fixed 1s: fast first ticks resolve the common ~5-8s run quickly, then the
+ * interval grows so a slow run still settles without spamming GET /runs. A total
+ * time budget (~20s) plus an attempt cap bound it.
  */
 export function useRunScheduledTaskNow() {
   const queryClient = useQueryClient();
@@ -194,29 +220,49 @@ export function useRunScheduledTaskNow() {
       if (existing != null) clearTimeout(existing);
 
       let attempts = 0;
+      const startedAt = Date.now();
+
+      // The next backoff interval for the given (1-indexed) attempt number,
+      // capped per-tick. attempt 1 → ~750ms, 2 → ~1275ms, 3 → ~2168ms, …
+      function nextIntervalMs(attemptNumber: number): number {
+        const raw = RUN_NOW_POLL_INITIAL_MS * RUN_NOW_POLL_BACKOFF_FACTOR ** (attemptNumber - 1);
+        return Math.min(raw, RUN_NOW_POLL_MAX_INTERVAL_MS);
+      }
 
       function poll() {
         attempts += 1;
         void queryClient.refetchQueries({ queryKey: scheduledTaskRunsKey(id) }).then(() => {
           const current = queryClient.getQueryData<ScheduledTaskRun[]>(scheduledTaskRunsKey(id));
-          // The newest run is index 0 (most-recent-first). We only stop once the
-          // RUN WE JUST FIRED has reached a terminal status — a new row that is
-          // still "running"/"scheduled" keeps the poll going.
+          // The newest run is index 0 (most-recent-first). Only the run we JUST
+          // fired counts — a new row still "running"/"scheduled" keeps polling.
           const newestRun = current?.[0];
           const isNewRun = newestRun != null && newestRun.id !== preNewestId;
-          const isTerminal = isNewRun && TERMINAL_STATUSES.has(newestRun.status);
-          if (isTerminal || attempts >= RUN_NOW_POLL_MAX) {
-            // Terminal (or cap reached) — final invalidate and stop.
+          const isRunTerminal = isNewRun && TERMINAL_STATUSES.has(newestRun.status);
+          // Conversation-settled: a run with no conversation (host-less skip/fail)
+          // has nothing to wait for; a run WITH a conversation must have left
+          // "running" so the final fetch observes the idle conversation and the
+          // unread dot flips to pink on-page (BUG 1).
+          const hasConversation = isNewRun && newestRun.conversationId != null;
+          const conversationSettled =
+            isRunTerminal &&
+            (!hasConversation ||
+              (newestRun.conversationStatus != null && newestRun.conversationStatus !== "running"));
+
+          const budgetExhausted =
+            attempts >= RUN_NOW_POLL_MAX || Date.now() - startedAt >= RUN_NOW_POLL_CEILING_MS;
+
+          if (conversationSettled || budgetExhausted) {
+            // Fully settled (or bound reached) — final invalidate and stop.
             runNowPollers.delete(id);
             void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(id) });
           } else {
-            const timer = setTimeout(poll, RUN_NOW_POLL_INTERVAL_MS);
+            const timer = setTimeout(poll, nextIntervalMs(attempts + 1));
             runNowPollers.set(id, timer);
           }
         });
       }
 
-      const timer = setTimeout(poll, RUN_NOW_POLL_INTERVAL_MS);
+      const timer = setTimeout(poll, nextIntervalMs(1));
       runNowPollers.set(id, timer);
     },
   });

@@ -136,8 +136,32 @@ describe("mutations invalidate the list", () => {
   });
 });
 
-const RUNNING_RUN: api.ScheduledTaskRun = { ...RUN, status: "running" };
-const SUCCEEDED_RUN: api.ScheduledTaskRun = { ...RUN, status: "succeeded" };
+// Run row running, conversation running (fresh fire, nothing settled yet).
+const RUNNING_RUN: api.ScheduledTaskRun = {
+  ...RUN,
+  status: "running",
+  conversationStatus: "running",
+};
+// Run row terminal but the CONVERSATION is still running — the intermediate
+// state the old poll stopped on too early (BUG 1). The poll must keep going.
+const SUCCEEDED_CONV_RUNNING_RUN: api.ScheduledTaskRun = {
+  ...RUN,
+  status: "succeeded",
+  conversationStatus: "running",
+};
+// Fully settled: run terminal AND conversation left "running".
+const SUCCEEDED_RUN: api.ScheduledTaskRun = {
+  ...RUN,
+  status: "succeeded",
+  conversationStatus: "idle",
+};
+// Host-less skipped run: terminal with no conversation — nothing to wait for.
+const SKIPPED_NO_CONV_RUN: api.ScheduledTaskRun = {
+  ...RUN,
+  status: "skipped",
+  conversationId: null,
+  conversationStatus: null,
+};
 
 function countRunRefetches(spy: { mock: { calls: unknown[][] } }) {
   return spy.mock.calls.filter(
@@ -146,16 +170,33 @@ function countRunRefetches(spy: { mock: { calls: unknown[][] } }) {
   ).length;
 }
 
+// Capture the run-now poll's own setTimeout delays (isolate from react-query's
+// internal timers by filtering to the poll's interval band, ~0.7s–4s).
+function pollDelays(spy: { mock: { calls: unknown[][] } }): number[] {
+  return spy.mock.calls
+    .map((args) => args[1])
+    .filter((d): d is number => typeof d === "number" && d >= 700 && d <= 4_000);
+}
+
 describe("run-now fast-poll after 202", () => {
-  it("keeps polling while the newest run is 'running' and stops once it reaches a terminal status", async () => {
+  it("keeps polling while the CONVERSATION is still running even though the run row is terminal, and stops once it settles (BUG 1)", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {
       const { queryClient, wrapper } = makeWrapper();
+      // Register a queryFn so the poll's refetchQueries actually calls the mocked
+      // API (consuming the mock sequence) and writes each transition into the
+      // cache that the stop condition reads back.
+      queryClient.setQueryDefaults(scheduledTaskRunsKey("st_1"), {
+        queryFn: () => api.listScheduledTaskRuns("st_1"),
+      });
       queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
 
-      // First refetch returns running; second returns succeeded (terminal).
+      // Tick 1: run running. Tick 2: run terminal but conversation STILL running
+      // (the intermediate state the old poll stopped on too early). Tick 3+:
+      // conversation settled to idle — only now may the poll stop.
       vi.mocked(api.listScheduledTaskRuns)
         .mockResolvedValueOnce([RUNNING_RUN])
+        .mockResolvedValueOnce([SUCCEEDED_CONV_RUNNING_RUN])
         .mockResolvedValue([SUCCEEDED_RUN]);
 
       const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
@@ -166,36 +207,115 @@ describe("run-now fast-poll after 202", () => {
         await Promise.resolve();
       });
 
-      // 1s: first poll — sees RUNNING_RUN (non-terminal), keeps going.
+      // Tick 1 (~750ms): run running — keep going.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
+        await vi.advanceTimersByTimeAsync(800);
       });
-      expect(countRunRefetches(refetchSpy)).toBeGreaterThanOrEqual(1);
+      expect(countRunRefetches(refetchSpy)).toBe(1);
 
-      // 1s: second poll — sees SUCCEEDED_RUN (terminal), stops.
+      // Tick 2 (~1275ms later): run terminal but conversation running — MUST NOT
+      // stop (the old bug). Poll continues.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
+        await vi.advanceTimersByTimeAsync(1_300);
+      });
+      expect(countRunRefetches(refetchSpy)).toBe(2);
+
+      // Tick 3 (~2168ms later): conversation now idle — poll stops.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_200);
       });
       const countAfterStop = countRunRefetches(refetchSpy);
-      expect(countAfterStop).toBeGreaterThanOrEqual(2);
+      expect(countAfterStop).toBe(3);
 
-      // No more refetches in the next 5s — poller has stopped.
+      // No further refetches once settled, even well past the ceiling.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.advanceTimersByTimeAsync(20_000);
       });
-      expect(countRunRefetches(refetchSpy)).toBeLessThanOrEqual(20);
+      expect(countRunRefetches(refetchSpy)).toBe(countAfterStop);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("does NOT stop early when the new row is still running (non-terminal)", async () => {
+  it("stops immediately when a terminal run has NO conversation (host-less skip)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { queryClient, wrapper } = makeWrapper();
+      queryClient.setQueryDefaults(scheduledTaskRunsKey("st_1"), {
+        queryFn: () => api.listScheduledTaskRuns("st_1"),
+      });
+      queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
+
+      // First (and every) tick returns a terminal skipped run with no conversation
+      // — there is nothing to wait for, so the poll stops after one tick.
+      vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([SKIPPED_NO_CONV_RUN]);
+
+      const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
+      const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
+
+      await act(async () => {
+        void result.current.mutateAsync("st_1");
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(800);
+      });
+      expect(countRunRefetches(refetchSpy)).toBe(1);
+
+      // Poll stopped — no more refetches over the next 20s.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(countRunRefetches(refetchSpy)).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses EXPONENTIAL BACKOFF for the poll interval (BUG 2)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const { queryClient, wrapper } = makeWrapper();
+      queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
+
+      // Never settles — always running — so we observe several backoff intervals.
+      vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
+
+      const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
+      await act(async () => {
+        void result.current.mutateAsync("st_1");
+        await Promise.resolve();
+      });
+
+      // Let several ticks fire.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+
+      const delays = pollDelays(setTimeoutSpy);
+      // At least three intervals observed, each strictly larger than the last
+      // until the per-tick cap (~4s) is hit.
+      expect(delays.length).toBeGreaterThanOrEqual(3);
+      expect(delays[0]).toBeLessThan(delays[1]!);
+      expect(delays[1]).toBeLessThan(delays[2]!);
+      // First interval is the fast initial tick (< 1s), and none exceed the cap.
+      expect(delays[0]).toBeLessThan(1_000);
+      expect(Math.max(...delays)).toBeLessThanOrEqual(4_000);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("run-now stops polling after the bound even without a settled run", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {
       const { queryClient, wrapper } = makeWrapper();
       queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
 
-      // Runs always return the running row — never transitions to terminal.
+      // Runs never settle — always returns running row (simulates stuck run).
       vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
 
       const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
@@ -206,47 +326,20 @@ describe("run-now fast-poll after 202", () => {
         await Promise.resolve();
       });
 
-      // After 3 polls (3s) the poller is still going (run still running).
+      // Advance well past the ~20s time budget.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(3_000);
-      });
-      expect(countRunRefetches(refetchSpy)).toBeGreaterThanOrEqual(3);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("run-now stops polling after the attempt cap even without a terminal run", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: false });
-    try {
-      const { queryClient, wrapper } = makeWrapper();
-      queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
-
-      // Runs never terminal — always returns running row (simulates stuck run).
-      vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
-
-      const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
-      const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
-
-      await act(async () => {
-        void result.current.mutateAsync("st_1");
-        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(30_000);
       });
 
-      // Advance past the 20-attempt cap (20 × 1s + 1s buffer).
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(21_000);
-      });
+      // Bounded — far fewer than the old ~20 fixed-interval ticks thanks to backoff.
+      const countAfterBound = countRunRefetches(refetchSpy);
+      expect(countAfterBound).toBeLessThanOrEqual(12);
 
-      // At most RUN_NOW_POLL_MAX (20) poll refetches.
-      expect(countRunRefetches(refetchSpy)).toBeLessThanOrEqual(20);
-
-      // No more refetches after another 5s.
-      const countAfterCap = refetchSpy.mock.calls.length;
+      // No more refetches after another 10s — poller has stopped.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.advanceTimersByTimeAsync(10_000);
       });
-      expect(refetchSpy.mock.calls.length).toBe(countAfterCap);
+      expect(countRunRefetches(refetchSpy)).toBe(countAfterBound);
     } finally {
       vi.useRealTimers();
     }
@@ -258,7 +351,7 @@ describe("run-now fast-poll after 202", () => {
       const { queryClient, wrapper } = makeWrapper();
       queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
 
-      // Never terminal — the poll would otherwise keep going until the cap.
+      // Never settles — the poll would otherwise keep going until the bound.
       vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
 
       const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
@@ -271,7 +364,7 @@ describe("run-now fast-poll after 202", () => {
 
       // One poll happens, then the page "unmounts" and cancels the poller.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
+        await vi.advanceTimersByTimeAsync(800);
       });
       const countBeforeCancel = countRunRefetches(refetchSpy);
       expect(countBeforeCancel).toBeGreaterThanOrEqual(1);
@@ -280,9 +373,9 @@ describe("run-now fast-poll after 202", () => {
         cancelRunNowPoll("st_1");
       });
 
-      // No further poll refetches once cancelled, even well past the cap window.
+      // No further poll refetches once cancelled, even well past the bound window.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(25_000);
+        await vi.advanceTimersByTimeAsync(30_000);
       });
       expect(countRunRefetches(refetchSpy)).toBe(countBeforeCancel);
     } finally {
