@@ -66,8 +66,9 @@ prepared with `just ensure`; CI is the enforcement backstop.
 ## Migration Plan
 
 1. **Introduce logical model intents.** Replace fallback ids with stable intents
-   such as `default`, `fast`, `balanced`, `large-context`, `coding`, `image`,
-   and `judge`.
+   currently required by callers: `default`, `fast`, `balanced`, and
+   `powerful`. Add purpose-specific intents only when a concrete caller needs
+   semantics that explicit capability or context requirements cannot express.
 2. **Resolve intents at runtime.** Add one resolver that maps intents to the
    active provider's live catalog, with provider-specific preference rules and
    clear errors when no compatible model exists.

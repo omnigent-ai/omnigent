@@ -50,7 +50,6 @@ def _candidate(
 def test_explicit_model_wins_without_catalog_metadata() -> None:
     resolution = resolve_model(
         ModelResolutionRequest(
-            intent=ModelIntent.CODING,
             explicit_model="user-choice",
         ),
         [_candidate("catalog-choice")],
@@ -73,7 +72,7 @@ def test_configured_default_wins_before_live_catalog() -> None:
     assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
 
 
-def test_capability_intent_skips_unverified_configured_default() -> None:
+def test_capability_requirement_skips_unverified_configured_default() -> None:
     coding_model = _candidate(
         "tool-capable",
         supported=frozenset({ModelCapability.TOOL_USE}),
@@ -81,8 +80,8 @@ def test_capability_intent_skips_unverified_configured_default() -> None:
 
     resolution = resolve_model(
         ModelResolutionRequest(
-            intent=ModelIntent.CODING,
             configured_default="unlisted-default",
+            required_capabilities=frozenset({ModelCapability.TOOL_USE}),
         ),
         [coding_model],
     )
@@ -99,7 +98,7 @@ def test_unknown_capability_does_not_satisfy_requirement() -> None:
     )
 
     resolution = resolve_model(
-        ModelResolutionRequest(intent=ModelIntent.CODING),
+        ModelResolutionRequest(required_capabilities=frozenset({ModelCapability.TOOL_USE})),
         [unknown, supported],
     )
 
@@ -124,21 +123,6 @@ def test_cost_intents_rank_by_normalized_tier(intent: ModelIntent, expected: str
     resolution = resolve_model(ModelResolutionRequest(intent=intent), models)
 
     assert resolution.model_id == expected
-
-
-def test_large_context_intent_prefers_largest_known_window() -> None:
-    models = [
-        _candidate("unknown-window"),
-        _candidate("large-window", context_window=500_000),
-        _candidate("small-window", context_window=100_000),
-    ]
-
-    resolution = resolve_model(
-        ModelResolutionRequest(intent=ModelIntent.LARGE_CONTEXT),
-        models,
-    )
-
-    assert resolution.model_id == "large-window"
 
 
 def test_constraints_filter_family_context_capability_and_wire_api() -> None:
@@ -180,7 +164,9 @@ def test_static_fallback_is_used_only_after_live_candidates_fail() -> None:
     )
 
     resolution = resolve_model(
-        ModelResolutionRequest(intent=ModelIntent.IMAGE),
+        ModelResolutionRequest(
+            required_capabilities=frozenset({ModelCapability.IMAGE_GENERATION})
+        ),
         [_candidate("live-with-unknown-capabilities")],
         static_fallbacks=[fallback],
     )
@@ -209,9 +195,9 @@ def test_provider_preference_policy_can_override_default_order() -> None:
 
 
 def test_no_compatible_model_raises_clear_error() -> None:
-    with pytest.raises(ModelResolutionError, match=r"coding.*tool-use"):
+    with pytest.raises(ModelResolutionError, match=r"default.*tool-use"):
         resolve_model(
-            ModelResolutionRequest(intent=ModelIntent.CODING),
+            ModelResolutionRequest(required_capabilities=frozenset({ModelCapability.TOOL_USE})),
             [_candidate("unknown-tools")],
         )
 

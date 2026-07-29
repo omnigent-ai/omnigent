@@ -82,12 +82,6 @@ class ModelPreferencePolicy(Protocol):
         ...
 
 
-_INTENT_CAPABILITIES: dict[ModelIntent, frozenset[ModelCapability]] = {
-    ModelIntent.CODING: frozenset({ModelCapability.TOOL_USE}),
-    ModelIntent.IMAGE: frozenset({ModelCapability.IMAGE_GENERATION}),
-    ModelIntent.JUDGE: frozenset({ModelCapability.STRUCTURED_OUTPUT}),
-}
-
 _COST_TIER_ORDER: dict[ModelIntent, tuple[ModelCostTier, ...]] = {
     ModelIntent.FAST: (
         ModelCostTier.ECONOMY,
@@ -121,19 +115,6 @@ class MetadataPreferencePolicy:
         candidates: Sequence[ModelCandidate],
     ) -> Sequence[ModelCandidate]:
         indexed = tuple(enumerate(candidates))
-        if intent == ModelIntent.LARGE_CONTEXT:
-            return tuple(
-                candidate
-                for _, candidate in sorted(
-                    indexed,
-                    key=lambda pair: (
-                        pair[1].metadata.context_window is None,
-                        -(pair[1].metadata.context_window or 0),
-                        pair[0],
-                    ),
-                )
-            )
-
         tier_order = _COST_TIER_ORDER.get(intent)
         if tier_order is None:
             return tuple(candidates)
@@ -151,11 +132,6 @@ class MetadataPreferencePolicy:
                 ),
             )
         )
-
-
-def intent_capabilities(intent: ModelIntent) -> frozenset[ModelCapability]:
-    """Return capabilities implied by a stable model intent."""
-    return _INTENT_CAPABILITIES.get(intent, frozenset())
 
 
 def resolve_model(
@@ -181,7 +157,7 @@ def resolve_model(
             all_models,
         )
 
-    capabilities = request.required_capabilities | intent_capabilities(request.intent)
+    capabilities = request.required_capabilities
     if request.configured_default is not None:
         configured = _find_candidate(request.configured_default, all_models)
         if configured is not None and _is_compatible(configured, request, capabilities):

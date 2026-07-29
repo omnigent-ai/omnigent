@@ -13,10 +13,6 @@ class ModelIntent(str, Enum):
     FAST = "fast"
     BALANCED = "balanced"
     POWERFUL = "powerful"
-    LARGE_CONTEXT = "large-context"
-    CODING = "coding"
-    IMAGE = "image"
-    JUDGE = "judge"
 
 
 class ModelCapability(str, Enum):
