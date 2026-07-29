@@ -367,3 +367,34 @@ def test_edenai_registered_as_openai_gateway() -> None:
     assert "edenai" in _providers_mod.COMMON_PROVIDERS
     assert _ENV_KEY_FAMILY["edenai"] == OPENAI_FAMILY
     assert _CATALOG_PROVIDER_FAMILY["edenai"] == OPENAI_FAMILY
+
+
+def test_edenai_key_provider_endpoint_is_not_api_openai_com() -> None:
+    """A ``key`` add for Eden AI must reach api.edenai.run, not api.openai.com.
+
+    Without a ``_KEY_PROVIDER_ENDPOINT`` entry, an ambiently-detected
+    EDENAI_API_KEY is synthesized against the openai-family default
+    (api.openai.com) and every request 401s — the exact failure mode the
+    surrounding code explicitly warns about for third-party gateways.
+    """
+    from omnigent.onboarding.configure_models import key_provider_endpoint
+
+    vendor = key_provider_endpoint("edenai")
+    assert vendor is not None
+    assert vendor.base_url == "https://api.edenai.run/v3"
+    assert vendor.wire_api == "chat"
+
+
+def test_edenai_has_an_interactive_add_path() -> None:
+    """Eden AI must be reachable via the ``configure harness`` add menu.
+
+    ``edenai`` is not in the bundled catalog JSON, so it never appears via
+    :func:`key_providers` alone — it needs a preset entry (like OpenRouter)
+    so the onboarding wizard can actually offer it, not just the routing
+    layer underneath.
+    """
+    from omnigent.onboarding.configure_models import _PRESET_KEY_PROVIDERS, add_menu_options
+
+    assert "edenai" in _PRESET_KEY_PROVIDERS
+    providers_in_menu = {opt.provider for opt in add_menu_options() if opt.provider}
+    assert "edenai" in providers_in_menu
