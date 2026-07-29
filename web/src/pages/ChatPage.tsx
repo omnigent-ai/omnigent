@@ -3884,6 +3884,9 @@ export function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
+  // Timer for the deferred compositionend reset below; cancelled when a new
+  // composition starts so a stale flush can't disarm the IME guard.
+  const composingResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -4792,19 +4795,23 @@ export function Composer({
               else resetCursor();
             }}
             onCompositionStart={() => {
+              // Safari can start a new composition (segment switch) before the
+              // previous compositionend's deferred reset runs — drop it, or it
+              // clears the flag mid-composition.
+              if (composingResetRef.current !== null) {
+                clearTimeout(composingResetRef.current);
+                composingResetRef.current = null;
+              }
               isComposingRef.current = true;
             }}
             onCompositionEnd={() => {
-              // Safari dispatches compositionend BEFORE the keydown of the
-              // Enter that confirmed the composition, and that keydown reports
-              // isComposing=false / keyCode=13 (not the 229 IME fallback) — so
-              // the #132 IME guard in handleKeyDown would let it through and
-              // submit the message. Defer the reset to the next macrotask so
-              // the confirming keydown still observes composition active and is
-              // ignored. The deferred reset flushes well before a user's next
-              // deliberate Enter (or a click-to-confirm), so neither regresses.
-              // #433
-              setTimeout(() => {
+              // Safari fires compositionend BEFORE the keydown of the Enter
+              // that confirmed the composition, and that keydown looks
+              // ordinary (isComposing=false, keyCode=13, not the 229 IME
+              // fallback). Defer the reset a macrotask so the IME guard in
+              // handleKeyDown still sees composition active and ignores it.
+              composingResetRef.current = setTimeout(() => {
+                composingResetRef.current = null;
                 isComposingRef.current = false;
               }, 0);
             }}

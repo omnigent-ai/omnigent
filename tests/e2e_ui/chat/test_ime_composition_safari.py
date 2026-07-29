@@ -1,14 +1,13 @@
 """IME composition guard against Safari's compositionend-before-Enter order.
 
-Covers issue #433 (PR #567): Safari fires ``compositionend`` BEFORE the
-``keydown(Enter)`` that confirmed the composition, and that keydown reports
-``isComposing=false`` / ``keyCode=13`` (not the ``229`` IME-processing
-fallback). The #132 guard (``isComposing`` ref + ``keyCode === 229``) missed
-it because the synchronous ``isComposing=false`` reset in the
-``compositionEnd`` handler had already cleared the flag by the time the
-confirming keydown fired. The fix defers the reset to the next macrotask
-(``setTimeout(0)``) in both live composers (``ChatPage`` + the new-chat
-landing screen) so the confirming Enter still observes composition active
+Safari fires ``compositionend`` BEFORE the ``keydown(Enter)`` that confirmed
+the composition, and that keydown looks ordinary: ``isComposing=false`` /
+``keyCode=13``, not the ``229`` IME-processing fallback. The composer's IME
+guard (``isComposing`` ref + ``keyCode === 229``) therefore missed it while
+the ``compositionEnd`` handler reset the flag synchronously, and the
+confirming Enter submitted mid-composition. Both live composers (``ChatPage``
++ the new-chat landing screen) now defer that reset to the next macrotask
+(``setTimeout(0)``) so the confirming Enter still observes composition active
 and is ignored.
 
 These tests drive the **chat** composer (``ChatPage.tsx``) in a real
@@ -69,8 +68,8 @@ _SAFARI_ORDER_JS = """
 """
 
 # Chrome/Firefox order: the confirming keydown fires DURING composition, so
-# isComposing=true. The #132 guard already catches this; the test is a
-# non-regression guard for #567's deferred reset (it must not clear the flag
+# isComposing=true. The base IME guard already catches this; the test is a
+# non-regression guard for the deferred reset (it must not clear the flag
 # before this keydown). Returns nothing.
 _CHROME_ORDER_JS = """
 () => {
@@ -125,10 +124,10 @@ def test_safari_compositionend_before_enter_does_not_submit(
     """Safari fires compositionend before the confirming Enter; Enter is suppressed.
 
     The confirming keydown reports ``isComposing=false`` / ``keyCode=13`` (not
-    229), which the #132 guard missed once the synchronous
-    ``compositionEnd`` reset had cleared the flag. The deferred reset (#567)
-    keeps ``isComposingRef`` true through this keydown, so ``handleKeyDown``
-    bails on the IME guard and ``submit()`` never runs.
+    229), which the IME guard missed while the ``compositionEnd`` reset was
+    synchronous. The deferred reset keeps ``isComposingRef`` true through this
+    keydown, so ``handleKeyDown`` bails on the IME guard and ``submit()``
+    never runs.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` — the chat composer
@@ -163,13 +162,13 @@ def test_chrome_composition_keydown_during_composition_does_not_submit(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Chrome-order confirming Enter (during composition) is ignored (#132 non-regression).
+    """Chrome-order confirming Enter (during composition) is ignored.
 
     Chrome/Firefox fire the confirming keydown DURING composition with
-    ``isComposing=true``, which #132 already caught. This test guards #567's
-    deferred reset: it must not clear ``isComposingRef`` before this mid-
-    composition keydown (a microtask reset would have). The deliberate Enter
-    after the flush sends normally.
+    ``isComposing=true``, which the base IME guard already caught. This test
+    guards the deferred reset: it must not clear ``isComposingRef`` before this
+    mid-composition keydown (a microtask reset would have). The deliberate
+    Enter after the flush sends normally.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)``.

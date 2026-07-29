@@ -151,9 +151,8 @@ describe("Composer Codex goal control", () => {
 });
 
 /**
- * Flush the deferred isComposing reset queued by compositionend. In real
- * browsers the reset lands within ~one macrotask; in jsdom we await a 0ms
- * timeout to model that gap before firing the next deliberate Enter. #433.
+ * Flush the deferred isComposing reset queued by compositionend — one
+ * macrotask, matching the gap before a user's next deliberate Enter.
  */
 async function flushCompositionReset() {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -272,21 +271,46 @@ describe("Composer slash-command menu", () => {
     expect(onSend).toHaveBeenCalledWith("オムニジェント", undefined);
   });
 
-  it("does not send when Safari fires the confirming Enter after compositionend (#433)", async () => {
+  it("does not send when Safari fires the confirming Enter after compositionend", async () => {
     const onSend = vi.fn();
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
     fireEvent.compositionStart(ta);
     fireEvent.change(ta, { target: { value: "オムニジェント" } });
 
-    // Safari order: compositionend BEFORE the confirming keydown, which reports
-    // isComposing=false / keyCode=13 (not the 229 fallback) — the #132 guard
-    // misses it. The deferred reset keeps isComposing true through this keydown.
+    // Safari order: compositionend BEFORE the confirming keydown, which looks
+    // ordinary (isComposing=false, keyCode=13). Only the deferred reset keeps
+    // the guard armed through this keydown.
     fireEvent.compositionEnd(ta);
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
 
     // After the deferred reset flushes, a deliberate Enter sends normally.
+    await flushCompositionReset();
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("オムニジェント", undefined);
+  });
+
+  it("keeps the guard armed when a new composition starts before the deferred reset flushes", async () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const ta = textarea();
+    fireEvent.compositionStart(ta);
+    fireEvent.change(ta, { target: { value: "オムニ" } });
+
+    // Safari segment switch: compositionend then a new compositionstart before
+    // the queued reset runs. compositionstart must cancel it — otherwise the
+    // stale flush clears the flag during the second composition.
+    fireEvent.compositionEnd(ta);
+    fireEvent.compositionStart(ta);
+    await flushCompositionReset();
+
+    fireEvent.change(ta, { target: { value: "オムニジェント" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    // Ending the second composition re-arms the reset, so the next Enter sends.
+    fireEvent.compositionEnd(ta);
     await flushCompositionReset();
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("オムニジェント", undefined);
