@@ -29,6 +29,13 @@ confined to the read-only calls, each within a bounded budget: polling retries
 transport errors, 408, 429, and 5xx, while the result call re-checks only the
 documented 409 (completed, but the result is not materialized yet).
 
+Some create failures leave the billing outcome unknown — a transport error or
+timeout may still have been received, and 408/5xx reached Nimble before failing
+— while a 202 carrying an unusable body means the run was definitely created.
+Those errors say so explicitly and tell the caller not to resubmit, pointing at
+the run id when one survived and at the account's run history when none did. A
+clear rejection (401/403/404/422) created nothing and carries no such warning.
+
 Effort is optional. When omitted, Nimble applies the selected agent/template
 default (the documented product default is ``high``; template defaults vary).
 The generally available ``low``, ``medium``, ``high``, and ``x-high`` tiers
@@ -245,6 +252,37 @@ def _resolve_effort(
             f"'degrade' was selected explicitly. Learn about enabling Max: {_MAX_CONTACT}"
         ),
         None,
+    )
+
+
+def _unresolved_create_error(message: str, run_id: str | None = None) -> str:
+    """
+    Add do-not-resubmit guidance to a create failure whose billing outcome is
+    unknown or already settled.
+
+    A create that fails in transport, times out, or returns 408/5xx may still
+    have been accepted server-side, and a create that returns an unusable body
+    definitely was. In both cases the run can be live and billed while this
+    call reports an error, so the caller is told to reconcile rather than
+    resubmit — a resubmission would pay for the task twice.
+
+    :param message: The underlying error message.
+    :param run_id: A durable run id to reconcile against, when one survived.
+    :returns: The message with reconciliation guidance appended.
+    """
+    if run_id is not None:
+        follow_up = f"reconcile run {_cap_field(run_id)} before trying again"
+    else:
+        follow_up = (
+            "check the account's recent Agent API run history for a matching run "
+            "before trying again"
+        )
+    # Messages arrive with and without trailing punctuation; normalize so the
+    # guidance always reads as its own sentence.
+    lead = message if message.endswith((".", "!", "?")) else f"{message}."
+    return (
+        f"{lead} Do not retry or resubmit this task automatically: the run may "
+        f"already have been created and billed — {follow_up}."
     )
 
 
@@ -468,13 +506,16 @@ def _start_run(
                 None,
                 "Nimble research error: HTTP 422 (the run request was rejected as invalid).",
             )
-        return (
-            None,
-            None,
-            f"Nimble research error: HTTP {code}{_http_error_detail(exc.response)}",
-        )
+        # 408 and 5xx are ambiguous: the request reached Nimble, so the run may
+        # have been created before the failure was reported.
+        detail = f"Nimble research error: HTTP {code}{_http_error_detail(exc.response)}"
+        if code == 408 or code >= 500:
+            return None, None, _unresolved_create_error(detail)
+        return None, None, detail
     except APIConnectionError as exc:
-        return None, None, f"Nimble research error: {exc}"
+        # Includes timeouts: the request may have been received and started a
+        # run even though no response came back.
+        return None, None, _unresolved_create_error(f"Nimble research error: {exc}")
     finally:
         client.close()
     run = created.model_dump(mode="json")
@@ -485,10 +526,12 @@ def _start_run(
         or len(run_id) > _MAX_RUN_ID_CHARS
         or not _ID_SAFE_RE.match(run_id)
     ):
+        # The run was accepted — and billed — but its id is unusable, so there
+        # is nothing durable to reconcile against except the account history.
         return (
             None,
             None,
-            (
+            _unresolved_create_error(
                 f"Nimble research error: expected a '{_RUN_ID_PREFIX}...' run id, "
                 f"got {_cap_field(repr(run_id))}."
             ),
@@ -496,7 +539,8 @@ def _start_run(
     returned_agent_id = run.get("web_search_agent_id")
     identity_error = _validate_agent_id(returned_agent_id, "the returned")
     if identity_error is not None:
-        return None, None, identity_error
+        # Same situation, but the run id survived and identifies the live run.
+        return None, None, _unresolved_create_error(identity_error, run_id=run_id)
     assert isinstance(returned_agent_id, str)
     if agent_id is not None and returned_agent_id != agent_id:
         # The run belongs to a different agent than the one it was requested
@@ -505,10 +549,11 @@ def _start_run(
         return (
             None,
             None,
-            (
+            _unresolved_create_error(
                 f"Nimble research run {_cap_field(run_id)} was created on agent "
                 f"{_cap_field(returned_agent_id)} but was requested on "
-                f"{_cap_field(agent_id)}; refusing to continue with a mismatched agent."
+                f"{_cap_field(agent_id)}; refusing to continue with a mismatched agent.",
+                run_id=run_id,
             ),
         )
     return run, returned_agent_id, None

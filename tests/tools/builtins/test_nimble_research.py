@@ -505,7 +505,11 @@ def test_create_id_without_prefix_is_protocol_error(tool_ctx: ToolContext) -> No
     """A 202 whose id is not ``task_run_...`` is a protocol error; no polling."""
     respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("queued", id="run_123")))
     out = _invoke(_config(), tool_ctx)
-    assert out == "Nimble research error: expected a 'task_run_...' run id, got 'run_123'."
+    assert out.startswith(
+        "Nimble research error: expected a 'task_run_...' run id, got 'run_123'."
+    )
+    # The run was still created, so the caller is told not to resubmit.
+    assert "Do not retry or resubmit this task automatically" in out
     assert respx.calls.call_count == 1
 
 
@@ -1354,3 +1358,102 @@ def test_generated_run_terminal_failure_keeps_run_id(
     out = _invoke({"api_key": "test-key"}, tool_ctx)
     assert out == f"Nimble research run {_RUN_ID} failed: source unreachable"
     assert result.call_count == 0, "C12: never fetch a result for a non-completed run"
+
+
+# ---------------------------------------------------------------------------
+# Ambiguous create outcomes: do-not-resubmit guidance
+# ---------------------------------------------------------------------------
+
+_NO_RETRY = "Do not retry or resubmit this task automatically"
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [408, 500, 502, 503, 504])
+def test_ambiguous_create_status_warns_against_resubmitting(
+    tool_ctx: ToolContext, status: int
+) -> None:
+    """A create that reached Nimble and then failed may already be billed.
+
+    408 and 5xx mean the request arrived, so the run can be live even though
+    this call reports an error. Resubmitting would pay for the task twice.
+    """
+    create = respx.post(_RUNS_URL).mock(return_value=httpx.Response(status))
+    out = _invoke(_config(), tool_ctx)
+    assert create.call_count == 1, "the create itself must still never be retried"
+    assert _NO_RETRY in out, out
+    assert "may already have been created and billed" in out
+    assert "run history" in out, "with no run id, reconciliation goes through account history"
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.ReadTimeout("timed out"),
+        httpx.ConnectTimeout("connect timed out"),
+        httpx.WriteError("broken pipe"),
+    ],
+)
+def test_transport_failure_on_create_warns_against_resubmitting(
+    tool_ctx: ToolContext, failure: Exception
+) -> None:
+    """A transport failure or timeout is the ambiguous case: no response, unknown billing."""
+    create = respx.post(_RUNS_URL).mock(side_effect=failure)
+    out = _invoke(_config(), tool_ctx)
+    assert create.call_count == 1
+    assert _NO_RETRY in out, out
+    assert "run history" in out
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [401, 403, 404, 422])
+def test_clear_rejection_does_not_warn_against_resubmitting(
+    tool_ctx: ToolContext, status: int
+) -> None:
+    """A rejected create billed nothing, so it must not carry the warning.
+
+    Attaching it to every failure would train the reader to ignore it.
+    """
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(status))
+    out = _invoke(_config(), tool_ctx)
+    assert _NO_RETRY not in out, (
+        f"HTTP {status} created no run; the warning is noise here: {out!r}"
+    )
+
+
+@respx.mock
+def test_unusable_run_id_warns_without_a_durable_id(tool_ctx: ToolContext) -> None:
+    """A 202 with an unusable run id means the run exists but cannot be named."""
+    respx.post(_GENERIC_RUNS_URL).mock(
+        return_value=httpx.Response(202, json=_run("queued", id="run_bogus"))
+    )
+    out = _invoke({"api_key": "test-key"}, tool_ctx)
+    assert _NO_RETRY in out, out
+    assert "run history" in out
+
+
+@respx.mock
+def test_unusable_returned_agent_id_reconciles_by_run_id(tool_ctx: ToolContext) -> None:
+    """When the run id survived, the guidance names it instead of the account history."""
+    respx.post(_GENERIC_RUNS_URL).mock(
+        return_value=httpx.Response(202, json=_run("queued", web_search_agent_id="../../admin"))
+    )
+    out = _invoke({"api_key": "test-key"}, tool_ctx)
+    assert _NO_RETRY in out, out
+    assert f"reconcile run {_RUN_ID}" in out
+
+
+@respx.mock
+def test_owner_mismatch_reconciles_by_run_id(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """A mismatched run was created and billed; the run id identifies it."""
+    respx.post(_RUNS_URL).mock(
+        return_value=httpx.Response(
+            202, json=_run("completed", web_search_agent_id=_GENERATED_AGENT_ID)
+        )
+    )
+    out = _invoke(_config(), tool_ctx)
+    assert _NO_RETRY in out, out
+    assert f"reconcile run {_RUN_ID}" in out
