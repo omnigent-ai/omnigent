@@ -1243,3 +1243,31 @@ describe("FilesPanel sort control", () => {
     expect(screen.getByRole("button", { name: /^Sort:/ })).toBeInTheDocument();
   });
 });
+
+describe("FilesPanel scroll position persistence", () => {
+  function renderAndGetScrollSection(conversationId: string, files: WorkspaceFile[]) {
+    const result = renderPanel({ conversationId, files });
+    const section = result.container.querySelector("section");
+    if (!section) throw new Error("scroll section not found");
+    return { result, section };
+  }
+
+  it("restores the saved scroll position when returning to a conversation", () => {
+    const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));
+
+    // Scroll in conversation A, then leave it.
+    const a = renderAndGetScrollSection("conv_scroll_a", files);
+    a.section.scrollTop = 120;
+    fireEvent.scroll(a.section);
+    a.result.unmount();
+
+    // Conversation B starts at the top, unaffected by A's position.
+    const b = renderAndGetScrollSection("conv_scroll_b", files);
+    expect(b.section.scrollTop).toBe(0);
+    b.result.unmount();
+
+    // Returning to A restores its saved position.
+    const back = renderAndGetScrollSection("conv_scroll_a", files);
+    expect(back.section.scrollTop).toBe(120);
+  });
+});

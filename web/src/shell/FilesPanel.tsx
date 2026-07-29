@@ -12,7 +12,7 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
@@ -249,6 +249,17 @@ function SearchFilterInput({
 }
 
 // ---------------------------------------------------------------------------
+// Scroll-position persistence
+// ---------------------------------------------------------------------------
+
+/**
+ * Module-level cache so the file list's scroll position survives switching
+ * conversations (and unmount/remount). Keyed per conversation and per view
+ * (Changed vs All) since the two lists have independent heights.
+ */
+const scrollTopCache = new Map<string, number>();
+
+// ---------------------------------------------------------------------------
 // Panel
 // ---------------------------------------------------------------------------
 
@@ -359,6 +370,23 @@ export function FilesPanel({
   );
   // Highlight the filters toggle when include/exclude carry a value.
   const treeFiltersActive = treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
+
+  // Restore the saved scroll position once the active view's data is ready.
+  // While a new conversation's files load, the list collapses to a short
+  // loading state and the browser clamps scrollTop to 0 — so restoration
+  // waits for content, and saving is gated on having restored first so the
+  // clamp can't overwrite the cached value.
+  const scrollRef = useRef<HTMLElement>(null);
+  const scrollKey = conversationId ? `${conversationId}:${flatView ? "changed" : "all"}` : null;
+  const contentReady = flatView ? !changedQuery.isLoading : !allFilesQuery.isLoading;
+  const restoredScrollKeyRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (!scrollKey || !contentReady || restoredScrollKeyRef.current === scrollKey) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = scrollTopCache.get(scrollKey) ?? 0;
+    restoredScrollKeyRef.current = scrollKey;
+  }, [scrollKey, contentReady]);
 
   return (
     <div
@@ -492,11 +520,17 @@ export function FilesPanel({
         </div>
       )}
       <section
+        ref={scrollRef}
         className={cn(
           "overflow-y-auto px-2 pb-2",
           flatView ? "pt-1" : "pt-2",
           fillHeight ? "min-h-0 flex-1" : "max-h-72",
         )}
+        onScroll={(event) => {
+          if (scrollKey && restoredScrollKeyRef.current === scrollKey) {
+            scrollTopCache.set(scrollKey, event.currentTarget.scrollTop);
+          }
+        }}
       >
         {flatView ? (
           <FlatFileList
