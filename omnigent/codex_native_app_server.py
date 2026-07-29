@@ -952,11 +952,57 @@ def _codex_policy_hooks_settings(
     }
 
 
+def _merge_user_hooks(
+    policy_payload: dict[str, Any], user_hooks_path: Path
+) -> dict[str, Any]:
+    """
+    Merge user-declared hooks into the policy hooks payload.
+
+    When a symlinked ``hooks.json`` exists in the private ``CODEX_HOME``
+    (the user's real ``~/.codex/hooks.json``), its hook entries are
+    appended after Omnigent's policy hooks for each shared event, and any
+    events declared only by the user are added wholesale. This preserves
+    all user hooks while keeping the Omnigent policy hooks in first
+    position so they always run before user hooks.
+
+    :param policy_payload: The ``hooks.json``-shaped dict built by
+        :func:`_codex_policy_hooks_settings`.
+    :param user_hooks_path: Path to the user's real ``hooks.json``; must
+        be readable.
+    :returns: Merged payload, or *policy_payload* unchanged on any read
+        or parse error (best-effort — policy enforcement must never fail
+        because the user's hooks file is malformed).
+    """
+    try:
+        user_data = json.loads(user_hooks_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return policy_payload
+    user_hooks: dict[str, Any] = user_data.get("hooks", {}) if isinstance(user_data, dict) else {}
+    if not user_hooks:
+        return policy_payload
+    merged: dict[str, Any] = dict(policy_payload)
+    merged["hooks"] = dict(policy_payload["hooks"])
+    for event, entries in user_hooks.items():
+        if not isinstance(entries, list):
+            continue
+        if event in merged["hooks"]:
+            merged["hooks"][event] = list(merged["hooks"][event]) + entries
+        else:
+            merged["hooks"][event] = entries
+    return merged
+
+
 def _write_codex_policy_hooks_file(
     codex_home: Path, bridge_dir: Path, python_executable: str | None
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
+
+    When ``_populate_codex_home_config`` has symlinked the user's
+    ``hooks.json`` into the private home, its entries are merged into the
+    policy hooks payload before the file is written so user hooks fire
+    alongside Omnigent's policy hooks. The symlink is replaced by a
+    regular merged file.
 
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param bridge_dir: Native Codex bridge directory for the hook command.
@@ -966,6 +1012,9 @@ def _write_codex_policy_hooks_file(
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = codex_home / _CODEX_HOOKS_FILE
     payload = _codex_policy_hooks_settings(bridge_dir, python_executable)
+    if path.is_symlink() and path.exists():
+        payload = _merge_user_hooks(payload, path.resolve())
+        path.unlink()
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_CODEX_HOOKS_FILE}.", dir=str(codex_home))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
