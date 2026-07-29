@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -17,6 +17,8 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn() }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceAllFiles: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
@@ -158,6 +160,7 @@ function renderPanel({
 }
 
 beforeEach(() => {
+  copyTextMock.mockReset().mockResolvedValue(undefined);
   useAllFilesMock.mockReset();
   useChangedFilesMock.mockReset();
   useDirectoryMock.mockReset();
@@ -199,6 +202,19 @@ describe("FilesPanel working folder directory", () => {
     expect(screen.getByText("my-project")).toBeInTheDocument();
   });
 
+  it("copies the full working folder path", async () => {
+    renderPanel({
+      conversationId: "conv_wdir_copy",
+      files: [],
+      workingDir: "/home/user/my-project",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy working folder path" }));
+
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledWith("/home/user/my-project"));
+    expect(screen.getByRole("button", { name: "Copied working folder path" })).toBeInTheDocument();
+  });
+
   it("does not render a directory label when workingDir is null", () => {
     renderPanel({ conversationId: "conv_wdir_null", files: [] });
     // "Working folder" label is present but no directory name span
@@ -215,7 +231,7 @@ describe("FilesPanel working folder header role", () => {
   // always visible and the header never carries aria-expanded.
   it("renders the header as a static label (no toggle button) in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^working folder$/i })).toBeNull();
     expect(screen.getByText("Working folder")).toBeInTheDocument();
     // Content is always shown — the scope switch is part of it.
     expect(screen.getByRole("radiogroup", { name: "File scope" })).toBeInTheDocument();
@@ -250,7 +266,7 @@ describe("FilesPanel working folder header role", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^working folder$/i })).toBeNull();
     expect(screen.getByText("Working folder")).toBeInTheDocument();
     expect(screen.getByRole("radiogroup", { name: "File scope" })).toBeInTheDocument();
   });
@@ -258,7 +274,7 @@ describe("FilesPanel working folder header role", () => {
   it("renders a static label header with a Close button in the drawer", () => {
     renderPanel({ conversationId: "conv_header_drawer", files: [], onClose: vi.fn() });
     // The drawer adds an X close button; the title is a plain label everywhere.
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^working folder$/i })).toBeNull();
     expect(screen.getByText("Working folder")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close files" })).toBeInTheDocument();
   });

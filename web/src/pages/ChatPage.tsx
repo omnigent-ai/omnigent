@@ -3042,7 +3042,7 @@ export const BubbleView = memo(
 );
 
 /**
- * Copy-to-clipboard handler for a message bubble's "Copy" action.
+ * Copy-to-clipboard handler with inline success feedback.
  *
  * Uses the shared {@link copyText} helper (async Clipboard API with an
  * `execCommand` fallback) rather than `navigator.clipboard.writeText`
@@ -3053,9 +3053,9 @@ export const BubbleView = memo(
  * copy is confirmed.
  *
  * @param getText - Produces the text to copy at click time.
- * @returns `{ isCopied, handleCopy }` for the action button.
+ * @returns `{ isCopied, handleCopy }` for a copy action button.
  */
-function useCopyMessage(getText: () => string): {
+function useCopyText(getText: () => string): {
   isCopied: boolean;
   handleCopy: () => void;
 } {
@@ -3079,7 +3079,7 @@ function useCopyMessage(getText: () => string): {
         }
       },
       (error) => {
-        console.warn("Failed to copy message", error);
+        console.warn("Failed to copy text", error);
       },
     );
   }, [getText, isCopied, isMobile]);
@@ -3122,7 +3122,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
-  const { isCopied, handleCopy } = useCopyMessage(() => text);
+  const { isCopied, handleCopy } = useCopyText(() => text);
 
   return (
     <Message
@@ -3263,7 +3263,7 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // Getter computes the markdown lazily at click time — the hook must run
   // before the early return below (rules of hooks), but `markdownText` is
   // derived after it.
-  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
+  const { isCopied, handleCopy } = useCopyText(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
 
@@ -3672,6 +3672,9 @@ function ComposerStatusLine({
   // from the same source the badge does so the tray's render guard matches.
   const { session } = useSession(conversationId);
   const isHostBound = !!session?.hostId;
+  const { isCopied: isWorktreePathCopied, handleCopy: copyWorktreePath } = useCopyText(
+    () => session?.workspace ?? "",
+  );
 
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
@@ -3728,6 +3731,23 @@ function ComposerStatusLine({
             <span data-testid="composer-git-branch" className="min-w-0 truncate" title={gitBranch}>
               {gitBranch}
             </span>
+            {session?.workspace && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={isWorktreePathCopied ? "Copied worktree path" : "Copy worktree path"}
+                title={isWorktreePathCopied ? "Copied worktree path" : "Copy worktree path"}
+                onClick={copyWorktreePath}
+                className="-my-1 size-5"
+              >
+                {isWorktreePathCopied ? (
+                  <CheckIcon className="size-3" />
+                ) : (
+                  <CopyIcon className="size-3" />
+                )}
+              </Button>
+            )}
           </span>
         )}
       </div>

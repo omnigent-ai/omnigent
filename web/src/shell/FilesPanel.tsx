@@ -1,6 +1,8 @@
 import {
   ArrowDownAZIcon,
   ArrowDownWideNarrowIcon,
+  CheckIcon,
+  CopyIcon,
   EyeIcon,
   EyeOffIcon,
   FileClockIcon,
@@ -23,6 +25,7 @@ import {
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
@@ -557,19 +560,50 @@ export function FilesPanel({
 // ---------------------------------------------------------------------------
 
 function WorkingDirLabel({ dir }: { dir: string }) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  function copyWorkingDir() {
+    if (copied) return;
+    copyText(dir).then(
+      () => setCopied(true),
+      (error) => console.warn("Failed to copy working folder path", error),
+    );
+  }
+
   // Outer span participates in the flex row as flex-1 for layout/truncation.
   // Inner span is the actual tooltip trigger so Radix anchors the popup to
   // the text's bounding rect (not the full flex-1 width).
   return (
-    <span className="min-w-0 flex-1 flex items-center overflow-hidden">
+    <span className="flex min-w-0 flex-1 items-center gap-1">
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="inline-block max-w-full truncate font-mono text-[11px] text-muted-foreground cursor-default">
+            <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground cursor-default">
               {dirBasename(dir)}
             </span>
           </TooltipTrigger>
           <TooltipContent side="bottom">{dir}</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={copied ? "Copied working folder path" : "Copy working folder path"}
+              className="shrink-0 cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+              onClick={copyWorkingDir}
+            >
+              {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            {copied ? "Copied working folder path" : "Copy working folder path"}
+          </TooltipContent>
         </Tooltip>
       </TooltipProvider>
     </span>
