@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -561,15 +562,27 @@ class TestConstructor(unittest.TestCase):
                 executor = ClaudeSDKExecutor(gateway=True)
 
             captured: dict[str, str | None] = {}
+            event_loop_thread = threading.get_ident()
+
+            def _resolve_model(provider_name: str, *, family: str) -> SimpleNamespace:
+                self.assertNotEqual(threading.get_ident(), event_loop_thread)
+                self.assertEqual((provider_name, family), ("databricks", "claude"))
+                return SimpleNamespace(model_id="catalog-databricks-claude-default")
 
             async def fake_get_or_create_client(sdk, *, session_key, options, model):
                 captured["model"] = model
                 raise RuntimeError("stop after model resolution")
 
-            with patch.object(
-                executor,
-                "_get_or_create_client",
-                side_effect=fake_get_or_create_client,
+            with (
+                patch(
+                    "omnigent.model_catalog.resolve_catalog_model",
+                    side_effect=_resolve_model,
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
             ):
                 with self.assertRaises(RuntimeError):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
