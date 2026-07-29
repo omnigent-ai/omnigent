@@ -53,9 +53,21 @@ _AGENT_NAME = "kiro-native-ui"
 # global and fixed, not account-scoped. ids match what ``kiro-cli --model`` accepts
 # (and ``--list-models`` reports); ``auto`` is kiro's default and a real literal id.
 # Refresh by hand from ``kiro-cli chat --list-models --format json`` if Kiro
-# ships/renames a model.
+# ships/renames a model. Last refreshed against kiro-cli 2.14.0 (adds Claude
+# Sonnet 5, Claude Opus 4.5/4.6/4.7/4.8, and the GPT-5.6 Sol/Terra/Luna preview
+# models, none of which were surfacing in the picker despite being reachable via
+# ``kiro-cli --model`` directly).
 _KIRO_BASE_MODELS: list[dict[str, Any]] = [
     {"id": "auto", "displayName": "Auto", "isDefault": True},
+    {"id": "claude-sonnet-5", "displayName": "Claude Sonnet 5"},
+    {"id": "claude-opus-4.8", "displayName": "Claude Opus 4.8"},
+    {"id": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol"},
+    {"id": "gpt-5.6-terra", "displayName": "GPT-5.6 Terra"},
+    {"id": "gpt-5.6-luna", "displayName": "GPT-5.6 Luna"},
+    {"id": "claude-opus-4.7", "displayName": "Claude Opus 4.7"},
+    {"id": "claude-opus-4.6", "displayName": "Claude Opus 4.6"},
+    {"id": "claude-sonnet-4.6", "displayName": "Claude Sonnet 4.6"},
+    {"id": "claude-opus-4.5", "displayName": "Claude Opus 4.5"},
     {"id": "claude-sonnet-4.5", "displayName": "Claude Sonnet 4.5"},
     {"id": "claude-sonnet-4", "displayName": "Claude Sonnet 4"},
     {"id": "claude-haiku-4.5", "displayName": "Claude Haiku 4.5"},

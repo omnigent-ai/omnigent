@@ -551,8 +551,21 @@ def test_kiro_base_model_options_shape_and_default() -> None:
     options = kiro_base_model_options()
     ids = [o["id"] for o in options]
 
-    # Canonical ids confirmed against ``kiro-cli --list-models`` (2.10.0).
+    # Canonical ids confirmed against ``kiro-cli --list-models`` (2.14.0).
     assert ids[0] == "auto"
+    assert len(ids) == len(set(ids))
+    added = {
+        "claude-sonnet-5",
+        "claude-opus-4.8",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "claude-opus-4.7",
+        "claude-opus-4.6",
+        "claude-sonnet-4.6",
+        "claude-opus-4.5",
+    }
+    assert added.issubset(set(ids))
     assert "claude-haiku-4.5" in ids and "glm-5" in ids
     # Exactly one default, and every option carries the picker fields.
     assert [o["id"] for o in options if o["isDefault"]] == ["auto"]
