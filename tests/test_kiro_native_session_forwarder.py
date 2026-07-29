@@ -1048,6 +1048,214 @@ def test_parse_kiro_jsonl_record_accepts_flat_acp_style_tool_blocks() -> None:
     )
 
 
+def test_extract_tool_calls_id_at_block_level_with_data_envelope() -> None:
+    """A tool block with the id at the block level and the rest under ``data``
+    is not dropped: block-level and envelope fields are both addressable."""
+    content = [
+        {
+            "kind": "toolUse",
+            "toolUseId": "tooluse_A",
+            "data": {"name": "read", "input": {"path": "f.txt"}},
+        }
+    ]
+    calls = forwarder._extract_tool_calls(content)
+    assert calls == (
+        forwarder.KiroToolCall(
+            call_id="tooluse_A", name="read", arguments=json.dumps({"path": "f.txt"})
+        ),
+    )
+
+
+def test_extract_tool_calls_keeps_nameless_call_with_placeholder() -> None:
+    """A recognized tool-use block with an id but no name keeps the call (with a
+    placeholder name) instead of dropping it and emptying the turn ledger."""
+    content = [{"kind": "toolUse", "data": {"tool_use_id": "tooluse_A", "input": {}}}]
+    calls = forwarder._extract_tool_calls(content)
+    assert len(calls) == 1
+    assert calls[0].call_id == "tooluse_A"
+    assert calls[0].name == "tool"
+
+
+def test_extract_tool_results_prefers_structured_over_empty_content() -> None:
+    """A structured-only result (empty ``content``, real ``structuredContent``)
+    yields the structured payload, not ``"[]"``."""
+    content = [
+        {
+            "kind": "toolResult",
+            "data": {
+                "toolUseId": "tooluse_A",
+                "content": [],
+                "structuredContent": {"rows": 3, "result": "actual data"},
+            },
+        }
+    ]
+    results = forwarder._extract_tool_results(content)
+    assert len(results) == 1
+    assert results[0].call_id == "tooluse_A"
+    assert results[0].output != "[]"
+    assert "actual data" in results[0].output
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_nameless_tool_does_not_close_turn_early(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool call whose name key is unrecognized still holds the turn open.
+
+    Regression: dropping the call emptied the pending ledger, so the tool
+    result record was mistaken for a closed turn and the spinner vanished
+    while the tool was still running.
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            _prompt_record("user-1", "run it"),
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "a1",
+                    "content": [
+                        {"kind": "text", "data": "Running"},
+                        {"kind": "toolUse", "data": {"tool_use_id": "tooluse_A", "input": {}}},
+                    ],
+                },
+            },
+            _tool_results_record([{"toolUseId": "tooluse_A", "content": "done"}]),
+            _assistant_record("a2", text="Finished"),
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    posted_events: list[dict[str, Any]] = []
+    _capture_events_client(monkeypatch, posted_events)
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    turn_id = "kiro:turn:user-1"
+    edges = [
+        (e["data"]["status"], e["data"]["response_id"])
+        for e in posted_events
+        if e["type"] == "external_session_status"
+    ]
+    # Exactly one running then one idle: the nameless call held the turn open
+    # through the result, and the FINAL prose (a2) closes it once. No early
+    # close/reopen churn.
+    assert edges == [("running", turn_id), ("idle", turn_id)]
+    kinds = [
+        e["data"]["item_type"] for e in posted_events if e["type"] == "external_conversation_item"
+    ]
+    assert "function_call" in kinds and "function_call_output" in kinds
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_restart_rebinds_known_session_under_ambiguity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart rebinds the persisted session id directly, even when a second
+    same-workspace session would make fresh discovery ambiguous.
+
+    Regression: discovery returned None on two candidates, the read/close block
+    was skipped, and the open turn's card was stranded.
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    jsonl_path = _write_kiro_session(
+        sessions_dir,
+        session_id="session-1",
+        cwd=workspace,
+        lines=[
+            _prompt_record("user-1", "run it"),
+            _assistant_record(
+                "a1",
+                text="Checking",
+                tool_uses=[{"tool_use_id": "tooluse_A", "name": "read", "input": {}}],
+            ),
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    bridge_dir = tmp_path / "bridge"
+    turn_id = "kiro:turn:user-1"
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    all_events: list[dict[str, Any]] = []
+    _capture_events_client(monkeypatch, all_events)
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=bridge_dir,
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+    first_count = len(all_events)
+    assert json.loads((bridge_dir / forwarder._STATE_FILE).read_text())["turn_live"] is True
+
+    # A SECOND same-workspace session appears (would make discovery ambiguous),
+    # and the turn finishes on session-1 while the forwarder is down.
+    _write_kiro_session(
+        sessions_dir,
+        session_id="session-2",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:40Z",
+        lines=[_prompt_record("other-1", "unrelated")],
+    )
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(_tool_results_record([{"toolUseId": "tooluse_A", "content": "data"}]))
+            + "\n"
+        )
+        handle.write(json.dumps(_assistant_record("a2", text="Done")) + "\n")
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=bridge_dir,
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+    second = all_events[first_count:]
+    # The restart rebound session-1 and closed its turn, rather than stranding it.
+    edges = [
+        (e["data"]["status"], e["data"]["response_id"])
+        for e in second
+        if e["type"] == "external_session_status"
+    ]
+    assert ("idle", turn_id) in edges
+    items = [e["data"] for e in second if e["type"] == "external_conversation_item"]
+    assert any(i["item_type"] == "function_call_output" for i in items)
+
+
 def test_forward_state_round_trips_turn_fields(tmp_path: Path) -> None:
     """The persisted cursor carries the open turn's card state across restarts."""
     state = forwarder._ForwardState(

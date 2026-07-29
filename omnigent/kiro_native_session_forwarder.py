@@ -469,15 +469,22 @@ def _block_tag(block: dict[str, object]) -> str | None:
     return None
 
 
-def _block_payload(block: dict[str, object]) -> dict[str, object]:
-    """Return the fields of a tool block, unwrapping a ``data`` envelope.
+def _block_fields(block: dict[str, object]) -> dict[str, object]:
+    """Flatten a content block's addressable fields across both levels.
 
     Text blocks nest their value under ``data`` (``{"kind": "text", "data":
-    ...}``), so tool blocks plausibly nest an object the same way; a flat block
-    carries its fields directly.
+    ...}``), and a tool block may carry its id at the block level while the rest
+    of the payload sits under ``data`` (``{"kind": "toolResult", "toolUseId":
+    ..., "data": {...}}``) or carry everything flat. Reading only the unwrapped
+    ``data`` envelope would then silently lose a block-level id and drop the
+    whole block. So merge: block-level keys are the base, the ``data`` envelope
+    overlays them, and a field found at either level is addressable.
     """
+    fields = {k: v for k, v in block.items() if k not in ("kind", "type", "data")}
     data = block.get("data")
-    return data if isinstance(data, dict) else block
+    if isinstance(data, dict):
+        fields.update(data)
+    return fields
 
 
 def _first_str(payload: dict[str, object], keys: tuple[str, ...]) -> str:
@@ -501,17 +508,28 @@ def _tool_arguments_json(payload: dict[str, object]) -> str:
 
 
 def _tool_output_text(payload: dict[str, object]) -> str:
-    """Return a tool-result block's output as display text."""
+    """Return a tool-result block's output as display text.
+
+    An empty container under an earlier key (e.g. the MCP ``content: []`` a
+    structured-only tool writes) is skipped rather than serialized to ``"[]"``,
+    so a later key that carries the real output (``structuredContent``) still
+    wins. A non-empty structure with no text blocks is remembered as a fallback
+    but a plain-text key is preferred over it.
+    """
+    fallback = ""
     for key in _TOOL_OUTPUT_KEYS:
         value = payload.get(key)
         if isinstance(value, str) and value:
             return value
         if isinstance(value, dict | list):
+            if not value:
+                continue
             nested = _kiro_content_text(value)
             if nested:
                 return nested
-            return json.dumps(value, ensure_ascii=True)
-    return ""
+            if not fallback:
+                fallback = json.dumps(value, ensure_ascii=True)
+    return fallback
 
 
 def _extract_tool_calls(content: object) -> tuple[KiroToolCall, ...]:
@@ -522,13 +540,18 @@ def _extract_tool_calls(content: object) -> tuple[KiroToolCall, ...]:
     for block in content:
         if not isinstance(block, dict) or _block_tag(block) not in _TOOL_USE_BLOCK_TAGS:
             continue
-        payload = _block_payload(block)
-        call_id = _first_str(payload, _TOOL_ID_KEYS)
-        name = _first_str(payload, _TOOL_NAME_KEYS)
-        if not call_id or not name:
+        fields = _block_fields(block)
+        call_id = _first_str(fields, _TOOL_ID_KEYS)
+        if not call_id:
             continue
+        # The tag already proved this is a tool-use block, so require only the
+        # id. A missing/unrecognized name key must not drop the call: dropping
+        # it also empties the turn's tool-call ledger, and a nameless-but-real
+        # call would then let the next prose record close the turn early and
+        # vanish the spinner mid-tool. Render it with a placeholder name.
+        name = _first_str(fields, _TOOL_NAME_KEYS) or "tool"
         calls.append(
-            KiroToolCall(call_id=call_id, name=name, arguments=_tool_arguments_json(payload))
+            KiroToolCall(call_id=call_id, name=name, arguments=_tool_arguments_json(fields))
         )
     return tuple(calls)
 
@@ -541,11 +564,11 @@ def _extract_tool_results(content: object) -> tuple[KiroToolResult, ...]:
     for block in content:
         if not isinstance(block, dict) or _block_tag(block) not in _TOOL_RESULT_BLOCK_TAGS:
             continue
-        payload = _block_payload(block)
-        call_id = _first_str(payload, _TOOL_ID_KEYS)
+        fields = _block_fields(block)
+        call_id = _first_str(fields, _TOOL_ID_KEYS)
         if not call_id:
             continue
-        results.append(KiroToolResult(call_id=call_id, output=_tool_output_text(payload)))
+        results.append(KiroToolResult(call_id=call_id, output=_tool_output_text(fields)))
     return tuple(results)
 
 
@@ -935,12 +958,30 @@ async def forward_kiro_session_to_omnigent(
                         )
                         if expected_path is not None:
                             discovered = (expected_session_id, expected_path)
-                    elif discovered is None:
-                        discovered = await asyncio.to_thread(
-                            _discover_kiro_session_jsonl,
-                            workspace=workspace,
-                            launch_epoch_ms=launch_epoch_ms,
-                        )
+                    else:
+                        # A restart drops the local jsonl_path but not the
+                        # persisted session_id. Rebind to that already-bound id
+                        # directly instead of re-running ambiguity-sensitive
+                        # discovery: with a second same-workspace kiro session
+                        # present, discovery returns None and the read/close
+                        # block below (gated on jsonl_path) never runs, so an
+                        # open turn's live card is stranded. The bound id is
+                        # authoritative; only fall through to discovery for a
+                        # genuinely new session when its file is gone.
+                        if state.session_id is not None:
+                            known_path = await asyncio.to_thread(
+                                _kiro_session_jsonl_for_id,
+                                state.session_id,
+                                workspace=workspace,
+                            )
+                            if known_path is not None:
+                                discovered = (state.session_id, known_path)
+                        if discovered is None:
+                            discovered = await asyncio.to_thread(
+                                _discover_kiro_session_jsonl,
+                                workspace=workspace,
+                                launch_epoch_ms=launch_epoch_ms,
+                            )
                     if discovered is not None:
                         discovered_session_id, discovered_path = discovered
                         if state.session_id != discovered_session_id:
@@ -978,6 +1019,17 @@ async def forward_kiro_session_to_omnigent(
                         # was #1137. The edges posted here always carry the
                         # turn's ``response_id``, which is what drives the live
                         # tool-call bubbles (the goose-native split).
+                        #
+                        # The cursor advances once per record, AFTER its items
+                        # post. A POST that throws partway through a multi-item
+                        # record (e.g. the 2nd of two tool calls) unwinds to the
+                        # poll's outer handler without advancing the cursor, so
+                        # the next poll re-reads the record and re-posts its
+                        # earlier items: delivery is at-least-once, matching the
+                        # goose forwarder's per-row cursor (accepted there as a
+                        # non-blocking duplicate window). No record is lost and
+                        # the turn id/running edge do not duplicate; only items
+                        # within the failed record can repeat.
                         await _mirror_record(
                             client,
                             session_id=session_id,
