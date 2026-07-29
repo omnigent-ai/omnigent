@@ -7748,6 +7748,109 @@ def _reset_fanout_rr_index() -> Iterator[None]:
     _FANOUT_RR_INDEX.clear()
 
 
+@pytest.fixture()
+def _reset_fanout_config_cache() -> Iterator[None]:
+    """Drop the cached config parse before/after a cache test.
+
+    :yields: Nothing — the teardown clears the module global so a cached
+        parse never bleeds into another test's config home.
+    """
+    import omnigent.runner.tool_dispatch as td
+
+    td._FANOUT_CONFIG_CACHE = None
+    yield
+    td._FANOUT_CONFIG_CACHE = None
+
+
+def test_claude_profile_config_parses_once_until_the_file_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _reset_fanout_config_cache: None,
+) -> None:
+    """Repeat spawns reuse one parse; an operator edit lands on the next spawn.
+
+    Every sub-agent spawn resolves a fan-out profile, so an uncached read
+    re-parsed ``~/.omnigent/config.yaml`` on each one.
+    """
+    import omnigent.onboarding.provider_config as pc
+    from omnigent.runner.tool_dispatch import _claude_profile_config
+
+    config_home = tmp_path / "omnigent"
+    config_home.mkdir()
+    config_file = config_home / "config.yaml"
+    config_file.write_text(
+        "claude_profiles:\n  fanout_pool: [work]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    calls = 0
+    real_load_config = pc.load_config
+
+    def counting_load_config() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return real_load_config()
+
+    monkeypatch.setattr(pc, "load_config", counting_load_config)
+
+    first = _claude_profile_config()
+    assert _claude_profile_config() is first, "second read should hit the cache"
+    assert calls == 1
+
+    # An operator edit changes the file's mtime+size, so the next read reparses.
+    config_file.write_text(
+        "claude_profiles:\n  fanout_pool: [work, personal, clientb]\n",
+        encoding="utf-8",
+    )
+    reloaded = _claude_profile_config()
+    assert calls == 2
+    block = reloaded["claude_profiles"]
+    assert isinstance(block, dict)
+    assert block["fanout_pool"] == ["work", "personal", "clientb"]
+
+
+def test_assign_fanout_profile_shares_one_config_read_per_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _reset_fanout_rr_index: None,
+    _reset_fanout_config_cache: None,
+) -> None:
+    """One spawn parses the config at most once, explicit lookup included."""
+    import omnigent.onboarding.provider_config as pc
+    from omnigent.runner.tool_dispatch import _assign_fanout_profile
+
+    config_home = tmp_path / "omnigent"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "claude_profiles:\n"
+        "  profiles:\n"
+        "    - name: work\n"
+        "      config_dir: /tmp/work\n"
+        "    - name: personal\n"
+        "      config_dir: /tmp/personal\n"
+        "  fanout_pool: [work, personal]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    calls = 0
+    real_load_config = pc.load_config
+
+    def counting_load_config() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return real_load_config()
+
+    monkeypatch.setattr(pc, "load_config", counting_load_config)
+
+    # An explicit unknown name exercises both lookups in one call.
+    assert _assign_fanout_profile("conv_cache_parent", explicit="ghost") == "work"
+    assert calls == 1
+    assert _assign_fanout_profile("conv_cache_parent") == "personal"
+    assert calls == 1
+
+
 def test_assign_fanout_profile_round_robin_deterministic(
     monkeypatch: pytest.MonkeyPatch, _reset_fanout_rr_index: None
 ) -> None:

@@ -275,9 +275,14 @@ def load_claude_fanout_pool(
     injects it as the child session's ``claude_profile``, so N sub-agents run
     across N budgets in parallel instead of all on ``active_default``.
 
-    Names must resolve to a configured :class:`ClaudeProfile`; unknown names
-    are silently dropped (a partial pool is still useful, and a typo should
-    not break every spawn). Declared order is preserved so round-robin is
+    Names must resolve to a configured :class:`ClaudeProfile` — which
+    :func:`load_claude_profiles` has already validated against
+    :data:`CLAUDE_PROFILE_NAME_PATTERN` and the reserved
+    :data:`RESERVED_CLAUDE_PROFILE_NAME` — so a pool entry can never carry a
+    name the server would reject when the spawn creates the child session.
+    Anything else (a typo, a profile that failed validation, a non-string) is
+    dropped with a warning rather than breaking every spawn; a partial pool
+    still fans out. Declared order is preserved so round-robin is
     deterministic and testable.
 
     :param config: A pre-loaded config mapping; ``None`` loads the global
@@ -297,6 +302,16 @@ def load_claude_fanout_pool(
     configured = {p.name for p in load_claude_profiles(cfg)}
     pool: list[str] = []
     for name in raw_pool:
-        if isinstance(name, str) and name and name in configured and name not in pool:
+        if not isinstance(name, str) or not name:
+            _logger.warning("claude_profiles: dropping non-string fanout_pool entry %r", name)
+            continue
+        if name not in configured:
+            _logger.warning(
+                "claude_profiles: dropping fanout_pool entry %r — no valid profile with "
+                "that name is configured",
+                name,
+            )
+            continue
+        if name not in pool:
             pool.append(name)
     return pool

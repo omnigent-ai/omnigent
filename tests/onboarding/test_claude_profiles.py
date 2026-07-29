@@ -334,6 +334,30 @@ def test_fanout_pool_drops_non_string_entries() -> None:
     assert load_claude_fanout_pool({"claude_profiles": block}) == ["work"]
 
 
+def test_fanout_pool_cannot_carry_a_name_the_server_would_reject(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pool entries inherit the loader's name validation.
+
+    The runner assigns a pool name as the child's ``claude_profile``, which the
+    server validates on create. A profile whose name breaks the charset (or is
+    the reserved sentinel) never survives :func:`load_claude_profiles`, so it
+    can never reach the pool either — one coherent validation, not two.
+    """
+    block: dict[str, object] = {
+        "profiles": [
+            {"name": "work", "config_dir": "/tmp/work"},
+            {"name": "bad name", "config_dir": "/tmp/bad"},
+            {"name": RESERVED_CLAUDE_PROFILE_NAME, "config_dir": "/tmp/reserved"},
+        ],
+        "fanout_pool": ["work", "bad name", RESERVED_CLAUDE_PROFILE_NAME],
+    }
+    with caplog.at_level("WARNING"):
+        assert load_claude_fanout_pool({"claude_profiles": block}) == ["work"]
+    assert "bad name" in caplog.text
+    assert RESERVED_CLAUDE_PROFILE_NAME in caplog.text
+
+
 def test_fanout_pool_empty_when_all_names_unknown() -> None:
     """A pool of only unknown names → empty (fan-out disabled, not an error)."""
     cfg = _config(

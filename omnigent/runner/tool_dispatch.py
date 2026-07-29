@@ -2253,6 +2253,39 @@ async def _send_to_existing_session(
 # inside a single sync helper with no await gap, so no lock is needed.
 _FANOUT_RR_INDEX: dict[str, int] = {}
 
+# Cached parse of ``~/.omnigent/config.yaml`` for the spawn path, keyed on the
+# file's identity+mtime+size. Resolving a fan-out profile otherwise re-reads
+# and re-parses the whole config on every sub-agent spawn (twice: the explicit
+# lookup and the pool). An operator edit still lands on the next spawn because
+# the stat changes. ``None`` = nothing cached yet.
+_FANOUT_CONFIG_CACHE: tuple[tuple[str, int, int], dict[str, object]] | None = None
+
+
+def _claude_profile_config() -> dict[str, object]:
+    """Return the parsed global config, cached until the file changes.
+
+    :returns: The parsed ``~/.omnigent/config.yaml`` mapping (``{}`` when
+        missing/unreadable). Not a copy — callers must treat it as read-only.
+    """
+    global _FANOUT_CONFIG_CACHE
+    from omnigent.config import global_config_path
+    from omnigent.onboarding.provider_config import load_config
+
+    stamp: tuple[str, int, int] | None = None
+    try:
+        path = global_config_path()
+        st = path.stat()
+        stamp = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    cached = _FANOUT_CONFIG_CACHE
+    if stamp is not None and cached is not None and cached[0] == stamp:
+        return cached[1]
+    config = load_config()
+    if stamp is not None:
+        _FANOUT_CONFIG_CACHE = (stamp, config)
+    return config
+
 
 def _assign_fanout_profile(
     parent_session_id: str,
@@ -2276,6 +2309,9 @@ def _assign_fanout_profile(
     ``await`` gap, so it is atomic w.r.t. other coroutines (asyncio is
     single-threaded) and GIL-safe under concurrent spawns.
 
+    Both lookups share one :func:`_claude_profile_config` read, so a spawn
+    costs at most one config parse (none at all while the file is unchanged).
+
     :param parent_session_id: The caller's session id — the round-robin key.
     :param explicit: Optional explicit profile name from the tool call.
     :returns: The chosen profile name, or ``None`` to leave the child on the
@@ -2286,15 +2322,16 @@ def _assign_fanout_profile(
         load_claude_fanout_pool,
     )
 
+    config = _claude_profile_config()
     if isinstance(explicit, str) and explicit:
-        if claude_profile_by_name(explicit) is not None:
+        if claude_profile_by_name(explicit, config) is not None:
             return explicit
         _logger.warning(
             "sys_session fan-out: explicit claude_profile %r is not a "
             "configured profile; falling back to round-robin pool",
             explicit,
         )
-    pool = load_claude_fanout_pool()
+    pool = load_claude_fanout_pool(config)
     if not pool:
         return None
     idx = _FANOUT_RR_INDEX.get(parent_session_id, 0)
