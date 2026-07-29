@@ -159,7 +159,13 @@ prompt: |
   the affected `<img>` (MDX supports JSX comments; the build is unaffected).
 
   ## Output contract (your final assistant text)
-  After a line containing exactly `<!-- DOC_DRAFT_SUMMARY -->`, emit:
+  On the line IMMEDIATELY BEFORE `<!-- DOC_DRAFT_SUMMARY -->`, emit a single
+  `DOC_PR_TITLE:` line — a concise, imperative summary of what the docs now cover,
+  grounded in the diff (e.g. `DOC_PR_TITLE: document SMALLINT enum-column storage`).
+  Keep it under 60 characters, no trailing period, and do NOT prefix it with
+  `docs:` (the workflow adds that). This becomes the docs PR title.
+
+  Then, after a line containing exactly `<!-- DOC_DRAFT_SUMMARY -->`, emit:
   - `## Changes documented` — one bullet per file you created, edited, or deleted
     (pages and `components/DocsSidebarFull.js`): `path — what changed` (say
     "deleted" / "removed section" for removals). If you made no edits, write

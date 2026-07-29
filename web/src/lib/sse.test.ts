@@ -113,3 +113,47 @@ describe("parseEvent — session.status (background_task_count)", () => {
     expect(bgCount({ background_task_count: -1 })).toBeUndefined();
   });
 });
+
+describe("parseEvent — session.mcp_startup", () => {
+  it("parses a per-server startup map for the MCP startup band", () => {
+    const ev = parseEvent("session.mcp_startup", {
+      conversation_id: "conv_a",
+      servers: {
+        safe: { status: "failed", error: "handshake failed" },
+        "storage-console": { status: "starting", error: null },
+      },
+    });
+    expect(ev).toEqual({
+      type: "session_mcp_startup",
+      conversationId: "conv_a",
+      servers: {
+        safe: { status: "failed", error: "handshake failed" },
+        "storage-console": { status: "starting", error: null },
+      },
+    });
+  });
+
+  it("skips entries with unknown statuses instead of dropping the frame", () => {
+    // A partial map still updates the band; a bogus status must not reach
+    // the store where it would render an unknown state.
+    const ev = parseEvent("session.mcp_startup", {
+      conversation_id: "conv_a",
+      servers: {
+        ok: { status: "ready" },
+        bad: { status: "exploded" },
+      },
+    });
+    expect(ev).toEqual({
+      type: "session_mcp_startup",
+      conversationId: "conv_a",
+      servers: { ok: { status: "ready", error: null } },
+    });
+  });
+
+  it("rejects frames without a conversation id or servers map", () => {
+    expect(parseEvent("session.mcp_startup", { servers: {} })).toBeNull();
+    expect(
+      parseEvent("session.mcp_startup", { conversation_id: "conv_a", servers: "nope" }),
+    ).toBeNull();
+  });
+});

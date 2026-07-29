@@ -445,6 +445,24 @@ class TestBuildModelsJson(unittest.TestCase):
         entry = next(e for e in provider["models"] if e["id"] == model)
         self.assertEqual(entry.get("input"), ["text", "image"])
 
+    def test_dynamic_reasoning_model_gets_reasoning_flag(self):
+        # DeepSeek streams output on ``reasoning_content``; without
+        # ``reasoning: true`` Pi's openai-completions parser never consumes
+        # that channel and the turn dies with "Stream ended without finish_reason".
+        # GLM now uses the Responses API so it no longer needs this flag.
+        model = "databricks-deepseek-r1"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertIs(entry.get("reasoning"), True, model)
+
+    def test_dynamic_non_reasoning_model_has_no_reasoning_flag(self):
+        model = "databricks-mlflow-2-5-pro"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertNotIn("reasoning", entry)
+
     def test_static_model_declared_image_capable(self):
         # #516 review: a STATIC (pre-registered) vision model must also
         # advertise image input. The dynamic-registration append is gated on
@@ -503,19 +521,18 @@ class TestBuildModelsJson(unittest.TestCase):
             self.assertNotIn("/ai-gateway/codex", base_url)
             self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
 
-    def test_gemini_model_routed_off_codex_gateway(self):
-        # Gemini falls to the databricks-completions catch-all; it must land on
-        # serving-endpoints, not the codex URL it used to inherit (#241).
+    def test_gemini_model_routed_to_mlflow_gateway(self):
+        # Gemini uses /ai-gateway/mlflow/v1 — system.ai.* ids 404 at serving-endpoints
+        # and the Responses API returns 400 for Gemini.
         result = _build_models_json(
             "https://host.example.com",
             "tok",
-            {"openai": "https://host.example.com/ai-gateway/codex/v1"},
-            model="databricks-gemini-2-5-pro",
+            model="system.ai.gemini-3-flash",
         )
-        provider = result["providers"][_pi_provider_for_model("databricks-gemini-2-5-pro")]
-        self.assertEqual(provider["baseUrl"], "https://host.example.com/serving-endpoints")
+        provider = result["providers"][_pi_provider_for_model("system.ai.gemini-3-flash")]
+        self.assertEqual(provider["baseUrl"], "https://host.example.com/ai-gateway/mlflow/v1")
         self.assertIn(
-            "databricks-gemini-2-5-pro",
+            "system.ai.gemini-3-flash",
             [entry.get("id") for entry in provider["models"]],
         )
 
@@ -2048,14 +2065,17 @@ class TestRunTurn(unittest.TestCase):
             fake_rpc.process.stdin = _FakeStreamWriter()
             fake_rpc._stderr_lines = []
 
+            errored = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "Rate limited",
+            }
             lines = [
                 json.dumps({"type": "response", "success": True}),
-                json.dumps(
-                    {
-                        "type": "message_end",
-                        "message": {"stopReason": "error", "errorMessage": "Rate limited"},
-                    }
-                ),
+                json.dumps({"type": "message_end", "message": errored}),
+                # Pi's agent loop always emits agent_end after an errored call.
+                json.dumps({"type": "agent_end", "messages": [errored]}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2077,6 +2097,136 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("Rate limited", events[0].message)
+
+        _run(_test())
+
+    def test_message_end_error_with_stream_eof_fails_with_real_error(self):
+        """If pi dies after reporting the errored message (no agent_end ever
+        arrives), the turn still fails with pi's error message rather than
+        the generic ended-without-response fallback.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {"stopReason": "error", "errorMessage": "boom"},
+                    }
+                ),
+            ]
+
+            async def fake_read_line(timeout=120.0):
+                del timeout
+                if lines:
+                    return lines.pop(0)
+                return None  # EOF: process died without agent_end.
+
+            fake_rpc.read_line = fake_read_line
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertEqual(events[0].message, "boom")
+
+        _run(_test())
+
+    def test_post_tool_error_drains_agent_end_before_failing(self):
+        """A message_end error after a successful tool call fails the turn
+        with pi's error message, but only after consuming the trailing
+        ``agent_end`` — leaving it queued would make the next turn on the
+        same RPC session read the stale terminal event as its own end.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+
+            parse_error = "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
+            errored_assistant = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": parse_error,
+            }
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "sys_os_shell",
+                        "isError": False,
+                        "result": {"content": [{"type": "text", "text": "ok"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": errored_assistant,
+                    }
+                ),
+                # Pi always emits agent_end after the errored LLM call ends
+                # the agent loop; it carries the errored message.
+                json.dumps({"type": "agent_end", "messages": [errored_assistant]}),
+            ]
+            for line in lines:
+                fake_rpc._line_queue.put_nowait(line)
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "run smoke"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
+            self.assertEqual(len(tool_completes), 1)
+            self.assertEqual(tool_completes[0].status, ToolCallStatus.SUCCESS)
+            # The turn fails with pi's real error — no fabricated assistant
+            # text, no synthetic TurnComplete.
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual([e.message for e in errors], [parse_error])
+            self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
+            self.assertFalse(any(isinstance(e, TextChunk) for e in events))
+            # The trailing agent_end was consumed: nothing stale is left for
+            # the next turn on this RPC session.
+            self.assertTrue(fake_rpc._line_queue.empty())
 
         _run(_test())
 
@@ -2820,10 +2970,15 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-claude-sonnet-4-6",
         "databricks-claude-sonnet-4-5",
     ]
-    openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == [
+    # Older GPT models (no tool-rejection via /chat/completions) → completions.
+    openai_completions_ids = [m["id"] for m in providers["databricks"]["models"]]
+    assert openai_completions_ids == [
         "databricks-gpt-5-4-mini",
         "databricks-gpt-5-4",
+    ]
+    # Newer GPT → responses API. Kimi/inkling/Qwen3 registered dynamically only.
+    openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
+    assert openai_responses_ids == [
         "databricks-gpt-5-5",
         "databricks-gpt-5-5-pro",
     ]
@@ -2835,7 +2990,7 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
 def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
     """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
     models = _build_models_json("https://host.example.com", "tok")
-    by_id = {m["id"]: m for m in models["providers"]["databricks"]["models"]}
+    by_id = {m["id"]: m for m in models["providers"]["databricks-openai"]["models"]}
     for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
         assert by_id[model_id]["contextWindow"] == 400000
         assert by_id[model_id]["maxTokens"] == 128000
@@ -2871,6 +3026,7 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
     # _pi_provider_for_model routes it to, advertising image input so Pi
     # doesn't strip attached images (#515).
     entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
+    # Non-Databricks kimi on OpenRouter uses completions path (no reasoning flag needed).
     assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.

@@ -64,6 +64,9 @@ describe("shouldShowModelPicker", () => {
     );
     // kiro applies the picked model as --model at launch (no in-session mirror).
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "kiro-native-ui" } })).toBe(true);
+    // pi injects a live model switch into the running Pi process (via the bridge
+    // inbox → setModel) and mirrors in-TUI /model picks back to model_override.
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "pi-native-ui" } })).toBe(true);
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {

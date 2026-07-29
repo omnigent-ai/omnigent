@@ -49,7 +49,8 @@ pub fn default_pod_dir(repo_root: &Path) -> Result<PathBuf> {
     Ok(cache.join("omnidev").join(format!("{slug}-{hash}")))
 }
 
-fn cache_home() -> Result<PathBuf> {
+/// `${XDG_CACHE_HOME:-~/.cache}`.
+pub fn cache_home() -> Result<PathBuf> {
     if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
         if !x.is_empty() {
             return Ok(PathBuf::from(x));
@@ -57,6 +58,27 @@ fn cache_home() -> Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".cache"))
+}
+
+/// `${XDG_CONFIG_HOME:-~/.config}`.
+pub fn config_home() -> Result<PathBuf> {
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !x.is_empty() {
+            return Ok(PathBuf::from(x));
+        }
+    }
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".config"))
+}
+
+/// `~/.config/omnidev/install.toml` — durable record of install intent.
+pub fn install_config_path() -> Result<PathBuf> {
+    Ok(config_home()?.join("omnidev").join("install.toml"))
+}
+
+/// `~/.cache/omnidev/omnigent-check.json` — volatile update-check state.
+pub fn check_cache_path() -> Result<PathBuf> {
+    Ok(cache_home()?.join("omnidev").join("omnigent-check.json"))
 }
 
 /// FNV-1a 64-bit, rendered as 8 hex chars. No external dep needed — we only

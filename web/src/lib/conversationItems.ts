@@ -61,6 +61,13 @@ export interface ErrorItem extends BaseItem {
   message: string;
 }
 
+export interface ReasoningItem extends BaseItem {
+  type: "reasoning";
+  model: string;
+  summary: Array<{ type: string; text: string }>;
+  content?: Array<{ type: string; text: string }>;
+}
+
 /** The provider-native tool item types the runtime persists today. */
 export const NATIVE_TOOL_ITEM_TYPES = new Set<string>([
   "web_search_call",
@@ -145,12 +152,12 @@ export interface RoutingDecisionItem extends BaseItem {
   type: "routing_decision";
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
-  /** Difficulty tier the router assigned. */
-  tier: "cheap" | "medium" | "expensive";
   /** `true` when the brain ran on `model`; `false` = "would have picked". */
   applied: boolean;
   /** The router's one-line rationale. */
   rationale: string;
+  /** Sub-agent name when mirrored into the parent session; undefined otherwise. */
+  agent?: string;
 }
 
 export type ConversationItem =
@@ -158,6 +165,7 @@ export type ConversationItem =
   | FunctionCallItem
   | FunctionCallOutputItem
   | ErrorItem
+  | ReasoningItem
   | NativeToolItem
   | CompactionItem
   | SlashCommandItem
@@ -179,6 +187,10 @@ export function isFunctionCallOutputItem(item: ConversationItem): item is Functi
 
 export function isErrorItem(item: ConversationItem): item is ErrorItem {
   return item.type === "error";
+}
+
+export function isReasoningItem(item: ConversationItem): item is ReasoningItem {
+  return item.type === "reasoning";
 }
 
 export function isNativeToolItem(item: ConversationItem): item is NativeToolItem {

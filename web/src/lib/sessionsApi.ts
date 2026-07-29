@@ -13,10 +13,12 @@
 import type { ConversationItem } from "./conversationItems";
 import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
+import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
+import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import type {
-  CodexModelOption,
   ModelUsage,
+  NativeModelOption,
   NestedSessionItem,
   SandboxStatus,
   Session,
@@ -25,6 +27,14 @@ import type {
   SessionStatus,
   SkillSummary,
 } from "./types";
+
+/** Returns the client surface label for the X-Omnigent-Client telemetry header. */
+function getClientSurface(): string {
+  if (isElectronShell()) return "desktop";
+  if (isIOSShell()) return "ios";
+  if (isAndroidShell()) return "android";
+  return "web";
+}
 
 /**
  * MCP-shape elicitation response, used as the `result` argument to
@@ -188,6 +198,7 @@ interface SessionResponseWire {
    * absent) for top-level sessions.
    */
   sub_agent_name?: string | null;
+  kind?: "default" | "sub_agent" | null;
   todos?: Array<{
     content: string;
     status: "pending" | "in_progress" | "completed";
@@ -199,7 +210,8 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
-  model_options?: CodexModelOption[];
+  /** Runner-owned model picker rows for native sessions. */
+  model_options?: NativeModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -212,6 +224,7 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  mcp_startup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
    * idle. Lets a client reconnecting mid-turn reopen a streaming
@@ -299,11 +312,13 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
+    kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
 }
@@ -425,7 +440,7 @@ export async function createSession(
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -461,6 +476,7 @@ export async function createBundledSession(
   form.append("bundle", bundle);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
+    headers: { "X-Omnigent-Client": getClientSurface() },
     body: form,
   });
   if (!res.ok) {
@@ -513,7 +529,7 @@ export async function forkSession(
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -636,9 +652,10 @@ export async function updateSession(
     costControlModeOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
+    labels?: Record<string, string>;
   },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null> = {};
+  const body: Record<string, string | boolean | null | Record<string, string>> = {};
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }
@@ -653,6 +670,11 @@ export async function updateSession(
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
+  }
+  if (updates.labels !== undefined) {
+    // Merge-upsert on the server; an empty-string value clears a label
+    // (e.g. the pinned flag on unpin — see PATCH /v1/sessions handler).
+    body.labels = updates.labels;
   }
   if (updates.silent) {
     body.silent = true;

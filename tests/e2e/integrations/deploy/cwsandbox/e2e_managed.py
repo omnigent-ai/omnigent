@@ -205,7 +205,7 @@ def _dump_server_logs(sb: Sandbox | None) -> None:
         [
             "bash",
             "-lc",
-            "tail -50 ~/.omnigent/logs/cli-*.log 2>/dev/null; "
+            "tail -50 ~/.omnigent/logs/cli/cli-*.log 2>/dev/null; "
             "echo '--- stdout ---'; tail -15 /tmp/omnigent-server.log",
         ]
     ).result()

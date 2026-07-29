@@ -8,6 +8,9 @@ import { KeyboardShortcutsDialog, openKeyboardShortcuts } from "./KeyboardShortc
 const isNativeShell = vi.fn(() => false);
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
+  // DialogContent (rendered here) reads isIOSShell to size modals for the iOS
+  // keyboard; this suite exercises the browser path, so it's always false.
+  isIOSShell: () => false,
 }));
 
 beforeEach(() => {

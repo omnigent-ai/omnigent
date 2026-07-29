@@ -352,13 +352,65 @@ async def test_streaming_maps_text_reasoning_and_usage(monkeypatch: pytest.Monke
     assert completes[0].response == "Hello world"
     # Usage maps the SDK's UsageMetadata field names onto Omnigent's keys and
     # stamps the resolved model so the scaffold can price the turn.
+    # input_tokens is the NON-cached portion: Gemini's prompt_token_count (11)
+    # is inclusive of cached_content_token_count (2), and compute_llm_cost
+    # prices cache_read_input_tokens additively, so input must be 11 - 2 = 9 to
+    # avoid double-billing the cached tokens.
     assert completes[0].usage == {
-        "input_tokens": 11,
+        "input_tokens": 9,
         "output_tokens": 7,
         "total_tokens": 18,
         "cache_read_input_tokens": 2,
         "model": "gemini-3-pro",
     }
+
+
+def test_extract_usage_subtracts_cached_to_avoid_double_billing() -> None:
+    """``input_tokens`` excludes cached tokens so cache reads aren't billed twice.
+
+    Gemini's ``prompt_token_count`` is inclusive of
+    ``cached_content_token_count``, and ``compute_llm_cost`` prices
+    ``cache_read_input_tokens`` additively while requiring ``input_tokens`` to
+    be the NON-cached portion. Passing the full prompt count as ``input_tokens``
+    while also reporting ``cache_read_input_tokens`` bills the cached tokens
+    twice — once at the full input rate, once at the cache-read rate.
+
+    Regression guard: pre-fix ``input_tokens`` was the full 1000 here.
+    """
+    meta = SimpleNamespace(
+        prompt_token_count=1000,
+        candidates_token_count=200,
+        total_token_count=1200,
+        cached_content_token_count=800,
+    )
+    usage = AntigravityExecutor._extract_usage(meta)
+    assert usage is not None
+    # 1000 prompt - 800 cached = 200 non-cached input.
+    assert usage["input_tokens"] == 200, (
+        f"input_tokens {usage['input_tokens']} != 200 — the cached portion must be "
+        "subtracted from the Gemini prompt count so compute_llm_cost does not "
+        "double-bill it against the additive cache_read bucket."
+    )
+    assert usage["cache_read_input_tokens"] == 800
+    assert usage["output_tokens"] == 200
+    assert usage["total_tokens"] == 1200
+    # input + cache_read reconstructs the original prompt count, proving the
+    # cached tokens are counted exactly once across the two buckets.
+    assert usage["input_tokens"] + usage["cache_read_input_tokens"] == 1000
+
+
+def test_extract_usage_clamps_when_cached_exceeds_prompt() -> None:
+    """A malformed cached > prompt count clamps ``input_tokens`` to 0, not negative."""
+    meta = SimpleNamespace(
+        prompt_token_count=100,
+        candidates_token_count=50,
+        total_token_count=150,
+        cached_content_token_count=999,
+    )
+    usage = AntigravityExecutor._extract_usage(meta)
+    assert usage is not None
+    assert usage["input_tokens"] == 0
+    assert usage["cache_read_input_tokens"] == 999
 
 
 @pytest.mark.asyncio
@@ -904,11 +956,14 @@ async def test_usage_observer_notified_on_turn_complete(monkeypatch: pytest.Monk
         remove()
 
     # Exactly one notification, carrying the model and the mapped token counts
-    # from the turn's UsageMetadata (_FakeUsage: prompt=11, candidates=7, total=18).
+    # from the turn's UsageMetadata (_FakeUsage: prompt=11, candidates=7,
+    # total=18, cached=2). input_tokens is the non-cached portion (11 - 2 = 9)
+    # so cached tokens are not double-billed against the additive cache_read
+    # bucket.
     assert len(seen) == 1
     assert seen[0] == {
         "model": "gemini-3-pro",
-        "input_tokens": 11,
+        "input_tokens": 9,
         "output_tokens": 7,
         "total_tokens": 18,
     }

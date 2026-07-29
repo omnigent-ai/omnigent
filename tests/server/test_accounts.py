@@ -437,7 +437,6 @@ def test_resolve_auth_source_defaults_to_header(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
     assert resolve_auth_source() == "header"
 
 
@@ -483,40 +482,7 @@ def test_resolve_auth_source_oidc_issuer_ignored_when_auth_disabled(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
     monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://accounts.google.com")
-    assert resolve_auth_source() == "header"
-
-
-def test_resolve_auth_source_deprecated_alias_still_selects_accounts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The pre-rename ``OMNIGENT_ACCOUNTS_ENABLED`` alias still works.
-
-    Existing deploys that set the old name must keep booting in accounts
-    mode after the rename. If this regressed, an upgrade would silently
-    drop those deploys back to single-user header mode (no login).
-    """
-    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
-    monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "1")
-    assert resolve_auth_source() == "accounts"
-
-
-def test_resolve_auth_source_new_var_wins_over_deprecated_alias(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The current name wins when both names are set.
-
-    A deploy migrating to ``OMNIGENT_AUTH_ENABLED`` can leave the old
-    ``OMNIGENT_ACCOUNTS_ENABLED`` in place: an explicit ``=0`` on the
-    new name disables auth even though the old name is truthy. If the
-    alias took precedence the new value would be unsettable while the
-    old one lingered.
-    """
-    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
-    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "1")
     assert resolve_auth_source() == "header"
 
 
@@ -551,7 +517,6 @@ def test_factory_defaults_to_header_when_env_unset(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
 
     provider = create_auth_provider()
 
@@ -1583,6 +1548,52 @@ def test_admin_cannot_delete_last_admin(accounts_app: TestClient) -> None:
     resp = admin.delete("/auth/users/admin")
     assert resp.status_code == 400
     assert "self" in resp.json()["error"].lower() or "last admin" in resp.json()["error"].lower()
+
+
+def test_concurrent_deletes_cannot_leave_zero_admins(tmp_path: Path) -> None:
+    """Two concurrent deletes of two *different* admins can't both apply.
+
+    Regression test for a TOCTOU race: a naive read-then-delete
+    ("are there other admins? if so, delete") checks and writes in
+    two separate transactions. If two admins are deleted at once,
+    each request's read can see the *other* as the remaining admin,
+    both checks pass, and the deploy ends up with zero admins and no
+    recovery path. ``AccountStore.delete_user`` closes this by
+    locking the admin set before counting it (``BEGIN IMMEDIATE`` on
+    SQLite), so the second writer blocks and re-observes the
+    up-to-date count instead of the stale one.
+
+    Runs the two deletes as real concurrent threads against the same
+    on-disk SQLite database — not a simulated interleave — so it
+    actually exercises the locking, not just the application logic.
+    """
+    import threading
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    store = SqlAlchemyAccountStore(db_url)
+    store.create_user_with_password("alice", hash_password("alice-pw-1234"), is_admin=True)
+    store.create_user_with_password("bob", hash_password("bob-pw-1234"), is_admin=True)
+
+    results: dict[str, bool | None] = {}
+    barrier = threading.Barrier(2)
+
+    def delete(user_id: str) -> None:
+        barrier.wait()  # maximize the chance both threads race the same window
+        results[user_id] = store.delete_user(user_id)
+
+    threads = [threading.Thread(target=delete, args=(uid,)) for uid in ("alice", "bob")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    remaining_admins = {u.id for u in store.list_users() if u.is_admin}
+    assert remaining_admins, (
+        f"last-admin invariant violated: {remaining_admins=} results={results}"
+    )
+    # Exactly one delete should have been refused (whichever ran second
+    # relative to the DB lock); the other applied.
+    assert sorted(results.values()) == [False, True]
 
 
 def test_admin_reset_returns_new_plaintext_once(

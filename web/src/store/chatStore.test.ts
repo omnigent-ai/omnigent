@@ -24,6 +24,7 @@ import type {
   ErrorBlock,
   NativeToolBlock,
   TextDone,
+  ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
 import type { ConversationItem } from "@/lib/conversationItems";
@@ -81,6 +82,19 @@ function userMessage(responseId: string, text: string): ConversationItem {
     role: "user",
     status: "completed",
     content: [{ type: "input_text", text }],
+  };
+}
+
+// A `[System: …]` marker — sent as a user-role message but re-classified by
+// the UI as a muted marker, not a real user turn / rail tick.
+function systemMarker(responseId: string, inner = "timer t1 fired"): ConversationItem {
+  return {
+    id: `msg_${responseId}_sys`,
+    response_id: responseId,
+    type: "message",
+    role: "user",
+    status: "completed",
+    content: [{ type: "input_text", text: `[System: ${inner}]` }],
   };
 }
 
@@ -1344,6 +1358,207 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
+  it("loadHistoryUntilUserMessages pages older history until the target user count", async () => {
+    // Dense turns: each turn is one user message followed by several
+    // non-user items (assistant + tool call), so a page spans many items per
+    // user prompt — the case the eager loader's large page size targets.
+    // 15 turns × 3 items = 45 items, comfortably past the initial window so
+    // the eager loader genuinely pages older history rather than no-opping.
+    const TURNS = 15;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `t_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(nativeToolItem(rid));
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_dense", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_dense", items);
+
+    await useChatStore.getState().switchTo("conv_dense");
+    // The initial window holds only the newest slice of items, so far fewer
+    // than TURNS user prompts are loaded — the stub the eager loader fills in.
+    const initialUsers = useChatStore
+      .getState()
+      .blocks.filter((b) => b.type === "user_message").length;
+    expect(initialUsers).toBeLessThan(TURNS);
+
+    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
+
+    const state = useChatStore.getState();
+    // Reached (at least) the requested user count and ran history dry.
+    expect(state.blocks.filter((b) => b.type === "user_message")).toHaveLength(TURNS);
+    expect(state.hasMoreHistory).toBe(false);
+    expect(state.loadingMoreHistory).toBe(false);
+  });
+
+  it("loadHistoryUntilUserMessages keeps items in chronological order", async () => {
+    // Regression: the eager loader used to prepend each fetched block
+    // one-by-one, which reversed every page's internal order and scrambled
+    // the transcript (a mid-conversation prompt would surface at the top).
+    // Dense turns force multi-item pages so any per-page reversal shows up.
+    // 15 turns × 3 items is well past the initial window, so the eager loader
+    // pages a real multi-item older window (where the reversal manifested).
+    const TURNS = 15;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `o_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(nativeToolItem(rid));
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_order", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_order", items);
+
+    await useChatStore.getState().switchTo("conv_order");
+    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
+
+    // The loaded blocks must match the seeded chronological order exactly.
+    const loadedIds = useChatStore
+      .getState()
+      .blocks.map((b) => b.ctx.itemId)
+      .filter((iid): iid is string => Boolean(iid));
+    expect(loadedIds).toEqual(items.map((item) => item.id));
+    // And user prompts read oldest-first (prompt 0 before prompt 1 …).
+    const userIds = useChatStore
+      .getState()
+      .blocks.filter((b): b is UserMessageBlock => b.type === "user_message")
+      .map((b) => b.ctx.itemId);
+    const seededUserIds = items
+      .filter((item) => item.type === "message" && item.role === "user")
+      .map((item) => item.id);
+    expect(userIds).toEqual(seededUserIds);
+  });
+
+  it("loadHistoryUntilUserMessages no-ops when the target is already met", async () => {
+    const items = Array.from({ length: SESSION_HISTORY_PAGE_SIZE }, (_, idx) =>
+      userMessage(`m_${idx.toString().padStart(3, "0")}`, `m ${idx}`),
+    );
+    seedSession("conv_met", items);
+
+    await useChatStore.getState().switchTo("conv_met");
+    const before = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    const itemFetchesBefore = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_met/items"),
+    ).length;
+
+    // The window already holds SESSION_HISTORY_PAGE_SIZE user prompts, so a
+    // smaller target must not fetch or mutate anything.
+    await useChatStore.getState().loadHistoryUntilUserMessages(2);
+
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(before);
+    const itemFetchesAfter = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_met/items"),
+    ).length;
+    expect(itemFetchesAfter).toBe(itemFetchesBefore);
+  });
+
+  it("loadHistoryUntilUserMessages disables further history on fetch failure", async () => {
+    // The rail's eager-load effect auto-fires this with no user gesture, so a
+    // persistent fetch failure that left hasMoreHistory true would re-arm the
+    // effect and hammer the failing endpoint in a tight loop. On error we
+    // commit progress AND clear hasMoreHistory to break that loop.
+    const TURNS = 15;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `f_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_fail", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_fail", items);
+
+    await useChatStore.getState().switchTo("conv_fail");
+    expect(useChatStore.getState().hasMoreHistory).toBe(true);
+
+    // Fail every older-history page fetch (the `olderThan=` cursor read).
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_fail\/items\?.*olderThan=/.test(url)) {
+        return Promise.reject(new Error("boom"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
+
+    const state = useChatStore.getState();
+    // hasMoreHistory is cleared so the auto-firing effect can't re-loop.
+    expect(state.hasMoreHistory).toBe(false);
+    expect(state.loadingMoreHistory).toBe(false);
+  });
+
+  it("loadHistoryUntilUserMessages ignores [System: …] markers when counting turns", async () => {
+    // The rail derives ticks from REAL user turns only (system markers are
+    // dropped), so the loader must count the same way. If it counted markers,
+    // it could early-return at the target while the rail has too few ticks —
+    // and, since the early-return leaves hasMoreHistory set, wedge the rail
+    // permanently hidden. Here every turn carries a [System: …] marker: with
+    // 15 real turns the loader must page ALL of them (running history dry)
+    // rather than stopping early on the inflated user-block count.
+    const TARGET = 10;
+    const TURNS = 15;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `s_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(systemMarker(rid)); // a user-role block that is NOT a real turn
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_sys", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_sys", items);
+
+    await useChatStore.getState().switchTo("conv_sys");
+    await useChatStore.getState().loadHistoryUntilUserMessages(TARGET);
+
+    const state = useChatStore.getState();
+    // Real user turns actually loaded — the count that feeds the rail.
+    const blockText = (b: (typeof state.blocks)[number]): string =>
+      b.type === "user_message"
+        ? b.content
+            .filter((c): c is { type: "input_text"; text: string } => c.type === "input_text")
+            .map((c) => c.text)
+            .join("")
+        : "";
+    const realTurns = state.blocks.filter(
+      (b) => b.type === "user_message" && !/^\[System: /.test(blockText(b)),
+    ).length;
+    expect(realTurns).toBeGreaterThanOrEqual(TARGET);
+    // hasMoreHistory settles false only because we counted real turns, not the
+    // (larger) raw user-block count — proving the loader didn't stop early.
+    expect(state.loadingMoreHistory).toBe(false);
+  });
+
+  it("loadHistoryUntilUserMessages assembles turns across multiple pages in order", async () => {
+    // EAGER_PAGE_LIMIT is 200, so to actually exercise the cross-page
+    // `older.unshift(...)` assembly (and the MAX_EAGER_PAGES loop) we need more
+    // than 200 items. 120 turns × 2 items = 240 items > one page.
+    const TURNS = 120;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `p_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_multi", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_multi", items);
+
+    await useChatStore.getState().switchTo("conv_multi");
+    // Target more turns than fit in a single 200-item page, forcing ≥2 pages.
+    await useChatStore.getState().loadHistoryUntilUserMessages(110);
+
+    // Whatever loaded must be a contiguous chronological suffix of the seed —
+    // any per-page reversal or misordered cross-page splice would break this.
+    const loadedIds = useChatStore
+      .getState()
+      .blocks.map((b) => b.ctx.itemId)
+      .filter((iid): iid is string => Boolean(iid));
+    const seededIds = items.map((it) => it.id);
+    const suffix = seededIds.slice(seededIds.length - loadedIds.length);
+    expect(loadedIds).toEqual(suffix);
+    expect(loadedIds.length).toBeGreaterThan(2 * SESSION_HISTORY_PAGE_SIZE);
+  });
+
   it("does not run flat session items through the nested snapshot flattener", async () => {
     seedSessionSnapshot("conv_native", []);
     seedSessionItems("conv_native", [nativeToolItem("resp_native")]);
@@ -1812,6 +2027,7 @@ describe("chatStore — send (first-send ordering)", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
       status: "idle",
+      sessionStatus: "running",
       blocks: [],
       pendingUserMessages: [],
     });
@@ -1833,6 +2049,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // Optimistic bubble rolled back, turn settled to idle.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
+    expect(state.sessionStatus).toBe("idle");
     // A standalone error block is appended carrying the friendly, retryable
     // copy — NOT the server's terse "No runner bound for session" — and no
     // raw code in the banner (code "" → clean "Error" title).
@@ -2267,8 +2484,9 @@ describe("chatStore — send while streaming (queueing)", () => {
     // The denied queued message was never persisted, so its optimistic
     // bubble must disappear even though the previous response is still live.
     expect(state.pendingUserMessages).toEqual([]);
-    // Denying the queued input must not mark the already-streaming prior
-    // response idle; that response still needs its own response_end.
+    // The denied branch of `send` only settles status when NOT already
+    // streaming, so the POST-return path leaves the prior turn's
+    // running/streaming state intact here.
     expect(state.status).toBe("streaming");
     expect(state.sessionStatus).toBe("running");
     expect(state.activeResponse).toEqual({
@@ -2277,17 +2495,28 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
+    // Accepted trade-off: the server's deny short-circuit still publishes a
+    // session-level running→idle pair for the denied out-of-band input, and
+    // the client now trusts `session.status` 1:1 (the guard that used to
+    // suppress this stray idle was removed to fix the fresh-session
+    // "Working…" persists bug). So this idle DOES flip `sessionStatus` to
+    // idle mid-stream. The bubble lifecycle is unaffected — `status` /
+    // `activeResponse` still defer to the streaming turn's own response_end —
+    // and the next real status edge re-asserts running, so the effect is a
+    // brief indicator blip confined to the rare deny-while-streaming case.
     handleSessionEvent({
       type: "session_status",
       conversationId: "conv_abc",
       status: "idle",
     });
     const afterIdle = useChatStore.getState();
-    // The server's deny short-circuit publishes running→idle for the
-    // queued input. That idle must not clear the prior response's
-    // running/working signal while its active response is still streaming.
+    expect(afterIdle.sessionStatus).toBe("idle");
     expect(afterIdle.status).toBe("streaming");
-    expect(afterIdle.sessionStatus).toBe("running");
+    expect(afterIdle.activeResponse).toEqual({
+      responseId: "resp_in_flight",
+      state: "streaming",
+      error: null,
+    });
   });
 });
 
@@ -2363,6 +2592,57 @@ describe("chatStore — background-shell tally (claude-native)", () => {
     const state = useChatStore.getState();
     expect(state.sessionStatus).toBe("idle");
     expect(state.backgroundTaskCount).toBe(0);
+  });
+
+  it("frees the local send lifecycle on a Stop-derived waiting edge (with responseId)", () => {
+    // Regression: the claude/cursor-native Stop hook posts the turn-end
+    // `waiting` edge WITH the ended turn's `response_id`. It must finalize the
+    // local `status` to idle (the turn is done) so the composer sends the next
+    // message instead of queuing it — while `sessionStatus` stays `waiting` and
+    // the shell count sticks, keeping the "Working…" spinner lit.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      backgroundTaskCount: 0,
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      responseId: "resp_1",
+      backgroundTaskCount: 1,
+    });
+    const state = useChatStore.getState();
+    expect(state.status).toBe("idle");
+    expect(state.activeResponse?.state).toBe("completed");
+    expect(state.sessionStatus).toBe("waiting");
+    expect(state.backgroundTaskCount).toBe(1);
+  });
+
+  it("frees the local send lifecycle on a waiting edge whose id doesn't match", () => {
+    // A `waiting` edge that carries no id (or a stale one) with no tracked
+    // response must still free the send lifecycle so a message isn't stranded.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      backgroundTaskCount: 0,
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      backgroundTaskCount: 1,
+    });
+    const state = useChatStore.getState();
+    expect(state.status).toBe("idle");
+    expect(state.sessionStatus).toBe("waiting");
+    // The stale streaming bubble is finalized so it doesn't linger spinning —
+    // no future edge names this id to close it.
+    expect(state.activeResponse?.state).toBe("completed");
   });
 
   it("clears the shell count when a new turn starts (running edge)", () => {
@@ -2992,7 +3272,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("idle preserves a still-streaming active response until response_end arrives", () => {
+    it("idle settles sessionStatus but preserves a still-streaming bubble until response_end", () => {
       useChatStore.setState({
         status: "streaming",
         sessionStatus: "running",
@@ -3006,16 +3286,20 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
 
       const state = useChatStore.getState();
-      // A real response bubble is closed by response_end, not by the
-      // coarser session.status signal. Clearing status here would make
-      // the bubble lifecycle disagree with the streaming reducer.
+      // sessionStatus tracks the server's session-level status 1:1 — a server
+      // idle means idle, and the "Working…" indicator (which reads only
+      // sessionStatus) must turn off. The bubble lifecycle is separate: a real
+      // response bubble is still closed by response_end, not by the coarser
+      // session.status signal, so the local `status`/`activeResponse` stay
+      // streaming until response_end lands (dropping the guard that used to
+      // strand sessionStatus at "running" — the "Working…" persists bug).
+      expect(state.sessionStatus).toBe("idle");
       expect(state.status).toBe("streaming");
       expect(state.activeResponse).toEqual({
         responseId: "resp_live",
         state: "streaming",
         error: null,
       });
-      expect(state.sessionStatus).toBe("running");
     });
 
     it("idle refetches the parent's child list when the conversation is a child", () => {
@@ -3442,6 +3726,56 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().sandboxStatus).toEqual({
         stage: "failed",
         error: "managed sandbox launch failed: boom",
+      });
+    });
+  });
+
+  describe("session.mcp_startup", () => {
+    it("mirrors an in-flight startup map for the MCP startup band", () => {
+      useChatStore.setState({ mcpStartup: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          safe: { status: "ready", error: null },
+          "storage-console": { status: "starting", error: null },
+        },
+      });
+      expect(useChatStore.getState().mcpStartup).toEqual({
+        safe: { status: "ready", error: null },
+        "storage-console": { status: "starting", error: null },
+      });
+    });
+
+    it("clears the map once every server settles ready", () => {
+      // An all-ready map means startup completed cleanly — retaining it
+      // would strand the startup band on screen.
+      useChatStore.setState({
+        mcpStartup: { safe: { status: "starting", error: null } },
+      });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: { safe: { status: "ready", error: null } },
+      });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+    });
+
+    it("retains failed and cancelled servers after startup settles", () => {
+      // The settled-with-failures map is what lets the page say which
+      // servers never came up (mirrors the Codex TUI's startup warnings).
+      useChatStore.setState({ mcpStartup: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          safe: { status: "failed", error: "handshake failed" },
+          "storage-console": { status: "cancelled", error: null },
+        },
+      });
+      expect(useChatStore.getState().mcpStartup).toEqual({
+        safe: { status: "failed", error: "handshake failed" },
+        "storage-console": { status: "cancelled", error: null },
       });
     });
   });
@@ -5003,6 +5337,21 @@ describe("chatStore — elicitation_resolved", () => {
 // PATCH fires as a side effect so the next turn uses the override
 // server-side.
 describe("chatStore — bindStream sticky-pref handoff", () => {
+  const CLAUDE_MODEL_OPTIONS = [
+    {
+      id: "opus",
+      model: "system.ai.claude-opus-4-10",
+      displayName: "Opus 4.10",
+      isDefault: true,
+    },
+    {
+      id: "sonnet",
+      model: "system.ai.claude-sonnet-5",
+      displayName: "Sonnet 5",
+      isDefault: false,
+    },
+  ];
+
   interface SnapshotOverrides {
     labels?: Record<string, string>;
     reasoning_effort?: string | null;
@@ -5052,11 +5401,14 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
   it("PATCHes sticky model and effort onto a claude-native session with no overrides", async () => {
     seedSession("conv_cn", []);
-    withSnapshot("conv_cn", { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+    withSnapshot("conv_cn", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      model_options: CLAUDE_MODEL_OPTIONS,
+    });
 
     useChatStore.setState({
       selectedEffort: "high",
-      selectedModel: "claude-opus-4-7",
+      selectedModel: "opus",
     });
     await useChatStore.getState().switchTo("conv_cn");
 
@@ -5064,14 +5416,254 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     // Model is silent; effort must notify the running native session.
     expect(patches).toEqual(
       expect.arrayContaining([
-        { model_override: "claude-opus-4-7", silent: true },
+        { model_override: "opus", silent: true },
         { reasoning_effort: "high" },
       ]),
     );
 
     const state = useChatStore.getState();
-    expect(state.selectedModel).toBe("claude-opus-4-7");
+    expect(state.selectedModel).toBe("opus");
     expect(state.selectedEffort).toBe("high");
+  });
+
+  it("applies a persisted Claude model after delayed model options arrive", async () => {
+    seedSession("conv_cn_delayed", []);
+    window.localStorage.setItem("omnigent.picker.model", "opus");
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_delayed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        return mockResponse({
+          id: "conv_cn_delayed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "opus" });
+    await useChatStore.getState().switchTo("conv_cn_delayed");
+
+    expect(patchCallsFor("conv_cn_delayed").some((p) => "model_override" in p)).toBe(false);
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_delayed",
+    });
+    await tick();
+
+    expect(patchCallsFor("conv_cn_delayed")).toEqual(
+      expect.arrayContaining([{ model_override: "opus", silent: true }]),
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: "opus",
+      sessionModelOverride: "opus",
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
+  it("refetches a resolved Claude catalog when its event races the bind snapshot", async () => {
+    seedSession("conv_cn_race", []);
+    window.localStorage.setItem("omnigent.picker.model", "opus");
+    let resolveInitialSnapshot: ((response: Response) => void) | null = null;
+    let resolveItems: ((response: Response) => void) | null = null;
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cn_race/items")) {
+        const response = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          resolveItems = resolve;
+        }).then(() => response);
+      }
+      if (url.split("?")[0] === "/v1/sessions/conv_cn_race" && (init?.method ?? "GET") === "GET") {
+        snapshotCount += 1;
+        const response = mockResponse({
+          id: "conv_cn_race",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+        if (snapshotCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveInitialSnapshot = resolve;
+          });
+        }
+        return response;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "opus" });
+    const switchPromise = useChatStore.getState().switchTo("conv_cn_race");
+    await tick();
+    expect(resolveInitialSnapshot).not.toBeNull();
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_race",
+    });
+    resolveInitialSnapshot!(
+      mockResponse({
+        id: "conv_cn_race",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        items: [],
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        model_override: null,
+        model_options: [],
+      }),
+    );
+    await tick();
+    expect(snapshotCount).toBe(2);
+    resolveItems!(mockResponse({}));
+    await switchPromise;
+    await tick();
+
+    expect(patchCallsFor("conv_cn_race")).toEqual(
+      expect.arrayContaining([{ model_override: "opus", silent: true }]),
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: "opus",
+      sessionModelOverride: "opus",
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
+  it("drops a removed sticky alias when the resolved catalog wins the bind race", async () => {
+    // Same race as above, but the sticky pick ("fable") is absent from the
+    // raced catalog: the bind's raced branch must not leave it visually
+    // selected with no server override behind it.
+    seedSession("conv_cn_race_removed", []);
+    window.localStorage.setItem("omnigent.picker.model", "fable");
+    let resolveInitialSnapshot: ((response: Response) => void) | null = null;
+    let resolveItems: ((response: Response) => void) | null = null;
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cn_race_removed/items")) {
+        const response = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          resolveItems = resolve;
+        }).then(() => response);
+      }
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_race_removed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        const response = mockResponse({
+          id: "conv_cn_race_removed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+        if (snapshotCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveInitialSnapshot = resolve;
+          });
+        }
+        return response;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "fable" });
+    const switchPromise = useChatStore.getState().switchTo("conv_cn_race_removed");
+    await tick();
+    expect(resolveInitialSnapshot).not.toBeNull();
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_race_removed",
+    });
+    resolveInitialSnapshot!(
+      mockResponse({
+        id: "conv_cn_race_removed",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        items: [],
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        model_override: null,
+        model_options: [],
+      }),
+    );
+    await tick();
+    resolveItems!(mockResponse({}));
+    await switchPromise;
+    await tick();
+
+    expect(patchCallsFor("conv_cn_race_removed").some((patch) => "model_override" in patch)).toBe(
+      false,
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: null,
+      sessionModelOverride: null,
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
+  it("does not apply a persisted Claude alias removed from the delayed catalog", async () => {
+    seedSession("conv_cn_delayed_removed", []);
+    window.localStorage.setItem("omnigent.picker.model", "fable");
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_delayed_removed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        return mockResponse({
+          id: "conv_cn_delayed_removed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "fable" });
+    await useChatStore.getState().switchTo("conv_cn_delayed_removed");
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_delayed_removed",
+    });
+    await tick();
+
+    expect(
+      patchCallsFor("conv_cn_delayed_removed").some((patch) => "model_override" in patch),
+    ).toBe(false);
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    window.localStorage.removeItem("omnigent.picker.model");
   });
 
   it("does NOT apply a sticky model to a routing-enabled session", async () => {
@@ -5142,11 +5734,12 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     withSnapshot("conv_child", {
       labels: { "omnigent.wrapper": "claude-code-native-ui" },
       parent_session_id: "conv_parent",
+      model_options: CLAUDE_MODEL_OPTIONS,
     });
 
     useChatStore.setState({
       selectedEffort: "xhigh",
-      selectedModel: "claude-opus-4-7",
+      selectedModel: "opus",
     });
     await useChatStore.getState().switchTo("conv_child");
 
@@ -5157,7 +5750,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     // Sticky prefs are preserved for later top-level sessions.
     const state = useChatStore.getState();
     expect(state.selectedEffort).toBe("xhigh");
-    expect(state.selectedModel).toBe("claude-opus-4-7");
+    expect(state.selectedModel).toBe("opus");
   });
 
   it("does NOT PATCH a non-Claude sticky model onto a claude-native session", async () => {
@@ -5175,6 +5768,20 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
     const patches = patchCallsFor("conv_cn_gpt");
     expect(patches.some((p) => "model_override" in p)).toBe(false);
+  });
+
+  it("does NOT PATCH a removed Claude alias onto a new session", async () => {
+    seedSession("conv_cn_removed", []);
+    withSnapshot("conv_cn_removed", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      model_options: CLAUDE_MODEL_OPTIONS,
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "fable" });
+    await useChatStore.getState().switchTo("conv_cn_removed");
+
+    expect(patchCallsFor("conv_cn_removed").some((p) => "model_override" in p)).toBe(false);
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
   });
 
   it("does NOT PATCH a non-Codex sticky model onto a codex-native session", async () => {
@@ -5388,15 +5995,18 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     // The claude-native handoff persists the sticky model, so it IS the
     // session's active override — `/model` should show it.
     seedSession("conv_sticky_cn", []);
-    withSnapshot("conv_sticky_cn", { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+    withSnapshot("conv_sticky_cn", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      model_options: CLAUDE_MODEL_OPTIONS,
+    });
 
-    useChatStore.setState({ selectedModel: "claude-opus-4-7", sessionModelOverride: null });
+    useChatStore.setState({ selectedModel: "opus", sessionModelOverride: null });
     await useChatStore.getState().switchTo("conv_sticky_cn");
 
     expect(patchCallsFor("conv_sticky_cn")).toEqual(
-      expect.arrayContaining([{ model_override: "claude-opus-4-7", silent: true }]),
+      expect.arrayContaining([{ model_override: "opus", silent: true }]),
     );
-    expect(useChatStore.getState().sessionModelOverride).toBe("claude-opus-4-7");
+    expect(useChatStore.getState().sessionModelOverride).toBe("opus");
   });
 
   it("does NOT surface a non-Claude sticky model as the session override (claude-native)", async () => {
@@ -5490,6 +6100,48 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
+  it("appends live command output to the running tool card", async () => {
+    useChatStore.setState({ conversationId: "conv_tool_delta", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_tool_delta", sink.stream, controller, setState, getState);
+
+    sink.push(sse("response.created", { id: "resp_tool", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "item_call",
+          type: "function_call",
+          response_id: "resp_tool",
+          call_id: "call_123",
+          name: "shell",
+          arguments: '{"command":"pytest"}',
+          status: "in_progress",
+        },
+      }),
+    );
+    sink.push(
+      sse("response.function_call_output.delta", {
+        call_id: "call_123",
+        delta: "collecting ",
+      }),
+    );
+    sink.push(
+      sse("response.function_call_output.delta", {
+        call_id: "call_123",
+        delta: "tests...",
+      }),
+    );
+    await tick();
+
+    const group = useChatStore
+      .getState()
+      .blocks.find((b): b is ToolGroup => b.type === "tool_group");
+    expect(group?.executions[0]?.output).toBe("collecting tests...");
+
+    controller.abort();
+  });
+
   it("keeps response_start/response_end lifecycle intact through batching", async () => {
     useChatStore.setState({
       conversationId: "conv_life",
@@ -5547,6 +6199,71 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     // the response_end branch ran after the buffer was flushed.
     expect(useChatStore.getState().activeResponse?.state).toBe("completed");
     expect(useChatStore.getState().status).toBe("idle");
+
+    controller.abort();
+  });
+
+  it("a stale wrapper response_end does NOT downgrade a newer turn's activeResponse", async () => {
+    // Hermes-native first-turn spinner bug: the runner opens an empty wrapper
+    // response that completes AFTER the forwarder's per-turn id (hermes_turn_1)
+    // has already taken over activeResponse. The wrapper's response_end must be
+    // ignored for lifecycle — otherwise it finalizes the LIVE turn to
+    // "completed", stopping its tool cards streaming (the "no spinner" bug).
+    useChatStore.setState({
+      conversationId: "conv_stale",
+      blocks: [],
+      activeResponse: null,
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_stale",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    // 1) The empty wrapper response opens → activeResponse adopts its id.
+    sink.push(sse("response.created", { id: "resp_wrap", status: "in_progress", output: [] }));
+    await tick();
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "resp_wrap",
+      state: "streaming",
+      error: null,
+    });
+
+    // 2) The forwarder's per-turn running edge takes over activeResponse.
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_stale",
+      status: "running",
+      responseId: "hermes_turn_1",
+    });
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "hermes_turn_1",
+      state: "streaming",
+      error: null,
+    });
+
+    // 3) The stale wrapper completes (empty). Its response_end targets
+    //    resp_wrap, which is no longer the active response, so it must NOT
+    //    touch activeResponse.
+    sink.push(sse("response.completed", { id: "resp_wrap", status: "completed", output: [] }));
+    sink.close();
+    await tick();
+    await tick();
+
+    // The live turn is still streaming — its cards keep their spinner.
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "hermes_turn_1",
+      state: "streaming",
+      error: null,
+    });
 
     controller.abort();
   });
@@ -6121,11 +6838,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(useChatStore.getState().abortController).toBeNull();
   });
 
-  it("gives up and marks the session failed on a permanent 404", async () => {
+  it("gives up after exhausting the transient-404 retry cap", async () => {
     seedSession("conv_404", []);
+    let opens = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        opens += 1;
         return mockResponse({}, { ok: false, status: 404 });
       }
       return defaultFetchHandler(input, init);
@@ -6138,11 +6857,53 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     });
 
     const loop = startStreamPump("conv_404", controller, setState, getState);
-    await vi.advanceTimersByTimeAsync(1);
+    // Every open 404s, so each is retried with backoff until the cap is
+    // exhausted; advance well past the worst-case cumulative backoff so the
+    // loop has time to give up on its own.
+    await vi.advanceTimersByTimeAsync(90_000);
     await loop;
 
+    expect(opens).toBe(11); // 1 initial open + 10 retries, then gives up
     expect(useChatStore.getState().sessionStatus).toBe("failed");
     expect(useChatStore.getState().abortController).toBeNull();
+  });
+
+  it("rides out a handful of transient 404s (backend restart) without failing the session", async () => {
+    seedSession("conv_404flap", []);
+    const sinks: StreamSink[] = [];
+    let opens = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        opens += 1;
+        // A reverse proxy 404s the first few opens (backend mid-restart);
+        // the next one succeeds once it's back.
+        if (opens <= 3) return mockResponse({}, { ok: false, status: 404 });
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_404flap",
+      abortController: controller,
+      sessionStatus: "running",
+    });
+
+    const loop = startStreamPump("conv_404flap", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(opens).toBe(4);
+    expect(sinks).toHaveLength(1);
+    // The 404s resolved well inside the cap — must not flip to failed.
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+
+    sinks[0]!.push("data: [DONE]\n\n");
+    sinks[0]!.close();
+    await vi.advanceTimersByTimeAsync(1);
+    await loop;
   });
 
   it("treats the first SUCCESSFUL open as initial (no reconcile) even after a failed open", async () => {
@@ -7570,6 +8331,150 @@ describe("chatStore — policy deny renders once", () => {
       await run({ delta: "[Denied by policy: over budget]", message_id: "deny_abc", index: 0 }),
     ).toBe(1);
   });
+
+  it("keeps the deny visible after its terminal response.completed", async () => {
+    // Full server sequence for an input-phase deny: the sentinel delta (a
+    // `live:` provisional preview), the committed item as
+    // `response.output_item.done` (carrying the persisted itemId), then the
+    // terminal `response.completed`. The terminal sweeps unfinalized `live:`
+    // previews; the commit event upgrades the deny to a durable, itemId-keyed
+    // `text_done` block that survives the sweep (and, being itemId-keyed, a
+    // reconnect and a refresh too). Without it the deny vanished until a
+    // refresh re-hydrated the persisted item.
+    const sentinel = "[Denied by policy: over budget]";
+    // Non-native session: the committed item reconciles via the itemId-stamp
+    // path (not the native-terminal provisional-replace path).
+    useChatStore.setState({
+      conversationId: "conv_deny2",
+      blocks: [],
+      isNativeTerminalSession: false,
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualSched();
+    void pumpStreamEvents(
+      "conv_deny2",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: sentinel,
+        message_id: "deny_xyz",
+        index: 0,
+      }),
+    );
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "msg_deny_1",
+          type: "message",
+          role: "assistant",
+          response_id: "deny_resp_1",
+          content: [{ type: "output_text", text: sentinel }],
+        },
+      }),
+    );
+    sink.push(
+      sse("response.completed", {
+        id: "deny_term",
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: sentinel }],
+          },
+        ],
+      }),
+    );
+    await tick();
+    manual.fire();
+    await tick();
+    const denyBlocks = useChatStore
+      .getState()
+      .blocks.filter(
+        (b) => b.type === "text_done" && (b as TextDone).fullText.includes("Denied by policy"),
+      );
+    controller.abort();
+    // Exactly one durable deny block survives the terminal sweep, keyed by
+    // the persisted itemId (not a swept `live:` provisional id).
+    expect(denyBlocks).toHaveLength(1);
+    expect(denyBlocks[0]!.ctx.itemId).toBe("msg_deny_1");
+  });
+
+  it("keeps the deny visible on a native-terminal session", async () => {
+    // Same server sequence as the non-native case, but on a native-terminal
+    // session the committed `text_done` reconciles via a DIFFERENT branch:
+    // it replaces the `live:` provisional IN PLACE (and retires the live
+    // message id) rather than appending and letting the terminal sweep drop
+    // the provisional. Both paths must yield exactly one durable, itemId-keyed
+    // deny block.
+    const sentinel = "[Denied by policy: over budget]";
+    useChatStore.setState({
+      conversationId: "conv_deny3",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualSched();
+    void pumpStreamEvents(
+      "conv_deny3",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: sentinel,
+        message_id: "deny_native",
+        index: 0,
+      }),
+    );
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "msg_deny_native",
+          type: "message",
+          role: "assistant",
+          response_id: "deny_resp_native",
+          content: [{ type: "output_text", text: sentinel }],
+        },
+      }),
+    );
+    sink.push(
+      sse("response.completed", {
+        id: "deny_term",
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: sentinel }],
+          },
+        ],
+      }),
+    );
+    await tick();
+    manual.fire();
+    await tick();
+    const denyBlocks = useChatStore
+      .getState()
+      .blocks.filter(
+        (b) => b.type === "text_done" && (b as TextDone).fullText.includes("Denied by policy"),
+      );
+    controller.abort();
+    // The in-place replace leaves exactly one deny block, keyed by the
+    // persisted itemId — no swept `live:` provisional, no duplicate.
+    expect(denyBlocks).toHaveLength(1);
+    expect(denyBlocks[0]!.ctx.itemId).toBe("msg_deny_native");
+  });
 });
 
 describe("chatStore — client-side message queue", () => {
@@ -7773,6 +8678,29 @@ describe("chatStore — client-side message queue", () => {
     expect(sendSpy.mock.calls[1]!.slice(0, 2)).toEqual(["second", "agent_xyz"]);
   });
 
+  // Regression: a background shell / still-running sub-agent keeps the session
+  // in `waiting` after the turn ends, but the server's turn gate is already
+  // free. The flush must NOT treat `waiting` as busy — otherwise a queued
+  // message stays stuck until full idle even though a new turn could start now.
+  it("flushes the head on `waiting` (background work outlives the turn)", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 1,
+      send: sendSpy,
+      queuedMessages: [{ queueId: "q_1", text: "first", conversationId: "conv_abc" }],
+    });
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["first", "agent_xyz"]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
   it("does not flush a queue owned by a different conversation", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({
@@ -7858,7 +8786,7 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["b1"]);
   });
 
-  it("does not flush while busy (streaming or running/waiting)", () => {
+  it("does not flush while busy (streaming or running)", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     const base = {
       conversationId: "conv_abc",
@@ -7872,9 +8800,6 @@ describe("chatStore — client-side message queue", () => {
     useChatStore.getState().maybeFlushQueuedHead();
     // Server-side turn still running.
     useChatStore.setState({ ...base, status: "idle", sessionStatus: "running" });
-    useChatStore.getState().maybeFlushQueuedHead();
-    // Draining background work.
-    useChatStore.setState({ ...base, status: "idle", sessionStatus: "waiting" });
     useChatStore.getState().maybeFlushQueuedHead();
 
     expect(sendSpy).not.toHaveBeenCalled();

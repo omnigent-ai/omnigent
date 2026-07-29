@@ -34,6 +34,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -189,9 +190,9 @@ def create_runner_tunnel_router(
         instead of polling to a timeout. ``None`` (e.g. minimal test
         wiring, or a server without host support) omits the field.
     :param resolve_managed_runner_owner: Optional ``runner_id -> owner``
-        resolver for server-managed sandbox runners. A managed runner
-        authenticates with a server-minted binding token (not a user
-        session), so ``auth_provider.get_user_id`` cannot resolve it;
+        resolver for host-launched and managed-sandbox runners. A delegated
+        runner authenticates with a binding token (not a user session), so
+        ``auth_provider.get_user_id`` cannot resolve it;
         this looks up the owner the server recorded for the runner at
         launch (the conversation bound to ``runner_id``) — the
         runner-side analog of the host tunnel's ``resolve_launch_token``.
@@ -283,10 +284,10 @@ def create_runner_tunnel_router(
 
     @router.post("/runners/{runner_id}/token")
     async def mint_runner_owner_token(request: Request, runner_id: str) -> dict[str, str | int]:
-        """Mint a short-lived owner bearer for a managed-sandbox runner.
+        """Mint a short-lived owner bearer for a delegated runner.
 
-        A managed sandbox runner has no user credential of its own; it
-        presents its server-minted tunnel binding token
+        A host-launched or managed-sandbox runner does not inherit the host
+        user's credential; it presents its server-minted tunnel binding token
         (``X-Omnigent-Runner-Tunnel-Token``) and the server returns a
         short-lived owner JWT the runner then uses on its HTTP callbacks
         (which gate on ``require_user``). This is the HTTP analog of the
@@ -298,8 +299,7 @@ def create_runner_tunnel_router(
         The binding-token match is required unconditionally — the
         allow-list shortcut honored on some other runner-token checks is
         deliberately NOT accepted here, because this endpoint issues a
-        full owner credential and managed sandboxes always run
-        token-bound (no allow-list).
+        full owner credential and delegated runners are token-bound.
 
         :param request: The incoming FastAPI request (carries the binding
             token header).
@@ -314,7 +314,7 @@ def create_runner_tunnel_router(
             # No auth configured: the runner authenticates by binding
             # token alone and needs no bearer — minting is meaningless.
             raise OmnigentError(
-                "managed-runner token minting requires an auth provider",
+                "runner token minting requires an auth provider",
                 code=ErrorCode.INVALID_INPUT,
             )
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
@@ -333,7 +333,7 @@ def create_runner_tunnel_router(
             # oidc/accounts mint; header/proxy mode can't (identity is
             # asserted upstream). Signal clearly rather than 401.
             raise OmnigentError(
-                "managed-runner token minting is unsupported in this auth mode",
+                "runner token minting is unsupported in this auth mode",
                 code=ErrorCode.INVALID_INPUT,
             )
         return {
@@ -701,6 +701,16 @@ async def _ping_loop(
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
+    Each tick that the runner is still alive also re-stamps
+    ``runner_last_seen`` (``session_live_state.touch_runner_liveness``)
+    so replicas that don't hold this tunnel keep deriving
+    ``runner_online`` from a fresh row instead of their own empty
+    registry. This runs from the per-connection ping loop — inside the
+    tunnel handler's ``workspace_scope`` — rather than a central lifespan
+    sweep, which would run context-free (default workspace) over a
+    workspace-blind registry and stamp no rows on a multi-tenant replica.
+    Mirrors the host tunnel's ``host_store.heartbeat`` refresh.
+
     :param ws: Accepted Starlette WebSocket used only for timeout
         close.
     :param session: Session-generation guard for the ping loop.
@@ -728,6 +738,11 @@ async def _ping_loop(
             except RuntimeError:
                 _logger.debug("Runner %s websocket already closed during ping timeout", runner_id)
             return
+        # Still within the liveness window — refresh the row so the
+        # freshness gate keeps the runner in the online set cross-replica.
+        # Best-effort and deduplicated inside the chokepoint; the enqueue
+        # inherits this handler's workspace scope via copy_context.
+        session_live_state.touch_runner_liveness([runner_id])
         try:
             await registry.send_text(
                 session,

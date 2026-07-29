@@ -70,18 +70,32 @@ def _quiet_pk_override() -> Iterator[None]:
 
 def _rebuild_pk(new_pk: list[str]) -> None:
     """Drop the current ``conversation_items`` PK and install ``new_pk``."""
-    sqlite = _is_sqlite()
+    dialect = op.get_bind().dialect.name
+    sqlite = dialect == "sqlite"
+
     if sqlite:
         op.execute(sa.text("PRAGMA foreign_keys = OFF"))
 
-    old_pk_name = None if sqlite else _existing_pk_name(_TABLE)
-    with (
-        _quiet_pk_override(),
-        op.batch_alter_table(_TABLE, recreate="always" if sqlite else "auto") as batch_op,
-    ):
-        if old_pk_name is not None:
-            batch_op.drop_constraint(old_pk_name, type_="primary")
-        batch_op.create_primary_key(f"pk_{_TABLE}", new_pk)
+    if dialect == "mysql":
+        # MySQL PKs are unnamed; use raw DDL so batch_alter_table does not
+        # try to add a second PRIMARY KEY before the first is dropped.
+        pk_col_list = ", ".join(f"`{c}`" for c in new_pk)
+        op.execute(
+            sa.text(
+                f"ALTER TABLE `{_TABLE}` "
+                f"DROP PRIMARY KEY, "
+                f"ADD CONSTRAINT `pk_{_TABLE}` PRIMARY KEY ({pk_col_list})"
+            )
+        )
+    else:
+        old_pk_name = None if sqlite else _existing_pk_name(_TABLE)
+        with (
+            _quiet_pk_override(),
+            op.batch_alter_table(_TABLE, recreate="always" if sqlite else "auto") as batch_op,
+        ):
+            if old_pk_name is not None:
+                batch_op.drop_constraint(old_pk_name, type_="primary")
+            batch_op.create_primary_key(f"pk_{_TABLE}", new_pk)
 
     if sqlite:
         op.execute(sa.text("PRAGMA foreign_keys = ON"))

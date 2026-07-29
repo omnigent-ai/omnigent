@@ -42,18 +42,26 @@ def test_name_indexes_key_on_checksum(db_engine: Engine) -> None:
     inspector = sa.inspect(db_engine)
 
     indexes = {i["name"]: i for i in inspector.get_indexes("policies")}
-    assert "ix_policies_default_name_cksum" in indexes
-    assert indexes["ix_policies_default_name_cksum"]["unique"]
-    assert indexes["ix_policies_default_name_cksum"]["column_names"] == ["name_cksum"]
+    # At head the partial unique index is replaced by a plain name_cksum
+    # lookup index (see z5a2b3c4d5e6); default-name uniqueness lives in the
+    # store. It still keys on name_cksum, not the raw name.
+    assert "ix_policies_default_name_cksum" not in indexes
+    assert "ix_policies_name_cksum" in indexes
+    assert not indexes["ix_policies_name_cksum"]["unique"]
+    # Leads with workspace_id (PK inclusion), keys on name_cksum, ends with id.
+    assert indexes["ix_policies_name_cksum"]["column_names"] == [
+        "workspace_id",
+        "name_cksum",
+        "id",
+    ]
     # The old raw-name index is gone.
     assert "ix_policies_default_name" not in indexes
 
     uniques = {u["name"]: u for u in inspector.get_unique_constraints("policies")}
-    assert "uq_policies_session_id_name_cksum" in uniques
-    assert uniques["uq_policies_session_id_name_cksum"]["column_names"] == [
-        "session_id",
-        "name_cksum",
-    ]
+    # The (session_id, name_cksum) unique key was dropped (d4c1b9e6f3a2);
+    # session-name uniqueness now lives in the store, keyed on name_cksum
+    # via the plain ix_policies_name_cksum index checked above.
+    assert "uq_policies_session_id_name_cksum" not in uniques
     assert "uq_policies_session_id_name" not in uniques
 
 
@@ -75,7 +83,8 @@ def test_backfill_computes_sha256_of_name(tmp_path: Path) -> None:
                 # scope=1 default, type=1 python (int codes at this revision).
                 "INSERT INTO policies"
                 " (workspace_id, id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES (0, 'pol_bf1', 'legacy_name', NULL, 1, 1, 1, 'mod.f', 1)"
+                " VALUES (0, '2f9bdde44384914ae0d8850527cdfe7d', 'legacy_name',"
+                " NULL, 1, 1, 1, 'mod.f', 1)"
             )
         )
     with engine.begin() as conn:
@@ -84,7 +93,9 @@ def test_backfill_computes_sha256_of_name(tmp_path: Path) -> None:
 
     with engine.begin() as conn:
         cksum = conn.execute(
-            sa.text("SELECT name_cksum FROM policies WHERE id = 'pol_bf1'")
+            sa.text(
+                "SELECT name_cksum FROM policies WHERE id = '2f9bdde44384914ae0d8850527cdfe7d'"
+            )
         ).scalar_one()
     assert bytes(cksum) == hashlib.sha256(b"legacy_name").digest()
 

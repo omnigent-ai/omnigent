@@ -19,6 +19,21 @@ CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_
 
 _STATE_FILE = "state.json"
 _STARTUP_ERROR_FILE = "startup_error.json"
+# Per-MCP-server startup state mirrored from Codex's
+# ``mcpServer/startupStatus/updated`` notifications. Written by the
+# forwarder (and by ``wait_for_thread_started`` while it drains startup
+# events), read by the executor's first-turn gate and the runner's
+# Stop handler.
+_MCP_STARTUP_FILE = "mcp_startup.json"
+
+# Startup states mirrored from Codex's ``McpServerStartupState`` enum.
+MCP_STARTUP_STARTING = "starting"
+MCP_STARTUP_READY = "ready"
+MCP_STARTUP_FAILED = "failed"
+MCP_STARTUP_CANCELLED = "cancelled"
+MCP_STARTUP_STATES = frozenset(
+    {MCP_STARTUP_STARTING, MCP_STARTUP_READY, MCP_STARTUP_FAILED, MCP_STARTUP_CANCELLED}
+)
 # Must match ``_CONFIG_FILE`` in ``claude_native_bridge.py`` because
 # ``serve-mcp`` reads this filename for the token.
 _MCP_CONFIG_FILE = "bridge.json"
@@ -341,7 +356,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Codex bridge directory.
     :returns: None.
     """
-    for name in (_STATE_FILE, _STARTUP_ERROR_FILE):
+    for name in (_STATE_FILE, _STARTUP_ERROR_FILE, _MCP_STARTUP_FILE):
         try:
             (bridge_dir / name).unlink()
         except FileNotFoundError:
@@ -390,6 +405,166 @@ def read_bridge_startup_error(bridge_dir: Path) -> str | None:
         return None
     message = raw.get("message")
     return message if isinstance(message, str) and message else None
+
+
+def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:
+    """
+    Read the recorded per-MCP-server startup state.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Mapping of server name to its latest startup record, e.g.
+        ``{"safe": {"status": "starting", "error": None}}``. Empty when
+        no state has been recorded or the file is unreadable.
+    """
+    path = bridge_dir / _MCP_STARTUP_FILE
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    servers = raw.get("servers") if isinstance(raw, dict) else None
+    if not isinstance(servers, dict):
+        return {}
+    parsed: dict[str, dict[str, str | None]] = {}
+    for name, record in servers.items():
+        if not (isinstance(name, str) and name and isinstance(record, dict)):
+            continue
+        status = record.get("status")
+        if status not in MCP_STARTUP_STATES:
+            continue
+        error = record.get("error")
+        parsed[name] = {
+            "status": status,
+            "error": error if isinstance(error, str) and error else None,
+        }
+    return parsed
+
+
+def _write_mcp_startup(bridge_dir: Path, servers: dict[str, dict[str, str | None]]) -> None:
+    """
+    Persist the per-MCP-server startup map atomically (best-effort).
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param servers: Full startup map, e.g.
+        ``{"safe": {"status": "ready", "error": None}}``.
+    :returns: None.
+    """
+    try:
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = bridge_dir / _MCP_STARTUP_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_MCP_STARTUP_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"servers": servers}, handle, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        return  # best-effort; surfacing MCP state must never sink startup
+
+
+def update_mcp_server_startup(
+    bridge_dir: Path,
+    name: str,
+    status: str,
+    error: str | None = None,
+) -> dict[str, dict[str, str | None]]:
+    """
+    Record one Codex MCP-server startup update.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param name: MCP server name, e.g. ``"storage-console"``.
+    :param status: One of :data:`MCP_STARTUP_STATES`.
+    :param error: Failure detail when ``status == "failed"``, e.g.
+        ``"handshaking with MCP server failed"``. ``None`` otherwise.
+    :returns: The full startup map after the update.
+    """
+    servers = read_mcp_startup(bridge_dir)
+    servers[name] = {"status": status, "error": error}
+    _write_mcp_startup(bridge_dir, servers)
+    return servers
+
+
+def pending_mcp_servers(servers: dict[str, dict[str, str | None]]) -> list[str]:
+    """
+    Return the MCP servers still reported as ``starting``.
+
+    :param servers: Startup map from :func:`read_mcp_startup`.
+    :returns: Sorted server names whose latest status is ``starting``.
+    """
+    return sorted(
+        name for name, record in servers.items() if record.get("status") == MCP_STARTUP_STARTING
+    )
+
+
+def cancel_pending_mcp_startup(bridge_dir: Path) -> list[str]:
+    """
+    Mark every still-``starting`` MCP server as ``cancelled``.
+
+    Used by the Stop path so the executor's first-turn gate unblocks
+    immediately, even when Codex's own ``cancelled`` notifications are
+    delayed or lost.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Sorted names of the servers that were flipped, e.g.
+        ``["storage-console"]``. Empty when nothing was pending.
+    """
+    servers = read_mcp_startup(bridge_dir)
+    pending = pending_mcp_servers(servers)
+    if not pending:
+        return []
+    for name in pending:
+        servers[name] = {"status": MCP_STARTUP_CANCELLED, "error": servers[name].get("error")}
+    _write_mcp_startup(bridge_dir, servers)
+    return pending
+
+
+def settle_pending_mcp_startup(bridge_dir: Path) -> tuple[dict[str, dict[str, str | None]], bool]:
+    """
+    Drop every still-``starting`` MCP server from the recorded map.
+
+    Codex delivers per-server terminal states (ready/failed) only to the
+    connection that owns the thread — never to Omnigent's observer
+    connection — so when a settle signal arrives (the thread went idle
+    after a turn, or the startup window elapsed) the round is known to be
+    over but the per-server outcomes are not. Unresolved entries are
+    removed rather than guessed; locally-known terminal states
+    (``cancelled`` from a Stop) are preserved.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``(map_after, changed)`` — the settled map and whether any
+        entry was dropped.
+    """
+    # The read→write below is not locked across processes: a runner Stop
+    # can flip an entry to ``cancelled`` in between, and this write drops
+    # it. Cosmetic only — both outcomes end the round, and the Stop path
+    # publishes its cancelled map independently.
+    servers = read_mcp_startup(bridge_dir)
+    pending = pending_mcp_servers(servers)
+    if not pending:
+        return servers, False
+    for name in pending:
+        servers.pop(name, None)
+    _write_mcp_startup(bridge_dir, servers)
+    return servers, True
+
+
+def mcp_startup_waiting_detail(servers: dict[str, dict[str, str | None]]) -> str | None:
+    """
+    Describe the MCP servers a startup wait is still blocked on.
+
+    :param servers: Startup map from :func:`read_mcp_startup`.
+    :returns: Text naming the pending servers, e.g.
+        ``"MCP startup still waiting on storage-console"``, or ``None``
+        when nothing is pending.
+    """
+    pending = pending_mcp_servers(servers)
+    if not pending:
+        return None
+    return f"MCP startup still waiting on {', '.join(pending)}"
 
 
 def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:

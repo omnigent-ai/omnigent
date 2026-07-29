@@ -151,7 +151,7 @@ def test_fork_switch_agent_carries_history(
 
     # The switch fork succeeds and navigates to a NEW session id.
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     expect(dialog).not_to_be_visible()
@@ -245,7 +245,7 @@ def test_fork_into_pi_labels_model_picker_pi(
 
     # Land on the new Pi-bound fork (a distinct session id).
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
@@ -262,13 +262,13 @@ def test_fork_into_pi_labels_model_picker_pi(
         f"expected the fork to bind the target's verbatim name, got {bound_name!r}"
     )
 
-    # The harness identity in the status tray shows the friendly "Pi" — the
-    # raw wrapper slug ("native-ui") must be gone. Pre-fix this read
-    # "Pi-native-ui". The identity moved out of the picker trigger into the
-    # status tray; a Pi-native session exposes no web-UI model/effort switch,
-    # so the trigger renders nothing and the tray carries the identity.
-    harness = page.get_by_test_id("composer-harness")
-    expect(harness).to_be_visible(timeout=30_000)
-    expect(harness).to_contain_text("Pi")
-    expect(harness).not_to_contain_text("native-ui")
-    expect(harness).not_to_contain_text("fork")
+    # The harness identity lives in the config gear's hover tooltip and shows
+    # the friendly "Pi" — the raw wrapper slug ("native-ui") must be gone
+    # (pre-fix this read "Pi-native-ui").
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=30_000)
+    gear.hover()
+    tooltip = page.get_by_test_id("composer-config-gear-tooltip")
+    expect(tooltip).to_contain_text("Pi")
+    expect(tooltip).not_to_contain_text("native-ui")
+    expect(tooltip).not_to_contain_text("fork")

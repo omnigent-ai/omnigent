@@ -16,9 +16,99 @@ from __future__ import annotations
 
 import getpass
 import hashlib
+import logging
 import os
+import shutil
 import sys
+from contextlib import suppress
 from pathlib import Path
+
+_logger = logging.getLogger(__name__)
+
+
+# Common global install dirs for npm/homebrew CLIs, probed when a binary isn't
+# on ``PATH``. The host daemon snapshots ``PATH`` at spawn and never refreshes
+# it, so a CLI installed into an nvm/npm/homebrew bin dir that only interactive
+# shell init puts on ``PATH`` is invisible to ``shutil.which``.
+def _cli_fallback_dirs() -> tuple[Path, ...]:
+    """Return the global install dirs to probe when a CLI isn't on ``PATH``.
+
+    Includes nvm's version-specific bin dirs (``~/.nvm/versions/node/*/bin``),
+    where npm global installs land under nvm — the common driver of a CLI that
+    a foreground shell sees but the daemon's frozen ``PATH`` doesn't.
+    """
+    home = Path.home()
+    dirs = [
+        home / ".local" / "bin",
+        Path("/usr/local/bin"),
+        Path("/opt/homebrew/bin"),
+        home / ".npm-global" / "bin",
+    ]
+    # nvm keeps global bins per Node version; newest first so a current install
+    # wins over a stale one. Sort by parsed numeric version (so v10 > v9, not
+    # the lexicographic order in which "v10" < "v9").
+    nvm_versions = home / ".nvm" / "versions" / "node"
+    with suppress(OSError):
+        version_dirs = [p for p in nvm_versions.iterdir() if p.is_dir()]
+        version_dirs.sort(key=lambda p: _parse_node_version(p.name), reverse=True)
+        dirs.extend(p / "bin" for p in version_dirs)
+    return tuple(dirs)
+
+
+def _parse_node_version(name: str) -> tuple[int, ...]:
+    """Parse an nvm version dir name (e.g. ``"v20.5.0"``) into a sortable tuple.
+
+    Non-numeric or malformed names sort lowest (empty tuple) so real versions
+    win over anything unparseable.
+    """
+    parts = name.lstrip("v").split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return ()
+
+
+def resolve_cli_binary(name: str, *, env_var: str | None = None) -> str | None:
+    """Resolve a CLI binary that may live off the process ``PATH``.
+
+    Checks an optional ``env_var`` override first (an explicit path or a name
+    on ``PATH``), then ``PATH`` via :func:`shutil.which`, then a ladder of
+    common global install dirs (:func:`_cli_fallback_dirs`). This survives the
+    host daemon's frozen ``PATH``, which omits nvm/npm/homebrew bin dirs that
+    only interactive shell init adds. Returns ``None`` when none resolve; the
+    caller decides whether that's fatal.
+
+    :param name: The binary name, e.g. ``"codex"`` or ``"claude"``.
+    :param env_var: Optional env var holding an override path/name, e.g.
+        ``"OMNIGENT_CODEX_PATH"``.
+    :returns: An absolute path to the executable, or ``None``.
+    """
+    if env_var:
+        override = os.environ.get(env_var, "").strip()
+        if override:
+            resolved = shutil.which(override)
+            if resolved:
+                return resolved
+            if os.access(override, os.X_OK) and os.path.isfile(override):
+                return override
+            # A set-but-unresolvable override (typo, moved/non-executable
+            # binary) silently falling through to PATH would launch a
+            # *different* binary than intended — warn so the misconfig surfaces.
+            _logger.warning(
+                "%s=%r does not resolve to an executable file; falling back to PATH for %r.",
+                env_var,
+                override,
+                name,
+            )
+    on_path = shutil.which(name)
+    if on_path is not None:
+        return on_path
+    for directory in _cli_fallback_dirs():
+        candidate = directory / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
 
 #: True on native Windows (cmd/PowerShell), i.e. ``os.name == "nt"``. This is
 #: *not* true under WSL, where Python reports a Linux platform.

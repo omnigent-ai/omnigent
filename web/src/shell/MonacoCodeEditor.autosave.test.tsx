@@ -37,6 +37,7 @@ interface FakeEditor {
   saveViewState: () => null;
   restoreViewState: () => void;
   getAction: () => { run: () => void };
+  getContribution: () => null;
   /** Test-only: set getValue() without firing onChange (mirrors a user keystroke
    *  landing in the buffer; the test fires onChange separately). */
   __set: (v: string) => void;
@@ -63,6 +64,7 @@ function makeFakeEditor(initial: string): FakeEditor {
     saveViewState: () => null,
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
+    getContribution: () => null,
     __set: (v) => {
       value = v;
     },

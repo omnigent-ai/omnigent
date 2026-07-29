@@ -74,25 +74,29 @@ class BenchProfile:
 def resolve_profile(name: str) -> BenchProfile:
     """Resolve a harness name to a :class:`BenchProfile`.
 
-    Resolution chain (option B in the design doc):
+    Resolution chain:
 
     1. An official harness in :mod:`tests.harness_bench.manifest`.
     2. A community harness that ships a profile: *name* is a dotted path
        to either a ``BenchProfile`` instance or a zero-arg
        ``bench_profile()`` factory (e.g.
        ``mypkg.myharness:bench_profile`` or ``mypkg.myharness.PROFILE``).
+    3. Any harness registered in the omnigent registry (in-repo or an
+       entry-point plugin), resolved by name / alias — the profile is
+       derived from the capability model (see
+       :func:`tests.harness_bench.manifest._registry_profile`). This is what
+       lets ``--harness acp`` or ``--harness rovo`` run with no bench edit.
 
     This keeps the official list a convenience index, not a gate: any
-    harness exposing a profile is probeable with ``--harness <path>`` and
-    no bench edits. When per-harness self-registration lands, step 1 swaps
-    from a static dict to dynamic discovery with no change here.
+    registered harness is probeable by name, and any out-of-tree one that
+    ships a ``BenchProfile`` is probeable by reference.
 
-    :param name: Official harness name or a dotted path / ``module:attr``.
+    :param name: Harness name / alias, or a dotted path / ``module:attr``.
     :returns: The resolved profile.
-    :raises KeyError: If *name* is neither official nor an importable
+    :raises KeyError: If *name* is not a registered harness nor an importable
         profile reference.
     """
-    from tests.harness_bench.manifest import OFFICIAL_PROFILES
+    from tests.harness_bench.manifest import OFFICIAL_PROFILES, _registry_profile
 
     if name in OFFICIAL_PROFILES:
         return OFFICIAL_PROFILES[name]
@@ -101,10 +105,14 @@ def resolve_profile(name: str) -> BenchProfile:
     if resolved is not None:
         return resolved
 
+    from_registry = _registry_profile(name)
+    if from_registry is not None:
+        return from_registry
+
     raise KeyError(
-        f"unknown harness {name!r}: not an official harness "
-        f"({', '.join(sorted(OFFICIAL_PROFILES))}) and not an importable "
-        f"BenchProfile reference (try 'module:attr' or 'module.ATTR')"
+        f"unknown harness {name!r}: not a registered omnigent harness, not an "
+        f"official profile ({', '.join(sorted(OFFICIAL_PROFILES))}), and not an "
+        f"importable BenchProfile reference (try 'module:attr' or 'module.ATTR')"
     )
 
 

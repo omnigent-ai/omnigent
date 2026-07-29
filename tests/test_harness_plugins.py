@@ -59,7 +59,11 @@ def test_community_harness_contribution_is_merged(monkeypatch: pytest.MonkeyPatc
     assert (
         hp.spawn_env_builders()["foo"] == "omnigent.community.harness.foo.plugin:build_spawn_env"
     )
-    assert {"id": "foo", "label": "Foo"} in hp.harness_catalog()
+    foo_row = next((row for row in hp.harness_catalog() if row["id"] == "foo"), None)
+    assert foo_row is not None
+    assert foo_row["label"] == "Foo"
+    # Every catalog row now also carries a setup_steps checklist.
+    assert "setup_steps" in foo_row
 
 
 def test_community_harness_rejects_non_community_import_path(
@@ -182,13 +186,13 @@ def test_community_harness_readiness_uses_install_metadata(
 
     from omnigent.onboarding import harness_readiness as readiness
 
-    monkeypatch.setattr(readiness.shutil, "which", lambda _binary: None)
+    monkeypatch.setattr(readiness, "resolve_cli_binary", lambda _binary: None)
     assert readiness.harness_is_configured("foo") is False
     configured = readiness.configured_harness_map()
     assert configured["foo"] is False
     assert configured["foo-code"] is False
 
-    monkeypatch.setattr(readiness.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(readiness, "resolve_cli_binary", lambda binary: f"/usr/bin/{binary}")
     assert readiness.harness_is_configured("foo") is True
 
 
@@ -212,3 +216,79 @@ def test_community_namespace_imports_external_harness_package(
 
     module = importlib.import_module("omnigent.community.harness.foo")
     assert module.VALUE == "ok"
+
+
+def test_builtin_background_title_generators_are_registered() -> None:
+    generators = hp.background_title_generators()
+
+    assert set(generators) >= {
+        "claude-sdk",
+        "claude-native",
+        "codex",
+        "codex-native",
+    }
+    assert generators["claude-sdk"].generator.endswith("sdk:generate_background_title")
+    assert generators["codex"].generator == generators["claude-sdk"].generator
+    assert generators["claude-native"].resolver_harness == "claude-sdk"
+    assert generators["codex-native"].resolver_harness is None
+
+
+def test_community_harness_can_register_background_title_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _contribution() -> hp.HarnessContribution:
+        return hp.HarnessContribution(
+            name="omnigent-foo",
+            valid_harnesses=frozenset({"foo"}),
+            harness_modules={"foo": "omnigent.community.harness.foo.inner.foo_harness"},
+            background_title_generators={
+                "foo": hp.BackgroundTitleGeneratorSpec(
+                    "omnigent.community.harness.foo.background_titles:generate"
+                )
+            },
+        )
+
+    _install_entry_points(monkeypatch, _EntryPoint("foo", _contribution))
+
+    generator = hp.background_title_generators()["foo"]
+    assert generator.generator == ("omnigent.community.harness.foo.background_titles:generate")
+
+
+def test_builtin_native_providers_cover_every_native_agent() -> None:
+    """Every native agent has exactly one provider row keyed by the same key."""
+    agent_keys = sorted(agent.key for agent in hp.native_agents())
+    provider_keys = sorted(provider.key for provider in hp.native_providers())
+    assert provider_keys == agent_keys
+    # No duplicate provider keys.
+    assert len(provider_keys) == len(set(provider_keys))
+
+
+def test_native_provider_for_key_lookup() -> None:
+    assert hp.native_provider_for_key("claude") is not None
+    assert hp.native_provider_for_key("claude").key == "claude"
+    assert hp.native_provider_for_key("does-not-exist") is None
+
+
+def test_builtin_native_providers_have_required_hooks() -> None:
+    """run_native and auto_create_terminal are mandatory on every built-in row."""
+    for provider in hp.native_providers():
+        assert provider.run_native, provider.key
+        assert provider.auto_create_terminal, provider.key
+
+
+def test_builtin_native_provider_paths_resolve() -> None:
+    """Every populated built-in provider hook resolves to a real callable.
+
+    This is the guard that keeps the provider rows honest: a typo'd import path
+    or a renamed run_<x>_native symbol fails here rather than at dispatch time.
+    """
+    from omnigent import native_dispatch
+
+    for provider in hp.native_providers():
+        for hook in (
+            "run_native",
+            "auto_create_terminal",
+            "materialize_agent_spec",
+        ):
+            resolved = native_dispatch.resolve_hook(provider, hook)
+            assert callable(resolved), f"{provider.key}.{hook} did not resolve to a callable"

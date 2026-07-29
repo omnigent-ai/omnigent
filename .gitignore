@@ -2,6 +2,8 @@
 build/
 dist/
 node_modules/
+.pnpm-store/
+.pnpm-debug.log*
 reviews/
 
 # Generated artifact; never committed.
@@ -57,6 +59,7 @@ dev/omnidev/target/
 
 # Playwright test run output (screenshots, traces, videos).
 test-results/
+output/playwright/
 
 # Visual-snapshot failure output (actual/expected/diff PNGs from the UI diff
 # gate). Regenerated each run; only the baseline under

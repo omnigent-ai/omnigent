@@ -585,12 +585,13 @@ def test_login_failure_leaves_default_server_unchanged(
 
 def _scripted_normalizer_httpx(
     monkeypatch: pytest.MonkeyPatch,
-    responses_by_url: dict[str, httpx.Response],
+    responses_by_url: dict[str, httpx.Response | Exception],
 ) -> list[str]:
     """Route ``httpx.get`` by exact URL for normalizer tests.
 
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param responses_by_url: Exact-URL → response map; an unmapped URL
+    :param responses_by_url: Exact-URL → response map; a mapped exception is
+        raised instead (for a host that does not resolve), and an unmapped URL
         fails the test loudly (it means an unexpected probe ran).
     :returns: The list of URLs probed, in order.
     """
@@ -599,10 +600,86 @@ def _scripted_normalizer_httpx(
     def _get(url: str, **kwargs: object) -> httpx.Response:
         probed.append(url)
         assert url in responses_by_url, f"unexpected probe: {url}"
-        return responses_by_url[url]
+        mapped = responses_by_url[url]
+        if isinstance(mapped, Exception):
+            raise mapped
+        return mapped
 
     monkeypatch.setattr(httpx, "get", _get)
     return probed
+
+
+def test_azure_vanity_url_falls_back_to_probed_canonical_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Azure vanity URL that 303s to /login resolves via the canonical host.
+
+    Drives the real ``_workspace_api_server_url`` with only httpx scripted, so it
+    catches what a stubbed expander cannot: that function drops the ``?o=``
+    selector before probing, so the fallback has to compare against the root it
+    actually probed rather than the URL it was handed.
+    """
+    vanity_root = "https://mydomain.azuredatabricks.net"
+    canonical_root = "https://adb-4173618801742158.18.azuredatabricks.net"
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            # The vanity edge redirects to a relative /login, which the
+            # login-target detector does not recognize.
+            f"{vanity_root}/v1/me": _response(303, headers={"location": "/login"}),
+            f"{canonical_root}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{canonical_root}/api/2.0/omnigent/v1/me": _response(
+                401, headers={"www-authenticate": 'DatabricksRealm realm="omnigent"'}
+            ),
+        },
+    )
+
+    result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
+
+    assert result == f"{canonical_root}/api/2.0/omnigent"
+    # The vanity root is probed first and the canonical host only after it fails.
+    assert probed[0] == f"{vanity_root}/v1/me"
+    assert f"{canonical_root}/v1/me" in probed
+
+
+def test_azure_vanity_url_that_answers_is_never_rewritten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanity URL that resolves on its own keeps the host the user typed."""
+    vanity_root = "https://mydomain.azuredatabricks.net"
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {f"{vanity_root}/v1/me": _response(200)},
+    )
+
+    result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
+
+    assert result == vanity_root
+    # No canonical host was ever synthesized or probed. The vanity root is asked
+    # twice: once by the expansion, once by the usable check, which is the cost of
+    # the expansion not reporting whether the URL it returned actually answered.
+    assert probed == [f"{vanity_root}/v1/me"] * 2
+
+
+def test_azure_vanity_url_kept_when_canonical_host_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrong synthesis must not strand the user on a host they never typed."""
+    vanity_root = "https://mydomain.azuredatabricks.net"
+    canonical_root = "https://adb-4173618801742158.18.azuredatabricks.net"
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{vanity_root}/v1/me": _response(303, headers={"location": "/login"}),
+            # The synthesized host does not resolve at all.
+            f"{canonical_root}/v1/me": httpx.ConnectError("dns failure"),
+        },
+    )
+
+    result = cli_mod._resolve_server_url(f"{vanity_root}/?o=4173618801742158")
+
+    assert result == vanity_root
+    assert f"{canonical_root}/v1/me" in probed
 
 
 def test_workspace_url_expands_bare_workspace_host(

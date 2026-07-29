@@ -27,9 +27,6 @@ class PolicyDenyProbe(CapabilityProbe):
     applies_to = Applicability.BOTH
 
     async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
-        # The driver owns the deny mechanism (a tool_call-phase verdict on the
-        # wrap path, a spec-baked deny policy on full-server); the probe only
-        # cares whether a surfaced tool call was actually blocked.
         result = await driver.run_tool_turn(deny=True)
         detail = {
             "policy_actions": result.policy_actions,
@@ -38,13 +35,7 @@ class PolicyDenyProbe(CapabilityProbe):
             "completed": result.completed,
         }
 
-        # A confirmed tool-call DENY is enforcement, whether or not a
-        # ``function_call`` item persisted. On full-server the denied call still
-        # surfaces an item (with a blocked output); on native-tui the deny is
-        # decided at the vendor hook *before* the tool runs, so no item persists
-        # and the only signal is the server's ``response.policy_denied`` event.
-        # Check the deny signal first so the native path is not swallowed by the
-        # "no tool call" guard below.
+        # Native hooks can deny before a function-call item is persisted.
         if result.tool_call_denied:
             if result.completed or result.failed:
                 return ProbeResult(
@@ -65,20 +56,12 @@ class PolicyDenyProbe(CapabilityProbe):
             )
 
         if not result.tool_calls:
-            # No deny signal AND no tool call: the model never tried the tool, so
-            # the tool-call DENY path was never exercised. (On native this also
-            # covers a turn where the vendor simply didn't call the tool.)
             return ProbeResult(
                 Verdict.SKIPPED,
                 note="model never attempted the tool; tool-call DENY path not exercised",
                 detail=detail,
             )
-        # A tool call happened but no DENY was surfaced. Policy evaluation is
-        # normally driven by the server / runner; in the wrap-direct transport
-        # some harnesses (e.g. codex) dispatch the tool without a tool-call
-        # evaluation hook, so we cannot exercise DENY here. That is a transport
-        # limitation, not proof the harness ignores policy — report SKIPPED and
-        # let the full-server / native transport assert enforcement.
+        # Wrap-direct transports may dispatch tools without a policy hook.
         return ProbeResult(
             Verdict.SKIPPED,
             note=(

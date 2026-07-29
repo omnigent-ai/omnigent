@@ -36,6 +36,7 @@ _PYPROJECTS = [
     "pyproject.toml",
     "sdks/python-client/pyproject.toml",
     "sdks/ui/pyproject.toml",
+    "integrations/slack/pyproject.toml",
 ]
 # The runtime version constant is stamped/verified alongside the pyprojects.
 _VERSION_PY = "omnigent/version.py"
@@ -54,12 +55,14 @@ def repo_copy(tmp_path: Path) -> Path:
 
 def test_set_version_rewrites_every_location(repo_copy: Path) -> None:
     changed = update_versions.set_version(repo_copy, "9.9.9")
-    # Three pyprojects plus omnigent/version.py.
-    assert len(changed) == 4
-    # root: version line + two sibling pins; SDKs: version line + one pin.
-    assert (repo_copy / "pyproject.toml").read_text().count("9.9.9") == 3
+    # Four pyprojects plus omnigent/version.py.
+    assert len(changed) == 5
+    # root: version line + three sibling pins (client, ui-sdk, slack);
+    # client/ui SDKs: version line + one pin; slack: version line only.
+    assert (repo_copy / "pyproject.toml").read_text().count("9.9.9") == 4
     assert (repo_copy / "sdks/python-client/pyproject.toml").read_text().count("9.9.9") == 2
     assert (repo_copy / "sdks/ui/pyproject.toml").read_text().count("9.9.9") == 2
+    assert (repo_copy / "integrations/slack/pyproject.toml").read_text().count("9.9.9") == 1
     # The runtime constant is stamped too.
     assert 'VERSION = "9.9.9"' in (repo_copy / _VERSION_PY).read_text()
     # check() round-trips: all agree and pins are exact.
@@ -101,9 +104,9 @@ def test_set_version_preserves_unrelated_version_literals(repo_copy: Path) -> No
     before = root_pyproject.read_text()
     # Real third-party floor that shares the old version digits — must
     # survive a bump untouched (anchored-on-name replacement, not blind).
-    assert '"databricks-mcp>=0.1.0",' in before
+    assert '"databricks-mcp>=0.9.0",' in before
     update_versions.set_version(repo_copy, "9.9.9")
-    assert '"databricks-mcp>=0.1.0",' in root_pyproject.read_text()
+    assert '"databricks-mcp>=0.9.0",' in root_pyproject.read_text()
 
 
 def test_check_detects_version_drift(repo_copy: Path) -> None:
@@ -131,9 +134,11 @@ def test_set_version_fails_loud_when_line_absent(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     (root / "sdks/python-client").mkdir(parents=True)
     (root / "sdks/ui").mkdir(parents=True)
+    (root / "integrations/slack").mkdir(parents=True)
     (root / "pyproject.toml").write_text('[project]\nname = "omnigent"\n')
     (root / "sdks/python-client/pyproject.toml").write_text("[project]\n")
     (root / "sdks/ui/pyproject.toml").write_text("[project]\n")
+    (root / "integrations/slack/pyproject.toml").write_text("[project]\n")
     with pytest.raises(ValueError, match="expected exactly 1 match"):
         update_versions.set_version(root, "9.9.9")
 
@@ -141,10 +146,10 @@ def test_set_version_fails_loud_when_line_absent(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("released", "expected"),
     [
-        ("0.1.2", "0.1.3.dev0"),
-        ("1.0.0", "1.0.1.dev0"),
-        ("0.1.2rc1", "0.1.3.dev0"),
-        ("2.5.9", "2.5.10.dev0"),
+        ("0.1.2", "0.2.0.dev0"),
+        ("1.0.0", "1.1.0.dev0"),
+        ("0.6.0rc1", "0.7.0.dev0"),
+        ("2.5.9", "2.6.0.dev0"),
     ],
 )
 def test_next_dev_version(released: str, expected: str) -> None:

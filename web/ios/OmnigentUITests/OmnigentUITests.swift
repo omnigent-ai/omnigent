@@ -36,6 +36,141 @@ final class OmnigentUITests: XCTestCase {
     snapshot("02-connected", timeWaitingForIdle: 5)
   }
 
+  // MARK: - Deep links (F-CR-6 end-to-end)
+
+  /// Launch the app with a deep link routed through the REAL handler via the
+  /// DEBUG-only `--omnigent-open-url` launch argument (see `AppRootView`). The
+  /// argument drives the same `handleDeepLink`/`DeepLink.parse` path that
+  /// `.onOpenURL` would. This is the CI-friendly delivery: XCUITest can't
+  /// reliably hand a custom-scheme URL to the app under test on this toolchain
+  /// (`XCUIApplication.open` drops custom schemes), so a launch argument is the
+  /// deterministic seam — no simulator URL routing, no Safari handoff flakiness.
+  ///
+  /// `--omnigent-reset-state` (also DEBUG-only) wipes persisted server
+  /// state so each test starts with NO known/recent server — otherwise a
+  /// prior test's saved `localhost:8000` would make a deep link to the same
+  /// host route in-place (no consent alert), making the tests order-dependent.
+  private func launchApp(openURL link: String) -> XCUIApplication {
+    let app = XCUIApplication(bundleIdentifier: "ai.omnigent.ios")
+    app.launchArguments += ["--omnigent-open-url", link, "--omnigent-reset-state"]
+    app.launch()
+    return app
+  }
+
+  /// A valid `omnigent://` deep link to a server the user has never connected
+  /// to (a cold-started test app has no recents) must surface the consent
+  /// alert — the one surface a page-click can't forge — proving the link made
+  /// it through `DeepLink.parse` and reached `handleDeepLink`.
+  func testValidDeepLinkShowsConsent() throws {
+    // A real 32-char-hex conversation id — the canonical form the API emits.
+    let app = launchApp(
+      openURL: "omnigent://localhost:8000/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9")
+
+    let alert = app.alerts["Open this Omnigent link?"]
+    XCTAssertTrue(
+      alert.waitForExistence(timeout: 10),
+      "A valid deep link to an unknown server should show the consent alert."
+    )
+    XCTAssertTrue(alert.buttons["Open"].exists, "Consent alert should offer Open.")
+    XCTAssertTrue(alert.buttons["Cancel"].exists, "Consent alert should offer Cancel.")
+    alert.buttons["Cancel"].tap()
+  }
+
+  /// A deep link that smuggles a query past the "/c/<id> only" shape via a
+  /// percent-encoded `?` (`%3F`) must be REJECTED: `DeepLink.parse` returns nil,
+  /// `handleDeepLink` returns early, and NO consent alert appears. Before the
+  /// grammar fix the decoded `?` rode inside the id and the link was accepted.
+  func testSmuggledQueryDeepLinkIsRejected() throws {
+    // `%3F` decodes to a literal `?` in URL.path — the smuggling vector from
+    // F-CR-6. The id grammar (hex only) rejects the `?`, so no alert.
+    let app = launchApp(
+      openURL:
+        "omnigent://localhost:8000/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9%3Fview=terminal")
+    // Sanity: the app reached a responsive state where a VALID link would have
+    // shown the alert — so the alert's absence means the link was rejected, not
+    // that delivery silently failed.
+    assertAppReachedSetup(app)
+
+    let alert = app.alerts["Open this Omnigent link?"]
+    XCTAssertFalse(
+      alert.waitForExistence(timeout: 6),
+      "A deep link with a smuggled query (encoded `?`) must be rejected — no consent alert."
+    )
+  }
+
+  /// A deep link with a smuggled fragment (`%23` → `#`) is likewise rejected.
+  func testSmuggledFragmentDeepLinkIsRejected() throws {
+    let app = launchApp(
+      openURL: "omnigent://localhost:8000/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9%23evil")
+    assertAppReachedSetup(app)
+
+    let alert = app.alerts["Open this Omnigent link?"]
+    XCTAssertFalse(
+      alert.waitForExistence(timeout: 6),
+      "A deep link with a smuggled fragment (encoded `#`) must be rejected — no consent alert."
+    )
+  }
+
+  /// A deep link whose id isn't a canonical conversation id (e.g. a short
+  /// stub like `conv_abc`) is still ACCEPTED: the validator is a denylist, not
+  /// a grammar — it rejects only smuggled structure, and leaves id-format
+  /// validity to the SPA's own router. So a benign non-canonical id reaches
+  /// `handleDeepLink` and (for an unknown server) shows the consent alert.
+  func testBenignNonCanonicalIdIsAccepted() throws {
+    // `conv_abc` isn't a real server id, but it smuggles no structure, so the
+    // parser forwards it — the SPA decides validity. Expect the consent alert
+    // (unknown server), proving the link was ACCEPTED.
+    let app = launchApp(openURL: "omnigent://localhost:8000/c/conv_abc")
+
+    let alert = app.alerts["Open this Omnigent link?"]
+    XCTAssertTrue(
+      alert.waitForExistence(timeout: 10),
+      "A deep link with a benign (non-smuggling) id should be accepted and show the consent alert."
+    )
+    alert.buttons["Cancel"].tap()
+  }
+
+  /// A deep link with an encoded `..` (`%2e%2e`) — a path-traversal-shaped id —
+  /// is rejected by the grammar (no `.` in a conversation id).
+  func testEncodedDotDotDeepLinkIsRejected() throws {
+    let app = launchApp(openURL: "omnigent://localhost:8000/c/%2e%2e")
+    assertAppReachedSetup(app)
+
+    let alert = app.alerts["Open this Omnigent link?"]
+    XCTAssertFalse(
+      alert.waitForExistence(timeout: 6),
+      "A deep link with an encoded `..` must be rejected — no consent alert."
+    )
+  }
+
+  /// A deep link with a control character (`%00` NUL) in the id is rejected.
+  func testControlCharDeepLinkIsRejected() throws {
+    let app = launchApp(
+      openURL: "omnigent://localhost:8000/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9%00x")
+    assertAppReachedSetup(app)
+
+    let alert = app.alerts["Open this Omnigent link?"]
+    XCTAssertFalse(
+      alert.waitForExistence(timeout: 6),
+      "A deep link with a control character in the id must be rejected — no consent alert."
+    )
+  }
+
+  /// Sanity for the rejection tests: assert the app launched and is showing the
+  /// setup page (or is otherwise responsive), so a VALID link would have had the
+  /// chance to surface the consent alert. Without this, a rejection test could
+  /// falsely pass if the launch-argument seam silently failed to fire.
+  private func assertAppReachedSetup(_ app: XCUIApplication) {
+    // Either the setup page's "Server URL" label is visible, OR — if the seam
+    // routed a link that the app is processing — the app is at least responsive
+    // (not crashed). The setup page is the expected landing for a reset-state
+    // launch, so require it.
+    XCTAssertTrue(
+      app.staticTexts["Server URL"].waitForExistence(timeout: 15),
+      "App should reach the setup page for a reset-state launch (delivery sanity check)."
+    )
+  }
+
   private func connectFromSetupIfNeeded(_ app: XCUIApplication, serverURL: String) {
     let setupLabel = app.staticTexts["Server URL"]
     guard setupLabel.waitForExistence(timeout: 5) else { return }

@@ -6,6 +6,22 @@ import json
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
+
+
+def _parse_limit(value: Any) -> tuple[int | None, str | None]:
+    """
+    Validate and clamp the optional result limit.
+
+    Matches the public contract: default 20, maximum 100, positive integers only.
+    """
+    if value is None:
+        return 20, None
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None, "'limit' must be an integer"
+    if value < 1:
+        return None, "'limit' must be at least 1"
+    return min(value, 100), None
 
 
 class ListFilesTool(Tool):
@@ -82,9 +98,19 @@ class ListFilesTool(Tool):
         :param ctx: Server-side execution context (unused).
         :returns: JSON string with file list and pagination info.
         """
-        args: dict[str, Any] = json.loads(arguments)
-        limit = min(args.get("limit", 20), 100)
+        args, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return json.dumps({"error": error})
+        assert args is not None
+
+        limit, error = _parse_limit(args.get("limit"))
+        if error is not None:
+            return json.dumps({"error": error})
+        assert limit is not None
+
         after = args.get("after")
+        if after is not None and not isinstance(after, str):
+            return json.dumps({"error": "'after' must be a string"})
 
         from omnigent.runtime import get_file_store
 

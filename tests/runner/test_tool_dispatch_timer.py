@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -120,3 +121,75 @@ async def test_timer_set_rejects_invalid_args_via_shared_validator() -> None:
 
     assert json.loads(output) == {"error": "seconds must be non-negative"}
     assert recorder.posts == []
+
+
+@pytest.mark.asyncio
+async def test_timer_set_rejects_zero_delay_repeating() -> None:
+    """
+    ``repeat=true`` with ``seconds=0`` is rejected with the same error
+    the builtin validator returns, and no wake POST is started.
+
+    Without this guard the firing loop would busy-loop ``sleep(0)`` and
+    hammer the sessions endpoint forever.
+    """
+    recorder = _TimerPostRecorder()
+    transport = httpx.MockTransport(recorder)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as server_client:
+        output = await execute_tool(
+            tool_name="sys_timer_set",
+            arguments=json.dumps({"seconds": 0, "repeat": True}),
+            conversation_id="conv_parent",
+            server_client=server_client,
+        )
+
+    assert json.loads(output) == {"error": "seconds must be > 0 when repeat is true"}
+    assert recorder.posts == []
+
+
+@pytest.mark.asyncio
+async def test_timer_delivery_logs_http_error_status(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    HTTP 4xx/5xx on the wake POST is treated as delivery failure.
+
+    ``httpx`` does not raise on error status codes by default; without an
+    explicit check the timer would silently ignore a rejected firing.
+    """
+
+    class _ErrorResponder:
+        """Mock transport that records the POST and returns HTTP 500."""
+
+        def __init__(self) -> None:
+            self.posts: list[dict[str, Any]] = []
+            self.post_seen = asyncio.Event()
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            self.posts.append({"url": request.url.path, "method": request.method})
+            self.post_seen.set()
+            return httpx.Response(500, text="internal error")
+
+    responder = _ErrorResponder()
+    transport = httpx.MockTransport(responder)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.tool_dispatch"):
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://server"
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_timer_set",
+                arguments=json.dumps({"seconds": 0, "note": "boom"}),
+                conversation_id="conv_parent",
+                server_client=server_client,
+            )
+            result = json.loads(output)
+            assert result["status"] == "scheduled"
+            await asyncio.wait_for(responder.post_seen.wait(), timeout=1.0)
+            # Let the one-shot loop finish after the failed POST.
+            await asyncio.sleep(0.05)
+
+    assert len(responder.posts) == 1
+    assert any(
+        "firing persist failed" in record.getMessage()
+        and result["timer_id"] in record.getMessage()
+        for record in caplog.records
+    )

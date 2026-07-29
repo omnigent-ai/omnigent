@@ -259,6 +259,20 @@ class OpenCodeClient:
         data = await self._request_json("GET", f"/session/{session_id}/message/{message_id}")
         return data if isinstance(data, dict) else {}
 
+    async def list_models(self) -> list[dict[str, Any]]:
+        """
+        List available models (``GET /api/model``).
+
+        :returns: A list of model objects; empty when the server exposes
+            no model catalog.
+        """
+        data = await self._request_json("GET", "/api/model")
+        if isinstance(data, dict):
+            models = data.get("models")
+            if isinstance(models, list):
+                return [m for m in models if isinstance(m, dict)]
+        return []
+
     async def prompt(self, session_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         """
         Send a (blocking) prompt (``POST /session/{id}/message``).

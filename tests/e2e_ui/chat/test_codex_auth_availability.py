@@ -12,7 +12,7 @@ available (absent / ``true``). This PR makes the picker render that distinction:
   (``new-chat-landing-harness-warning``):
   ``"<agent> needs Codex authentication on <host> — run codex login on that
   machine."`` — shown for any selected Codex agent (native or brain harness).
-* the **needs-auth badge** (``new-chat-landing-harness-warning-codex``,
+* the **needs-setup badge** (``new-chat-landing-harness-warning-codex``,
   text ``"needs auth"``) on the Codex row inside a bundle agent's per-entry
   "Agent Harness" config submenu.
 
@@ -187,24 +187,21 @@ async def _register_routes(
 
 
 async def _open_entry_config(page, agent_id: str) -> None:
-    """Open the agent/harness picker and drill into one entry's config submenu.
+    """Select one agent and open its Agent Harness select in the config modal.
 
-    The redesigned composer replaces the old harness trigger with a single
-    agent/harness dropdown (``new-chat-landing-agent-select``). A bundle agent's
-    brain-harness radios (the "Agent Harness" group, with the per-row readiness
-    badges) live in its per-entry **submenu**. A plain *click* on a knobbed row
-    COMMITS that agent and closes the menu, so this hovers the row and nudges it
-    with ``ArrowRight`` to open the submenu without committing — the Playwright
-    counterpart of the unit test's ``openAgentConfig`` helper.
+    A bundle agent's brain-harness options (the "Agent Harness" group, with the
+    per-row readiness badges) now live in the gear-icon config modal's Select,
+    not a picker submenu. Select the agent from the dropdown, open its config
+    modal via the gear, then open the harness Select so the badged options
+    render.
 
     :param page: The Playwright page (the landing picker is already mounted).
-    :param agent_id: The stubbed agent id whose submenu to open, e.g.
-        ``"ag_polly_e2e"``.
+    :param agent_id: The stubbed agent id to configure, e.g. ``"ag_polly_e2e"``.
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()
-    row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
-    await row.hover()
-    await row.press("ArrowRight")
+    await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+    await page.get_by_test_id("new-chat-landing-config-gear").click()
+    await page.get_by_test_id("new-chat-landing-config-harness").click()
 
 
 def test_codex_needs_auth_warns_and_clears_when_available(
@@ -332,11 +329,17 @@ async def _drive_codex_badge(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Polly auto-selects (sole agent); its brain-harness radio group lives
-            # in the picker's per-entry config submenu.
+            # Polly auto-selects (sole agent); its Agent Harness options live in
+            # the gear config modal's Select. Radix mirrors the selected item's
+            # content in the trigger, so a badge can match twice — take .first.
             await _open_entry_config(page, "ag_polly_e2e")
-            badge = page.get_by_test_id("new-chat-landing-harness-warning-codex")
+            badge = page.get_by_test_id("new-chat-landing-harness-warning-codex").first
             await expect(badge).to_be_visible(timeout=30_000)
+            # This test doesn't enable OMNIGENT_HARNESS_INSTALL_ENABLED, so the
+            # picker runs on the feature-OFF default — where the badge keeps the
+            # original per-reason text ("needs auth"). (With the feature ON the
+            # badge collapses to a single "needs setup" and the reason moves into
+            # the setup dialog.)
             await expect(badge).to_contain_text("needs auth")
         finally:
             await browser.close()

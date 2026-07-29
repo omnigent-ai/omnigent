@@ -45,6 +45,31 @@ describe("openTerminalLink", () => {
     );
   });
 
+  it("routes same-origin session links in-place without opening a new tab", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const pushSpy = vi.spyOn(window.history, "pushState");
+    const event = new MouseEvent("click");
+    const preventSpy = vi.spyOn(event, "preventDefault");
+
+    openTerminalLink(event, `${window.location.origin}/c/conv_next`);
+
+    expect(preventSpy).toHaveBeenCalledOnce();
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(pushSpy).toHaveBeenCalledWith(null, "", "/c/conv_next");
+  });
+
+  it("does not reopen the current same-origin session link", () => {
+    window.history.replaceState(null, "", "/c/conv_current");
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const pushSpy = vi.spyOn(window.history, "pushState");
+    const event = new MouseEvent("click");
+
+    openTerminalLink(event, `${window.location.origin}/c/conv_current`);
+
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(pushSpy).not.toHaveBeenCalled();
+  });
+
   it("prevents the addon's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");

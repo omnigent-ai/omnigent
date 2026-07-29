@@ -45,6 +45,7 @@ from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.app import create_app
+from omnigent.server.auth import LEVEL_EDIT
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -187,14 +188,14 @@ def _create_child_session(
     Create a child conversation under a parent session.
 
     :param db_uri: Test database URI.
-    :param parent_id: Parent session id, e.g. ``"conv_parent"``.
+    :param parent_id: Parent session id, e.g. ``"ead6d59a6b650d19dbdf61ec32426f4e"``.
     :param agent_id: Agent id inherited by the child.
     :param title: Sub-agent title in ``"<agent>:<name>"`` form, e.g.
         ``"codex-child:approval"``. Must be unique per parent — the DB
         enforces ``(parent_conversation_id, title)`` uniqueness, so a
         fan-out test creating multiple children under one parent must
         pass distinct titles.
-    :returns: Child session id, e.g. ``"conv_child"``.
+    :returns: Child session id, e.g. ``"ff5cac23d0beb79fad914046049f32ff"``.
     """
     store = SqlAlchemyConversationStore(db_uri)
     child = store.create_conversation(
@@ -973,7 +974,7 @@ class _InputRequiredRunnerClient:
         Record the execute payload and return the scripted response.
 
         :param url: Runner path, e.g.
-            ``"/v1/sessions/conv_child/mcp/execute"``.
+            ``"/v1/sessions/ff5cac23d0beb79fad914046049f32ff/mcp/execute"``.
         :param json: The request body.
         :param timeout: Forward timeout (ignored by the stub).
         :returns: A real ``httpx.Response`` with the scripted JSON.
@@ -1268,7 +1269,7 @@ async def test_resolve_url_unknown_session_returns_404(
     URL fails loud rather than silently no-op'ing.
     """
     resp = await client.post(
-        "/v1/sessions/conv_does_not_exist/elicitations/elicit_nope/resolve",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/elicitations/elicit_nope/resolve",
         json={"action": "accept"},
     )
     assert resp.status_code == 404, resp.text
@@ -1337,26 +1338,31 @@ async def test_resolve_url_cross_user_forbidden(
     auth_client: httpx.AsyncClient,
 ) -> None:
     """
-    A non-owner cannot reach the resolve endpoint when auth is
+    A shared editor cannot reach the resolve endpoint when auth is
     active.
 
-    Alice owns the session; Bob's POST to its resolve URL is rejected
-    by the ``LEVEL_EDIT`` access gate before any resolution runs. The
+    Alice owns the session and grants Bob edit access. Bob's POST to
+    its resolve URL is rejected by the ``LEVEL_OWNER`` access gate
+    before any resolution runs. The
     unguessable elicitation id is a capability, but session-owner
-    access control is the outer fence — Bob must not get past it even
-    with a valid-looking id.
+    access control is the outer fence — edit access must not authorize
+    tools that execute with Alice's credentials.
     """
     agent = await create_test_agent(auth_client, user="alice@example.com")
     session_id = await _create_session(auth_client, agent["id"], user="alice@example.com")
+    grant = await auth_client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "bob@example.com", "level": LEVEL_EDIT},
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert grant.status_code == 200, grant.text
 
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/elicitations/elicit_whatever/resolve",
         json={"action": "accept"},
         headers={"X-Forwarded-Email": "bob@example.com"},
     )
-    # Non-owner is denied (403 forbidden, or 404 to avoid leaking
-    # existence — both are acceptable refusals).
-    assert resp.status_code in (403, 404), resp.text
+    assert resp.status_code == 403, resp.text
 
 
 # ── GET /sessions/{id}/elicitations/{eid} (approval page) ────
@@ -1417,7 +1423,7 @@ async def test_elicitation_page_unknown_session_returns_404(
     Requesting the page for a nonexistent session returns 404.
     """
     resp = await client.get(
-        "/v1/sessions/conv_does_not_exist/elicitations/elicit_nope",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/elicitations/elicit_nope",
     )
     assert resp.status_code == 404, resp.text
 
@@ -1456,13 +1462,13 @@ def test_mrtr_response_url_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         rpc_id=1,
         elicitation_id="elicit_abc",
         message="Approve?",
-        request_state='{"elicitation_id":"elicit_abc","session_id":"conv_123"}',
-        session_id="conv_123",
+        request_state='{"elicitation_id":"elicit_abc","session_id":"0099dc8be6d82871e2e450424d46d1b7"}',
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
     )
     body = json.loads(resp.body)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]
     assert params["mode"] == "url"
-    assert params["url"] == "/approve/conv_123/elicit_abc"
+    assert params["url"] == "/approve/0099dc8be6d82871e2e450424d46d1b7/elicit_abc"
     assert params["message"] == "Approve?"
 
 
@@ -1481,7 +1487,7 @@ def test_mrtr_response_form_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         elicitation_id="elicit_abc",
         message="Approve?",
         request_state="{}",
-        session_id="conv_123",
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
     )
     body = json.loads(resp.body)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]

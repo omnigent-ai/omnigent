@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
+import sys
+
+import pytest
+
+from omnigent.errors import OmnigentError
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
@@ -42,6 +48,21 @@ def _make_parent_spec(
         llm=LLMConfig(model=model),
         executor=executor,
     )
+
+
+@pytest.fixture(autouse=True)
+def _default_sandbox_binary_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep the seed-time sandbox probe host-independent for the suite.
+
+    ``build_researcher_spec`` now calls ``shutil.which`` against the real
+    host PATH for a no-``os_env`` parent (see
+    ``_ensure_default_sandbox_runnable``). Unit tests must not depend on
+    bubblewrap / ``sandbox-exec`` being installed on the runner, so default
+    the probe to "binary present". The probe-specific tests below override
+    this with their own ``monkeypatch.setattr(shutil, "which", ...)``.
+    """
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
 
 
 # ── Schema ───────────────────────────────────────────
@@ -159,6 +180,97 @@ def test_researcher_os_env_without_parent_sandbox() -> None:
     researcher = build_researcher_spec(parent)
     assert researcher.os_env is not None
     assert researcher.os_env.sandbox is None
+
+
+def test_no_os_env_parent_fails_at_build_when_bwrap_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A no-os_env parent's researcher inherits the platform-default
+    ``linux_bwrap`` sandbox, so a missing ``bwrap`` binary must fail
+    at spec-build time pointing at the host dependency.
+
+    Regression (#2068): the probe only ran at spawn time, deep in the
+    run, and the error told the user to set ``os_env.sandbox.type`` —
+    unreachable for a spawn-only parent, which cannot add an
+    ``os_env`` block without also registering OS tools on itself.
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    parent = _make_parent_spec()
+    assert parent.os_env is None
+    with pytest.raises(OmnigentError, match="bubblewrap") as excinfo:
+        build_researcher_spec(parent)
+    assert "sandbox.type" not in str(excinfo.value)
+
+
+def test_no_os_env_parent_builds_when_bwrap_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``bwrap`` on PATH the no-os_env spec builds as before."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/bwrap")
+    researcher = build_researcher_spec(_make_parent_spec())
+    assert researcher.os_env is not None
+
+
+def test_parent_with_os_env_skips_bwrap_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A parent that declares its own ``os_env`` keeps the inherit-
+    verbatim path: its sandbox posture is its own to configure, so the
+    probe must not second-guess it.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    parent = AgentSpec(
+        spec_version=1,
+        name="test-parent",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none")),
+    )
+    researcher = build_researcher_spec(parent)
+    assert researcher.os_env is not None
+    assert researcher.os_env.sandbox is not None
+    assert researcher.os_env.sandbox.type == "none"
+
+
+def test_no_os_env_parent_fails_at_build_when_sandbox_exec_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same seed-time probe covers the macOS default sandbox."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    with pytest.raises(OmnigentError, match="sandbox-exec") as excinfo:
+        build_researcher_spec(_make_parent_spec())
+    assert "sandbox.type" not in str(excinfo.value)
+
+
+def test_no_os_env_parent_builds_when_sandbox_exec_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``sandbox-exec`` on PATH the no-os_env spec builds on macOS."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/sandbox-exec")
+    researcher = build_researcher_spec(_make_parent_spec())
+    assert researcher.os_env is not None
+
+
+def test_windows_platform_skips_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``windows_jobobject`` drives kernel Job Objects through ``ctypes``
+    with no external binary, so there is nothing to probe on Windows.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    researcher = build_researcher_spec(_make_parent_spec())
+    assert researcher.os_env is not None
 
 
 def test_researcher_name_is_internal() -> None:

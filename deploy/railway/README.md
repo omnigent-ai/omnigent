@@ -47,14 +47,12 @@ steps below are validated end-to-end:
    reference value simply hadn't propagated yet — **redeploy** and it resolves.
    (To confirm, the app service should have a `DATABASE_URL` variable
    referencing the Postgres service, e.g. `${{Postgres.DATABASE_URL}}`.)
-3. **Get the admin password** from the first-boot **Deploy logs** (printed once;
-   idempotent — later boots don't reprint):
-   ```
-   ✓ Created initial admin account (accounts auth provider).
-       password: <generated>
-   ```
-   It's also written to `/data/admin-credentials`.
-4. Open the URL, log in as `admin`, invite teammates from **Members**.
+3. **Create the first admin.** No credentials are auto-generated. The
+   first-boot **Deploy logs** print a "No admin yet" line pointing at your
+   `*.up.railway.app` URL (printed once; idempotent — later boots don't
+   reprint). Open that URL and use the web Create-admin form to pick your own
+   username + password.
+4. Log in with the admin you just created, invite teammates from **Members**.
 
 > **`HOST` is handled automatically.** Railway injects `HOST=[::]`, which a
 > socket bind can't use and which Railway's IPv4 edge can't reach; the
@@ -68,6 +66,12 @@ steps below are validated end-to-end:
 > auto-detected from `RAILWAY_PUBLIC_DOMAIN`, so those don't need setting. To
 > pin a known admin password, set `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`
 > before first boot.
+
+> **Security note for public deployments:** `POST /auth/setup` is
+> unauthenticated while no password-bearing account exists, so an instance
+> exposed before you reach the Create-admin form can be claimed by the first
+> visitor. Pre-seed `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`, or complete setup
+> promptly after the deploy goes live.
 
 ## Use your own IdP instead (OIDC)
 

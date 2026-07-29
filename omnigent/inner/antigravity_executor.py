@@ -1066,7 +1066,15 @@ class AntigravityExecutor(Executor):
         total_tokens = getattr(meta, "total_token_count", None)
         cached = getattr(meta, "cached_content_token_count", None)
         if prompt_tokens is not None:
-            usage["input_tokens"] = prompt_tokens
+            # Gemini's ``prompt_token_count`` is INCLUSIVE of
+            # ``cached_content_token_count``. ``compute_llm_cost`` expects
+            # ``input_tokens`` to be the NON-cached portion and prices
+            # ``cache_read_input_tokens`` additively, so pass the non-cached
+            # remainder here — otherwise the cached tokens are billed twice
+            # (once at the full input rate, once at the cache-read rate).
+            # Mirrors the qwen executor, which maps the same Gemini usage
+            # shape. Clamp so a malformed cached > prompt never goes negative.
+            usage["input_tokens"] = max(0, prompt_tokens - (cached or 0))
         if output_tokens is not None:
             usage["output_tokens"] = output_tokens
         if total_tokens is not None:

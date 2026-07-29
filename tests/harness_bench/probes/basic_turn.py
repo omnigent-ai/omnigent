@@ -1,9 +1,4 @@
-"""Basic-turn probe — the prerequisite: does a plain turn produce text?
-
-Every other behavioral probe presupposes this one passes. Its verdict
-also tells a reader whether a red row is "this harness is broken" versus
-"this one capability is missing".
-"""
+"""Basic-turn prerequisite probe."""
 
 from __future__ import annotations
 
@@ -23,16 +18,12 @@ class BasicTurnProbe(CapabilityProbe):
     async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
         result = await driver.run_basic_turn(profile.marker)
         if result.timed_out:
-            # A timeout on the prerequisite turn is almost always a hung
-            # environment, not a capability fact — do not call it UNSUPPORTED.
             return ProbeResult(
                 Verdict.SKIPPED,
                 note="turn did not complete within timeout; harness not exercisable",
             )
         infra = infra_failure_reason(result)
         if infra is not None:
-            # Auth / gateway / connectivity failure — an environment problem,
-            # reported as SKIPPED so it never shows up as capability drift.
             return ProbeResult(Verdict.SKIPPED, note=infra)
         if result.failed:
             return ProbeResult(Verdict.UNSUPPORTED, note=f"turn failed: {result.error}")
@@ -43,8 +34,6 @@ class BasicTurnProbe(CapabilityProbe):
                 detail={"chars": len(result.text)},
             )
         if result.text:
-            # Text came back but not the marker — the wire path works, the
-            # model just didn't follow instructions. Still a working turn.
             return ProbeResult(
                 Verdict.SUPPORTED,
                 note="text returned (marker not echoed; model drift)",

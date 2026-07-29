@@ -1,3 +1,5 @@
+import { MonitorOff as MonitorOffIcon } from "lucide-react";
+
 import { useHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
@@ -62,8 +64,20 @@ const STATUS_WORD: Record<HostBadgeStatus, string> = {
  * session isn't host-bound — same self-contained shape as PresenceAvatars.
  * Shows the friendly host name (or sandbox-provider label) plus a status
  * circle: green online, red offline, neutral while liveness is still unknown.
+ *
+ * When `onReconnect` is set the session is unreachable because its host is
+ * offline (`host_offline` liveness): the badge becomes a clickable "Host is
+ * offline — click to reconnect" affordance in the same slot, replacing the
+ * passive name + dot. This is what moves the reconnect prompt up beside the
+ * host instead of a separate banner below the composer.
  */
-export function HostBadge({ sessionId }: { sessionId: string }) {
+export function HostBadge({
+  sessionId,
+  onReconnect,
+}: {
+  sessionId: string;
+  onReconnect?: () => void;
+}) {
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
   // Keep sandbox hosts so managed sessions resolve to a provider label.
@@ -84,6 +98,22 @@ export function HostBadge({ sessionId }: { sessionId: string }) {
 
   const badge = resolveHostBadge({ hostId, host, online });
   if (!badge) return null;
+
+  if (onReconnect) {
+    return (
+      <button
+        type="button"
+        data-testid="host-badge"
+        onClick={onReconnect}
+        className="flex min-w-0 items-center gap-1.5 text-xs text-destructive underline-offset-2 hover:underline"
+        title="Host is offline — click to reconnect"
+      >
+        <span aria-hidden className="size-2 shrink-0 rounded-full bg-destructive" />
+        <MonitorOffIcon className="size-3.5 shrink-0" aria-hidden />
+        <span className="truncate">Host is offline — click to reconnect</span>
+      </button>
+    );
+  }
 
   return (
     <div

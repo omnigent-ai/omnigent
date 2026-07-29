@@ -602,7 +602,10 @@ async def test_skill_slash_command_policy_body_uses_typed_command_text():
             None,
         )
 
-    assert seen_content == ["/grill-me review Canada rollout"]
+    # REQUEST content is the structured dict ({"user_content", "attachments"})
+    # so policies can reason about attachments per-file; a slash command carries
+    # no attachments.
+    assert seen_content == [{"user_content": "/grill-me review Canada rollout", "attachments": []}]
     assert result["verdict"] == "deny"
     assert result["reason"] == "Input mentions Canada"
 
@@ -966,13 +969,15 @@ def test_build_evaluation_context_request_accepts_string_data() -> None:
     request-phase gate OPEN (cost-over-budget terminal prompts sailed through).
     """
     ctx = _build_evaluation_context(Phase.REQUEST, "delete the prod database", {})
-    assert ctx.content == "delete the prod database"
+    # REQUEST content is the structured dict ({"user_content", "attachments"}); the
+    # native / opencode path carries no attachments.
+    assert ctx.content == {"user_content": "delete the prod database", "attachments": []}
 
 
 def test_build_evaluation_context_request_dict_still_works() -> None:
     """The native-hook convention (dict with ``text``) still resolves."""
     ctx = _build_evaluation_context(Phase.REQUEST, {"text": "hello"}, {})
-    assert ctx.content == "hello"
+    assert ctx.content == {"user_content": "hello", "attachments": []}
     # ``content`` fallback also honored.
     ctx2 = _build_evaluation_context(Phase.REQUEST, {"content": "hi"}, {})
-    assert ctx2.content == "hi"
+    assert ctx2.content == {"user_content": "hi", "attachments": []}

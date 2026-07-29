@@ -5,12 +5,13 @@ import type { ReactNode } from "react";
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
 }));
 vi.mock("@/store/chatStore", () => ({
   useChatStore: vi.fn(),
 }));
 
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
   downloadWorkspaceFile,
@@ -21,6 +22,7 @@ import {
 import type { FileContentResponse } from "./useFileContent";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
+const hostOnlineMock = vi.mocked(useSessionHostOnline);
 const chatStoreMock = vi.mocked(useChatStore);
 const fetchMock = vi.fn();
 
@@ -282,8 +284,9 @@ describe("downloadWorkspaceFile", () => {
 // ---------------------------------------------------------------------------
 
 describe("useFileContent gating", () => {
-  it("does not fetch when the runner is offline", async () => {
+  it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
     stubChatStore();
 
     render(
@@ -294,6 +297,26 @@ describe("useFileContent gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches when the runner is offline but the host can serve the file", async () => {
+    // Regression: opening a file while the agent is asleep must still fetch
+    // — the server reads the bytes over the host tunnel. A blank viewer here
+    // is exactly the bug this gate fix addresses.
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore();
+
+    render(
+      <Wrap>
+        <Probe id="conv_asleep" path="src/a.txt" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_asleep/resources/environments/default/filesystem/src/a.txt",
+    );
   });
 
   it("does not fetch when path is null", async () => {
