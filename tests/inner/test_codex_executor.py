@@ -2603,6 +2603,41 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     assert list(target.iterdir()) == []
 
 
+def test_populate_codex_home_config_symlinks_hooks_json(tmp_path: Path) -> None:
+    """``hooks.json`` is symlinked so user hooks fire inside the private home."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "hooks.json").is_symlink()
+    assert (target / "hooks.json").read_text() == '{"hooks": {}}'
+
+
+def test_populate_codex_home_config_hooks_json_skipped_in_minimal_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``hooks.json`` is not symlinked in minimal mode (title worker)."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "1")
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / "hooks.json").exists()
+
+
 def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
     """When only some config files exist, only those are symlinked.
 

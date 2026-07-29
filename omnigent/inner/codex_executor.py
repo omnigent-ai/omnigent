@@ -110,7 +110,7 @@ _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
-_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
+_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
