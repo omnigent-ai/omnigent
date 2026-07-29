@@ -860,6 +860,13 @@ async def _post_item_once(
     restart mid-record an already-posted item must not repeat. The key is added
     and the state persisted only after the post succeeds, so a failed post is
     retried (never skipped) and a succeeded one is never re-sent.
+
+    This is exactly-once on the in-process retry. Across a restart it holds
+    except the one window inherent to any post-then-persist design without
+    server-side dedup: if this ``_write_state`` fails after the post already
+    landed and the process restarts before the next successful write, the key
+    is not on disk and that single item re-posts. The floor is at-least-once (a
+    lone duplicate, never a dropped item), same as the goose forwarder.
     """
     if key in state.posted_item_keys:
         return
@@ -1089,8 +1096,11 @@ async def forward_kiro_session_to_omnigent(
                         # advancing the cursor, so the next poll re-reads the
                         # record; _post_item_once (via state.posted_item_keys,
                         # persisted per item) skips the items that already landed
-                        # so the retry posts only the failed one. Delivery is
-                        # exactly-once across in-process retry and restart.
+                        # so the retry posts only the failed one. Exactly-once on
+                        # the in-process retry; across a restart the floor is
+                        # at-least-once only in the narrow post-then-persist
+                        # window (see _post_item_once), a lone duplicate never a
+                        # lost item.
                         await _mirror_record(
                             client,
                             session_id=session_id,
