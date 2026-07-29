@@ -1785,23 +1785,11 @@ class ClaudeSDKExecutor(Executor):
         session_key: str,
         content: str | Message,
     ) -> bool:
-        state = self._clients.get(session_key)
-        if state is None:
-            return False
-        try:
-            if isinstance(content, str):
-                prompt = content
-            else:
-                prompt = json.dumps(content, ensure_ascii=True)
-            await state.client.query(prompt, session_id=session_key)
-            return True
-        except Exception as exc:  # noqa: BLE001 — enqueue returns False on any SDK failure
-            logger.warning(
-                "Claude SDK live message enqueue failed for session %s: %s",
-                session_key,
-                exc,
-            )
-            return False
+        # query() queues a NEW turn on the SDK's stdin; it does not inject
+        # into the turn already running. Returning False lets the adapter's
+        # buffer hold the message and re-deliver it as a continuation turn
+        # once the active turn ends, preserving in-order delivery.
+        return False
 
     @staticmethod
     async def _force_close_client(client: _ClaudeClient) -> None:
@@ -1886,7 +1874,9 @@ class ClaudeSDKExecutor(Executor):
         return True
 
     def supports_live_message_queue(self) -> bool:
-        return True
+        # The SDK has no API to inject into an active turn; claiming this
+        # capability caused the one-turn-behind desync described in #3472.
+        return False
 
     def supports_tool_boundary_interrupt(self) -> bool:
         return True

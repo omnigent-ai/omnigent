@@ -4364,3 +4364,44 @@ def test_find_system_claude_delegates_to_shared_resolver(monkeypatch) -> None:
     monkeypatch.setattr(cse, "resolve_cli_binary", fake_resolve)
     assert cse._find_system_claude() == "/opt/homebrew/bin/claude"
     assert captured == {"name": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
+
+
+def test_claude_sdk_does_not_claim_live_message_queue() -> None:
+    """ClaudeSDKExecutor must not advertise live message queue support.
+
+    query() queues a new turn on stdin rather than injecting into the active
+    turn, so returning True from enqueue_session_message caused a permanent
+    one-turn-behind desync (issue #3472). The executor must return False from
+    both methods so the adapter keeps the message buffered and delivers it as
+    a continuation turn after the active turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    assert executor.supports_live_message_queue() is False
+
+
+@pytest.mark.asyncio
+async def test_enqueue_session_message_returns_false_without_queuing() -> None:
+    """enqueue_session_message must return False and never call query().
+
+    Calling query() while a turn is active queues a new turn, not an
+    in-turn injection, which produces the desync from issue #3472.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    query_called = False
+
+    class _FakeClient:
+        async def query(self, *args, **kwargs):
+            nonlocal query_called
+            query_called = True
+
+    # Inject a fake client state so the session key is known.
+    executor._clients["s1"] = SimpleNamespace(client=_FakeClient())
+
+    result = await executor.enqueue_session_message("s1", "hello")
+
+    assert result is False
+    assert not query_called, "query() must not be called during enqueue"
