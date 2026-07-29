@@ -571,7 +571,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
           data-testid="run-status-dot"
           data-run-icon="unread"
           data-run-unread={true}
-          className="size-1.5 shrink-0 rounded-full bg-brand-accent"
+          className="size-2 shrink-0 rounded-full bg-brand-accent"
         />
       </IndicatorWithTooltip>
     );
@@ -584,7 +584,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
       data-testid="run-status-dot"
       data-run-icon={run.status === "succeeded" ? "read" : "pending"}
       data-run-unread={run.status === "succeeded" ? false : undefined}
-      className="size-1.5 shrink-0 rounded-full bg-muted-foreground/40"
+      className="size-2 shrink-0 rounded-full bg-muted-foreground/40"
     />
   );
   if (run.status === "succeeded") {
