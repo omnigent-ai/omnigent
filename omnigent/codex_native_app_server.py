@@ -952,9 +952,7 @@ def _codex_policy_hooks_settings(
     }
 
 
-def _merge_user_hooks(
-    policy_payload: dict[str, Any], user_hooks_path: Path
-) -> dict[str, Any]:
+def _merge_user_hooks(policy_payload: dict[str, Any], user_hooks_path: Path) -> dict[str, Any]:
     """
     Merge user-declared hooks into the policy hooks payload.
 
