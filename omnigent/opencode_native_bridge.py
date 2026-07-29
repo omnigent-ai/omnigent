@@ -82,9 +82,8 @@ _OPENCODE_POLICY_PLUGIN_JS = r"""
 // phases the reactive permission.asked path cannot reach.
 const BASE = (process.env.OMNIGENT_POLICY_URL || "").replace(/\/+$/, "");
 const SESSION = process.env.OMNIGENT_SESSION_ID || "";
-// Full routing header map (Authorization + workspace / deployment routing
-// selectors) baked by the runner so this out-of-process plugin's POSTs reach the
-// SAME server instance as the runner.
+const RELAY_FILE = process.env.OMNIGENT_RELAY_FILE || "";
+// Full routing header map baked by the runner for the direct-server fallback.
 let POLICY_HEADERS = {};
 try {
   POLICY_HEADERS = JSON.parse(process.env.OMNIGENT_POLICY_HEADERS || "{}") || {};
@@ -93,11 +92,31 @@ try {
 }
 const TIMEOUT_MS = 600000;
 
+const fs = require("fs");
+
+// Re-read tool_relay.json on each call so the plugin picks up the relay as
+// soon as it starts (the file is written after opencode serve launches).
+function relayCredentials() {
+  if (!RELAY_FILE) return null;
+  try {
+    const d = JSON.parse(fs.readFileSync(RELAY_FILE, "utf8"));
+    if (d && typeof d.url === "string" && typeof d.token === "string") {
+      return { url: d.url, token: d.token };
+    }
+  } catch (_e) {}
+  return null;
+}
+
 async function evaluate(type, target, data) {
   // Returns {result, reason}. Not wired (no server/session) -> no-op allow.
   if (!BASE || !SESSION) return { result: "ALLOW" };
-  const url = BASE + "/v1/sessions/" + encodeURIComponent(SESSION) + "/policies/evaluate";
-  const headers = { "content-type": "application/json", ...POLICY_HEADERS };
+  const relay = relayCredentials();
+  const url = relay
+    ? relay.url.replace(/\/+$/, "") + "/policies/evaluate"
+    : BASE + "/v1/sessions/" + encodeURIComponent(SESSION) + "/policies/evaluate";
+  const headers = relay
+    ? { "content-type": "application/json", authorization: "Bearer " + relay.token }
+    : { "content-type": "application/json", ...POLICY_HEADERS };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {

@@ -299,7 +299,11 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
 @pytest.mark.parametrize(
     ("harness", "target", "expected_kwargs"),
     [
-        ("pi-native", "_auto_create_pi_terminal", {"server_client", "agent_spec"}),
+        (
+            "pi-native",
+            "_auto_create_pi_terminal",
+            {"server_client", "agent_spec", "ensure_comment_relay"},
+        ),
         (
             "cursor-native",
             "_auto_create_cursor_terminal",

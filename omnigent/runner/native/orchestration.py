@@ -129,7 +129,6 @@ _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
 # Delegated runner bearers last 30 minutes and refresh five minutes before
 # expiry. A one-minute cadence allows several retries without giving the child
 # the runner binding token; cached factory calls stay local and cheap.
-_PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S = 60.0
 
 
 class _CodexNativeModelOptionsNotReady(RuntimeError):
@@ -188,36 +187,6 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> N
             del _AUTO_FORWARDER_TASKS[session_id]
 
     task.add_done_callback(_evict)
-
-
-async def _refresh_claude_permission_hook_auth(
-    *,
-    bridge_dir: Path,
-    server_url: str,
-    auth_token_factory: Callable[[], str | None],
-    refresh_interval_s: float = _PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S,
-) -> None:
-    """Keep the Claude permission hook's bearer snapshot current.
-
-    :param bridge_dir: Owner-only Claude bridge directory.
-    :param server_url: Omnigent server receiving permission requests.
-    :param auth_token_factory: Refresh-capable runner bearer factory.
-    :param refresh_interval_s: Delay between snapshot refresh attempts.
-    """
-    from omnigent.claude_native_bridge import update_permission_hook_auth_headers
-    from omnigent.cli_auth import databricks_request_headers
-
-    while True:
-        await asyncio.sleep(refresh_interval_s)
-        try:
-            token = await asyncio.to_thread(auth_token_factory)
-            if token:
-                headers = databricks_request_headers(server_url, bearer_token=token)
-                update_permission_hook_auth_headers(bridge_dir, headers)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 — retain the last still-valid snapshot
-            _logger.warning("Could not refresh Claude permission-hook auth")
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -1007,9 +976,13 @@ async def _auto_create_opencode_terminal(
         config["plugin"] = [str(plugin_path)]
         policy_env["OMNIGENT_POLICY_URL"] = runner_server_url
         policy_env["OMNIGENT_SESSION_ID"] = session_id
-        # One-shot auth-token snapshot (mirrors codex's policy_hook.json /
-        # cost-popup). Long-session staleness degrades to fail-open (no
-        # enforcement), like codex; a refreshable token file is the follow-up.
+        # Point the plugin at tool_relay.json so it can pick up relay
+        # credentials as soon as the relay starts (written later by
+        # ensure_comment_relay). The plugin re-reads on every call.
+        from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+
+        policy_env["OMNIGENT_RELAY_FILE"] = str(bridge_dir / _TOOL_RELAY_FILE)
+        # Bake fallback headers for the first calls before relay starts.
         from omnigent.runner._entry import _make_auth_token_factory
 
         _policy_factory = _make_auth_token_factory()
@@ -1017,10 +990,6 @@ async def _auto_create_opencode_terminal(
         if _policy_token:
             from omnigent.cli_auth import databricks_request_headers
 
-            # Bake the FULL routing header map (bearer + workspace / deployment
-            # selectors), not a bare bearer: the plugin POSTs /policies/evaluate
-            # to the omnigent server out-of-process, so without the selectors it
-            # could land on a different server instance than the runner's.
             policy_env["OMNIGENT_POLICY_HEADERS"] = json.dumps(
                 databricks_request_headers(runner_server_url, bearer_token=_policy_token)
             )
@@ -1742,6 +1711,7 @@ async def _auto_create_pi_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -1757,6 +1727,7 @@ async def _auto_create_pi_terminal(
         spec; callers must not pass ``None`` to paper over a resolution error.
     :returns: Created terminal resource view.
     """
+    await _cancel_auto_forwarder_task(session_id)
     from omnigent.conversation_browser import conversation_url
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.pi_native import resolve_pi_executable
@@ -1909,6 +1880,22 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
+
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+        from omnigent.claude_native_bridge import _TOOL_RELAY_FILE, _read_json_file
+        from omnigent.pi_native_bridge import inject_relay_into_config
+
+        relay_info = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
+        relay_url = relay_info.get("url") if relay_info else None
+        relay_token = relay_info.get("token") if relay_info else None
+        if isinstance(relay_url, str) and isinstance(relay_token, str):
+            inject_relay_into_config(bridge_dir, relay_url, relay_token)
+
     # Surface an unresolved-credential warning to the session. Without it, a Pi
     # session whose Databricks token can't be refreshed launches fine but every
     # message silently fails to reach the model — the user sees no reply and no
@@ -2614,6 +2601,19 @@ async def _auto_create_hermes_terminal(
             explicit_bridge_dir=bridge_dir,
             await_notify=False,
         )
+        # After the relay starts, rewrite the policy hook wrapper to use the
+        # relay's non-expiring local token so subsequent hook invocations
+        # never need a server bearer.
+        from omnigent.claude_native_bridge import _TOOL_RELAY_FILE, _read_json_file
+        from omnigent.hermes_native_bridge import inject_relay_into_policy_hook
+
+        relay_info = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
+        relay_url = relay_info.get("url") if relay_info else None
+        relay_token = relay_info.get("token") if relay_info else None
+        if isinstance(relay_url, str) and isinstance(relay_token, str):
+            inject_relay_into_policy_hook(
+                bridge_dir, relay_url, relay_token, server_url, session_id
+            )
 
     async def _supervise_hermes_native_bridges() -> None:
         """Run the transcript forwarder and the approval mirror together.
@@ -6004,30 +6004,15 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native_forwarder import supervise_forwarder
 
     async def _supervise_bridge() -> None:
-        refresh_task: asyncio.Task[None] | None = None
-        if _auth_factory is not None:
-            refresh_task = asyncio.create_task(
-                _refresh_claude_permission_hook_auth(
-                    bridge_dir=bridge_dir,
-                    server_url=server_url,
-                    auth_token_factory=_auth_factory,
-                ),
-                name=f"claude-hook-auth-{session_id}",
-            )
-        try:
-            await supervise_forwarder(
-                base_url=server_url,
-                headers=_runner_headers,
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                agent_name="claude-native-ui",
-                start_at_end=resume_external_session_id is not None,
-                auth=_runner_auth,
-            )
-        finally:
-            if refresh_task is not None:
-                refresh_task.cancel()
-                _ = await asyncio.gather(refresh_task, return_exceptions=True)
+        await supervise_forwarder(
+            base_url=server_url,
+            headers=_runner_headers,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=resume_external_session_id is not None,
+            auth=_runner_auth,
+        )
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),
@@ -6450,6 +6435,7 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         agent_spec=ctx.agent_spec,
+        ensure_comment_relay=ctx.ensure_comment_relay,
     )
 
 

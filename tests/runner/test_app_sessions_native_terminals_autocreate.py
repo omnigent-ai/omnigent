@@ -50,7 +50,6 @@ from omnigent.runner.app import (
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
-    _refresh_claude_permission_hook_auth,
     _terminal_lookup_miss_log_state,
 )
 from omnigent.runner.resource_registry import (
@@ -70,47 +69,40 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
-@pytest.mark.asyncio
-async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
+def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The parent runner refreshes delegated hook auth in the bridge file."""
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    bridge_dir = prepare_bridge_dir("refresh-hook-auth", workspace=tmp_path)
-    claude_native_bridge.build_hook_settings(
-        bridge_dir,
-        ap_server_url="https://omnigent.example.com",
-        ap_auth_headers={"Authorization": "Bearer old-token"},
+    """read_relay_policy_config extracts relay URL, token, and session_id."""
+    from omnigent.native_policy_hook import read_relay_policy_config
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    relay_file = bridge_dir / "tool_relay.json"
+    relay_file.write_text(
+        '{"url": "http://127.0.0.1:9999", "token": "tok123", "session_id": "conv_abc"}'
     )
+    result = read_relay_policy_config(bridge_dir)
+    assert result == ("http://127.0.0.1:9999", "tok123", "conv_abc")
 
-    task = asyncio.create_task(
-        _refresh_claude_permission_hook_auth(
-            bridge_dir=bridge_dir,
-            server_url="https://omnigent.example.com",
-            auth_token_factory=lambda: "fresh-delegated-token",
-            refresh_interval_s=0.01,
-        )
-    )
-    try:
 
-        async def _wait_for_refresh() -> None:
-            while True:
-                config = read_permission_hook_config(bridge_dir)
-                if config.get("ap_auth_headers", {}).get("Authorization") == (
-                    "Bearer fresh-delegated-token"
-                ):
-                    return
-                await asyncio.sleep(0.01)
+def test_read_relay_policy_config_returns_none_when_missing(tmp_path: Path) -> None:
+    """read_relay_policy_config returns None when tool_relay.json absent."""
+    from omnigent.native_policy_hook import read_relay_policy_config
 
-        await asyncio.wait_for(_wait_for_refresh(), timeout=1.0)
-    finally:
-        task.cancel()
-        _ = await asyncio.gather(task, return_exceptions=True)
+    assert read_relay_policy_config(tmp_path) is None
 
-    config = read_permission_hook_config(bridge_dir)
-    assert config["ap_auth_headers"]["Authorization"] == "Bearer fresh-delegated-token"
+
+def test_read_relay_policy_config_returns_none_when_session_id_absent(
+    tmp_path: Path,
+) -> None:
+    """read_relay_policy_config returns None when session_id absent (relay not policy-capable)."""
+    from omnigent.native_policy_hook import read_relay_policy_config
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    relay_file = bridge_dir / "tool_relay.json"
+    relay_file.write_text('{"url": "http://127.0.0.1:9999", "token": "tok123"}')
+    assert read_relay_policy_config(bridge_dir) is None
 
 
 @pytest.mark.asyncio

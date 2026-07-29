@@ -2803,6 +2803,7 @@ def create_runner_app(
                     resource_registry=resource_registry,
                     publish_event=_publish_event,
                     server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
                 ),
                 ensure_locks=_pi_terminal_ensure_locks,
                 resolve_agent_spec=lambda: _resolve_session_agent_spec(session_id),
@@ -5473,6 +5474,8 @@ def create_runner_app(
                 tools=relay_schemas,
                 tool_executor=_relay_tool_executor,
                 loop=asyncio.get_running_loop(),
+                policy_client=server_client,
+                session_id=session_id,
             )
         except (OSError, RuntimeError):
             _logger.warning(
@@ -7185,6 +7188,7 @@ def create_runner_app(
                         _publish_event,
                         server_client=server_client,
                         agent_spec=_pi_ensure_spec,
+                        ensure_comment_relay=_ensure_comment_relay_started,
                     )
                 except Exception as exc:
                     _logger.exception(
