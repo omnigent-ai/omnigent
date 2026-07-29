@@ -67,6 +67,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.onboarding.claude_profiles import CLAUDE_PROFILE_NAME_PATTERN
 from omnigent.policies.types import EvaluationContext
 from omnigent.reasoning_effort import (
     EFFORT_VALUES,
@@ -1897,8 +1898,10 @@ def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
 # block — the config_dir it resolves to comes from that block, never from
 # the user, so there is no path-injection surface. The charset still rejects
 # shell/path-shaped values so a garbled pick fails loud at create time
-# rather than reaching the runner as an unresolvable name.
-_CLAUDE_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# rather than reaching the runner as an unresolvable name. The pattern comes
+# from the profile loader so the two ends cannot drift: a name the loader
+# accepts is a name this validator accepts.
+_CLAUDE_PROFILE_NAME_RE = re.compile(CLAUDE_PROFILE_NAME_PATTERN)
 
 
 def _validated_claude_profile(value: str | None) -> str | None:

@@ -1346,7 +1346,9 @@ export function AgentHarnessPicker({
  * in-dropdown submenu committed on every change).
  */
 // Select sentinel for "no claude_profile" — Radix Select can't hold an empty
-// string value, and null means "defer to the runner's default ~/.claude".
+// string value, and null means "send no per-session override", leaving the
+// runner on whatever login it is already configured for. Reserved server-side
+// so an operator can't declare a real profile the picker could never select.
 const CLAUDE_PROFILE_SELECT_DEFAULT = "__default__";
 
 function HarnessConfigModal({
@@ -1808,7 +1810,7 @@ function HarnessConfigModal({
             <ConfigRow label="Claude account" description="Which Claude Code login to run under">
               <Select
                 value={draftProfile ?? CLAUDE_PROFILE_SELECT_DEFAULT}
-                onValueChange={(v) =>
+                onValueChange={(v: string) =>
                   setDraftProfile(v === CLAUDE_PROFILE_SELECT_DEFAULT ? null : v)
                 }
               >
@@ -1828,7 +1830,7 @@ function HarnessConfigModal({
                     value={CLAUDE_PROFILE_SELECT_DEFAULT}
                     data-testid="new-chat-landing-claude-profile-default"
                   >
-                    Default (~/.claude)
+                    Default (no override)
                   </SelectItem>
                   {claudeProfiles.map((p) => (
                     <SelectItem
@@ -2164,9 +2166,10 @@ export function NewChatLandingScreen() {
   );
   // Per-session Claude Code account profile (issue #503). Selects which
   // isolated CLAUDE_CONFIG_DIR the runner uses for the Claude Code CLI.
-  // null = no profile (defers to the runner's default ~/.claude); cleared on
-  // every agent switch so a pick never leaks across agents. Only offered when
-  // the operator has configured >=1 claude_profiles entry.
+  // null = send no override, leaving the runner on whatever login its own
+  // env/config already selects; cleared on every agent switch so a pick never
+  // leaks across agents. Only offered when the operator has configured >=1
+  // claude_profiles entry.
   const [pickedProfile, setPickedProfile] = useState<string | null>(null);
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
@@ -3729,8 +3732,8 @@ export function NewChatLandingScreen() {
             smart_routing_message:
               smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
             // Claude Code account profile pick (issue #503). Omitted when
-            // unset (null) so the session defers to the runner's default
-            // ~/.claude; the runner resolves the name to a CLAUDE_CONFIG_DIR.
+            // unset (null) so the session carries no override; the runner
+            // resolves a name to its local CLAUDE_CONFIG_DIR.
             claude_profile: pickedProfile ?? undefined,
           }),
         });

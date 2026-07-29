@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from omnigent.onboarding.claude_profiles import (
+    CLAUDE_PROFILE_NAME_PATTERN,
+    RESERVED_CLAUDE_PROFILE_NAME,
     ClaudeProfile,
     active_default_claude_profile,
     claude_profile_by_name,
@@ -79,6 +81,64 @@ def test_load_skips_entries_missing_name_or_config_dir() -> None:
     )
     profiles = load_claude_profiles(cfg)
     assert [p.name for p in profiles] == ["good"]
+
+
+def test_load_skips_reserved_default_name(caplog: pytest.LogCaptureFixture) -> None:
+    """``__default__`` is the picker's no-override sentinel, so it is reserved.
+
+    It matches the name charset, so without this an operator could declare a
+    real profile the account picker can never select unambiguously.
+    """
+    cfg = _config(
+        profiles=[
+            {"name": RESERVED_CLAUDE_PROFILE_NAME, "config_dir": "/tmp/reserved"},
+            {"name": "work", "config_dir": "/tmp/work"},
+        ]
+    )
+    with caplog.at_level("WARNING"):
+        profiles = load_claude_profiles(cfg)
+    assert [p.name for p in profiles] == ["work"]
+    assert "reserved" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "has space",
+        "slash/name",
+        "dot.name",
+        "tilde~name",
+        "semi;colon",
+        "x" * 65,
+    ],
+)
+def test_load_skips_names_outside_the_server_charset(
+    name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A name the server's create-time validator would reject is dropped at load.
+
+    The picker round-trips the name back as ``claude_profile`` on session
+    create, where it is validated against the same charset — so a profile
+    with an unusable name is a config error worth surfacing once, not a
+    failure on every spawn.
+    """
+    cfg = _config(
+        profiles=[
+            {"name": name, "config_dir": "/tmp/bad"},
+            {"name": "good", "config_dir": "/tmp/good"},
+        ]
+    )
+    with caplog.at_level("WARNING"):
+        profiles = load_claude_profiles(cfg)
+    assert [p.name for p in profiles] == ["good"]
+    assert CLAUDE_PROFILE_NAME_PATTERN in caplog.text
+
+
+def test_loader_and_server_validator_share_one_charset() -> None:
+    """The server compiles the loader's pattern, so the two ends cannot drift."""
+    from omnigent.server.routes._sessions.helpers import _CLAUDE_PROFILE_NAME_RE
+
+    assert _CLAUDE_PROFILE_NAME_RE.pattern == CLAUDE_PROFILE_NAME_PATTERN
 
 
 def test_load_non_string_display_falls_back_to_none() -> None:

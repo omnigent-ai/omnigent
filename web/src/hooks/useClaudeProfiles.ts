@@ -32,8 +32,18 @@ async function fetchClaudeProfiles(): Promise<ClaudeProfile[]> {
   // non-OK reply — the picker hides itself on an empty list, so a failed
   // fetch must never throw to the UI.
   if (!res || !res.ok) return [];
-  const data = (await res.json()) as { data?: ClaudeProfileWire[] };
-  return (data.data ?? []).map((p) => ({ name: p.name, display: p.display }));
+  // A proxy or error page can answer 200 with a non-JSON body, so the
+  // parse itself can reject. Swallow it (and any non-envelope shape) for
+  // the same reason: an empty list hides the picker, a throw would not.
+  let data: { data?: ClaudeProfileWire[] } | null;
+  try {
+    data = (await res.json()) as { data?: ClaudeProfileWire[] } | null;
+  } catch {
+    return [];
+  }
+  const items = data?.data;
+  if (!Array.isArray(items)) return [];
+  return items.map((p) => ({ name: p.name, display: p.display }));
 }
 
 export function useClaudeProfiles() {
