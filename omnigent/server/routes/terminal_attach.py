@@ -89,6 +89,7 @@ from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.registry import ResolveSnapshot
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -153,10 +154,6 @@ def create_terminal_attach_router(
             pick the control-mode vs PTY bridge in-process. ``None`` defers to
             the terminal spec / global default.
         """
-        from omnigent.entities.session_resources import (
-            resolve_terminal_entry_by_resource_id,
-        )
-
         await _authorize_terminal_attach(
             websocket,
             session_id=session_id,
@@ -228,17 +225,26 @@ def create_terminal_attach_router(
             )
             return
 
-        entry = resolve_terminal_entry_by_resource_id(
-            session_id,
-            terminal_id,
-            terminal_registry,
-        )
-        if entry is None or not entry.instance.running or not await entry.instance.is_alive():
+        resolved = terminal_registry.resolve_snapshot(session_id, terminal_id)
+        if not isinstance(resolved, ResolveSnapshot):
             await websocket.close(
                 code=_WS_CLOSE_TERMINAL_NOT_FOUND,
                 reason="terminal resource not found or not running",
             )
             return
+
+        if not await asyncio.to_thread(
+            terminal_registry.run_fenced,
+            resolved,
+            resolved.instance.is_alive,
+            invalid=False,
+        ):
+            await websocket.close(
+                code=_WS_CLOSE_TERMINAL_NOT_FOUND,
+                reason="terminal resource not found or not running",
+            )
+            return
+        entry = resolved.entry
 
         from omnigent.inner.terminal import (
             TERMINAL_TRANSPORT_CONTROL,
@@ -265,11 +271,21 @@ def create_terminal_attach_router(
                 if resolved_transport == TERMINAL_TRANSPORT_CONTROL
                 else bridge_tmux_pty_to_websocket
             )
+
+            async def _send_attached_input(data: bytes) -> bool:
+                return await asyncio.to_thread(
+                    terminal_registry.run_fenced,
+                    resolved,
+                    lambda: resolved.instance.send_raw_bytes(data),
+                    invalid=False,
+                )
+
             await bridge(
                 websocket,
                 socket_path=str(entry.instance.socket_path),
                 tmux_target=entry.instance.tmux_target,
                 read_only=read_only,
+                on_client_input=_send_attached_input,
             )
 
     return router

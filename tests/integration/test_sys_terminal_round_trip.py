@@ -57,14 +57,20 @@ package gate is lifted in mock mode by
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
+import sys
+import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.runner import create_runner_app
+from omnigent.terminals import TerminalRegistry
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -72,6 +78,7 @@ from tests.e2e.conftest import (
     register_inline_agent,
     send_user_message_to_session,
 )
+from tests.runner.helpers import NullServerClient
 
 
 def _list_session_items(client: httpx.Client, session_id: str) -> list[dict[str, Any]]:
@@ -229,6 +236,127 @@ def terminal_session(
         mock_llm_server_url=mock_llm_server_url,
     )
     return session_id, model_name
+
+
+@pytest.mark.asyncio
+async def test_runner_terminal_input_route_live_tmux_round_trip(tmp_path: Path) -> None:
+    """Create a real shell, POST literal input, and read its output marker."""
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux not installed; runner terminal input needs tmux on PATH")
+
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    marker = f"RUNNER_INPUT_MARKER_{uuid.uuid4().hex[:8]}"
+    output_marker = f"OUT-{marker}"
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            create = await client.post(
+                "/v1/sessions/conv_route/resources/terminals",
+                json={
+                    "terminal": "bash",
+                    "session_key": "route",
+                    "spec": {"command": "bash", "cwd": str(tmp_path)},
+                },
+            )
+            assert create.status_code == 200, create.text
+
+            sent = await client.post(
+                "/v1/sessions/conv_route/resources/terminals/terminal_bash_route/input",
+                json={"text": f"printf 'OUT-%s\\n' {marker}"},
+            )
+            assert sent.status_code == 200, sent.text
+            assert sent.json() == {"status": "sent", "outcome": "sent"}
+
+            instance = registry.get("conv_route", "bash", "route")
+            assert instance is not None
+            screens: list[str] = []
+            for _ in range(20):
+                read_result = await instance.read()
+                screens.append(str(read_result.get("screen", "")))
+                if output_marker in screens[-1]:
+                    break
+                await asyncio.sleep(0.05)
+
+            assert output_marker in "\n".join(screens)
+    finally:
+        await registry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runner_terminal_input_waits_past_startup_stdin_consumer(tmp_path: Path) -> None:
+    """Startup stdin cannot swallow a command behind a false readiness ACK."""
+    if shutil.which("tmux") is None or shutil.which("bash") is None:
+        pytest.skip("tmux and bash are required for live readiness coverage")
+
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    marker = f"READY_INPUT_MARKER_{uuid.uuid4().hex[:8]}"
+    startup = (
+        "import os,select,sys;"
+        "ready,_,_=select.select([sys.stdin],[],[],0.25);"
+        "sys.stdin.readline() if ready else None;"
+        "os.execvp('bash',['bash','--noprofile','--norc','-i'])"
+    )
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            create = await client.post(
+                "/v1/sessions/conv_ready/resources/terminals",
+                json={
+                    "terminal": "shell",
+                    "session_key": "startup",
+                    "spec": {
+                        "command": sys.executable,
+                        "args": ["-c", startup],
+                        "cwd": str(tmp_path),
+                        "ready_process": "bash",
+                    },
+                },
+            )
+            assert create.status_code == 200, create.text
+
+            sent = await client.post(
+                "/v1/sessions/conv_ready/resources/terminals/terminal_shell_startup/input",
+                json={
+                    "attempt_id": str(uuid.uuid4()),
+                    "text": f"printf '%s\\n' {marker}",
+                    "wait_for_ready": True,
+                },
+            )
+            if sent.status_code == 409:
+                assert sent.json()["error"]["code"] == "terminal_not_ready"
+                return
+
+            assert sent.status_code == 200, sent.text
+            assert sent.json()["outcome"] == "sent"
+            instance = registry.get("conv_ready", "shell", "startup")
+            assert instance is not None
+            screens: list[str] = []
+            for _ in range(40):
+                read_result = await instance.read()
+                screens.append(str(read_result.get("screen", "")))
+                if marker in screens[-1]:
+                    break
+                await asyncio.sleep(0.05)
+            assert marker in "\n".join(screens), (
+                "a 200/sent readiness result must prove the final shell, not "
+                "the startup stdin consumer, received the command"
+            )
+    finally:
+        await registry.shutdown()
 
 
 def test_sys_terminal_basic_round_trip(
@@ -572,3 +700,130 @@ def test_sys_terminal_send_keys_drives_interactive(
         f"Enter didn't reach python's stdin; if nothing useful shows, python3 "
         f"may not be on PATH in the tmux env."
     )
+
+
+def _write_probe_residue_delayed_shell(
+    tmp_path: Path,
+    *,
+    shell_name: str,
+    real_shell: str,
+) -> Path:
+    """Create a shell-named shim that waits before preserving the real argv."""
+    wrapper_dir = tmp_path / "probe-residue-shells"
+    wrapper_dir.mkdir(exist_ok=True)
+    wrapper = wrapper_dir / shell_name
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "time.sleep(1.35)\n"
+        f"real_shell = {real_shell!r}\n"
+        "os.execv(real_shell, [real_shell, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def _probe_residue_output_command(marker: str) -> str:
+    """Return a command whose typed representation does not include *marker*."""
+    encoded = "".join(f"\\0{ord(char):03o}" for char in marker)
+    return f"builtin printf '%b\\n' '{encoded}'"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("shell_name", "shell_args"),
+    [
+        ("bash", ["--noprofile", "--norc"]),
+        ("zsh", ["-f"]),
+    ],
+)
+async def test_runner_terminal_input_cold_spawn_hides_readiness_probe(
+    tmp_path: Path,
+    shell_name: str,
+    shell_args: list[str],
+) -> None:
+    """A delayed direct shell shows only the one user command and its output."""
+    real_shell = shutil.which(shell_name)
+    if shutil.which("tmux") is None or real_shell is None:
+        pytest.skip(f"tmux and {shell_name} are required for live readiness coverage")
+
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    marker = f"O{uuid.uuid4().hex[:6]}"
+    command = _probe_residue_output_command(marker)
+    wrapper = _write_probe_residue_delayed_shell(
+        tmp_path,
+        shell_name=shell_name,
+        real_shell=real_shell,
+    )
+    session_key = f"clean-{shell_name}"
+
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            create = await client.post(
+                "/v1/sessions/conv_clean/resources/terminals",
+                json={
+                    "terminal": shell_name,
+                    "session_key": session_key,
+                    "spec": {
+                        "command": str(wrapper),
+                        "args": shell_args,
+                        "cwd": str(tmp_path),
+                    },
+                },
+            )
+            assert create.status_code == 200, create.text
+
+            instance = registry.get("conv_clean", shell_name, session_key)
+            assert instance is not None
+            nonce = instance.shell_ready_nonce
+            assert nonce is not None
+
+            started = time.monotonic()
+            sent = await client.post(
+                (
+                    "/v1/sessions/conv_clean/resources/terminals/"
+                    f"terminal_{shell_name}_{session_key}/input"
+                ),
+                json={
+                    "attempt_id": str(uuid.uuid4()),
+                    "text": command,
+                    "keys": "Enter",
+                    "wait_for_ready": True,
+                },
+            )
+            elapsed = time.monotonic() - started
+            assert sent.status_code == 200, sent.text
+            assert sent.json() == {"status": "sent", "outcome": "sent"}
+            assert elapsed > 1.0
+
+            screens: list[str] = []
+            for _ in range(40):
+                result = await instance.read(scrollback=100)
+                screen = str(result.get("screen", ""))
+                screens.append(screen)
+                if any(line.strip() == marker for line in screen.splitlines()):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError(f"shell output {marker!r} did not appear:\n{screens[-1]}")
+
+            nonempty_lines = [line for line in screen.splitlines() if line.strip()]
+            assert command in nonempty_lines[0], screen
+            assert screen.count(command) == 1, screen
+            assert screen.count(marker) == 1, screen
+            assert "BASH_SOURCE" not in screen, screen
+            assert "ZSH_EVAL_CONTEXT" not in screen, screen
+            assert "OMNIGENT_SHELL_READY_" not in screen, screen
+            assert nonce not in screen, screen
+    finally:
+        await registry.shutdown()

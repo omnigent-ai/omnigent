@@ -39,7 +39,7 @@ import struct
 import sys
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
 
@@ -510,6 +510,7 @@ async def bridge_tmux_pty_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    on_client_input: Callable[[bytes], Awaitable[bool]] | None = None,
 ) -> None:
     """
     Bridge a tmux attach PTY to an already-accepted *websocket*.
@@ -538,6 +539,10 @@ async def bridge_tmux_pty_to_websocket(
         mis-reading them as agent activity. ``None`` (e.g. the
         server-direct attach path, which is out-of-process from the
         watcher) disables that attribution.
+    :param on_client_input: Optional owner-fenced raw-input dispatcher. The
+        runner supplies this so each frame revalidates ownership and performs
+        the complete tmux write under the instance lock. ``False`` closes the
+        stale attachment without forwarding bytes.
     """
     # Attaching is itself a client interaction: tmux resizes the window to
     # the new client, which reflows the pane. Stamp it before the bridge
@@ -647,10 +652,27 @@ async def bridge_tmux_pty_to_websocket(
                             rows = int(ctl["rows"])
                         except (KeyError, TypeError, ValueError):
                             continue
+                        if on_client_input is not None and not await on_client_input(b""):
+                            with contextlib.suppress(RuntimeError):
+                                await websocket.close(
+                                    code=WS_CLOSE_TERMINAL_NOT_FOUND,
+                                    reason="terminal ownership changed",
+                                )
+                            return
                         winsize = struct.pack("HHHH", rows, cols, 0, 0)
                         with contextlib.suppress(OSError):
                             fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
                 elif data is not None and not read_only:
+                    if on_client_input is not None:
+                        last_client_input_at = _monotonic()
+                        if not await on_client_input(data):
+                            with contextlib.suppress(RuntimeError):
+                                await websocket.close(
+                                    code=WS_CLOSE_TERMINAL_NOT_FOUND,
+                                    reason="terminal ownership changed",
+                                )
+                            return
+                        continue
                     # Probe pane liveness only if we haven't checked recently (cache
                     # for ~100ms to avoid a subprocess per keystroke). When remain-on-exit
                     # keeps a dead pane alive, Ctrl-C silently fails; detect and close

@@ -108,8 +108,8 @@ def test_runner_resource_attach_spawns_tmux_for_running_terminal(
             # ``?transport=pty`` pins this to the PTY bridge (the one that forks
             # tmux attach) independent of the global control-mode default.
             "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=pty"
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
     # ``-r`` is absent (read_only defaulted to false) and the local
     # socket path from the registry is what's threaded in.
@@ -156,8 +156,8 @@ def test_runner_resource_attach_passes_read_only_to_tmux(
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
             "?read_only=true&transport=pty"
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
     assert "-r" in captured["argv"], (
         f"Expected -r with read_only=true, got argv={captured['argv']!r}"
@@ -204,18 +204,57 @@ def test_runner_resource_attach_selects_control_bridge_on_transport_query(
     base = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
     client = TestClient(app)
     with contextlib.suppress(WebSocketDisconnect):
-        with client.websocket_connect(f"{base}?transport=control"):
-            pass
+        with client.websocket_connect(f"{base}?transport=control") as ws:
+            ws.receive_bytes()
     with contextlib.suppress(WebSocketDisconnect):
-        with client.websocket_connect(f"{base}?transport=pty"):
-            pass
+        with client.websocket_connect(f"{base}?transport=pty") as ws:
+            ws.receive_bytes()
     with contextlib.suppress(WebSocketDisconnect):
-        with client.websocket_connect(base):  # no query → control default
-            pass
+        with client.websocket_connect(base) as ws:  # no query → control default
+            ws.receive_bytes()
 
     assert calls == ["control", "pty", "control"], (
         f"transport query did not select the expected bridge: {calls!r}"
     )
+
+
+def test_runner_resource_attach_frame_after_transfer_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-attached socket cannot write after ownership transfers."""
+    registry = TerminalRegistry()
+    instance = _make_running_instance("bash", "s1", tmp_path)
+    _seed_registry(registry, "conv_abc", instance)
+    app = create_runner_app(
+        terminal_registry=registry,
+        server_client=NullServerClient(),
+    )
+    decisions: list[bool] = []
+    tmux_calls = 0
+
+    async def count_tmux(*args: str) -> None:
+        nonlocal tmux_calls
+        del args
+        tmux_calls += 1
+
+    async def fake_control(websocket, **kwargs) -> None:
+        assert registry.transfer("conv_abc", "conv_new", "bash", "s1") is True
+        on_client_input = kwargs["on_client_input"]
+        decisions.append(await on_client_input(b"x"))
+        await websocket.close()
+
+    monkeypatch.setattr(instance, "_tmux", count_tmux)
+    monkeypatch.setattr("omnigent.runner.app.bridge_tmux_control_to_websocket", fake_control)
+
+    with contextlib.suppress(WebSocketDisconnect):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control"
+        ) as ws:
+            ws.receive_bytes()
+
+    assert decisions == [False]
+    assert tmux_calls == 0
 
 
 def test_runner_resource_attach_unknown_terminal_closes_4404(tmp_path: Path) -> None:
@@ -413,8 +452,8 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
     # The recreate ran exactly once, for this session. [] means the
     # route still closes 4404 (the pre-fix dead-end); a wrong id means
@@ -435,8 +474,8 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
     assert auto_create_sessions == ["conv_abc"]
     assert str(fresh_dir / "tui-main.sock") in attach_argvs[1]
@@ -533,8 +572,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach?transport=pty"
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
     assert auto_create_sessions == ["conv_abc"]
     assert str(fresh_dir / "qwen-main.sock") in attach_argvs[0]
@@ -543,8 +582,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach?transport=pty"
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
     assert auto_create_sessions == ["conv_abc"]
     assert str(fresh_dir / "qwen-main.sock") in attach_argvs[1]

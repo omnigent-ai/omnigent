@@ -730,6 +730,11 @@ def _parse_terminal_env_spec(data: YamlData | str | bool | None) -> TerminalEnvS
     if not isinstance(env_val, dict):
         raise TypeError("terminal 'env' must be a mapping of string -> string")
     env = {str(k): str(v) for k, v in env_val.items()}
+    ready_process = data.get("ready_process")
+    if ready_process is not None and (
+        not isinstance(ready_process, str) or not ready_process.strip()
+    ):
+        raise TypeError("terminal 'ready_process' must be a non-empty string")
 
     return TerminalEnvSpec(
         command=data.get("command", "bash"),
@@ -741,6 +746,7 @@ def _parse_terminal_env_spec(data: YamlData | str | bool | None) -> TerminalEnvS
         log_file=data.get("log_file"),
         scrollback=int(data.get("scrollback", 10000)),
         session_prefix=data.get("session_prefix", "omni_"),
+        ready_process=ready_process,
     )
 
 

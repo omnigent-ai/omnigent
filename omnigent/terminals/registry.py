@@ -29,9 +29,10 @@ map. Tool invocations run on background threads via
 spins up its own ``asyncio.run`` loop to drive the registry's async
 methods. An ``asyncio.Lock`` would be bound to whichever loop created
 it and would silently fail to synchronize concurrent invocations from
-different threads. The threading lock is held only for short map
-mutations (no tmux I/O underneath); slow tmux subprocess calls happen
-outside the lock.
+different threads. The registry lock is held only for short map
+mutations. Terminal operations capture a snapshot, acquire the stable
+instance-owned ``op_lock``, revalidate under the registry lock, then
+perform tmux I/O while retaining only ``op_lock``.
 """
 
 from __future__ import annotations
@@ -39,8 +40,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -91,14 +94,43 @@ class TerminalListEntry:
 
     :param terminal_name: The terminal's spec name, e.g. ``"bash"``.
     :param session_key: The per-launch session key, e.g. ``"s1"``.
-    :param instance: The live :class:`TerminalInstance`. Callers can
-        read ``.running``, ``.command``, ``.socket_path``, etc., or
-        invoke ``send`` / ``read`` directly when wrapping in tools.
+    :param instance: The :class:`TerminalInstance` at snapshot time.
+        Callers may inspect metadata; tmux operations must use an atomic
+        :class:`ResolveSnapshot` and revalidate ownership first.
     """
 
     terminal_name: str
     session_key: str
     instance: TerminalInstance
+
+
+@dataclass(frozen=True)
+class ResolveSnapshot:
+    """Atomic terminal ownership snapshot used to fence one tmux operation."""
+
+    entry: TerminalListEntry
+    instance: TerminalInstance
+    op_lock: threading.Lock
+    owner_tuple: tuple[str, str, str]
+    owner_generation: int
+
+
+@dataclass(frozen=True)
+class AmbiguousResourceId:
+    """Fail-closed result for legacy registry entries sharing one public id."""
+
+    session_id: str
+    terminal_id: str
+    code: str = "ambiguous_resource_id"
+
+
+class AmbiguousResourceIdError(RuntimeError):
+    """Raised when a mutating terminal operation receives an ambiguous id."""
+
+
+ResolveResult = ResolveSnapshot | AmbiguousResourceId | None
+_FencedResultT = TypeVar("_FencedResultT")
+_FencedInvalidT = TypeVar("_FencedInvalidT")
 
 
 class TerminalRegistry:
@@ -128,20 +160,10 @@ class TerminalRegistry:
         # Per-conversation maps make ``cleanup_conversation`` cheap
         # (one pop) and ``list_for_conversation`` direct.
         self._by_conversation: dict[str, dict[tuple[str, str], TerminalInstance]] = {}
-        # Per-instance locks keyed by the full (conv_id, name, session_key)
-        # triple. Created at launch, removed at close /
-        # cleanup_conversation. Sender / reader / closer tools acquire
-        # this around the ``asyncio.run(instance.X())`` call to serialize
-        # tmux subprocess invocations on the same instance — without it,
-        # two concurrent ``sys_terminal_send`` calls can interleave their
-        # per-keystroke tmux commands (a ``send(text=X, keys="Enter")``
-        # decomposes to ~2 subprocess calls with a 50ms ``asyncio.sleep``
-        # between them — plenty of room for another send to slip in).
-        # See ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §9.1.
-        self._instance_locks: dict[tuple[str, str, str], threading.Lock] = {}
         # Threading lock — see module docstring for the rationale.
-        # Protects both ``_by_conversation`` and ``_instance_locks``.
+        # It protects the map and every owner-generation transition.
         self._lock = threading.Lock()
+        self._shutting_down = False
 
     def conversation_link_for_id(self, conversation_id: str) -> str:
         """
@@ -204,14 +226,33 @@ class TerminalRegistry:
             tool wraps in a JSON error envelope.
         """
         key = (terminal_name, session_key)
+        existing_snapshot: ResolveSnapshot | None = None
         with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("terminal registry is shutting down")
+            self._assert_resource_id_available_locked(
+                conversation_id,
+                terminal_name,
+                session_key,
+            )
             existing = self._by_conversation.get(conversation_id, {}).get(key)
-        if existing is not None and existing.running:
-            if await existing.is_alive():
-                return existing
-            await self.close(conversation_id, terminal_name, session_key)
-        elif existing is not None:
-            await self.close(conversation_id, terminal_name, session_key)
+            if existing is not None:
+                existing_snapshot = ResolveSnapshot(
+                    entry=TerminalListEntry(terminal_name, session_key, existing),
+                    instance=existing,
+                    op_lock=existing.op_lock,
+                    owner_tuple=(conversation_id, terminal_name, session_key),
+                    owner_generation=existing.owner_generation,
+                )
+        if existing_snapshot is not None:
+            if await asyncio.to_thread(
+                self.run_fenced,
+                existing_snapshot,
+                existing_snapshot.instance.is_alive,
+                invalid=False,
+            ):
+                return existing_snapshot.instance
+            await self.close_snapshot(existing_snapshot)
 
         # Lock-free section: ``create_terminal_instance`` and
         # ``launch`` may take real time (tmux spawn). Holding the
@@ -242,28 +283,37 @@ class TerminalRegistry:
                 f"terminal {terminal_name}:{session_key} exited before it became available"
             )
 
+        registration_error: RuntimeError | None = None
         with self._lock:
-            slot = self._by_conversation.setdefault(conversation_id, {})
-            # Re-check: another concurrent launch for the same key may
-            # have raced ours. Take the second-arrival policy: close
-            # ours and return the racer's. Avoids two live tmux
-            # sessions for the same key.
-            racer = slot.get(key)
-            if racer is not None and racer.running:
-                # Close ours outside the lock; racer wins.
-                instance_to_close: TerminalInstance | None = created.instance
-                winning_instance = racer
-            else:
-                slot[key] = created.instance
-                instance_to_close = None
+            if self._shutting_down:
+                shutdown_started = True
+                instance_to_close = created.instance
                 winning_instance = created.instance
-                # Allocate a per-instance lock alongside the
-                # registration. Tools fetch it via
-                # :meth:`get_instance_lock` to serialize concurrent
-                # tmux ops on this instance.
-                self._instance_locks[(conversation_id, terminal_name, session_key)] = (
-                    threading.Lock()
-                )
+            else:
+                shutdown_started = False
+                try:
+                    self._assert_resource_id_available_locked(
+                        conversation_id,
+                        terminal_name,
+                        session_key,
+                    )
+                except RuntimeError as exc:
+                    registration_error = exc
+                    instance_to_close = created.instance
+                    winning_instance = created.instance
+                else:
+                    slot = self._by_conversation.setdefault(conversation_id, {})
+                    # Re-check: another concurrent launch for the same key may
+                    # have raced ours. Take the second-arrival policy: close
+                    # ours and return the racer's.
+                    racer = slot.get(key)
+                    if racer is not None and racer.running:
+                        instance_to_close = created.instance
+                        winning_instance = racer
+                    else:
+                        slot[key] = created.instance
+                        instance_to_close = None
+                        winning_instance = created.instance
 
         if instance_to_close is not None:
             try:
@@ -275,35 +325,117 @@ class TerminalRegistry:
                     session_key,
                     conversation_id,
                 )
+        if shutdown_started:
+            raise RuntimeError("terminal registry is shutting down")
+        if registration_error is not None:
+            raise registration_error
         return winning_instance
 
-    def get_instance_lock(
+    def _assert_resource_id_available_locked(
         self,
         conversation_id: str,
         terminal_name: str,
         session_key: str,
-    ) -> threading.Lock | None:
-        """Return the per-instance lock for a registered terminal.
+    ) -> None:
+        """Reject a sanitized ``(name, key)`` collision while ``_lock`` is held."""
+        from omnigent.entities.session_resources import terminal_resource_id
 
-        Used by the ``sys_terminal_send`` / ``read`` / ``close``
-        tools to serialize tmux subprocess invocations against the
-        same instance. The lock exists from registration (in
-        :meth:`launch`) until the instance is closed (in
-        :meth:`close` or :meth:`cleanup_conversation`).
+        requested_id = terminal_resource_id(terminal_name, session_key)
+        slot = self._by_conversation.get(conversation_id, {})
+        collisions = [
+            (name, key)
+            for name, key in slot
+            if terminal_resource_id(name, key) == requested_id
+            and (name, key) != (terminal_name, session_key)
+        ]
+        if collisions:
+            raise RuntimeError(
+                f"terminal resource id {requested_id!r} collides with registered "
+                f"terminal {collisions[0][0]!r}:{collisions[0][1]!r}"
+            )
 
-        :param conversation_id: Owning conversation id.
-        :param terminal_name: Terminal spec name.
-        :param session_key: Session key from launch.
-        :returns: A :class:`threading.Lock` to acquire around
-            per-instance ops, or ``None`` if the instance was
-            never registered (or has been closed). Callers should
-            handle ``None`` by surfacing a "not running" error to
-            the LLM rather than skipping the lock — the
-            instance-not-found path means the operation can't
-            proceed at all.
-        """
+    def resolve_snapshot(
+        self,
+        session_id: str,
+        terminal_id: str,
+    ) -> ResolveResult:
+        """Resolve one public id and capture ownership atomically under ``_lock``."""
+        from omnigent.entities.session_resources import terminal_resource_id
+
         with self._lock:
-            return self._instance_locks.get((conversation_id, terminal_name, session_key))
+            matches = [
+                (name, key, instance)
+                for (name, key), instance in self._by_conversation.get(session_id, {}).items()
+                if terminal_resource_id(name, key) == terminal_id
+            ]
+            if len(matches) > 1:
+                return AmbiguousResourceId(session_id=session_id, terminal_id=terminal_id)
+            if not matches:
+                return None
+            name, key, instance = matches[0]
+            entry = TerminalListEntry(
+                terminal_name=name,
+                session_key=key,
+                instance=instance,
+            )
+            return ResolveSnapshot(
+                entry=entry,
+                instance=instance,
+                op_lock=instance.op_lock,
+                owner_tuple=(session_id, name, key),
+                owner_generation=instance.owner_generation,
+            )
+
+    def resolve_key_snapshot(
+        self,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+    ) -> ResolveResult:
+        """Resolve a tool's name/key arguments through the public-id resolver."""
+        from omnigent.entities.session_resources import terminal_resource_id
+
+        return self.resolve_snapshot(
+            session_id,
+            terminal_resource_id(terminal_name, session_key),
+        )
+
+    def snapshot_error_code(self, snapshot: ResolveSnapshot) -> str | None:
+        """Return why a captured owner can no longer operate, or ``None``."""
+        with self._lock:
+            if not self._snapshot_mapping_matches_locked(snapshot):
+                return "terminal_moved"
+            if snapshot.instance.retired or not snapshot.instance.running:
+                return "terminal_not_running"
+            return None
+
+    def run_fenced(
+        self,
+        snapshot: ResolveSnapshot,
+        async_fn: Callable[
+            [],
+            Coroutine[Any, Any, _FencedResultT] | _FencedResultT,
+        ],
+        *,
+        invalid: _FencedInvalidT | Callable[[str], _FencedInvalidT],
+    ) -> _FencedResultT | _FencedInvalidT:
+        """Run one operation while its captured terminal owner stays valid."""
+        with snapshot.op_lock:
+            error_code = self.snapshot_error_code(snapshot)
+            if error_code is not None:
+                return invalid(error_code) if callable(invalid) else invalid
+            result = async_fn()
+            if asyncio.iscoroutine(result):
+                return asyncio.run(result)
+            return result
+
+    def _snapshot_mapping_matches_locked(self, snapshot: ResolveSnapshot) -> bool:
+        session_id, terminal_name, session_key = snapshot.owner_tuple
+        current = self._by_conversation.get(session_id, {}).get((terminal_name, session_key))
+        return (
+            current is snapshot.instance
+            and snapshot.instance.owner_generation == snapshot.owner_generation
+        )
 
     def get(
         self,
@@ -400,16 +532,42 @@ class TerminalRegistry:
         :raises RuntimeError: If the target conversation already has an
             entry with the same terminal name and session key.
         """
+        resolved = self.resolve_key_snapshot(
+            source_conversation_id,
+            terminal_name,
+            session_key,
+        )
+        if isinstance(resolved, AmbiguousResourceId):
+            raise AmbiguousResourceIdError(
+                f"Terminal resource {resolved.terminal_id!r} is ambiguous"
+            )
+        if resolved is None:
+            return False
+        with resolved.op_lock:
+            return self.transfer_snapshot(resolved, target_conversation_id)
+
+    def transfer_snapshot(
+        self,
+        snapshot: ResolveSnapshot,
+        target_conversation_id: str,
+    ) -> bool:
+        """Move a captured owner while its stable ``op_lock`` is held."""
+        if not snapshot.op_lock.locked():
+            raise RuntimeError("transfer_snapshot requires the instance operation lock")
+        source_conversation_id, terminal_name, session_key = snapshot.owner_tuple
         key = (terminal_name, session_key)
-        source_lock_key = (source_conversation_id, terminal_name, session_key)
-        target_lock_key = (target_conversation_id, terminal_name, session_key)
         with self._lock:
-            source_slot = self._by_conversation.get(source_conversation_id)
-            if source_slot is None:
+            if self._shutting_down or not self._snapshot_mapping_matches_locked(snapshot):
                 return False
-            instance = source_slot.get(key)
-            if instance is None:
+            if snapshot.instance.retired or not snapshot.instance.running:
                 return False
+            if source_conversation_id == target_conversation_id:
+                return True
+            self._assert_resource_id_available_locked(
+                target_conversation_id,
+                terminal_name,
+                session_key,
+            )
             target_slot = self._by_conversation.setdefault(target_conversation_id, {})
             if key in target_slot:
                 raise RuntimeError(
@@ -417,13 +575,12 @@ class TerminalRegistry:
                     f"conversation {target_conversation_id!r}"
                 )
 
+            snapshot.instance.owner_generation += 1
+            source_slot = self._by_conversation[source_conversation_id]
             source_slot.pop(key)
             if not source_slot:
                 self._by_conversation.pop(source_conversation_id, None)
-            target_slot[key] = instance
-
-            lock = self._instance_locks.pop(source_lock_key, None)
-            self._instance_locks[target_lock_key] = lock or threading.Lock()
+            target_slot[key] = snapshot.instance
         return True
 
     async def close(
@@ -446,33 +603,79 @@ class TerminalRegistry:
             if no live instance was found (already-closed or
             never-launched).
         """
-        key = (terminal_name, session_key)
-        with self._lock:
-            slot = self._by_conversation.get(conversation_id)
-            if slot is None:
-                return False
-            instance = slot.pop(key, None)
-            if not slot:
-                # Drop the empty per-conversation dict so memory
-                # doesn't grow with stale conversation ids.
-                self._by_conversation.pop(conversation_id, None)
-            # Drop the per-instance lock too so subsequent
-            # ``get_instance_lock`` calls return ``None`` for this
-            # closed instance (callers surface a "not running"
-            # error to the LLM).
-            self._instance_locks.pop((conversation_id, terminal_name, session_key), None)
-        if instance is None:
-            return False
-        try:
-            await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Terminal close timed out for %s:%s in conv %s",
-                terminal_name,
-                session_key,
-                conversation_id,
+        resolved = self.resolve_key_snapshot(
+            conversation_id,
+            terminal_name,
+            session_key,
+        )
+        if isinstance(resolved, AmbiguousResourceId):
+            raise AmbiguousResourceIdError(
+                f"Terminal resource {resolved.terminal_id!r} is ambiguous"
             )
+        if resolved is None:
+            return False
+        return await self.close_snapshot(resolved)
+
+    async def close_snapshot(self, snapshot: ResolveSnapshot) -> bool:
+        """Retire and close one captured terminal without blocking the event loop."""
+        return await asyncio.to_thread(self._retire_and_close, snapshot, "Terminal close")
+
+    def _retire_and_close(
+        self,
+        snapshot: ResolveSnapshot,
+        log_prefix: str,
+    ) -> bool:
+        """Linearize retirement, then run tmux teardown under ``op_lock``."""
+        conversation_id, terminal_name, session_key = snapshot.owner_tuple
+        with snapshot.op_lock:
+            with self._lock:
+                if not self._snapshot_mapping_matches_locked(snapshot):
+                    return False
+                if snapshot.instance.retired:
+                    return False
+                snapshot.instance.retired = True
+                snapshot.instance.owner_generation += 1
+                slot = self._by_conversation[conversation_id]
+                slot.pop((terminal_name, session_key))
+                if not slot:
+                    self._by_conversation.pop(conversation_id, None)
+
+            async def _close_with_timeout() -> None:
+                await asyncio.wait_for(
+                    snapshot.instance.close(),
+                    timeout=_CLOSE_TIMEOUT_S,
+                )
+
+            try:
+                asyncio.run(_close_with_timeout())
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "%s timed out for %s:%s in conv %s",
+                    log_prefix,
+                    terminal_name,
+                    session_key,
+                    conversation_id,
+                )
         return True
+
+    def _snapshots_for_conversation_locked(
+        self,
+        conversation_id: str,
+    ) -> list[ResolveSnapshot]:
+        """Capture every exact owner in a conversation while ``_lock`` is held."""
+        return [
+            ResolveSnapshot(
+                entry=TerminalListEntry(name, key, instance),
+                instance=instance,
+                op_lock=instance.op_lock,
+                owner_tuple=(conversation_id, name, key),
+                owner_generation=instance.owner_generation,
+            )
+            for (name, key), instance in self._by_conversation.get(
+                conversation_id,
+                {},
+            ).items()
+        ]
 
     async def cleanup_conversation(self, conversation_id: str) -> None:
         """Close every terminal owned by *conversation_id*.
@@ -495,24 +698,16 @@ class TerminalRegistry:
         :param conversation_id: The conversation being torn down.
         """
         with self._lock:
-            slot = self._by_conversation.pop(conversation_id, None)
-            # Drop every per-instance lock owned by this conversation.
-            # Iterate over `slot` (the just-popped per-conv map) for the
-            # canonical (name, key) pairs.
-            if slot:
-                for name, sess in slot:
-                    self._instance_locks.pop((conversation_id, name, sess), None)
-        if not slot:
+            snapshots = self._snapshots_for_conversation_locked(conversation_id)
+        if not snapshots:
             return
-        for (name, key), instance in slot.items():
+        for snapshot in snapshots:
+            _, name, key = snapshot.owner_tuple
             try:
-                await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "cleanup_conversation: close timed out for %s:%s in conv %s",
-                    name,
-                    key,
-                    conversation_id,
+                await asyncio.to_thread(
+                    self._retire_and_close,
+                    snapshot,
+                    "cleanup_conversation: close",
                 )
             except Exception:
                 # We're in a workflow finally block; raising here would
@@ -533,29 +728,27 @@ class TerminalRegistry:
         a stuck instance shouldn't block the rest of Omnigent shutdown.
         """
         with self._lock:
-            slots = list(self._by_conversation.items())
-            self._by_conversation.clear()
-            # AP-shutdown clears all instance locks too — every
-            # conversation's terminals are being torn down.
-            self._instance_locks.clear()
-        for conversation_id, slot in slots:
-            for (name, key), instance in slot.items():
-                try:
-                    await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "shutdown: close timed out for %s:%s in conv %s",
-                        name,
-                        key,
-                        conversation_id,
-                    )
-                except Exception:
-                    logger.exception(
-                        "shutdown: close failed for %s:%s in conv %s",
-                        name,
-                        key,
-                        conversation_id,
-                    )
+            self._shutting_down = True
+            snapshots = [
+                snapshot
+                for conversation_id in tuple(self._by_conversation)
+                for snapshot in self._snapshots_for_conversation_locked(conversation_id)
+            ]
+        for snapshot in snapshots:
+            conversation_id, name, key = snapshot.owner_tuple
+            try:
+                await asyncio.to_thread(
+                    self._retire_and_close,
+                    snapshot,
+                    "shutdown: close",
+                )
+            except Exception:
+                logger.exception(
+                    "shutdown: close failed for %s:%s in conv %s",
+                    name,
+                    key,
+                    conversation_id,
+                )
 
     def active_conversation_ids(self) -> list[str]:
         """Return ids of conversations with at least one registered terminal.

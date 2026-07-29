@@ -62,6 +62,10 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
 from omnigent.spec.types import AgentSpec
+from omnigent.terminals import (
+    AmbiguousResourceId,
+    ResolveSnapshot,
+)
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -263,15 +267,11 @@ def _terminal_lookup_miss_reason(
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is None:
         return "terminal_registry_missing"
-    entries = terminal_registry.list_for_conversation(session_id)
-    if not entries:
-        return "session_has_no_registered_terminals"
-    registered_ids = [
-        terminal_resource_id(entry.terminal_name, entry.session_key) for entry in entries
-    ]
-    for entry in entries:
-        if terminal_resource_id(entry.terminal_name, entry.session_key) != terminal_id:
-            continue
+    resolved = terminal_registry.resolve_snapshot(session_id, terminal_id)
+    if isinstance(resolved, AmbiguousResourceId):
+        return "ambiguous_resource_id"
+    if isinstance(resolved, ResolveSnapshot):
+        entry = resolved.entry
         if not entry.instance.running:
             return (
                 "terminal_registered_but_not_running "
@@ -283,6 +283,12 @@ def _terminal_lookup_miss_reason(
             f"name={entry.terminal_name!r} session_key={entry.session_key!r} "
             f"socket={entry.instance.socket_path}"
         )
+    entries = terminal_registry.list_for_conversation(session_id)
+    if not entries:
+        return "session_has_no_registered_terminals"
+    registered_ids = [
+        terminal_resource_id(entry.terminal_name, entry.session_key) for entry in entries
+    ]
     return f"terminal_id_not_registered registered_ids={registered_ids!r}"
 
 

@@ -688,8 +688,8 @@ async def test_attach_terminal_local_fallback_spawns_tmux(
             # attach) independent of the global control-mode default.
             "/v1/sessions/conv_local_attach/resources/terminals/terminal_bash_s1/attach"
             "?read_only=true&transport=pty"
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
     # tmux argv must include -r (read-only) and the local socket
     # path the registry knew about. If the socket path is the wrong

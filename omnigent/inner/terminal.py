@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -433,6 +434,9 @@ _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 # (1024 chars ≤ 4KB packed). tmux writes each invocation's bytes to the
 # pane in submission order, so the program sees one contiguous stream.
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
+_SEND_KEYS_HEX_BYTES_PER_CALL = 1024
+_SHELL_READY_POLL_SECONDS = 0.025
+_SHELL_READY_STABLE_SAMPLES = 2
 
 
 class _IdleDetector:
@@ -932,6 +936,8 @@ class TerminalInstance:
         the first tmux client attaches to the session.
     :param running: Whether the tmux server is currently expected to
         be alive.
+    :param ready_process: Declared final process for arbitrary-command
+        readiness, or ``None`` when no explicit readiness contract exists.
     """
 
     name: str
@@ -974,7 +980,14 @@ class TerminalInstance:
     # attach routes via :func:`resolve_terminal_transport`; does not affect how
     # the tmux server itself is launched.
     terminal_transport: str | None = None
+    ready_process: str | None = None
+    shell_ready_nonce: str | None = None
+    _shell_ready_probe_sent: bool = field(default=False, repr=False, compare=False)
+    _shell_ready_acknowledged: bool = field(default=False, repr=False, compare=False)
     running: bool = False
+    retired: bool = False
+    owner_generation: int = 0
+    op_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     launch_cwd: str | None = None
     # Owned per-launch egress proxy. ``None`` when the sandbox
     # carries no ``egress_rules`` or the backend doesn't need a
@@ -1246,9 +1259,21 @@ class TerminalInstance:
         if not self.running:
             return {"error": "Terminal is not running"}
 
+        # ``keys`` tokens are passed to ``tmux send-keys`` as bare arguments
+        # (no ``-l``), so a token beginning with ``-``/``+`` would be parsed as
+        # a send-keys flag rather than a key name. Reject before any dispatch.
+        for key in keys.split():
+            if key.startswith(("-", "+")):
+                raise ValueError(
+                    f"Invalid tmux key name {key!r}: key names must not start "
+                    "with '-' or '+' (they would be consumed as send-keys flags)"
+                )
+
+        dispatch_started = False
         try:
             if text:
                 for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
+                    dispatch_started = True
                     await self._tmux(
                         "send-keys",
                         "-l",
@@ -1261,17 +1286,230 @@ class TerminalInstance:
                 if text:
                     await asyncio.sleep(0.05)
                 for key in keys.split():
+                    dispatch_started = True
                     await self._tmux("send-keys", "-t", self.tmux_target, key)
-        except RuntimeError:
+        except (RuntimeError, OSError):
             self.running = False
+            if dispatch_started:
+                return {
+                    "error": (
+                        f"Delivery to terminal {self.name}:{self.session_key} "
+                        "could not be confirmed"
+                    ),
+                    "delivery_unknown": True,
+                }
             return {
                 "error": (
                     f"Terminal {self.name}:{self.session_key} is no longer "
                     "running (tmux server exited)"
                 )
             }
+        except asyncio.CancelledError:
+            if dispatch_started:
+                return {
+                    "error": (
+                        f"Delivery to terminal {self.name}:{self.session_key} "
+                        "could not be confirmed"
+                    ),
+                    "delivery_unknown": True,
+                }
+            raise
 
         return {"status": "sent"}
+
+    async def send_raw_bytes(self, data: bytes) -> bool:
+        """Inject one attached-client frame through tmux's byte-exact hex path."""
+        if not self.running:
+            return False
+        try:
+            for start in range(0, len(data), _SEND_KEYS_HEX_BYTES_PER_CALL):
+                chunk = data[start : start + _SEND_KEYS_HEX_BYTES_PER_CALL]
+                await self._tmux(
+                    "send-keys",
+                    "-t",
+                    self.tmux_target,
+                    "-H",
+                    *(f"{value:02x}" for value in chunk),
+                )
+        except (RuntimeError, OSError):
+            self.running = False
+            return False
+        return True
+
+    async def _clear_shell_readiness_residue(
+        self,
+        *,
+        nonce: str,
+        deadline: float,
+        poll_interval_s: float,
+    ) -> bool:
+        """Clear the acknowledged probe from the screen and scrollback.
+
+        Sends ``C-l`` then ``clear-history`` so the typed readiness probe
+        leaves no residue in the pane or its history.
+        """
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.wait_for(
+            self._tmux("send-keys", "-t", self.tmux_target, "C-l"),
+            timeout=remaining,
+        )
+
+        while self.running:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            snapshot = await asyncio.wait_for(
+                self._tmux_output(
+                    "capture-pane",
+                    "-t",
+                    self.tmux_target,
+                    "-p",
+                ),
+                timeout=remaining,
+            )
+            self._remember_pane_snapshot(snapshot)
+            if nonce not in _strip_ansi(snapshot):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                await asyncio.wait_for(
+                    self._tmux("clear-history", "-t", self.tmux_target),
+                    timeout=remaining,
+                )
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(poll_interval_s, remaining))
+        return False
+
+    async def wait_for_shell_ready(
+        self,
+        *,
+        timeout_s: float,
+        poll_interval_s: float = _SHELL_READY_POLL_SECONDS,
+    ) -> bool:
+        """Wait for an input-loop ACK or a stable declared final process."""
+        try:
+            async with asyncio.timeout(timeout_s):
+                return await self._wait_for_shell_ready_once(
+                    timeout_s=timeout_s,
+                    poll_interval_s=poll_interval_s,
+                )
+        except TimeoutError:
+            return False
+        finally:
+            if not self._shell_ready_acknowledged:
+                self._shell_ready_probe_sent = False
+
+    async def _wait_for_shell_ready_once(
+        self,
+        *,
+        timeout_s: float,
+        poll_interval_s: float,
+    ) -> bool:
+        """Run one bounded shell-readiness evaluation.
+
+        Under the nonce contract this types a probe into the live pane and,
+        once acknowledged, clears it plus the scrollback via
+        ``_clear_shell_readiness_residue`` so the user never sees it.
+        """
+        if not self.running or timeout_s <= 0:
+            return False
+        if self.shell_ready_nonce is None and self.ready_process is None:
+            return False
+        if self._shell_ready_acknowledged:
+            return True
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        stable_process_samples = 0
+        probe_nonce = self.shell_ready_nonce
+        if probe_nonce is not None and not self._shell_ready_probe_sent:
+            probe_nonce = _mint_shell_ready_nonce()
+            self.shell_ready_nonce = probe_nonce
+            remaining = deadline - loop.time()
+            try:
+                probe = _direct_shell_readiness_probe(
+                    Path(self.command).name,
+                    probe_nonce,
+                )
+                await asyncio.wait_for(
+                    self._tmux(
+                        "send-keys",
+                        "-l",
+                        "-t",
+                        self.tmux_target,
+                        probe,
+                    ),
+                    timeout=remaining,
+                )
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                await asyncio.wait_for(
+                    self._tmux("send-keys", "-t", self.tmux_target, "Enter"),
+                    timeout=remaining,
+                )
+                self._shell_ready_probe_sent = True
+            except (TimeoutError, RuntimeError, OSError, ValueError):
+                return False
+
+        while self.running:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                if probe_nonce is not None:
+                    snapshot = await asyncio.wait_for(
+                        self._tmux_output(
+                            "capture-pane",
+                            "-t",
+                            self.tmux_target,
+                            "-p",
+                            "-S",
+                            "-",
+                        ),
+                        timeout=remaining,
+                    )
+                    self._remember_pane_snapshot(snapshot)
+                    if probe_nonce in _strip_ansi(snapshot):
+                        if not await self._clear_shell_readiness_residue(
+                            nonce=probe_nonce,
+                            deadline=deadline,
+                            poll_interval_s=poll_interval_s,
+                        ):
+                            return False
+                        self._shell_ready_acknowledged = True
+                        return True
+                else:
+                    process = await asyncio.wait_for(
+                        self._tmux_output(
+                            "display-message",
+                            "-p",
+                            "-t",
+                            self.tmux_target,
+                            "#{pane_current_command}",
+                        ),
+                        timeout=remaining,
+                    )
+                    if process.strip() == self.ready_process:
+                        stable_process_samples += 1
+                        if stable_process_samples >= _SHELL_READY_STABLE_SAMPLES:
+                            return True
+                    else:
+                        stable_process_samples = 0
+            except (TimeoutError, RuntimeError, OSError):
+                return False
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(poll_interval_s, remaining))
+        return False
 
     async def read(self, scrollback: int = 0) -> TerminalResult:
         """Capture the terminal screen."""
@@ -1884,6 +2122,90 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def _direct_shell_args_reach_input_loop(shell_name: str, args: list[str]) -> bool:
+    """Return whether direct shell argv can reach a command-reading loop."""
+    stdin_mode = False
+    option_operand = False
+    parsing_options = True
+    for arg in args:
+        if option_operand:
+            option_operand = False
+            continue
+        if parsing_options and arg == "--":
+            parsing_options = False
+            continue
+        if parsing_options and arg == "-":
+            stdin_mode = True
+            parsing_options = False
+            continue
+        if parsing_options and arg.startswith("--"):
+            option, separator, _value = arg.partition("=")
+            if option in {
+                "--command",
+                "--dump-po-strings",
+                "--dump-strings",
+                "--help",
+                "--noexec",
+                "--pretty-print",
+                "--version",
+            }:
+                return False
+            if option in {"--init-file", "--rcfile"} and not separator:
+                option_operand = True
+            if option in {"--shinstdin", "--stdin"}:
+                stdin_mode = True
+            continue
+        if parsing_options and len(arg) > 1 and arg[0] in {"-", "+"}:
+            if arg[:2] in {"-O", "+O", "-o", "+o"}:
+                option_operand = len(arg) == 2
+                continue
+            flags = arg[1:]
+            if any(flag in flags for flag in ("c", "D", "n", "t")):
+                return False
+            if "s" in flags:
+                stdin_mode = True
+            continue
+        if not stdin_mode:
+            return False
+
+    return not option_operand and shell_name in {"bash", "zsh"}
+
+
+def terminal_spec_supports_shell_readiness(spec: TerminalEnvSpec) -> bool:
+    """Return whether *spec* has a fail-closed spawn readiness contract."""
+    if spec.ready_process is not None:
+        return True
+    shell_name = Path(spec.command or "bash").name
+    return _direct_shell_args_reach_input_loop(shell_name, list(spec.args))
+
+
+def _direct_shell_readiness_probe(shell_name: str, nonce: str) -> str:
+    """Build a nonce-free command that ACKs only at a shell input loop."""
+    encoded_nonce = "".join(f"\\0{byte:03o}" for byte in nonce.encode("ascii"))
+    if shell_name == "bash":
+        condition = "[[ ${#BASH_SOURCE[@]} -eq 0 ]]"
+    elif shell_name == "zsh":
+        condition = "[[ $ZSH_EVAL_CONTEXT == toplevel ]]"
+    else:
+        raise ValueError(f"Unsupported direct readiness shell: {shell_name}")
+    return f"if {condition}; then builtin printf '%b\\n' '{encoded_nonce}'; fi"
+
+
+def _mint_shell_ready_nonce() -> str:
+    """Mint one direct-shell readiness probe nonce."""
+    return f"OMNIGENT_SHELL_READY_{secrets.token_hex(16)}"
+
+
+def _owned_shell_ready_nonce(spec: TerminalEnvSpec) -> str | None:
+    """Mint a readiness nonce for direct shells with an input-loop contract."""
+    if spec.ready_process is not None:
+        return None
+    shell_name = Path(spec.command or "bash").name
+    if not _direct_shell_args_reach_input_loop(shell_name, list(spec.args)):
+        return None
+    return _mint_shell_ready_nonce()
+
+
 @dataclass(frozen=True)
 class TerminalCreateResult:
     """
@@ -2038,6 +2360,8 @@ def create_terminal_instance(
         tmux_start_on_attach=spec.tmux_start_on_attach,
         keep_alive_after_exit=spec.keep_alive_after_exit,
         terminal_transport=spec.terminal_transport,
+        ready_process=spec.ready_process,
+        shell_ready_nonce=_owned_shell_ready_nonce(spec),
     )
 
     return TerminalCreateResult(instance=instance, cwd=cwd)

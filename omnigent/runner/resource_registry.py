@@ -35,6 +35,12 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.terminals.registry import (
+    AmbiguousResourceId,
+    AmbiguousResourceIdError,
+    ResolveSnapshot,
+    TerminalListEntry,
+)
 
 if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
@@ -523,27 +529,23 @@ class SessionResourceRegistry:
         """
         if self._terminal_registry is None:
             return None
+        resolved = self._terminal_registry.resolve_snapshot(session_id, terminal_id)
+        if not isinstance(resolved, ResolveSnapshot):
+            return None
 
-        for entry in self._terminal_registry.list_for_conversation(
-            session_id,
-        ):
-            if terminal_resource_id(entry.terminal_name, entry.session_key) != terminal_id:
-                continue
-            if not entry.instance.running:
-                return None
+        cache_key = f"{session_id}:{terminal_id}"
+        cached = self._is_alive_cache.get(cache_key)
 
-            cache_key = f"{session_id}:{terminal_id}"
-            cached = self._is_alive_cache.get(cache_key)
-            if cached is not None:
-                return terminal_resource_view(session_id, entry) if cached else None
-
-            alive = await entry.instance.is_alive()
-            if alive:
-                self._is_alive_cache[cache_key] = True
-            else:
-                self._is_alive_cache.pop(cache_key, None)
-                return None
-            return terminal_resource_view(session_id, entry)
+        alive = await asyncio.to_thread(
+            self._terminal_registry.run_fenced,
+            resolved,
+            lambda: bool(cached) if cached is not None else resolved.instance.is_alive(),
+            invalid=False,
+        )
+        if alive:
+            self._is_alive_cache[cache_key] = True
+            return terminal_resource_view(session_id, resolved.entry)
+        self._is_alive_cache.pop(cache_key, None)
         return None
 
     def resolve_environment(
@@ -1217,22 +1219,17 @@ class SessionResourceRegistry:
         """
         if self._terminal_registry is None:
             return False
-
-        for entry in self._terminal_registry.list_for_conversation(
-            session_id,
-        ):
-            if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
-                closed = await self._terminal_registry.close(
-                    session_id,
-                    entry.terminal_name,
-                    entry.session_key,
-                )
-                if closed:
-                    with self._lock:
-                        self._terminal_roles.pop((session_id, terminal_id), None)
-                        self._terminal_lifecycles.pop((session_id, terminal_id), None)
-                return closed
-        return False
+        resolved = self._terminal_registry.resolve_snapshot(session_id, terminal_id)
+        if isinstance(resolved, AmbiguousResourceId):
+            raise AmbiguousResourceIdError(f"Terminal resource {terminal_id!r} is ambiguous")
+        if resolved is None:
+            return False
+        closed = await self._terminal_registry.close_snapshot(resolved)
+        if closed:
+            with self._lock:
+                self._terminal_roles.pop((session_id, terminal_id), None)
+                self._terminal_lifecycles.pop((session_id, terminal_id), None)
+        return closed
 
     async def transfer_terminal(
         self,
@@ -1261,40 +1258,49 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             return None
 
-        from omnigent.terminals.registry import TerminalListEntry
-
-        for entry in self._terminal_registry.list_for_conversation(
+        resolved = self._terminal_registry.resolve_snapshot(
             source_session_id,
+            terminal_id,
+        )
+        if isinstance(resolved, AmbiguousResourceId):
+            raise AmbiguousResourceIdError(f"Terminal resource {terminal_id!r} is ambiguous")
+        if resolved is None:
+            return None
+
+        def _transfer_after_revalidation() -> (
+            tuple[
+                SessionResourceView,
+                str | None,
+                TerminalLifecycle | None,
+            ]
+            | None
         ):
-            if not entry.instance.running:
-                continue
-            if terminal_resource_id(entry.terminal_name, entry.session_key) != terminal_id:
-                continue
-            moved = self._terminal_registry.transfer(
-                source_session_id,
+            moved = self._terminal_registry.transfer_snapshot(
+                resolved,
                 target_session_id,
-                entry.terminal_name,
-                entry.session_key,
             )
             if not moved:
                 return None
+            entry = resolved.entry
+            instance = resolved.instance
             with self._lock:
                 role = self._terminal_roles.pop((source_session_id, terminal_id), None)
                 if role is not None:
                     self._terminal_roles[(target_session_id, terminal_id)] = role
-                lifecycle = self._terminal_lifecycles.pop((source_session_id, terminal_id), None)
+                lifecycle = self._terminal_lifecycles.pop(
+                    (source_session_id, terminal_id),
+                    None,
+                )
                 if lifecycle is not None:
                     self._terminal_lifecycles[(target_session_id, terminal_id)] = lifecycle
-            # Move the PTY-status memo with the pane so a post-transfer exit is
-            # classified against the right session. Don't clobber a status the
-            # target already has from its own terminal.
-            with self._lock:
                 moved_status = self._last_session_status.pop(source_session_id, None)
                 if moved_status is not None and target_session_id not in self._last_session_status:
                     self._last_session_status[target_session_id] = moved_status
             try:
-                await entry.instance.set_conversation_link(
-                    self._terminal_registry.conversation_link_for_id(target_session_id)
+                asyncio.run(
+                    instance.set_conversation_link(
+                        self._terminal_registry.conversation_link_for_id(target_session_id)
+                    )
                 )
             except (RuntimeError, OSError) as exc:
                 _logger.warning(
@@ -1302,25 +1308,37 @@ class SessionResourceRegistry:
                     target_session_id,
                     exc,
                 )
-            if lifecycle is not None:
-                self._start_terminal_activity_watcher(
-                    target_session_id,
-                    entry.terminal_name,
-                    entry.session_key,
-                    entry.instance,
-                    role,
-                    lifecycle,
-                    replace=True,
-                )
-            return terminal_resource_view(
+            view = terminal_resource_view(
                 target_session_id,
                 TerminalListEntry(
                     terminal_name=entry.terminal_name,
                     session_key=entry.session_key,
-                    instance=entry.instance,
+                    instance=instance,
                 ),
             )
-        return None
+            return view, role, lifecycle
+
+        transferred = await asyncio.to_thread(
+            self._terminal_registry.run_fenced,
+            resolved,
+            _transfer_after_revalidation,
+            invalid=None,
+        )
+        if transferred is None:
+            return None
+        view, role, lifecycle = transferred
+        if lifecycle is not None:
+            entry = resolved.entry
+            self._start_terminal_activity_watcher(
+                target_session_id,
+                entry.terminal_name,
+                entry.session_key,
+                resolved.instance,
+                role,
+                lifecycle,
+                replace=True,
+            )
+        return view
 
     async def cleanup_session(self, session_id: str) -> None:
         """Close all resources owned by a session.

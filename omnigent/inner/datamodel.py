@@ -779,6 +779,9 @@ class TerminalEnvSpec:
         default, which is control mode unless ``terminal.transport`` in
         ``~/.omnigent/config.yaml`` opts out to ``pty``. A per-attach
         ``?transport=`` query overrides both.
+    :param ready_process: Final process name that proves an arbitrary
+        configured command has handed control to its input owner. Used only
+        by explicit shell-command readiness waits.
     """
 
     command: str | None = None
@@ -796,6 +799,7 @@ class TerminalEnvSpec:
     tmux_start_on_attach: bool = False
     keep_alive_after_exit: bool = False
     terminal_transport: str | None = None
+    ready_process: str | None = None
 
 
 # ---------------------------------------------------------------------------

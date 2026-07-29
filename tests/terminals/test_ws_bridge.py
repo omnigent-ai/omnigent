@@ -651,6 +651,7 @@ class _ScriptedWebSocket:
         self._park = asyncio.Event()  # never set: parks ``receive``
         self.sent: list[bytes] = []
         self.close_code: int | None = None
+        self.close_codes: list[int] = []
 
     async def send_bytes(self, data: bytes) -> None:
         """Record PTY output forwarded to the browser (unused here)."""
@@ -667,6 +668,7 @@ class _ScriptedWebSocket:
     async def close(self, code: int = 1000, reason: str = "") -> None:
         """Capture the bridge's chosen close code."""
         self.close_code = code
+        self.close_codes.append(code)
 
 
 def _slave_winsize(slave_fd: int) -> tuple[int, int]:
@@ -801,6 +803,75 @@ async def test_bridge_read_only_gates_keystrokes_but_not_resize(
             await bridge_task
         with contextlib.suppress(OSError):
             os.close(master_fd)
+
+
+@pytest.mark.parametrize(
+    "frame,expected_callback_data",
+    [
+        ({"type": "websocket.receive", "bytes": b"stale-input"}, b"stale-input"),
+        (
+            {
+                "type": "websocket.receive",
+                "text": '{"type":"resize","cols":137,"rows":41}',
+            },
+            b"",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_bridge_owner_fence_rejects_stale_inbound_frame(
+    frame: dict[str, object],
+    expected_callback_data: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A revoked attachment cannot write either input bytes or a resize."""
+    master_fd, slave_fd = os.openpty()
+    # An owner-fence rejection makes the bridge return, and its teardown closes
+    # the master fd it was handed. Hold an independent handle to the pty master
+    # so the post-fence slave assertions below aren't ioctl'ing a torn-down pty
+    # (a closed master makes the slave's TIOCGWINSZ fail EIO on Linux).
+    master_keep = os.dup(master_fd)
+    tty.setraw(slave_fd)
+    flags = fcntl.fcntl(slave_fd, fcntl.F_GETFL)
+    fcntl.fcntl(slave_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    initial_size = _slave_winsize(slave_fd)
+    monkeypatch.setattr(pty, "fork", lambda: (999_999, master_fd))
+    monkeypatch.setattr(os, "kill", lambda *_args, **_kwargs: None)
+
+    async def _dead_session(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(ws_bridge, "_tmux_session_alive", _dead_session)
+    callback_data: list[bytes] = []
+
+    async def _owner_guard(data: bytes) -> bool:
+        callback_data.append(data)
+        return False
+
+    ws = _ScriptedWebSocket([frame])
+    try:
+        await asyncio.wait_for(
+            bridge_tmux_pty_to_websocket(
+                ws,
+                socket_path="/nonexistent.sock",
+                tmux_target="main",
+                read_only=False,
+                on_client_input=_owner_guard,
+            ),
+            timeout=5.0,
+        )
+
+        assert callback_data == [expected_callback_data]
+        assert _drain(slave_fd) == b""
+        assert _slave_winsize(slave_fd) == initial_size
+        assert ws_bridge.WS_CLOSE_TERMINAL_NOT_FOUND in ws.close_codes
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(slave_fd)
+        with contextlib.suppress(OSError):
+            os.close(master_fd)
+        with contextlib.suppress(OSError):
+            os.close(master_keep)
 
 
 @pytest.mark.asyncio
@@ -952,7 +1023,7 @@ async def test_bridge_splits_pty_redraw_after_control_key_input(
     )
     try:
         await asyncio.wait_for(ws.exhausted.wait(), timeout=5.0)
-        os.write(slave_fd, redraw)
+        await _write_all_nonblocking(asyncio.get_running_loop(), slave_fd, redraw)
         await asyncio.wait_for(_wait_for_sent_bytes(ws, len(redraw)), timeout=5.0)
 
         assert all(
