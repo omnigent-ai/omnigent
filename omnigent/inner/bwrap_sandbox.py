@@ -1239,7 +1239,9 @@ def _dotfile_and_symlink_mask_args(
     # Explicit operator-declared masks: hide these regardless of name
     # or depth, on top of the dotfile walk. Kind is decided by a stat
     # so a directory tmpfs-masks and a file /dev/null-masks; a missing
-    # path is dropped by the re-stat below.
+    # path is dropped by the re-stat below. ``is_dir`` follows symlinks
+    # (unlike the walker's ``follow_symlinks=False``), so a symlink to a
+    # directory tmpfs-masks at the link location.
     for mask_path in policy.mask_paths or []:
         key = str(mask_path)
         if key in seen_mask_paths:

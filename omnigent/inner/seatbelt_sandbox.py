@@ -1005,6 +1005,8 @@ def _build_profile(
     # Explicit operator-declared masks: deny these regardless of name
     # or depth, on top of the dotfile walk. A directory becomes a
     # ``(subpath ...)`` deny and a file/other a ``(literal ...)`` deny.
+    # ``is_dir`` follows symlinks (unlike the walker); a missing path
+    # still emits a harmless literal deny (no re-stat drop like bwrap).
     for mask_path in policy.mask_paths or []:
         key = str(mask_path)
         if key in seen_mask_paths:
