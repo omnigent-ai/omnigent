@@ -9,8 +9,10 @@ fallback.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +54,13 @@ _MODEL_PREFIX_TO_PROVIDER: dict[str, str] = {
     "mistral-": "mistral",
 }
 
+# Providers Omnigent routes directly for explicit ``vendor/model`` ids.
+# :func:`fetch_model_pricing` gates its OpenRouter fallbacks on this set so a
+# transient catalog-fetch failure for one of these providers (``models is
+# None``) can't be mistaken for "unrecognized provider" and mis-price e.g.
+# ``openai/gpt-4o`` at OpenRouter's public rate.
+_KNOWN_DIRECT_PROVIDERS: frozenset[str] = frozenset(_MODEL_PREFIX_TO_PROVIDER.values())
+
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
 # Omnigent's authoritative context-window registry, consulted BEFORE litellm
@@ -87,6 +96,8 @@ _CONTEXT_WINDOW_REGISTRY: dict[str, int] = {
 # rather than stripping it (the base id may legitimately have a smaller window).
 _ANTHROPIC_1M_BETA_SUFFIX = "[1m]"
 _ANTHROPIC_1M_BETA_WINDOW = 1_000_000
+
+_logger = logging.getLogger(__name__)
 
 
 def _registry_context_window(model: str) -> int | None:
@@ -130,6 +141,29 @@ def _registry_context_window(model: str) -> int | None:
 # over-charged cache reads ~10×.
 _FALLBACK_CACHE_READ_INPUT_RATIO: float = 0.10
 _FALLBACK_CACHE_WRITE_INPUT_RATIO: float = 1.25
+
+# Live OpenRouter pricing lookup cache.  The entire /api/v1/models list
+# (~342 entries) is fetched once and cached under the singleton key
+# _LIVE_PRICING_LIST_KEY as a dict[str, ModelPricing | None].  Per-model
+# lookups are plain dict.get() against this cached map, so a single network
+# call amortises across ALL models (the "one network call" property).
+# Negative results (model not in list) are implicitly cached as missing keys.
+# Transient failures (timeout/DNS/5xx) are cached separately at a short TTL
+# so the model can recover quickly, while "not found" stays cached for the
+# full list TTL.
+_OPENROUTER_LIVE_TTL_SECONDS = 3600
+_LIVE_PRICING_FAILURE_TTL_SECONDS = 60  # short TTL for transient failures
+_live_pricing_cache: cachetools.TTLCache[str, dict[str, ModelPricing] | None] = (
+    cachetools.TTLCache(maxsize=8, ttl=_OPENROUTER_LIVE_TTL_SECONDS)
+)
+_live_pricing_cache_lock = threading.Lock()
+_LIVE_PRICING_LIST_KEY = "__openrouter_list__"
+_LIVE_PRICING_MISS = object()  # sentinel distinguishing "absent" from cached None
+# Per-key failure cache: maps lookup_key -> (reason, timestamp).
+# Checked AFTER the main cache miss; entries expire after
+# _LIVE_PRICING_FAILURE_TTL_SECONDS so transient failures recover quickly.
+_live_pricing_failure_cache: dict[str, tuple[str, float]] = {}
+_live_pricing_failure_lock = threading.Lock()
 
 
 def _infer_provider(bare: str) -> str | None:
@@ -271,7 +305,7 @@ def _fetch_context_window_from_mlflow(model: str) -> int | None:
         matched = {
             name: e
             for name, e in models.items()
-            if name.startswith(prefix) and isinstance(e, dict)
+            if name.startswith(prefix + "-") and isinstance(e, dict)
         }
         if matched:
             windows = {
@@ -283,6 +317,144 @@ def _fetch_context_window_from_mlflow(model: str) -> int | None:
                 return int(next(iter(windows)))  # type: ignore[arg-type]
 
     return None
+
+
+def _fetch_live_openrouter_pricing(model: str) -> ModelPricing | None:
+    """
+    Fetch per-token pricing from the OpenRouter models LIST endpoint.
+
+    Last-resort fallback for models absent from the MLflow openrouter
+    catalog (e.g. ``z-ai/glm-5.2``).  The per-model endpoint
+    (``/api/v1/models/{id}``) returns 404 for all models, so pricing is
+    fetched from the list endpoint (``/api/v1/models``), which returns
+    ~342 entries as a JSON array under ``data`` (NB: NOT keyed on id;
+    not a dict).
+
+    The entire list is fetched once per call (bounded by the 3 s timeout)
+    and indexed into a dict keyed on each entry's ``id`` field.  The
+    *entire* ``by_id`` map is then cached under a single singleton key
+    (:data:`_LIVE_PRICING_LIST_KEY`) so a single network call amortises
+    across ALL models -- the "one network call" property holds across
+    different models.  Per-model lookups are plain ``dict.get()`` against
+    this cached map.
+
+    The ``model`` argument may carry an ``openrouter/`` prefix (bare
+    ``vendor/model`` is the expected form, but the prefix is stripped for
+    safety).
+
+    Pricing fields in the response are per-token *strings* (e.g.
+    ``"0.0000007938"``).  A value of ``"0"`` is an authoritative zero;
+    absent or unparseable fields are treated as unknown (``None``).  The
+    helper never raises into the caller.
+
+    Transient failures (timeout/DNS/5xx) are cached for a short TTL
+    (:data:`_LIVE_PRICING_FAILURE_TTL_SECONDS`) so the model can recover
+    quickly.  "Not found" results are cached for the full list TTL
+    (:data:`_OPENROUTER_LIVE_TTL_SECONDS`).
+
+    :param model: The model id as reported by pi, e.g.
+        ``"z-ai/glm-5.2"`` or ``"openrouter/z-ai/glm-5.2"``.
+    :returns: :class:`ModelPricing` or ``None``.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    # Normalise: strip a leading "openrouter/" so the bare vendor/model
+    # matches the list-endpoint's ``id`` field.
+    lookup_key = model.removeprefix("openrouter/")
+
+    # --- Check the main list cache first (singleton key) ---
+    with _live_pricing_cache_lock:
+        cached_list = _live_pricing_cache.get(_LIVE_PRICING_LIST_KEY, _LIVE_PRICING_MISS)
+        if cached_list is not _LIVE_PRICING_MISS:
+            if cached_list is None:
+                return None
+            return cached_list.get(lookup_key)
+
+    # --- Check the short-TTL failure cache ---
+    with _live_pricing_failure_lock:
+        failure_entry = _live_pricing_failure_cache.get(lookup_key)
+        if failure_entry is not None:
+            reason, failure_ts = failure_entry
+            elapsed = time.monotonic() - failure_ts
+            if elapsed < _LIVE_PRICING_FAILURE_TTL_SECONDS:
+                _logger.debug(
+                    "openrouter pricing failure (cached %.0fs ago): %s: %s",
+                    elapsed,
+                    lookup_key,
+                    reason,
+                )
+                return None
+
+    # --- Fetch the full list (one network call) ---
+    url = "https://openrouter.ai/api/v1/models"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            raw = _json.loads(resp.read())
+    except Exception as exc:
+        _logger.debug("openrouter pricing fetch failed for %s: %s", lookup_key, exc)
+        with _live_pricing_failure_lock:
+            _live_pricing_failure_cache[lookup_key] = (str(exc), time.monotonic())
+        return None
+
+    # Parse the list into a by_id map.  On parse failure, cache a
+    # short-TTL failure so the next call retries quickly.
+    try:
+        data = raw.get("data") if isinstance(raw, dict) else raw
+        if not isinstance(data, list):
+            _logger.debug(
+                "openrouter pricing: malformed response (data is %s)",
+                type(data).__name__,
+            )
+            with _live_pricing_failure_lock:
+                _live_pricing_failure_cache[lookup_key] = (
+                    f"malformed response: data is {type(data).__name__}",
+                    time.monotonic(),
+                )
+            return None
+
+        def _to_float(val: object) -> float | None:
+            """Parse a pricing string to float; ``None`` on failure."""
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        by_id: dict[str, ModelPricing] = {}
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            eid = entry.get("id")
+            if not isinstance(eid, str):
+                continue
+            pricing_raw = entry.get("pricing")
+            if not isinstance(pricing_raw, dict):
+                continue
+            input_pt = _to_float(pricing_raw.get("prompt"))
+            output_pt = _to_float(pricing_raw.get("completion"))
+            if input_pt is None or output_pt is None:
+                continue
+            by_id[eid] = ModelPricing(
+                input_per_token=input_pt,
+                output_per_token=output_pt,
+                cache_read_per_token=_to_float(pricing_raw.get("input_cache_read")),
+                cache_write_per_token=None,  # OpenRouter doesn't publish cache-write
+            )
+
+        # Cache the entire list under the singleton key.  If the target
+        # model is absent, by_id.get(lookup_key) returns None (implicit
+        # negative cache for the full list TTL).
+        with _live_pricing_cache_lock:
+            _live_pricing_cache[_LIVE_PRICING_LIST_KEY] = by_id
+        return by_id.get(lookup_key)
+    except Exception as exc:
+        _logger.debug("openrouter pricing parse failed for %s: %s", lookup_key, exc)
+        with _live_pricing_failure_lock:
+            _live_pricing_failure_cache[lookup_key] = (str(exc), time.monotonic())
+        return None
 
 
 def get_model_context_window(model: str) -> int:
@@ -434,6 +606,13 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
     if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
         return None
 
+    # Strip explicit openrouter/ prefix early so the lookup key is the
+    # bare vendor/model form used by both the OpenRouter MLflow catalog
+    # and the live API.  This MUST happen before the catalog retry and
+    # family-prefix block so an ``openrouter/vendor/model`` id hits the
+    # catalog retry (and doesn't fall through to the network path).
+    or_model = model.removeprefix("openrouter/")
+
     if "/" in model:
         _explicit_provider, bare = model.split("/", 1)
         provider = _explicit_provider
@@ -445,8 +624,6 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
         return None
 
     models = _fetch_mlflow_provider_catalog(provider)
-    if models is None:
-        return None
 
     def _extract(entry: object) -> ModelPricing | None:
         """Extract per-token pricing (incl. cache rates) from a catalog entry."""
@@ -472,7 +649,7 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
             ),
         )
 
-    entry = models.get(bare)
+    entry = models.get(bare) if models is not None else None
     if entry is not None:
         result = _extract(entry)
         if result is not None:
@@ -480,12 +657,26 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
 
     # Family-prefix fallback: strip last hyphen segment and look for
     # entries that share the same pricing.
-    if "-" in bare:
+    # (#7) Use startswith(prefix + "-") to avoid over-matching
+    # ("kimi" matching "kimi-k30").
+    if "-" in bare and models is not None:
         prefix = bare.rsplit("-", 1)[0]
-        matched = [e for name, e in models.items() if name.startswith(prefix)]
-        prices = {_extract(e) for e in matched if _extract(e) is not None}
+        matched = [e for name, e in models.items() if name.startswith(prefix + "-")]
+        # (#1) Compute _extract once per element, dedupe on a tuple key
+        # to avoid requiring ModelPricing to be hashable.
+        prices: dict[tuple, ModelPricing] = {}
+        for e in matched:
+            p = _extract(e)
+            if p is not None:
+                k = (
+                    p.input_per_token,
+                    p.output_per_token,
+                    p.cache_read_per_token,
+                    p.cache_write_per_token,
+                )
+                prices[k] = p
         if len(prices) == 1:
-            return next(iter(prices))
+            return next(iter(prices.values()))
 
     # Databricks-gateway alias fallback. A model served through the
     # Databricks gateway is reported as ``databricks-<base>`` (e.g.
@@ -500,6 +691,71 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
         base = bare[len("databricks-") :]
         if base and base != bare:
             return fetch_model_pricing(base)
+
+    # --- Precedence for vendor/model ids (e.g. "xiaomi/mimo-v2.5-pro") ---
+    #
+    # 1.  Own-provider catalog  (step 1 above: "xiaomi" -> xiaomi.json)
+    # 2.  OpenRouter MLflow catalog  (step below: full key lookup + family-prefix)
+    # 3.  Live OpenRouter API list  (step below: last-resort, cached)
+    #
+    # This means a model priced by its own provider catalog is never
+    # overridden by the OpenRouter catalog, even when both carry the key.
+    # Unresolved vendor/model ids fall through to OpenRouter rates by
+    # design, because the bare form is what pi reports for all OpenRouter
+    # dispatches.
+    #
+    # (#3) GATE: OpenRouter fallbacks apply only for an explicit
+    # ``openrouter/`` prefix (or_model != model) or a provider outside
+    # _KNOWN_DIRECT_PROVIDERS. Gating on the provider name rather than on
+    # ``models is None`` matters because that signal is ambiguous: it's
+    # ``None`` both for an unrecognized provider (safe to fall through) and
+    # for a known provider's catalog fetch failing transiently (must NOT
+    # fall through, or a one-off timeout mis-prices e.g. ``openai/gpt-4o``
+    # at OpenRouter's rate for up to an hour).
+
+    # OpenRouter vendor/model retry.  For bare ``vendor/model`` ids from
+    # unrecognized providers (e.g. ``xiaomi/mimo-v2.5-pro``,
+    # ``moonshotai/kimi-k3``) or explicitly ``openrouter/``-prefixed ids,
+    # retry against the ``openrouter`` MLflow catalog.  The MLflow
+    # openrouter.json stores these ids verbatim.
+    # (#2) Uses the prefix-stripped ``or_model`` (not the raw ``model``)
+    # so ``openrouter/vendor/model`` matches the catalog key
+    # ``vendor/model``.
+    #
+    # The condition: explicit ``openrouter/`` prefix OR provider is not one
+    # Omnigent routes directly.
+    if or_model != model or provider not in _KNOWN_DIRECT_PROVIDERS:
+        or_models = _fetch_mlflow_provider_catalog("openrouter")
+        if or_models is not None:
+            entry = or_models.get(or_model)
+            if entry is not None:
+                result = _extract(entry)
+                if result is not None:
+                    return result
+            # Family-prefix fallback within the openrouter catalog too.
+            # (#7) Use startswith(prefix + "-") to avoid over-matching.
+            if "-" in or_model:
+                prefix = or_model.rsplit("-", 1)[0]
+                matched = [e for n, e in or_models.items() if n.startswith(prefix + "-")]
+                # (#1) Dedupe on a tuple key; compute _extract once.
+                prices = {}
+                for e in matched:
+                    p = _extract(e)
+                    if p is not None:
+                        k = (
+                            p.input_per_token,
+                            p.output_per_token,
+                            p.cache_read_per_token,
+                            p.cache_write_per_token,
+                        )
+                        prices[k] = p
+                if len(prices) == 1:
+                    return next(iter(prices.values()))
+
+        # Live OpenRouter API fallback for models absent from MLflow entirely
+        # (e.g. ``z-ai/glm-5.2``).  Fetches the models LIST endpoint once,
+        # caches results for 1 h, never raises into the turn-completion path.
+        return _fetch_live_openrouter_pricing(or_model)
 
     return None
 
