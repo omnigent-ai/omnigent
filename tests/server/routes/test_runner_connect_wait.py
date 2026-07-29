@@ -99,23 +99,32 @@ async def test_wait_without_report_runs_to_timeout() -> None:
     assert registry.waited == [("runner_slow", 0.1)]
 
 
-class _ScriptedConnectWaits:
-    """Scripted stand-in for the runner-connect wait.
+class _GatedConnectWaits:
+    """Connect-wait stand-in whose first wait is released by an event.
 
-    Returns the queued outcome for each successive call and records the
-    timeout it was given, so a test can assert both the number of waits and
-    the budget each one received without any wall-clock sleeping.
+    Makes the race ordering explicit instead of scheduler-dependent: the
+    first wait blocks until *release* is set, so a test can guarantee the
+    liveness verdict has already resolved before the grace-length wait
+    reports back. Each call records the budget it was handed.
 
-    :param outcomes: Outcome per call, in order. ``None`` models "the wait
+    :param outcomes: Outcome per call, in order. ``None`` models "this wait
         expired with no runner"; anything else is returned as the client.
+    :param release: Event gating the first call, or ``None`` to let every
+        call return without suspending.
     """
 
-    def __init__(self, outcomes: list[object | None]) -> None:
-        """Initialize with the scripted outcomes.
+    def __init__(
+        self,
+        outcomes: list[object | None],
+        release: asyncio.Event | None = None,
+    ) -> None:
+        """Initialize with the scripted outcomes and optional gate.
 
         :param outcomes: Outcome per call, in order.
+        :param release: Event gating the first call, if any.
         """
         self._outcomes = list(outcomes)
+        self._release = release
         self.timeouts: list[float] = []
 
     async def __call__(
@@ -128,7 +137,7 @@ class _ScriptedConnectWaits:
         timeout_s: float,
         runner_exit_reports: object = None,
     ) -> object | None:
-        """Record the budget and return the next scripted outcome.
+        """Record the budget, wait for the gate, return the next outcome.
 
         :param session_id: Session id (unused).
         :param runner_router: Router (unused).
@@ -139,23 +148,26 @@ class _ScriptedConnectWaits:
         :returns: The next scripted outcome.
         """
         del session_id, runner_router, tunnel_registry, runner_id, runner_exit_reports
+        first = not self.timeouts
         self.timeouts.append(timeout_s)
+        if first and self._release is not None:
+            await self._release.wait()
         return self._outcomes.pop(0)
 
 
 async def _call_host_bound_wait(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    connect: _ScriptedConnectWaits,
-    status_suspends: bool,
+    connect: _GatedConnectWaits,
+    on_status: asyncio.Event | None,
 ) -> object | None:
     """Drive ``_wait_for_host_bound_runner_client`` over scripted collaborators.
 
     :param monkeypatch: Pytest patcher.
-    :param connect: Scripted connect-wait stand-in.
-    :param status_suspends: When ``True`` the status query yields once, so the
-        connect settles first; when ``False`` both resolve in the same wait
-        turn (the simultaneous-completion case).
+    :param connect: Gated connect-wait stand-in.
+    :param on_status: Event the liveness query sets once it has answered
+        ``alive``, used to release *connect*'s first wait. ``None`` leaves the
+        query with no side effect.
     :returns: Whatever the wait returns.
     """
     from omnigent.server.routes._sessions import orchestration
@@ -168,9 +180,8 @@ async def _call_host_bound_wait(
         :returns: ``"alive"``.
         """
         del args, kwargs
-        if status_suspends:
-            # Yield once so the connect wait reaches ``done`` first.
-            await asyncio.sleep(0)
+        if on_status is not None:
+            on_status.set()
         return "alive"
 
     monkeypatch.setattr(orchestration, "_wait_for_runner_client", connect)
@@ -194,22 +205,26 @@ async def test_alive_verdict_waits_out_the_remaining_budget(
 ) -> None:
     """An ``alive`` runner gets the grace, then the rest of the budget.
 
-    The cold-boot case: the host still holds the runner's process, so the
-    tunnel is coming and only the timing is in doubt. Expiring at the grace
-    rotates the binding and races a replacement, which is what produced
-    ``runner_unavailable`` with nothing persisted.
+    The cold-boot case: the host still holds the runner's process, so it may
+    yet register and the grace alone cannot tell. Expiring there rotates the
+    binding and launches a replacement, leaving two runners racing for one
+    session — and the message failing if the replacement also misses its
+    rendezvous.
 
-    Scripted budgets prove the split without waiting: the grace-length wait
-    (10) comes back empty, then a second wait for the remainder (50) returns
-    the original runner's client.
+    Ordering is explicit rather than scheduler-dependent: the grace-length
+    wait is gated on the verdict having been answered, so ``alive`` is
+    resolved before that wait reports empty. Scripted budgets then prove the
+    split — 10 for the grace, 50 for the remainder — and the original
+    runner's client is returned.
 
     Mutation check: drop the ``alive`` extension and only ``[10.0]`` is
     recorded and ``None`` is returned, failing both assertions.
     """
+    answered = asyncio.Event()
     sentinel = object()
-    connect = _ScriptedConnectWaits([None, sentinel])
+    connect = _GatedConnectWaits([None, sentinel], release=answered)
 
-    result = await _call_host_bound_wait(monkeypatch, connect=connect, status_suspends=True)
+    result = await _call_host_bound_wait(monkeypatch, connect=connect, on_status=answered)
 
     assert result is sentinel, "the original binding's client must be returned, not None"
     assert connect.timeouts == [10.0, 50.0], (
@@ -222,23 +237,27 @@ async def test_alive_verdict_survives_simultaneous_connect_timeout(
 ) -> None:
     """A grace that expires in the same turn as ``alive`` keeps the verdict.
 
-    ``asyncio.wait`` can report both the connect wait and the status query as
-    done together. Reading the connect result first and returning it would
-    throw away an ``alive`` answer that arrived simultaneously, relaunching a
-    runner the host had just confirmed was still coming up.
+    Neither stand-in suspends, so both the connect wait and the liveness
+    query finish before ``asyncio.wait``'s waiter is resumed — completing a
+    future schedules its done-callbacks through ``call_soon`` rather than
+    running them inline, so the waiter observes both in the done set. That is
+    the case where reading the connect result first would throw away an
+    ``alive`` answer that arrived alongside it and relaunch a runner the host
+    had just reported as still held.
 
     Mutation check: return the connect result whenever it is done (ignoring a
     same-turn verdict) and this records only ``[10.0]`` and returns ``None``.
     """
     sentinel = object()
-    connect = _ScriptedConnectWaits([None, sentinel])
+    connect = _GatedConnectWaits([None, sentinel])  # ungated: never suspends
 
-    result = await _call_host_bound_wait(monkeypatch, connect=connect, status_suspends=False)
+    result = await _call_host_bound_wait(monkeypatch, connect=connect, on_status=None)
 
     assert result is sentinel, (
         "a same-turn 'alive' verdict must still extend the wait; returning "
         "None here means the verdict was discarded"
     )
     assert connect.timeouts == [10.0, 50.0], (
-        f"expected the grace then the remaining budget; got {connect.timeouts!r}"
+        f"the extension must run even though the connect wait had already "
+        f"settled; got {connect.timeouts!r}"
     )

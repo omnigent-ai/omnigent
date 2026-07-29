@@ -2153,19 +2153,22 @@ async def _wait_for_host_bound_runner_client(
       crashed, or lost to a host restart). That means it will never
       connect, so the wait ends immediately and the caller relaunches
       without burning the rest of the grace.
-    * An ``alive`` verdict is the opposite signal: the host still holds the
-      runner's process, so the tunnel is coming and the only question is
-      when. A cold boot can outlast the short grace, and giving up on it
-      rotates the binding and races a replacement runner, so the wait runs
-      to ``alive_timeout_s`` instead of expiring at ``timeout_s``. A crash
-      report landing meanwhile still ends it early, via the connect wait's
-      own short-circuit.
+    * An ``alive`` verdict points the other way. It does not promise the
+      tunnel is coming — only that the host still holds a running process,
+      which may yet register, or may be wedged. A cold boot can outlast the
+      short grace, and abandoning it there rotates the binding and races a
+      replacement runner, so the wait runs to ``alive_timeout_s`` instead of
+      expiring at ``timeout_s``. ``alive_timeout_s`` is what bounds a process
+      that is held but never registers. A crash report landing meanwhile
+      still ends the wait early, via the connect wait's own short-circuit.
 
-    Running the query *alongside* the wait rather than before it is what
-    keeps the query strictly a speed-up: a host that is too old to answer,
-    slow, or silent (verdict ``None`` / ``"alive"``) never shortcuts the
-    wait, so the connect grace runs its normal course with no added
-    latency.
+    Running the query *alongside* the wait rather than before it keeps its
+    cost off the fast path: a runner that registers promptly is returned by
+    the connect wait and the verdict never matters. The verdict can then
+    shorten the wait (``dead``/``unknown``) or extend it to the bounded
+    budget (``alive``), while a host that is offline, too old to answer, or
+    slow yields no verdict at all and the plain connect grace runs its
+    normal course.
 
     :param session_id: Session/conversation identifier.
     :param runner_router: The ``RunnerRouter`` instance, or ``None``.
@@ -2217,10 +2220,10 @@ async def _wait_for_host_bound_runner_client(
             # No usable verdict (an unavailable/too-old/slow host, or no alive
             # budget configured): let the connect grace run its normal course.
             return connect_task.result() if connect_task in done else await connect_task
-        # The host still holds this runner's process, so the tunnel is coming
-        # and only the timing is in doubt. Let the grace finish, then spend
-        # what is left of the larger budget rather than rotating the binding
-        # and racing a replacement. A crash report arriving meanwhile still
+        # The host still holds this runner's process, so it has not been ruled
+        # out and may yet register. Let the grace finish, then spend what is
+        # left of the larger budget rather than rotating the binding and
+        # racing a replacement. A crash report arriving meanwhile still
         # ends the wait early — ``_wait_for_runner_client`` short-circuits on
         # it, so that case needs no separate check here.
         if connect_task not in done:
