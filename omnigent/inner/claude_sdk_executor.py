@@ -1782,8 +1782,8 @@ class ClaudeSDKExecutor(Executor):
 
     async def enqueue_session_message(
         self,
-        session_key: str,
-        content: str | Message,
+        session_key: str,  # noqa: ARG002
+        content: str | Message,  # noqa: ARG002
     ) -> bool:
         # query() queues a NEW turn on the SDK's stdin; it does not inject
         # into the turn already running. Returning False lets the adapter's
