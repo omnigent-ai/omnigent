@@ -47,6 +47,7 @@ import yaml
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
+from omnigent import model_catalog
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
@@ -1614,10 +1615,7 @@ def _ucode_config_for_profile(
     if not profile:
         return None
 
-    from omnigent.onboarding.databricks_config import (
-        DATABRICKS_CLAUDE_DEFAULT_MODEL,
-        get_workspace_url_for_profile,
-    )
+    from omnigent.onboarding.databricks_config import get_workspace_url_for_profile
     from omnigent.onboarding.ucode_state import read_ucode_state
 
     workspace_url = get_workspace_url_for_profile(profile)
@@ -1739,7 +1737,9 @@ def _ucode_config_for_profile(
     return ClaudeNativeUcodeConfig(
         env=env,
         api_key_helper=agent_state.auth_command,
-        model=default_model or configured_default or DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        model=default_model
+        or configured_default
+        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
     )
 
 

@@ -19,7 +19,6 @@ from omnigent.server.smart_routing import (
     RoutingResult,
     _build_rubric,
     fetch_runner_models,
-    infer_models,
     route_session_harness,
     route_turn,
 )
@@ -72,12 +71,60 @@ class _FakeRoutingClient:
         return self._result
 
 
-# ── infer_models ────────────────────────────────────────────────────
+_TEST_MODELS = {
+    "claude-sdk": [
+        "databricks-claude-haiku-4-5",
+        "databricks-claude-sonnet-4-6",
+        "databricks-claude-opus-4-8",
+    ],
+    "claude-native": ["databricks-claude-haiku-4-5"],
+    "codex": ["databricks-gpt-5-4-nano", "databricks-gpt-5-5"],
+    "codex-native": ["databricks-gpt-5-4-nano"],
+    "openai-agents": ["databricks-gpt-5-4-nano"],
+    "pi": [
+        "databricks-claude-haiku-4-5",
+        "databricks-gpt-5-4-nano",
+        "databricks-gpt-5-5",
+    ],
+}
 
 
-def test_infer_models_claude_sdk() -> None:
+def _models_for(harness: str | None) -> list[str] | None:
+    models = _TEST_MODELS.get(harness or "")
+    return list(models) if models is not None else None
+
+
+def _catalog_client() -> MagicMock:
+    workers = {
+        "claude_code": _TEST_MODELS["claude-sdk"],
+        "codex": _TEST_MODELS["codex"],
+        "pi": _TEST_MODELS["pi"],
+        "self": _TEST_MODELS["claude-sdk"],
+    }
+    response = MagicMock()
+    response.json.return_value = {
+        "workers": {
+            worker: {
+                "source": "catalog",
+                "verified": True,
+                "models": [{"id": model} for model in models],
+                "note": "",
+            }
+            for worker, models in workers.items()
+        }
+    }
+    response.raise_for_status = MagicMock()
+    client = MagicMock()
+    client.get = AsyncMock(return_value=response)
+    return client
+
+
+# ── test catalog fixtures ───────────────────────────────────────────
+
+
+def test_models_fixture_claude_sdk() -> None:
     """claude-sdk returns the claude model list."""
-    models = infer_models("claude-sdk")
+    models = _models_for("claude-sdk")
     assert models is not None
     assert any("haiku" in m for m in models)
     assert any("opus" in m for m in models)
@@ -87,33 +134,33 @@ def test_infer_models_claude_sdk() -> None:
     assert haiku_idx < opus_idx
 
 
-def test_infer_models_native_harnesses() -> None:
-    assert infer_models("claude-native") is not None
-    assert infer_models("codex-native") is not None
+def test_models_fixture_native_harnesses() -> None:
+    assert _models_for("claude-native") is not None
+    assert _models_for("codex-native") is not None
 
 
-def test_infer_models_codex() -> None:
-    models = infer_models("codex")
+def test_models_fixture_codex() -> None:
+    models = _models_for("codex")
     assert models is not None
     assert any("gpt" in m for m in models)
 
 
-def test_infer_models_openai_agents() -> None:
-    assert infer_models("openai-agents") is not None
+def test_models_fixture_openai_agents() -> None:
+    assert _models_for("openai-agents") is not None
 
 
-def test_infer_models_pi() -> None:
+def test_models_fixture_pi() -> None:
     """pi is multi-model — both Claude and GPT."""
-    models = infer_models("pi")
+    models = _models_for("pi")
     assert models is not None
     assert any("haiku" in m for m in models)
     assert any("gpt" in m for m in models)
 
 
-def test_infer_models_unknown_harness() -> None:
-    assert infer_models("cursor") is None
-    assert infer_models("antigravity") is None
-    assert infer_models(None) is None
+def test_models_fixture_unknown_harness() -> None:
+    assert _models_for("cursor") is None
+    assert _models_for("antigravity") is None
+    assert _models_for(None) is None
 
 
 # ── _build_rubric ───────────────────────────────────────────────────
@@ -153,7 +200,7 @@ async def test_llm_routing_client_returns_result() -> None:
         "rationale": "hard refactor",
     }
     client = LLMRoutingClient(_FakeLLMClient(verdict))
-    models = infer_models("claude-sdk")
+    models = _models_for("claude-sdk")
     assert models is not None
     result = await client.route("refactor auth", {"claude-sdk": models})
     assert result is not None
@@ -165,7 +212,7 @@ async def test_llm_routing_client_returns_result() -> None:
 @pytest.mark.asyncio
 async def test_llm_routing_client_harness_mismatch_re_resolves() -> None:
     """If the judge picks a harness that doesn't own the model, fall back."""
-    claude_models = infer_models("claude-sdk")
+    claude_models = _models_for("claude-sdk")
     assert claude_models is not None
     verdict = {
         "harness": "codex",  # codex doesn't have claude models
@@ -185,7 +232,7 @@ async def test_llm_routing_client_harness_mismatch_re_resolves() -> None:
 @pytest.mark.asyncio
 async def test_llm_routing_client_unknown_harness_re_resolves() -> None:
     """If the judge returns an unrecognised harness, fall back to model ownership."""
-    models = infer_models("claude-sdk")
+    models = _models_for("claude-sdk")
     assert models is not None
     verdict = {
         "harness": "hallucinated-harness",
@@ -203,7 +250,7 @@ async def test_llm_routing_client_unknown_harness_re_resolves() -> None:
 async def test_llm_routing_client_clamps_hallucinated_model() -> None:
     verdict = {"harness": "claude-sdk", "model": "hallucinated-model", "rationale": "hard"}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
-    models = infer_models("claude-sdk")
+    models = _models_for("claude-sdk")
     assert models is not None
     result = await client.route("hard task", {"claude-sdk": models})
     assert result is not None
@@ -214,7 +261,7 @@ async def test_llm_routing_client_clamps_hallucinated_model() -> None:
 async def test_llm_routing_client_rejects_empty_model() -> None:
     verdict = {"harness": "claude-sdk", "model": "", "rationale": "x"}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
-    models = infer_models("claude-sdk")
+    models = _models_for("claude-sdk")
     assert models is not None
     result = await client.route("hello", {"claude-sdk": models})
     assert result is None
@@ -227,7 +274,7 @@ async def test_llm_routing_client_returns_none_on_error() -> None:
             raise TypeError("boom")
 
     client = LLMRoutingClient(_BrokenLLM())
-    models = infer_models("claude-sdk")
+    models = _models_for("claude-sdk")
     assert models is not None
     result = await client.route("hello", {"claude-sdk": models})
     assert result is None
@@ -275,6 +322,32 @@ async def test_fetch_runner_models_parses_catalog() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_runner_models_orders_reported_cost_tiers() -> None:
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            "self": {
+                "models": [
+                    {"id": "premium-model", "cost_tier": "premium"},
+                    {"id": "unknown-model"},
+                    {"id": "economy-model", "cost_tier": "economy"},
+                    {"id": "standard-model", "cost_tier": "standard"},
+                ]
+            }
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    result = await fetch_runner_models("conv_123", mock_client)
+
+    assert result == {
+        "self": ["economy-model", "standard-model", "premium-model", "unknown-model"]
+    }
+
+
+@pytest.mark.asyncio
 async def test_fetch_runner_models_returns_none_on_http_error() -> None:
     import httpx
 
@@ -318,7 +391,12 @@ async def test_route_turn_uses_caps_routing_client() -> None:
         "omnigent.runtime._globals._caps",
         new=caps,
     ):
-        model, v = await route_turn("claude-sdk", "hello")
+        model, v = await route_turn(
+            "claude-sdk",
+            "hello",
+            session_id="conv_123",
+            runner_client=_catalog_client(),
+        )
     assert model == "databricks-claude-haiku-4-5"
     assert v is not None
     assert "tier" not in v
@@ -385,19 +463,15 @@ async def test_route_turn_uses_runner_catalog_when_available() -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None:
-    """Falls back to infer_models when runner catalog fetch fails."""
+async def test_route_turn_skips_routing_when_runner_unavailable() -> None:
+    """A discovery failure leaves the provider-resolved default untouched."""
     import httpx
 
     mock_client = MagicMock()
     mock_client.get = AsyncMock(side_effect=httpx.HTTPError("runner down"))
 
-    expected = RoutingResult(
-        model="databricks-claude-haiku-4-5",
-        rationale="simple",
-        harness="claude-sdk",
-    )
-    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    routing_client = AsyncMock()
+    caps = _FakeCaps(routing_client=routing_client)
     with patch("omnigent.runtime._globals._caps", new=caps):
         model, _v = await route_turn(
             "claude-sdk",
@@ -405,8 +479,8 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
             session_id="conv_123",
             runner_client=mock_client,
         )
-    # Still routes — fell back to static infer_models
-    assert model == "databricks-claude-haiku-4-5"
+    assert model is None
+    routing_client.route.assert_not_awaited()
 
 
 # ── ExternalRoutingClient ─────────────────────────────────────────────
@@ -806,7 +880,9 @@ async def test_route_session_harness_surfaces_router_error_detail() -> None:
 
     caps = _FakeCaps(routing_client=_FailingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, _verdict, error = await route_session_harness("hi")
+        harness, model, _verdict, error = await route_session_harness(
+            "hi", session_id="conv_123", runner_client=_catalog_client()
+        )
     assert harness is None
     assert model is None
     assert error is not None
@@ -827,7 +903,11 @@ async def test_route_session_harness_picks_harness_and_model() -> None:
     )
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, verdict, error = await route_session_harness("refactor the auth module")
+        harness, model, verdict, error = await route_session_harness(
+            "refactor the auth module",
+            session_id="conv_123",
+            runner_client=_catalog_client(),
+        )
     assert harness == "claude-sdk"
     assert model == "databricks-claude-opus-4-8"
     assert verdict is not None
@@ -836,8 +916,8 @@ async def test_route_session_harness_picks_harness_and_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_session_harness_passes_all_sdk_harnesses_static() -> None:
-    """Without a runner_client, all _AUTO_ROUTING_HARNESSES appear as candidates."""
+async def test_route_session_harness_passes_discovered_sdk_harnesses() -> None:
+    """The live worker catalog supplies every routable harness candidate."""
     received_harnesses: list[str] = []
 
     class _CapturingClient:
@@ -849,7 +929,9 @@ async def test_route_session_harness_passes_all_sdk_harnesses_static() -> None:
 
     caps = _FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
-        await route_session_harness("quick task")
+        await route_session_harness(
+            "quick task", session_id="conv_123", runner_client=_catalog_client()
+        )
     for h in _AUTO_ROUTING_HARNESSES:
         assert h in received_harnesses, f"harness {h!r} missing from candidate set"
 
@@ -1012,15 +1094,15 @@ async def test_route_session_harness_maps_worker_names_to_harnesses() -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> None:
-    """A catalog with only an unrecognized 'self' worker falls back to the static table."""
+async def test_route_session_harness_reports_when_catalog_has_only_self() -> None:
+    """An unrecognized self-only catalog cannot invent auto-harness candidates."""
     from unittest.mock import AsyncMock, MagicMock
 
     mock_response = MagicMock()
     mock_response.json.return_value = {
         "workers": {
             # "self" is not in _WORKER_NAME_TO_HARNESS, so live matching yields
-            # nothing and the static infer_models fallback kicks in.
+            # no auto-harness candidates.
             "self": {
                 "source": "catalog",
                 "verified": True,
@@ -1033,16 +1115,11 @@ async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> 
     mock_client = MagicMock()
     mock_client.get = AsyncMock(return_value=mock_response)
 
-    received: list[str] = []
-
     class _CapturingClient:
         async def route(
             self, _message: str, available_models: dict[str, list[str]]
         ) -> RoutingResult | None:
-            received.extend(available_models.keys())
-            return RoutingResult(
-                model="databricks-claude-opus-4-8", rationale="x", harness="claude-sdk"
-            )
+            raise AssertionError(f"router should not receive {available_models!r}")
 
     caps = _FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -1051,11 +1128,8 @@ async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> 
             session_id="conv_child",
             runner_client=mock_client,
         )
-    # Static fallback offers all _AUTO_ROUTING_HARNESSES.
-    for h in _AUTO_ROUTING_HARNESSES:
-        assert h in received, f"static fallback should offer {h!r}"
-    assert harness == "claude-sdk"
-    assert error is None
+    assert harness is None
+    assert error == "No discovered routable harnesses are available on this runner."
 
 
 @pytest.mark.asyncio
@@ -1100,7 +1174,9 @@ async def test_route_session_harness_sends_full_candidate_set_unfiltered() -> No
 
     caps = _FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
-        await route_session_harness("hello")
+        await route_session_harness(
+            "hello", session_id="conv_123", runner_client=_catalog_client()
+        )
     # The excluded-on-pi models are still SENT (router requires the full set);
     # incompatibility is handled post-verdict by the redirect.
     assert "databricks-claude-haiku-4-5" in pi_models
@@ -1120,7 +1196,9 @@ async def test_route_session_harness_redirects_incompatible_router_pick() -> Non
     )
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, _verdict, error = await route_session_harness("do something")
+        harness, model, _verdict, error = await route_session_harness(
+            "do something", session_id="conv_123", runner_client=_catalog_client()
+        )
     assert harness == "codex", f"gpt-5.5 on pi should redirect to codex, got {harness!r}"
     assert model == "databricks-gpt-5-5"
     assert error is None
@@ -1132,7 +1210,9 @@ async def test_route_session_harness_redirects_claude_on_pi_to_claude_sdk() -> N
     expected = RoutingResult(model="databricks-claude-haiku-4-5", rationale="cheap", harness="pi")
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, _verdict, error = await route_session_harness("quick q")
+        harness, model, _verdict, error = await route_session_harness(
+            "quick q", session_id="conv_123", runner_client=_catalog_client()
+        )
     assert harness == "claude-sdk", f"claude on pi should redirect to claude-sdk, got {harness!r}"
     assert model == "databricks-claude-haiku-4-5"
     assert error is None
@@ -1148,7 +1228,11 @@ async def test_route_session_harness_falls_back_by_model_when_harness_absent() -
     )
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, _verdict, _error = await route_session_harness("what time is it?")
+        harness, model, _verdict, _error = await route_session_harness(
+            "what time is it?",
+            session_id="conv_123",
+            runner_client=_catalog_client(),
+        )
     # codex precedes pi in _AUTO_ROUTING_HARNESSES, so a GPT model owned by both
     # deterministically resolves to codex.
     assert harness == "codex"

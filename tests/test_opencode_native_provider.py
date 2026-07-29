@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from omnigent.opencode_native_provider import (
-    DEFAULT_DATABRICKS_GATEWAY_MODEL,
     OpenCodeGatewayResolution,
     _gateway_endpoint_for_model,
     _strip_jsonc_comments,
@@ -23,6 +22,16 @@ from omnigent.opencode_native_provider import (
     resolve_databricks_gateway,
     write_opencode_provider_config,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: types.SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
 
 
 def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
@@ -154,7 +163,7 @@ def test_resolve_gateway_defaults_non_gateway_model(monkeypatch: pytest.MonkeyPa
     _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
     res = resolve_databricks_gateway("oss", model_id="claude-opus-4")
     assert res is not None
-    assert res.model_id == DEFAULT_DATABRICKS_GATEWAY_MODEL
+    assert res.model_id == "catalog-databricks-claude-default"
 
 
 def test_resolve_gateway_none_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:

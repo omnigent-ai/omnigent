@@ -298,7 +298,7 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
         socket_path=tmp_path / "codex.sock",
         codex_home=tmp_path / "codex-home",
         cwd=tmp_path,
-        model=None,
+        model="test-model",
         profile="oss",
         bridge_dir=tmp_path / "bridge",
         ap_server_url=None,

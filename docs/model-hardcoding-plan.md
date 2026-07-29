@@ -16,9 +16,8 @@ The remaining pins fall into a few buckets:
   `omnigent/inner/*_executor.py`, and `omnigent/codex_native_app_server.py`
   still carry fallback model ids.
 - **Static pickers/catalogs:** `omnigent/model_catalog.py`,
-  `omnigent/cursor_native.py`, `omnigent/kiro_native.py`, and
-  `omnigent/server/smart_routing.py` encode static model choices for CLIs or
-  routing tiers that do not always expose a live listing API.
+  `omnigent/cursor_native.py`, and `omnigent/kiro_native.py` encode static
+  model choices for CLIs that do not always expose a live listing API.
 - **Policy and sizing logic:** `omnigent/llms/context_window.py`,
   `omnigent/policies/builtins/routing.py`, and `omnigent/tools/builtins/spawn.py`
   mention concrete models when mapping windows, routing examples, or dispatch
@@ -109,7 +108,39 @@ The first migration building block lives in `omnigent/model_metadata.py` and
   preference rules can supply a `ModelPreferencePolicy` without changing
   callers or the precedence contract.
 
-This contract is intentionally pure and side-effect free. Follow-up migrations
-will adapt executor defaults and smart routing to it, then enrich catalog entries
-from provider and MLflow metadata. Until those callers move, their existing
-selection behavior remains unchanged.
+This contract is intentionally pure and side-effect free. Runtime callers adapt
+provider discovery into candidates at the boundary; later migrations can move
+smart routing and remaining policy decisions without coupling them to catalog I/O.
+
+## Runtime Default Migration
+
+The first runtime slice adapts the MLflow provider catalog into normalized
+resolver candidates and moves unresolved executor/native defaults behind that
+boundary:
+
+- Explicit request, spec, ucode, and provider-configured models still win and do
+  not depend on discovery.
+- Generic Anthropic/OpenAI providers and Databricks gateway paths resolve the
+  appropriate Claude/OpenAI catalog family with the `default` intent.
+- Catalog capability, context-window, and pricing data become normalized
+  metadata; missing capability facts remain unknown rather than supported.
+- A missing live catalog produces a clear configuration/discovery error instead
+  of silently selecting a stale release-specific fallback.
+- Executor and native-launch tests stub the catalog boundary, while catalog and
+  resolver tests exercise metadata normalization and selection independently.
+
+Static picker rows, smart-routing tiers, context/wire heuristics, and CI model
+inputs remain separate migration slices because they require different discovery
+or configuration sources.
+
+## Smart Routing Migration
+
+Smart routing now treats the runner's live worker catalog as its only candidate
+source. Provider-relative cost metadata orders candidates for the stable `fast`,
+`balanced`, and `powerful` intents; catalog order remains the tie-breaker when
+cost is unknown. If discovery is unavailable, routing skips the override and the
+harness keeps the provider-resolved default instead of consulting a stale table.
+
+The remaining exact compatibility exclusions in smart routing are temporary
+wire-API workarounds. They stay isolated until catalog wire metadata can express
+the affected harness constraints without model-name checks.

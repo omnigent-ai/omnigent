@@ -25,16 +25,21 @@ from omnigent.model_catalog import (
     ModelEntry,
     ModelListing,
     catalog_for_spec,
+    catalog_model_entries,
     list_models_for_worker,
+    resolve_catalog_model,
     resolve_model_provider,
     spec_harness,
 )
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
+    ModelIntent,
     ModelMetadata,
     ModelWireAPI,
 )
+from omnigent.model_resolver import ModelResolutionError, ModelResolutionSource
+from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec
 
@@ -1161,6 +1166,173 @@ def test_catalog_payload_serializes_normalized_model_metadata() -> None:
             "wire_apis": ["openai-responses"],
         }
     ]
+
+
+def test_bundled_catalog_entries_normalize_capabilities_context_and_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MLflow model facts become provider-neutral resolver metadata."""
+    models = [
+        ModelInfo(
+            name="provider/model-premium",
+            provider="provider",
+            mode="chat",
+            supports_function_calling=True,
+            supports_reasoning=True,
+            supports_vision=False,
+            supports_structured_output=True,
+            max_input_tokens=100_000,
+            max_output_tokens=20_000,
+            input_price=10.0,
+            output_price=30.0,
+        ),
+        ModelInfo(
+            name="provider/model-economy",
+            provider="provider",
+            mode="chat",
+            input_price=0.1,
+            output_price=0.2,
+        ),
+        ModelInfo(
+            name="provider/model-standard",
+            provider="provider",
+            mode="chat",
+            input_price=2.0,
+            output_price=6.0,
+        ),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda _provider: models)
+
+    entries = catalog_model_entries("provider")
+
+    premium = entries[0]
+    assert premium.metadata.context_window == 100_000
+    assert premium.metadata.cost_tier == ModelCostTier.PREMIUM
+    assert premium.metadata.supports(ModelCapability.TOOL_USE) is True
+    assert premium.metadata.supports(ModelCapability.REASONING) is True
+    assert premium.metadata.supports(ModelCapability.VISION) is False
+    assert premium.metadata.supports(ModelCapability.STRUCTURED_OUTPUT) is True
+    assert entries[1].metadata.cost_tier == ModelCostTier.ECONOMY
+    assert entries[2].metadata.cost_tier == ModelCostTier.STANDARD
+
+
+def test_resolve_catalog_model_uses_intent_and_configured_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = [
+        ModelInfo(
+            name="model-economy",
+            provider="provider",
+            mode="chat",
+            input_price=0.1,
+            output_price=0.2,
+        ),
+        ModelInfo(
+            name="model-premium",
+            provider="provider",
+            mode="chat",
+            input_price=10.0,
+            output_price=30.0,
+        ),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda _provider: models)
+
+    powerful = resolve_catalog_model("provider", intent=ModelIntent.POWERFUL)
+    configured = resolve_catalog_model(
+        "provider",
+        intent=ModelIntent.POWERFUL,
+        configured_default="model-configured",
+        family="other",
+    )
+
+    assert powerful.model_id == "model-premium"
+    assert powerful.source == ModelResolutionSource.LIVE_CATALOG
+    assert configured.model_id == "model-configured"
+    assert configured.source == ModelResolutionSource.CONFIGURED_DEFAULT
+
+
+def test_resolve_catalog_default_preserves_provider_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default resolution skips specialty models after family filtering."""
+    models = [
+        ModelInfo(name="gpt-audio-new", provider="gateway", mode="chat"),
+        ModelInfo(name="gpt-general", provider="gateway", mode="chat"),
+        ModelInfo(name="claude-general", provider="gateway", mode="chat"),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda provider: models)
+
+    resolution = resolve_catalog_model("gateway", family="openai")
+
+    assert resolution.model_id == "gpt-general"
+    assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("provider", "family", "expected_model"),
+    [
+        ("anthropic", "claude", "claude-opus-4-8"),
+        ("openai", "openai", "gpt-5.5"),
+    ],
+)
+def test_resolve_catalog_default_preserves_provider_pin_when_catalog_lags(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    family: str,
+    expected_model: str,
+) -> None:
+    """Provider pins remain valid before the remote catalog learns their ids."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_chat_models",
+        lambda _provider: [
+            ModelInfo(name=f"{family}-catalog-model", provider=provider, mode="chat")
+        ],
+    )
+
+    resolution = resolve_catalog_model(provider, family=family)
+
+    assert resolution.model_id == expected_model
+    assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("family", "expected_model"),
+    [
+        ("claude", "databricks-claude-general"),
+        ("openai", "databricks-gpt-general"),
+    ],
+)
+def test_resolve_databricks_default_requires_gateway_routable_id(
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+    expected_model: str,
+) -> None:
+    """Databricks defaults exclude bare vendor ids the gateway rejects."""
+    models = [
+        ModelInfo(name="claude-newer", provider="databricks", mode="chat"),
+        ModelInfo(name="gpt-newer", provider="databricks", mode="chat"),
+        ModelInfo(name="databricks-claude-general", provider="databricks", mode="chat"),
+        ModelInfo(name="databricks-gpt-general", provider="databricks", mode="chat"),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda _provider: models)
+
+    resolution = resolve_catalog_model("databricks", family=family)
+
+    assert resolution.model_id == expected_model
+    assert resolution.model_id.startswith("databricks-")
+    assert resolution.family == family
+
+
+def test_resolve_catalog_model_fails_when_discovery_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda provider: [])
+
+    with pytest.raises(
+        ModelResolutionError,
+        match="configure an explicit model or retry when catalog discovery is available",
+    ):
+        resolve_catalog_model("provider")
 
 
 def test_spec_harness_derivation() -> None:

@@ -28,6 +28,16 @@ from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.spec import load
 
 
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
+
+
 def _write_codex_auth(path: Path, payload: object) -> None:
     """Write a test Codex auth.json payload."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -841,7 +851,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
             None,
             [
                 "-c",
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
                 "--remote",
@@ -854,7 +864,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
             "thread_host",
             [
                 "-c",
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
                 "resume",
@@ -890,7 +900,7 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
             thread_id=thread_id,
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 'model_provider="omnigent_databricks"',
             ),
         )

@@ -3010,6 +3010,9 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
             llm_block = raw.get("llm")
             if isinstance(llm_block, dict):
                 llm_block.pop("model", None)
+            env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
+            if env_model is not None:
+                executor_block["model"] = env_model
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)

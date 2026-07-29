@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 import tomlkit
 import websockets
 
+from omnigent import model_catalog
+
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
@@ -54,7 +56,6 @@ CodexParams = dict[str, Any]
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _STDERR_CHUNK_LIMIT = 65536
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -1267,7 +1268,8 @@ def build_codex_native_server(
         host = host.rstrip("/")
         config_overrides.extend(
             _databricks_codex_config_overrides(
-                model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,
+                model=model
+                or model_catalog.resolve_catalog_model("databricks", family="openai").model_id,
                 base_url=_databricks_codex_base_url(host),
                 auth_command=_databricks_codex_auth_command(host, profile),
             )

@@ -413,7 +413,7 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[2], ToolCallComplete)
             self.assertIsInstance(events[3], TurnComplete)
             self.assertEqual(fake_session.calls[0]["system_prompt"], "Be helpful.")
-            self.assertEqual(fake_session.calls[0]["model"], "gpt-5.4-mini")
+            self.assertEqual(fake_session.calls[0]["model"], "catalog-openai-openai-default")
             self.assertEqual(fake_session.calls[0]["tools"][0]["name"], "calculate")
 
         _run(_t())
@@ -441,7 +441,7 @@ class TestCodexExecutor(unittest.TestCase):
             ]
 
             self.assertEqual(events[-1].response, "done")
-            self.assertEqual(fake_session.calls[0]["model"], "databricks-gpt-5-5")
+            self.assertEqual(fake_session.calls[0]["model"], "catalog-databricks-openai-default")
 
         _run(_t())
 

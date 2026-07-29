@@ -12,6 +12,16 @@ settings:
   strictPeerDependencies: false
   nodeLinker: hoisted
 
+# jest-dom doesn't declare vitest as a (peer) dependency, so under pnpm's store
+# layout its `declare module "vitest"` matcher-type augmentation can't resolve
+# vitest and silently fails to merge — `tsc` then loses every DOM matcher
+# (toBeInTheDocument, toHaveClass, …) though they work at runtime. Re-enable the
+# peer so the augmentation resolves. Drop once jest-dom ships the peer upstream.
+packageExtensions:
+  '@testing-library/jest-dom':
+    peerDependencies:
+      vitest: '*'
+
 catalog:
   react: ^18.2.0
   react-dom: ^18.2.0

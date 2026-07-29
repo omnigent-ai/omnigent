@@ -1550,6 +1550,21 @@ def test_apply_overrides_explicit_model_wins_over_env_var(
     )
 
 
+def test_apply_overrides_harness_uses_explicit_env_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI harness override keeps an explicit environment model pin."""
+    monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
+    raw: dict[str, object] = {"name": "ad_hoc", "prompt": "hi"}
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="openai-agents"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["harness"] == "openai-agents"
+    assert executor["model"] == "from-env"
+
+
 def test_apply_overrides_canonicalizes_claude_harness_alias() -> None:
     """AP override materialization normalizes ``--harness claude``."""
     raw: dict[str, object] = {"name": "claude_agent", "prompt": "hi"}

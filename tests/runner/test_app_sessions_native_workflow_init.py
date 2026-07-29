@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
@@ -22,6 +23,7 @@ from omnigent.runner.app import (
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
 )
+from omnigent.runner.native import _resolve_native_spawn_env
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
@@ -127,6 +129,136 @@ async def test_session_labels_for_runner_spawn_empty_200_body_recovers(
     ]
     assert len(json_records) == 1
     assert json_records[0].levelno == logging.WARNING
+
+
+@pytest.mark.asyncio
+async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> None:
+    """A bare-shape harness (pi) calls its builder with just the session id."""
+    captured: dict[str, Any] = {}
+
+    def _fake_build(conversation_id: str) -> dict[str, str]:
+        captured["session_id"] = conversation_id
+        return {"PI_BRIDGE": conversation_id}
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("omnigent.pi_native_bridge.build_pi_native_spawn_env", _fake_build)
+        async with httpx.AsyncClient(base_url="http://ap") as client:
+            env = await _resolve_native_spawn_env(
+                "pi-native",
+                "conv_pi",
+                server_client=client,
+                optional_labels=None,
+            )
+
+    assert env == {"PI_BRIDGE": "conv_pi"}
+    assert captured == {"session_id": "conv_pi"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
+    """A label-shape harness (codex) reads its bridge id from session labels."""
+    captured: dict[str, Any] = {}
+
+    def _fake_build(conversation_id: str, *, bridge_id: str | None = None) -> dict[str, str]:
+        captured["session_id"] = conversation_id
+        captured["bridge_id"] = bridge_id
+        return {"CODEX_BRIDGE": bridge_id or conversation_id}
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge_xyz"}}
+        )
+
+    transport = httpx.MockTransport(_labels_handler)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("omnigent.codex_native_bridge.build_codex_native_spawn_env", _fake_build)
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+            env = await _resolve_native_spawn_env(
+                "codex-native",
+                "conv_codex",
+                server_client=client,
+                optional_labels=None,
+            )
+
+    assert env == {"CODEX_BRIDGE": "bridge_xyz"}
+    assert captured == {"session_id": "conv_codex", "bridge_id": "bridge_xyz"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_native_spawn_env_claude_uses_bridge_id_helper() -> None:
+    """Claude resolves its bridge id through the runner helper, not a label read."""
+    captured: dict[str, Any] = {}
+
+    def _fake_build(conversation_id: str, *, bridge_id: str | None = None) -> dict[str, str]:
+        captured["session_id"] = conversation_id
+        captured["bridge_id"] = bridge_id
+        return {"CLAUDE_BRIDGE": bridge_id or ""}
+
+    async def _fake_bridge_id(*, server_client: Any, session_id: str, session_labels: Any) -> str:
+        captured["helper_labels"] = session_labels
+        return "claude_bridge_1"
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("omnigent.claude_native_bridge.build_claude_native_spawn_env", _fake_build)
+        mp.setattr(
+            "omnigent.runner.native.orchestration._claude_native_bridge_id_with_optional_labels",
+            _fake_bridge_id,
+        )
+        async with httpx.AsyncClient(base_url="http://ap") as client:
+            env = await _resolve_native_spawn_env(
+                "claude-native",
+                "conv_claude",
+                server_client=client,
+                optional_labels={"some": "label"},
+            )
+
+    assert env == {"CLAUDE_BRIDGE": "claude_bridge_1"}
+    assert captured["session_id"] == "conv_claude"
+    assert captured["bridge_id"] == "claude_bridge_1"
+    # Envelope labels are forwarded to the helper (which prefers them over a fetch).
+    assert captured["helper_labels"] == {"some": "label"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_native_spawn_env_hermes_writes_policy_hook_before_build() -> None:
+    """Hermes writes its policy-hook config before building the spawn env."""
+    order: list[str] = []
+
+    def _fake_write(bridge_dir: Any, server_url: str, session_id: str) -> None:
+        order.append("write_policy_hook")
+
+    def _fake_build(session_id: str) -> dict[str, str]:
+        order.append("build")
+        return {"HERMES_BRIDGE": session_id}
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("omnigent.hermes_native_bridge.write_policy_hook_config", _fake_write)
+        mp.setattr("omnigent.hermes_native_bridge.build_hermes_native_spawn_env", _fake_build)
+        async with httpx.AsyncClient(base_url="http://ap") as client:
+            env = await _resolve_native_spawn_env(
+                "hermes-native",
+                "conv_hermes",
+                server_client=client,
+                optional_labels=None,
+            )
+
+    assert env == {"HERMES_BRIDGE": "conv_hermes"}
+    # Policy-hook config is written *before* the env is built.
+    assert order == ["write_policy_hook", "build"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_native_spawn_env_non_native_returns_none() -> None:
+    """A non-native harness yields None so the caller keeps its SDK spawn env."""
+    async with httpx.AsyncClient(base_url="http://ap") as client:
+        env = await _resolve_native_spawn_env(
+            "claude-sdk",
+            "conv_sdk",
+            server_client=client,
+            optional_labels=None,
+        )
+
+    assert env is None
 
 
 @pytest.mark.asyncio
