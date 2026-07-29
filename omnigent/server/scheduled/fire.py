@@ -355,6 +355,11 @@ async def _run_fire_for_task(
             )
             return
 
+        # Missing host_id / workspace after resolution is a PERMANENT misconfig,
+        # not a host-availability miss: this task's stored spec can never launch
+        # a connected-host run, and it will re-hit this gate on every occurrence.
+        # Record a "failed" run (not "skipped") so the user gets a signal to fix
+        # the task's configuration rather than a silent, forever-skipped task.
         input_error = _validate_connected_host_inputs(effective)
         if input_error is not None:
             error, error_code = input_error
@@ -364,7 +369,7 @@ async def _run_fire_for_task(
                 task,
                 None,
                 scheduled_at,
-                status="skipped",
+                status="failed",
                 error=error,
                 error_code=error_code,
             )
@@ -393,6 +398,12 @@ async def _run_fire_for_task(
         # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
         # does — an agent that pins an absolute cwd outside HOME records a failed
         # run instead of silently launching outside its declared boundary.
+        #
+        # A validation failure here (bad model_override, workspace outside the
+        # agent boundary, non-absolute path, missing execution input) is a
+        # PERMANENT misconfig, not a host-availability miss — the stored spec
+        # will fail this gate on every occurrence. Record a "failed" run (not
+        # "skipped") so the user gets a signal to fix the task's configuration.
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace
@@ -405,7 +416,7 @@ async def _run_fire_for_task(
                 task,
                 None,
                 scheduled_at,
-                status="skipped",
+                status="failed",
                 error=error,
                 error_code=error_code,
             )

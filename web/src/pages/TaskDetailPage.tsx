@@ -30,6 +30,7 @@ import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import {
+  cancelRunNowPoll,
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
@@ -102,12 +103,16 @@ export function TaskDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runs, awaitingRunRow]);
 
-  // Unmount cleanup so the safety timer doesn't fire into an unmounted component.
+  // Unmount cleanup so neither the local safety timer nor the module-global
+  // run-now poller fires into / refetches for an unmounted page.
   useEffect(() => {
     return () => {
       if (awaitingTimerRef.current != null) clearTimeout(awaitingTimerRef.current);
+      // Stop the accelerated run-now poll this page kicked off (self-scheduling
+      // setTimeout chain in useRunScheduledTaskNow) once we navigate away.
+      if (taskId !== "") cancelRunNowPoll(taskId);
     };
-  }, []);
+  }, [taskId]);
 
   // Auto-mark newly-completed (succeeded) runs as unread so the pink dot
   // appears until the user opens the conversation.

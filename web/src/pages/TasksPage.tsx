@@ -10,7 +10,7 @@
  * endpoint.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ import {
   type ScheduledTaskSuggestion,
 } from "@/components/scheduled/suggestions";
 import {
+  cancelRunNowPoll,
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTasks,
@@ -134,9 +135,22 @@ export function TasksPage() {
     deleteMutation.mutate(task.id);
   }
 
+  // Task ids this page fired a run-now for, so their module-global pollers can be
+  // cancelled on unmount (the poll's self-scheduling setTimeout chain in
+  // useRunScheduledTaskNow would otherwise keep refetching after we leave /tasks).
+  const firedRunNowIdsRef = useRef<Set<string>>(new Set());
+
   function handleRunNow(task: ScheduledTask) {
+    firedRunNowIdsRef.current.add(task.id);
     runNowMutation.mutate(task.id);
   }
+
+  useEffect(() => {
+    const firedIds = firedRunNowIdsRef.current;
+    return () => {
+      for (const id of firedIds) cancelRunNowPoll(id);
+    };
+  }, []);
 
   function handleEdit(task: ScheduledTask) {
     setPrefill(null);

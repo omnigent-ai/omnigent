@@ -147,6 +147,22 @@ const TERMINAL_STATUSES = new Set(["succeeded", "failed", "skipped"]);
 const runNowPollers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
 /**
+ * Cancel the accelerated run-now poller for a task id, if one is active: clears
+ * its pending timer and drops it from the module-global map. Idempotent (a no-op
+ * when there is no poller for the id). Call it from an unmount effect in any
+ * component that fired a run-now so the self-scheduling `setTimeout` chain stops
+ * issuing `refetchQueries` after the user navigates away — mirroring how
+ * TaskDetailPage cancels its own awaiting-run timer on unmount. The poll is
+ * already self-bounded (RUN_NOW_POLL_MAX / terminal status) and only touches the
+ * unmount-safe queryClient, so this just avoids the wasted background refetches.
+ */
+export function cancelRunNowPoll(id: string): void {
+  const timer = runNowPollers.get(id);
+  if (timer != null) clearTimeout(timer);
+  runNowPollers.delete(id);
+}
+
+/**
  * Trigger an immediate ("run now") fire of a task, then refresh the list and
  * that task's run history. The server returns 202 (fire-and-forget) and writes
  * the run row in the background as status "running", then transitions it to a

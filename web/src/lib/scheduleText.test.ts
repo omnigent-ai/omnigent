@@ -512,6 +512,25 @@ describe("describeRunError", () => {
     expect(describeRunError("launch_failed", "failed")).toBe("The agent session failed to launch");
   });
 
+  it("maps permanent-misconfig codes to config-fixing copy (now recorded as failed)", () => {
+    expect(describeRunError("invalid_input", "failed")).toBe(
+      "This task's model or workspace is invalid. Edit the task to fix it.",
+    );
+    const missingCopy = "This task is missing its host or workspace. Edit the task to fix it.";
+    expect(describeRunError("missing_workspace", "failed")).toBe(missingCopy);
+    expect(describeRunError("missing_host_id", "failed")).toBe(missingCopy);
+    expect(describeRunError("missing_execution_input", "failed")).toBe(missingCopy);
+  });
+
+  it("keeps host-availability codes as skipped copy", () => {
+    expect(describeRunError("host_offline", "skipped")).toBe(
+      "The pinned host was offline. Run skipped.",
+    );
+    expect(describeRunError("default_workspace_unresolved", "skipped")).toBe(
+      "Couldn't resolve a workspace on the host. Run skipped.",
+    );
+  });
+
   it("falls back to a status-keyed generic for an unknown / null code", () => {
     expect(describeRunError("some_new_code", "skipped")).toBe("Run skipped");
     expect(describeRunError(null, "failed")).toBe("Run failed");

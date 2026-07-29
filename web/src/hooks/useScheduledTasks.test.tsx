@@ -8,6 +8,7 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/lib/scheduledTasksApi";
 import {
+  cancelRunNowPoll,
   SCHEDULED_TASKS_KEY,
   scheduledTaskRunsKey,
   useCreateScheduledTask,
@@ -246,6 +247,44 @@ describe("run-now fast-poll after 202", () => {
         await vi.advanceTimersByTimeAsync(5_000);
       });
       expect(refetchSpy.mock.calls.length).toBe(countAfterCap);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancelRunNowPoll stops the poller (no further refetches after unmount cancel)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { queryClient, wrapper } = makeWrapper();
+      queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
+
+      // Never terminal — the poll would otherwise keep going until the cap.
+      vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
+
+      const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
+      const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
+
+      await act(async () => {
+        void result.current.mutateAsync("st_1");
+        await Promise.resolve();
+      });
+
+      // One poll happens, then the page "unmounts" and cancels the poller.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      const countBeforeCancel = countRunRefetches(refetchSpy);
+      expect(countBeforeCancel).toBeGreaterThanOrEqual(1);
+
+      act(() => {
+        cancelRunNowPoll("st_1");
+      });
+
+      // No further poll refetches once cancelled, even well past the cap window.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(25_000);
+      });
+      expect(countRunRefetches(refetchSpy)).toBe(countBeforeCancel);
     } finally {
       vi.useRealTimers();
     }

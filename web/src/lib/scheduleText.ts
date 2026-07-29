@@ -225,6 +225,15 @@ export function describeRunError(
       return "No host was reachable at fire time. Run skipped.";
     case "default_workspace_unresolved":
       return "Couldn't resolve a workspace on the host. Run skipped.";
+    // Permanent misconfiguration codes — the stored task spec fails every
+    // occurrence (recorded as "failed", not "skipped"). Copy points the user at
+    // fixing the task's configuration rather than waiting for a host.
+    case "invalid_input":
+      return "This task's model or workspace is invalid. Edit the task to fix it.";
+    case "missing_workspace":
+    case "missing_host_id":
+    case "missing_execution_input":
+      return "This task is missing its host or workspace. Edit the task to fix it.";
     case "unsupported_target":
       return "This task's target can't be run automatically";
     case "session_create_failed":
