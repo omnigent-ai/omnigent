@@ -97,14 +97,20 @@ class _FakeFileStore:
             data = list(self._files.values())
         return _FakePage(data=data[:limit])
 
-    def get(self, file_id: str) -> _FakeFile | None:
+    def get(self, file_id: str, session_id: str | None = None) -> _FakeFile | None:
         """
         Look up a file by ID.
 
         :param file_id: The file ID.
+        :param session_id: If set, only return a file owned by this session.
         :returns: The file record, or None.
         """
-        return self._files.get(file_id)
+        row = self._files.get(file_id)
+        if row is None:
+            return None
+        if session_id is not None and row.session_id != session_id:
+            return None
+        return row
 
 
 class _FakeArtifactStore:

@@ -15,6 +15,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.runtime.content_resolver import (
     extract_text_attachments,
+    get_file_for_session,
     resolve_content_references,
 )
 
@@ -32,14 +33,20 @@ class FakeFileStore:
 
     files: dict[str, StoredFile]
 
-    def get(self, file_id: str) -> StoredFile | None:
+    def get(self, file_id: str, session_id: str | None = None) -> StoredFile | None:
         """
         Return the StoredFile for *file_id*, or ``None``.
 
         :param file_id: The file identifier to look up.
+        :param session_id: If set, only return a file owned by this session.
         :returns: The matching StoredFile or None.
         """
-        return self.files.get(file_id)
+        row = self.files.get(file_id)
+        if row is None:
+            return None
+        if session_id is not None and row.session_id != session_id:
+            return None
+        return row
 
 
 @dataclass
@@ -387,6 +394,90 @@ def test_missing_file_id_raises_value_error(
             file_store,
             artifact_store,  # type: ignore[arg-type]
         )
+
+
+class SessionRequiredFileStore:
+    """
+    FileStore whose ``get`` requires ``session_id`` — no default.
+
+    Mirrors dual-store deployments that use the session id to route
+    the lookup; calling ``get(file_id)`` there raises ``TypeError``.
+
+    :param files: Mapping of file_id to StoredFile.
+    """
+
+    def __init__(self, files: dict[str, StoredFile]) -> None:
+        self.files = files
+
+    def get(self, file_id: str, session_id: str | None) -> StoredFile | None:
+        """
+        Return the StoredFile for *file_id*, enforcing scope.
+
+        :param file_id: The file identifier to look up.
+        :param session_id: Required owning-session filter.
+        :returns: The matching StoredFile or None.
+        """
+        row = self.files.get(file_id)
+        if row is None:
+            return None
+        if session_id is not None and row.session_id != session_id:
+            return None
+        return row
+
+
+def test_store_requiring_session_id_resolves_file_id(
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """
+    Resolution must pass ``session_id`` to ``FileStore.get`` — a store
+    whose ``get`` requires it (dual-store deployments) previously got
+    ``TypeError`` and the message-carrying request 500'd.
+    """
+    store = SessionRequiredFileStore(
+        files={
+            "file_img": StoredFile(
+                id="file_img",
+                created_at=1000,
+                filename="photo.png",
+                bytes=len(PNG_BYTES),
+                content_type="image/png",
+                session_id="conv_1",
+            ),
+        }
+    )
+    item = _make_conversation_item([{"type": "input_image", "file_id": "file_img"}])
+
+    result = resolve_content_references(
+        [item],
+        store,  # type: ignore[arg-type]
+        artifact_store,  # type: ignore[arg-type]
+        session_id="conv_1",
+    )
+
+    assert isinstance(result[0].data, MessageData)
+    block = result[0].data.content[0]
+    assert block["image_url"].startswith("data:image/png;base64,")
+
+
+def test_scoped_lookup_falls_back_to_unscoped_legacy_file(
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """
+    A legacy unscoped file (``session_id`` is None) is invisible to a
+    session-scoped ``get``; get_file_for_session must fall back to an
+    unscoped read so the reference still resolves.
+    """
+    unscoped = StoredFile(
+        id="file_img",
+        created_at=1000,
+        filename="photo.png",
+        bytes=len(PNG_BYTES),
+        content_type="image/png",
+    )
+    store = SessionRequiredFileStore(files={"file_img": unscoped})
+
+    assert get_file_for_session(store, "file_img", "conv_1") is unscoped  # type: ignore[arg-type]
+    assert get_file_for_session(store, "file_missing", "conv_1") is None  # type: ignore[arg-type]
 
 
 def test_original_item_not_mutated(

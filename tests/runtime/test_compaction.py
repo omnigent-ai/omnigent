@@ -514,7 +514,7 @@ def test_resolver_parameterized_image_is_cleared_before_token_counting() -> None
     )
 
     class _FileStore:
-        def get(self, file_id: str) -> StoredFile | None:
+        def get(self, file_id: str, session_id: str | None = None) -> StoredFile | None:
             return stored if file_id == stored.id else None
 
     class _ArtifactStore:

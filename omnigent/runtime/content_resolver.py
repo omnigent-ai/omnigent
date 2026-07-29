@@ -15,7 +15,7 @@ import copy
 import logging
 from typing import Any
 
-from omnigent.entities import ConversationItem, MessageData
+from omnigent.entities import ConversationItem, MessageData, StoredFile
 from omnigent.stores import ArtifactStore, FileStore
 
 _logger = logging.getLogger(__name__)
@@ -287,6 +287,31 @@ def _is_text_like_attachment(content_type: str, filename: str | None) -> bool:
     return attachment_text_type_for_extension(filename) is not None
 
 
+def get_file_for_session(
+    file_store: FileStore,
+    file_id: str,
+    session_id: str | None,
+) -> StoredFile | None:
+    """Look up file metadata, always passing the owning session id.
+
+    ``FileStore.get`` declares ``session_id`` as optional, but some
+    deployments back it with a store whose ``get`` requires the session
+    id to route the lookup — omitting the argument raises ``TypeError``
+    there. Always pass it explicitly. A scoped lookup hides legacy
+    unscoped rows (``session_id IS NULL``), so fall back to an unscoped
+    read on a miss; callers still enforce ownership on the returned row.
+
+    :param file_store: Store for file metadata lookups.
+    :param file_id: Unique file identifier, e.g. ``"file_abc123"``.
+    :param session_id: Owning session id, or ``None`` when unknown.
+    :returns: The :class:`StoredFile` if found, otherwise ``None``.
+    """
+    file_meta = file_store.get(file_id, session_id=session_id)
+    if file_meta is None and session_id is not None:
+        file_meta = file_store.get(file_id, session_id=None)
+    return file_meta
+
+
 def extract_text_attachments(
     content: list[dict[str, Any]],
     file_store: FileStore,
@@ -322,7 +347,7 @@ def extract_text_attachments(
         if not isinstance(file_id, str):
             continue
         try:
-            file_meta = file_store.get(file_id)
+            file_meta = get_file_for_session(file_store, file_id, session_id)
         except Exception:  # best-effort scan; never break message delivery
             continue
         if file_meta is None:
@@ -511,7 +536,7 @@ def _resolve_file_id_block(
     """
     file_id = block["file_id"]
     owner_session_id = session_id or _session_id_from_block(block)
-    file_meta = file_store.get(file_id)
+    file_meta = get_file_for_session(file_store, file_id, owner_session_id)
     if file_meta is None or (
         file_meta.session_id is not None and file_meta.session_id != owner_session_id
     ):

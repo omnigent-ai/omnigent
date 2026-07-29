@@ -91,7 +91,9 @@ class DownloadFileTool(Tool):
         if file_store is None or artifact_store is None:
             return json.dumps({"error": "File store not configured."})
 
-        record = file_store.get(file_id)
+        from omnigent.runtime.content_resolver import get_file_for_session
+
+        record = get_file_for_session(file_store, file_id, ctx.conversation_id)
         if record is None:
             return json.dumps({"error": f"File {file_id!r} not found."})
 
