@@ -85,6 +85,9 @@ from omnigent.server.routes.sessions import (
     create_sessions_router,
     set_server_runner_router,
 )
+from omnigent.server.routes.deferred_actions import (
+    router as deferred_actions_router,
+)
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
@@ -2418,6 +2421,8 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
+
+    app.include_router(deferred_actions_router)
 
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.

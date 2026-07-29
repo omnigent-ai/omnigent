@@ -1138,17 +1138,19 @@ class Phase(str, Enum):
 
 class PolicyAction(str, Enum):
     """
-    The three decisions a policy can emit.
+    The decisions a policy can emit.
 
     - ``ALLOW``: the phase proceeds normally.
-    - ``ASK``: park for user approval; on approve → ALLOW, on
+    - ``ASK``: park for synchronous user approval; on approve → ALLOW, on
       refuse/timeout → DENY.
+    - ``DEFER``: freeze manifest for out-of-band asynchronous approval.
     - ``DENY``: short-circuit the phase; replace content with a
       sentinel so downstream steps cannot act on it.
     """
 
     ALLOW = "allow"
     ASK = "ask"
+    DEFER = "defer"
     DENY = "deny"
 
 
