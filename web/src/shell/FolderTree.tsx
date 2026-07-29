@@ -1,5 +1,5 @@
 import { ChevronRightIcon, FileIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   RunnerOfflineError,
   type WorkspaceChangedFile,
@@ -244,10 +244,21 @@ export function FolderTree({
   });
 
   // When files arrive for the first time (async load) and no cache entry
-  // exists yet, compute and persist the default open set.
-  useEffect(() => {
+  // exists yet, compute and persist the default open set. Also re-sync from
+  // the cache when the panel switches conversations without remounting —
+  // otherwise the tree keeps the previous conversation's expanded set. A
+  // layout effect so the switch resolves before paint (no collapsed flash).
+  const expandedForRef = useRef(conversationId);
+  useLayoutEffect(() => {
     if (!conversationId) return;
-    if (!files || expandedPathsCache.has(conversationId)) return;
+    const switched = expandedForRef.current !== conversationId;
+    expandedForRef.current = conversationId;
+    const cached = expandedPathsCache.get(conversationId);
+    if (cached) {
+      if (switched) setExpandedPaths(new Set(cached));
+      return;
+    }
+    if (!files) return;
     const initial = defaultExpandedPaths(files);
     expandedPathsCache.set(conversationId, initial);
     setExpandedPaths(new Set(initial));
