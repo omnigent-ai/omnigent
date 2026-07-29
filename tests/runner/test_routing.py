@@ -44,6 +44,14 @@ class _ConversationStore:
         """
         self._conversations = conversations
 
+    def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
+        """Bulk binding read mirroring the real store's contract."""
+        return {
+            cid: self._conversations[cid].runner_id
+            for cid in conversation_ids
+            if cid in self._conversations
+        }
+
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
         Return a conversation by id.
@@ -247,5 +255,74 @@ async def test_runner_router_existing_conversation_returns_none_when_unpinned() 
     router = RunnerRouter(registry=registry, conversation_store=store)  # type: ignore[arg-type]
     try:
         assert router.client_for_existing_conversation("conv_test") is None
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.parametrize(
+    ("method", "missing", "unpinned"),
+    [
+        ("client_for_session_resources", ErrorCode.NOT_FOUND, ErrorCode.CONFLICT),
+        # The optional variant reports both as "no runner to route to".
+        ("client_for_existing_conversation", None, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_narrowed_binding_routing_is_fresh_and_keeps_its_semantics(
+    method: str,
+    missing: ErrorCode | None,
+    unpinned: ErrorCode | None,
+) -> None:
+    """
+    Every per-event route that narrowed its conversation read to the binding
+    must stay fresh, stay narrow, and keep its own missing/unpinned answers.
+
+    Parametrized over the methods rather than written per method: the first
+    of the two was covered and the second was not, so reverting it to a
+    full-row read left the suite green.
+
+    Narrow: the full-row read explodes, so any regression to
+    ``get_conversation`` fails here. Fresh: a rebind landing between
+    resolutions is picked up by the next one. Semantics: a missing
+    conversation and an existing-but-unbound one stay distinguishable, which
+    is what the store's two-state binding lookup exists to preserve.
+    """
+    registry = TunnelRegistry()
+    registry.register("runner_new", _FakeWebSocket(), _hello(harnesses=["codex"]))
+
+    class _BindingOnlyStore:
+        def __init__(self) -> None:
+            self.binding: dict[str, str | None] = {
+                "conv_test": "runner_old",
+                "conv_unpinned": None,
+            }
+
+        def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
+            return {c: self.binding[c] for c in conversation_ids if c in self.binding}
+
+        def get_conversation(self, conversation_id: str) -> None:
+            raise AssertionError("routing must not load the full conversation row")
+
+    store = _BindingOnlyStore()
+    router = RunnerRouter(registry=registry, conversation_store=store)  # type: ignore[arg-type]
+    resolve = getattr(router, method)
+    try:
+        # Bound to an offline runner: both methods report it the same way.
+        with pytest.raises(OmnigentError) as excinfo:
+            resolve("conv_test")
+        _assert_omnigent_error(excinfo, code=ErrorCode.RUNNER_UNAVAILABLE)
+
+        # A concurrent rebind must be visible to the very next resolution.
+        store.binding["conv_test"] = "runner_new"
+        routed = resolve("conv_test")
+        assert routed is not None and routed.runner_id == "runner_new"
+
+        for conv_id, expected in (("conv_missing", missing), ("conv_unpinned", unpinned)):
+            if expected is None:
+                assert resolve(conv_id) is None, conv_id
+            else:
+                with pytest.raises(OmnigentError) as excinfo:
+                    resolve(conv_id)
+                _assert_omnigent_error(excinfo, code=expected)
     finally:
         await router.aclose()

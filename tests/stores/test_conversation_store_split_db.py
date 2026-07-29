@@ -596,3 +596,36 @@ def test_delete_conversation_keeps_template_agent(
 
     asyncio.run(store.delete_conversation(conv.id))
     assert _col(omnigent_db, "agents", "id") == ["191cbf904e3223e9e00ac9a1abfe79a5"]
+
+
+def test_get_runner_ids_distinguishes_missing_from_unbound_split_db(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Split-DB must draw the same two-state distinction as one bind.
+
+    With the tables on separate binds there is no join to root the lookup
+    in, so existence comes from the AP bind and bindings are overlaid onto
+    it. Skipping that seeding drops an existing-but-unbound conversation and
+    reports a false NOT_FOUND — the same defect as a metadata-rooted lookup,
+    reached a different way.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+    from omnigent.db.db_models import SqlConversationMetadata as _Meta
+
+    bound = store.create_conversation(title="bound")
+    store.set_runner_id(bound.id, "runner_live")
+    orphaned_metadata = store.create_conversation(title="ap-row-gone")
+    store.set_runner_id(orphaned_metadata.id, "runner_old")
+    missing_metadata = store.create_conversation(title="metadata-gone")
+
+    with store._conv_session() as session:
+        session.execute(sa_delete(_Conv).where(_Conv.id == orphaned_metadata.id))
+    with store._session() as session:
+        session.execute(sa_delete(_Meta).where(_Meta.id == missing_metadata.id))
+
+    assert store.get_runner_ids([bound.id, orphaned_metadata.id, missing_metadata.id]) == {
+        bound.id: "runner_live",
+        missing_metadata.id: None,
+    }

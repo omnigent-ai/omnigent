@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import (
@@ -20,6 +21,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import QueryableAttribute, Session, aliased
 from sqlalchemy.sql.selectable import Subquery
 
@@ -459,6 +461,66 @@ def _dialect_upsert_labels(
         },
     )
     session.execute(stmt)
+
+
+def _insert_labels_if_absent(
+    session: Session,
+    conversation_id: str,
+    defaults: dict[str, str],
+    updated_at: int,
+) -> None:
+    """
+    Insert label rows only where the key is not already present.
+
+    Distinct from :func:`_upsert_labels`, which overwrites. Used for
+    declared-initial seeding, where overwriting is precisely wrong: a
+    policy write that lands between a reader's snapshot and its seed
+    would be reset to the initial value. ``ON CONFLICT DO NOTHING``
+    makes the seed a no-op for keys that already exist, so the decision
+    is made by the database rather than by a stale snapshot.
+
+    Falls back to per-key ``INSERT`` attempts on dialects without
+    ``ON CONFLICT`` support, each in a nested transaction so a losing
+    race is absorbed rather than failing the caller.
+
+    :param session: Active SQLAlchemy session.
+    :param conversation_id: Owning conversation id.
+    :param defaults: Non-empty ``key -> initial value`` mapping.
+    :param updated_at: Timestamp written on inserted rows.
+    """
+    dialect = session.bind.dialect.name if session.bind is not None else ""
+    rows = [
+        {
+            "conversation_id": conversation_id,
+            "key": key,
+            "value": value[:LABEL_VALUE_MAX_LEN],
+            "updated_at": updated_at,
+        }
+        for key, value in defaults.items()
+    ]
+    stmt: Any
+    if dialect in ("sqlite", "postgresql"):
+        if dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(SqlConversationLabel).values(rows)
+        else:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            stmt = pg_insert(SqlConversationLabel).values(rows)
+        session.execute(
+            stmt.on_conflict_do_nothing(
+                index_elements=["workspace_id", "conversation_id", "key"],
+            )
+        )
+        return
+    for row in rows:
+        try:
+            with session.begin_nested():
+                session.add(SqlConversationLabel(**row))
+        except IntegrityError:
+            # Another writer inserted this key first — that value wins.
+            continue
 
 
 def _fetch_labels(
@@ -1040,22 +1102,82 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """
-        Single ``SELECT id, runner_id WHERE id IN (...)`` — bulk
-        variant of :meth:`get_conversation` for the runner-dot path.
-        Missing ids are omitted; ids without a bound runner map to
-        ``None``.
+        Bulk ``runner_id`` lookup, gated on the conversation still existing.
+
+        The binding lives on the Omnigent metadata row, but the AP
+        ``conversations`` row is the EXISTENCE authority: deletion is
+        deliberately ordered AP-row-first, metadata-second, and a failed
+        second transaction leaves orphaned metadata for a conversation that
+        no longer exists (documented as an acceptable best-effort tradeoff
+        in :meth:`delete_conversation`). That tradeoff is only acceptable
+        while every reachability check consults the AP row — a
+        metadata-only read would route a deleted conversation to its old
+        runner instead of reporting it missing.
+
+        The lookup is therefore rooted in the AP row and reaches sideways for
+        the binding, never the other way round: one outer-joined query when
+        both live on the same bind, two when they are split (still narrower
+        than the three a full :meth:`get_conversation` costs). Rooting it in
+        metadata instead answered only one of the two failure directions —
+        a deleted conversation with orphaned metadata was correctly dropped,
+        while an existing conversation whose metadata row is absent was
+        *also* dropped, turning "exists but unbound" into a false
+        ``NOT_FOUND``. Both states are constructible: creation commits the AP
+        row and the metadata row in separate transactions, the same
+        two-transaction shape as deletion in the opposite order.
+
+        :param conversation_ids: Conversation ids to look up.
+        :returns: ``{id: runner_id or None}`` for ids whose AP row exists.
+            Ids with no AP row are omitted, exactly as a missing
+            :meth:`get_conversation` would report them; ids that exist
+            without a binding map to ``None``.
         """
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
+        same_bind = self._conv_engine is self._engine
+        if same_bind:
+            with self._session() as session:
+                rows = session.execute(
+                    select(SqlConversation.id, SqlConversationMetadata.runner_id)
+                    .outerjoin(
+                        SqlConversationMetadata,
+                        and_(
+                            SqlConversationMetadata.workspace_id == SqlConversation.workspace_id,
+                            SqlConversationMetadata.id == SqlConversation.id,
+                        ),
+                    )
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(unique_ids),
+                    )
+                ).all()
+            return {row.id: row.runner_id for row in rows}
+        # Split-DB: no cross-bind join, so read existence from the AP bind and
+        # overlay the bindings. Seeding every existing id with ``None`` keeps
+        # the two states distinct without a second existence check.
+        with self._conv_session() as ap_session:
+            existing = set(
+                ap_session.execute(
+                    select(SqlConversation.id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(unique_ids),
+                    )
+                ).scalars()
+            )
+        if not existing:
+            return {}
+        bindings: dict[str, str | None] = dict.fromkeys(existing)
         with self._session() as session:
             rows = session.execute(
                 select(SqlConversationMetadata.id, SqlConversationMetadata.runner_id).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(unique_ids),
+                    SqlConversationMetadata.id.in_(list(existing)),
                 )
             ).all()
-        return {row.id: row.runner_id for row in rows}
+        for row in rows:
+            bindings[row.id] = row.runner_id
+        return bindings
 
     def get_session_connectivity(
         self, conversation_ids: list[str]
@@ -1250,6 +1372,62 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._conv_session() as session:
             _upsert_labels(session, conversation_id, updates, stamp)
 
+    def seed_labels_if_absent(
+        self,
+        conversation_id: str,
+        defaults: dict[str, str],
+        updated_at: int | None = None,
+    ) -> dict[str, str]:
+        """
+        Insert declared initial labels for keys that have none, then read back.
+
+        Seeding must not overwrite: a concurrent policy write landing
+        between a caller's snapshot and its seed would otherwise be reset
+        to the initial value. The insert is ``ON CONFLICT DO NOTHING``, so
+        existing keys keep their persisted value, and the post-seed
+        snapshot is read in the same transaction.
+
+        :param conversation_id: The conversation to seed,
+            e.g. ``"conv_abc123"``.
+        :param defaults: ``key -> initial value``. Empty skips the write
+            and just returns the current snapshot — including for a
+            conversation that does not exist: with nothing to insert,
+            there is nothing that needs the existence check below.
+        :param updated_at: Timestamp for inserted rows (``None`` → now).
+        :returns: The conversation's labels after seeding, or ``{}`` when
+            *defaults* is empty and the conversation does not exist.
+        :raises ConversationNotFoundError: When *defaults* is non-empty and
+            the conversation does not exist. Labels are not foreign-keyed,
+            so an unchecked insert leaves orphan rows behind for a
+            conversation that was never there or has since been deleted —
+            the same phantom write the state and usage paths refuse, on
+            the third write path. The check below is an unlocked ``SELECT``,
+            not a locking read: it narrows the orphan-row window to a
+            concurrent delete landing between this check and the insert,
+            rather than eliminating it — still strictly better than
+            ``set_labels``, which performs no check at all.
+        """
+        stamp = updated_at if updated_at is not None else now_epoch()
+        with self._conv_session() as session:
+            if defaults:
+                # Existence is checked inside the same transaction as the
+                # insert, for the same reason the insert is
+                # insert-if-absent: a check the caller made earlier can be
+                # stale by now. Unlocked, so it narrows rather than closes
+                # the race against a concurrent delete of this same row.
+                exists = session.execute(
+                    select(SqlConversation.id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                    )
+                ).first()
+                if exists is None:
+                    raise ConversationNotFoundError(
+                        f"Cannot seed labels for {conversation_id!r}: no conversation row exists."
+                    )
+                _insert_labels_if_absent(session, conversation_id, defaults, stamp)
+            return _fetch_labels(session, conversation_id)
+
     def set_session_state(
         self,
         conversation_id: str,
@@ -1276,6 +1454,102 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(session_state=json.dumps(state))
             )
+
+    def mutate_session_state(
+        self,
+        conversation_id: str,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """
+        Apply *mutate* to the persisted session state under a row lock.
+
+        Read-merge-write in ONE locked transaction, so concurrent writers
+        cannot lose each other's updates. ``set_session_state`` overwrites
+        the whole blob from a snapshot the caller read earlier, which drops
+        anything written in between — two policies each incrementing a
+        counter by 1 persisted 1, not 2.
+
+        Locking mirrors :meth:`increment_session_usage`: ``SELECT … FOR
+        UPDATE`` where supported, and ``BEGIN IMMEDIATE`` on SQLite (via
+        the immediate session maker) so the read cannot race a second
+        writer's read.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param mutate: Callable applied in place to the freshly read state
+            dict. Runs inside the locked transaction, so it must not
+            perform store calls of its own.
+        :returns: The merged state, as persisted.
+        :raises ConversationNotFoundError: When the conversation has no
+            metadata row. Nothing can be persisted in that case, so
+            returning a merged state would report a write that never
+            happened.
+        """
+        return self._mutate_metadata_json(
+            conversation_id, "session_state", mutate, what="session state"
+        )
+
+    def _mutate_metadata_json(
+        self,
+        conversation_id: str,
+        column: str,
+        mutate: Callable[[dict[str, Any]], None],
+        *,
+        what: str,
+    ) -> dict[str, Any]:
+        """
+        Locked read-merge-write of one JSON column on conversation metadata.
+
+        The single row-missing contract for every read-modify-write primitive
+        on this table: no row means nothing can be persisted, so raise rather
+        than return a merged dict the database does not hold. Each caller used
+        to carry its own copy of this loop, and a fix applied to one of them
+        left the other reporting phantom writes.
+
+        Locking is dialect-complementary: ``SELECT … FOR UPDATE`` where
+        supported, and ``BEGIN IMMEDIATE`` on SQLite (via the immediate
+        session maker), which takes the write lock before the first read so
+        two writers cannot each read a pre-merge snapshot.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param column: Metadata column holding the JSON blob, either
+            ``"session_state"`` or ``"session_usage"``.
+        :param mutate: Callable applied in place to the freshly read dict.
+            Runs inside the locked transaction, so it must not perform store
+            calls of its own.
+        :param what: Human-readable name of the thing being written, used in
+            the error message, e.g. ``"session usage"``.
+        :returns: The merged dict, as persisted.
+        :raises ConversationNotFoundError: When the conversation has no
+            metadata row.
+        """
+        import json
+
+        with self._session_immediate() as session:
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            if meta is None:
+                raise ConversationNotFoundError(
+                    f"Cannot update {what} for {conversation_id!r}: no metadata row exists."
+                )
+            raw = getattr(meta, column)
+            current: dict[str, Any] = dict(json.loads(raw)) if raw else {}
+            mutate(current)
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(**{column: json.dumps(current)})
+            )
+            return current
 
     def set_session_usage(
         self,
@@ -1361,32 +1635,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param delta: Usage increments (see
             :meth:`ConversationStore.increment_session_usage`).
         :returns: The updated ``session_usage`` dict.
+        :raises ConversationNotFoundError: When the conversation has no
+            metadata row — the increment cannot be persisted, so reporting a
+            new total would be a lie. Callers on streaming paths where a
+            conversation can vanish mid-turn should treat this as "nothing to
+            accumulate", not as a failure.
         """
-        import json
-
         from omnigent.stores.conversation_store import apply_session_usage_delta
 
-        with self._session_immediate() as session:
-            q = select(SqlConversationMetadata).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.id == conversation_id,
-            )
-            if self._meta_supports_for_update:
-                q = q.with_for_update()
-            meta = session.scalars(q).first()
-            current: dict[str, Any] = (
-                dict(json.loads(meta.session_usage)) if meta and meta.session_usage else {}
-            )
-            apply_session_usage_delta(current, delta)
-            session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
-                )
-                .values(session_usage=json.dumps(current))
-            )
-            return current
+        return self._mutate_metadata_json(
+            conversation_id,
+            "session_usage",
+            lambda current: apply_session_usage_delta(current, delta),
+            what="session usage",
+        )
 
     def add_daily_cost(self, user_id: str, day_utc: str, delta_usd: float) -> None:
         """

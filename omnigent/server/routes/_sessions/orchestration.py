@@ -67,6 +67,9 @@ from omnigent.runtime.policies.approval import (
     resolve_ask_timeout,
 )
 from omnigent.runtime.policies.builder import (
+    _sum_subtree_usage,
+    ancestor_ids_from_tree,
+    load_session_tree,
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
@@ -596,6 +599,7 @@ def _build_session_list_item(
 def _publish_subtree_cost_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
+    conv: Conversation | None = None,
 ) -> None:
     """
     Re-publish each ancestor's subtree-summed cost after a child usage update.
@@ -608,18 +612,40 @@ def _publish_subtree_cost_to_ancestors(
     display side.) For each ancestor of *session_id*, recompute its subtree
     priced cost and publish a ``session.usage`` event carrying it.
 
+    One tree load serves the whole walk. Every ancestor of this session is in
+    the same tree, so both the chain and each ancestor's sum are derived from
+    one set of freshly-read rows — previously each ancestor paged the tree
+    again, and the chain came from a conversation row that may have been read
+    before a concurrent delete/recreate moved this session elsewhere.
+
     Sync (does store reads + SSE fan-out); call via
     :func:`asyncio.to_thread`, mirroring the elicitation ancestor-publish
     helpers. ``session_stream.publish`` is safe to call from a worker thread.
 
-    :param conv_store: Store used to discover ancestors and sum each
-        ancestor's subtree usage.
+    :param conv_store: Store used to load the tree.
     :param session_id: The child session whose usage just changed, e.g.
         ``"conv_child123"``.
+    :param conv: The child's already-loaded conversation row, when the caller
+        holds one. Only its ``root_conversation_id`` is used, and only as a
+        hint: :func:`load_session_tree` verifies the tree it names actually
+        contains this session and resolves the root itself when it does not.
+        The parameter belongs to this function, not to whichever caller first
+        needed it, so that no caller can be removed and leave a signature
+        behind that its remaining callers already depend on.
     :returns: None.
     """
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        ancestor_usage = load_session_usage(ancestor_id, conv_store)
+    # Loaded HERE, not taken from the caller. What each ancestor's badge
+    # should read is a fact about now, at publication time — a tree captured
+    # when the request arrived can already describe a smaller total, and two
+    # siblings publishing from their own request-start snapshots delivered a
+    # newer figure followed by an older one, leaving the parent's badge stale.
+    tree = load_session_tree(
+        session_id,
+        conv_store,
+        conv.root_conversation_id if conv is not None else None,
+    )
+    for ancestor_id in ancestor_ids_from_tree(tree, session_id):
+        ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
         usage_by_model = _usage_by_model_for_display(ancestor_usage)
         if subtree_cost is None and usage_by_model is None:
@@ -962,7 +988,15 @@ def _accumulate_session_usage(
             model_delta["total_cost_usd"] = cost_delta
         delta["by_model"] = {llm_model: model_delta}
 
-    new_current = conversation_store.increment_session_usage(session_id, delta)
+    try:
+        new_current = conversation_store.increment_session_usage(session_id, delta)
+    except ConversationNotFoundError:
+        # The session was deleted while its turn was still streaming. There is
+        # no row to bill and nothing to publish; the store now refuses to report
+        # a total it did not persist, and failing the relay loop over a deleted
+        # session would be worse than dropping the increment. The primitive that
+        # raises ships this handler, so it can land without regressing callers.
+        return None
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
     return _priced_cost_for_display(new_current)
@@ -1161,6 +1195,7 @@ def _persist_native_cumulative_usage(
 
 async def _persist_external_session_usage(
     session_id: str,
+    conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
 ) -> int | None:
@@ -1172,6 +1207,9 @@ async def _persist_external_session_usage(
     (:func:`_persist_native_cumulative_usage`) must be present.
 
     :param session_id: Session/conversation identifier.
+    :param conv: The already-loaded conversation row; only its immutable
+        ``root_conversation_id`` is read (so a request-start row is safe),
+        letting the subtree recompute skip one conversation read.
     :param body: External session-usage event body.
     :param conversation_store: Store used to upsert the labels.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
@@ -1234,7 +1272,16 @@ async def _persist_external_session_usage(
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    # This tree serves only this session's own subtree total. The ancestor
+    # re-publish below loads its OWN tree instead of reusing this one — see
+    # the comment down there for why sharing it would be wrong.
+    tree = await asyncio.to_thread(
+        load_session_tree,
+        session_id,
+        conversation_store,
+        conv.root_conversation_id,
+    )
+    subtree_usage = _sum_subtree_usage(tree, session_id)
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -1259,12 +1306,16 @@ async def _persist_external_session_usage(
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # No-op for a top-level session (no ancestors). Threaded: it pages the
-    # conversation tree per ancestor.
+    # Publishes nothing for a top-level session (no ancestors to walk), but
+    # still pays its own tree load to find that out — it reads its own tree
+    # rather than reusing the one summed above: what an ancestor's badge
+    # should show is a fact about publication time, and a sibling's event may
+    # have landed since this request started.
     await asyncio.to_thread(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
+        conv,
     )
     return raw_tokens
 
@@ -4857,7 +4908,7 @@ async def _evaluate_tool_call_policy(
     if spec is None:
         return None
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
 
     try:
@@ -5009,7 +5060,7 @@ async def _evaluate_input_policy(
     request_content = {"user_content": user_text, "attachments": attachments}
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     ctx = EvaluationContext(
         phase=Phase.REQUEST,
@@ -5921,7 +5972,7 @@ async def _handle_mcp_tools_call(
     # only) and TOOL_RESULT (both paths). Engine construction reads
     # session-policy specs and labels from the DB, so keep it off-loop too.
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
 
     if is_retry:

@@ -62,6 +62,18 @@ def _engine_on(
     )
 
 
+def _drop_metadata_row(store: SqlAlchemyConversationStore, conversation_id: str) -> None:
+    """Delete a conversation's metadata row, leaving nothing to mutate."""
+    from sqlalchemy import delete as sa_delete
+
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    with store._session() as session:
+        session.execute(
+            sa_delete(SqlConversationMetadata).where(SqlConversationMetadata.id == conversation_id)
+        )
+
+
 def _set_approved(value: float) -> StateUpdate:
     return StateUpdate(
         key=SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -246,3 +258,55 @@ async def test_subagent_gate_sees_parent_spend_not_just_own(
     )
 
     assert await _evaluate_bash(engine) == PolicyAction.ASK
+
+
+def test_deleted_root_does_not_fail_the_subagent_turn(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A root deleted mid-turn must not turn an approval into a failed call.
+
+    The store refuses to report a state mutation it could not persist, so the
+    root mirror can now raise where the old snapshot-then-write path silently
+    wrote nothing. Recording the checkpoint on the root is best-effort —
+    losing it re-prompts, it does not overspend — so the sub-agent's turn
+    continues with the approval still visible to this engine.
+
+    Both halves are observed, because the visible outcome alone is identical
+    under the old implementation: the write goes through the locked primitive
+    (not a get/apply/set pair), and the missing-row error it raises is
+    swallowed here rather than propagating.
+    """
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+
+    used: list[str] = []
+
+    class _RecordingStore:
+        """Records which write primitive the engine reaches for."""
+
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+
+        def mutate_session_state(self, conversation_id: str, mutate):
+            used.append("mutate_session_state")
+            return self._inner.mutate_session_state(conversation_id, mutate)
+
+        def set_session_state(self, conversation_id: str, state):
+            used.append("set_session_state")
+            return self._inner.set_session_state(conversation_id, state)
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+    engine = _engine_on(_RecordingStore(conversation_store), child.id, parent.id)  # type: ignore[arg-type]
+    _drop_metadata_row(conversation_store, parent.id)
+
+    engine.apply_state_updates([_set_approved(0.05)])
+
+    assert "mutate_session_state" in used, used
+    assert "set_session_state" not in used, (
+        "the approval must go through the locked merge, not a snapshot write"
+    )
+    assert engine._session_state.get(SESSION_COST_ASK_APPROVED_STATE_KEY) == 0.05

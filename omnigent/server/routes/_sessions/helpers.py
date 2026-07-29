@@ -1242,6 +1242,12 @@ def _ancestor_session_ids(
     """
     Return ancestor session ids for a session, nearest parent first.
 
+    Reads each link fresh. The cost-usage fan-out walks a loaded tree
+    instead (:func:`ancestor_ids_from_tree`); this remains for callers that
+    hold no tree, and a caller-supplied starting row is deliberately not
+    accepted — a row read earlier in the request can name a parent chain the
+    session has since left, and these ids decide where events are published.
+
     :param conv_store: Store used to read conversation parent links.
     :param session_id: Session to walk upward from, e.g.
         ``"conv_child123"``.
@@ -3799,8 +3805,13 @@ async def _get_runner_client_impl(
     """
     Get an HTTP client for the runner bound to a session.
 
-    Uses the ``RunnerRouter`` to resolve the pinned runner. Falls
-    back to the in-process runner client for test setups.
+    Uses the ``RunnerRouter`` to resolve the pinned runner via a fresh
+    single-column binding read, so the RESOLUTION reflects a rebind that
+    landed before this call. The returned client is bound to that runner:
+    a rebind between this resolution and the caller's POST is not fenced
+    (the resolve→forward window is unchanged by the read narrowing, and
+    fencing it needs a binding generation on the wire). Falls back to the
+    in-process runner client for test setups.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -6328,7 +6339,16 @@ def _build_policy_engine_from_spec_impl(
     spec: AgentSpec,
     session_id: str,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
 ) -> PolicyEngine:
+    """Build an engine for *spec*, reusing a conversation row when held.
+
+    Every caller of this wrapper already loaded the conversation to
+    resolve *spec*; passing it lets the builder skip its own read. Only
+    the row's immutable identity is reused — the builder re-derives
+    labels, session_state and model from a fresh read (see
+    :func:`build_policy_engine`).
+    """
     caps = get_caps()
     host_connection = (
         caps.policy_llm_connection_factory() if caps.policy_llm_connection_factory else None
@@ -6337,6 +6357,11 @@ def _build_policy_engine_from_spec_impl(
         spec=spec,
         conversation_id=session_id,
         conversation_store=conversation_store,
+        conversation=conversation,
+        # The spec was resolved from this row's agent binding; the builder
+        # confirms it against its own fresh read and fails closed if a
+        # switch-agent landed in between.
+        expected_agent_id=conversation.agent_id if conversation is not None else None,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
         server_llm=caps.llm,
@@ -6400,7 +6425,7 @@ async def _apply_pending_policy_ask_writes(
     if spec is None:
         return
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     # The label/state writes hit the DB synchronously too — keep them
     # off the loop.
@@ -6508,11 +6533,13 @@ def _build_evaluation_context(
             harness=hook_harness,
         )
     # REQUEST / RESPONSE — content is the user/assistant text. The wire ``data``
-    # is a dict for the native command hooks (``{"text"|"content": ...}``), but
-    # may be a bare string — opencode's policy plugin sends the prompt text
-    # directly for ``PHASE_REQUEST``. Accept both, and NEVER raise here: a crash
-    # 500s the evaluate endpoint, which silently fails the request/result gate
-    # OPEN (the exact symptom that let cost-over-budget terminal prompts through).
+    # is a dict for every current first-party producer (``{"text"|"content":
+    # ...}``, including OpenCode's plugin, which sends ``{"text": ...}``), but
+    # a bare string is still accepted for ``PHASE_REQUEST`` for compatibility
+    # with older or third-party callers that send the prompt text directly.
+    # Accept both, and NEVER raise here: a crash 500s the evaluate endpoint,
+    # which silently fails the request/result gate OPEN (the exact symptom
+    # that let cost-over-budget terminal prompts through).
     if isinstance(data, str):
         text = data
     elif isinstance(data, dict):
@@ -6797,7 +6824,7 @@ async def _evaluate_output_policy(
         return None
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     ctx = EvaluationContext(
         phase=Phase.RESPONSE,

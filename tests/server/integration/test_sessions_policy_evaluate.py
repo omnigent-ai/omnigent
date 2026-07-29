@@ -24,10 +24,13 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+import pytest_asyncio
+from fastapi import FastAPI
 
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
@@ -1162,3 +1165,170 @@ async def test_llm_response_allow_when_no_matching_policy(
     assert body["result"] in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"), (
         f"Expected ALLOW or UNSPECIFIED for no-policy session, got {body['result']}."
     )
+
+
+_EVALUATE_USER = "alice@example.com"
+
+
+@pytest.fixture()
+def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """App with permissions + header auth, for route-level SQL budgeting."""
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+
+@pytest_asyncio.fixture()
+async def auth_client(auth_app: FastAPI, mock_llm: Any, tmp_path: Path):
+    """Async client against the auth-enabled app."""
+    from omnigent.runtime import set_harness_process_manager
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+
+    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
+    await pm.start()
+    set_harness_process_manager(pm)
+    transport = httpx.ASGITransport(app=auth_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    mock_llm.release_all()
+    set_harness_process_manager(None)
+    await pm.shutdown()
+
+
+async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: str) -> str:
+    """Create a real agent-bound session and grant it to the test user.
+
+    Uses the real create path (a genuine uploaded bundle) so the agent
+    cache can load the spec — a fabricated agent row with a fake bundle
+    location cannot be loaded and the route would bail before the work
+    this budget measures.
+    """
+    import json as _json
+
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from tests.server.helpers import build_agent_bundle
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(_EVALUATE_USER)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    resp = await auth_client.post(
+        "/v1/sessions",
+        data={"metadata": _json.dumps({"title": "budget"})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                # The agent MUST declare a policy: with no policies the route
+                # short-circuits via ``any_policies_apply`` before building an
+                # engine, so a budget measured without one would not cover the
+                # preload path at all (it silently didn't, first time round).
+                build_agent_bundle(
+                    name="budget-agent",
+                    guardrails={
+                        "policies": {
+                            "allow_all": {
+                                "type": "function",
+                                "on": ["tool_call"],
+                                "function": "tests.runtime.policies.conftest._always_allow",
+                            }
+                        }
+                    },
+                ),
+                "application/gzip",
+            )
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["session_id"]
+    perms.grant(_EVALUATE_USER, session_id, LEVEL_OWNER)
+    return session_id
+
+
+# Measured SQL-statement budget for the AUTHENTICATED evaluate route — the
+# blocking PreToolUse hook. Counted as executed statements, not store-method
+# calls: a store-call oracle cannot see that one call fans out to three
+# statements (conversation + metadata + labels), which is exactly how an
+# earlier "6 queries" claim survived being wrong by five.
+#
+# Measured (both dialects) for the seed below: one owner grant, one agent
+# declaring one tool_call policy, one conversation, no declared labels, no
+# children. Composition: ACL resolution 3, the handler's conversation load
+# 3, session-policy lookup, agent row, spawn-tree scan 3.
+#
+# This is the number the PR must quote — an earlier description claimed 6.
+# It is also the oracle for the preload optimisation: dropping the
+# ``conversation=`` argument makes the builder re-read the conversation and
+# pushes this up, which no behavioural assertion can see because both
+# variants return the same verdict.
+_EVALUATE_ROUTE_SQL_BUDGET = 11
+
+
+@pytest.mark.asyncio
+async def test_authenticated_evaluate_route_sql_budget(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Pin the route's SQL count so the description cannot drift from the code,
+    and so removing the preload is detectable.
+
+    This is the oracle for the preload optimisation: dropping the
+    ``conversation=`` argument in ``_build_engine`` makes the builder read
+    the conversation again, which changes this count. A behavioural
+    assertion alone cannot see that, because both variants return the same
+    verdict.
+    """
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+
+    session_id = await _seed_authenticated_session(auth_client, db_uri)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    payload = {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+        }
+    }
+    # Warm the spec / policy caches so the count is the steady-state one.
+    await auth_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate", json=payload, headers=headers
+    )
+
+    engine = _engine_cache[db_uri]
+    statements: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        if not statement.lstrip().upper().startswith("PRAGMA"):
+            statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", _on_exec)
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=payload, headers=headers
+        )
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _on_exec)
+
+    assert resp.status_code == 200, resp.text
+    assert len(statements) == _EVALUATE_ROUTE_SQL_BUDGET, [
+        s.split("\n")[0][:80] for s in statements
+    ]

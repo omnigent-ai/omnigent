@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -14,6 +15,7 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.policies.types import (
     PolicyAction,
@@ -510,7 +512,14 @@ def register_hooks_routes(
             hook_elicitation_id = raw_elicitation_id
         data = event.get("data") or {}
 
-        conv = conversation_store.get_conversation(session_id)
+        # Reuse the row the ACL check already fetched — same point in the
+        # request, so no less fresh than reading it again here, one query
+        # fewer on the blocking PreToolUse path. Absent for admin callers
+        # (who bypass the conversation lookup) and when permissions are
+        # disabled, which fall back to their own read.
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise OmnigentError(
                 f"Session {session_id!r} not found.",
@@ -570,7 +579,7 @@ def register_hooks_routes(
             _caps.policy_llm_connection_factory() if _caps.policy_llm_connection_factory else None
         )
 
-        def _build_engine() -> PolicyEngine:
+        def _build_engine(preloaded_conv: Conversation | None = None) -> PolicyEngine:
             """
             Build a policy engine for this session from the loaded spec.
 
@@ -579,6 +588,10 @@ def register_hooks_routes(
             does not re-query it during ``evaluate``, so a fresh build is the
             only way to observe a concurrent sibling's just-recorded approval.
 
+            :param preloaded_conv: The conversation row this handler already
+                loaded, passed on the FIRST build only to skip the builder's
+                re-read. Rebuilds that must observe concurrent writes (the
+                ASK-gate re-evaluation) pass ``None`` for a fresh read.
             :returns: A :class:`PolicyEngine` seeded with the latest
                 persisted state for ``session_id``.
             """
@@ -586,20 +599,30 @@ def register_hooks_routes(
                 spec=loaded.spec,
                 conversation_id=session_id,
                 conversation_store=conversation_store,
+                conversation=preloaded_conv,
+                # ``agent`` below was resolved from conv.agent_id; the builder
+                # re-reads the row and fails closed if it was rebound since.
+                expected_agent_id=agent.id,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine()
+        engine = _build_engine(conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
         # user_id for direct API callers and native-terminal sessions (whose
         # turns go via _dispatch_session_event_to_runner, which does not write
         # this label).
-        turn_actor = conv.labels.get(_TURN_ACTOR_LABEL)
+        # Read the actor from the engine's label snapshot, not from the row
+        # fetched at the top of this handler: the engine's labels come from a
+        # read taken after the agent/spec load, so a turn-actor label written
+        # in that window still gates on the right principal. (``agent_id``
+        # cannot be treated the same way — it selects the spec the engine is
+        # built from, so it is necessarily read first.)
+        turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
         ctx = _build_evaluation_context(
             phase, data, event, actor=_build_actor(turn_actor or user_id)
         )
