@@ -189,7 +189,11 @@ def _detect_terminal_background() -> Literal["dark", "light"] | None:
 
     :returns: ``"dark"``, ``"light"``, or ``None`` on failure.
     """
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
+    # ``termios`` is POSIX-only, and the OSC 11 exchange below needs raw-mode
+    # terminal control it provides, so Windows cannot detect the background
+    # this way. Fall back to "unknown" (``None``) instead of importing termios,
+    # which does not exist on Windows and would raise ``ModuleNotFoundError``.
+    if sys.platform == "win32" or not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
 
     import select
@@ -306,7 +310,11 @@ def startup_theme_picker(
     detected = _detect_terminal_background()
     selected = 0 if detected == "dark" else 1  # dark=0, light=1
 
-    if not sys.stdin.isatty():
+    # The interactive picker below drives the terminal through POSIX-only
+    # ``termios``/``tty``, so on Windows (and any non-tty) skip it and persist
+    # the detected-or-default theme rather than importing termios, which is
+    # absent on Windows and would raise ``ModuleNotFoundError`` at startup.
+    if sys.platform == "win32" or not sys.stdin.isatty():
         # Non-interactive — use detected or default to light.
         theme = DARK_THEME if detected == "dark" else LIGHT_THEME
         update_user_config(theme=theme.name)
