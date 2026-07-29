@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,59 @@ import httpx
 import pytest
 
 import omnigent.kiro_native_session_forwarder as forwarder
+
+
+def _write_kiro_sqlite(
+    db_path: Path,
+    *,
+    cwd: Path,
+    conversation_id: str,
+    history: list[dict[str, Any]],
+) -> None:
+    """Write a minimal kiro-cli ``conversations_v2`` SQLite store.
+
+    Shape matches a captured kiro-cli 2.15.1 session: ``key`` is the workspace
+    cwd, ``value`` is a ConversationState blob whose ``history`` is a list of
+    turns with tagged ``user.content`` and ``assistant`` sides.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS conversations_v2 "
+        "(key TEXT PRIMARY KEY, conversation_id TEXT, value TEXT, "
+        "created_at TEXT, updated_at TEXT)"
+    )
+    con.execute(
+        "INSERT OR REPLACE INTO conversations_v2 "
+        "(key, conversation_id, value, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (
+            str(cwd),
+            conversation_id,
+            json.dumps({"conversation_id": conversation_id, "history": history}),
+            "2026-07-29T00:00:00Z",
+            "2026-07-29T00:01:00Z",
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def _sqlite_prompt_turn(prompt: str, assistant_tool: dict[str, Any]) -> dict[str, Any]:
+    """A conversations_v2 turn: user Prompt + assistant ToolUse."""
+    return {
+        "user": {"content": {"Prompt": {"prompt": prompt}}},
+        "assistant": {"ToolUse": assistant_tool},
+    }
+
+
+def _sqlite_results_turn(
+    tool_use_results: list[dict[str, Any]], assistant_text: str
+) -> dict[str, Any]:
+    """A conversations_v2 turn: user ToolUseResults + assistant Response."""
+    return {
+        "user": {"content": {"ToolUseResults": {"tool_use_results": tool_use_results}}},
+        "assistant": {"Response": {"message_id": "resp-1", "content": assistant_text}},
+    }
 
 
 def _write_kiro_session(
@@ -1692,3 +1746,314 @@ async def test_forward_kiro_session_stalled_turn_backstop_closes_card(
     )
     assert persisted["turn_live"] is False
     assert persisted["turn_response_id"] == turn_id
+
+
+# ── SQLite conversations_v2 source (current kiro) ───────────────────────────
+
+
+def test_kiro_records_from_conversation_normalizes_tool_turn() -> None:
+    """A conversations_v2 tool turn maps onto the Prompt / AssistantMessage /
+    ToolResults record stream, matching a real captured kiro-cli 2.15.1 session."""
+    history = [
+        _sqlite_prompt_turn(
+            "run it",
+            {
+                "message_id": "asst-1",
+                "content": "",
+                "tool_uses": [
+                    {
+                        "id": "tooluse_A",
+                        "name": "execute_cmd",
+                        "orig_name": "execute_cmd",
+                        "args": {"command": "echo hi"},
+                        "orig_args": {"command": "echo hi"},
+                    }
+                ],
+            },
+        ),
+        _sqlite_results_turn(
+            [
+                {
+                    "tool_use_id": "tooluse_A",
+                    "content": [{"Json": {"exit_status": "0", "stdout": "hi", "stderr": ""}}],
+                    "status": "Success",
+                }
+            ],
+            "Done, it printed hi.",
+        ),
+    ]
+
+    paired, next_index = forwarder._kiro_records_from_conversation("conv-1", history, 0)
+    records = [r for r, _cursor in paired]
+
+    assert next_index == 2
+    kinds = [(r.kind, r.message_id) for r in records]
+    assert kinds == [
+        ("Prompt", "conv-1:0"),
+        ("AssistantMessage", "asst-1"),
+        ("ToolResults", ""),
+        ("AssistantMessage", "resp-1"),
+    ]
+    assert records[1].tool_calls == (
+        forwarder.KiroToolCall(
+            call_id="tooluse_A", name="execute_cmd", arguments=json.dumps({"command": "echo hi"})
+        ),
+    )
+    assert records[2].tool_results[0].call_id == "tooluse_A"
+    assert "hi" in records[2].tool_results[0].output
+    assert records[3].text == "Done, it printed hi."
+    # Within one history entry only the last record advances the cursor: the
+    # non-last record carries the entry's start index, so a mid-entry failure
+    # re-reads the whole entry (item dedup handles the rest).
+    assert [cursor for _r, cursor in paired] == [0, 1, 1, 2]
+
+
+def test_kiro_records_from_conversation_holds_unfinished_turn() -> None:
+    """A turn whose assistant side is not yet written holds the cursor.
+
+    The streaming turn is re-read once kiro finishes it, rather than emitting a
+    half turn and advancing past it.
+    """
+    history = [
+        _sqlite_results_turn([{"tool_use_id": "x", "content": [{"Text": "ok"}]}], "first done"),
+        {"user": {"content": {"Prompt": {"prompt": "second"}}}},  # no assistant side yet
+    ]
+
+    paired, next_index = forwarder._kiro_records_from_conversation("c", history, 0)
+
+    # Only the finished first turn is emitted; the cursor holds at index 1.
+    assert next_index == 1
+    assert [r.kind for r, _c in paired] == ["ToolResults", "AssistantMessage"]
+
+    # Kiro finishes the second turn; the next read delivers it.
+    history[1]["assistant"] = {"Response": {"message_id": "r2", "content": "second done"}}
+    paired2, next_index2 = forwarder._kiro_records_from_conversation("c", history, next_index)
+    assert next_index2 == 2
+    assert [r.kind for r, _c in paired2] == ["Prompt", "AssistantMessage"]
+
+
+def test_read_kiro_sqlite_records_binds_by_cwd(tmp_path: Path) -> None:
+    """The reader binds the conversation whose key matches the workspace cwd and
+    reads new turns past the history cursor."""
+    db = tmp_path / "kiro-cli" / "data.sqlite3"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    # A different-workspace conversation must not be picked.
+    _write_kiro_sqlite(
+        db, cwd=other, conversation_id="other", history=[_sqlite_results_turn([], "nope")]
+    )
+    _write_kiro_sqlite(
+        db,
+        cwd=workspace,
+        conversation_id="mine",
+        history=[
+            _sqlite_prompt_turn("hi", {"message_id": "a1", "content": "hello", "tool_uses": []})
+        ],
+    )
+
+    paired, idx = forwarder._read_kiro_sqlite_records(db, str(workspace), 0)
+    records = [r for r, _c in paired]
+
+    assert idx == 1
+    assert [r.kind for r in records] == ["Prompt", "AssistantMessage"]
+    assert records[0].text == "hi"
+    assert records[1].text == "hello"
+
+    # No new turns past the cursor.
+    records2, idx2 = forwarder._read_kiro_sqlite_records(db, str(workspace), 1)
+    assert records2 == [] and idx2 == 1
+
+    # Missing DB is a clean empty read, not a crash.
+    assert forwarder._read_kiro_sqlite_records(tmp_path / "gone.sqlite3", str(workspace), 0) == (
+        [],
+        0,
+    )
+
+
+def test_kiro_cli_database_path_honors_overrides(tmp_path: Path) -> None:
+    """KIRO_HOME wins; else the platform app-data dir is used."""
+    assert forwarder.kiro_cli_database_path(env={"KIRO_HOME": str(tmp_path)}) == (
+        tmp_path / "kiro-cli" / "data.sqlite3"
+    )
+    win = forwarder.kiro_cli_database_path(
+        home=tmp_path, env={"LOCALAPPDATA": str(tmp_path / "Local")}
+    )
+    # On Windows the LOCALAPPDATA branch is taken; elsewhere the XDG/home branch.
+    assert win.name == "data.sqlite3" and win.parent.name == "kiro-cli"
+
+
+def _blind_legacy_and_v3(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point legacy JSONL and V3 discovery at empty dirs so a test isolates one
+    source (they run before/after SQLite in the detection priority)."""
+    empty = tmp_path / "empty-sessions"
+    empty.mkdir(exist_ok=True)
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda *a, **k: empty)
+    monkeypatch.setattr(forwarder, "kiro_v3_sessions_dir", lambda *a, **k: empty)
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_mirrors_sqlite_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forwarder detects and mirrors the SQLite conversations_v2 store (the
+    format current kiro's ``chat --tui`` engine writes), driving the full card
+    lifecycle from a real-shape conversation."""
+    db = tmp_path / "kiro-cli" / "data.sqlite3"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_sqlite(
+        db,
+        cwd=workspace,
+        conversation_id="conv-1",
+        history=[
+            _sqlite_prompt_turn(
+                "run it",
+                {
+                    "message_id": "a1",
+                    "content": "",
+                    "tool_uses": [
+                        {"id": "tooluse_A", "name": "execute_cmd", "args": {"command": "echo hi"}}
+                    ],
+                },
+            ),
+            _sqlite_results_turn(
+                [
+                    {
+                        "tool_use_id": "tooluse_A",
+                        "content": [{"Json": {"stdout": "hi"}}],
+                        "status": "Success",
+                    }
+                ],
+                "Done.",
+            ),
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_database_path", lambda *a, **k: db)
+    _blind_legacy_and_v3(monkeypatch, tmp_path)
+    posted_events: list[dict[str, Any]] = []
+    _capture_events_client(monkeypatch, posted_events)
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=0,
+        )
+
+    turn_id = "kiro:turn:conv-1:0"
+    edges = [
+        (e["data"]["status"], e["data"]["response_id"])
+        for e in posted_events
+        if e["type"] == "external_session_status"
+    ]
+    assert edges == [("running", turn_id), ("idle", turn_id)]
+    items = [e["data"] for e in posted_events if e["type"] == "external_conversation_item"]
+    types = [i["item_type"] for i in items]
+    assert "function_call" in types and "function_call_output" in types
+    call = next(i["item_data"] for i in items if i["item_type"] == "function_call")
+    assert call["call_id"] == "tooluse_A" and call["name"] == "execute_cmd"
+    out = next(i["item_data"] for i in items if i["item_type"] == "function_call_output")
+    assert out["call_id"] == "tooluse_A" and "hi" in out["output"]
+    # The bound source and history cursor are persisted for restart resume.
+    persisted = json.loads((tmp_path / "bridge" / forwarder._STATE_FILE).read_text())
+    assert persisted["source_kind"] == "sqlite"
+    assert persisted["session_id"] == "conv-1"
+    assert persisted["byte_offset"] == 2
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_mirrors_v3_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forwarder detects and mirrors a V3 ``messages.jsonl`` session,
+    closing the turn on ``turn_end`` (its prose events never settle the card)."""
+    sessions_root = tmp_path / "sessions"
+    sess_dir = sessions_root / "hash1" / "sess_abc"
+    sess_dir.mkdir(parents=True)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (sess_dir / "session.json").write_text(
+        json.dumps({"cwd": str(workspace), "created_at": "2026-07-29T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    def _v3(payload: dict[str, Any], rid: str) -> str:
+        return json.dumps({"id": rid, "timestamp": "2026-07-29T00:00:00Z", "payload": payload})
+
+    (sess_dir / "messages.jsonl").write_text(
+        "\n".join(
+            [
+                _v3({"type": "user", "content": "run it"}, "u1"),
+                _v3({"type": "turn_start", "executionId": "e1"}, "ts1"),
+                _v3(
+                    {
+                        "type": "tool_call",
+                        "toolCallId": "tc_A",
+                        "toolName": "execute_pwsh",
+                        "args": {"command": "echo hi"},
+                    },
+                    "call1",
+                ),
+                _v3({"type": "tool_result", "toolCallId": "tc_A", "content": "hi"}, "res1"),
+                _v3({"type": "assistant", "content": "It printed hi."}, "asst1"),
+                _v3({"type": "turn_end", "stopReason": "end_turn", "executionId": "e1"}, "te1"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # No SQLite, no legacy; V3 is the only source.
+    monkeypatch.setattr(forwarder, "kiro_cli_database_path", lambda *a, **k: tmp_path / "none.db")
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda *a, **k: tmp_path / "empty")
+    monkeypatch.setattr(forwarder, "kiro_v3_sessions_dir", lambda *a, **k: sessions_root)
+    posted_events: list[dict[str, Any]] = []
+    _capture_events_client(monkeypatch, posted_events)
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=0,
+        )
+
+    turn_id = "kiro:turn:u1"
+    edges = [
+        (e["data"]["status"], e["data"]["response_id"])
+        for e in posted_events
+        if e["type"] == "external_session_status"
+    ]
+    # Exactly one running then one idle (the idle from turn_end, not the
+    # intermediate prose which carries closes_turn=False).
+    assert edges == [("running", turn_id), ("idle", turn_id)]
+    items = [e["data"] for e in posted_events if e["type"] == "external_conversation_item"]
+    assert [i["item_type"] for i in items].count("function_call") == 1
+    assert [i["item_type"] for i in items].count("function_call_output") == 1
+    assert {
+        i["response_id"]
+        for i in items
+        if i["item_type"] != "message" or i["item_data"].get("role") == "assistant"
+    } <= {turn_id}
+    persisted = json.loads((tmp_path / "bridge" / forwarder._STATE_FILE).read_text())
+    assert persisted["source_kind"] == "v3_jsonl"
