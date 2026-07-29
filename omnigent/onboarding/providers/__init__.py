@@ -107,12 +107,13 @@ class ProviderConfig:
 
 
 # ---------------------------------------------------------------------------
-# Catalog loading — live fetch from MLflow GitHub Release assets
+# Catalog loading — live fetch from provider catalog endpoints
 # ---------------------------------------------------------------------------
 
 _MLFLOW_CATALOG_URL = (
     "https://github.com/mlflow/mlflow/releases/download/model-catalog%2Flatest/{provider}.json"
 )
+_ATLASCLOUD_CATALOG_URL = "https://api.atlascloud.ai/api/v1/models"
 _CATALOG_TTL_SECONDS = 3600
 _catalog_cache: cachetools.TTLCache[str, dict[str, Any] | None] = cachetools.TTLCache(
     maxsize=64, ttl=_CATALOG_TTL_SECONDS
@@ -123,7 +124,11 @@ _CATALOG_MISS = object()
 
 def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
     """
-    Fetch ``{provider}.json`` from the MLflow GitHub Release catalog.
+    Fetch a provider model catalog.
+
+    Most providers use ``{provider}.json`` from the MLflow GitHub Release
+    catalog. Atlas Cloud uses its public mixed-modality catalog, normalized by
+    :func:`_normalize_atlascloud_catalog` into the same internal shape.
 
     Skipped when ``OMNIGENT_DISABLE_CATALOG_LOOKUP=1`` (set by the test
     suite to avoid network calls in CI).
@@ -136,13 +141,56 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
 
     if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
         return None
-    url = _MLFLOW_CATALOG_URL.format(provider=provider)
+    if provider == "atlascloud":
+        request: str | urllib.request.Request = urllib.request.Request(
+            _ATLASCLOUD_CATALOG_URL,
+            headers={"User-Agent": "omnigent-model-catalog"},
+        )
+    else:
+        request = _MLFLOW_CATALOG_URL.format(provider=provider)
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with urllib.request.urlopen(request, timeout=5) as resp:
             result: dict[str, Any] = json.loads(resp.read())
+        if provider == "atlascloud":
+            return _normalize_atlascloud_catalog(result)
         return result
     except Exception:
         return None
+
+
+def _normalize_atlascloud_catalog(payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert Atlas Cloud's public model list to the internal catalog shape.
+
+    Atlas Cloud publishes image, video, and text models in one unauthenticated
+    endpoint. Omnigent's harness picker needs only OpenAI-compatible text
+    models, so non-text entries are excluded here instead of appearing as
+    unusable coding-agent choices.
+
+    :param payload: Parsed response from Atlas Cloud's public model endpoint.
+    :returns: A catalog mapping with text models under ``models``.
+    """
+    models: dict[str, dict[str, Any]] = {}
+    entries = payload.get("data")
+    if not isinstance(entries, list):
+        return {"models": models}
+
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "Text":
+            continue
+        model = entry.get("model")
+        if not isinstance(model, str) or not model:
+            continue
+        context: dict[str, int] = {}
+        if isinstance(entry.get("contextLength"), int):
+            context["max_input"] = entry["contextLength"]
+        if isinstance(entry.get("maxCompletionTokens"), int):
+            context["max_output"] = entry["maxCompletionTokens"]
+        models[model] = {
+            "mode": "chat",
+            "capabilities": {},
+            "context_window": context,
+        }
+    return {"models": models}
 
 
 def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
@@ -169,13 +217,14 @@ def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
 
 def _list_provider_names() -> list[str]:
     """
-    Return the known provider names supported by the MLflow catalog.
+    Return the known provider names supported by onboarding catalogs.
 
-    This is a static list matching the JSON files published in the
-    MLflow GitHub Release assets, used to drive ``get_all_providers()``
+    This is primarily the static list matching JSON files published in the
+    MLflow GitHub Release assets, plus providers such as Atlas Cloud that have
+    their own compatible public catalog. It drives ``get_all_providers()``
     without requiring an upfront network scan. Provider variants (e.g.
-    ``vertex_ai-llama_models``) are included; consolidation is applied
-    later in ``get_all_providers()``.
+    ``vertex_ai-llama_models``) are included; consolidation is applied later
+    in ``get_all_providers()``.
 
     :returns: Sorted list of provider names.
     """
@@ -185,6 +234,7 @@ def _list_provider_names() -> list[str]:
             "aleph_alpha",
             "amazon_nova",
             "anthropic",
+            "atlascloud",
             "anyscale",
             "azure",
             "azure_ai",
@@ -282,11 +332,12 @@ def _normalize_provider(provider: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-# Popular providers shown first in selection UI, matching MLflow AI Gateway.
-# Remaining providers follow in alphabetical order.
+# Popular providers shown first in selection UI, followed by the remaining
+# providers in alphabetical order.
 COMMON_PROVIDERS: list[str] = [
     "openai",
     "anthropic",
+    "atlascloud",
     "databricks",
     "bedrock",
     "gemini",
@@ -444,6 +495,7 @@ _DEFAULT_MODEL_OVERRIDE: dict[str, str] = {
     # OpenRouter (and the gateway add's OSS pre-fill) → a broadly-served OSS
     # model rather than an OpenAI/Anthropic id.
     "openrouter": "moonshotai/kimi-k2.6",
+    "atlascloud": "deepseek-ai/deepseek-v4-pro",
     # xAI — pin the flagship so click.prompt(default=...) always has a value
     # even when the catalog fetch is disabled (e.g. in tests).
     "xai": "grok-3",
@@ -766,6 +818,7 @@ _PROVIDER_DISPLAY_NAMES: dict[str, str] = {
     "cerebras": "Cerebras",
     "deepseek": "DeepSeek",
     "openrouter": "OpenRouter",
+    "atlascloud": "Atlas Cloud",
     "ollama": "Ollama",
 }
 
@@ -796,6 +849,7 @@ PROVIDER_ENV_VARS: dict[str, str] = {
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "atlascloud": "ATLASCLOUD_API_KEY",
     "togetherai": "TOGETHERAI_API_KEY",
     "cohere": "COHERE_API_KEY",
     "ai21": "AI21_API_KEY",
