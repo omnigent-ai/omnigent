@@ -226,3 +226,72 @@ def test_startup_picker_non_tty_respects_dark_detection(
     assert result is DARK_THEME
     config = (tmp_path / ".omnigent" / "config.yaml").read_text(encoding="utf-8")
     assert "theme: dark" in config
+
+
+# ── Windows: no crash on the POSIX-only termios path ──────────────────────────
+
+
+def _block_termios(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``import termios`` raise, as it does on Windows.
+
+    Reproduces the ``ModuleNotFoundError: No module named 'termios'`` that
+    crashed ``omni`` at startup on native Windows (issues #2993, #3251, #3359,
+    and duplicates): if either code path below still reaches ``import termios``
+    on a Windows tty, the import raises here instead of being silently masked by
+    the Linux CI runner that does have termios.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fake_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "termios":
+            raise ModuleNotFoundError("No module named 'termios'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+
+def test_detect_terminal_background_returns_none_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Background detection degrades to ``None`` on Windows, not a termios crash.
+
+    A real Windows terminal is a tty, so the ``isatty`` guard alone did not
+    cover it; the Windows guard must return before importing termios.
+    """
+    from omnigent.repl._theme_picker import _detect_terminal_background
+
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    _block_termios(monkeypatch)
+
+    assert _detect_terminal_background() is None
+
+
+def test_startup_picker_does_not_crash_on_windows(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The startup picker persists a default theme on Windows instead of crashing.
+
+    Regression for the ``omni setup``/startup ``ModuleNotFoundError: No module
+    named 'termios'`` on native Windows: the interactive picker is POSIX-only,
+    so a Windows tty must take the non-interactive fallback.
+    """
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "omnigent.repl._theme_picker._detect_terminal_background",
+        lambda: None,
+    )
+    _block_termios(monkeypatch)
+
+    import io
+
+    result = startup_theme_picker(out=io.StringIO())
+    assert result is LIGHT_THEME
+    config = (tmp_path / ".omnigent" / "config.yaml").read_text(encoding="utf-8")
+    assert "theme: light" in config
