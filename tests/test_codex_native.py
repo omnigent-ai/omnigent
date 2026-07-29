@@ -1048,6 +1048,47 @@ def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
     )
 
 
+def test_build_codex_remote_args_bypass_hook_trust_prepends_flag() -> None:
+    """``bypass_hook_trust=True`` prepends ``--dangerously-bypass-hook-trust``.
+
+    Runner-owned headless sessions pass this flag so the TUI skips the
+    interactive "Hooks need review" prompt that can never be answered without
+    a live terminal user.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        bypass_hook_trust=True,
+    )
+    assert args[0] == "--dangerously-bypass-hook-trust"
+    assert "--remote" in args
+    assert "ws://127.0.0.1:9876" in args
+
+
+def test_build_codex_remote_args_bypass_hook_trust_with_resume() -> None:
+    """``bypass_hook_trust=True`` flag precedes the ``resume`` subcommand."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id="thread-abc",
+        remote_url="ws://127.0.0.1:9876",
+        bypass_hook_trust=True,
+    )
+    assert args[0] == "--dangerously-bypass-hook-trust"
+    assert "resume" in args
+    assert args.index("--dangerously-bypass-hook-trust") < args.index("resume")
+
+
+def test_build_codex_remote_args_bypass_hook_trust_default_false() -> None:
+    """``bypass_hook_trust`` defaults to ``False``; flag is absent."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+    assert "--dangerously-bypass-hook-trust" not in args
+
+
 def test_codex_app_server_client_uses_codex_remote_handshake(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

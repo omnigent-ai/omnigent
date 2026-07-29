@@ -41,7 +41,6 @@ from omnigent.inner.codex_executor import (
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
     _find_codex_cli,
-    _merge_codex_hook_trust_back,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
@@ -88,6 +87,11 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # — we detect the old version up front and skip registration with a loud
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
+# Minimum codex CLI version that accepts ``--dangerously-bypass-hook-trust``.
+# Added in openai/codex PR #21768, shipped in rust-v0.131.0 (2026-05-18).
+# Below this the flag is unknown and codex exits immediately with an error,
+# so we skip it and fall back to the old behaviour (trust prompt may appear).
+_MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 
 
 def _format_codex_version(version: tuple[int, int, int] | None) -> str:
@@ -589,6 +593,7 @@ class CodexNativeAppServer:
     pinned_model: str | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
+    codex_cli_version: tuple[int, int, int] | None = None
 
     async def start(self) -> None:
         """
@@ -625,6 +630,7 @@ class CodexNativeAppServer:
         # never silently disables enforcement — a genuine trust failure is
         # then caught below.
         codex_version = await _codex_cli_version(self.codex_path)
+        self.codex_cli_version = codex_version
         if codex_version is not None and codex_version < _MIN_POLICY_HOOK_CODEX_VERSION:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
@@ -823,14 +829,6 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
-        # Flush any hook-trust the user accepted this session back into the
-        # global config so the next session's copy inherits it and
-        # _retarget_codex_hook_trust_keys can carry it forward without prompting.
-        _merge_codex_hook_trust_back(
-            self.codex_home / "config.toml",
-            _codex_home_config_source_from_env(),
-            self.codex_home,
-        )
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -1829,6 +1827,7 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # flag because it MUST go, the sandbox flag for hygiene so the launched arg
 # list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+_CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
 # Granular approval/sandbox flags to drop when bypass is on. The "Full
 # access" / "Read only" approval presets emit the long ``--flag value`` form
 # (see web CODEX_NATIVE_APPROVAL_MODES), but ``terminal_launch_args`` is
@@ -1905,6 +1904,7 @@ def build_codex_remote_args(
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
     bypass_sandbox: bool = False,
+    bypass_hook_trust: bool = False,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -1954,6 +1954,14 @@ def build_codex_remote_args(
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
         the granular flags untouched. See issue #657.
+    :param bypass_hook_trust: When ``True``, emit
+        ``--dangerously-bypass-hook-trust`` so the TUI runs all enabled
+        hooks without the interactive "Hooks need review" trust prompt.
+        Intended for runner-owned headless sessions where the private
+        ``CODEX_HOME`` is provisioned by Omnigent and there is no terminal
+        user to answer the prompt. Default ``False`` for interactive
+        ``omnigent codex`` sessions where the user faces the terminal and
+        can accept hooks normally.
     :returns: Codex argv tail after the executable.
     """
     override_args: list[str] = []
@@ -1965,6 +1973,8 @@ def build_codex_remote_args(
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
         passthrough = normalize_codex_permission_launch_args(codex_args)
+    if bypass_hook_trust:
+        passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]

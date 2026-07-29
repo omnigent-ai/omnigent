@@ -669,6 +669,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""

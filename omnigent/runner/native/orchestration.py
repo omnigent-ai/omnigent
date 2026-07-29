@@ -3392,6 +3392,7 @@ async def _auto_create_codex_terminal(
     from pathlib import Path
 
     from omnigent.codex_native_app_server import (
+        _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         CodexAppServerClient,
         build_codex_native_server,
         build_codex_remote_args,
@@ -3735,6 +3736,15 @@ async def _auto_create_codex_terminal(
                     # OpenAI built-in (which would force the first-run
                     # login screen and block thread creation).
                     config_overrides=tuple(app_server.config_overrides),
+                    # Omnigent provisions the private CODEX_HOME and vets
+                    # hook sources itself; skip the interactive trust prompt
+                    # that headless sub-agents can never answer.
+                    # Gated on version: the flag was added in 0.140.0; on
+                    # older binaries it causes an immediate exit error.
+                    bypass_hook_trust=(
+                        app_server.codex_cli_version is None
+                        or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+                    ),
                 ),
                 env=codex_terminal_env(app_server),
                 # Match the local ``omnigent codex`` terminal scrollback.
