@@ -254,7 +254,7 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
 
     The built-in native harnesses follow a uniform module layout: each exports
     ``run_<key>_native`` (CLI + resume launch) and ``_materialize_<key>_agent_spec``
-    (agent seeding), re-exports ``_auto_create_<key>_terminal`` from
+    (agent seeding), exposes a ``_launch_<key>`` terminal adapter in
     ``omnigent.runner.native``, and exposes ``build_<key>_native_spawn_env`` in
     ``omnigent.<key>_native_bridge``. The remaining hooks (interrupt, stop,
     bridge-dir) are still runner-local closures / inline dispatch, so they stay
@@ -264,7 +264,7 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     return NativeHarnessProvider(
         key=key,
         run_native=f"{module}:run_{key}_native",
-        auto_create_terminal=f"omnigent.runner.native:_auto_create_{key}_terminal",
+        auto_create_terminal=f"omnigent.runner.native:_launch_{key}",
         spawn_env_builder=f"{module}_bridge:build_{key}_native_spawn_env",
         bridge_id_label_key=(f"{module}.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",

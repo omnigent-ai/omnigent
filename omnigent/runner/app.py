@@ -72,6 +72,7 @@ from omnigent.runner.native import (
     _COST_POPUP_REPOP_TASKS,
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
+    NativeLaunchContext,
     ResolvedSpec,
     _antigravity_native_terminal_arrives_via_transfer,
     _auto_create_antigravity_terminal,
@@ -101,6 +102,7 @@ from omnigent.runner.native import (
     _is_runner_owned_antigravity_terminal,
     _is_runner_owned_codex_terminal,
     _is_spec_local_native_python_tool,
+    _launch_native_terminal,
     _log_terminal_lookup_miss,
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
@@ -2785,105 +2787,46 @@ def create_runner_app(
                     )
 
         if harness_name == "pi-native":
-            _pi_ensure_lock = _pi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _pi_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_pi_terminal = (
-                    _tr is not None and _tr.get(session_id, "pi", "main") is not None
-                )
-                if not _has_pi_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        _pi_spec = await _resolve_session_agent_spec(session_id)
-                        await _auto_create_pi_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            agent_spec=_pi_spec,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create pi terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Pi",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
+            # pi resolves its spec unwrapped — a resolution error surfaces as a
+            # terminal-start error (preserved by not swallowing in the resolver).
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                ),
+                ensure_locks=_pi_terminal_ensure_locks,
+                resolve_agent_spec=lambda: _resolve_session_agent_spec(session_id),
+            )
 
         if harness_name == "cursor-native":
-            _cursor_ensure_lock = _cursor_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_cursor_terminal_ensure_locks,
+                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
             )
-            async with _cursor_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_cursor_terminal = (
-                    _tr is not None and _tr.get(session_id, "cursor", "main") is not None
-                )
-                if not _has_cursor_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        try:
-                            _cursor_spec = await _resolve_session_agent_spec(session_id)
-                        except OmnigentError:
-                            _cursor_spec = None
-                        await _auto_create_cursor_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                            agent_spec=_cursor_spec,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create cursor terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Cursor",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
 
         if harness_name == "kiro-native":
-            _kiro_ensure_lock = _kiro_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _kiro_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_kiro_terminal = (
-                    _tr is not None and _tr.get(session_id, "kiro", "main") is not None
-                )
-                if not _has_kiro_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_kiro_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create kiro terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Kiro",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_kiro_terminal_ensure_locks,
+            )
 
         if harness_name == "antigravity-native":
             _antigravity_ensure_lock = _antigravity_terminal_ensure_locks.setdefault(
@@ -2947,175 +2890,71 @@ def create_runner_app(
                     )
 
         if harness_name == "opencode-native":
-            _opencode_ensure_lock = _opencode_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_opencode_terminal_ensure_locks,
+                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
             )
-            async with _opencode_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_opencode_terminal = (
-                    _tr is not None and _tr.get(session_id, "opencode", "main") is not None
-                )
-                if not _has_opencode_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        try:
-                            _opencode_spec = await _resolve_session_agent_spec(session_id)
-                        except OmnigentError:
-                            _opencode_spec = None
-                        await _auto_create_opencode_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            agent_spec=_opencode_spec,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create opencode terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "OpenCode",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
 
         if harness_name == "goose-native":
-            _goose_ensure_lock = _goose_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_goose_terminal_ensure_locks,
             )
-            async with _goose_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_goose_terminal = (
-                    _tr is not None and _tr.get(session_id, "goose", "main") is not None
-                )
-                if not _has_goose_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_goose_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create goose terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Goose",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
 
         if harness_name == "hermes-native":
-            _hermes_ensure_lock = _hermes_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_hermes_terminal_ensure_locks,
             )
-            async with _hermes_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_hermes_terminal = (
-                    _tr is not None and _tr.get(session_id, "hermes", "main") is not None
-                )
-                if not _has_hermes_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_hermes_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create hermes terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Hermes",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
 
         if harness_name == "qwen-native":
-            _qwen_ensure_lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _qwen_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_qwen_terminal = (
-                    _tr is not None and _tr.get(session_id, "qwen", "main") is not None
-                )
-                if not _has_qwen_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_qwen_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create qwen terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "qwen",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_qwen_terminal_ensure_locks,
+            )
 
         if harness_name == "kimi-native":
-            _kimi_ensure_lock = _kimi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _kimi_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_kimi_terminal = (
-                    _tr is not None and _tr.get(session_id, "kimi", "main") is not None
-                )
-                if not _has_kimi_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        try:
-                            _kimi_spec = await _resolve_session_agent_spec(session_id)
-                        except OmnigentError:
-                            _kimi_spec = None
-                        await _auto_create_kimi_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                            agent_spec=_kimi_spec,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create kimi terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Kimi",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_kimi_terminal_ensure_locks,
+                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
+            )
 
         if (
             spec is not None
@@ -8444,6 +8283,18 @@ def create_runner_app(
     async def _resolve_session_agent_spec(session_id: str) -> Any | None:
         entry = await _resolve_session_spec_entry(session_id)
         return _unwrap_resolved_spec(entry) if entry is not None else None
+
+    async def _resolve_session_agent_spec_or_none(session_id: str) -> Any | None:
+        """Resolve the session agent spec, tolerating resolution failure.
+
+        The cursor/opencode/kimi launch arms swallow ``OmnigentError`` and
+        continue without a spec; this is their spec resolver for
+        ``_launch_native_terminal``.
+        """
+        try:
+            return await _resolve_session_agent_spec(session_id)
+        except OmnigentError:
+            return None
 
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
         cached = _session_skills_cache.get(session_id)
