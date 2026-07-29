@@ -66,6 +66,7 @@ def _spawn_host_daemon(
     tmp_path: Path,
     live_server: str,
     mock_llm_server_url: str,
+    host_config: dict[str, object] | None = None,
 ) -> _SpawnedHostDaemon:
     """
     Spawn an isolated host daemon for a single host e2e test.
@@ -96,9 +97,12 @@ def _spawn_host_daemon(
     # bare form, so _wait_for_host_online's comparison must see the same.
     host_id = uuid.uuid4().hex
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
+    host_section: dict[str, object] = {"host_id": host_id, "name": host_name}
+    if host_config is not None:
+        host_section.update(host_config)
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(
-            {"host": {"host_id": host_id, "name": host_name}},
+            {"host": host_section},
             default_flow_style=False,
             sort_keys=True,
         )

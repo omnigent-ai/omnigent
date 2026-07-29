@@ -119,7 +119,9 @@ def load_or_create_host_identity(
     name = socket.gethostname()
     identity = HostIdentity(host_id=host_id, name=name)
 
-    cfg["host"] = {"host_id": identity.host_id, "name": identity.name}
+    preserved_host = dict(host_section) if isinstance(host_section, dict) else {}
+    preserved_host.update({"host_id": identity.host_id, "name": identity.name})
+    cfg["host"] = preserved_host
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)

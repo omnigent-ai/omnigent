@@ -38,6 +38,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.managed_workspace import parse_managed_workspace
 from omnigent.model_override import validate_model_override
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
@@ -422,11 +423,20 @@ def register_core_routes(
                         "schema constraint should have prevented this",
                         code=ErrorCode.INTERNAL_ERROR,
                     )
+                try:
+                    managed_repo = parse_managed_workspace(resp.workspace)
+                except ValueError as exc:
+                    raise OmnigentError(
+                        "session has an invalid managed workspace marker",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    ) from exc
                 launch_frame = encode_host_frame(
                     HostLaunchRunnerFrame(
                         request_id=request_id,
                         binding_token=binding_token,
                         workspace=resp.workspace,
+                        git_branch=resp.git_branch if managed_repo is not None else None,
+                        managed_repo=managed_repo,
                         session_id=resp.id,
                         # Already canonical (see _resolve_harness); lets
                         # the host refuse an unconfigured harness before

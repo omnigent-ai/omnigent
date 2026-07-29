@@ -205,6 +205,12 @@ async def register_host(
                                     "runner_from_host" if launch_status == "launched" else None
                                 ),
                                 "error": None if launch_status == "launched" else "boom",
+                                "workspace": (
+                                    "/home/alice/universe-managed-1"
+                                    if frame.managed_repo is not None
+                                    else None
+                                ),
+                                "git_branch": frame.git_branch,
                             }
                         )
                 elif isinstance(frame, HostRemoveWorktreeFrame):
@@ -246,6 +252,7 @@ async def _launch(
     session_id: str,
     *,
     git: dict[str, object] | None = None,
+    managed_repo: str | None = None,
 ) -> httpx.Response:
     """POST the dedicated per-session bind+launch endpoint.
 
@@ -259,7 +266,36 @@ async def _launch(
     body: dict[str, object] = {"session_id": session_id, "workspace": _SOURCE_REPO}
     if git is not None:
         body["git"] = git
+    if managed_repo is not None:
+        body["managed_repo"] = managed_repo
     return await client.post(f"/v1/hosts/{_HOST_ID}/runners", json=body)
+
+
+async def test_managed_repo_launch_delegates_worktree_selection_to_host(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    cap = register_host()
+    session_id = await _bare_session(client, "managed-wt-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={"branch_name": "feature/managed"},
+        managed_repo="universe",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert cap.create == []
+    assert len(cap.launch) == 1
+    assert cap.launch[0].managed_repo == "universe"
+    assert cap.launch[0].workspace == "managed://universe"
+    assert cap.launch[0].git_branch == "feature/managed"
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == "managed://universe"
+    assert conv.git_branch == "feature/managed"
 
 
 async def test_launch_runner_with_git_creates_worktree_and_persists_branch(

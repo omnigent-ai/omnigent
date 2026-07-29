@@ -53,6 +53,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.managed_workspace import parse_managed_workspace
 from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -4101,11 +4102,18 @@ async def _launch_runner_on_host_impl(
         asyncio.get_running_loop().create_future()
     )
     host_conn.pending_launches[request_id] = launch_future
+    try:
+        managed_repo = parse_managed_workspace(conv.workspace)
+    except ValueError:
+        _logger.exception("session %s has an invalid managed workspace marker", conv.id)
+        return _HostLaunchAttempt(runner_id=new_runner_id)
     launch_frame = encode_host_frame(
         HostLaunchRunnerFrame(
             request_id=request_id,
             binding_token=binding_token,
             workspace=conv.workspace,
+            git_branch=conv.git_branch if managed_repo is not None else None,
+            managed_repo=managed_repo,
             session_id=conv.id,
             # Canonical harness (see _resolve_harness) so the host runs the
             # same configuration check it does at create-time launch. None
