@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import uuid
@@ -416,16 +417,53 @@ async def test_launch_native_terminal_force_recreate_tears_down_existing(
 
     monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
     registry = _FakeTerminalRegistry(existing=True)
+
+    async def _pre_launch(_has_terminal: bool) -> PreLaunchResult:
+        return PreLaunchResult(force_recreate=True)
+
     result = await _launch_native_terminal(
         "pi-native",
         _launch_ctx(resource_registry=_FakeResourceRegistry(registry)),
         ensure_locks={},
-        pre_launch=PreLaunchResult(force_recreate=True),
+        pre_launch=_pre_launch,
     )
 
     assert result is True
     assert registry.cleaned == ["conv_x"]
     assert created == ["conv_x"]
+
+
+@pytest.mark.asyncio
+async def test_launch_native_terminal_force_recreate_and_skip_tears_down_without_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """force_recreate + skip together = teardown but NO create.
+
+    Preserves the claude rebuild+transfer-inbound case: the stale terminal is
+    torn down, but because a sibling session's terminal is rotating in (skip),
+    creation is left to the transfer instead of racing it with a fresh launch.
+    """
+    from omnigent.runner.native import PreLaunchResult, _launch_native_terminal
+
+    async def _must_not_call(ctx: NativeLaunchContext) -> object:
+        raise AssertionError("adapter must not run when the transfer will deliver")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _must_not_call)
+    registry = _FakeTerminalRegistry(existing=True)
+
+    async def _pre_launch(_has_terminal: bool) -> PreLaunchResult:
+        return PreLaunchResult(force_recreate=True, skip=True)
+
+    result = await _launch_native_terminal(
+        "pi-native",
+        _launch_ctx(resource_registry=_FakeResourceRegistry(registry)),
+        ensure_locks={},
+        pre_launch=_pre_launch,
+    )
+
+    assert result is False
+    # Torn down (rebuild) but not recreated (skip → the transfer delivers).
+    assert registry.cleaned == ["conv_x"]
 
 
 @pytest.mark.asyncio
@@ -441,8 +479,14 @@ async def test_launch_native_terminal_skip_and_needs_terminal_return_false(
     monkeypatch.setattr("omnigent.runner.native._launch_pi", _must_not_call)
 
     for decision in (PreLaunchResult(skip=True), PreLaunchResult(needs_terminal=False)):
+
+        async def _pre_launch(
+            _has_terminal: bool, _d: PreLaunchResult = decision
+        ) -> PreLaunchResult:
+            return _d
+
         result = await _launch_native_terminal(
-            "pi-native", _launch_ctx(), ensure_locks={}, pre_launch=decision
+            "pi-native", _launch_ctx(), ensure_locks={}, pre_launch=_pre_launch
         )
         assert result is False
 
@@ -514,6 +558,68 @@ async def test_launch_native_terminal_non_native_returns_none() -> None:
 
     result = await _launch_native_terminal("claude-sdk", _launch_ctx(), ensure_locks={})
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_launch_native_terminal_build_context_enriches_only_on_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """build_context runs inside the create block and feeds the adapter's ctx."""
+    from omnigent.runner.native import _launch_native_terminal
+
+    seen: dict[str, Any] = {}
+    build_calls = {"n": 0}
+
+    async def _fake_launch_pi(ctx: NativeLaunchContext) -> object:
+        seen["bundle_dir"] = ctx.bundle_dir
+        return object()
+
+    async def _build(ctx: NativeLaunchContext) -> NativeLaunchContext:
+        build_calls["n"] += 1
+        return dataclasses.replace(ctx, bundle_dir=Path("/tmp/enriched"))
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
+
+    await _launch_native_terminal(
+        "pi-native", _launch_ctx(), ensure_locks={}, build_context=_build
+    )
+    assert build_calls["n"] == 1
+    assert seen["bundle_dir"] == Path("/tmp/enriched")
+
+    # Existing terminal: build_context must NOT run.
+    await _launch_native_terminal(
+        "pi-native",
+        _launch_ctx(resource_registry=_FakeResourceRegistry(_FakeTerminalRegistry(existing=True))),
+        ensure_locks={},
+        build_context=_build,
+    )
+    assert build_calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_launch_native_terminal_reraise_propagates_without_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reraise=True re-raises the builder failure instead of publishing an event."""
+    from omnigent.runner.native import _launch_native_terminal
+
+    async def _boom(ctx: NativeLaunchContext) -> object:
+        raise RuntimeError("cold-boot blew up")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _boom)
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    with pytest.raises(RuntimeError, match="cold-boot blew up"):
+        await _launch_native_terminal(
+            "pi-native",
+            _launch_ctx(publish_event=lambda name, event: events.append((name, event))),
+            ensure_locks={},
+            reraise=True,
+        )
+
+    # No start-error event was published (the caller converts the raise to a 503);
+    # only the pending on/off bracket events, none of which carry an error.
+    assert not any("error" in name.lower() or "error" in event for name, event in events)
 
 
 @pytest.mark.asyncio

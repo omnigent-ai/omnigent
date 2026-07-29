@@ -679,7 +679,9 @@ async def test_claude_native_model_options_use_session_launch_catalog(
             metadata={"terminal_name": "claude", "session_key": "main", "running": True},
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _fake_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
         spec_resolver=_resolver,
@@ -764,7 +766,9 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
             metadata={"terminal_name": "claude", "session_key": "main", "running": True},
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _fake_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
         spec_resolver=_resolver,
