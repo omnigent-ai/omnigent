@@ -1032,11 +1032,13 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
-    """Picking a non-default approval preset rides along to the create call.
+def test_start_session_select_codex_model_and_approval_mode(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Codex model and approval picks ride along to the create call.
 
-    Selecting "Full access" in the Codex config modal and saving must reach
-    ``POST /v1/sessions`` as
+    Selecting GPT-5.6 Sol and "Full access" in the Codex config modal must
+    reach ``POST /v1/sessions`` as a model override plus
     ``terminal_launch_args: ["--sandbox", "danger-full-access",
     "--ask-for-approval", "never"]``.
     """
@@ -1088,6 +1090,7 @@ async def _drive_agent_picker_pagination_dedupe(base_url: str, session_id: str) 
 
             await page.route("**/v1/agents?after=ag_codex_fork_2", handle_agents_page_2)
             await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
@@ -1149,6 +1152,28 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
 
             await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
+            async def handle_model_options(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "models": [
+                                {
+                                    "id": "databricks-gpt-5-6-sol",
+                                    "displayName": "GPT-5.6 Sol",
+                                },
+                                {"id": "databricks-gpt-5-5", "displayName": "GPT-5.5"},
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route(
+                f"**/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+                handle_model_options,
+            )
+
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
@@ -1160,9 +1185,14 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in); its approval presets live in
-            # the gear-icon config modal.
+            # Codex auto-selects (only built-in); model and approval choices
+            # share the gear-icon config modal.
             await _open_entry_config(page, "ag_codex_e2e")
+            await _pick_config_select(
+                page,
+                "new-chat-landing-config-model",
+                "GPT-5.6 Sol",
+            )
             approval = page.get_by_test_id("new-chat-landing-config-approval")
             await expect(approval).to_be_visible()
             await approval.click()
@@ -1179,6 +1209,7 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
+            assert body.get("model_override") == "databricks-gpt-5-6-sol", body
             assert body.get("terminal_launch_args") == [
                 "--sandbox",
                 "danger-full-access",

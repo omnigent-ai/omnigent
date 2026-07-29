@@ -99,6 +99,45 @@ async def test_handle_model_options_uses_host_claude_configuration(
     )
 
 
+async def test_handle_model_options_uses_host_codex_provider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Codex launch picker previews the host's resolved provider models."""
+    from omnigent import model_catalog
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(
+        model_catalog,
+        "list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="gateway",
+            verified=True,
+            models=(
+                ModelEntry(id="databricks-gpt-5-6-sol", family="openai"),
+                ModelEntry(id="databricks-gpt-5-5", family="openai"),
+            ),
+            note="test catalog",
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[
+            {
+                "id": "databricks-gpt-5-6-sol",
+                "displayName": "databricks-gpt-5-6-sol",
+            },
+            {"id": "databricks-gpt-5-5", "displayName": "databricks-gpt-5-5"},
+        ],
+    )
+
+
 def _make_host_process() -> HostProcess:
     """Create a HostProcess with a test identity.
 

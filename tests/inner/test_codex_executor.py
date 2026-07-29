@@ -441,7 +441,7 @@ class TestCodexExecutor(unittest.TestCase):
             ]
 
             self.assertEqual(events[-1].response, "done")
-            self.assertEqual(fake_session.calls[0]["model"], "databricks-gpt-5-5")
+            self.assertEqual(fake_session.calls[0]["model"], "databricks-gpt-5-6-sol")
 
         _run(_t())
 

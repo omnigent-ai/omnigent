@@ -40,6 +40,9 @@ MODEL_LISTS: dict[str, list[str]] = {
         "databricks-gpt-5-4-mini",
         "databricks-gpt-5-4",
         "databricks-gpt-5-5",
+        "databricks-gpt-5-6-luna",
+        "databricks-gpt-5-6-terra",
+        "databricks-gpt-5-6-sol",
     ],
     # pi is multi-model: Claude and GPT both available.
     "pi": [
@@ -50,6 +53,9 @@ MODEL_LISTS: dict[str, list[str]] = {
         "databricks-gpt-5-4",
         "databricks-claude-opus-4-8",
         "databricks-gpt-5-5",
+        "databricks-gpt-5-6-luna",
+        "databricks-gpt-5-6-terra",
+        "databricks-gpt-5-6-sol",
     ],
 }
 

@@ -54,7 +54,7 @@ CodexParams = dict[str, Any]
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _STDERR_CHUNK_LIMIT = 65536
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
+_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-6-sol"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
