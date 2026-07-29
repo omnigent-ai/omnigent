@@ -47,6 +47,13 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  Command,
+  CommandEmpty,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
   CLAUDE_NATIVE_EFFORTS,
   ConfigRow,
   DescribedSelect,
@@ -1359,9 +1366,119 @@ export function AgentHarnessPicker({
   );
 }
 
+function SearchableModelPicker({
+  value,
+  options,
+  loading,
+  onValueChange,
+}: {
+  value: string;
+  options: readonly { id: string; displayName: string }[];
+  loading: boolean;
+  onValueChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const selectedLabel =
+    value === MODEL_SELECT_DEFAULT
+      ? "Default"
+      : (options.find((option) => option.id === value)?.displayName ?? value);
+  const keywords = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  const filteredOptions =
+    keywords.length === 0
+      ? options
+      : options.filter((option) => {
+          const haystack = `${option.displayName} ${option.id}`.toLocaleLowerCase();
+          return keywords.every((keyword) => haystack.includes(keyword));
+        });
+  const select = (nextValue: string) => {
+    onValueChange(nextValue);
+    setOpen(false);
+    setQuery("");
+  };
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        if (!nextOpen) {
+          setQuery("");
+        }
+      }}
+    >
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          aria-label="Model"
+          className="h-8 w-full justify-between gap-2 px-2.5 font-normal"
+          data-testid="new-chat-landing-config-model"
+        >
+          <span className="min-w-0 truncate">{selectedLabel}</span>
+          <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        className="max-h-[var(--radix-popover-content-available-height)] w-[var(--radix-popover-trigger-width)] overflow-hidden p-0"
+      >
+        <Command shouldFilter={false} className="h-auto min-h-0">
+          <CommandInput
+            value={query}
+            onValueChange={setQuery}
+            placeholder="Search models…"
+            data-testid="new-chat-landing-config-model-search"
+          />
+          <CommandList
+            className="max-h-72 min-h-0 overflow-y-auto overscroll-contain"
+            onWheel={(event) => event.stopPropagation()}
+          >
+            <CommandItem
+              value={MODEL_SELECT_DEFAULT}
+              data-checked={value === MODEL_SELECT_DEFAULT}
+              onSelect={() => select(MODEL_SELECT_DEFAULT)}
+            >
+              Default
+            </CommandItem>
+            {filteredOptions.map((option) => (
+              <div
+                key={option.id}
+                title={option.displayName}
+                data-hover-label={option.displayName}
+                className="relative before:pointer-events-none before:absolute before:inset-x-1 before:top-1/2 before:z-10 before:hidden before:-translate-y-1/2 before:rounded-md before:border before:border-border before:bg-popover before:px-2.5 before:py-2 before:text-xs before:break-all before:text-popover-foreground before:shadow-sm before:content-[attr(data-hover-label)] hover:before:block"
+              >
+                <CommandItem
+                  value={option.id}
+                  data-model-id={option.id}
+                  data-checked={value === option.id}
+                  onSelect={() => select(option.id)}
+                >
+                  <span className="min-w-0 truncate">{option.displayName}</span>
+                </CommandItem>
+              </div>
+            ))}
+            {!loading && filteredOptions.length === 0 && (
+              <CommandEmpty>No models found</CommandEmpty>
+            )}
+            {loading && (
+              <div className="px-2 py-3 text-center text-xs text-muted-foreground">
+                Loading models…
+              </div>
+            )}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 /**
  * Harness-configuration modal opened from the composer's gear icon. Shows the
  * selected agent's run-config knobs — Claude: model / effort / permissions;
+ * Pi: model;
  * Codex/OpenCode: approval mode (+ Codex's dangerous full-bypass opt-in);
  * Cursor: exec mode; bundle agents: brain-harness override. On the fully-auto
  * harness the router owns harness and model, so every harness-specific knob
@@ -1391,6 +1508,8 @@ function HarnessConfigModal({
   claudeModelsLoading,
   codexModelOptions,
   codexModelsLoading,
+  piModelOptions,
+  piModelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1421,6 +1540,8 @@ function HarnessConfigModal({
   claudeModelsLoading: boolean;
   codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   codexModelsLoading: boolean;
+  piModelOptions: readonly { id: string; displayName: string }[];
+  piModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1442,9 +1563,8 @@ function HarnessConfigModal({
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
   const hasAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
+  const hasModelPicker = nativeAgentHasCapability(agent, "modelPicker");
   const isCodex = entryHarness === "codex-native";
-  const modelOptions = isCodex ? codexModelOptions : claudeModelOptions;
-  const modelsLoading = isCodex ? codexModelsLoading : claudeModelsLoading;
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
@@ -1542,6 +1662,9 @@ function HarnessConfigModal({
           effort: draftEffort,
           mode: draftPermission,
         });
+    } else if (hasModelPicker) {
+      setPickedModel(draftModel);
+      if (entryHarness) writeHarnessOption(entryHarness, { model: draftModel });
     } else if (hasApproval) {
       if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
@@ -1596,7 +1719,10 @@ function HarnessConfigModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md" data-testid="new-chat-landing-config-modal">
+      <DialogContent
+        className={cn("sm:max-w-md", entryHarness === "pi-native" && "sm:max-w-xl")}
+        data-testid="new-chat-landing-config-modal"
+      >
         <DialogHeader>
           <DialogTitle>Configure {configTitleName}</DialogTitle>
           <DialogDescription className="sr-only">
@@ -1605,6 +1731,17 @@ function HarnessConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
+          {!autoRouting && hasModelPicker && !hasPermission && (
+            <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
+              <SearchableModelPicker
+                value={modelValue}
+                options={piModelOptions}
+                loading={piModelsLoading}
+                onValueChange={onModelChange}
+              />
+            </ConfigRow>
+          )}
+
           {!autoRouting && hasPermission && (
             <>
               <ConfigRow label="Model" description="Underlying LLM">
@@ -1687,10 +1824,10 @@ function HarnessConfigModal({
                   defaultLabel={defaultModelLabel(codexModelOptions, displayModelId)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                 >
-                  {modelsLoading && (
+                  {codexModelsLoading && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
                   )}
-                  {!modelsLoading && modelOptions.length === 0 && (
+                  {!codexModelsLoading && codexModelOptions.length === 0 && (
                     <div className="px-2.5 py-1 text-sm text-muted-foreground">
                       Models unavailable
                     </div>
@@ -2090,6 +2227,11 @@ export function NewChatLandingScreen() {
     "codex-native",
     !sandboxSelected,
   );
+  const { data: hostPiModelOptions, isLoading: hostPiModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    "pi-native",
+    !sandboxSelected,
+  );
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -2106,6 +2248,16 @@ export function NewChatLandingScreen() {
   const codexModelOptions = useMemo(
     () => (sandboxSelected ? [] : (hostCodexModelOptions ?? [])),
     [hostCodexModelOptions, sandboxSelected],
+  );
+  const piModelOptions = useMemo(
+    () =>
+      sandboxSelected
+        ? []
+        : (hostPiModelOptions ?? []).map((option) => ({
+            id: option.id,
+            displayName: option.displayName ?? option.id,
+          })),
+    [hostPiModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -2637,15 +2789,16 @@ export function NewChatLandingScreen() {
         : agentList.find((a) => a.id === effectiveAgentId),
     [agentList, effectiveAgentId, pendingAgent],
   );
+  const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
+  const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
-  const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
@@ -2683,6 +2836,7 @@ export function NewChatLandingScreen() {
     supportsApprovalMode ||
     supportsCursorMode ||
     supportsAgySkipPermissions ||
+    supportsModelPicker ||
     smartRoutingEligible ||
     (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
   // Label/value pairs summarizing the selected agent's current run-config, for
@@ -2708,6 +2862,11 @@ export function NewChatLandingScreen() {
       // mirror it. Report the constant — never a mode left over in state from a
       // previously selected native harness.
       return [{ label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
+    }
+    if (supportsModelPicker && !supportsPermissionMode) {
+      const modelValue =
+        piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
+      return [{ label: "Model", value: modelValue }];
     }
     if (supportsPermissionMode) {
       const modelValue = routingOn
@@ -2782,12 +2941,14 @@ export function NewChatLandingScreen() {
     supportsApprovalMode,
     supportsCursorMode,
     supportsAgySkipPermissions,
+    supportsModelPicker,
     selectedAgent,
     brainHarnessLabelsAll,
     routingOn,
     pickedModel,
     claudeModelOptions,
     codexModelOptions,
+    piModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -2837,6 +2998,13 @@ export function NewChatLandingScreen() {
     // this holds on every run of this effect — including the re-run when the
     // model catalog resolves, which lands after the routing seed below.
     const storedRoutingOn = stored.routing === "on";
+    if (selectedNativeHarness === "pi-native") {
+      setPickedModel(
+        stored.model != null && piModelOptions.some((model) => model.id === stored.model)
+          ? stored.model
+          : "",
+      );
+    }
     if (supportsPermissionMode) {
       setPermissionMode(
         resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
@@ -2881,7 +3049,7 @@ export function NewChatLandingScreen() {
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions]);
+  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions, piModelOptions]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
   // (which resolves after mount — this must reseed when it lands). A stored
@@ -3581,6 +3749,7 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
       const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
+      const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is
@@ -3748,13 +3917,13 @@ export function NewChatLandingScreen() {
                       ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
                       : undefined,
             // Model + reasoning effort, persisted on the session row before
-            // the runner launches. Claude and Codex read model_override at
+            // the runner launches. Claude, Codex, and Pi read model_override at
             // terminal launch; an unselected ("") knob is omitted so the
             // harness keeps its own configured/default model.
             model_override:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              (agentSupportsPermissionMode || nativeAgent?.harness === "codex-native") &&
+              (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
               pickedModel
                 ? pickedModel
                 : undefined,
@@ -4323,6 +4492,10 @@ export function NewChatLandingScreen() {
                     codexModelOptions={codexModelOptions}
                     codexModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
+                    }
+                    piModelOptions={piModelOptions}
+                    piModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostPiModelsLoading
                     }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}

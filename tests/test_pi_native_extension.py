@@ -2668,9 +2668,9 @@ const setModelCalls = [];
 // The catalog Pi's modelRegistry exposes; setModel returns false for a model
 // with no configured API key (mirrors Pi's real contract).
 const catalog = [
-  { id: "databricks-claude-sonnet-4-6", name: "Sonnet", hasKey: true },
-  { id: "databricks-claude-opus-4-1", name: "Opus", hasKey: true },
-  { id: "no-key-model", name: "NoKey", hasKey: false },
+  { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet", hasKey: true },
+  { provider: "omnigent", id: "databricks-claude-opus-4-1", name: "Opus", hasKey: true },
+  { provider: "omnigent", id: "no-key-model", name: "NoKey", hasKey: false },
 ];
 const pi = {
   registerCommand() {},
@@ -2692,10 +2692,11 @@ const ctx = {
   // external_model_change). ``getAvailable`` returns only auth-configured
   // models (what the picker should show); ``getAll`` is Pi's full built-in
   // catalog (the fallback for older Pi).
-  model: { id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
+  model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
   modelRegistry: {
     getAll: () => catalog,
     getAvailable: () => catalog.filter((m) => m.hasKey),
+    find: (provider, id) => catalog.find((m) => m.provider === provider && m.id === id),
   },
 };
 
@@ -2747,7 +2748,7 @@ def test_inbox_model_change_applies_via_set_model(tmp_path: Path) -> None:
         + r"""
 (async () => {
   await handlers.session_start({}, ctx); // starts the inbox poller
-  await deliverModelChange("databricks-claude-opus-4-1");
+  await deliverModelChange("omnigent/databricks-claude-opus-4-1");
 
   assert.equal(setModelCalls.length, 1, JSON.stringify(setModelCalls));
   assert.equal(setModelCalls[0].id, "databricks-claude-opus-4-1");
@@ -2814,23 +2815,23 @@ def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
   // resolves from the start; ignore that when checking the user switch.
   const startupChanges = posted.filter((e) => e.type === "external_model_change");
   assert.equal(startupChanges.length, 1, JSON.stringify(posted));
-  assert.equal(startupChanges[0].data.model, "databricks-claude-sonnet-4-6");
+  assert.equal(startupChanges[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
 
   // A genuine user switch mirrors back.
   await handlers.model_select(
-    { source: "set", model: { id: "databricks-claude-opus-4-1" } },
+    { source: "set", model: { provider: "omnigent", id: "databricks-claude-opus-4-1" } },
     ctx,
   );
   // A startup restore must be ignored (could clobber a pending web override).
   await handlers.model_select(
-    { source: "restore", model: { id: "databricks-claude-sonnet-4-6" } },
+    { source: "restore", model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6" } },
     ctx,
   );
 
   const changes = posted.filter((e) => e.type === "external_model_change");
   // Two total: the startup mirror + the one user switch (restore ignored).
   assert.equal(changes.length, 2, JSON.stringify(posted));
-  assert.equal(changes[1].data.model, "databricks-claude-opus-4-1");
+  assert.equal(changes[1].data.model, "omnigent/databricks-claude-opus-4-1");
   finish();
 })().catch((error) => {
   finish();
@@ -2870,16 +2871,19 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
   // getAvailable() filters out ``no-key-model`` (no configured auth).
   assert.deepEqual(
     models.map((m) => m.id),
-    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
     JSON.stringify(models),
   );
   // Display name falls back to the model's ``name``.
-  assert.equal(models[0].displayName, "Sonnet");
+  assert.equal(models[0].displayName, "omnigent/Sonnet");
 
   // The launch model is mirrored so the pill/active-row resolve immediately.
   const changes = posted.filter((e) => e.type === "external_model_change");
   assert.equal(changes.length, 1, JSON.stringify(posted));
-  assert.equal(changes[0].data.model, "databricks-claude-sonnet-4-6");
+  assert.equal(changes[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
   finish();
 })().catch((error) => {
   finish();

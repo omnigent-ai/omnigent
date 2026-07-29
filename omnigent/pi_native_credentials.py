@@ -356,6 +356,25 @@ class PiProviderConfig:
         )
 
 
+def pi_native_model_options() -> list[dict[str, object]]:
+    """Return pre-launch Pi choices configured through ``omni setup``."""
+    provider = resolve_pi_native_provider()
+    if provider is None:
+        return []
+
+    options: dict[str, dict[str, object]] = {}
+    for provider_id, payload in provider.to_models_config()["providers"].items():
+        for model in payload["models"]:
+            model_id = model["id"]
+            qualified = f"{provider_id}/{model_id}"
+            options[qualified] = {
+                "id": qualified,
+                "model": qualified,
+                "displayName": f"{provider_id}/{model.get('name') or model_id}",
+            }
+    return [options[model_id] for model_id in sorted(options)]
+
+
 def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
     """Resolve a Databricks-profile provider into Pi gateway config.
 
@@ -1058,7 +1077,10 @@ def write_pi_models_config(
 
 
 def pi_native_provider_launch(
-    agent_dir: Path, provider: PiProviderConfig
+    agent_dir: Path,
+    provider: PiProviderConfig,
+    *,
+    selection: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Write the managed config and return the launch env + CLI args for Pi.
 
@@ -1089,20 +1111,30 @@ def pi_native_provider_launch(
     # models are in the primary provider (omnigent). Read the *rendered* config
     # rather than additional_providers so a model routed by the family fallback
     # gets the same --provider that models.json registered it under.
+    selected_model = provider.model
     model_provider_id = provider.provider_id
-    for extra_id, extra_cfg in rendered["providers"].items():
-        if extra_id == provider.provider_id:
-            continue
-        if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
-            model_provider_id = extra_id
-            break
+    if selection and "/" in selection:
+        candidate_provider, _, candidate_model = selection.partition("/")
+        configured = rendered["providers"].get(candidate_provider)
+        if configured and any(
+            model.get("id") == candidate_model for model in configured.get("models", [])
+        ):
+            model_provider_id = candidate_provider
+            selected_model = candidate_model
+    else:
+        for extra_id, extra_cfg in rendered["providers"].items():
+            if extra_id == provider.provider_id:
+                continue
+            if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
+                model_provider_id = extra_id
+                break
     # When the model id contains a "/" Pi's arg parser splits on the first
     # slash and treats the left part as a provider name, overriding
     # --provider. Pass the fully-qualified "provider/model" reference so Pi's
     # findExactModelReferenceMatch matches the canonical form exactly and
     # routes to our custom provider, not a builtin with the same model id.
     model_arg = (
-        f"{model_provider_id}/{provider.model}" if "/" in provider.model else provider.model
+        f"{model_provider_id}/{selected_model}" if "/" in selected_model else selected_model
     )
     args = ["--provider", model_provider_id, "--model", model_arg]
     # For non-Claude models on openai-completions/responses, disable thinking.
