@@ -289,8 +289,12 @@ def test_max_effort_is_rejected_unbilled(tool_ctx: ToolContext) -> None:
 
 
 @respx.mock
-def test_legacy_gate_policy_cannot_degrade_max(tool_ctx: ToolContext) -> None:
-    """A stale config cannot silently turn the coming-soon tier into x-high."""
+def test_unknown_config_keys_cannot_make_max_selectable(tool_ctx: ToolContext) -> None:
+    """No config key can turn the coming-soon tier into a silent x-high downgrade.
+
+    `gate_policy` is not read anywhere in the tool — this pins that fact: an
+    unrecognized key stays inert instead of re-opening a substitution path.
+    """
     out = _invoke(
         _config(gate_policy="degrade"),
         tool_ctx,
@@ -536,10 +540,11 @@ def test_timeout_uses_monotonic_deadline(tool_ctx: ToolContext, fake_clock: _Fak
         _config(timeout_seconds="10", poll_interval_seconds="2"),
         tool_ctx,
     )
-    assert out == (
+    assert out.startswith(
         f"Nimble research run {_RUN_ID} timed out after 10s (last status: running). "
         "The run may still complete server-side."
     )
+    assert "Do not resubmit this task automatically" in out
     assert fake_clock.sleeps == [2.0] * 5, "polling must pace by the configured interval"
 
 
@@ -575,7 +580,8 @@ def test_poll_403_no_blind_retry(tool_ctx: ToolContext, fake_clock: _FakeClock) 
     respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("queued")))
     poll = respx.get(_RUN_URL).mock(return_value=httpx.Response(403))
     out = _invoke(_config(), tool_ctx)
-    assert out == f"Nimble research run {_RUN_ID} polling failed: HTTP 403"
+    assert out.startswith(f"Nimble research run {_RUN_ID} polling failed: HTTP 403")
+    assert "Do not resubmit this task automatically" in out
     assert poll.call_count == 1
 
 
@@ -620,7 +626,8 @@ def test_poll_transient_budget_exhausted(tool_ctx: ToolContext, fake_clock: _Fak
     respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("queued")))
     poll = respx.get(_RUN_URL).mock(return_value=httpx.Response(503))
     out = _invoke(_config(), tool_ctx)
-    assert out == f"Nimble research run {_RUN_ID} polling failed: HTTP 503"
+    assert out.startswith(f"Nimble research run {_RUN_ID} polling failed: HTTP 503")
+    assert "Do not resubmit this task automatically" in out
     assert poll.call_count == 4, "three retries after the first failure, then give up"
 
 
@@ -658,10 +665,11 @@ def test_result_409_budget_exhausted(tool_ctx: ToolContext, fake_clock: _FakeClo
     respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
     result = respx.get(_RESULT_URL).mock(return_value=httpx.Response(409))
     out = _invoke(_config(), tool_ctx)
-    assert out == (
-        f"Nimble research run {_RUN_ID} completed but its result was not yet "
-        "available (HTTP 409). Retry the task to fetch it."
+    assert out.startswith(
+        f"Nimble research run {_RUN_ID} completed but its result was not yet available (HTTP 409)."
     )
+    assert "Do not resubmit this task automatically" in out
+    assert "Retry the task" not in out
     assert result.call_count == 4, "three re-checks after the first 409, then give up"
 
 
@@ -692,10 +700,11 @@ def test_poll_5xx_error_body_detail_surfaced(
         )
     )
     out = _invoke(_config(), tool_ctx)
-    assert out == (
+    assert out.startswith(
         f"Nimble research run {_RUN_ID} polling failed: "
         "HTTP 500: backend hiccup (task: task_poll_500)"
     )
+    assert "Do not resubmit this task automatically" in out
 
 
 @respx.mock
@@ -738,7 +747,8 @@ def test_result_malformed_json_keeps_run_id(tool_ctx: ToolContext, fake_clock: _
     respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
     respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, text="<html>oops</html>"))
     out = _invoke(_config(), tool_ctx)
-    assert out == f"Nimble research run {_RUN_ID} result was not valid JSON."
+    assert out.startswith(f"Nimble research run {_RUN_ID} result was not valid JSON.")
+    assert "Do not resubmit this task automatically" in out
 
 
 # ---------------------------------------------------------------------------
@@ -987,17 +997,17 @@ def test_clamp_seconds_junk_and_bounds() -> None:
 
 def test_resolve_effort_preserves_omission_and_validates_tiers() -> None:
     """Unset stays omitted; released tiers normalize; max always stops."""
-    assert _resolve_effort({}, None) == (None, None, None)
-    assert _resolve_effort({"effort": "  "}, None) == (None, None, None)
+    assert _resolve_effort({}, None) == (None, None)
+    assert _resolve_effort({"effort": "  "}, None) == (None, None)
     for tier in ("low", "medium", "high", "x-high"):
-        assert _resolve_effort({}, tier.upper()) == (tier, None, None)
-    effort, notice, error = _resolve_effort({"effort": "max"}, None)
+        assert _resolve_effort({}, tier.upper()) == (tier, None)
+    effort, error = _resolve_effort({"effort": "max"}, None)
     assert effort is None
-    assert notice is None
     assert error is not None and "nothing was sent" in error
-    effort, notice, error = _resolve_effort({"effort": "max", "gate_policy": "degrade"}, None)
+    # A resolved effort is always exactly what was asked for: there is no
+    # substitution channel, so no legacy config can turn max into another tier.
+    effort, error = _resolve_effort({"effort": "max", "gate_policy": "degrade"}, None)
     assert effort is None
-    assert notice is None
     assert error is not None and "explicitly choose x-high" in error
 
 
@@ -1391,7 +1401,7 @@ def test_transport_failure_on_create_warns_against_resubmitting(
 
 
 @respx.mock
-@pytest.mark.parametrize("status", [401, 403, 404, 422])
+@pytest.mark.parametrize("status", [401, 403, 404, 422, 429])
 def test_clear_rejection_does_not_warn_against_resubmitting(
     tool_ctx: ToolContext, status: int
 ) -> None:
@@ -1441,3 +1451,39 @@ def test_owner_mismatch_reconciles_by_run_id(
     out = _invoke(_config(), tool_ctx)
     assert _NO_RETRY in out, out
     assert f"reconcile run {_RUN_ID}" in out
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "phase", ["poll_timeout", "poll_http_error", "result_http_error", "result_409_exhausted"]
+)
+def test_post_create_failures_warn_against_resubmitting(
+    tool_ctx: ToolContext, fake_clock: _FakeClock, phase: str
+) -> None:
+    """Once the run exists it is billed, so no later failure may invite a resubmit.
+
+    The create-time rule and the post-create rule have to agree: telling the
+    caller to "retry the task" after a run was created and paid for is how the
+    same research gets billed twice.
+    """
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("queued")))
+    if phase == "poll_timeout":
+        respx.get(_RUN_URL).mock(return_value=httpx.Response(200, json=_run("running")))
+    elif phase == "poll_http_error":
+        respx.get(_RUN_URL).mock(return_value=httpx.Response(500))
+    else:
+        respx.get(_RUN_URL).mock(return_value=httpx.Response(200, json=_run("completed")))
+        respx.get(_RESULT_URL).mock(
+            return_value=httpx.Response(409 if phase == "result_409_exhausted" else 500)
+        )
+
+    out = _invoke(
+        _config(timeout_seconds="10", poll_interval_seconds="2"),
+        tool_ctx,
+        args={"task": "x"},
+    )
+
+    assert _RUN_ID in out, out
+    assert "Do not resubmit this task automatically" in out, out
+    assert "reconcile it by run id" in out
+    assert "Retry the task" not in out, "a billed run must never be re-submitted to re-read"

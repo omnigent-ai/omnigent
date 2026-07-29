@@ -34,7 +34,11 @@ timeout may still have been received, and 408/5xx reached Nimble before failing
 — while a 202 carrying an unusable body means the run was definitely created.
 Those errors say so explicitly and tell the caller not to resubmit, pointing at
 the run id when one survived and at the account's run history when none did. A
-clear rejection (401/403/404/422) created nothing and carries no such warning.
+clear rejection (401/403/404/422) created nothing and carries no such warning, and a
+create-time 429 is treated the same way: a rate limiter refuses the request before a run
+is started, so there is nothing to reconcile. Once creation succeeds the run exists and is
+billed, so every later failure — timeout, polling, result fetch — carries the same
+do-not-resubmit guidance, keyed to the run id.
 
 Effort is optional. When omitted, Nimble applies the selected agent/template
 default (the documented product default is ``high``; template defaults vary).
@@ -205,22 +209,24 @@ def _clamp_seconds(
 
 def _resolve_effort(
     config: dict[str, str], arg_value: str | None
-) -> tuple[str | None, str | None, str | None]:
+) -> tuple[str | None, str | None]:
     """
     Resolve an optional effort override. An omission stays ``None`` so the
     selected agent/template default applies.
 
+    A requested tier is either honored or refused: there is no substitution, so
+    a resolved effort is always exactly what the caller asked for.
+
     :param config: Spec-level config (optional ``effort``).
     :param arg_value: Effort from the tool call, if any.
-    :returns: ``(effective_effort, notice, error_message)``.
+    :returns: ``(effective_effort, error_message)``.
     """
     raw = arg_value if arg_value is not None else config.get("effort")
     if raw is None or not str(raw).strip():
-        return None, None, None
+        return None, None
     value = str(raw).strip().lower()
     if value == "max":
         return (
-            None,
             None,
             (
                 "Max effort is a coming-soon custom-budget capability and is not "
@@ -233,10 +239,27 @@ def _resolve_effort(
     if value not in _SELECTABLE_EFFORTS:
         return (
             None,
-            None,
             (f"Error: unsupported effort {str(raw)!r}. Choose low, medium, high, or x-high."),
         )
-    return value, None, None
+    return value, None
+
+
+def _created_run_guidance(run_id: str) -> str:
+    """
+    Guidance for a failure that happens *after* the run was created.
+
+    Once creation succeeds the run exists and has been billed, so resubmitting
+    the task creates and pays for a second one. Every post-create failure ends
+    with this, mirroring the create-time rule rather than leaving the caller to
+    guess which side of the boundary it is on.
+
+    :param run_id: The run that already exists.
+    :returns: A sentence telling the caller to reconcile, not resubmit.
+    """
+    return (
+        f" Do not resubmit this task automatically: run {_cap_field(run_id)} was already "
+        "created and billed — reconcile it by run id before trying again."
+    )
 
 
 def _unresolved_create_error(message: str, run_id: str | None = None) -> str:
@@ -630,12 +653,14 @@ def _poll_until_terminal(
             return None, (
                 f"Nimble research run {run_id} timed out after {timeout_s:g}s "
                 f"(last status: {status}). The run may still complete server-side."
+                + _created_run_guidance(run_id)
             )
         _sleep(min(interval_s, remaining))
         if deadline - _monotonic() <= 0:
             return None, (
                 f"Nimble research run {run_id} timed out after {timeout_s:g}s "
                 f"(last status: {status}). The run may still complete server-side."
+                + _created_run_guidance(run_id)
             )
         try:
             resp = httpx.get(
@@ -644,18 +669,24 @@ def _poll_until_terminal(
                 timeout=_HTTP_TIMEOUT_S,
             )
         except httpx.InvalidURL as exc:
-            return None, f"Nimble research run {run_id} polling failed: {exc}"
+            return None, (
+                f"Nimble research run {run_id} polling failed: {exc}"
+                + _created_run_guidance(run_id)
+            )
         except httpx.RequestError as exc:
             transient_failures += 1
             if transient_failures > _MAX_TRANSIENT_RETRIES:
-                return None, f"Nimble research run {run_id} polling failed: {exc}"
+                return None, (
+                    f"Nimble research run {run_id} polling failed: {exc}"
+                    + _created_run_guidance(run_id)
+                )
             continue
         if resp.status_code == 429:
             transient_failures += 1
             if transient_failures > _MAX_TRANSIENT_RETRIES:
                 return None, (
                     f"Nimble research run {run_id} polling was rate-limited "
-                    f"(HTTP 429{_http_error_detail(resp)})."
+                    f"(HTTP 429{_http_error_detail(resp)})." + _created_run_guidance(run_id)
                 )
             retry_after = _retry_after_seconds(resp)
             if retry_after is not None:
@@ -667,17 +698,22 @@ def _poll_until_terminal(
                 return (
                     None,
                     f"Nimble research run {run_id} polling failed: "
-                    f"HTTP {resp.status_code}{_http_error_detail(resp)}",
+                    f"HTTP {resp.status_code}{_http_error_detail(resp)}"
+                    + _created_run_guidance(run_id),
                 )
             continue
         if resp.status_code >= 400:
             return None, (
                 f"Nimble research run {run_id} polling failed: "
                 f"HTTP {resp.status_code}{_http_error_detail(resp)}"
+                + _created_run_guidance(run_id)
             )
         data = _parse_json_dict(resp)
         if data is None:
-            return None, f"Nimble research run {run_id} polling returned a non-JSON response."
+            return None, (
+                f"Nimble research run {run_id} polling returned a non-JSON response."
+                + _created_run_guidance(run_id)
+            )
         current = data
         transient_failures = 0
 
@@ -713,7 +749,10 @@ def _fetch_result(
                 timeout=_HTTP_TIMEOUT_S,
             )
         except (httpx.RequestError, httpx.InvalidURL) as exc:
-            return None, f"Nimble research run {run_id} result fetch failed: {exc}"
+            return None, (
+                f"Nimble research run {run_id} result fetch failed: {exc}"
+                + _created_run_guidance(run_id)
+            )
         if resp.status_code == 409:
             # The run was observed completed, so a 409 here is a brief
             # consistency race; re-check within the deadline.
@@ -722,7 +761,7 @@ def _fetch_result(
             if conflict_retries > _MAX_TRANSIENT_RETRIES or remaining <= 0:
                 return None, (
                     f"Nimble research run {run_id} completed but its result was not yet "
-                    "available (HTTP 409). Retry the task to fetch it."
+                    "available (HTTP 409)." + _created_run_guidance(run_id)
                 )
             _sleep(min(interval_s, remaining))
             continue
@@ -737,11 +776,15 @@ def _fetch_result(
             return (
                 None,
                 f"Nimble research run {run_id} result fetch failed: "
-                f"HTTP {resp.status_code}{_http_error_detail(resp)}",
+                f"HTTP {resp.status_code}{_http_error_detail(resp)}"
+                + _created_run_guidance(run_id),
             )
         data = _parse_json_dict(resp)
         if data is None:
-            return None, f"Nimble research run {run_id} result was not valid JSON."
+            return None, (
+                f"Nimble research run {run_id} result was not valid JSON."
+                + _created_run_guidance(run_id)
+            )
         output = data.get("output")
         if isinstance(output, dict):
             return data, None
@@ -920,7 +963,7 @@ def _run_agent_v2(
         config_error = _validate_agent_id(configured_agent_id, "the configured")
         if config_error is not None:
             return config_error
-    effort, gate_notice, effort_error = _resolve_effort(config, effort_arg)
+    effort, effort_error = _resolve_effort(config, effort_arg)
     if effort_error is not None:
         return effort_error
     timeout_s = _clamp_seconds(
@@ -937,33 +980,9 @@ def _run_agent_v2(
     headers = _headers(api_key)
     deadline = _monotonic() + timeout_s
 
-    outcome = _run_lifecycle(
+    return _run_lifecycle(
         base, headers, configured_agent_id, task, effort, controls, deadline, interval_s, timeout_s
     )
-    # A degraded run is announced on every outcome, not only a successful one:
-    # the caller asked for an effort they did not get, and that stays true when
-    # the run then fails or times out.
-    return _attach_notice(outcome, gate_notice)
-
-
-def _attach_notice(outcome: str, notice: str | None) -> str:
-    """
-    Surface a gate notice alongside the run's outcome.
-
-    :param outcome: The JSON envelope, or an error message.
-    :param notice: The notice to surface, if any.
-    :returns: The outcome carrying the notice.
-    """
-    if notice is None:
-        return outcome
-    try:
-        envelope = json.loads(outcome)
-    except (json.JSONDecodeError, ValueError):
-        envelope = None
-    if isinstance(envelope, dict):
-        envelope["notice"] = notice
-        return json.dumps(envelope, ensure_ascii=False)
-    return f"{outcome} ({notice})"
 
 
 def _run_lifecycle(
@@ -1099,18 +1118,22 @@ class NimbleResearchTool(Tool):
                         },
                         "sources": {
                             "type": "object",
+                            # Mirrors what _resolve_controls actually enforces, so a
+                            # schema-conformant call is never rejected at runtime.
+                            "additionalProperties": False,
                             "properties": {
-                                "prioritize": {"type": "string"},
-                                "avoid": {"type": "string"},
+                                "prioritize": {"type": "string", "minLength": 1},
+                                "avoid": {"type": "string", "minLength": 1},
                                 "allow": {
                                     "type": "array",
                                     "items": {
                                         "type": "object",
+                                        "additionalProperties": False,
                                         "properties": {
-                                            "title": {"type": "string"},
+                                            "title": {"type": "string", "minLength": 1},
                                             "domains": {
                                                 "type": "array",
-                                                "items": {"type": "string"},
+                                                "items": {"type": "string", "minLength": 1},
                                                 "minItems": 1,
                                             },
                                             "order": {"type": "integer"},
@@ -1122,11 +1145,12 @@ class NimbleResearchTool(Tool):
                                     "type": "array",
                                     "items": {
                                         "type": "object",
+                                        "additionalProperties": False,
                                         "properties": {
-                                            "title": {"type": "string"},
+                                            "title": {"type": "string", "minLength": 1},
                                             "domains": {
                                                 "type": "array",
-                                                "items": {"type": "string"},
+                                                "items": {"type": "string", "minLength": 1},
                                                 "minItems": 1,
                                             },
                                             "order": {"type": "integer"},
