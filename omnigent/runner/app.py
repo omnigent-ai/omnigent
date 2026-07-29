@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
+import itertools
 import json
 import logging
 import mimetypes
@@ -31,6 +33,7 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalListEntry
 
 import click
+import httpcore
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -296,6 +299,31 @@ _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 # fail-open/retry path. Guarded by tests/test_ask_timeout_infinite.py.
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
+
+# Verdict-delivery transport errors that mean the harness channel itself is
+# dead (subprocess SIGKILL'd, connection reset, already gone before the POST
+# opens a socket, or unresponsive past the deadline) rather than a transient
+# blip. Nothing on a dead channel can resolve the harness's parked policy
+# future, so it would hang for ``_POLICY_EVAL_TIMEOUT_S`` (24h) instead of
+# self-healing. ``httpx.TimeoutException`` is the base for read/write/pool/
+# connect timeouts — a wedged harness that accepts the socket but never
+# acknowledges the POST is just as dead as one that reset the connection.
+_DEAD_HARNESS_CHANNEL_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.StreamClosed,
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpcore.ReadError,
+    httpcore.ConnectError,
+    httpcore.TimeoutException,
+)
+
+# Client-visible code for a turn-context desync. Deliberately absent from AP's
+# retryable-harness-error allowlist so the L2 classifier treats it as terminal
+# rather than retry-looping into the same wedge.
+_RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole
 # delivery signal for the last child of a fan-out, and Omnigent routinely
 # returns a transient 503 RUNNER_UNAVAILABLE while the parent's runner tunnel
@@ -361,6 +389,7 @@ async def _evaluate_policy_via_omnigent(
     evaluation_id: str,
     phase: str,
     data: dict[str, Any],
+    on_delivery_failure: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     """
     Proxy a policy evaluation request from the harness to the Omnigent server.
@@ -396,6 +425,12 @@ async def _evaluate_policy_via_omnigent(
     :param phase: Proto-style phase string, e.g.
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
+    :param on_delivery_failure: Optional async callback invoked with
+        *conversation_id* when the verdict cannot be delivered because the
+        harness channel is dead (a transport error surviving one retry on a
+        fresh connection). The parked policy future can never resolve on a
+        dead channel, so the caller wires this to tear the wedged turn down.
+        ``None`` preserves the legacy log-and-swallow behaviour.
     """
     # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
     # fails CLOSED (this round-trip is the authoritative gate for
@@ -459,27 +494,66 @@ async def _evaluate_policy_via_omnigent(
         )
 
     # Post the verdict back to the harness as a policy_verdict event.
-    try:
-        verdict_body: dict[str, Any] = {
-            "type": "policy_verdict",
-            "evaluation_id": evaluation_id,
-            "action": verdict_action,
-        }
-        if verdict_reason is not None:
-            verdict_body["reason"] = verdict_reason
-        if verdict_data is not None:
-            verdict_body["data"] = verdict_data
-        await harness_client.post(
-            f"/v1/sessions/{conversation_id}/events",
-            json=verdict_body,
-            timeout=30.0,
-        )
-    except Exception:  # noqa: BLE001 — best-effort delivery
+    verdict_body: dict[str, Any] = {
+        "type": "policy_verdict",
+        "evaluation_id": evaluation_id,
+        "action": verdict_action,
+    }
+    if verdict_reason is not None:
+        verdict_body["reason"] = verdict_reason
+    if verdict_data is not None:
+        verdict_body["data"] = verdict_data
+
+    # A verdict is ACKNOWLEDGED only on a 2xx — that is the sole outcome where
+    # the harness enqueued the event and its parked future will resolve. Every
+    # other outcome (a dead-channel transport error, a timeout, a 3xx/4xx/5xx
+    # response, OR an unexpected exception) leaves that future unresolvable, so
+    # the turn would hang for _POLICY_EVAL_TIMEOUT_S — each MUST eventually
+    # signal recovery. ``harness_client.post`` does not raise on non-2xx, so the
+    # status is checked explicitly. Retry policy stays selective: dead-channel /
+    # timeout / non-2xx retry once on a fresh connection; an unexpected
+    # (non-transport) error is a code bug, not a transient channel fault, so it
+    # is not retried — but it still signals, because the verdict is still
+    # unacknowledged and the future is still parked.
+    for _attempt in range(2):
+        try:
+            resp = await harness_client.post(
+                f"/v1/sessions/{conversation_id}/events",
+                json=verdict_body,
+                timeout=30.0,
+            )
+        except _DEAD_HARNESS_CHANNEL_ERRORS as exc:
+            _logger.warning(
+                "Policy verdict %s delivery hit a dead harness channel (attempt %d/2): %s",
+                evaluation_id,
+                _attempt + 1,
+                exc,
+            )
+            continue
+        except Exception:  # noqa: BLE001 — non-transport: no retry, but still signal
+            _logger.warning(
+                "Failed to deliver policy verdict %s to harness (unexpected error)",
+                evaluation_id,
+                exc_info=True,
+            )
+            break
+        if 200 <= resp.status_code < 300:
+            return
         _logger.warning(
-            "Failed to deliver policy verdict %s to harness",
+            "Policy verdict %s delivery got HTTP %d — harness did not accept it (attempt %d/2)",
             evaluation_id,
-            exc_info=True,
+            resp.status_code,
+            _attempt + 1,
         )
+
+    _logger.error(
+        "Policy verdict %s delivery unacknowledged (dead channel / timeout / "
+        "non-2xx / unexpected) after retry; signaling desync for %s",
+        evaluation_id,
+        conversation_id,
+    )
+    if on_delivery_failure is not None:
+        await on_delivery_failure(conversation_id)
 
 
 def _response_body_preview(resp: Any, *, limit: int = 500) -> str:
@@ -1791,6 +1865,9 @@ def create_runner_app(
     _spec_cache: dict[str, Any] = {}  # agent_id → cached AgentSpec for terminal tools
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
+    # Exposed on app.state so tests driving the respawn→resync adapter directly
+    # can seed the currently-bound turn's response id for the identity gate.
+    app.state.live_response_id = _live_response_id
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, Any | None] = {}  # session_id → session AgentSpec
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
@@ -1858,20 +1935,45 @@ def create_runner_app(
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
+    app.state.active_turns = _active_turns
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
+    app.state.session_message_buffers = _session_message_buffers
     _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
+    # Conversations whose harness↔runner lifecycle desynced this turn. Marked by
+    # ``_resync_turn_state`` / ``_on_proxy_stream_end``, cleared when a fresh
+    # turn binds so a recovered conversation isn't left flagged.
+    _desynced_sessions: set[str] = set()
+    app.state.desynced_sessions = _desynced_sessions
+    # Per-conversation turn-bind epoch: the value from a process-wide, strictly
+    # increasing, NON-REPEATING sequence stamped every time a turn binds the slot
+    # (including continuations that later complete). Recovery captures it to tell
+    # whether a REPLACEMENT turn started during a teardown await even if it already
+    # finished and popped its slot — a slot check alone cannot. The sequence is
+    # global (not a per-conversation counter reset on delete) so a same-id
+    # delete→recreate never returns to an epoch a stalled recovery still holds,
+    # which would let it clobber the new lifetime's turn.
+    _turn_epoch_seq = itertools.count(1)
+    _turn_bind_epoch: dict[str, int] = {}
+    app.state.turn_bind_epoch = _turn_bind_epoch
+    # Publish-once token: maps a conversation to the bind epoch the desync recovery
+    # claimed the terminal ``failed`` for. A competing publish site suppresses its
+    # own ``idle`` only while the epoch still matches — a NEW turn (higher epoch)
+    # publishes its own terminal normally, so recovery can't swallow it.
+    _desync_terminalized: dict[str, int] = {}
+    app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
     _subagent_wake_pending: set[str] = set()
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
     _session_event_queues = _session_event_queues_ref
+    app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
@@ -3022,7 +3124,7 @@ def create_runner_app(
                 or last_type == "function_call_output"
             )
             if needs_turn and session_id not in _active_turns:
-                _active_turns[session_id] = None
+                _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
                     "agent_id": agent_id,
@@ -3205,6 +3307,14 @@ def create_runner_app(
                 await turn_task
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
+        # Clear ALL paired desync/turn state on delete so a recreated same-id
+        # session starts clean: a leftover _desync_terminalized claim or a stale
+        # _desynced flag would otherwise carry into the new lifetime. (Epochs
+        # themselves come from a non-repeating sequence, so they never collide;
+        # this is state hygiene, not collision avoidance.)
+        _turn_bind_epoch.pop(session_id, None)
+        _desync_terminalized.pop(session_id, None)
+        _desynced_sessions.discard(session_id)
         _native_pane_status.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -5137,27 +5247,110 @@ def create_runner_app(
             policy_name=policy_name if isinstance(policy_name, str) and policy_name else None,
         )
 
+    def _begin_turn_slot(conv_id: str) -> None:
+        """Bind the ``None`` sentinel for a NEW turn and stamp a fresh bind epoch.
+
+        The epoch comes from a process-wide, non-repeating sequence, so recovery
+        can detect that a replacement turn ran during a teardown await even after
+        it finished and popped its own slot — and a same-id delete→recreate never
+        reuses an epoch a stalled recovery still holds. Use this at every
+        turn-start bind, not a bare ``_active_turns[conv] = None``.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        """
+        _active_turns[conv_id] = None
+        _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
+
+    def _release_live_turn_markers(conv_id: str) -> None:
+        """Drop ``_live_response_id`` and the process-manager in-flight marker together.
+
+        They are one fact split across two stores. Popping the live response alone
+        severs the ownership link ``_on_proxy_stream_end`` keys on, so the marker is
+        left set and the idle reaper skips that harness forever. Any site that clears
+        the live response without terminating the process must call this, not a bare
+        pop.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        """
+        _live_response_id.pop(conv_id, None)
+        if process_manager is not None:
+            process_manager.clear_in_flight(conv_id)
+
+    def _sweep_dead_turn_slot(conv_id: str, occupant: asyncio.Task[None] | None) -> bool:
+        """Remove a completed turn from ``_active_turns`` and clear all its per-turn
+        tokens together.
+
+        A done Task in the slot is a corpse, not a live turn. Removing it is not
+        enough: its live-turn markers and its ``_interrupted_sessions`` token (which
+        is not cleared at the next turn's start) must go too, or they poison later
+        liveness checks and taint the next turn's terminal. Identity-guarded — if a
+        newer turn already took the slot, touch nothing.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param occupant: The dead slot value; a no-op unless the slot still holds it.
+        :returns: ``True`` if swept, ``False`` if a newer turn owns the slot.
+        """
+        if _active_turns.get(conv_id) is not occupant:
+            return False
+        _active_turns.pop(conv_id, None)
+        _release_live_turn_markers(conv_id)
+        _interrupted_sessions.discard(conv_id)
+        return True
+
     def _on_proxy_stream_end(
         conv_id: str,
         *,
         error: dict[str, Any] | None = None,
+        owner_response_id: str | None = None,
     ) -> None:
+        # Generation-ownership guard: a stream's terminal callback must only
+        # finalize the conversation while THIS stream still owns it. Stream-mode
+        # desync recovery can pop the old sentinel and bind a continuation (a new
+        # response id + in-flight marker) BEFORE the old stream unwinds; the old
+        # stream's terminal must not then clear the newer turn's slot, response
+        # id, and in-flight marker. When ``owner_response_id`` is supplied (the
+        # proxy_stream terminal callers) and no longer matches the live response,
+        # a newer turn has taken over — this is a stale finalizer, so no-op every
+        # conversation-state mutation. Conversation-level callers that own no
+        # streamed response (setup-failure, the _run_turn_bg finally floor with
+        # its own identity guard, _cancel_active_turn with its expected_task
+        # guard, the desync recovery path) pass ``None`` and keep the
+        # unconditional behavior.
+        if owner_response_id is not None and _live_response_id.get(conv_id) != owner_response_id:
+            _logger.debug(
+                "proxy stream end for %s ignored: response %s superseded by %s",
+                conv_id,
+                owner_response_id,
+                _live_response_id.get(conv_id),
+            )
+            return
 
         _active_turns.pop(conv_id, None)
-        _live_response_id.pop(conv_id, None)
-        if process_manager is not None:
-            process_manager.clear_in_flight(conv_id)
+        _release_live_turn_markers(conv_id)
+        # A transport-loss ending leaves the harness lifecycle out of step with
+        # the runner's; flag it so the next turn binds clean. ``connection_error``
+        # is the code proxy_stream's transport handler stamps.
+        if error is not None and error.get("code") == "connection_error":
+            _desynced_sessions.add(conv_id)
         has_buffered = bool(_session_message_buffers.get(conv_id))
         was_interrupted = conv_id in _interrupted_sessions
+        # Publish-once guard, epoch-scoped: suppress our own terminal only if the
+        # desync recovery claimed the token for the CURRENTLY-bound generation. A
+        # newer turn (higher bind epoch) is not the turn recovery meant to
+        # supersede, so it publishes normally instead of being swallowed.
+        _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
+        if _suppress_status:
+            _desync_terminalized.pop(conv_id, None)
         if was_interrupted:
             _interrupted_sessions.discard(conv_id)
             _append_cancellation_items(conv_id)
-            if not has_buffered:
+            if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
         elif error is not None:
-            _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
+            if not _suppress_status:
+                _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
         else:
-            if not has_buffered:
+            if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
                 has_running_children = any(
                     (e := _subagent_work_by_child.get(c)) is not None
@@ -5166,11 +5359,23 @@ def create_runner_app(
                 )
                 _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
         if was_interrupted:
-            _mark_subagent_terminal_and_wake(
-                conv_id,
-                status="cancelled",
-                output="[System: sub-agent interrupted]",
-            )
+            if conv_id in _desynced_sessions and not has_buffered:
+                # This turn was torn down by desync recovery (which sets the
+                # interrupt marker to unwind the harness), NOT by a user
+                # interrupt — and it publishes a terminal desync ``failed``. Report
+                # the sub-agent FAILED so the parent wake/result matches that
+                # ``failed``, rather than a contradictory ``cancelled``.
+                _mark_subagent_terminal_and_wake(
+                    conv_id,
+                    status="failed",
+                    output="Error: sub-agent turn failed: runner turn-context desync.",
+                )
+            else:
+                _mark_subagent_terminal_and_wake(
+                    conv_id,
+                    status="cancelled",
+                    output="[System: sub-agent interrupted]",
+                )
         elif error is not None:
             _mark_subagent_terminal_and_wake(
                 conv_id,
@@ -5197,7 +5402,18 @@ def create_runner_app(
         conv_id: str, expected_task: asyncio.Task[None] | None = None
     ) -> bool:
         turn_task = _active_turns.get(conv_id)
-        if not isinstance(turn_task, asyncio.Task) or turn_task.done():
+        if not isinstance(turn_task, asyncio.Task):
+            return False
+        if turn_task.done():
+            # A completed generation left in the slot is a CORPSE (same class as
+            # _cancel_inprocess_turn's done-task handling). This IS reachable: a
+            # live task cancel-forwarded by _cancel_inprocess_turn can COMPLETE
+            # during the intervening _forward_harness_interrupt await, arriving
+            # here done — and it carries an _interrupted_sessions token that must
+            # be cleared or it taints the next turn. Sweep it (tokens included),
+            # honoring expected_task.
+            if expected_task is None or turn_task is expected_task:
+                _sweep_dead_turn_slot(conv_id, turn_task)
             return False
         if expected_task is not None and turn_task is not expected_task:
             return False
@@ -5210,23 +5426,38 @@ def create_runner_app(
         if conv_id in _interrupted_sessions:
             _interrupted_sessions.discard(conv_id)
             _append_cancellation_items(conv_id)
-            _mark_subagent_terminal_and_wake(
-                conv_id,
-                status="cancelled",
-                output="[System: sub-agent interrupted]",
-            )
+            # A turn torn down by desync recovery publishes a desync `failed`, so
+            # its sub-agent must be reported FAILED, not a contradictory
+            # `cancelled`, for the parent wake/result.
+            if conv_id in _desynced_sessions:
+                _mark_subagent_terminal_and_wake(
+                    conv_id,
+                    status="failed",
+                    output="Error: sub-agent turn failed: runner turn-context desync.",
+                )
+            else:
+                _mark_subagent_terminal_and_wake(
+                    conv_id,
+                    status="cancelled",
+                    output="[System: sub-agent interrupted]",
+                )
         return True
 
-    async def _cancel_inprocess_turn(conv_id: str) -> None:
-        target = _active_turns.get(conv_id)
-        if not isinstance(target, asyncio.Task) or target.done():
-            return
-        _interrupted_sessions.add(conv_id)
+    async def _forward_harness_interrupt(conv_id: str) -> None:
+        """Best-effort POST ``{"type":"interrupt"}`` to a conversation's harness.
+
+        Releases the harness's parked policy/tool future so its ``run_turn``
+        unwinds. A dead or wedged harness logs and is swallowed — the
+        runner-side floor does not depend on this succeeding.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        """
         try:
             harness_client = await process_manager.get_client(conv_id, "any")
             await harness_client.post(
                 f"/v1/sessions/{conv_id}/events",
                 json={"type": "interrupt"},
+                # Bounded under the Omnigent server's 5s stop deadline.
                 timeout=3.0,
             )
         except NoLiveHarnessError:
@@ -5237,7 +5468,204 @@ def create_runner_app(
                 conv_id,
                 exc_info=True,
             )
-        await _cancel_active_turn(conv_id, expected_task=target)
+
+    async def _cancel_inprocess_turn(conv_id: str) -> None:
+        # Distinguish "no live turn" (absent) from a stream-mode turn (present as
+        # the None sentinel — driven by the AP request's consumption of
+        # proxy_stream, so the runner owns no cancellable Task). Both a live Task
+        # and the sentinel have a live harness turn parked on a future, so the
+        # interrupt must be forwarded for either.
+        if conv_id not in _active_turns:
+            return
+        target = _active_turns.get(conv_id)
+        if isinstance(target, asyncio.Task) and target.done():
+            # A done Task is a corpse, not a live turn. Leaving it wedges every
+            # ``conv in _active_turns`` liveness check (the buffer gate would strand
+            # later messages) — sweep it, tokens included.
+            _sweep_dead_turn_slot(conv_id, target)
+            return
+        _interrupted_sessions.add(conv_id)
+        await _forward_harness_interrupt(conv_id)
+        # Floor: force-cancel the runner Task when we own one. In stream mode
+        # there is no Task here — ``_resync_turn_state`` owns the sentinel pop,
+        # and direct interrupt/stop callers rely on the forwarded interrupt
+        # ending proxy_stream.
+        if isinstance(target, asyncio.Task):
+            await _cancel_active_turn(conv_id, expected_task=target)
+
+    async def _resync_turn_state(
+        conv_id: str, reason: str, *, owner_response_id: str | None = None
+    ) -> None:
+        """Single ordered recovery entry for a harness↔runner desync.
+
+        Marks the conversation desynced, clears the stale live-response marker,
+        tears the wedged turn down, and either drains a buffered continuation or
+        publishes one terminal desync ``failed``. Cancelling the turn unwinds
+        ``run_turn``, releasing the harness's parked policy future in
+        milliseconds instead of at ``_POLICY_EVAL_TIMEOUT_S``.
+
+        Idempotent: ``_cancel_inprocess_turn`` no-ops with no turn in flight and
+        ``_interrupted_sessions`` is the existing idempotency token, so a
+        duplicate signal for the same wedged turn collapses to one recovery.
+
+        Generation-ownership gate: a desync signal names the turn that produced
+        it (its ``owner_response_id``). A delayed or duplicate signal from an
+        OLD response must not cancel whichever newer turn is now active, so when
+        ``owner_response_id`` is supplied and no longer matches the live
+        response, this is a stale signal — no-op. Signals with no owning response
+        (e.g. a conversation-level path) pass ``None`` and always recover.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param reason: Short machine reason for the desync, logged for ops.
+        :param owner_response_id: The response id the signal belongs to; when it
+            no longer matches ``_live_response_id[conv_id]`` a newer turn has
+            taken over and the signal is ignored.
+        """
+        if owner_response_id is not None and _live_response_id.get(conv_id) != owner_response_id:
+            _logger.debug(
+                "resync for %s ignored: response %s superseded by %s",
+                conv_id,
+                owner_response_id,
+                _live_response_id.get(conv_id),
+            )
+            return
+        _logger.warning("resyncing turn state for %s: %s", conv_id, reason)
+        _desynced_sessions.add(conv_id)
+        # Capture the wedged generation's bind epoch. Any turn that binds during the
+        # teardown await bumps it — so a REPLACEMENT that starts AND finishes during
+        # the await (invisible to a post-teardown slot check, which sees an empty
+        # slot) is still detectable as a continuation.
+        _entry_epoch = _turn_bind_epoch.get(conv_id, 0)
+        # Clear the live response and the in-flight marker together, before any
+        # await, so a concurrent forward sees no live turn and the reaper isn't
+        # left a stale marker.
+        _release_live_turn_markers(conv_id)
+        # Best-effort pre-claim of the terminal token, SCOPED to this generation's
+        # epoch: a competing terminal suppresses its own idle only while the epoch
+        # still matches, so a newer turn's terminal is never swallowed. The
+        # authoritative ownership decision is re-made after teardown.
+        if not _session_message_buffers.get(conv_id):
+            _desync_terminalized[conv_id] = _entry_epoch
+        # Tear the wedged generation out of the slot. A stream=true turn parks the
+        # None sentinel (no runner Task) — pop it synchronously so the active-turn
+        # gate can't stay stuck if the interrupt never ends the stream; a Task turn
+        # goes through _cancel_inprocess_turn. Both paths REMOVE the wedged
+        # generation (including a completed corpse).
+        stream_sentinel = conv_id in _active_turns and not isinstance(
+            _active_turns.get(conv_id), asyncio.Task
+        )
+        if stream_sentinel:
+            _active_turns.pop(conv_id, None)
+            await _forward_harness_interrupt(conv_id)
+        else:
+            await _cancel_inprocess_turn(conv_id)
+        # Ownership decision, AFTER teardown. A continuation ran iff the bind epoch
+        # advanced — this catches a replacement that started AND finished during the
+        # await (empty slot, but a higher epoch), which a slot check alone misses.
+        # (A live slot is also covered: binding bumps the epoch.)
+        _continuation_ran = _turn_bind_epoch.get(conv_id, 0) != _entry_epoch
+        _has_buffer = bool(_session_message_buffers.get(conv_id))
+        if not _continuation_ran and not _has_buffer:
+            # We own the terminal status; the competing OLD-generation terminal
+            # no-ops via the epoch-scoped token.
+            _publish_turn_status(
+                conv_id,
+                "failed",
+                error={
+                    "code": _RUNNER_TURN_CONTEXT_DESYNC_CODE,
+                    "message": (
+                        "The agent turn was interrupted by a harness desync and "
+                        "could not be recovered. Please send your message again."
+                    ),
+                },
+            )
+        else:
+            # A continuation owns the terminal status — release OUR claim so its
+            # own _on_proxy_stream_end publishes normally. Compare-and-pop: only
+            # remove the token if it still holds THIS recovery's epoch. A nested
+            # recovery for the replacement may have already re-claimed it under a
+            # different (higher) epoch; popping unconditionally would strip that
+            # and unsuppress the replacement's own competing terminal.
+            if _desync_terminalized.get(conv_id) == _entry_epoch:
+                _desync_terminalized.pop(conv_id, None)
+            # If a message is buffered but no continuation has run yet, kick one:
+            # a turn cancelled mid-drain pops its own slot without scheduling a
+            # continuation, so the buffered message would otherwise strand.
+            # Idempotent — _check_and_start_next_turn bails if a turn is active.
+            if _has_buffer and not _continuation_ran:
+                try:
+                    loop = asyncio.get_running_loop()
+                    _cont = loop.create_task(_check_and_start_next_turn(conv_id))
+                    _cont.add_done_callback(_background_tasks.discard)
+                    _background_tasks.add(_cont)
+                except RuntimeError:
+                    pass
+
+    async def _resync_turn_state_on_delivery_failure(
+        conv_id: str, response_id: str | None
+    ) -> None:
+        """``on_delivery_failure`` adapter binding the desync reason + owner.
+
+        Carries the response id of the turn whose verdict delivery failed so a
+        delayed or duplicate failure from an old response cannot cancel a newer
+        active turn (the ownership gate in :func:`_resync_turn_state`).
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param response_id: The response id of the turn whose verdict delivery
+            failed, or ``None`` if the eval fired before ``response.created``.
+        """
+        await _resync_turn_state(
+            conv_id, "verdict_delivery_channel_dead", owner_response_id=response_id
+        )
+
+    async def _resync_turn_state_on_harness_respawn(
+        conv_id: str, reason: str, replaced_response_id: str
+    ) -> None:
+        """``HarnessProcessManager`` respawn-hook adapter for ``_resync_turn_state``.
+
+        A respawn landing while the turn that OWNED the replaced in-flight
+        response is still bound on the runner is the deterministic #1026 desync:
+        the inner generation dies with the subprocess and the active-turn slot
+        is never cleaned. Recovering here collapses the window instead of
+        waiting for the orphan backstop.
+
+        Two gates keep it from cancelling a HEALTHY turn:
+
+        1. ``conv_id in _active_turns`` — a respawn with no bound turn is a no-op.
+        2. ``_live_response_id[conv_id] == replaced_response_id`` — the process
+           manager only fires when the replaced process was mid-response, but by
+           the time this runs the wedged turn may already have ended and a NEW
+           turn bound under the same conversation (whose ``get_client`` triggered
+           the respawn). Cancelling on the bare conversation would then clobber
+           that new turn. Identity-match the replaced response so only the turn
+           that actually lost its subprocess is torn down; a mismatch means the
+           new turn owns the slot and must be left alone.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param reason: Machine reason from the process manager, e.g.
+            ``"harness_respawn_model_switch"``.
+        :param replaced_response_id: The in-flight response id of the process
+            that was torn down, for identity-matching the bound turn.
+        """
+        if conv_id not in _active_turns:
+            return
+        # The identity match against the replaced response is enforced centrally
+        # by ``_resync_turn_state``'s ownership gate — a fresh turn that took the
+        # slot has a different live response id and is left alone.
+        await _resync_turn_state(conv_id, reason, owner_response_id=replaced_response_id)
+
+    # Test seams: the real signals originate in a harness verdict POST failure
+    # and inside the process manager's get_client, neither scriptable in-process.
+    app.state.resync_turn_state = _resync_turn_state
+    app.state.resync_turn_state_on_harness_respawn = _resync_turn_state_on_harness_respawn
+    app.state.on_proxy_stream_end = _on_proxy_stream_end
+    # Test seam: bind a turn slot with a fresh (non-repeating) bind epoch, so a
+    # test can simulate a same-id recreate binding a new lifetime's turn.
+    app.state.begin_turn_slot = _begin_turn_slot
+    # hasattr guard: alternate/stub process managers need not implement the hook
+    # — they simply fall back to the orphan-callback backstop.
+    if process_manager is not None and hasattr(process_manager, "set_respawn_hook"):
+        process_manager.set_respawn_hook(_resync_turn_state_on_harness_respawn)
 
     def _history_message_from_body(body: dict[str, Any]) -> dict[str, Any]:
         message = {
@@ -5323,7 +5751,7 @@ def create_runner_app(
                     )
                 next_body = all_bodies[-1]
 
-            _active_turns[session_id] = None
+            _begin_turn_slot(session_id)
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
                 _run_turn_bg(next_body, session_id),
@@ -5509,8 +5937,21 @@ def create_runner_app(
         conv: str,
     ) -> None:
         _subagent_wake_pending.discard(conv)
+        # Capture our own task so the finally floor can identity-compare before
+        # clearing the slot (see below).
+        _own_task = asyncio.current_task()
+        # A fresh turn is binding: whatever desync the previous turn ended on is
+        # resolved now. Also clear a stale publish-once token (e.g. left set by a
+        # wedged stream that never reached its own _on_proxy_stream_end) so it
+        # can't suppress this turn's legitimate terminal publish.
+        _desynced_sessions.discard(conv)
+        _desync_terminalized.pop(conv, None)
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
+        except _ContextWindowOverflow:
+            # The streaming phase handles reactive compaction itself; re-raise so
+            # its handler is never shadowed by the generic except below.
+            raise
         except asyncio.CancelledError as exc:
             _logger.error(
                 "turn cancelled for %s: %s",
@@ -5528,6 +5969,22 @@ def create_runner_app(
                 exc_info=True,
             )
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+        finally:
+            # Permanent-wedge floor: guarantee _active_turns is never left stale,
+            # however the body exits — including a BaseException that escapes
+            # ``except Exception``. A setup-phase abnormal exit otherwise leaves
+            # the slot set and every later message buffers forever.
+            #
+            # Identity compare-and-clear: only finalize when the slot STILL holds
+            # THIS turn's own task. A turn that ended cleanly already popped its
+            # slot via _on_proxy_stream_end, which schedules a continuation that
+            # can bind a NEW turn's task under the same conv — a bare
+            # ``conv in _active_turns`` check would then let this stale finally
+            # clobber the newer turn (the same class of bug the ExecutorAdapter
+            # identity CAS fixes). When the slot is a None sentinel or a
+            # different task, this turn is already accounted for — skip.
+            if _active_turns.get(conv) is _own_task and _own_task is not None:
+                _on_proxy_stream_end(conv)
 
     async def _run_turn_bg_setup_and_stream(
         msg_body: dict[str, Any],
@@ -5870,9 +6327,25 @@ def create_runner_app(
             async for _chunk in response.body_iterator:
                 pass
         except asyncio.CancelledError:
-            _active_turns.pop(session_id, None)
-            _live_response_id.pop(session_id, None)
-            _publish_turn_status(session_id, "idle")
+            # Identity guard (same generation-ownership class as
+            # _on_proxy_stream_end and the _run_turn_bg finally floor): the drain
+            # runs INLINE in this turn's own _run_turn_bg task, so the slot should
+            # still hold that task. Only clear when it does — if a newer turn has
+            # taken the slot, this is a stale finalizer and must not pop the newer
+            # turn's state, response id, or publish a spurious idle over it.
+            if _active_turns.get(session_id) is asyncio.current_task():
+                _active_turns.pop(session_id, None)
+                # Clear the live response AND the in-flight marker together (B1
+                # class fix): a bare pop would leak the process-manager marker and
+                # the idle reaper would skip the harness forever.
+                _release_live_turn_markers(session_id)
+                # Publish-once guard, epoch-scoped (same token as
+                # _on_proxy_stream_end): suppress this ``idle`` only if recovery
+                # claimed the terminal for THIS generation's epoch.
+                if _desync_terminalized.get(session_id) == _turn_bind_epoch.get(session_id, 0):
+                    _desync_terminalized.pop(session_id, None)
+                else:
+                    _publish_turn_status(session_id, "idle")
             raise
         except (httpx.HTTPError, RuntimeError, StopAsyncIteration) as exc:
             _logger.error(
@@ -6289,6 +6762,7 @@ def create_runner_app(
                                                     "message": _err_msg,
                                                     "type": _err_type,
                                                 },
+                                                owner_response_id=_response_id,
                                             )
                                             yield _response_failed_event(
                                                 {"message": _err_msg, "type": _err_type}
@@ -6354,6 +6828,16 @@ def create_runner_app(
                                                 evaluation_id=_eval_id,
                                                 phase=_eval_phase,
                                                 data=_eval_data,
+                                                # A dead verdict-delivery channel
+                                                # parks the harness turn forever;
+                                                # route it to the recovery entry,
+                                                # binding THIS turn's response id
+                                                # so a delayed failure can't cancel
+                                                # a newer turn (ownership gate).
+                                                on_delivery_failure=functools.partial(
+                                                    _resync_turn_state_on_delivery_failure,
+                                                    response_id=_response_id,
+                                                ),
                                             )
                                         )
                                     )
@@ -6369,7 +6853,9 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
-                    _on_proxy_stream_end(conv_id, error=_stream_failed_error)
+                    _on_proxy_stream_end(
+                        conv_id, error=_stream_failed_error, owner_response_id=_response_id
+                    )
 
             except _ContextWindowOverflow as overflow:
                 _error = {
@@ -6386,7 +6872,7 @@ def create_runner_app(
                     "error": _error,
                 }
                 _publish_event(conv_id, _overflow_fail)
-                _on_proxy_stream_end(conv_id, error=_error)
+                _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error)
 
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -6407,7 +6893,7 @@ def create_runner_app(
                     "error": _error,
                 }
                 _publish_event(conv_id, _http_fail)
-                _on_proxy_stream_end(conv_id, error=_error)
+                _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error)
 
         return StreamingResponse(
@@ -6558,7 +7044,7 @@ def create_runner_app(
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
-                _active_turns[conversation_id] = None
+                _begin_turn_slot(conversation_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -9327,7 +9813,7 @@ def create_runner_app(
                     and new_items
                     and new_items[-1].get("role") == "user"
                 ):
-                    _active_turns[session_id] = None
+                    _begin_turn_slot(session_id)
                     _publish_turn_status(session_id, "running")
                     agent_id = _session_agent_ids.get(session_id)
                     msg_body = {
