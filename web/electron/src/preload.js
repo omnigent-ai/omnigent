@@ -392,6 +392,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("browser-element-prompt-dismiss", listener);
     return () => ipcRenderer.removeListener("browser-element-prompt-dismiss", listener);
   },
+  /** Synchronize the isolated Chromium surface used for artifact previews. */
+  syncArtifactSurface: (params) => ipcRenderer.invoke("omnigent:artifact-surface-sync", params),
+  /** Destroy an artifact surface if the id still owns the active view. */
+  destroyArtifactSurface: (id) => ipcRenderer.invoke("omnigent:artifact-surface-destroy", id),
+  /** Pick an artifact element and open Electron DevTools focused on it. */
+  inspectArtifactSurface: (id) => ipcRenderer.invoke("omnigent:artifact-surface-inspect", id),
+  /** Pick an artifact element and return structured context for the composer. */
+  selectArtifactElement: (id) => ipcRenderer.invoke("omnigent:artifact-surface-select", id),
+  /** Reload the active artifact preview surface. */
+  reloadArtifactSurface: (id) => ipcRenderer.invoke("omnigent:artifact-surface-reload", id),
+  /** Run accessibility and runtime diagnostics against the active artifact. */
+  reviewArtifactSurface: (id) => ipcRenderer.invoke("omnigent:artifact-surface-review", id),
 });
 
 // Setup-page bridge: persist + navigate to a server URL, and read the saved

@@ -52,6 +52,18 @@ describe("sessionWorkspaceState", () => {
     expect(stored).toEqual(Array.from({ length: 20 }, (_, i) => `f${i + 5}`));
   });
 
+  it("round-trips the Artifacts tab and selected artifact path", () => {
+    writeSessionWorkspaceState("conv_artifacts", {
+      rightRailTab: "artifacts",
+      selectedArtifactPath: "artifacts/revenue/index.html",
+    });
+
+    expect(readSessionWorkspaceState("conv_artifacts")).toMatchObject({
+      rightRailTab: "artifacts",
+      selectedArtifactPath: "artifacts/revenue/index.html",
+    });
+  });
+
   it("prunes the least-recently-touched session past the cap (numeric ids)", () => {
     // Seed exactly MAX_SESSIONS sessions with purely numeric ids ("1".."100").
     // Numeric-string keys are the case a plain object store gets wrong: V8

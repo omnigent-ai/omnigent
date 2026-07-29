@@ -1,0 +1,474 @@
+const { describe, it } = require("node:test");
+const assert = require("node:assert/strict");
+
+const {
+  ArtifactSurfaceManager,
+  artifactPreviewOriginForServer,
+  navigationAllowed,
+  normalizeArtifactBounds,
+  normalizeArtifactCaptureRect,
+  parseArtifactPreviewUrl,
+} = require("../src/artifact_surface");
+
+function fakeWindow() {
+  const children = [];
+  return {
+    id: 7,
+    contentView: {
+      addChildView(view) {
+        children.push(view);
+      },
+      removeChildView(view) {
+        const index = children.indexOf(view);
+        if (index >= 0) children.splice(index, 1);
+      },
+    },
+    getContentBounds: () => ({ x: 0, y: 0, width: 900, height: 700 }),
+    children,
+  };
+}
+
+function fakeViewFactory(created) {
+  return (options) => {
+    const listeners = new Map();
+    const webContents = {
+      options,
+      loaded: [],
+      closed: false,
+      setWindowOpenHandler: (handler) => {
+        webContents.windowOpenHandler = handler;
+      },
+      on: (event, handler) => listeners.set(event, handler),
+      loadURL: async (url) => webContents.loaded.push(url),
+      executeJavaScript: async () => webContents.executeResult ?? { x: 42, y: 84 },
+      capturePage: async (rect) => {
+        webContents.capturedRect = rect;
+        return {
+          toDataURL: () => "data:image/png;base64,c2VsZWN0aW9u",
+        };
+      },
+      inspectElement: (x, y) => {
+        webContents.inspected = { x, y };
+      },
+      reload: () => {
+        webContents.reloads = (webContents.reloads ?? 0) + 1;
+      },
+      enableDeviceEmulation: (parameters) => {
+        webContents.enableDeviceEmulationCalls = (webContents.enableDeviceEmulationCalls ?? 0) + 1;
+        webContents.deviceEmulation = parameters;
+      },
+      disableDeviceEmulation: () => {
+        webContents.disableDeviceEmulationCalls =
+          (webContents.disableDeviceEmulationCalls ?? 0) + 1;
+        webContents.deviceEmulation = null;
+      },
+      close: () => {
+        webContents.closed = true;
+      },
+    };
+    const view = {
+      webContents,
+      bounds: null,
+      visible: true,
+      setBounds: (bounds) => {
+        view.bounds = bounds;
+      },
+      setVisible: (visible) => {
+        view.visible = visible;
+      },
+      emit: (event, ...args) => listeners.get(event)?.(...args),
+    };
+    created.push(view);
+    return view;
+  };
+}
+
+describe("artifact preview URL policy", () => {
+  it("derives the dedicated preview origin from the connected server", () => {
+    assert.equal(
+      artifactPreviewOriginForServer("http://localhost:6767/workspace"),
+      "http://preview.localhost:6767",
+    );
+    assert.equal(
+      artifactPreviewOriginForServer("http://[::1]:6767/workspace"),
+      "http://preview.localhost:6767",
+    );
+    assert.equal(
+      artifactPreviewOriginForServer("https://app.example.com"),
+      "https://preview.app.example.com",
+    );
+  });
+
+  it("accepts capability-scoped HTTP URLs", () => {
+    expectPreview(
+      parseArtifactPreviewUrl("http://preview.localhost:6767/p/token-1/artifacts/a/index.html"),
+      {
+        origin: "http://preview.localhost:6767",
+        capabilityPrefix: "/p/token-1/",
+      },
+    );
+  });
+
+  it("rejects non-capability and non-http URLs", () => {
+    assert.throws(() => parseArtifactPreviewUrl("http://preview.localhost:6767/artifacts/a"));
+    assert.throws(() => parseArtifactPreviewUrl("file:///tmp/index.html"));
+  });
+
+  it("rejects capability URLs outside the connected server preview origin", () => {
+    assert.throws(() =>
+      parseArtifactPreviewUrl(
+        "https://attacker.example/p/token-1/artifacts/a/index.html",
+        "https://preview.app.example.com",
+      ),
+    );
+  });
+
+  it("allows only the original origin and capability prefix", () => {
+    const policy = parseArtifactPreviewUrl(
+      "http://preview.localhost:6767/p/token-1/artifacts/a/index.html",
+    );
+    assert.equal(
+      navigationAllowed("http://preview.localhost:6767/p/token-1/artifacts/a/app.js", policy),
+      true,
+    );
+    assert.equal(
+      navigationAllowed("http://preview.localhost:6767/p/token-2/artifacts/a/index.html", policy),
+      false,
+    );
+    assert.equal(
+      navigationAllowed("http://localhost:6767/p/token-1/artifacts/a/index.html", policy),
+      false,
+    );
+  });
+});
+
+describe("artifact bounds", () => {
+  it("rounds and clamps renderer bounds to the window content", () => {
+    assert.deepEqual(
+      normalizeArtifactBounds(
+        { x: -4.4, y: 20.2, width: 1000.9, height: 800 },
+        { width: 900, height: 700 },
+      ),
+      { x: 0, y: 20, width: 900, height: 680 },
+    );
+  });
+});
+
+describe("artifact capture bounds", () => {
+  it("clamps a finite rectangle to the trusted viewport", () => {
+    assert.deepEqual(
+      normalizeArtifactCaptureRect(
+        { x: -20, y: 30, width: 800, height: 500 },
+        { width: 500, height: 400 },
+      ),
+      { x: 0, y: 30, width: 500, height: 370 },
+    );
+  });
+
+  it("rejects malformed, non-finite, empty, and excessive rectangles", () => {
+    const viewport = { width: 5000, height: 5000 };
+    assert.equal(normalizeArtifactCaptureRect(null, viewport), null);
+    assert.equal(
+      normalizeArtifactCaptureRect({ x: 0, y: 0, width: Infinity, height: 1 }, viewport),
+      null,
+    );
+    assert.equal(normalizeArtifactCaptureRect({ x: 0, y: 0, width: 0, height: 1 }, viewport), null);
+    assert.equal(
+      normalizeArtifactCaptureRect({ x: 0, y: 0, width: 5000, height: 5000 }, viewport),
+      null,
+    );
+  });
+});
+
+describe("ArtifactSurfaceManager", () => {
+  it("creates an isolated surface and blocks navigation outside its grant", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const deniedPermissions = [];
+    const manager = new ArtifactSurfaceManager({
+      createView: fakeViewFactory(created),
+      configureSession: (ses) => deniedPermissions.push(ses),
+    });
+
+    await manager.sync(win, {
+      id: "artifact-1",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 10, y: 20, width: 500, height: 400 },
+    });
+
+    const view = created[0];
+    assert.equal(win.children[0], view);
+    assert.deepEqual(view.bounds, { x: 10, y: 20, width: 500, height: 400 });
+    assert.equal(view.webContents.options.webPreferences.contextIsolation, true);
+    assert.equal(view.webContents.options.webPreferences.nodeIntegration, false);
+    assert.equal(view.webContents.options.webPreferences.sandbox, true);
+    assert.match(
+      view.webContents.options.webPreferences.partition,
+      /^omnigent-artifact-preview-7-/,
+    );
+    assert.equal(deniedPermissions.length, 1);
+    assert.equal(view.webContents.disableDeviceEmulationCalls, undefined);
+    assert.deepEqual(view.webContents.windowOpenHandler(), { action: "deny" });
+
+    const event = {
+      prevented: false,
+      preventDefault() {
+        this.prevented = true;
+      },
+    };
+    view.emit(
+      "will-navigate",
+      event,
+      "http://preview.localhost:6767/p/grant-b/artifacts/b/index.html",
+    );
+    assert.equal(event.prevented, true);
+  });
+
+  it("ignores stale destroy ids and cleans up the active view", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 100, height: 100 },
+    });
+
+    manager.destroy(win, "stale");
+    assert.equal(created[0].webContents.closed, false);
+    manager.destroy(win, "current");
+    assert.equal(created[0].webContents.closed, true);
+    assert.equal(win.children.length, 0);
+  });
+
+  it("creates a fresh partition across surface and capability changes", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "session-a",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 100, height: 100 },
+    });
+    await manager.sync(win, {
+      id: "session-b",
+      url: "http://preview.localhost:6767/p/grant-b/artifacts/b/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 120, height: 120 },
+    });
+
+    assert.equal(created.length, 2);
+    assert.equal(created[0].webContents.closed, true);
+    assert.notEqual(
+      created[0].webContents.options.webPreferences.partition,
+      created[1].webContents.options.webPreferences.partition,
+    );
+    assert.deepEqual(created[0].webContents.loaded, [
+      "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+    ]);
+    assert.deepEqual(created[1].webContents.loaded, [
+      "http://preview.localhost:6767/p/grant-b/artifacts/b/index.html",
+    ]);
+    manager.destroy(win, "session-a");
+    assert.equal(created[1].webContents.closed, false);
+    manager.destroy(win, "session-b");
+    assert.equal(created[1].webContents.closed, true);
+  });
+
+  it("fits a fixed viewport inside the native artifact pane", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 480, height: 600 },
+      viewportWidth: 768,
+    });
+
+    assert.deepEqual(created[0].webContents.deviceEmulation, {
+      screenPosition: "desktop",
+      screenSize: { width: 768, height: 960 },
+      viewPosition: { x: 0, y: 0 },
+      deviceScaleFactor: 1,
+      viewSize: { width: 768, height: 960 },
+      scale: 0.625,
+    });
+    assert.equal(created[0].webContents.enableDeviceEmulationCalls, 1);
+
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 480, height: 600 },
+      viewportWidth: 768,
+    });
+    assert.equal(created[0].webContents.enableDeviceEmulationCalls, 1);
+
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 480, height: 600 },
+    });
+    assert.equal(created[0].webContents.deviceEmulation, null);
+    assert.equal(created[0].webContents.disableDeviceEmulationCalls, 1);
+  });
+
+  it("destroys the surface during window cleanup", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 100, height: 100 },
+    });
+    manager.destroyWindow(win);
+    assert.equal(created[0].webContents.closed, true);
+    assert.equal(win.children.length, 0);
+  });
+
+  it("runs the picker and inspects the selected node", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 100, height: 100 },
+    });
+
+    assert.equal(await manager.inspect(win, "stale"), false);
+    assert.equal(await manager.inspect(win, "current"), true);
+    assert.deepEqual(created[0].webContents.inspected, { x: 42, y: 84 });
+  });
+
+  it("captures structured element context and a screenshot crop", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 500, height: 400 },
+    });
+    created[0].webContents.executeResult = {
+      selector: "main > button.primary",
+      tagName: "button",
+      role: "button",
+      accessibleName: "Save changes",
+      text: "Save",
+      html: '<button class="primary">Save</button>',
+      rect: { x: 12, y: 24, width: 120, height: 40 },
+      viewport: { width: 500, height: 400, devicePixelRatio: 1 },
+      styles: { color: "rgb(0, 0, 0)", display: "inline-flex" },
+    };
+
+    assert.equal(await manager.select(win, "stale"), null);
+    assert.deepEqual(await manager.select(win, "current"), {
+      selector: "main > button.primary",
+      tagName: "button",
+      role: "button",
+      accessibleName: "Save changes",
+      text: "Save",
+      html: '<button class="primary">Save</button>',
+      rect: { x: 12, y: 24, width: 120, height: 40 },
+      viewport: { width: 500, height: 400, devicePixelRatio: 1 },
+      styles: { color: "rgb(0, 0, 0)", display: "inline-flex" },
+      screenshotDataUrl: "data:image/png;base64,c2VsZWN0aW9u",
+    });
+    assert.deepEqual(created[0].webContents.capturedRect, { x: 12, y: 24, width: 120, height: 40 });
+  });
+
+  it("rejects page-controlled capture rectangles outside safe bounds", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 500, height: 400 },
+    });
+
+    for (const rect of [
+      { x: 0, y: 0, width: Infinity, height: 1 },
+      { x: 0, y: 0, width: -1, height: 1 },
+      { x: "bad", y: 0, width: 1, height: 1 },
+    ]) {
+      created[0].webContents.executeResult = { rect };
+      assert.equal(await manager.select(win, "current"), null);
+    }
+    assert.equal(created[0].webContents.capturedRect, undefined);
+  });
+
+  it("reloads the surface and reports console, load, and accessibility diagnostics", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 500, height: 400 },
+    });
+    const view = created[0];
+    view.emit("console-message", {}, 3, "Broken interaction", 18, "app.js");
+    view.emit("did-fail-load", {}, -6, "ERR_FILE_NOT_FOUND", "missing.css", true);
+    view.webContents.executeResult = {
+      viewport: { width: 500, height: 400 },
+      issues: [
+        {
+          severity: "error",
+          code: "missing-label",
+          message: "Button has no accessible name",
+          selector: "main > button:nth-of-type(2)",
+        },
+      ],
+    };
+
+    assert.equal(manager.reload(win, "stale"), false);
+    assert.equal(manager.reload(win, "current"), true);
+    assert.equal(view.webContents.reloads, 1);
+    assert.deepEqual(await manager.review(win, "current"), {
+      viewport: { width: 500, height: 400 },
+      issues: [
+        {
+          severity: "error",
+          code: "missing-label",
+          message: "Button has no accessible name",
+          selector: "main > button:nth-of-type(2)",
+        },
+      ],
+      consoleMessages: [
+        {
+          level: "error",
+          message: "Broken interaction",
+          line: 18,
+          source: "app.js",
+        },
+      ],
+      loadErrors: [
+        {
+          code: -6,
+          description: "ERR_FILE_NOT_FOUND",
+          url: "missing.css",
+          mainFrame: true,
+        },
+      ],
+    });
+  });
+});
+
+function expectPreview(actual, expected) {
+  assert.equal(actual.origin, expected.origin);
+  assert.equal(actual.capabilityPrefix, expected.capabilityPrefix);
+}

@@ -45,8 +45,13 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const { ArtifactSurfaceManager, artifactPreviewOriginForServer } = require("./artifact_surface");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
+
+const artifactSurfaceManager = new ArtifactSurfaceManager({
+  createView: (options) => new WebContentsView(options),
+});
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -572,7 +577,40 @@ function pinWindow(win, origin) {
  */
 function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
-  if (state) state.serverUrl = serverUrl;
+  if (!state) return;
+  if (state.serverUrl !== serverUrl) {
+    state.artifactPreviewOriginServerUrl = null;
+    state.artifactPreviewOriginPromise = null;
+  }
+  state.serverUrl = serverUrl;
+}
+
+async function artifactPreviewOriginForSender(event, serverUrl) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = win && windows.get(win);
+  if (!state) return artifactPreviewOriginForServer(serverUrl);
+  if (state.artifactPreviewOriginServerUrl !== serverUrl || !state.artifactPreviewOriginPromise) {
+    state.artifactPreviewOriginServerUrl = serverUrl;
+    state.artifactPreviewOriginPromise = (async () => {
+      try {
+        const base = serverUrl.endsWith("/") ? serverUrl : `${serverUrl}/`;
+        const response = await event.sender.session.fetch(new URL("v1/info", base).href);
+        if (response.ok) {
+          const info = await response.json();
+          if (typeof info?.artifact_preview_origin === "string") {
+            const configured = new URL(info.artifact_preview_origin);
+            if (configured.protocol === "http:" || configured.protocol === "https:") {
+              return configured.origin;
+            }
+          }
+        }
+      } catch {
+        // Older servers and transient info-probe failures use the safe derived origin.
+      }
+      return artifactPreviewOriginForServer(serverUrl);
+    })();
+  }
+  return state.artifactPreviewOriginPromise;
 }
 
 /**
@@ -1059,6 +1097,8 @@ function createWindow(targetUrl, opts = {}) {
     // Clean server identity (no conversation path) for host/server CLI
     // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
     serverUrl: destination ? serverUrl : null,
+    artifactPreviewOriginServerUrl: null,
+    artifactPreviewOriginPromise: null,
     ephemeral,
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
@@ -1158,6 +1198,9 @@ function createWindow(targetUrl, opts = {}) {
   // The desktop never auto-connects this machine as a runner — on launch or on
   // connect. Connecting is an explicit action from the host menu.
 
+  win.on("close", () => {
+    artifactSurfaceManager.destroyWindow(win);
+  });
   win.on("closed", () => {
     // Destroy this window's embedded-browser views, else they leak webContents.
     try {
@@ -2034,6 +2077,49 @@ function browserRegistryForSender(event) {
 }
 
 function registerIpc() {
+  ipcMain.handle("omnigent:artifact-surface-sync", async (event, params) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("artifact surfaces are only available to a connected server page");
+    }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) throw new Error("artifact surfaces require a connected server");
+    return artifactSurfaceManager.sync(win, {
+      ...params,
+      expectedOrigin: await artifactPreviewOriginForSender(event, serverUrl),
+    });
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-destroy", (event, id) => {
+    if (!isPinnedOriginSender(event)) return;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    artifactSurfaceManager.destroy(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-inspect", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.inspect(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-select", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return null;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.select(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-reload", (event, id) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.reload(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-review", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return null;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.review(win, id);
+  });
+
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
