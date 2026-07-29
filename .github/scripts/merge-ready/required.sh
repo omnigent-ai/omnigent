@@ -4,28 +4,40 @@
 # absent in some runs: draft PRs (empty matrix) and path-ignored PRs (the
 # workflow doesn't run). The real-gateway e2e-ui tests run nightly only and are
 # NOT PR checks, so they are not listed here.
-# Generated file -- do not hand-edit; it is replaced wholesale on every sync.
+#
+# Keep in sync with live job names in .github/workflows/{ci,lint,docker-build,
+# e2e,e2e-ui,integration,ui-snapshot,web-tests}.yml. CI enforces this via
+# validate-required.py (the "Merge-ready required sync" check). Workflows
+# intentionally left unscanned are listed in INTENTIONAL_UNSCANNED_WORKFLOWS
+# in that script.
 
 REQUIRED=(
   "DCO"
   "Pre-commit checks"
+  "Mypy"
+  "Merge-ready required sync"
+  "Version lockstep check"
   "Docker build"
+  "npm test"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
   "Pytest (runtime-core)"
-  "Pytest (inner-terminal)"
-  "Pytest (inner-env)"
-  "Pytest (inner-tracing)"
   "Pytest (inner-rest)"
   "Pytest (tools)"
   "Pytest (repl-sdk)"
-  "Pytest (server-responses)"
+  "Pytest (server-approvals)"
+  "Pytest (server-integration)"
   "Pytest (server-rest)"
   "Pytest (spec-llms)"
+  "Pytest (integration-mock)"
   "Pytest (runner-app)"
   "Pytest (stores)"
+  "Pytest (stores-postgres)"
+  "Pytest (stores-mysql)"
   "Pytest (misc)"
   "Pytest (databricks)"
+  "Pytest (slack)"
+  "Pytest (codex-parity)"
   "E2E Tests (shard 0/4)"
   "E2E Tests (shard 1/4)"
   "E2E Tests (shard 2/4)"
@@ -34,29 +46,31 @@ REQUIRED=(
   "E2E UI Tests (shard 1/3)"
   "E2E UI Tests (shard 2/3)"
   "UI Snapshot (visual baselines)"
-  "Integration (claude-sdk)"
   "Integration (openai-agents)"
-  "Integration (codex)"
 )
 
 ALLOW_SKIP=(
   "Docker build"
+  "npm test"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
   "Pytest (runtime-core)"
-  "Pytest (inner-terminal)"
-  "Pytest (inner-env)"
-  "Pytest (inner-tracing)"
   "Pytest (inner-rest)"
   "Pytest (tools)"
   "Pytest (repl-sdk)"
-  "Pytest (server-responses)"
+  "Pytest (server-approvals)"
+  "Pytest (server-integration)"
   "Pytest (server-rest)"
   "Pytest (spec-llms)"
+  "Pytest (integration-mock)"
   "Pytest (runner-app)"
   "Pytest (stores)"
+  "Pytest (stores-postgres)"
+  "Pytest (stores-mysql)"
   "Pytest (misc)"
   "Pytest (databricks)"
+  "Pytest (slack)"
+  "Pytest (codex-parity)"
   "E2E Tests (shard 0/4)"
   "E2E Tests (shard 1/4)"
   "E2E Tests (shard 2/4)"
@@ -65,9 +79,7 @@ ALLOW_SKIP=(
   "E2E UI Tests (shard 1/3)"
   "E2E UI Tests (shard 2/3)"
   "UI Snapshot (visual baselines)"
-  "Integration (claude-sdk)"
   "Integration (openai-agents)"
-  "Integration (codex)"
 )
 
 is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
@@ -79,6 +91,7 @@ is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
 workflow_for() {
   case "$1" in
     "Docker build")          echo "Docker build" ;;
+    "npm test")              echo "web Tests" ;;
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;

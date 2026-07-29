@@ -1,9 +1,11 @@
 name: Lint
 
-# Runs the project's pre-commit hooks (ruff, mypy, custom anti-pattern grep
-# hooks, etc.) on every non-draft PR and on push to main. Surfaces as the
-# `Pre-commit checks` check, a REQUIRED gate entry in merge-ready.yml. Draft PRs
-# are skipped; `ready_for_review` refires so the check doesn't strand pending.
+# Runs formatting/lint pre-commit hooks (ruff, custom anti-pattern hooks, etc.),
+# web `tsc`, incremental mypy (`Mypy` job via scripts/mypy_gate.py), and the
+# merge-ready REQUIRED↔workflow sync guard on every non-draft PR and on push to
+# main. `Pre-commit checks`, `Mypy`, `Merge-ready required sync`, and
+# `Version lockstep check` are REQUIRED gate entries. Draft PRs are skipped;
+# `ready_for_review` refires so checks don't strand pending.
 
 on:
   pull_request:
@@ -120,13 +122,70 @@ jobs:
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
 
-      - name: Run formatting, lint, and typing checks
+      - name: Run formatting and lint checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
 
       # Type-checking is temporarily skipped in CI while the pnpm lockfile
       # settles; `pnpm --filter web run type-check` still works locally.
       # - name: Type-check web
       #   run: pnpm --filter web run type-check
+
+  # Incremental mypy gate: full-tree strict mypy still has a large pre-existing
+  # deficit (see mypy-baseline.txt). scripts/mypy_gate.py fails only on *new*
+  # fingerprints so typing cannot silently rot further. Rewrite the baseline
+  # with `uv run python scripts/mypy_gate.py --write-baseline` when graduating
+  # fixed errors (review the diff).
+  mypy:
+    name: Mypy
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Mypy (fail on new errors vs baseline)
+        run: uv run python scripts/mypy_gate.py
+
+  # Stale names in required.sh auto-pass (missing + ALLOW_SKIP + green
+  # workflow). Fail the PR if REQUIRED drifts from live job names.
+  merge-ready-required-sync:
+    name: Merge-ready required sync
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: REQUIRED names match live workflow jobs
+        run: python .github/scripts/merge-ready/validate-required.py
 
   # The four packages release in lockstep (identical versions + `==` sibling
   # pins). Assert agreement on every change so drift from a bad merge or

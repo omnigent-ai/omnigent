@@ -14,9 +14,12 @@ name: Code Coverage
 # COVERAGE_TOLERANCE).
 #
 # Soft rollout: while COVERAGE_ENFORCE is "false" a regression is reported as a
-# success status annotated "would fail once enforced" — never a red ✗. To turn on
-# real red statuses, set COVERAGE_ENFORCE: "true"; to make them actually block a
-# merge, also mark the status a required check in branch protection.
+# success status annotated "would fail once enforced" — never a red ✗. Coverage
+# statuses are not merge-ready REQUIRED checks (evaluate-checks.sh reads
+# check-runs only); keep enforce false so the status matches that reality. To
+# hard-gate coverage later: teach evaluate-checks about statuses (or convert to
+# a check-run), add Coverage / Coverage (ui) to required.sh, then set
+# COVERAGE_ENFORCE: "true".
 
 on:
   workflow_run:
@@ -39,10 +42,12 @@ env:
   COVERAGE_TOLERANCE: "0.5"
   # "false" = observe only: a regression posts a success status annotated
   # "would fail once enforced" instead of a red ✗. "true" = a regression posts a
-  # real failure (red ✗). This stays non-blocking until the status is also marked
-  # a required check in branch protection — so red ✗ surfaces the drop without
-  # blocking the merge.
-  COVERAGE_ENFORCE: "true"
+  # real failure (red ✗). Coverage / Coverage (ui) are commit *statuses* (not
+  # check-runs), and merge-ready/evaluate-checks.sh only reads check-runs — so
+  # they cannot be added to REQUIRED without also teaching the gate about
+  # statuses. Keep enforce false until that lands; a red ✗ here would look like
+  # a hard gate while Merge Ready stayed green.
+  COVERAGE_ENFORCE: "false"
   # How many recent main commits to scan for the last recorded baseline status.
   # Must exceed the longest expected run of consecutive merges that don't touch
   # a given suite. Capped at 100 (the GraphQL history page size); raising it
