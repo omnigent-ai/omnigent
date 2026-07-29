@@ -820,8 +820,10 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
                                 "id": "provider-latest",
                                 "displayName": "Provider Latest",
                                 "isDefault": True,
+                                "description": "Provider supplied description",
                                 "contextWindow": 256_000,
                                 "rateMultiplier": 0.5,
+                                "rateUnit": "Credit",
                             }
                         ]
                     }
@@ -854,8 +856,12 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
 
     assert f"/v1/sessions/{session_id}/kiro-model-options" in fake_client.get_calls
     assert [model.id for model in snapshot.model_options] == ["provider-latest"]
+    assert snapshot.model_options[0].model_dump()["description"] == (
+        "Provider supplied description"
+    )
     assert snapshot.model_options[0].model_dump()["contextWindow"] == 256_000
     assert snapshot.model_options[0].model_dump()["rateMultiplier"] == 0.5
+    assert snapshot.model_options[0].model_dump()["rateUnit"] == "Credit"
 
 
 @pytest.mark.asyncio
