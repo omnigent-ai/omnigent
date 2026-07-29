@@ -93,6 +93,11 @@ class NativeHarnessProvider:
     run_native: str  # CLI + resume launch entry point
     auto_create_terminal: str  # runner terminal builder
     spawn_env_builder: str | None = None
+    # Session-label key carrying this harness's bridge id, when its spawn-env
+    # builder takes a ``bridge_id=`` kwarg resolved from session labels
+    # (codex/opencode/antigravity). ``None`` for bare builders and for harnesses
+    # whose bridge id resolves through a different path (e.g. claude).
+    bridge_id_label_key: str | None = None
     interrupt_handler: str | None = None
     stop_handler: str | None = None
     materialize_agent_spec: str | None = None  # built-in agent seeding
@@ -235,13 +240,23 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
 )
 
 
+# Native harnesses whose spawn-env builder takes a ``bridge_id=`` resolved from
+# a session label. Their label key follows the uniform
+# ``omnigent.<key>_native.bridge_id`` pattern (pinned against the real bridge
+# constants in tests/test_harness_plugins.py). Claude also carries a bridge id
+# but resolves it through a runner helper with a server-side fallback, so it is
+# handled as a spawn-env special case rather than a plain label read.
+_BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "antigravity"})
+
+
 def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     """Build a built-in provider row from the ``omnigent.<key>_native`` module.
 
     The built-in native harnesses follow a uniform module layout: each exports
     ``run_<key>_native`` (CLI + resume launch) and ``_materialize_<key>_agent_spec``
-    (agent seeding), and re-exports ``_auto_create_<key>_terminal`` from
-    ``omnigent.runner.native``. The remaining hooks (spawn-env, interrupt, stop,
+    (agent seeding), re-exports ``_auto_create_<key>_terminal`` from
+    ``omnigent.runner.native``, and exposes ``build_<key>_native_spawn_env`` in
+    ``omnigent.<key>_native_bridge``. The remaining hooks (interrupt, stop,
     bridge-dir) are still runner-local closures / inline dispatch, so they stay
     ``None`` until those hubs migrate onto the seam.
     """
@@ -250,6 +265,8 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
         key=key,
         run_native=f"{module}:run_{key}_native",
         auto_create_terminal=f"omnigent.runner.native:_auto_create_{key}_terminal",
+        spawn_env_builder=f"{module}_bridge:build_{key}_native_spawn_env",
+        bridge_id_label_key=(f"{module}.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
     )
 

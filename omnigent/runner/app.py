@@ -107,6 +107,7 @@ from omnigent.runner.native import (
     _publish_terminal_pending,
     _publish_tmux_target_for_bridge,
     _required_runner_env,
+    _resolve_native_spawn_env,
     _resolve_opencode_compact_model,
     _resolved_spec_workdir,
     _resolved_workdir_for_spec,
@@ -2564,93 +2565,13 @@ def create_runner_app(
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
             )
-            if harness_name == "claude-native" and spawn_env is None:
-                from omnigent.claude_native_bridge import (
-                    build_claude_native_spawn_env,
-                )
-
-                bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            if spawn_env is None:
+                spawn_env = await _resolve_native_spawn_env(
+                    harness_name,
+                    session_id,
                     server_client=server_client,
-                    session_id=session_id,
-                    session_labels=init_context.labels,
+                    optional_labels=init_context.labels,
                 )
-                spawn_env = build_claude_native_spawn_env(session_id, bridge_id=bridge_id)
-            if harness_name == "codex-native" and spawn_env is None:
-                from omnigent.codex_native_bridge import (
-                    CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
-                    build_codex_native_spawn_env,
-                )
-
-                labels = await _session_labels_for_runner_spawn(
-                    server_client=server_client,
-                    session_id=session_id,
-                )
-                bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
-                spawn_env = build_codex_native_spawn_env(session_id, bridge_id=bridge_id)
-            if harness_name == "pi-native" and spawn_env is None:
-                from omnigent.pi_native_bridge import build_pi_native_spawn_env
-
-                spawn_env = build_pi_native_spawn_env(session_id)
-            if harness_name == "opencode-native" and spawn_env is None:
-                from omnigent.opencode_native_bridge import (
-                    OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
-                    build_opencode_native_spawn_env,
-                )
-
-                labels = await _session_labels_for_runner_spawn(
-                    server_client=server_client,
-                    session_id=session_id,
-                )
-                bridge_id = labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY)
-                spawn_env = build_opencode_native_spawn_env(session_id, bridge_id=bridge_id)
-            if harness_name == "cursor-native" and spawn_env is None:
-                from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
-
-                spawn_env = build_cursor_native_spawn_env(session_id)
-            if harness_name == "kiro-native" and spawn_env is None:
-                from omnigent.kiro_native_bridge import build_kiro_native_spawn_env
-
-                spawn_env = build_kiro_native_spawn_env(session_id)
-            if harness_name == "antigravity-native" and spawn_env is None:
-                from omnigent.antigravity_native_bridge import (
-                    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-                    build_antigravity_native_spawn_env,
-                )
-
-                labels = await _session_labels_for_runner_spawn(
-                    server_client=server_client,
-                    session_id=session_id,
-                )
-                antigravity_bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
-                spawn_env = build_antigravity_native_spawn_env(
-                    session_id, bridge_id=antigravity_bridge_id
-                )
-            if harness_name == "goose-native" and spawn_env is None:
-                from omnigent.goose_native_bridge import build_goose_native_spawn_env
-
-                spawn_env = build_goose_native_spawn_env(session_id)
-            if harness_name == "hermes-native" and spawn_env is None:
-                from omnigent.hermes_native_bridge import (
-                    bridge_dir_for_session_id as _hermes_bridge_dir,
-                )
-                from omnigent.hermes_native_bridge import (
-                    build_hermes_native_spawn_env,
-                    write_policy_hook_config,
-                )
-
-                _h_server_url = os.environ.get(
-                    "RUNNER_SERVER_URL", "http://localhost:6767"
-                ).rstrip("/")
-                write_policy_hook_config(_hermes_bridge_dir(session_id), _h_server_url, session_id)
-                spawn_env = build_hermes_native_spawn_env(session_id)
-            if harness_name == "qwen-native" and spawn_env is None:
-                from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
-
-                spawn_env = build_qwen_native_spawn_env(session_id)
-            if harness_name == "kimi-native" and spawn_env is None:
-                from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
-
-                spawn_env = build_kimi_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
         else:
             harness_name = "runner-test-default"
@@ -6089,91 +6010,13 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
                     },
                 )
-        if harness_name == "claude-native" and spawn_env is None:
-            from omnigent.claude_native_bridge import build_claude_native_spawn_env
-
-            bridge_id = await _claude_native_bridge_id_with_optional_labels(
+        if spawn_env is None:
+            spawn_env = await _resolve_native_spawn_env(
+                harness_name,
+                conv_id,
                 server_client=server_client,
-                session_id=conv_id,
-                session_labels=startup_labels,
+                optional_labels=startup_labels,
             )
-            spawn_env = build_claude_native_spawn_env(conv_id, bridge_id=bridge_id)
-        if harness_name == "codex-native" and spawn_env is None:
-            from omnigent.codex_native_bridge import (
-                CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
-                build_codex_native_spawn_env,
-            )
-
-            labels = await _session_labels_for_runner_spawn(
-                server_client=server_client,
-                session_id=conv_id,
-            )
-            bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
-            spawn_env = build_codex_native_spawn_env(conv_id, bridge_id=bridge_id)
-        if harness_name == "pi-native" and spawn_env is None:
-            from omnigent.pi_native_bridge import build_pi_native_spawn_env
-
-            spawn_env = build_pi_native_spawn_env(conv_id)
-        if harness_name == "opencode-native" and spawn_env is None:
-            from omnigent.opencode_native_bridge import (
-                OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
-                build_opencode_native_spawn_env,
-            )
-
-            labels = await _session_labels_for_runner_spawn(
-                server_client=server_client,
-                session_id=conv_id,
-            )
-            bridge_id = labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY)
-            spawn_env = build_opencode_native_spawn_env(conv_id, bridge_id=bridge_id)
-        if harness_name == "cursor-native" and spawn_env is None:
-            from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
-
-            spawn_env = build_cursor_native_spawn_env(conv_id)
-        if harness_name == "kiro-native" and spawn_env is None:
-            from omnigent.kiro_native_bridge import build_kiro_native_spawn_env
-
-            spawn_env = build_kiro_native_spawn_env(conv_id)
-        if harness_name == "antigravity-native" and spawn_env is None:
-            from omnigent.antigravity_native_bridge import (
-                ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-                build_antigravity_native_spawn_env,
-            )
-
-            labels = await _session_labels_for_runner_spawn(
-                server_client=server_client,
-                session_id=conv_id,
-            )
-            antigravity_bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
-            spawn_env = build_antigravity_native_spawn_env(
-                conv_id, bridge_id=antigravity_bridge_id
-            )
-        if harness_name == "goose-native" and spawn_env is None:
-            from omnigent.goose_native_bridge import build_goose_native_spawn_env
-
-            spawn_env = build_goose_native_spawn_env(conv_id)
-        if harness_name == "hermes-native" and spawn_env is None:
-            from omnigent.hermes_native_bridge import (
-                bridge_dir_for_session_id as _hermes_bridge_dir2,
-            )
-            from omnigent.hermes_native_bridge import (
-                build_hermes_native_spawn_env,
-                write_policy_hook_config,
-            )
-
-            _h_server_url2 = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip(
-                "/"
-            )
-            write_policy_hook_config(_hermes_bridge_dir2(conv_id), _h_server_url2, conv_id)
-            spawn_env = build_hermes_native_spawn_env(conv_id)
-        if harness_name == "qwen-native" and spawn_env is None:
-            from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
-
-            spawn_env = build_qwen_native_spawn_env(conv_id)
-        if harness_name == "kimi-native" and spawn_env is None:
-            from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
-
-            spawn_env = build_kimi_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:

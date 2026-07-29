@@ -270,10 +270,11 @@ def test_native_provider_for_key_lookup() -> None:
 
 
 def test_builtin_native_providers_have_required_hooks() -> None:
-    """run_native and auto_create_terminal are mandatory on every built-in row."""
+    """run_native, auto_create_terminal, and spawn_env_builder are mandatory."""
     for provider in hp.native_providers():
         assert provider.run_native, provider.key
         assert provider.auto_create_terminal, provider.key
+        assert provider.spawn_env_builder, provider.key
 
 
 def test_builtin_native_provider_paths_resolve() -> None:
@@ -288,7 +289,33 @@ def test_builtin_native_provider_paths_resolve() -> None:
         for hook in (
             "run_native",
             "auto_create_terminal",
+            "spawn_env_builder",
             "materialize_agent_spec",
         ):
             resolved = native_dispatch.resolve_hook(provider, hook)
             assert callable(resolved), f"{provider.key}.{hook} did not resolve to a callable"
+
+
+def test_builtin_native_provider_bridge_id_label_keys_match_constants() -> None:
+    """The derived bridge_id_label_key equals each harness's real constant.
+
+    ``harness_plugins`` derives the label key from the uniform
+    ``omnigent.<key>_native.bridge_id`` pattern rather than importing the bridge
+    modules (which would break its import-light contract). Pin the derivation
+    against the actual constants so a rename can't silently diverge.
+    """
+    from omnigent.antigravity_native_bridge import ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.opencode_native_bridge import OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY
+
+    expected = {
+        "codex": CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+        "opencode": OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
+        "antigravity": ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    }
+    for provider in hp.native_providers():
+        if provider.key in expected:
+            assert provider.bridge_id_label_key == expected[provider.key]
+        else:
+            # Bare builders and claude (resolved via a runner helper) carry no key.
+            assert provider.bridge_id_label_key is None, provider.key

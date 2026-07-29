@@ -39,7 +39,10 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
+from omnigent.harness_plugins import native_provider_for_key
 from omnigent.model_override import validate_model_override
+from omnigent.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native_dispatch import resolve_hook
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -6329,6 +6332,70 @@ async def _claude_native_bridge_id_with_optional_labels(
         session_id=session_id,
         session_labels=session_labels,
     )
+
+
+async def _resolve_native_spawn_env(
+    harness_name: str,
+    session_id: str,
+    *,
+    server_client: httpx.AsyncClient,
+    optional_labels: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """Build the spawn env for a native harness through the provider seam.
+
+    Replaces the per-harness ``if harness_name == "<x>-native"`` spawn-env
+    dispatch: resolves the harness's ``spawn_env_builder`` from the registry and
+    supplies the bridge id the way that harness needs it.
+
+    Three shapes: *bare* builders take only the session id; *label* builders
+    (codex/opencode/antigravity) take ``bridge_id=`` read from a session label
+    named by ``provider.bridge_id_label_key``; and two specials — claude
+    (bridge id via a runner helper with a server-side fallback) and hermes
+    (writes its policy-hook config before building).
+
+    :param harness_name: Harness id, e.g. ``"codex-native"``.
+    :param session_id: Omnigent conversation id.
+    :param server_client: Runner's client to the Omnigent server, for label reads.
+    :param optional_labels: Envelope labels already in hand (claude prefers these
+        over a fresh fetch), or ``None``.
+    :returns: The spawn env mapping, or ``None`` when *harness_name* is not a
+        native harness with a registered spawn-env builder (caller keeps its
+        existing ``spawn_env``).
+    """
+    agent = native_coding_agent_for_harness(harness_name)
+    if agent is None:
+        return None
+    provider = native_provider_for_key(agent.key)
+    if provider is None or provider.spawn_env_builder is None:
+        return None
+    builder = resolve_hook(provider, "spawn_env_builder")
+
+    if agent.key == "claude":
+        bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            server_client=server_client,
+            session_id=session_id,
+            session_labels=optional_labels,
+        )
+        return builder(session_id, bridge_id=bridge_id)
+
+    if agent.key == "hermes":
+        from omnigent.hermes_native_bridge import (
+            bridge_dir_for_session_id,
+            write_policy_hook_config,
+        )
+
+        server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
+        write_policy_hook_config(bridge_dir_for_session_id(session_id), server_url, session_id)
+        return builder(session_id)
+
+    if provider.bridge_id_label_key is not None:
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+        return builder(session_id, bridge_id=labels.get(provider.bridge_id_label_key))
+
+    return builder(session_id)
 
 
 async def _claude_native_session_wants_rebuild(
