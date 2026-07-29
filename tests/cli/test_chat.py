@@ -1516,6 +1516,31 @@ def test_apply_overrides_uses_env_var_when_yaml_has_no_model_or_harness(
     )
 
 
+def test_apply_overrides_yaml_model_wins_over_env_and_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A YAML model remains authoritative over fallback sources."""
+    monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
+    monkeypatch.setattr(
+        chat_module,
+        "resolve_catalog_model",
+        lambda *args, **kwargs: pytest.fail(
+            f"catalog fallback called for explicit YAML model: {args=}, {kwargs=}"
+        ),
+    )
+    raw: dict[str, object] = {
+        "name": "configured",
+        "prompt": "hi",
+        "executor": {"model": "from-yaml"},
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides())
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["model"] == "from-yaml"
+
+
 def test_apply_overrides_explicit_model_wins_over_env_var(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
