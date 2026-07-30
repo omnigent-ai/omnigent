@@ -412,13 +412,13 @@ function renderToolRunFragment(
   return renderItem(fragment.tool, runStart + fragment.index, false);
 }
 
-const _ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
-const _SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
+const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
+const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
 
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (_ADVISE_MODELS_NAMES.has(item.execution.name) || _SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
   );
 }
 
@@ -481,7 +481,7 @@ function renderItem(
     case "tool":
       // Intelligent routing's fan-out sizing gets a structured plan card
       // instead of the generic name(json) row + raw-JSON expansion.
-      if (_ADVISE_MODELS_NAMES.has(item.execution.name)) {
+      if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
         return (
           <SmartRoutingCard
             key={key}

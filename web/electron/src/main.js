@@ -87,7 +87,7 @@ const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
- * file). `let` (not const) so tests can shrink them via __test.setQuitTimeouts
+ * file). `let` (not const) so tests can shrink them via testApi.setQuitTimeouts
  * to exercise the force-exit safety nets without waiting seconds in real
  * time. Production code never writes them.
  */
@@ -370,8 +370,8 @@ function registerLocalhostAccess() {
 // never a tight loop. In the normal case the gate full-page-redirects the
 // reload's top-level navigation to its login page, so no further API calls
 // (hence no further redirects) fire anyway.
-const _lastExpiryReloadAt = new WeakMap();
-const _EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
+const lastExpiryReloadAt = new WeakMap();
+const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
 
 /**
  * Recover the desktop window when the workspace SSO session expires.
@@ -386,9 +386,9 @@ function registerSessionExpiryAccess() {
     const now = Date.now();
     for (const [win, state] of windows) {
       if (state.origin !== origin || win.isDestroyed()) continue;
-      const last = _lastExpiryReloadAt.get(win) ?? 0;
-      if (now - last < _EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
-      _lastExpiryReloadAt.set(win, now);
+      const last = lastExpiryReloadAt.get(win) ?? 0;
+      if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
+      lastExpiryReloadAt.set(win, now);
       win.webContents.reload();
     }
   });
@@ -2838,9 +2838,9 @@ if (!gotLock) {
     // subsequent spawn/execFile call inherits it. Runs before resolvedCliPath()
     // (a PATH consumer) and any host spawn, so the ordering guarantee is implicit.
     const { resolveLoginShellPath, mergePath } = require("./loginShellPath");
-    const _loginPath = resolveLoginShellPath();
-    if (_loginPath) {
-      process.env.PATH = mergePath(process.env.PATH, _loginPath);
+    const loginPath = resolveLoginShellPath();
+    if (loginPath) {
+      process.env.PATH = mergePath(process.env.PATH, loginPath);
     }
     // Resolve the CLI path once at startup so the first status/control call is
     // instant (primes the in-memory cache in resolvedCliPath); also lets the

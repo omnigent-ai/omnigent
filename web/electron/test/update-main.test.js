@@ -138,7 +138,7 @@ function loadMainHarness({
   // into the menu, the IPC surface, and the before-quit install handoff.
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    '\nmodule.exports.__test = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
+    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
 
   const module = { exports: {} };
   const sandbox = {
@@ -174,14 +174,14 @@ function loadMainHarness({
   };
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
-  module.exports.__test.windows.set(win, {
+  module.exports.testApi.windows.set(win, {
     origin: "https://server.example",
     serverUrl: "https://server.example/app",
     badgeCount: 0,
   });
 
   return {
-    api: module.exports.__test,
+    api: module.exports.testApi,
     appEvents,
     autoUpdater,
     calls,
