@@ -33,6 +33,7 @@ from omnigent.inner.pi_executor import (
     _generate_extension_js,
     _pi_provider_for_model,
     _PiRpcSession,
+    _PiSessionState,
     _redact_argv_for_log,
     _safe_dumps,
     _sanitize_schema,
@@ -1300,8 +1301,19 @@ class TestPiExecutorConstructor(unittest.TestCase):
 
     def test_constructor_raises_when_pi_not_found(self):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=None):
-            with self.assertRaises(ImportError):
+            with self.assertRaisesRegex(ImportError, r">=0\.80\.4"):
                 PiExecutor()
+
+    def test_constructor_reuses_one_version_probe(self):
+        with (
+            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+            patch("omnigent.pi_native.pi_version", return_value=(0, 80, 4)) as version_probe,
+        ):
+            executor = PiExecutor()
+
+        version_probe.assert_called_once_with("/usr/bin/pi")
+        self.assertEqual(executor._pi_version, (0, 80, 4))
+        self.assertIn("--approve", executor._extra_args)
 
     def test_constructor_databricks_with_env(self):
         with (
@@ -1799,6 +1811,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -1860,6 +1873,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -1986,6 +2000,7 @@ class TestRunTurn(unittest.TestCase):
                         ],
                     }
                 ),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2032,6 +2047,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2079,6 +2095,7 @@ class TestRunTurn(unittest.TestCase):
                 json.dumps({"type": "message_end", "message": errored}),
                 # Pi's agent loop always emits agent_end after an errored call.
                 json.dumps({"type": "agent_end", "messages": [errored]}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2157,11 +2174,11 @@ class TestRunTurn(unittest.TestCase):
 
         _run(_test())
 
-    def test_post_tool_error_drains_agent_end_before_failing(self):
+    def test_post_tool_error_drains_to_settlement_before_failing(self):
         """A message_end error after a successful tool call fails the turn
-        with pi's error message, but only after consuming the trailing
-        ``agent_end`` — leaving it queued would make the next turn on the
-        same RPC session read the stale terminal event as its own end.
+        with pi's error message, but only after consuming ``agent_end`` and
+        ``agent_settled``. Leaving either queued would contaminate the next
+        turn on the same RPC session.
         """
 
         async def _test():
@@ -2200,6 +2217,7 @@ class TestRunTurn(unittest.TestCase):
                 # Pi always emits agent_end after the errored LLM call ends
                 # the agent loop; it carries the errored message.
                 json.dumps({"type": "agent_end", "messages": [errored_assistant]}),
+                json.dumps({"type": "agent_settled"}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2227,8 +2245,7 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual([e.message for e in errors], [parse_error])
             self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
             self.assertFalse(any(isinstance(e, TextChunk) for e in events))
-            # The trailing agent_end was consumed: nothing stale is left for
-            # the next turn on this RPC session.
+            # Both terminal frames were consumed.
             self.assertTrue(fake_rpc._line_queue.empty())
 
         _run(_test())
@@ -2342,6 +2359,7 @@ def test_pi_thinking_deltas_stream_as_reasoning_chunks() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -2406,6 +2424,7 @@ def test_pi_thinking_and_text_delta_ordering_preserved() -> None:
                 _update({"type": "thinking_delta", "contentIndex": 2, "delta": "revise"}),
                 _update({"type": "text_delta", "contentIndex": 3, "delta": " step two"}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -2641,6 +2660,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -2663,6 +2683,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -2684,6 +2705,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -2709,6 +2731,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -2730,6 +2753,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -3359,6 +3383,7 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             stderr_lines=[],
         )
@@ -3431,6 +3456,7 @@ def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             stderr_lines=[],
         )
@@ -3490,6 +3516,7 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
             stdout_lines=[
                 json.dumps({"type": "response", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             stderr_lines=[],
         )
@@ -3621,6 +3648,7 @@ def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> Non
             stdout_lines=[
                 json.dumps({"type": "response", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             stderr_lines=[],
         )
@@ -3737,6 +3765,7 @@ def test_pi_usage_captured_from_message_end() -> None:
                 ),
                 json.dumps({"type": "message_end", "message": _pi_assistant_message_with_usage()}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -3798,6 +3827,7 @@ def test_pi_usage_fallback_from_agent_end() -> None:
                         ],
                     }
                 ),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -3846,6 +3876,7 @@ def test_pi_usage_model_falls_back_to_configured_model() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ],
             model="databricks-claude-sonnet-4-6",
         )
@@ -3916,6 +3947,7 @@ def test_pi_usage_sums_across_multiple_message_end() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -3967,6 +3999,7 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
                 # message_end with no usage object, then a usage-less agent_end.
                 json.dumps({"type": "message_end", "message": {"stopReason": "stop"}}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
             ]
         )
 
@@ -3987,3 +4020,669 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
         assert turn_complete[0].response == "Hi there"
 
     _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# PiExecutor turn-boundary tests: agent_settled, not agent_end, ends a turn.
+#
+# Pi wraps one logical turn (prompt + retry + compaction + queued
+# continuation) in a single agent session that can emit SEVERAL agent_end
+# frames — one per internal agent loop — followed by exactly one
+# agent_settled. run_turn must drain to agent_settled; returning at the
+# first agent_end drops the rest of the turn and leaves its late frames
+# queued for the NEXT run_turn to misread as its own terminal frames.
+# ---------------------------------------------------------------------------
+
+
+class TestAgentSettledTurnBoundary(unittest.TestCase):
+    def _make_executor(self):
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            return PiExecutor()
+
+    def _make_fake_rpc(self, lines: list[str]) -> _PiRpcSession:
+        fake_rpc = _PiRpcSession()
+        fake_rpc._line_queue = asyncio.Queue()
+        fake_rpc.process = _FakeProcess()
+        fake_rpc._stderr_lines = []
+        for line in lines:
+            fake_rpc._line_queue.put_nowait(line)
+        return fake_rpc
+
+    def _attach(
+        self,
+        executor,
+        fake_rpc,
+        version: tuple[int, int, int] | None = (0, 80, 4),
+    ) -> None:
+        executor._pi_version = version
+        state = _PiSessionState(rpc=fake_rpc)
+        executor._session_states["__default__"] = state
+
+        async def fake_ensure_rpc(*args, **kwargs):
+            executor._configure_session_turn_boundary(state)
+            return fake_rpc
+
+        executor._ensure_rpc = fake_ensure_rpc
+
+    def _usage_message(self, text: str, input_tokens: int, output_tokens: int) -> dict:
+        """Assistant message carrying a pi ``usage`` object."""
+        return {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "stopReason": "stop",
+            "model": "claude-sonnet-4-6",
+            "usage": {
+                "input": input_tokens,
+                "output": output_tokens,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": input_tokens + output_tokens,
+            },
+        }
+
+    def test_supported_version_waits_for_agent_settled(self):
+        """Pi 0.80.4+ must not finalize at the first agent_end."""
+
+        async def _test():
+            executor = self._make_executor()
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "first "},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "second"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc, version=(0, 80, 4))
+
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            completed = [event for event in events if isinstance(event, TurnComplete)]
+            self.assertEqual([event.response for event in completed], ["first second"])
+            self.assertTrue(fake_rpc._line_queue.empty())
+
+        _run(_test())
+
+    def test_older_version_uses_legacy_agent_end_boundary(self):
+        """Pi before 0.80.4 completes at agent_end instead of stalling."""
+
+        async def _test():
+            executor = self._make_executor()
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "legacy"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc, version=(0, 80, 3))
+
+            with patch("omnigent.inner.pi_executor.logger.warning"):
+                events = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hello"}],
+                        [],
+                        "system",
+                    )
+                ]
+
+            completed = [event for event in events if isinstance(event, TurnComplete)]
+            self.assertEqual([event.response for event in completed], ["legacy"])
+            state = executor._session_states["__default__"]
+            self.assertEqual(state.pi_version, (0, 80, 3))
+            self.assertFalse(state.supports_agent_settled)
+
+        _run(_test())
+
+    def test_undetectable_version_uses_legacy_agent_end_boundary(self):
+        """An unknown version fails safe to the non-hanging boundary."""
+
+        async def _test():
+            executor = self._make_executor()
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc, version=None)
+
+            with patch("omnigent.inner.pi_executor.logger.warning"):
+                events = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hello"}],
+                        [],
+                        "system",
+                    )
+                ]
+
+            self.assertEqual(len([e for e in events if isinstance(e, TurnComplete)]), 1)
+            self.assertFalse(any(isinstance(e, ExecutorError) for e in events))
+
+        _run(_test())
+
+    def test_legacy_boundary_warning_is_emitted_once(self):
+        """Multiple old-version sessions emit one actionable warning."""
+        executor = self._make_executor()
+        executor._pi_version = (0, 80, 3)
+
+        with patch("omnigent.inner.pi_executor.logger.warning") as warning:
+            executor._configure_session_turn_boundary(_PiSessionState())
+            executor._configure_session_turn_boundary(_PiSessionState())
+
+        warning.assert_called_once()
+        args = warning.call_args.args
+        self.assertIn("0.80.3", args)
+        self.assertIn("Pi >= 0.80.4", args[0])
+
+    def test_multiple_agent_ends_settle_to_one_turn_complete(self):
+        """A retried turn emits message_end(error) + agent_end(willRetry)
+        for the failed loop, then streams the real answer and ends the
+        second loop with agent_end + agent_settled. Exactly ONE TurnComplete
+        must surface, carrying the retry's answer — not the failed loop's
+        error, and not a completion at the first agent_end.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+            errored = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "Rate limited",
+            }
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                # First internal loop: retryable LLM failure.
+                json.dumps({"type": "message_end", "message": errored}),
+                json.dumps({"type": "agent_end", "willRetry": True, "messages": [errored]}),
+                # Second internal loop (the retry) streams the real answer.
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "Final "},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "answer"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": self._usage_message("Final answer", 100, 20),
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [self._usage_message("Final answer", 100, 20)],
+                    }
+                ),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc)
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual(errors, [])
+            turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(len(turn_complete), 1)
+            # The completion carries the retry's streamed answer, and it is
+            # the LAST event — emitted at settlement, not mid-turn.
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertEqual(turn_complete[0].response, "Final answer")
+            usage = turn_complete[0].usage
+            self.assertIsNotNone(usage)
+            self.assertEqual(usage["input_tokens"], 100)
+            self.assertEqual(usage["output_tokens"], 20)
+            # Every terminal frame was drained: nothing stale is left for
+            # the next turn on this RPC session.
+            self.assertTrue(fake_rpc._line_queue.empty())
+
+        _run(_test())
+
+    def test_abort_drains_to_agent_settled(self):
+        """message_end(stopReason=aborted) must NOT end the read loop:
+        agent_end(stopReason=aborted) and agent_settled follow it on the
+        wire, and leaving them queued poisons the next turn.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+            aborted = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "aborted",
+                "errorMessage": "Request was aborted",
+            }
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "working"},
+                    }
+                ),
+                json.dumps({"type": "message_end", "message": aborted}),
+                json.dumps({"type": "agent_end", "messages": [aborted]}),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc)
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual([e.message for e in errors], ["Request was aborted"])
+            self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
+            # agent_end + agent_settled were consumed, not left queued.
+            self.assertTrue(fake_rpc._line_queue.empty())
+
+        _run(_test())
+
+    def test_error_drains_to_agent_settled(self):
+        """A non-retried LLM error surfaces as ExecutorError only after
+        agent_end AND agent_settled are drained off the stream.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+            errored = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "401 Unauthorized",
+            }
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "message_end", "message": errored}),
+                json.dumps({"type": "agent_end", "messages": [errored]}),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc)
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual([e.message for e in errors], ["401 Unauthorized"])
+            self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
+            self.assertTrue(fake_rpc._line_queue.empty())
+
+        _run(_test())
+
+    def test_context_overflow_compaction_returns_recovered_answer(self):
+        """Context overflow is not auto-retryable, so willRetry is false.
+        Pi compacts and continues anyway; the successful continuation must
+        supersede the overflow error and its partial output.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+            overflow = {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "discarded"}],
+                "stopReason": "error",
+                "errorMessage": "context window exceeded",
+            }
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "discarded"},
+                    }
+                ),
+                json.dumps({"type": "message_end", "message": overflow}),
+                json.dumps({"type": "agent_end", "willRetry": False, "messages": [overflow]}),
+                json.dumps({"type": "compaction_start"}),
+                json.dumps({"type": "compaction_end"}),
+                json.dumps({"type": "agent_start"}),
+                json.dumps({"type": "message_start", "message": {"role": "assistant"}}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Post-compaction answer",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": self._usage_message("Post-compaction answer", 80, 12),
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [self._usage_message("Post-compaction answer", 80, 12)],
+                    }
+                ),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc)
+            read_timeouts: list[float] = []
+            real_read = fake_rpc.read_line
+
+            async def read_spy(timeout=120.0):
+                read_timeouts.append(timeout)
+                return await real_read(timeout)
+
+            fake_rpc.read_line = read_spy
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            self.assertFalse(any(isinstance(e, ExecutorError) for e in events))
+            completed = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0].response, "Post-compaction answer")
+            # The error-to-agent_end read uses the short drain budget; after
+            # agent_end, compaction gets the normal budget again.
+            self.assertEqual(read_timeouts[3], 10.0)
+            self.assertEqual(read_timeouts[4], 120.0)
+            self.assertTrue(fake_rpc._line_queue.empty())
+
+        _run(_test())
+
+    def test_partial_retry_output_is_not_retained(self):
+        """A failed retry attempt may stream text before erroring. Its text
+        must not prefix the successful attempt's TurnComplete response.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+            errored = {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "partial"}],
+                "stopReason": "error",
+                "errorMessage": "retry me",
+            }
+            final = self._usage_message("Final answer", 30, 5)
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "partial"},
+                    }
+                ),
+                json.dumps({"type": "message_end", "message": errored}),
+                json.dumps({"type": "agent_end", "willRetry": True, "messages": [errored]}),
+                json.dumps({"type": "message_start", "message": {"role": "assistant"}}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Final answer",
+                        },
+                    }
+                ),
+                json.dumps({"type": "message_end", "message": final}),
+                json.dumps({"type": "agent_end", "messages": [final]}),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc)
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            completed = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0].response, "Final answer")
+
+        _run(_test())
+
+    def test_later_internal_run_uses_agent_end_usage_fallback(self):
+        """Usage fallback is per internal run, not per logical turn."""
+
+        async def _test():
+            executor = self._make_executor()
+            first = self._usage_message("First", 10, 2)
+            second_with_usage = self._usage_message("Second", 20, 3)
+            second_without_usage = {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Second"}],
+                "stopReason": "stop",
+            }
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "message_end", "message": first}),
+                json.dumps({"type": "agent_end", "messages": [first]}),
+                json.dumps({"type": "agent_start"}),
+                json.dumps({"type": "message_start", "message": {"role": "assistant"}}),
+                json.dumps({"type": "message_end", "message": second_without_usage}),
+                json.dumps({"type": "agent_end", "messages": [second_with_usage]}),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc)
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            completed = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(len(completed), 1)
+            usage = completed[0].usage
+            self.assertIsNotNone(usage)
+            self.assertEqual(usage["input_tokens"], 30)
+            self.assertEqual(usage["output_tokens"], 5)
+
+        _run(_test())
+
+    def test_interleaved_state_response_does_not_discard_stream_frames(self):
+        """A stale get_state response is just another command response.
+        Stream frames around it still pass through the normal state machine.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "before "},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "stale_probe",
+                        "type": "response",
+                        "command": "get_state",
+                        "success": True,
+                        "data": {"isStreaming": True},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "after"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc)
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            completed = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual([e.response for e in completed], ["before after"])
+            self.assertTrue(fake_rpc._line_queue.empty())
+
+        _run(_test())
+
+    def test_idle_response_before_settlement_does_not_end_turn(self):
+        """Pi can report idle before its settlement handler writes the
+        agent_settled frame. Only the latter is the turn boundary.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "done"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps(
+                    {
+                        "id": "stale_probe",
+                        "type": "response",
+                        "command": "get_state",
+                        "success": True,
+                        "data": {"isStreaming": False},
+                    }
+                ),
+                json.dumps({"type": "agent_settled"}),
+            ]
+            fake_rpc = self._make_fake_rpc(lines)
+            self._attach(executor, fake_rpc)
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            completed = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual([e.response for e in completed], ["done"])
+            self.assertTrue(fake_rpc._line_queue.empty())
+
+        _run(_test())
+
+    def test_stall_abort_send_is_bounded_and_rpc_is_recycled(self):
+        """A wedged abort drain cannot outlive the stall watchdog, and the
+        active RPC is closed even when the abort command times out.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+            fake_rpc = self._make_fake_rpc([json.dumps({"type": "response", "success": True})])
+            fake_process = fake_rpc.process
+            self._attach(executor, fake_rpc)
+            abort_started = asyncio.Event()
+            real_send = fake_rpc.send_command
+            sent_types: list[str] = []
+
+            async def send_with_wedged_abort(command):
+                sent_types.append(command.get("type", ""))
+                if command.get("type") != "abort":
+                    await real_send(command)
+                    return
+                abort_started.set()
+                await asyncio.Event().wait()
+
+            fake_rpc.send_command = send_with_wedged_abort
+
+            with (
+                patch("omnigent.inner.pi_executor._READ_STALL_TIMEOUT_S", 0.01),
+                patch("omnigent.inner.pi_executor._STALL_ABORT_TIMEOUT_S", 0.01),
+            ):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hello"}],
+                        [],
+                        "system",
+                    )
+                ]
+
+            self.assertTrue(abort_started.is_set())
+            self.assertEqual(sent_types, ["prompt", "abort"])
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual(len(errors), 1)
+            self.assertIn("aborted and recycled", errors[0].message)
+            self.assertEqual(executor._session_states, {})
+            self.assertIsNone(fake_rpc.process)
+            self.assertIsNotNone(fake_process)
+            self.assertEqual(fake_process.returncode, 0)
+
+        _run(_test())
