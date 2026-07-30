@@ -836,6 +836,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
                     "in_cluster",
                     "resources",
                     "pvc_mounts",
+                    "tolerations",
                 },
                 "sandbox.kubernetes",
             )
@@ -850,6 +851,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
             pvc_mounts=_parse_kubernetes_pvc_mounts(raw),
+            tolerations=_parse_kubernetes_tolerations(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -1914,6 +1916,84 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
     return normalized or None
 
 
+def _parse_kubernetes_tolerations(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.tolerations`` list.
+
+    Each entry is a Pod toleration in the usual Kubernetes shape (the
+    config-side ``toleration_seconds`` maps to manifest ``tolerationSeconds``),
+    letting runner Pods schedule onto tainted nodes — the common case is a
+    dedicated agent node pool carrying a ``NoSchedule`` taint. Validated at
+    parse time so an operator typo fails server startup instead of the first
+    managed launch, and normalized to manifest shape so
+    :func:`~omnigent.onboarding.sandboxes.kubernetes.build_pod_manifest` can
+    emit entries verbatim.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Manifest-shaped entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, or an
+        entry combines fields Kubernetes itself would reject at Pod creation.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("tolerations")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.tolerations' must be a list of "
+            "{key?, operator?, value?, effect?, toleration_seconds?} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.tolerations[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        _reject_unknown_keys(
+            entry, {"key", "operator", "value", "effect", "toleration_seconds"}, path_prefix
+        )
+        toleration: dict[str, object] = {}
+        for field in ("key", "operator", "value", "effect"):
+            if field not in entry:
+                continue
+            field_value = entry[field]
+            if not isinstance(field_value, str) or not field_value.strip():
+                raise ValueError(
+                    f"server config '{path_prefix}.{field}' must be a non-empty string"
+                )
+            toleration[field] = field_value.strip()
+        if toleration.get("operator") not in (None, "Exists", "Equal"):
+            raise ValueError(f"server config '{path_prefix}.operator' must be 'Exists' or 'Equal'")
+        if toleration.get("operator") == "Exists" and "value" in toleration:
+            # Mirrors the API server's own toleration validation, surfaced at
+            # startup instead of at the first Pod create.
+            raise ValueError(
+                f"server config '{path_prefix}' cannot combine operator 'Exists' with 'value'"
+            )
+        if toleration.get("effect") not in (None, "NoSchedule", "PreferNoSchedule", "NoExecute"):
+            raise ValueError(
+                f"server config '{path_prefix}.effect' must be 'NoSchedule', "
+                "'PreferNoSchedule' or 'NoExecute'"
+            )
+        if "toleration_seconds" in entry:
+            seconds = entry["toleration_seconds"]
+            if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 0:
+                raise ValueError(
+                    f"server config '{path_prefix}.toleration_seconds' must be a "
+                    "non-negative integer"
+                )
+            if toleration.get("effect") != "NoExecute":
+                raise ValueError(
+                    f"server config '{path_prefix}.toleration_seconds' requires effect 'NoExecute'"
+                )
+            toleration["tolerationSeconds"] = seconds
+        if not toleration:
+            raise ValueError(f"server config '{path_prefix}' must set at least one field")
+        normalized.append(toleration)
+    return normalized or None
+
+
 def _kubernetes_launcher_factory(
     *,
     image: str | None,
@@ -1926,6 +2006,7 @@ def _kubernetes_launcher_factory(
     in_cluster: bool | None,
     resources: dict[str, object] | None,
     pvc_mounts: list[dict[str, object]] | None,
+    tolerations: list[dict[str, object]] | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -1949,6 +2030,8 @@ def _kubernetes_launcher_factory(
     :param resources: Validated ``resources`` block, or ``None`` for defaults.
     :param pvc_mounts: Normalized PVC mount entries added to every runner Pod,
         or ``None``.
+    :param tolerations: Manifest-shaped toleration entries added to every
+        runner Pod, or ``None``.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -1969,6 +2052,7 @@ def _kubernetes_launcher_factory(
             in_cluster=in_cluster,
             resources=resources,
             pvc_mounts=pvc_mounts,
+            tolerations=tolerations,
         )
 
     return _build

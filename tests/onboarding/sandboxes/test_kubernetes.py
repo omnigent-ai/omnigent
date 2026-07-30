@@ -235,6 +235,21 @@ def test_build_pod_manifest_omits_envfrom_without_harness_secret() -> None:
     assert "envFrom" not in manifest["spec"]["containers"][0]
 
 
+def test_build_pod_manifest_omits_tolerations_when_unconfigured() -> None:
+    """No tolerations config → no tolerations key; scheduling is unchanged."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert "tolerations" not in manifest["spec"]
+
+
+def test_build_pod_manifest_emits_configured_tolerations_verbatim() -> None:
+    """Parse-time-normalized tolerations land on the Pod spec as given."""
+    tolerations = [
+        {"key": "dedicated", "operator": "Equal", "value": "agents", "effect": "NoSchedule"}
+    ]
+    manifest = build_pod_manifest(**{**_MANIFEST_KW, "tolerations": tolerations})
+    assert manifest["spec"]["tolerations"] == tolerations
+
+
 def test_build_pod_manifest_defaults_to_amd64_node_selector() -> None:
     """No node_selector → Pods keep the amd64 default placement."""
     manifest = build_pod_manifest(**{**_MANIFEST_KW, "node_selector": None})

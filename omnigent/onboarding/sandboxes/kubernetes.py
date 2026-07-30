@@ -476,6 +476,7 @@ def build_pod_manifest(
     host_config: dict[str, object] | None = None,
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
+    tolerations: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -506,6 +507,8 @@ def build_pod_manifest(
     - Operator *pvc_mounts* become ``persistentVolumeClaim`` volumes mounted on
       the **host container only** (read-only unless opted out); the init
       container sees only HOME, so nothing external is exposed at clone time.
+    - Operator *tolerations* are emitted verbatim on the Pod spec, letting
+      runner Pods schedule onto tainted nodes (e.g. a dedicated agent pool).
 
     :param pod_name: DNS-label-safe Pod name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Pod is created in.
@@ -537,6 +540,8 @@ def build_pod_manifest(
     :param pvc_mounts: Normalized PVC mounts (``{claim_name, mount_path,
         read_only}``) added as ``persistentVolumeClaim`` volumes on the host
         container only, or ``None``.
+    :param tolerations: Manifest-shaped toleration entries emitted verbatim on
+        the Pod spec (validated at config-parse time), or ``None`` for none.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -652,6 +657,8 @@ def build_pod_manifest(
         "initContainers": [init_container],
         "containers": [host_container],
     }
+    if tolerations:
+        spec["tolerations"] = [dict(entry) for entry in tolerations]
     return {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -846,6 +853,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
+        tolerations: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -872,6 +880,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             for the built-in defaults.
         :param pvc_mounts: Normalized ``sandbox.kubernetes.pvc_mounts`` entries
             (validated at parse time), or ``None`` for none.
+        :param tolerations: Manifest-shaped ``sandbox.kubernetes.tolerations``
+            entries (validated at parse time), or ``None`` for none.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -883,6 +893,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._in_cluster = in_cluster
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
+        self._tolerations = [dict(entry) for entry in tolerations] if tolerations else None
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
@@ -1172,6 +1183,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     harness_secret=self._resolve_secret(),
                     env_literals=env_literals,
                     node_selector=self._node_selector,
+                    tolerations=self._tolerations,
                     workspace=workspace,
                     clone_dir=clone_dir,
                     repo_url=repo_url,
