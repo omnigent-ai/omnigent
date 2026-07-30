@@ -431,6 +431,12 @@ _SPECIALTY_MODEL_TOKENS: tuple[str, ...] = (
 # flagship ``gpt-*`` is broadly accessible, so no steering is needed).
 _PREFERRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "anthropic": "sonnet",
+}
+
+# Providers whose default must remain within a specific catalog family. If the
+# family is absent, onboarding asks for an explicit model instead of silently
+# choosing an incompatible or unexpectedly proprietary alternative.
+_REQUIRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "openrouter": "kimi",
 }
 
@@ -453,7 +459,10 @@ def default_chat_model(
        also tags ``mode="chat"`` and which would otherwise outrank the
        flagship text model by release date for some providers (OpenAI's
        ``gpt-audio-*`` / ``gpt-realtime-*`` sort above ``gpt-5.4``).
-    3. If the provider has a preferred default *tier*
+    3. If the provider requires a default *tier*
+       (:data:`_REQUIRED_DEFAULT_TIER_TOKEN`), return its newest model or
+       ``None`` when the catalog offers none.
+    4. If the provider has a preferred default *tier*
        (:data:`_PREFERRED_DEFAULT_TIER_TOKEN`), return the newest remaining
        model of that tier — so a fresh user gets a model their key can
        actually use. Fall back to the newest remaining general-purpose model
@@ -476,6 +485,10 @@ def default_chat_model(
         if any(token in lowered for token in _SPECIALTY_MODEL_TOKENS):
             continue
         general.append(model.name)
+
+    required_token = _REQUIRED_DEFAULT_TIER_TOKEN.get(provider)
+    if required_token is not None:
+        return next((name for name in general if required_token in name.lower()), None)
 
     preferred_token = _PREFERRED_DEFAULT_TIER_TOKEN.get(provider)
     if preferred_token is not None:

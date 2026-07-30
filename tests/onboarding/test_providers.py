@@ -245,9 +245,14 @@ def test_default_chat_model_openai_uses_newest_general_model() -> None:
         assert token not in default.lower()
 
 
-def test_default_chat_model_openrouter_prefers_oss_family() -> None:
-    """OpenRouter prefers its broadly-served OSS family over newer entries."""
+def test_default_chat_model_openrouter_prefers_kimi_family() -> None:
+    """OpenRouter prefers its broadly-served Kimi family over newer entries."""
     assert default_chat_model("openrouter") == "moonshotai/kimi-k2.6"
+
+
+def test_default_chat_model_openrouter_requires_kimi_family() -> None:
+    """OpenRouter does not silently fall back to a proprietary model."""
+    assert default_chat_model("openrouter", allowed_models={"openai/gpt-6"}) is None
 
 
 def test_default_chat_model_without_catalog_is_none() -> None:
