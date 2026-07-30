@@ -36,6 +36,7 @@ _API_VERSION = "2023-06-01"
 _DEFAULT_MAX_TOKENS = 16384
 _REQUEST_TIMEOUT = 120
 _STREAM_TIMEOUT = 300
+_MODEL_METADATA_TIMEOUT_S = 10.0
 _MODEL_METADATA_TTL_S = 300.0
 _MODEL_METADATA_CACHE_PARTITION_SALT = secrets.token_bytes(32)
 _MODEL_METADATA_CACHE_PARTITION_ITERATIONS = 200_000
@@ -251,6 +252,7 @@ async def _get_anthropic_model_metadata(
             )
             _MODEL_METADATA_IN_FLIGHT[cache_key] = task
 
+    # Keep the shared lookup alive if one waiting request is cancelled.
     return await asyncio.shield(task)
 
 
@@ -266,7 +268,10 @@ async def _fetch_anthropic_model_metadata(
     try:
         try:
             url = f"{_models_url(base_url)}/{quote(model, safe='')}"
-            async with httpx.AsyncClient(transport=transport, timeout=_REQUEST_TIMEOUT) as client:
+            async with httpx.AsyncClient(
+                transport=transport,
+                timeout=_MODEL_METADATA_TIMEOUT_S,
+            ) as client:
                 response = await client.get(url, headers=headers)
                 response.raise_for_status()
                 payload = response.json()
