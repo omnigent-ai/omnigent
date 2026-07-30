@@ -8,9 +8,36 @@ import {
   deleteProject,
   getProject,
   listProjects,
+  normalizeProjectDirectories,
   renameProject,
   updateProjectConfig,
 } from "./projectsApi";
+
+describe("normalizeProjectDirectories", () => {
+  it("normalizes, deduplicates, and excludes the primary workspace", () => {
+    expect(
+      normalizeProjectDirectories(
+        [
+          { path: " /repo/main/ " },
+          { path: "/repo/shared/" },
+          { path: "/repo/shared" },
+          { path: "relative" },
+          { path: 42 },
+        ],
+        "/repo/main",
+      ),
+    ).toEqual([{ path: "/repo/shared" }]);
+  });
+
+  it("drops malformed config and caps additional roots at the session limit", () => {
+    expect(normalizeProjectDirectories({ path: "/repo/nope" })).toEqual([]);
+    expect(
+      normalizeProjectDirectories(
+        Array.from({ length: 20 }, (_, index) => ({ path: `/repo/${index}` })),
+      ),
+    ).toHaveLength(15);
+  });
+});
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
