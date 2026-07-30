@@ -45,9 +45,9 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import importlib.util
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -153,9 +153,16 @@ def _build_locust_argv(args: argparse.Namespace, out_dir: Path) -> list[str]:
 
     :param args: Parsed CLI arguments.
     :param out_dir: Directory the CSV/HTML reports are written into.
-    :returns: Full argv beginning with ``"locust"``.
+    :returns: Full argv beginning with ``[sys.executable, "-m", "locust"]``.
     """
+    # Launch locust as a module of the CURRENT interpreter, not a bare
+    # ``locust`` console script. A bare name resolves through PATH, which can
+    # find a stale/broken locust from another Python (e.g. a ~/.local 3.10
+    # install missing gevent's deps) even when run.py itself runs under a venv.
+    # ``sys.executable -m locust`` guarantees the same interpreter + site.
     argv = [
+        sys.executable,
+        "-m",
         "locust",
         "-f",
         args.locustfile,
@@ -377,8 +384,12 @@ def main() -> int:
     """Parse inputs, run locust, and write the result set."""
     args = _build_parser().parse_args()
 
-    if shutil.which("locust") is None:
-        sys.exit("locust not found — install the extra: pip install -e '.[loadtest]'")
+    if importlib.util.find_spec("locust") is None:
+        sys.exit(
+            f"locust is not importable under {sys.executable} — install the extra: "
+            "pip install -e '.[loadtest]' (or: uv sync --extra loadtest), and run "
+            "run.py with that same interpreter."
+        )
     if not Path(args.locustfile).is_file():
         sys.exit(f"locustfile not found: {args.locustfile}")
 
@@ -388,7 +399,7 @@ def main() -> int:
         # Interactive UI: hand off to locust directly, no result files.
         argv = _build_locust_argv(args, Path("."))
         print(f"$ {' '.join(argv)}", flush=True)
-        os.execvpe("locust", argv, env)
+        os.execvpe(sys.executable, argv, env)
 
     out_dir = _resolve_out_dir(args)
     argv = _build_locust_argv(args, out_dir)
