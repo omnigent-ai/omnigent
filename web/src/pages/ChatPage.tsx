@@ -1720,7 +1720,7 @@ function MainAgentSurface({
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <PreserveScrollDistanceOnResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
-            <HistoryAutoLoader />
+            <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
             {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
               // Cold launch: a centered spinner instead of the "ready to
               // type" empty state (the create-then-send path uses the
@@ -1798,7 +1798,7 @@ function MainAgentSurface({
                     (question at top, reply grows below) and keeps the pane
                     scrollable so older history stays reachable. Last child so
                     it measures everything above it. */}
-                <LatestTurnSpacer />
+                <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
               </>
             )}
           </ConversationContent>
@@ -2124,7 +2124,11 @@ function HistoryLoadingIndicator() {
 /** Builds the initial history window, then keeps loading near the top. */
 const HISTORY_LOAD_TOP_THRESHOLD_PX = 500;
 
-export function HistoryAutoLoader() {
+export function HistoryAutoLoader({
+  scrollElement,
+}: {
+  scrollElement?: HTMLElement | null;
+} = {}) {
   // useStickToBottomContext exposes scrollRef (the actual scroll container
   // element) in the runtime context even though the public TS types only
   // declare isAtBottom and scrollToBottom. Cast to access it.
@@ -2153,7 +2157,7 @@ export function HistoryAutoLoader() {
   // Register before sibling layout effects can resize the transcript and make
   // StickToBottom adjust scrollTop; otherwise that first scroll can be missed.
   useLayoutEffect(() => {
-    const el = ctx.scrollRef?.current;
+    const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
     const handleScroll = () => {
       prevScrollHeightRef.current = el.scrollHeight;
@@ -2162,12 +2166,12 @@ export function HistoryAutoLoader() {
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
-  }, [ctx.scrollRef]);
+  }, [ctx.scrollRef, scrollElement]);
 
   // This is the single paging effect. Fetches are driven by user scrolls or a
   // changed oldest item, including a visually height-neutral prepend.
   useLayoutEffect(() => {
-    const el = ctx.scrollRef?.current;
+    const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
 
     const generationChanged = generationRef.current !== historyGeneration;
@@ -2216,7 +2220,14 @@ export function HistoryAutoLoader() {
 
     if (buildingInitialWindow) pagesFetchedRef.current += 1;
     void state.loadMoreHistory();
-  }, [ctx.scrollRef, historyGeneration, loadingMoreHistory, oldestItemId, scrollRevision]);
+  }, [
+    ctx.scrollRef,
+    historyGeneration,
+    loadingMoreHistory,
+    oldestItemId,
+    scrollElement,
+    scrollRevision,
+  ]);
 
   // No visible control — history loads purely on scroll-up / the initial-window
   // build above.
@@ -2241,7 +2252,11 @@ const PINNED_ANCHOR_TOP_GAP_PX = 96;
  * spacer's own top, whose position is fixed by the content above it and so is
  * independent of the height we set — the measurement can't feed back on itself.
  */
-export function LatestTurnSpacer() {
+export function LatestTurnSpacer({
+  scrollElement,
+}: {
+  scrollElement?: HTMLElement | null;
+} = {}) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
@@ -2252,7 +2267,7 @@ export function LatestTurnSpacer() {
   const spacerRef = useRef<HTMLDivElement>(null);
 
   const measure = useCallback(() => {
-    const scrollEl = ctx.scrollRef?.current;
+    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
     const spacerEl = spacerRef.current;
     if (!scrollEl || !spacerEl) return;
     // Newest real user prompt, else newest assistant text output. System
@@ -2274,21 +2289,21 @@ export function LatestTurnSpacer() {
     const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
-  }, [ctx.scrollRef]);
+  }, [ctx.scrollRef, scrollElement]);
 
   useLayoutEffect(() => {
     measure();
   }, [measure, blockCount, historyGeneration]);
 
   useLayoutEffect(() => {
-    const scrollEl = ctx.scrollRef?.current;
+    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
     const contentEl = spacerRef.current?.parentElement;
     if (!scrollEl || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => measure());
     observer.observe(scrollEl); // viewport (clientHeight) changes
     if (contentEl) observer.observe(contentEl); // streaming / reflow growth
     return () => observer.disconnect();
-  }, [ctx.scrollRef, measure]);
+  }, [ctx.scrollRef, measure, scrollElement]);
 
   return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
 }

@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { Profiler, useLayoutEffect } from "react";
+import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { MAX_INITIAL_PAGES } from "@/lib/sessionsApi";
@@ -187,28 +187,51 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
-  it("observes scroll changes made by a later sibling layout effect", () => {
+  it("attaches when the live scroll element becomes available after mount", () => {
     const loadMoreHistory = vi.fn(async () => {});
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
     const metrics = { scrollTop: 600, scrollHeight: 1000 };
     setScrollMetrics(scrollRoot, metrics);
-    stickContext.scrollRef.current = scrollRoot;
+    stickContext.scrollRef.current = null;
 
-    function AdjustScrollDuringLayout() {
-      useLayoutEffect(() => {
-        metrics.scrollTop = 499;
-        scrollRoot.dispatchEvent(new Event("scroll"));
+    function DeferredScroller() {
+      const [scrollElement, setScrollElement] = useState<HTMLElement | null>(null);
+      useEffect(() => {
+        setScrollElement(scrollRoot);
       }, []);
-      return null;
+      return <HistoryAutoLoader scrollElement={scrollElement} />;
     }
 
-    render(
-      <>
-        <HistoryAutoLoader />
-        <AdjustScrollDuringLayout />
-      </>,
-    );
+    render(<DeferredScroller />);
+    metrics.scrollTop = 499;
+    fireEvent.scroll(scrollRoot);
+
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts initial paging when the live scroll element becomes available after mount", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 600, scrollHeight: 1000, clientHeight: 500 });
+    stickContext.scrollRef.current = null;
+
+    function DeferredScroller() {
+      const [scrollElement, setScrollElement] = useState<HTMLElement | null>(null);
+      useEffect(() => {
+        setScrollElement(scrollRoot);
+      }, []);
+      return <HistoryAutoLoader scrollElement={scrollElement} />;
+    }
+
+    render(<DeferredScroller />);
 
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
