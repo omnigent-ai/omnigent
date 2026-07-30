@@ -22,6 +22,7 @@ from omnigent.codex_native_bridge import (
     read_mcp_startup,
     update_active_turn_id,
 )
+from omnigent.inner.codex_goal_command import goal_objective_from_content
 from omnigent.inner.executor import (
     Executor,
     ExecutorConfig,
@@ -31,7 +32,11 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import materialize_attachment, parse_data_uri
+from omnigent.inner.native_attachments import (
+    materialize_attachment,
+    parse_data_uri,
+    unresolved_attachment_marker,
+)
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 
 _logger = logging.getLogger(__name__)
@@ -199,7 +204,13 @@ class CodexNativeExecutor(Executor):
         """
         del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
-        input_items = _latest_user_input_items(messages, self._bridge_dir)
+        latest_user_content = _latest_user_content(messages)
+        goal_objective = goal_objective_from_content(latest_user_content)
+        input_items = (
+            [{"type": "text", "text": goal_objective}]
+            if goal_objective is not None
+            else _content_to_input_items(latest_user_content, self._bridge_dir)
+        )
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
             return
@@ -249,6 +260,14 @@ class CodexNativeExecutor(Executor):
                 )
                 await client.connect()
                 try:
+                    if goal_objective is not None:
+                        await client.request(
+                            "thread/goal/set",
+                            {
+                                "threadId": state.thread_id,
+                                "objective": goal_objective,
+                            },
+                        )
                     if state.active_turn_id is not None:
                         response = await client.request(
                             "turn/steer",
@@ -378,20 +397,17 @@ def _session_is_active(session_id: str, request_session_id: str | None) -> bool:
     return request_session_id is None or request_session_id == session_id
 
 
-def _latest_user_input_items(messages: list[Message], bridge_dir: Path) -> list[dict[str, Any]]:
+def _latest_user_content(messages: list[Message]) -> Any:
     """
-    Build Codex app-server input items from the latest user message.
+    Return the latest user message content.
 
     :param messages: Executor message list.
-    :param bridge_dir: Bridge directory for materializing image/file
-        attachments, e.g. ``Path("/tmp/omnigent/codex-native/<digest>")``.
-    :returns: Codex ``turn/start``/``turn/steer`` input items, or ``[]``
-        when there is no user content to send.
+    :returns: The latest user content, or ``None`` when absent.
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_input_items(message.get("content"), bridge_dir)
-    return []
+            return message.get("content")
+    return None
 
 
 def _content_to_input_items(content: Any, bridge_dir: Path) -> list[dict[str, Any]]:
@@ -428,6 +444,8 @@ def _content_to_input_items(content: Any, bridge_dir: Path) -> list[dict[str, An
                 path = materialize_attachment(block, bridge_dir)
                 if path is not None:
                     items.append({"type": "localImage", "path": str(path)})
+                else:
+                    items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
@@ -452,8 +470,9 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Bridge directory for materializing the file.
-    :returns: A Codex ``text`` input item, or ``None`` when the file
-        could not be decoded or materialized.
+    :returns: A Codex ``text`` input item; a visible could-not-load
+        marker item when the file failed to materialize; or ``None``
+        for an empty text file.
     """
     file_data = block.get("file_data")
     if isinstance(file_data, str) and file_data.startswith("data:"):
@@ -471,4 +490,4 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
         # matching _ATTACHMENT_MARKER_RE in
         # omnigent/entities/conversation.py. Keep in sync.
         return {"type": "text", "text": f"[Attached file: {path}]"}
-    return None
+    return {"type": "text", "text": unresolved_attachment_marker(block)}

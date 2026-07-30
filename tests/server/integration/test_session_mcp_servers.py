@@ -189,8 +189,7 @@ name: single_yaml_agent
 prompt: Say hello.
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 """
                 ),
                 "application/gzip",

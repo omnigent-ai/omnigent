@@ -183,10 +183,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     const childEntries = queryClient.getQueriesData<ChildSessionInfo[]>({
       queryKey: ["conversation"],
     });
-    for (const [key, children] of childEntries) {
+    for (const [key, childSessions] of childEntries) {
       // Only ["conversation", <id>, "child_sessions"] entries carry child lists.
-      if (Array.isArray(key) && key[2] === "child_sessions" && Array.isArray(children)) {
-        for (const child of children) {
+      if (Array.isArray(key) && key[2] === "child_sessions" && Array.isArray(childSessions)) {
+        for (const child of childSessions) {
           if (!ids.includes(child.id)) ids.push(child.id);
         }
       }

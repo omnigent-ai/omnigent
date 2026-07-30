@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from omnigent import model_catalog
 from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
     CHAT_WIRE_API,
@@ -58,11 +59,6 @@ PI_CODING_AGENT_DIR_ENV_VAR = "PI_CODING_AGENT_DIR"
 # ``--provider`` can select it.
 _PI_PROVIDER_ID = "omnigent"
 
-# Default model for the Databricks AI Gateway's Anthropic surface — the same
-# default the in-process Databricks executor pins. Used when the session
-# carries no explicit model override.
-_DATABRICKS_PI_DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
-
 # Provider id for the secondary OpenAI Responses provider (GPT models that only
 # support tools via the Responses API, e.g. gpt-5.5, gpt-5.6-*).
 _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
@@ -70,6 +66,16 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 # Provider id for the tertiary OpenAI Completions provider (non-GPT models that
 # work via /chat/completions: Kimi, Llama, GLM, Gemini, older GPT models).
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
+_PI_MLFLOW_PROVIDER_ID = "omnigent-mlflow"
+
+# Keyword fragments that identify Databricks serving-endpoint models which
+# require the Responses API. These models don't send finish_reason via
+# /chat/completions but work correctly via /ai-gateway/codex/v1/responses
+# using their system.ai.* alias (derived by stripping "databricks-" prefix).
+# Use specific enough fragments to avoid false-positives (e.g. bare "glm" would
+# match "zai-org-glm-4-7" which has no system.ai.* alias; "glm-" avoids that).
+_SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "glm-")
+
 
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
@@ -153,6 +159,11 @@ class PiProviderConfig:
         request time, used for short-lived gateway tokens).
     :param auth_header: When ``True``, Pi sends ``Authorization: Bearer
         <apiKey>`` (gateways) instead of a provider-native key header.
+    :param credential_warning: A user-facing notice set when the provider was
+        rendered but its credentials could not be resolved (e.g. an expired
+        Databricks OAuth token). Pi still launches — its ``!command`` apiKey may
+        recover at request time — but the caller surfaces this so a session that
+        would otherwise fail silently tells the user how to re-authenticate.
     """
 
     provider_id: str
@@ -161,6 +172,7 @@ class PiProviderConfig:
     model: str
     api_key: str
     auth_header: bool
+    credential_warning: str | None = None
     # Full model list for providers that expose multiple models (e.g. the
     # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
     # dataclass stays hashable even though list[dict] is not hashable.
@@ -184,7 +196,7 @@ class PiProviderConfig:
                 any(m.get("id") == self.model for m in prov.get("models", []))
                 for prov in self.additional_providers.values()
             )
-            # Skip models excluded from Pi entirely (e.g. gemini-2-5 thinking
+            # Skip models excluded from Pi entirely (e.g. Gemini — no Responses API
             # models) — don't register them under the Anthropic provider either.
             if (
                 not any(m.get("id") == self.model for m in models)
@@ -230,20 +242,36 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     # exactly the endpoints available on this workspace. Falls back to the
     # bundled static lists when credentials can't be resolved or the API call
     # fails (e.g. network blip, new workspace with no endpoints yet).
+    #
+    # Distinguish two failure modes so the caller can surface the fatal one:
+    #   * credential resolution fails (expired OAuth token) — Pi's per-request
+    #     ``!command`` apiKey will also fail, so the session dies silently. Carry
+    #     a ``credential_warning`` so the caller can tell the user to re-auth.
+    #   * model-list fetch fails after creds resolved (network blip, empty
+    #     workspace) — benign; just show the single default model.
+    credential_warning: str | None = None
+    claude_models: list[dict[str, Any]] = []
+    gpt_models: list[dict[str, Any]] = []
+    completions_models: list[dict[str, Any]] = []
+    gemini_models: list[dict[str, Any]] = []
     try:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
         creds = resolve_databricks_workspace(entry.profile)
-        claude_models, gpt_models, completions_models = _fetch_pi_model_lists(
-            creds.host, creds.token
-        )
-    except Exception:  # noqa: BLE001 — credential/network failure must not break launch
+    except Exception:  # noqa: BLE001 — credential failure must not break launch
         _LOGGER.info(
             "pi-native: falling back to single-model display (could not resolve credentials)"
         )
-        claude_models = []
-        gpt_models = []
-        completions_models = []
+        credential_warning = _databricks_credential_warning(entry.profile)
+    else:
+        try:
+            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
+                creds.host, creds.token
+            )
+        except Exception:  # noqa: BLE001 — network failure must not break launch
+            _LOGGER.info(
+                "pi-native: could not fetch workspace model list; showing default model only"
+            )
     additional: dict[str, Any] = {}
     if gpt_models:
         additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
@@ -253,11 +281,15 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
             api_key, f"{host}/serving-endpoints", completions_models, api_type="openai-completions"
         )
+    if gemini_models:
+        additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, f"{host}/ai-gateway/mlflow/v1", gemini_models, api_type="openai-completions"
+        )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
         api="anthropic-messages",
-        model=model or _DATABRICKS_PI_DEFAULT_MODEL,
+        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is refreshed per request (the auth command itself
         # force-refreshes), matching codex-native's refresh semantics.
@@ -265,6 +297,22 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         auth_header=True,
         extra_models=claude_models,
         additional_providers=additional,
+        credential_warning=credential_warning,
+    )
+
+
+def _databricks_credential_warning(profile: str | None) -> str:
+    """User-facing notice for an unresolvable Databricks profile.
+
+    :param profile: The Databricks config profile that failed to authenticate.
+    :returns: A short message naming the profile and the re-auth command.
+    """
+    profile_name = profile or "DEFAULT"
+    return (
+        f"Couldn't authenticate to the Databricks profile '{profile_name}' — "
+        "your login has likely expired, so this Pi session can't reach the model "
+        "and won't reply. Re-authenticate by running "
+        f"`databricks auth login --profile {profile_name}`, then start a new Pi session."
     )
 
 
@@ -335,38 +383,53 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         return None
 
 
+# GPT model versions known to work fine with /chat/completions + function tools.
+# Any GPT model NOT in this set defaults to the Responses API (safer default for
+# newer models we haven't explicitly tested with completions).
+# These token fragments identify GPT models that work fine with
+# /chat/completions + function tools. Any GPT model whose id does NOT contain
+# one of these tokens defaults to the Responses API (safer for new models).
+# Use specific enough tokens so "gpt-5" doesn't match "gpt-5-5".
+_GPT_COMPLETIONS_COMPATIBLE: frozenset[str] = frozenset(
+    {
+        "gpt-5-4",  # gpt-5-4, gpt-5-4-mini, gpt-5-4-nano
+        "gpt-5-2",
+        "gpt-5-1",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-oss",
+    }
+)
+
+
 def _needs_responses_api(model_id_lower: str) -> bool:
-    """Return True when a Databricks model requires the Responses API for tools.
+    """Return True when a GPT model requires the Responses API for tools.
 
-    Newer GPT models (gpt-5.5, gpt-5.6-*, gpt-5.3-codex) reject function tool
-    calls via ``/chat/completions`` with 400; they work via the Responses API at
-    the AI Gateway (``/ai-gateway/codex/v1/responses``). Detected by name: these
-    models have ``gpt-5.5``, ``gpt-5.6``, or ``gpt-5.3-codex`` in their id.
-    Non-GPT models (Kimi, Llama, GLM) and older GPT (5.4, 5.2, …) work fine
-    with ``/chat/completions`` + tools.
+    Some GPT models reject function tool calls via ``/chat/completions`` with
+    400; they work via the AI Gateway Responses API instead. Rather than
+    maintaining a denylist of newer versions, we maintain an allowlist of models
+    known to work with completions. Any GPT model not in the allowlist defaults
+    to the Responses API — safer for new models we haven't tested.
 
-    Expects a pre-lowercased model id (the caller typically has ``name_lower``
-    already computed).
+    Non-GPT models are handled separately (Kimi/inkling/Qwen3 routed via
+    system.ai.* Responses API; Gemini excluded via _unsupported_in_pi).
+
+    Expects a pre-lowercased model id.
     """
-    return any(token in model_id_lower for token in ("gpt-5-5", "gpt-5-6", "gpt-5-3-codex"))
+    if "gpt" not in model_id_lower:
+        return False
+    return not any(token in model_id_lower for token in _GPT_COMPLETIONS_COMPATIBLE)
 
 
 def _unsupported_in_pi(model_id_lower: str) -> bool:
-    """Return True for models Pi can't handle via openai-completions or responses.
+    """Return True for models Pi can't handle at all.
 
-    Gemini 2.5 thinking models return ``content`` as an array
-    (``[{"type":"text","text":"...","thoughtSignature":"..."}]``) in streaming
-    responses when tools are present. Pi's ``openai-completions`` handler
-    expects ``content`` to be a string; receiving an array causes a JavaScript
-    ``[object Object]`` parse error — effectively a silent 400 from Pi's
-    perspective. The Responses API doesn't support Gemini at all.
-    Exclude these models from both providers so the picker can show them but
-    Pi doesn't try to call them with tools.
+    - gemini-2-5: returns ``content`` as a typed array with ``thoughtSignature``
+      that Pi's completions handler mangles; Responses API returns 400 for it.
+    - gpt-oss: returns typed-array content that Pi's openai-completions handler
+      can't parse (same ``[object Object]`` issue as gemini-2-5).
 
-    Also includes gpt-oss models (gpt-oss-120b, gpt-oss-20b) which return
-    content as a typed array ``[{type:'reasoning',...},{type:'text',...}]``.
-    Pi's openai-completions streaming handler does ``block.text += content``
-    where content is an array, producing ``[object Object],[object Object]``.
+    Other Gemini variants route via /ai-gateway/mlflow/v1/chat/completions.
 
     Expects a pre-lowercased model id.
     """
@@ -376,19 +439,20 @@ def _unsupported_in_pi(model_id_lower: str) -> bool:
 def _fetch_pi_model_lists(
     workspace_url: str,
     token: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Fetch live model lists from the Databricks serving-endpoints API.
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch live model lists from the Unity Catalog model-services API.
 
-    Calls ``GET <workspace>/api/2.0/serving-endpoints``, filters for READY LLM
-    endpoints, and splits them into two Pi model entry dict lists:
+    Calls ``GET <workspace>/api/2.1/unity-catalog/model-services``, which
+    returns ``system.ai.*`` model ids with their supported API types:
 
+    * ``openai/v1/responses`` in supported_api_types → ``openai-responses``
+      provider at the AI Gateway codex surface.
+    * Chat-capable models without Responses API support → ``openai-completions``
+      provider at the serving-endpoints surface.
     * Claude models → ``anthropic-messages`` provider.
-    * Newer GPT models (gpt-5.5, gpt-5.6-*, gpt-5.3-codex, …) that reject
-      function tools via ``/chat/completions`` → ``openai-responses`` provider
-      at the AI Gateway codex surface.
-    * Other LLMs (Kimi, Llama, GLM, Gemini, older GPT …) that work with
-      function tools via ``/chat/completions`` → ``openai-completions`` provider
-      at the serving-endpoints surface.
+
+    Using this API avoids the ``databricks-*`` → ``system.ai.*`` translation
+    and gives authoritative API capability information per model.
 
     Falls back to empty lists on any HTTP or auth failure so a network blip
     never breaks Pi session launch.
@@ -396,7 +460,7 @@ def _fetch_pi_model_lists(
     :param workspace_url: Databricks workspace base URL, e.g.
         ``"https://wkspc.example.com"`` — **no** trailing slash or path.
     :param token: Bearer token for the workspace API.
-    :returns: ``(claude_models, gpt_responses_models, completions_models)`` —
+    :returns: ``(claude_models, gpt_responses_models, completions_models, gemini_models)`` —
         Pi model entry dicts ready to write into ``models.json``.
     """
     import httpx
@@ -404,7 +468,7 @@ def _fetch_pi_model_lists(
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(
-                f"{workspace_url.rstrip('/')}/api/2.0/serving-endpoints",
+                f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
                 headers={"Authorization": f"Bearer {token}"},
             )
             resp.raise_for_status()
@@ -415,55 +479,66 @@ def _fetch_pi_model_lists(
             "Pi will show only the selected model",
             exc_info=True,
         )
-        return [], [], []
+        return [], [], [], []
 
-    endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
+    services = payload.get("model_services") if isinstance(payload, dict) else None
     claude: list[dict[str, Any]] = []
-    # Newer GPT models (gpt-5.5, gpt-5.6-*, gpt-5.3-codex) reject function tools
-    # via /chat/completions; they need the Responses API at the AI Gateway.
     gpt_responses: list[dict[str, Any]] = []
-    # Non-GPT models (Kimi, Llama, GLM, Gemini) and older GPT models work fine
-    # with function tools via /chat/completions at serving-endpoints.
     completions: list[dict[str, Any]] = []
+    gemini: list[dict[str, Any]] = []
 
-    for endpoint in endpoints if isinstance(endpoints, list) else []:
-        if not isinstance(endpoint, dict):
+    for service in services if isinstance(services, list) else []:
+        if not isinstance(service, dict):
             continue
-        name = endpoint.get("name")
-        if not isinstance(name, str) or not name:
+        raw_name = service.get("name", "")
+        # Name format: "model-services/system.ai.<model>"
+        name = (
+            raw_name.replace("model-services/", "")
+            if raw_name.startswith("model-services/")
+            else raw_name
+        )
+        if not name:
             continue
-        # Filter to chat/completion LLM endpoints (exclude embeddings/rerankers).
-        task = endpoint.get("task", "")
-        task_lower = task.lower() if isinstance(task, str) else ""
         name_lower = name.lower()
-        if task_lower:
-            is_llm = any(t in task_lower for t in ("chat", "completion"))
-        else:
-            is_llm = any(
-                t in name_lower
-                for t in ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi", "glm")
-            )
-        if not is_llm:
+        # Filter to chat-capable LLM endpoints (exclude embeddings/rerankers).
+        api_types = service.get("supported_api_types", [])
+        has_chat = any("chat" in t for t in api_types)
+        has_embedding = any("embed" in t.lower() for t in api_types)
+        if not has_chat or has_embedding:
             continue
-        state = endpoint.get("state")
-        ready = state.get("ready") if isinstance(state, dict) else None
-        if isinstance(ready, str) and ready and ready.upper() != "READY":
-            continue
+        # Models that support the Responses API use it directly.
+        has_responses = "openai/v1/responses" in api_types
         entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
+        # DeepSeek streams on reasoning_content; needs reasoning:true so Pi reads
+        # from that channel. GLM/kimi/inkling now use Responses API, not needed.
+        if "deepseek" in name_lower:
+            entry["reasoning"] = True
+        needs_responses = (
+            has_responses
+            or _needs_responses_api(name_lower)
+            or any(kw in name_lower for kw in _SYSTEM_AI_MODEL_KEYWORDS)
+        )
         if "claude" in name_lower:
             claude.append(entry)
-        elif _needs_responses_api(name_lower):
+        elif _unsupported_in_pi(name_lower):
+            pass  # exclude (e.g. gemini-2-5 thinking models)
+        elif needs_responses:
+            # Responses API: GPT models that need it + kimi/inkling/qwen3/glm keywords.
             gpt_responses.append(entry)
-        elif not _unsupported_in_pi(name_lower):
+        elif name_lower.startswith("system.ai."):
+            # Other system.ai.* ids (Gemini, Llama) → mlflow gateway;
+            # system.ai.* ids are not valid at /serving-endpoints.
+            gemini.append(entry)
+        else:
             completions.append(entry)
 
-    if not claude and not gpt_responses and not completions:
+    if not claude and not gpt_responses and not completions and not gemini:
         _LOGGER.info(
-            "pi-native: Databricks serving-endpoints returned no LLM models; "
+            "pi-native: Unity Catalog model-services returned no LLM models; "
             "Pi will show only the selected model"
         )
 
-    return claude, gpt_responses, completions
+    return claude, gpt_responses, completions, gemini
 
 
 def _gateway_anthropic_base_url(codex_base_url: str) -> str:
@@ -640,6 +715,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     claude_models: list[dict[str, Any]] = []
     gpt_models: list[dict[str, Any]] = []
     completions_models: list[dict[str, Any]] = []
+    gemini_models: list[dict[str, Any]] = []
     # Derive the workspace URL for the serving-endpoints API call.
     # For dedicated-subdomain URLs (ai-gateway.cloud.databricks.com), the
     # real workspace hostname must come from ~/.databrickscfg. For
@@ -665,7 +741,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     if real_workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:
-            claude_models, gpt_models, completions_models = _fetch_pi_model_lists(
+            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
                 real_workspace_url, token
             )
         else:
@@ -688,6 +764,9 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     workspace_completions_url = (
         real_workspace_url + "/serving-endpoints" if real_workspace_url else None
     )
+    workspace_mlflow_url = (
+        real_workspace_url + "/ai-gateway/mlflow/v1" if real_workspace_url else None
+    )
     additional: dict[str, Any] = {}
     if gpt_models:
         additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
@@ -697,11 +776,15 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
             api_key, workspace_completions_url, completions_models, api_type="openai-completions"
         )
+    if gemini_models and workspace_mlflow_url:
+        additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, workspace_mlflow_url, gemini_models, api_type="openai-completions"
+        )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=_gateway_anthropic_base_url(transport.base_url),
         api="anthropic-messages",
-        model=model or _DATABRICKS_PI_DEFAULT_MODEL,
+        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token (the codex auth command prints it) is refreshed per
         # request — matching codex-native's refresh semantics.

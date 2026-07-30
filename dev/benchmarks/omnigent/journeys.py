@@ -15,6 +15,10 @@ v1 journeys are pure HTTP/API (server + DB, no runner, no LLM):
   ``external_conversation_item`` (see :meth:`BenchEnvironment.seed_items`).
 - ``fork_session`` — fork a session (deep-copy its items), then DELETE.
 - ``add_comment`` — create a review comment on a file (DB write).
+- ``list_projects`` — the sidebar project list (dual-read union of first-class
+  projects + legacy ``omni_project`` label-projects).
+- ``list_project_sessions`` — a project folder's session list, the
+  ``?project=`` dual-read filter behind clicking a project in the sidebar.
 
 ``read_runner_file`` needs a runner but no LLM turn: it plants a file in the
 runner environment (setup) and times the server → runner filesystem read proxy.
@@ -47,7 +51,7 @@ from typing import Literal, cast
 
 import httpx
 
-from .environment import BenchEnvironment
+from .environment import BenchEnvironment, ServerRequestSnapshot
 from .measure import RunResult
 
 # Per-journey context returned by ``setup`` and threaded to ``measure``. Its
@@ -149,7 +153,54 @@ def _setup_failed_result(exc: Exception) -> RunResult:
     return result
 
 
-# ── timed operation (shared by both runners) ─────────────────
+# ── server request counting (shared by both runners) ─────────
+
+# Route key for the harness's own counter-poll (see environment.py's debug
+# endpoint). Filtered out of the per-journey route appendix — it's
+# instrumentation overhead, not the journey's traffic.
+_METRICS_ROUTE_KEY = "GET /debug/server-metrics"
+
+
+async def _count_start(env: BenchEnvironment) -> ServerRequestSnapshot | None:
+    """Snapshot the server request counters before a run's timed region.
+
+    Returns ``None`` (counting disabled for the run) if the counter is
+    unreachable, so a benchmark against a server without the debug router still
+    produces latency numbers — it just omits the network block.
+    """
+    try:
+        return await env.server_request_snapshot()
+    except Exception:  # noqa: BLE001 — counting is best-effort, never fatal
+        return None
+
+
+async def _count_finish(
+    env: BenchEnvironment, start: ServerRequestSnapshot | None, result: RunResult
+) -> None:
+    """Record server HTTP requests handled during the run's timed region.
+
+    Diffs the counters against *start* and stores the total + per-route
+    breakdown on *result*. The closing poll itself hits the server and lands
+    inside the window, so subtract it (1) from the total to leave only the
+    journey's own requests plus any cross-process traffic (runner → server,
+    host → server). The poll targets the debug-metrics route, a bucket no
+    journey uses, so it never pollutes the per-route diff. A negative or
+    unavailable value leaves ``http_requests`` as ``None``.
+    """
+    if start is None:
+        return
+    end = await _count_start(env)
+    if end is None:
+        return
+    result.http_requests = max(0, end.total - start.total - 1)
+    result.route_requests = {
+        route: delta
+        for route, count in end.routes.items()
+        # Exclude the harness's own counter-poll route so the appendix reflects
+        # only the journey's traffic (the total above already backs it out).
+        if route != _METRICS_ROUTE_KEY
+        if (delta := count - start.routes.get(route, 0)) > 0
+    }
 
 
 async def _timed(
@@ -189,6 +240,7 @@ async def run_latency(
                 await journey.run_prepare(env, ctx)
                 await journey.measure(env, ctx)
         result = RunResult()
+        count_start = await _count_start(env)
         wall_start = time.perf_counter()
         for _ in range(iterations):
             try:
@@ -198,6 +250,7 @@ async def run_latency(
                 continue
             await _timed(journey, env, ctx, result)
         result.wall_time = time.perf_counter() - wall_start
+        await _count_finish(env, count_start, result)
         return result
     finally:
         with contextlib.suppress(Exception):  # teardown failure must not abort the suite
@@ -247,9 +300,11 @@ async def run_throughput(
             await asyncio.gather(*[_one(False, throwaway) for _ in range(warmup)])
 
         result = RunResult()
+        count_start = await _count_start(env)
         wall_start = time.perf_counter()
         await asyncio.gather(*[_one(True, result) for _ in range(requests)])
         result.wall_time = time.perf_counter() - wall_start
+        await _count_finish(env, count_start, result)
         return result
     finally:
         with contextlib.suppress(Exception):  # teardown failure must not abort the suite
@@ -335,6 +390,53 @@ async def _measure_load_history(env: BenchEnvironment, ctx: JourneyContext) -> N
         f"/v1/sessions/{session_id}/items",
         params={"order": "asc", "limit": _HISTORY_PAGE_LIMIT},
     )
+    resp.raise_for_status()
+
+
+# Project name for the folder-fetch journey. Self-seeded when the corpus has no
+# project so the ``?project=`` filter has a real member to resolve and return.
+_BENCH_PROJECT_NAME = "bench-project"
+
+
+async def _setup_project_name(env: BenchEnvironment) -> str:
+    """Return a project name to fetch: an existing corpus project, else seed one.
+
+    Mirrors ``_setup_target_session``: real runs read a representative project
+    from the seeded corpus (``seed.py`` files a configurable fraction of sessions
+    into first-class projects), so the folder fetch resolves a realistically
+    populated project. When none exists (empty-DB smoke path) we file one session
+    under a fresh project so the ``?project=`` filter still exercises the real
+    dual-read path instead of an empty match.
+    """
+    assert env.client is not None
+    listing = await env.client.get("/v1/sessions/projects")
+    listing.raise_for_status()
+    projects = listing.json()
+    if projects:
+        return str(projects[0]["name"])
+    # Empty DB: create a first-class project and file one session into it.
+    name = await env.ensure_agent()
+    agent_id = await env.agent_id(name)
+    session_id = await env.create_session(agent_id)
+    created = await env.client.post("/v1/projects", json={"name": _BENCH_PROJECT_NAME})
+    created.raise_for_status()
+    filed = await env.client.patch(
+        f"/v1/sessions/{session_id}", json={"project_id": created.json()["id"]}
+    )
+    filed.raise_for_status()
+    return _BENCH_PROJECT_NAME
+
+
+async def _measure_list_projects(env: BenchEnvironment, _ctx: JourneyContext) -> None:
+    assert env.client is not None
+    resp = await env.client.get("/v1/sessions/projects")
+    resp.raise_for_status()
+
+
+async def _measure_list_project_sessions(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    assert env.client is not None
+    project = cast(str, ctx)  # _setup_project_name
+    resp = await env.client.get("/v1/sessions", params={"limit": 20, "project": project})
     resp.raise_for_status()
 
 
@@ -619,6 +721,21 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_search_sessions,
             concurrency_safe=True,
             description="GET /v1/sessions?search_query= — unindexed LIKE over titles + items.",
+        ),
+        Journey(
+            name="list_projects",
+            kind="latency",
+            measure=_measure_list_projects,
+            concurrency_safe=True,
+            description="GET /v1/sessions/projects — sidebar project list (dual-read union).",
+        ),
+        Journey(
+            name="list_project_sessions",
+            kind="latency",
+            measure=_measure_list_project_sessions,
+            setup=_setup_project_name,
+            concurrency_safe=True,
+            description="GET /v1/sessions?project= — a project folder's sessions (dual-read).",
         ),
         Journey(
             name="fork_session",

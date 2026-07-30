@@ -320,6 +320,9 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
     ...overrides,
   };
 }
@@ -456,7 +459,12 @@ beforeEach(() => {
   // todo list from one test doesn't leak into the next.
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
-  useChatStore.setState({ todos: [], terminalPending: false, sessionStatus: "idle" });
+  useChatStore.setState({
+    todos: [],
+    terminalPending: false,
+    sessionStatus: "idle",
+    status: "idle",
+  });
 });
 
 afterEach(cleanup);
@@ -529,6 +537,22 @@ describe("AppShell header", () => {
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
+
+  it("keeps the terminal-startup spinner when a send is relaunching a failed session", () => {
+    // A runner disconnect marks the session failed, and that status lingers
+    // until the relaunched runner pushes a fresh edge. A send in flight
+    // (local status "streaming") means the host is relaunching the runner
+    // right now, so the spinner must show through the relaunch window
+    // instead of leaving a silent gap until the runner is fully booted.
+    mockConversations([
+      { id: "conv_terminal", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useChatStore.setState({ terminalPending: true, sessionStatus: "failed", status: "streaming" });
+
+    renderShell("/c/conv_terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
 });
 
 describe("TerminalFirstContext", () => {
@@ -597,6 +621,7 @@ describe("TerminalFirstContext", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -1559,6 +1584,7 @@ describe("Subagents tab", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -1608,6 +1634,27 @@ describe("FilesPanel visibility", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("reserves the visible pane width plus its two desktop margins from the header", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_offset", permission_level: null }]);
+
+    renderShell("/c/conv_offset");
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    const panelWidth = Number.parseFloat(panel.style.width);
+    const headerGroup = panel.parentElement;
+    expect(headerGroup?.querySelector("header")).not.toBeNull();
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(
+      `${panelWidth + 16}px`,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
+  });
+
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
     // A no-os_env agent (available: false) with no shells and no todos
     // still has the unconditional Agents tab (the panel lists at least
@@ -2735,6 +2782,7 @@ describe("AppShell clone/fork action", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -2763,6 +2811,7 @@ describe("AppShell clone/fork action", () => {
         permissionLevel: 1,
         parentSessionId: null,
         subAgentName: null,
+        kind: "default",
       },
       isLoading: false,
       error: null,
@@ -2897,6 +2946,7 @@ describe("AppShell share action", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -3049,6 +3099,7 @@ describe("Mobile header actions menu", () => {
         permissionLevel: 1,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,

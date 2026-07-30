@@ -37,6 +37,8 @@ from omnigent.native_policy_hook import (
     hook_payload_to_evaluation_request,
     policy_hook_reauth,
     post_evaluate_with_retry,
+    read_relay_policy_config,
+    relay_policy_evaluate_url,
 )
 
 # Client-side budget for the permission-request long-poll to AP. Held
@@ -1002,14 +1004,6 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         return 0
-    config = read_permission_hook_config(bridge_dir)
-    ap_server_url = config.get("ap_server_url")
-    if not isinstance(ap_server_url, str) or not ap_server_url:
-        return 0
-    headers: dict[str, str] = {}
-    raw_headers = config.get("ap_auth_headers")
-    if isinstance(raw_headers, dict):
-        headers = {str(key): str(value) for key, value in raw_headers.items()}
 
     hook_event = payload.get("hook_event_name", "")
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
@@ -1017,29 +1011,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # Unrecognized hook event — no policy to evaluate.
         return 0
 
-    # Stamp the live model from this session's statusLine capture (the
-    # statusLine wrapper writes the active model id into ``context.json`` on
-    # every render — including right after an in-pane ``/model`` switch). This
-    # is the cost gate's source of truth at hook time, race-free, unlike the
-    # forwarder's async ``model_override`` mirror which lags a poll behind.
-    # Without it the cost-budget gate can see an unresolved model (None) and
-    # fail closed — blocking a cheap-model (sonnet/haiku) session over budget,
-    # even though only expensive tiers should be gated (the server prefers a
-    # stamped model over its own resolution; see ``PolicyEngine._inject_model``).
-    # hook_payload_to_evaluation_request always returns an event with a
-    # "context" dict, so index it directly (fail loud if that contract changes).
+    # Stamp the live model from this session's statusLine capture.
     context = eval_request["event"]["context"]
-    # Stamp the harness so the over-budget message names claude-native's
-    # model-switch surface (the in-pane ``/model`` picker).
     context["harness"] = "claude-native"
     status_model = read_claude_status_model(bridge_dir)
     if status_model:
         context["model"] = status_model
-
-    # The session is governed (active id + ap_server_url) and we have a
-    # policy-relevant event: from here a failure to obtain a usable verdict
-    # fails CLOSED for the tool-call gate (see ``fail_closed_hook_output``).
-    reauth = policy_hook_reauth(ap_server_url, headers)
 
     def _fail_closed(detail: str | None = None) -> int:
         out = fail_closed_hook_output(hook_event, detail)
@@ -1047,7 +1024,29 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             sys.stdout.write(json.dumps(out))
         return 0
 
-    url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
+    # Prefer the relay; fall back to direct server call when relay not yet up.
+    relay = read_relay_policy_config(bridge_dir)
+    if relay:
+        relay_url, relay_token, _sid = relay
+        url = relay_policy_evaluate_url(relay_url)
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {relay_token}",
+        }
+        reauth = None
+    else:
+        config = read_permission_hook_config(bridge_dir)
+        ap_server_url = config.get("ap_server_url")
+        if not isinstance(ap_server_url, str) or not ap_server_url:
+            return 0
+        headers = {}
+        raw_headers = config.get("ap_auth_headers")
+        if isinstance(raw_headers, dict):
+            headers = {str(k): str(v) for k, v in raw_headers.items()}
+        session_component = url_component(session_id)
+        url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
+        reauth = policy_hook_reauth(ap_server_url, headers)
+
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
@@ -1057,7 +1056,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         reauth=reauth,
     )
     if resp is None:
-        return _fail_closed(api_error or reauth.failure_reason)
+        return _fail_closed(api_error or (reauth.failure_reason if reauth else None))
     if not resp.content:
         print("omnigent evaluate-policy hook: empty Omnigent response", file=sys.stderr)
         return _fail_closed()

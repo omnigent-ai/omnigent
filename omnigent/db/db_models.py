@@ -36,11 +36,6 @@ from omnigent.db.compression import CompressedText
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
-# 16-byte (truncated sha256) digest column, same rationale as _CKSUM32 but half
-# the width. 128 bits of collision resistance is ample for a per-parent unique
-# key, so the conversation title hash uses this narrower form.
-_CKSUM16 = LargeBinary(16).with_variant(MySQLBinary(16), "mysql")
-
 
 # Hex length of a bare uuid4 id, the canonical Python-side form.
 _UUID_HEX_LEN = 32
@@ -566,6 +561,8 @@ class SqlSessionPermission(OmnigentBase):
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage. Each level subsumes the
         ones below it (comparison is ``>=``).
+    :param can_approve: Owner-controlled authority to resolve privileged
+        action approvals for this session.
     """
 
     __tablename__ = "session_permissions"
@@ -587,6 +584,12 @@ class SqlSessionPermission(OmnigentBase):
         primary_key=True,
     )
     level: Mapped[int] = mapped_column(Integer, nullable=False)
+    can_approve: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=false(),
+        default=False,
+    )
 
     __table_args__ = (
         CheckConstraint("level IN (1, 2, 3, 4)", name="ck_session_permissions_level"),
@@ -647,6 +650,10 @@ class SqlConversationMetadata(OmnigentBase):
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # First-class project membership. Relates to projects.id; no DB FK
+    # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
+    # label via the store's dual-read until labels are consolidated.
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -656,29 +663,83 @@ class SqlConversationMetadata(OmnigentBase):
         ),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
+        # "list sessions in project X" + per-project counts (GROUP BY project_id).
+        Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
     )
 
 
-def conversation_title_hash(title: str) -> bytes:
-    """Return the 16-byte truncated sha256 digest of a conversation title.
-
-    ``ix_conversations_parent_title_unique`` keys on this instead of a wide
-    512-char title prefix, so the unique index stays a fixed 16 bytes. The full
-    title is hashed verbatim (no normalization), so two titles collide iff their
-    digests do — uniqueness is exact and case-sensitive.
+class SqlProject(OmnigentBase):
     """
-    return hashlib.sha256(title.encode("utf-8")).digest()[:16]
+    SQLAlchemy model for the ``projects`` table.
 
+    A user-defined, owner-private container that groups sessions (see
+    ``designs/PROJECTS_PRD.md``). A project row exists independently of its
+    member sessions, so it can be empty, renamed, and carry its own config —
+    the things the implicit ``omni_project`` label could not. Session
+    membership lives on ``omnigent_conversation_metadata.project_id``, not
+    here; there is no DB foreign key (Rule R032).
 
-def _default_conversation_title_hash(context: Any) -> bytes:
-    """Column default: derive ``title_hash`` from the bound ``title`` on INSERT.
+    Ownership is stamped on the row via ``owner_user_id`` (like
+    ``scheduled_tasks``), not derived from a permission table the way session
+    ownership is — projects have no ACL of their own and are never shared.
 
-    ``title`` carries a ``server_default=""``, so an INSERT that omits it leaves
-    ``title`` out of the bound params — fall back to ``""`` to match the stored
-    value. Column defaults do not fire on UPDATE, so the store recomputes it
-    explicitly on the rename paths.
+    :param id: Uuid16 primary key (bare 32-char hex in Python).
+    :param name: Human-readable project name; unique per owner (enforced in
+        the store, since ``owner_user_id`` is NULL in single-user mode and a DB
+        unique index treats NULLs as distinct).
+    :param owner_user_id: Owning user, or ``None`` in single-user mode.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
     """
-    return conversation_title_hash(context.get_current_parameters().get("title") or "")
+
+    __tablename__ = "projects"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Default session settings as a compact JSON object (host/workspace/harness/
+    # model/reasoning_effort/git base-branch, …), or NULL for "no defaults". The
+    # keys are an opaque, client-owned vocabulary: the value is read and written
+    # whole with the row and never filtered in SQL, so new keys need no schema
+    # change. Stored values are hints the new-chat dialog pre-fills and the user
+    # can always override.
+    config: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        # "list my projects" — prefix scan on (workspace_id, owner_user_id) with
+        # created_at in the key so the ORDER BY created_at, id is served by the
+        # index (no filesort). Server returns a stable order; reorder, if ever
+        # added, is a client-only concern, so there is no ``position`` column.
+        Index(
+            "ix_projects_owner_user_id",
+            "workspace_id",
+            "owner_user_id",
+            "created_at",
+            "id",
+        ),
+        # Enforces per-owner name uniqueness at the DB layer for NON-NULL owners
+        # (closing the store's check-then-insert race under concurrency). SQL
+        # treats NULLs as distinct, so single-user rows (owner_user_id IS NULL)
+        # can still collide on name — the store's _name_taken check covers that
+        # case. Also backs the get-by-name lookup.
+        Index(
+            "ix_projects_name",
+            "workspace_id",
+            "owner_user_id",
+            "name",
+            unique=True,
+        ),
+    )
 
 
 class SqlConversation(ConversationBase):
@@ -726,14 +787,6 @@ class SqlConversation(ConversationBase):
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
-    # Fixed-width sha256(title)[:16] mirror of ``title`` that the unique index
-    # keys on instead of a wide title prefix. The ORM default stamps it on INSERT
-    # and the store recomputes it on rename, so every app-created row has a hash;
-    # it is nullable only so raw-SQL inserts (tests/tooling that bypass the ORM
-    # default) don't have to supply it.
-    title_hash: Mapped[bytes | None] = mapped_column(
-        _CKSUM16, nullable=True, default=_default_conversation_title_hash
-    )
     parent_conversation_id: Mapped[str | None] = mapped_column(
         Uuid16(),
         nullable=True,
@@ -782,18 +835,10 @@ class SqlConversation(ConversationBase):
             "agent_id",
             "id",
         ),
-        # Unique index on (parent_conversation_id, title_hash) prevents two
-        # same-named children under the same parent. Keys on the fixed-width
-        # title_hash rather than a wide title prefix. NULLs are distinct in a
-        # unique index, so top-level conversations (NULL parent) are exempt.
-        Index(
-            "ix_conversations_parent_title_unique",
-            "workspace_id",
-            "parent_conversation_id",
-            "title_hash",
-            unique=True,
-        ),
-        # Composite index for child-session listing.
+        # Child-session listing, and the per-parent title lookup that backs the
+        # application-level (parent, title) uniqueness check in create_conversation
+        # (no DB unique constraint: the check seeks this parent's children here and
+        # filters title as a residual).
         Index(
             "idx_conversations_parent",
             "workspace_id",
@@ -1441,8 +1486,16 @@ class SqlScheduledTask(OmnigentBase):
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
-        Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
-        Index("ix_scheduled_tasks_user_id", "workspace_id", "user_id", "id"),
+        # One user-scoped listing index. Covers "a user's tasks ordered by
+        # created_at" (GET /scheduled-tasks) as a covered seek; the scheduler's
+        # state scan reads whole rows regardless of any index.
+        Index(
+            "ix_scheduled_tasks_user_scope",
+            "workspace_id",
+            "user_id",
+            "created_at",
+            "id",
+        ),
     )
 
 
@@ -1520,5 +1573,13 @@ class SqlScheduledTaskRun(OmnigentBase):
             "scheduled_task_id",
             "scheduled_at",
             "id",
+        ),
+        # Reverse lookup conversation_id -> run for the event-driven completion
+        # hook (get_running_run_by_conversation), which fires on every turn's
+        # terminal edge; without this the lookup is a full-table scan.
+        Index(
+            "ix_scheduled_task_runs_conversation_id",
+            "workspace_id",
+            "conversation_id",
         ),
     )

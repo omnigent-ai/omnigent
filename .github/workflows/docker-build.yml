@@ -31,7 +31,8 @@ on:
       - 'pyproject.toml'
       - 'setup.py'
       - 'uv.lock'
-      - 'web/package-lock.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
       - '.github/workflows/docker-build.yml'
 
 permissions:

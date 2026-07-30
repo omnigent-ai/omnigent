@@ -59,6 +59,7 @@ from omnigent.session_lifecycle import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -211,6 +212,7 @@ _ASYNC_INBOX_TOOLS = frozenset(
 # continues child sessions. The read-only observability helpers
 # (peek/list/close) dispatch via ``_SESSION_QUERY_TOOLS`` below.
 _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
+_TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 # Priority 5f.0a: Session-create write. ``sys_session_create`` spawns a
 # child session (parent forced to the caller) from an existing agent_id
@@ -980,6 +982,68 @@ def _subagent_message_from_args(args: dict[str, Any]) -> str | None:
     return None
 
 
+async def _session_turn_actor(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> str | None:
+    """Return the parent turn actor label for runner-originated callbacks."""
+    try:
+        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    if resp.status_code != 200:
+        return None
+    labels = resp.json().get("labels")
+    if not isinstance(labels, dict):
+        return None
+    actor = labels.get(_TURN_ACTOR_LABEL)
+    return actor if isinstance(actor, str) and actor else None
+
+
+async def _post_child_message_event(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    content: list[dict[str, Any]],
+    created_by: str | None,
+) -> httpx.Response:
+    """Post a child message, retrying once without best-effort attribution."""
+
+    def _payload(actor: str | None) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": content,
+            },
+            **({"created_by": actor} if actor is not None else {}),
+        }
+
+    resp = await server_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=_payload(created_by),
+        # This message is gated at the recipient's REQUEST phase, which can
+        # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
+        # ``ask_timeout``. A 30s read budget severed that park → fail-closed
+        # /retry → duplicate cards. Wait for the real verdict (one-day read
+        # budget, fast connect); a non-parking eval still returns immediately.
+        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+    )
+    if created_by is None or resp.status_code != 403:
+        return resp
+
+    _logger.debug(
+        "Child message POST attribution rejected for session=%s; retrying without actor",
+        session_id,
+    )
+    return await server_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=_payload(None),
+        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+    )
+
+
 def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
@@ -1522,12 +1586,17 @@ async def _execute_subagent_tool(
                 "existing session. Re-send without 'cost_budget' to continue "
                 f"session {target_session_id!r}."
             )
+        dispatch_created_by = await _session_turn_actor(
+            server_client=server_client,
+            conversation_id=conversation_id,
+        )
         return await _send_to_existing_session(
             target_session_id,
             message,
             server_client=server_client,
             conversation_id=conversation_id,
             publish_event=publish_event,
+            created_by=dispatch_created_by,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -1541,6 +1610,11 @@ async def _execute_subagent_tool(
     # Verify the sub-agent exists in the parent spec.
     if not _has_subagent(sub_agent_name, agent_spec):
         return f"Error: sub-agent {sub_agent_name!r} not found in agent spec"
+
+    dispatch_created_by = await _session_turn_actor(
+        server_client=server_client,
+        conversation_id=conversation_id,
+    )
 
     # Use the PARENT's agent_id — inline sub-agents are part of
     # the same bundle, not separately registered. The runner
@@ -1685,8 +1759,9 @@ async def _execute_subagent_tool(
                 return (
                     f"Error: sub-agent {sub_agent_name!r} can't start on this "
                     f"machine: harness {child_harness!r} needs the "
-                    f"{missing_cli.binary!r} CLI on PATH, which was not found. "
-                    f"Install it with: {install} "
+                    f"{missing_cli.binary!r} CLI on PATH and on a supported "
+                    f"version, but it is missing or outdated. "
+                    f"Install/upgrade it with: {install} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
         # Create child session on the server (no initial items —
@@ -1815,6 +1890,7 @@ async def _execute_subagent_tool(
         agent=str(sub_agent_name),
         title=session_name,
         wrapper_label=child_wrapper_label,
+        created_by=dispatch_created_by,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -1852,21 +1928,11 @@ async def _execute_subagent_tool(
     # post_event forwards it to the runner and starts the child
     # turn.
     try:
-        msg_resp = await server_client.post(
-            f"/v1/sessions/{child_session_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": message_content,
-                },
-            },
-            # This message is gated at the recipient's REQUEST phase, which can
-            # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
-            # ``ask_timeout``. A 30s read budget severed that park → fail-closed
-            # /retry → duplicate cards. Wait for the real verdict (one-day read
-            # budget, fast connect); a non-parking eval still returns immediately.
-            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        msg_resp = await _post_child_message_event(
+            server_client,
+            child_session_id,
+            content=message_content,
+            created_by=dispatch_created_by,
         )
     except httpx.HTTPError as exc:
         teardown_warning = await _teardown_failed_child(
@@ -1919,6 +1985,7 @@ async def _send_to_existing_session(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    created_by: str | None = None,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -2000,6 +2067,7 @@ async def _send_to_existing_session(
         agent=agent_label,
         title=parsed.title or "",
         wrapper_label=_session_wrapper_label(snap_data),
+        created_by=created_by,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -2011,20 +2079,11 @@ async def _send_to_existing_session(
     )
 
     try:
-        msg_resp = await server_client.post(
-            f"/v1/sessions/{target_session_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": message}],
-                },
-            },
-            # Same as the other message-send: gated at the recipient's REQUEST
-            # phase, which can PARK on a human ASK up to the policy's
-            # ``ask_timeout``. Wait for the real verdict (one-day read budget,
-            # fast connect) instead of severing at 30s and retrying into duplicates.
-            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        msg_resp = await _post_child_message_event(
+            server_client,
+            target_session_id,
+            content=[{"type": "input_text", "text": message}],
+            created_by=created_by,
         )
     except httpx.HTTPError as exc:
         _runner_app.unregister_child_session(target_session_id)
@@ -4603,10 +4662,12 @@ async def execute_tool(
         not tracked — shell side-effects cannot be attributed to a session.
     :returns: Tool output string.
     """
-    try:
-        args = json.loads(arguments)
-    except json.JSONDecodeError:
-        args = {}
+    if not arguments.strip():
+        return json.dumps({"error": "malformed JSON arguments"})
+    args, error = parse_json_object_arguments(arguments)
+    if error is not None:
+        return json.dumps({"error": error})
+    assert args is not None
 
     try:
         if mcp_manager is not None:
@@ -5306,22 +5367,28 @@ async def _execute_rest_tool(
                     f"Error: sys_call_async event post returned "
                     f"{event_resp.status_code}: {event_resp.text[:200]}"
                 )
-            # Return session_id as the handle (replaces task_id).
-            return json.dumps({"task_id": session_id, "status": "running"})
+            return json.dumps(
+                {
+                    "handle_id": session_id,
+                    # Compatibility alias for older clients; remove in 0.8.0.
+                    "task_id": session_id,
+                    "status": "running",
+                }
+            )
         except Exception as exc:  # noqa: BLE001
             return f"Error: sys_call_async failed: {exc}"
 
     if tool_name == SysCancelAsyncTool.name():
-        # task_id from sys_call_async is now a session_id.
-        task_id = args.get("task_id", "")
+        # ``task_id`` fallback supports older clients; remove in 0.8.0.
+        handle_id = args.get("handle_id") or args.get("task_id", "")
         try:
             resp = await server_client.post(
-                f"/v1/sessions/{task_id}/events",
+                f"/v1/sessions/{handle_id}/events",
                 json={"type": "interrupt", "data": {}},
                 timeout=30.0,
             )
             if resp.status_code in (200, 201, 202):
-                return f"Cancelled task {task_id}"
+                return f"Cancelled async handle {handle_id}"
             return f"Error: sys_cancel_async returned {resp.status_code}"
         except Exception as exc:  # noqa: BLE001
             return f"Error: sys_cancel_async failed: {exc}"
@@ -6177,8 +6244,11 @@ def _spawn_async_tool(
         ``GET …/changes`` endpoint.
     :param resource_registry: Optional session-resource registry used by
         async terminal-tool launches.
-    :returns: JSON handle string with ``handle_id``, ``tool_name``,
-        ``status``.
+    :returns: JSON handle string with canonical ``handle_id``,
+        plus compatibility ``task_id`` (identical value; remove in 0.8.0),
+        ``tool_name``, ``status``, and ``message``. Prefer
+        ``handle_id``; ``task_id`` exists only so older clients
+        that still parse the pre-handle_id field keep working.
     """
     target_tool = args.get("tool")
     target_args = args.get("args", "{}")
@@ -6286,12 +6356,15 @@ def _spawn_async_tool(
     return json.dumps(
         {
             "handle_id": handle_id,
+            # Compatibility alias for older clients; remove in 0.8.0.
+            "task_id": handle_id,
             "tool_name": target_tool,
             "status": "in_progress",
             "message": (
                 f"[System: {target_tool} dispatched as background "
                 f"task {handle_id}. Result will appear in your "
-                f"inbox — call sys_read_inbox to check.]"
+                f"inbox — call sys_read_inbox to check. To abort, "
+                f"call sys_cancel_async with handle_id={handle_id!r}.]"
             ),
         }
     )

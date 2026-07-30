@@ -1,5 +1,6 @@
 """Conversation store — manages conversations and their items."""
 
+import hashlib
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -83,6 +84,61 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+
+# Reserved label-key PREFIX that records whether a session is "pinned" in the
+# sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
+# (see :func:`pinned_label_key`), so pinning a session shared with others does
+# not pin it for them, and either party can pin/unpin independently — matching
+# the prior per-user localStorage behaviour. The value is the epoch-ms pin time
+# (any non-empty value means pinned; the row is deleted on unpin), which lets
+# the sidebar order the Pinned section by pin recency (stable under a new
+# message bumping ``updated_at``) and keeps the Cmd+1..0 hotkey slots consistent
+# across a user's devices. Server-side persistence lets a pin follow the user
+# across devices.
+#
+# The bare ``omnigent.pinned`` (no user suffix) is the CANONICAL key the web
+# client reads/writes; the server rewrites it to the caller's per-user key on
+# write and collapses the caller's per-user key back to it on read (see
+# ``_build_session_list_item``), so the per-user dimension never crosses the
+# API boundary — a viewer never sees another user's pin key. The web client
+# mirrors the canonical key as ``PINNED_LABEL_KEY``.
+PINNED_LABEL_KEY = "omnigent.pinned"
+
+# Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
+# reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
+_PINNED_LABEL_LOCAL_USER = "local"
+
+# ``conversation_labels.key`` is ``String(128)``. The prefix ``omnigent.pinned.``
+# is 16 chars, so a raw ``user_id`` suffix must stay ≤ 112 chars to fit. User ids
+# are ``String(128)`` elsewhere (SSO subject ids can be long), so a raw suffix
+# could overflow the key column — Postgres errors, MySQL silently truncates (and
+# two long ids could then collide on the truncated key). To stay safe while
+# keeping the common case (emails) human-readable in the DB, ids that don't fit
+# are replaced with a fixed-width hash suffix.
+_PINNED_LABEL_MAX_SUFFIX_LEN = 128 - len(PINNED_LABEL_KEY) - 1  # minus the "." joiner
+
+
+def pinned_label_key(user_id: str | None) -> str:
+    """
+    The per-user pinned-label key for ``user_id``.
+
+    Deterministic in ``user_id`` (the write path and the ``pinned=True`` filter
+    derive the key the same way, so they always match). Normal ids are used
+    verbatim for DB readability; an id too long to fit the ``String(128)`` key
+    column is replaced with a fixed-width ``sha256`` suffix so it can never
+    overflow or collide via silent truncation.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
+        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
+    :returns: ``"omnigent.pinned.<suffix>"`` (suffix = the id, or its hash when
+        the id is too long).
+    """
+    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
+    if len(suffix) > _PINNED_LABEL_MAX_SUFFIX_LEN:
+        # 64 hex chars — well within the budget and collision-safe.
+        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    return f"{PINNED_LABEL_KEY}.{suffix}"
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -554,6 +610,8 @@ class ConversationStore(ABC):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        pinned: bool = False,
+        pinned_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -644,12 +702,22 @@ class ConversationStore(ABC):
             conversations are excluded. When ``True``, archived and
             non-archived conversations are both returned (the caller
             groups them). Powers the sidebar's "Show archived" toggle.
-        :param project: When set to a non-empty string, only return
-            sessions that have a ``conversation_labels`` row with
-            ``key="omni_project"`` and ``value=project`` (the sidebar's
-            per-project folder fetch). When set to an empty string
-            ``""``, only return sessions with NO project label (unfiled
-            sessions). ``None`` disables the filter.
+        :param project: Filter by project NAME, dual-reading the
+            first-class projects entity and the legacy ``omni_project``
+            label (the sidebar's per-project folder fetch). A non-empty
+            string returns sessions that EITHER have a first-class
+            membership (``metadata.project_id`` → ``owned_by``'s project of
+            this name) OR carry the ``omni_project`` label with this value.
+            ``""`` returns sessions with NEITHER (unfiled). ``None`` disables
+            the filter. The name→id resolution is owner-scoped (projects are
+            owner-private), so pass ``owned_by`` alongside a specific name.
+            See ``designs/PROJECTS_PRD.md``.
+        :param pinned: When ``True``, only return sessions ``pinned_owner`` has
+            pinned (their per-user ``omnigent.pinned.<user>`` label — the
+            sidebar's Pinned section). ``False`` (default) disables the filter.
+        :param pinned_owner: The user whose pins ``pinned=True`` filters to
+            (their per-user key). ``None`` → the single-user ``local`` sentinel.
+            Ignored unless ``pinned`` is ``True``.
         :param title: When set, only return conversations whose
             ``title`` matches exactly. ``None`` disables the filter.
             Powers the ``(agent, title)`` child-session lookup in
@@ -696,15 +764,17 @@ class ConversationStore(ABC):
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
         harness_override: str | None = None,
+        _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
 
-        For ``reasoning_effort``, ``model_override``, and
-        ``cost_control_mode_override``, ``None`` means "leave
-        unchanged". To explicitly clear them back to ``None``, pass
+        For ``reasoning_effort``, ``model_override``,
+        ``cost_control_mode_override``, and ``harness_override``,
+        ``None`` means "leave unchanged". To explicitly clear them
+        back to ``None``, pass
         the matching ``_unset_*`` flag.
 
         :param conversation_id: Unique conversation identifier,
@@ -903,6 +973,26 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_conversation_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """
+        File a conversation into a first-class project (or unfile it).
+
+        Sets ``omnigent_conversation_metadata.project_id``; ``None`` unfiles
+        the session. The first-class counterpart to moving a session between
+        ``omni_project`` labels (see ``designs/PROJECTS_PRD.md``).
+
+        :param conversation_id: The conversation to update, e.g. ``"conv_abc"``.
+        :param project_id: The project id to file under, or ``None`` to unfile.
+        :returns: ``True`` if a metadata row was updated; ``False`` if the
+            conversation has no metadata row.
+        """
+        ...
+
+    @abstractmethod
     def increment_session_usage(
         self,
         conversation_id: str,
@@ -973,6 +1063,27 @@ class ConversationStore(ABC):
             ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
         :returns: The accumulated ``cost_usd`` for that
             ``(user_id, day_utc)``, or ``0.0`` when no row exists.
+        """
+        ...
+
+    @abstractmethod
+    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+        """
+        Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
+
+        Backs the ``omni usage`` rolling-window summary: the daily rollup
+        is time-attributed per calendar day, so summing the days in a
+        window gives spend that actually happened in that window (a
+        weeks-old session touched today no longer dumps its whole cost
+        into "today"). Day strings sort lexicographically because they are
+        zero-padded ``"YYYY-MM-DD"``, so the ``>=`` range works as a plain
+        string comparison.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as an ISO date
+            string ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
+        :returns: The summed ``cost_usd`` across matching days, or ``0.0``
+            when no rows fall in the range.
         """
         ...
 

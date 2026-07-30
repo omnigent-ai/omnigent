@@ -28,7 +28,7 @@ from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import ScheduledTask
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.scheduled import fire as fire_mod
-from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -978,3 +978,107 @@ async def test_managed_sandbox_is_skipped_and_recorded() -> None:
     assert launched == []
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "skipped"
+
+
+# ── build_run_now (manual "run now" trigger) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_now_active_creates_session_grant_and_run() -> None:
+    """Run-now fires an active task through the same create/grant/record path."""
+    perm = FakePermissionStore()
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append((conv, task))
+
+    run_now = build_run_now(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    started = await run_now(0, "task_1")
+    await _drain()
+
+    assert started is True
+    assert len(conv_store.created) == 1
+    assert perm.grants and perm.grants[0][2] == LEVEL_OWNER
+    assert len(launched) == 1
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_run_now_fires_paused_task() -> None:
+    """Run-now is a manual override: a PAUSED task still fires (unlike the scheduler)."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(state="paused")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    run_now = build_run_now(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    started = await run_now(0, "task_1")
+    await _drain()
+
+    assert started is True
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_run_now_missing_row_is_noop() -> None:
+    """Run-now on a deleted/missing task starts nothing and records no run."""
+    store = FakeScheduledTaskStore(rows={})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    run_now = build_run_now(_deps(store), launch_dispatch=_launch)
+    started = await run_now(0, "task_1")
+    await _drain()
+
+    assert started is False
+    assert launched == []
+    assert store.runs == []
+
+
+@pytest.mark.asyncio
+async def test_run_now_skips_when_already_in_flight() -> None:
+    """A second run-now for the same task is skipped while the first is in flight.
+
+    Shares the ``_IN_FLIGHT_TASKS`` overlap guard with the scheduled path, so a
+    manual run cannot double-launch (or collide with a scheduled fire).
+    """
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    release = asyncio.Event()
+
+    async def _slow_launch(conv: Any, task: Any) -> None:
+        await release.wait()
+
+    run_now = build_run_now(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_slow_launch,
+    )
+    first = await run_now(0, "task_1")
+    second = await run_now(0, "task_1")
+
+    for _ in range(100):
+        if conv_store.created:
+            break
+        await asyncio.sleep(0.01)
+    assert first is True
+    assert second is False
+    assert len(conv_store.created) == 1
+    release.set()
+    await _drain()
+    assert len(store.runs) == 1

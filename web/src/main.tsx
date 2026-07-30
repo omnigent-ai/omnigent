@@ -61,6 +61,16 @@ initNativeInsets();
 applyUiFontScale(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
 
+// The sidebar font size control was removed. Clear any previously persisted
+// value so existing users fall back to the default 13px size on reload.
+if (typeof window !== "undefined") {
+  try {
+    localStorage.removeItem("omnigent:sidebar-font-size");
+  } catch {
+    // localStorage access errors are non-fatal.
+  }
+}
+
 // Apply the saved color palette (data-theme on <html>) before first paint too,
 // so the app renders in the chosen theme rather than flashing the brand default.
 applyCustomTheme(readCustomTheme());
@@ -89,6 +99,9 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
+          harness_install_enabled: false,
+          installable_harnesses: [],
+          dictation_available: false,
         }),
       1500,
     ),

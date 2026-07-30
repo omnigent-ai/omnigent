@@ -99,6 +99,22 @@ function freshAuthHeaders(fallback) {
   return fallback || {};
 }
 
+// Return the relay URL and token from config.json when available. The runner
+// writes relayUrl + relayToken into config.json after the tool relay starts,
+// so policy POSTs can use the relay's non-expiring local token instead of a
+// baked server bearer.
+function relayCredentials() {
+  const cfg = readConfig();
+  if (
+    cfg &&
+    typeof cfg.relayUrl === "string" &&
+    typeof cfg.relayToken === "string"
+  ) {
+    return { url: cfg.relayUrl, token: cfg.relayToken };
+  }
+  return null;
+}
+
 /**
  * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
@@ -153,7 +169,11 @@ async function evalNativePolicyHttp(config, toolName, args) {
     typeof fetch !== "function"
   )
     return null;
-  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+  // Prefer relay (non-expiring local token); fall back to direct server call.
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/policies/evaluate`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
   // Mint one stable re-attach id for this tool call. Every (re)POST carries
   // it so a re-park lands on the SAME elicitation — no duplicate approval
   // card. Kept for the whole call, across both the park loop and any
@@ -168,10 +188,15 @@ async function evalNativePolicyHttp(config, toolName, args) {
     },
     _omnigent_elicitation_id: elicitationId,
   });
-  const reqHeaders = {
-    "content-type": "application/json",
-    ...freshAuthHeaders(config.authHeaders),
-  };
+  const reqHeaders = relay
+    ? {
+        "content-type": "application/json",
+        authorization: `Bearer ${relay.token}`,
+      }
+    : {
+        "content-type": "application/json",
+        ...freshAuthHeaders(config.authHeaders),
+      };
 
   const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
   // Independent transient-error budget so a server that is actually down
@@ -1126,6 +1151,7 @@ module.exports = function (pi) {
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
+  const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
   // Live streaming state for assistant text deltas. Pi emits
@@ -1388,13 +1414,19 @@ module.exports = function (pi) {
     });
   }
 
-  async function postReasoningText(text, responseId, keyHint) {
+  async function postCompletedReasoning(text, responseId, keyHint, streamed) {
     if (typeof text !== "string" || !text.trim()) return;
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
     if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
     postedReasoning.add(key);
     postedReasoning.add(textKey);
+    if (!streamed) {
+      await postEvent(config, {
+        type: "external_output_reasoning_delta",
+        data: { delta: text, started: true },
+      });
+    }
     await postEvent(config, {
       type: "external_conversation_item",
       data: {
@@ -1406,6 +1438,21 @@ module.exports = function (pi) {
           content: [{ type: "reasoning_text", text }],
         },
       },
+    });
+  }
+
+  function reasoningBlockKey(responseId, contentIndex) {
+    return `${responseId}:msg:${streamingMessageOrdinal}:thinking:${contentIndex}`;
+  }
+
+  async function postReasoningDelta(update, responseId) {
+    if (typeof update.delta !== "string" || !update.delta) return;
+    const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+    const started = !streamedReasoningBlocks.has(blockKey);
+    streamedReasoningBlocks.add(blockKey);
+    await postEvent(config, {
+      type: "external_output_reasoning_delta",
+      data: { delta: update.delta, started },
     });
   }
 
@@ -1475,7 +1522,13 @@ module.exports = function (pi) {
       if (block.type === "thinking") {
         const text = typeof block.thinking === "string" ? block.thinking : "";
         const key = block.thinkingSignature || `${turnOrdinal}:${index}`;
-        await postReasoningText(text, responseId, key);
+        const blockKey = reasoningBlockKey(responseId, index);
+        await postCompletedReasoning(
+          text,
+          responseId,
+          key,
+          streamedReasoningBlocks.has(blockKey),
+        );
       }
     }
   }
@@ -1563,6 +1616,7 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
+    streamedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
@@ -1630,13 +1684,23 @@ module.exports = function (pi) {
       await postTextDelta(update, responseId);
       return;
     }
+    if (update.type === "thinking_delta") {
+      await postReasoningDelta(update, responseId);
+      return;
+    }
     if (update.type === "toolcall_end") {
       await postToolCall(update.toolCall, responseId);
       return;
     }
     if (update.type === "thinking_end") {
       const key = `${turnOrdinal}:${update.contentIndex}`;
-      await postReasoningText(update.content, responseId, key);
+      const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+      await postCompletedReasoning(
+        update.content,
+        responseId,
+        key,
+        streamedReasoningBlocks.has(blockKey),
+      );
     }
   });
 
@@ -1731,12 +1795,34 @@ module.exports = function (pi) {
     // posted and this finalize agree on the id regardless of whether Pi
     // fires message_start.
     await finalizeStreamingMessage(responseId);
-    streamingMessageOrdinal += 1;
     await mirrorAssistantMessage(message, responseId);
+    streamingMessageOrdinal += 1;
     // ``message_end`` is the primary usage-capture site (one completed
     // assistant message per LLM call); fold its token counts into the
     // cumulative session totals and flush to the server for pricing.
     if (accumulateUsage(message)) await postSessionUsage();
+    // Surface Pi-reported errors (e.g. 404 for unknown model ids, 400 for
+    // unsupported API types) as visible error items in the web UI so users
+    // aren't left staring at an empty turn.
+    const stopReason =
+      message && typeof message.stopReason === "string" ? message.stopReason : "";
+    const errorMessage =
+      message && typeof message.errorMessage === "string" ? message.errorMessage : "";
+    if (stopReason === "error" && errorMessage) {
+      await postEvent(config, {
+        type: "external_conversation_item",
+        data: {
+          response_id: responseId,
+          item_type: "error",
+          item_data: {
+            source: "execution",
+            code: "RuntimeError",
+            message: `Pi model error: ${errorMessage}`,
+          },
+        },
+      });
+      return;
+    }
     const text = textFromMessage(message);
     if (!text) return;
     // The authoritative assistant item. The web UI retires + replaces the

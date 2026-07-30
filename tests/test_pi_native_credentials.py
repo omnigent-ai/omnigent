@@ -5,10 +5,21 @@ from __future__ import annotations
 import json
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from omnigent import pi_native_credentials as creds
+
+
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
 
 
 def _databricks_config() -> dict[str, object]:
@@ -40,7 +51,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
     assert provider is not None
     assert provider.api == "anthropic-messages"
     assert provider.base_url == "https://wkspc.example.com/ai-gateway/anthropic"
-    assert provider.model == "databricks-claude-sonnet-4-6"
+    assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
     # apiKey is a "!command" so Pi refreshes the gateway token per request.
     assert provider.api_key.startswith("!")
@@ -56,6 +67,67 @@ def test_databricks_unresolvable_host_returns_none(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(databricks_executor, "_read_databrickscfg_host", _no_host)
     assert creds.resolve_pi_native_provider(config_loader=_databricks_config) is None
+
+
+def test_databricks_unresolvable_credentials_sets_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expired token → provider still resolves but carries a re-auth warning.
+
+    Pi launches fine (its ``!command`` apiKey may recover), but a silent dead
+    session is worse than a visible notice — so the resolver flags it.
+    """
+    from omnigent.inner import databricks_executor
+    from omnigent.runtime.credentials import databricks as rt_databricks
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    def _boom(profile: str | None):
+        raise OSError("refresh token is invalid")
+
+    monkeypatch.setattr(rt_databricks, "resolve_databricks_workspace", _boom)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is not None
+    assert "demo-staging" in provider.credential_warning
+    assert "databricks auth login" in provider.credential_warning
+
+
+def test_databricks_model_list_failure_has_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Creds resolve but the model-list fetch fails → benign, no warning."""
+    from omnigent.inner import databricks_executor
+    from omnigent.runtime.credentials import databricks as rt_databricks
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+    monkeypatch.setattr(
+        rt_databricks,
+        "resolve_databricks_workspace",
+        lambda profile: rt_databricks.WorkspaceCreds(
+            host="https://wkspc.example.com", token="tok"
+        ),
+    )
+
+    def _fetch_boom(host: str, token: str):
+        raise RuntimeError("network blip")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch_boom)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
 
 
 def test_key_provider_resolves_to_inline_family() -> None:
@@ -337,7 +409,7 @@ def test_cli_config_databricks_resolves_to_anthropic_gateway(
     assert (
         provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
     )
-    assert provider.model == "databricks-claude-sonnet-4-6"
+    assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
     # apiKey is a "!command" rebuilt from the table's [X.auth] command + args
     # so Pi refreshes the gateway token per request.
@@ -852,7 +924,7 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda *_: (live_claude, live_gpt_responses, live_gpt_completions),
+        lambda *_: (live_claude, live_gpt_responses, live_gpt_completions, []),
     )
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
@@ -905,7 +977,7 @@ def test_cli_config_databricks_registers_gpt_provider(
         # Assert the auth_command token is used, not the SDK token
         assert token == "cmd-tok", f"expected auth_command token, got {token!r}"
         assert "dbc-a5d4177a" in workspace_url
-        return live_claude, live_gpt, []
+        return live_claude, live_gpt, [], []
 
     monkeypatch.setattr(creds, "_fetch_pi_model_lists", _mock_fetch)
 
@@ -926,48 +998,42 @@ def test_cli_config_databricks_registers_gpt_provider(
 
 
 def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
-    """_fetch_pi_model_lists splits live endpoints into claude/openai lists."""
+    """_fetch_pi_model_lists uses Unity Catalog model-services API for model ids."""
     import json
     import unittest.mock
 
     import httpx
 
+    def _make_service(name: str, api_types: list[str]) -> dict:
+        return {
+            "name": f"model-services/{name}",
+            "supported_api_types": api_types,
+        }
+
     payload = {
-        "endpoints": [
-            {
-                "name": "databricks-claude-sonnet-4-6",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            },
-            {
-                "name": "databricks-claude-opus-4-8",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            },
-            {"name": "databricks-gpt-5-4", "task": "llm/v1/chat", "state": {"ready": "READY"}},
-            {"name": "databricks-llama-3-70b", "task": "llm/v1/chat", "state": {"ready": "READY"}},
-            # GLM endpoint — task-based detection (no name token needed)
-            {
-                "name": "databricks-zai-org-glm-4-7",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            },
-            # GLM without task field — falls back to name token "glm"
-            {"name": "databricks-glm-4-7", "state": {"ready": "READY"}},
-            {"name": "my-embedding-model", "task": "llm/v1/embeddings"},
-            {"name": "databricks-gpt-5-5", "task": "llm/v1/chat", "state": {"ready": "READY"}},
-            # NOT_READY — excluded regardless of API type
-            {
-                "name": "databricks-gpt-5-5-pro",
-                "task": "llm/v1/chat",
-                "state": {"ready": "NOT_READY"},
-            },
+        "model_services": [
+            _make_service("system.ai.claude-sonnet-4-6", ["mlflow/v1/chat/completions"]),
+            _make_service("system.ai.claude-opus-4-8", ["mlflow/v1/chat/completions"]),
+            # GPT with Responses API support
+            _make_service(
+                "system.ai.gpt-5-5", ["mlflow/v1/chat/completions", "openai/v1/responses"]
+            ),
+            # GPT completions only (older)
+            _make_service(
+                "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
+            ),
+            # Llama - chat only
+            _make_service("system.ai.llama-4-maverick", ["mlflow/v1/chat/completions"]),
+            # Kimi - chat only (no Responses API per UC metadata)
+            _make_service("system.ai.kimi-k2-7-code", ["mlflow/v1/chat/completions"]),
+            # Embedding model - should be excluded
+            _make_service("system.ai.qwen3-embedding", ["mlflow/v1/embeddings"]),
         ]
     }
 
     class _MockTransport(httpx.BaseTransport):
         def handle_request(self, request: httpx.Request) -> httpx.Response:
-            assert "/api/2.0/serving-endpoints" in str(request.url)
+            assert "/api/2.1/unity-catalog/model-services" in str(request.url)
             assert request.headers["authorization"].startswith("Bearer ")
             return httpx.Response(200, content=json.dumps(payload).encode())
 
@@ -976,24 +1042,29 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_MockTransport()),
     ):
-        claude, gpt, completions = creds._fetch_pi_model_lists("https://wkspc.example.com", "tok")
+        claude, gpt, completions, _gemini = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "tok"
+        )
 
-    assert [m["id"] for m in claude] == [
-        "databricks-claude-sonnet-4-6",
-        "databricks-claude-opus-4-8",
-    ]
-    # Newer GPT needing Responses API
+    # Claude models
+    claude_ids = [m["id"] for m in claude]
+    assert "system.ai.claude-sonnet-4-6" in claude_ids
+    assert "system.ai.claude-opus-4-8" in claude_ids
+    # GPT with openai/v1/responses → gpt_responses
     gpt_ids = [m["id"] for m in gpt]
-    assert "databricks-gpt-5-5" in gpt_ids  # needs responses API
-    assert "databricks-gpt-5-4" not in gpt_ids  # works with completions
-    # Llama and GLM go to completions (work with /chat/completions + tools)
+    assert "system.ai.gpt-5-5" in gpt_ids
+    assert "system.ai.gpt-5-4" in gpt_ids
+    assert "system.ai.kimi-k2-7-code" in gpt_ids
+    # Kimi uses Responses API — no reasoning:true needed (that's completions-path only).
+    kimi_entry = next(m for m in gpt if m["id"] == "system.ai.kimi-k2-7-code")
+    assert kimi_entry.get("reasoning") is None
+    # Llama routes to mlflow gateway (system.ai.* ids 404 at serving-endpoints).
+    mlflow_ids = [m["id"] for m in _gemini]
+    assert "system.ai.llama-4-maverick" in mlflow_ids
     completions_ids = [m["id"] for m in completions]
-    assert "databricks-gpt-5-4" in completions_ids
-    assert "databricks-llama-3-70b" in completions_ids
-    assert "databricks-zai-org-glm-4-7" in completions_ids
-    assert "databricks-glm-4-7" in completions_ids
-    # Embeddings and not-ready endpoints excluded
-    assert "my-embedding-model" not in gpt_ids + completions_ids
+    assert not completions_ids  # no completions-only models in this test payload
+    # Embedding excluded
+    assert "system.ai.qwen3-embedding" not in gpt_ids + completions_ids + claude_ids
     assert all(m.get("input") == ["text", "image"] for m in claude + gpt + completions)
 
 
@@ -1016,10 +1087,11 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_ErrorTransport()),
     ):
-        claude, gpt, completions = creds._fetch_pi_model_lists(
+        claude, gpt, completions, gemini = creds._fetch_pi_model_lists(
             "https://wkspc.example.com", "bad-tok"
         )
 
     assert claude == []
     assert gpt == []
     assert completions == []
+    assert gemini == []

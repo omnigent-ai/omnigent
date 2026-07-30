@@ -223,7 +223,10 @@ export function shouldEchoSynchronously(byteLength: number, msSinceLastInput: nu
  */
 // eslint-disable-next-line no-underscore-dangle
 type TerminalCore = {
-  _core?: { writeSync?: (data: Uint8Array, maxSubsequentCalls?: number) => void };
+  _core?: {
+    writeSync?: (data: Uint8Array, maxSubsequentCalls?: number) => void;
+    coreMouseService?: { activeEncoding?: string };
+  };
 };
 
 /**
@@ -297,6 +300,124 @@ export function applyTerminalCopy(
 }
 
 /**
+ * Ceiling on synthesized wheel reports for a single DOM wheel event, so a
+ * page-mode or pathological delta can't flood the input channel.
+ */
+export const WHEEL_REPORTS_MAX_PER_EVENT = 50;
+
+/**
+ * Mouse state consulted by {@link wheelReportPayload}. ``mouseTrackingMode``
+ * comes from the public ``term.modes``; ``sgrEncoding`` is whether the pane
+ * program requested SGR mouse encoding (``?1006h``) — the public ``IModes``
+ * does not expose the encoding, so the session feature-detects it from
+ * xterm's core mouse service (see ``TerminalSession.sgrMouseEncodingActive``).
+ */
+export type WheelMouseState = {
+  mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any";
+  sgrEncoding: boolean;
+};
+
+/** Screen geometry needed to place and scale a wheel report. */
+export type WheelScreenMetrics = {
+  /** Viewport coordinates of the character grid's top-left corner. */
+  left: number;
+  top: number;
+  /** Size of one character cell in CSS pixels. */
+  cellWidth: number;
+  cellHeight: number;
+  cols: number;
+  rows: number;
+};
+
+/**
+ * Build SGR mouse-wheel reports for *lines* scroll steps at cell
+ * (*col*, *row*), 1-based. Negative lines scroll up (button 64),
+ * positive down (button 65); 0 yields "".
+ */
+export function sgrWheelReports(lines: number, col: number, row: number): string {
+  if (lines === 0) return "";
+  const button = lines < 0 ? 64 : 65;
+  return `\x1b[<${button};${col};${row}M`.repeat(Math.abs(lines));
+}
+
+/**
+ * Decide how one DOM wheel event over the terminal becomes SGR mouse-wheel
+ * reports, carrying fractional scroll across events.
+ *
+ * xterm's built-in wheel→report conversion is unusable with macOS
+ * trackpads: it damps sub-50px pixel deltas by ×0.3 and emits at most one
+ * report per DOM event regardless of magnitude, so two-finger scrolling
+ * over a mouse-tracking TUI (Claude Code, tmux with ``mouse on``) barely
+ * moves. This helper replaces that path: deltas convert to lines at face
+ * value, the fractional remainder accumulates in *partial* so a run of
+ * small trackpad deltas still adds up, and one report is emitted per whole
+ * line (capped at {@link WHEEL_REPORTS_MAX_PER_EVENT}; the excess is
+ * discarded rather than banked so a giant delta can't keep scrolling long
+ * after the gesture).
+ *
+ * The event is only consumed when the pane program is tracking the mouse
+ * with SGR encoding — both tmux ``mouse on`` (PTY transport) and Claude
+ * Code's own tracking (control transport) request SGR. Otherwise the
+ * caller must let xterm handle the wheel natively so, e.g., a plain shell
+ * on the control transport scrolls xterm's own scrollback. Shift-wheel is
+ * also left to xterm, mirroring its built-in escape hatch.
+ *
+ * Pure helper — exported for direct unit testing; production code calls it
+ * from the session's custom wheel handler.
+ *
+ * :param event: The DOM wheel event fields consulted.
+ * :param mouse: Current mouse tracking mode + SGR-encoding flag.
+ * :param screen: Character-grid geometry, or ``null`` when layout isn't
+ *     measurable yet (event is left to xterm).
+ * :param partial: Fractional lines carried over from previous events.
+ * :returns: ``consume`` — whether the caller owns the event (prevent
+ *     default, return ``false`` to xterm); ``data`` — SGR reports to feed
+ *     to the terminal ("" when the accumulator hasn't reached a whole
+ *     line); ``partial`` — the new carry.
+ */
+export function wheelReportPayload(
+  event: Pick<WheelEvent, "deltaY" | "deltaMode" | "shiftKey" | "clientX" | "clientY">,
+  mouse: WheelMouseState,
+  screen: WheelScreenMetrics | null,
+  partial: number,
+): { consume: boolean; data: string; partial: number } {
+  if (mouse.mouseTrackingMode === "none" || !mouse.sgrEncoding) {
+    // Tracking off (or an encoding we don't synthesize): xterm's native
+    // handling is correct. Drop the carry so a stale fraction can't leak
+    // into the next tracking-on scroll.
+    return { consume: false, data: "", partial: 0 };
+  }
+  if (event.shiftKey || event.deltaY === 0 || screen === null) {
+    return { consume: false, data: "", partial };
+  }
+  let lines: number;
+  switch (event.deltaMode) {
+    case WheelEvent.DOM_DELTA_LINE:
+      lines = event.deltaY;
+      break;
+    case WheelEvent.DOM_DELTA_PAGE:
+      lines = event.deltaY * screen.rows;
+      break;
+    default:
+      lines = event.deltaY / screen.cellHeight;
+  }
+  const total = partial + lines;
+  const whole = Math.trunc(total);
+  const capped = Math.max(
+    -WHEEL_REPORTS_MAX_PER_EVENT,
+    Math.min(WHEEL_REPORTS_MAX_PER_EVENT, whole),
+  );
+  const clamp = (v: number, max: number) => Math.min(Math.max(v, 1), max);
+  const col = clamp(Math.floor((event.clientX - screen.left) / screen.cellWidth) + 1, screen.cols);
+  const row = clamp(Math.floor((event.clientY - screen.top) / screen.cellHeight) + 1, screen.rows);
+  return {
+    consume: true,
+    data: sgrWheelReports(capped, col, row),
+    partial: capped === whole ? total - whole : 0,
+  };
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -328,6 +449,8 @@ export class TerminalSession {
    * control transport, would otherwise be an avoidable ``refresh-client -C``.
    */
   private lastSentSize: { cols: number; rows: number } | null = null;
+  /** Fractional wheel lines carried across events (see {@link wheelReportPayload}). */
+  private wheelPartialLines = 0;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -506,6 +629,29 @@ export class TerminalSession {
       return false;
     });
 
+    // Replace xterm's lossy wheel→mouse-report conversion (trackpad deltas
+    // are damped and capped to one report per event, which reads as
+    // "scrolling doesn't work" on macOS trackpads) with the accumulating
+    // synthesis in wheelReportPayload. term.input routes the reports
+    // through the normal onData path above, so they hit the WS send and
+    // the input-activity bookkeeping like any keystroke.
+    this.term.attachCustomWheelEventHandler((e) => {
+      const result = wheelReportPayload(
+        e,
+        {
+          mouseTrackingMode: this.term.modes.mouseTrackingMode,
+          sgrEncoding: this.sgrMouseEncodingActive(),
+        },
+        this.screenMetrics(),
+        this.wheelPartialLines,
+      );
+      this.wheelPartialLines = result.partial;
+      if (!result.consume) return true;
+      if (result.data) this.term.input(result.data, true);
+      e.preventDefault();
+      return false;
+    });
+
     // ResizeObserver fires on any layout-affecting change (window
     // resize, font load, CSS class change). tmux deduplicates same-
     // size events server-side, so no throttle needed here.
@@ -587,6 +733,43 @@ export class TerminalSession {
       }
     }
     this.term.write(bytes);
+  }
+
+  /**
+   * Whether the pane program requested SGR mouse encoding (``?1006h``).
+   *
+   * The public ``IModes`` exposes the tracking mode but not the encoding,
+   * so this feature-detects xterm's core mouse service — same pattern as
+   * the ``writeSync`` fast path. Both tmux with ``mouse on`` (PTY
+   * transport) and Claude Code (control transport) request SGR; when the
+   * private shape is missing or the encoding is anything else, the wheel
+   * handler defers to xterm rather than synthesizing reports the program
+   * could not parse.
+   */
+  private sgrMouseEncodingActive(): boolean {
+    // eslint-disable-next-line no-underscore-dangle
+    const core = (this.term as unknown as TerminalCore)._core;
+    return core?.coreMouseService?.activeEncoding === "SGR";
+  }
+
+  /**
+   * Measure the character grid for wheel-report placement, or ``null``
+   * when layout isn't available (pre-mount, jsdom). Reads the
+   * ``.xterm-screen`` element because the outer container includes
+   * padding that would skew the per-cell math.
+   */
+  private screenMetrics(): WheelScreenMetrics | null {
+    const { cols, rows } = this.term;
+    const rect = this.term.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0 || cols <= 0 || rows <= 0) return null;
+    return {
+      left: rect.left,
+      top: rect.top,
+      cellWidth: rect.width / cols,
+      cellHeight: rect.height / rows,
+      cols,
+      rows,
+    };
   }
 
   private sendResize(): void {

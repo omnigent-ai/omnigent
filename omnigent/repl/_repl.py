@@ -4870,11 +4870,22 @@ def _build_model_readout_lines(
         PI_SURFACE,
         describe_active_credential,
         harness_family,
+        harness_owns_its_credential,
         load_providers,
         provider_families,
     )
 
     lines: list[str] = []
+    if harness and harness_owns_its_credential(harness):
+        # The external agent authenticates itself, so there is no Omnigent
+        # credential to name. An in-session override is still shown (it's
+        # real, and e.g. goose applies it as GOOSE_MODEL); whether it reaches
+        # the agent varies per ACP agent, so no claim is made either way.
+        model_label = model_override or "(the agent's own model)"
+        return [
+            f"Active:  {model_label}  ·  🤖 ACP agent (agent's own auth)",
+            "usage: /model <name> · /model default | off | reset to clear",
+        ]
     cred = describe_active_credential(config, harness, model_override=model_override)
     if cred is None:
         # Nothing resolves for this harness's surface — not in the explicit
@@ -8307,12 +8318,32 @@ class _SlashCommandCompleter(Completer):
         if "/" in text_before[1:]:
             return
 
-        prefix = text_before.lower()
+        # Match the web UI's rule (slashCommandMatches in
+        # SlashCommandMenu.tsx): a case-insensitive substring of the
+        # command name (sans the leading "/"), so a namespaced skill is
+        # reachable by its leaf name (``/using-superpowers`` ->
+        # ``/superpowers:using-superpowers``). Name only, not the
+        # description — kept identical to the web menu, which never shows
+        # descriptions inline.
+        #
+        # Prefix matches rank ahead of mid-string matches (mirrors the web
+        # menu's ``rankedSlashCommandNames``): ``/e`` surfaces ``/effort``
+        # (a prefix) before ``/context`` (which merely contains "e"), so
+        # the first, auto-selectable completion is the intended one. Each
+        # tier keeps ``COMMANDS`` insertion order (an empty query — lone
+        # "/" — puts every command in the prefix tier, unchanged).
+        query = text_before[1:].lower()
+        prefix_hits: list[tuple[str, str]] = []
+        substring_hits: list[tuple[str, str]] = []
         for name, (desc, _) in COMMANDS.items():
             if name in _SLASH_COMMAND_ALIASES:
                 continue
-            if not name.startswith(prefix):
-                continue
+            body = name[1:].lower()
+            if body.startswith(query):
+                prefix_hits.append((name, desc))
+            elif query in body:
+                substring_hits.append((name, desc))
+        for name, desc in (*prefix_hits, *substring_hits):
             yield Completion(
                 text=name,
                 # Replace everything typed so far so the splice

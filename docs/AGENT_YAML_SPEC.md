@@ -203,6 +203,40 @@ same YAML works across platforms. For the full set of sandbox options, how to
 share one policy across `sys_os_*` and terminals, and how to set up network
 egress rules, see the `sandbox:` examples below and the sandbox source under `omnigent/inner/`.
 
+### Secretless credential proxy
+
+`sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts
+without the real secret ever entering the sandbox: the mandatory L7 egress proxy
+attaches the credential on the way out. It requires `egress_rules` and a
+network-isolating backend (`linux_bwrap` or `darwin_seatbelt`). See
+`designs/SANDBOX_CREDENTIAL_PROXY.md` for the full type table.
+
+The `databricks_cli` type proxies the Databricks CLI. List the profiles to
+proxy; only those are materialized into the sandbox (with placeholder tokens)
+and swapped by the proxy. As with every other credential-proxy type, you must
+list each workspace host in `egress_rules` yourself — the proxy does not widen
+egress on its own. OAuth tokens are refreshed for the life of the session.
+Requires the `databricks` extra and `linux_bwrap` (the Go CLI ignores
+`SSL_CERT_FILE` on macOS, so `darwin_seatbelt` is rejected).
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    egress_rules:
+      - "* pypi.org/**"                              # your other egress needs
+      - "* dbc-adb7b1a3-9097.cloud.databricks.com/**"  # the proxied workspace
+    credential_proxy:
+      - type: databricks_cli
+        profiles: [dbc-adb7b1a3-9097, oss]
+        default: dbc-adb7b1a3-9097   # optional; sets DATABRICKS_CONFIG_PROFILE
+```
+
+Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
+works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
+
 ## Tools
 
 Tools are declared under `tools` by name.
@@ -260,11 +294,15 @@ Use `container_image` for new specs; `docker_image` remains accepted as a
 deprecated alias for backwards compatibility. Set `container_runtime: podman` to
 run the image with Podman instead of Docker.
 
+The runtime can also be set globally via the `OMNIGENT_CONTAINER_RUNTIME`
+environment variable (accepted values: `docker`, `podman`). The per-agent
+`container_runtime` YAML key takes precedence over the environment variable.
+
 ```yaml
 tools:
   sandbox:
     container_image: python:3.12-slim
-    container_runtime: podman  # optional; defaults to docker
+    container_runtime: podman  # optional; defaults to docker (or OMNIGENT_CONTAINER_RUNTIME)
 ```
 
 ### Sub-agent tool

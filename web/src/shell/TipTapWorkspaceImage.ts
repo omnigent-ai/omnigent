@@ -14,8 +14,8 @@
 // images re-serialise with normalised attribute order/quoting, so the
 // guarantee is attribute preservation, not whole-tag byte identity.)
 
-import Image from "@tiptap/extension-image";
-import Link from "@tiptap/extension-link";
+import { Image } from "@tiptap/extension-image";
+import { Link } from "@tiptap/extension-link";
 import type { AnyExtension } from "@tiptap/core";
 import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
 

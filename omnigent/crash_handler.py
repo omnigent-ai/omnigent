@@ -347,8 +347,17 @@ def _save_report(report_md: str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = d / f"crash-{stamp}.md"
-    if path.exists():  # same-second collision — disambiguate by pid.
-        path = d / f"crash-{stamp}-{os.getpid()}.md"
+    if path.exists():
+        # Same-second collision. The pid separates concurrent processes, but a
+        # process that crashes twice in one second reuses its own pid — so keep
+        # counting until the name is free, else the second report would
+        # overwrite the first and the earlier crash would be lost.
+        base = f"crash-{stamp}-{os.getpid()}"
+        path = d / f"{base}.md"
+        suffix = 1
+        while path.exists():
+            path = d / f"{base}-{suffix}.md"
+            suffix += 1
     path.write_text(report_md, encoding="utf-8")
     with contextlib.suppress(OSError):
         os.chmod(path, 0o600)

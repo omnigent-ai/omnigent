@@ -12,6 +12,7 @@ import respx
 from click.testing import CliRunner
 
 from omnigent.cli import _CLICK_SUBCOMMANDS, cli
+from omnigent.session_import.models import SessionImportNotFoundError
 
 _BASE = "http://localhost:6767"
 
@@ -86,7 +87,7 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
 
 
 def test_import_command_rejects_cursor() -> None:
-    """The v0 import command accepts only Claude Code and Codex."""
+    """The import command rejects sources without a supported adapter."""
     result = CliRunner().invoke(
         cli,
         ["import", "--harness", "cursor", "--session", "cursor-session"],
@@ -94,6 +95,97 @@ def test_import_command_rejects_cursor() -> None:
 
     assert result.exit_code == 2
     assert "Invalid value for '--harness'" in result.output
+
+
+@respx.mock
+def test_import_command_accepts_qwen_session(tmp_path: Path) -> None:
+    """The public CLI accepts a newly supported JSONL harness."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / ".qwen" / "projects" / "-repo" / "chats" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "uuid": "user-1",
+                "sessionId": session_id,
+                "type": "user",
+                "cwd": "/repo",
+                "message": {"role": "user", "parts": [{"text": "hello"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_qwen", "status": "imported", "item_count": 1},
+        )
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "qwen", "--session", session_id],
+            env={"HOME": str(tmp_path), "QWEN_HOME": str(tmp_path / ".qwen")},
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(route.calls.last.request.content)
+    assert payload["source"] == "qwen"
+    assert payload["external_session_id"] == f"-repo:{session_id}"
+    assert "conv_qwen" in result.output
+
+
+@respx.mock
+def test_import_command_accepts_opencode_export() -> None:
+    """The CLI accepts OpenCode and uploads its public export representation."""
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_opencode", "status": "imported", "item_count": 1},
+        )
+    )
+    export = {
+        "info": {"id": "ses_cli", "directory": "/repo"},
+        "messages": [
+            {
+                "info": {"id": "msg_user", "role": "user"},
+                "parts": [{"type": "text", "text": "hello"}],
+            }
+        ],
+    }
+
+    with (
+        patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
+        patch("omnigent.session_import.local._run_opencode_json", return_value=export),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "opencode", "--session", "ses_cli"],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(route.calls.last.request.content)
+    assert payload["source"] == "opencode"
+    assert payload["external_session_id"] == "ses_cli"
+    assert payload["workspace"] == "/repo"
+    assert "conv_opencode" in result.output
+
+
+def test_import_command_reports_opencode_discovery_failure() -> None:
+    """Batch discovery surfaces a missing or broken OpenCode CLI cleanly."""
+    with patch(
+        "omnigent.session_import.local._run_opencode_json",
+        side_effect=SessionImportNotFoundError("opencode CLI not found on PATH"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "opencode", "--last", "1"],
+        )
+
+    assert result.exit_code == 1
+    assert "opencode CLI not found on PATH" in result.output
 
 
 @respx.mock

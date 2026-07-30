@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.7.0.dev0"
+version = "0.8.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,10 +26,12 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.7.0.dev0",
-    "omnigent-ui-sdk==0.7.0.dev0",
+    "omnigent-client==0.8.0.dev0",
+    "omnigent-ui-sdk==0.8.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
+    # OpenClaw stores its wrapped acpx registry as JSON5.
+    "json5>=0.10,<1",
     # openai-agents<0.18.2 omits a field required by openai>=2.45.
     # Keep this cap until the websockets<15 compatibility pin can be lifted.
     "openai>=1.0,<2.45",
@@ -100,6 +102,11 @@ dependencies = [
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
+    # CA root bundle for client TLS verification (omnigent/tls.py,
+    # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
+    # python-build-standalone interpreters whose OpenSSL has no default cert
+    # path; previously only transitive, pinned here now that we import it.
+    "certifi>=2023.7",
     # Protobuf schema for the AI-gateway routing API
     # (omnigent/api/routing/v1/routing.proto).
     # Previously only a transitive dep; declared directly now that we ship a proto.
@@ -181,6 +188,22 @@ antigravity = ["google-antigravity>=0.1,<1"]
 # extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is
 # why it is not part of the baseline install. Pin major.
 copilot = ["github-copilot-sdk>=1,<2"]
+# Server-side streaming dictation (`WS /v1/dictation/stream`,
+# designs/server-dictation.md). Local CPU speech-to-text via sherpa-onnx;
+# the engine module imports it lazily, so only servers offering dictation
+# need the extra. Models are fetched separately
+# (scripts/fetch-dictation-models.sh). sherpa-onnx-core (the native
+# onnxruntime payload) is pinned explicitly because sherpa-onnx's wheel
+# metadata declares it inconsistently across platforms — without the
+# explicit pin it is missing from uv.lock, which breaks both the hashed
+# OSV audit and aarch64 installs.
+dictation = [
+    "sherpa-onnx>=1.13,<2",
+    "sherpa-onnx-core>=1.13,<2",
+    # The engine converts PCM frames with numpy directly; declare it
+    # rather than riding whichever extra happens to pull it in.
+    "numpy>=1.24,<3",
+]
 # Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
 # harness imports the cursor-sdk lazily on first turn, so only `--harness
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
@@ -204,7 +227,13 @@ memory = ["hindsight-client>=0.4.0"]
 # installs resolve it from `integrations/slack` via [tool.uv.sources] below;
 # publishing `omnigent[slack]` to an index additionally requires publishing
 # `omnigent-slack` there (not yet wired into the release pipeline).
-slack = ["omnigent-slack"]
+# Version-locked (==) with the lockstep cycle — `scripts/update_versions.py`
+# keeps this pin in sync with the other sibling `==` pins
+# (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
+# `[project].version` in `integrations/slack/pyproject.toml`.
+slack = [
+    "omnigent-slack==0.8.0.dev0",
+]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -542,6 +571,15 @@ known-first-party = ["omnigent"]
 "integrations/slack/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# The sessions route is a facade over an implementation package: the public
+# ``sessions.py`` re-exports its impl modules with ``import *``, and each impl
+# module layers on the ones below it the same way (common → helpers →
+# orchestration). Star re-export is the point of the facade, so F403 (star
+# import) and F405 (name may be from star import) are expected here and can't
+# be resolved without enumerating hundreds of re-exports by hand.
+"omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401", "F403", "F405"]
+"omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401", "F403", "F405"]
+"omnigent/server/routes/_sessions/*.py" = ["F403", "F405"]
 
 [tool.mypy]
 python_version = "3.12"

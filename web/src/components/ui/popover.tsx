@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Popover as PopoverPrimitive } from "radix-ui";
+import * as PopoverPrimitive from "radix-ui/popover";
 
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";

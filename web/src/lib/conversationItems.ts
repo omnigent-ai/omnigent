@@ -61,6 +61,13 @@ export interface ErrorItem extends BaseItem {
   message: string;
 }
 
+export interface ReasoningItem extends BaseItem {
+  type: "reasoning";
+  model: string;
+  summary: Array<{ type: string; text: string }>;
+  content?: Array<{ type: string; text: string }>;
+}
+
 /** The provider-native tool item types the runtime persists today. */
 export const NATIVE_TOOL_ITEM_TYPES = new Set<string>([
   "web_search_call",
@@ -158,6 +165,7 @@ export type ConversationItem =
   | FunctionCallItem
   | FunctionCallOutputItem
   | ErrorItem
+  | ReasoningItem
   | NativeToolItem
   | CompactionItem
   | SlashCommandItem
@@ -179,6 +187,10 @@ export function isFunctionCallOutputItem(item: ConversationItem): item is Functi
 
 export function isErrorItem(item: ConversationItem): item is ErrorItem {
   return item.type === "error";
+}
+
+export function isReasoningItem(item: ConversationItem): item is ReasoningItem {
+  return item.type === "reasoning";
 }
 
 export function isNativeToolItem(item: ConversationItem): item is NativeToolItem {

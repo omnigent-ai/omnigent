@@ -15,7 +15,7 @@ import json
 import re
 import threading
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,17 +30,31 @@ class ModelInfo:
     :param name: The model identifier, e.g. ``"claude-sonnet-4-20250514"``.
     :param provider: The provider name, e.g. ``"anthropic"``.
     :param mode: The model mode, e.g. ``"chat"``, ``"embedding"``, or ``None``.
-    :param supports_function_calling: Whether the model supports tool use.
+    :param supports_function_calling: Whether the model supports tool use, or
+        ``None`` when the catalog does not report it.
+    :param supports_reasoning: Whether the model supports reasoning, or
+        ``None`` when unknown.
+    :param supports_vision: Whether the model supports image input, or
+        ``None`` when unknown.
+    :param supports_structured_output: Whether the model supports response
+        schemas, or ``None`` when unknown.
     :param max_input_tokens: Maximum input context window size, or ``None``.
     :param max_output_tokens: Maximum output tokens, or ``None``.
+    :param input_price: Input price per million tokens, or ``None``.
+    :param output_price: Output price per million tokens, or ``None``.
     """
 
     name: str
     provider: str
     mode: str | None = None
-    supports_function_calling: bool = False
+    supports_function_calling: bool | None = None
+    supports_reasoning: bool | None = None
+    supports_vision: bool | None = None
+    supports_structured_output: bool | None = None
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
+    input_price: float | None = None
+    output_price: float | None = None
 
 
 @dataclass
@@ -352,18 +366,21 @@ def get_models(provider: str) -> list[ModelInfo]:
 
             context = entry.get("context_window", {})
             capabilities = entry.get("capabilities", {})
+            pricing = entry.get("pricing", {})
 
             models.append(
                 ModelInfo(
                     name=model_name,
                     provider=provider,
                     mode=entry.get("mode"),
-                    supports_function_calling=capabilities.get(
-                        "function_calling",
-                        False,
-                    ),
+                    supports_function_calling=capabilities.get("function_calling"),
+                    supports_reasoning=capabilities.get("reasoning"),
+                    supports_vision=capabilities.get("vision"),
+                    supports_structured_output=capabilities.get("response_schema"),
                     max_input_tokens=context.get("max_input"),
                     max_output_tokens=context.get("max_output"),
+                    input_price=pricing.get("input_per_million_tokens"),
+                    output_price=pricing.get("output_per_million_tokens"),
                 )
             )
 
@@ -416,24 +433,18 @@ _PREFERRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "anthropic": "sonnet",
 }
 
-# Explicit per-provider default-model pins. These win over the catalog's
-# dynamic rule so the out-of-box default is a specific, current model even
-# when the bundled catalog lags a new release (these ids may not be in the
-# catalog yet). The user can still pick another via ``configure harness`` /
-# ``/model``.
-_DEFAULT_MODEL_OVERRIDE: dict[str, str] = {
-    "anthropic": "claude-opus-4-8",
-    "openai": "gpt-5.5",
-    # OpenRouter (and the gateway add's OSS pre-fill) → a broadly-served OSS
-    # model rather than an OpenAI/Anthropic id.
-    "openrouter": "moonshotai/kimi-k2.6",
-    # xAI — pin the flagship so click.prompt(default=...) always has a value
-    # even when the catalog fetch is disabled (e.g. in tests).
-    "xai": "grok-3",
+# Required provider → case-insensitive model-id substring. If no entry matches,
+# onboarding asks explicitly instead of choosing an unexpected alternative.
+_REQUIRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
+    "openrouter": "kimi",
 }
 
 
-def default_chat_model(provider: str) -> str | None:
+def default_chat_model(
+    provider: str,
+    *,
+    allowed_models: Collection[str] | None = None,
+) -> str | None:
     """
     Return the catalog's canonical default chat model for a provider.
 
@@ -447,35 +458,36 @@ def default_chat_model(provider: str) -> str | None:
        also tags ``mode="chat"`` and which would otherwise outrank the
        flagship text model by release date for some providers (OpenAI's
        ``gpt-audio-*`` / ``gpt-realtime-*`` sort above ``gpt-5.4``).
-    3. If the provider has a preferred default *tier*
+    3. If the provider requires a default *tier*
+       (:data:`_REQUIRED_DEFAULT_TIER_TOKEN`), return its newest model or
+       ``None`` when the catalog offers none.
+    4. If the provider has a preferred default *tier*
        (:data:`_PREFERRED_DEFAULT_TIER_TOKEN`), return the newest remaining
        model of that tier — so a fresh user gets a model their key can
        actually use. Fall back to the newest remaining general-purpose model
        when no model matches the tier.
 
-    ``anthropic`` and ``openai`` carry an explicit pin
-    (:data:`_DEFAULT_MODEL_OVERRIDE`) that wins over steps 1-3, so the
-    out-of-box default is a specific current model (``claude-opus-4-8`` /
-    ``gpt-5.5``) even when the bundled catalog lags. Other providers follow
-    the dynamic rule above.
+    ``allowed_models`` constrains the catalog rule so callers can apply family
+    or routing compatibility before selection.
 
     :param provider: Provider name, e.g. ``"anthropic"`` or ``"openai"``.
-    :returns: The default model id, e.g. ``"claude-opus-4-8"`` or
-        ``"gpt-5.5"``, or ``None`` when the catalog has no chat model for
-        that provider (genuinely unknown provider).
+    :param allowed_models: Optional model ids eligible for selection.
+    :returns: The selected catalog model id, or ``None`` when the catalog has
+        no chat model for that provider.
     """
-    # An explicit pin wins over the dynamic catalog rule (and may name a
-    # model newer than the bundled catalog).
-    override = _DEFAULT_MODEL_OVERRIDE.get(provider)
-    if override is not None:
-        return override
-
+    allowed = set(allowed_models) if allowed_models is not None else None
     general: list[str] = []
     for model in get_chat_models(provider):
+        if allowed is not None and model.name not in allowed:
+            continue
         lowered = model.name.lower()
         if any(token in lowered for token in _SPECIALTY_MODEL_TOKENS):
             continue
         general.append(model.name)
+
+    required_token = _REQUIRED_DEFAULT_TIER_TOKEN.get(provider)
+    if required_token is not None:
+        return next((name for name in general if required_token in name.lower()), None)
 
     preferred_token = _PREFERRED_DEFAULT_TIER_TOKEN.get(provider)
     if preferred_token is not None:
@@ -490,12 +502,11 @@ def default_chat_model(provider: str) -> str | None:
 # Model sorting — newest/best models first
 # ---------------------------------------------------------------------------
 
-# Matches version-like numbers in model names: gpt-4 → 4, claude-3.5 → 3.5,
-# o1 → 1, gpt-4.1 → 4.1, llama-4 → 4
-_VERSION_PATTERN = re.compile(
-    r"(?:^|[-/])"  # start of string or separator
-    r"(?:gpt-?|o|claude-?|llama-?|gemini-?|deepseek-?v?)?"
-    r"(\d+(?:\.\d+)?)"  # version number (e.g. 4, 3.5, 4.1)
+# Vendor marker used to isolate version tokens from provider prefixes, model
+# sizes, and dates. The previous optional marker treated any number as a model
+# version, so a size such as ``120b`` could outrank a newer vendor model.
+_VERSION_FAMILY_PATTERN = re.compile(
+    r"(?:^|[-/])(?:gpt|claude|llama|gemini|deepseek(?:-v)?|o)(?=[-/]?\d|[-/])"
 )
 
 # Matches dates: 2025-04-14, 20250414, 20241022
@@ -509,10 +520,19 @@ def _extract_model_version(name: str) -> float:
     :param name: Model name, e.g. ``"gpt-4.1-2025-04-14"``.
     :returns: Version as float, or ``0.0`` if none found.
     """
-    match = _VERSION_PATTERN.search(name)
-    if match:
-        return float(match.group(1))
-    return 0.0
+    family = _VERSION_FAMILY_PATTERN.search(name.lower())
+    if family is None:
+        return 0.0
+    suffix = _DATE_PATTERN.sub("", name[family.end() :])
+    tokens = [
+        token for token in re.split(r"[-/]", suffix) if re.fullmatch(r"\d+(?:\.\d+)?", token)
+    ]
+    if not tokens:
+        return 0.0
+    primary = float(tokens[0])
+    if "." not in tokens[0] and len(tokens) > 1 and len(tokens[1]) == 1:
+        return float(f"{tokens[0]}.{tokens[1]}")
+    return primary
 
 
 def _extract_model_date(name: str) -> int:

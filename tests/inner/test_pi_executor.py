@@ -11,6 +11,7 @@ import textwrap
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,7 +39,6 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -446,18 +446,18 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertEqual(entry.get("input"), ["text", "image"])
 
     def test_dynamic_reasoning_model_gets_reasoning_flag(self):
-        # GLM/DeepSeek stream their output on ``reasoning_content``;
-        # without ``reasoning: true`` Pi's openai-completions parser never
-        # consumes that channel and the turn dies with "Stream ended without
-        # finish_reason".
-        for model in ("databricks-glm-5-2", "databricks-deepseek-r1"):
-            result = _build_models_json("https://host.example.com", "tok", model=model)
-            provider = result["providers"][_pi_provider_for_model(model)]
-            entry = next(e for e in provider["models"] if e["id"] == model)
-            self.assertIs(entry.get("reasoning"), True, model)
+        # DeepSeek streams output on ``reasoning_content``; without
+        # ``reasoning: true`` Pi's openai-completions parser never consumes
+        # that channel and the turn dies with "Stream ended without finish_reason".
+        # GLM now uses the Responses API so it no longer needs this flag.
+        model = "databricks-deepseek-r1"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertIs(entry.get("reasoning"), True, model)
 
     def test_dynamic_non_reasoning_model_has_no_reasoning_flag(self):
-        model = "databricks-gemini-2-5-pro"
+        model = "databricks-mlflow-2-5-pro"
         result = _build_models_json("https://host.example.com", "tok", model=model)
         provider = result["providers"][_pi_provider_for_model(model)]
         entry = next(e for e in provider["models"] if e["id"] == model)
@@ -521,19 +521,18 @@ class TestBuildModelsJson(unittest.TestCase):
             self.assertNotIn("/ai-gateway/codex", base_url)
             self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
 
-    def test_gemini_model_routed_off_codex_gateway(self):
-        # Gemini falls to the databricks-completions catch-all; it must land on
-        # serving-endpoints, not the codex URL it used to inherit (#241).
+    def test_gemini_model_routed_to_mlflow_gateway(self):
+        # Gemini uses /ai-gateway/mlflow/v1 — system.ai.* ids 404 at serving-endpoints
+        # and the Responses API returns 400 for Gemini.
         result = _build_models_json(
             "https://host.example.com",
             "tok",
-            {"openai": "https://host.example.com/ai-gateway/codex/v1"},
-            model="databricks-gemini-2-5-pro",
+            model="system.ai.gemini-3-flash",
         )
-        provider = result["providers"][_pi_provider_for_model("databricks-gemini-2-5-pro")]
-        self.assertEqual(provider["baseUrl"], "https://host.example.com/serving-endpoints")
+        provider = result["providers"][_pi_provider_for_model("system.ai.gemini-3-flash")]
+        self.assertEqual(provider["baseUrl"], "https://host.example.com/ai-gateway/mlflow/v1")
         self.assertIn(
-            "databricks-gemini-2-5-pro",
+            "system.ai.gemini-3-flash",
             [entry.get("id") for entry in provider["models"]],
         )
 
@@ -1493,7 +1492,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model="cfg-override")), "cfg-override"
+            _run(executor._resolve_model(ExecutorConfig(model="cfg-override"))),
+            "cfg-override",
         )
 
     def test_constructor_default_used_when_no_cfg_override(self):
@@ -1503,7 +1503,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model=None)), "constructor-default"
+            _run(executor._resolve_model(ExecutorConfig(model=None))),
+            "constructor-default",
         )
 
     def test_cfg_model_used_when_no_constructor_default(self):
@@ -1514,7 +1515,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model="config-model")), "config-model"
+            _run(executor._resolve_model(ExecutorConfig(model="config-model"))),
+            "config-model",
         )
 
 
@@ -2877,7 +2879,35 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True)
-    assert executor._resolve_model(ExecutorConfig(model=None)) == DATABRICKS_CLAUDE_DEFAULT_MODEL
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
+        "catalog-databricks-claude-default"
+    )
+
+
+def test_catalog_default_is_registered_in_models_json() -> None:
+    """Pi registers a catalog-selected gateway default before launch."""
+    catalog_default = "databricks-claude-catalog-default"
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.resolve_catalog_model",
+            return_value=SimpleNamespace(model_id=catalog_default),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+        resolved = _run(executor._resolve_model(ExecutorConfig(model=None)))
+
+    models = _build_models_json("https://h.example.com", "tok", model=resolved)
+    anthropic_ids = {
+        entry["id"] for entry in models["providers"]["databricks-anthropic"]["models"]
+    }
+
+    assert resolved == catalog_default
+    assert catalog_default in anthropic_ids
 
 
 def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
@@ -2896,7 +2926,7 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True, model="databricks-gpt-5-4")
-    assert executor._resolve_model(ExecutorConfig(model=None)) == "databricks-gpt-5-4"
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == "databricks-gpt-5-4"
 
 
 def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
@@ -2921,7 +2951,7 @@ def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
             gateway_host="https://example.databricks.com",
             gateway_auth_command="printf token",
         )
-    assert executor._resolve_model(ExecutorConfig(model=None)) is None
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
 def test_non_gateway_path_does_not_inject_default_model() -> None:
@@ -2932,23 +2962,7 @@ def test_non_gateway_path_does_not_inject_default_model() -> None:
     """
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
-    assert executor._resolve_model(ExecutorConfig(model=None)) is None
-
-
-def test_databricks_default_model_is_resolvable_in_models_json() -> None:
-    """
-    The shared Databricks default must route to the anthropic provider AND
-    be listed in that provider's models — otherwise the default the
-    producer/executor inject can't be resolved by pi at spawn time.
-
-    Failure means the default-model constant and pi's models.json drifted
-    apart: every modelless gateway agent would fail its first turn with a
-    pi "unknown model" error.
-    """
-    assert _pi_provider_for_model(DATABRICKS_CLAUDE_DEFAULT_MODEL) == "databricks-anthropic"
-    models = _build_models_json("https://host.example.com", "tok")
-    anthropic_ids = [m["id"] for m in models["providers"]["databricks-anthropic"]["models"]]
-    assert DATABRICKS_CLAUDE_DEFAULT_MODEL in anthropic_ids
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
 def test_models_json_lists_only_gateway_verified_models() -> None:
@@ -2971,10 +2985,15 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-claude-sonnet-4-6",
         "databricks-claude-sonnet-4-5",
     ]
-    openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == [
+    # Older GPT models (no tool-rejection via /chat/completions) → completions.
+    openai_completions_ids = [m["id"] for m in providers["databricks"]["models"]]
+    assert openai_completions_ids == [
         "databricks-gpt-5-4-mini",
         "databricks-gpt-5-4",
+    ]
+    # Newer GPT → responses API. Kimi/inkling/Qwen3 registered dynamically only.
+    openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
+    assert openai_responses_ids == [
         "databricks-gpt-5-5",
         "databricks-gpt-5-5-pro",
     ]
@@ -2986,7 +3005,7 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
 def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
     """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
     models = _build_models_json("https://host.example.com", "tok")
-    by_id = {m["id"]: m for m in models["providers"]["databricks"]["models"]}
+    by_id = {m["id"]: m for m in models["providers"]["databricks-openai"]["models"]}
     for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
         assert by_id[model_id]["contextWindow"] == 400000
         assert by_id[model_id]["maxTokens"] == 128000
@@ -3022,6 +3041,7 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
     # _pi_provider_for_model routes it to, advertising image input so Pi
     # doesn't strip attached images (#515).
     entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
+    # Non-Databricks kimi on OpenRouter uses completions path (no reasoning flag needed).
     assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.

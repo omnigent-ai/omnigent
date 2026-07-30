@@ -317,6 +317,7 @@ async def _grant_permission(
     granter: str,
     target_user: str,
     level: int,
+    can_approve: bool | None = None,
 ) -> httpx.Response:
     """Grant a permission on a session.
 
@@ -325,11 +326,15 @@ async def _grant_permission(
     :param granter: User identity of the granter.
     :param target_user: User to receive the grant.
     :param level: Numeric permission level (1/2/3).
+    :param can_approve: Optional delegated approval capability.
     :returns: The raw httpx response.
     """
+    body: dict[str, Any] = {"user_id": target_user, "level": level}
+    if can_approve is not None:
+        body["can_approve"] = can_approve
     return await client.put(
         f"/v1/sessions/{session_id}/permissions",
-        json={"user_id": target_user, "level": level},
+        json=body,
         headers={"X-Forwarded-Email": granter},
     )
 
@@ -499,7 +504,7 @@ async def test_full_permission_lifecycle(
         user="bryan",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     # Only bryan (owner) and rice (edit) should remain.
     # corey was revoked in step 5.
@@ -732,6 +737,133 @@ async def test_edit_grant_allows_post_but_blocks_permission_management(
         f"user-b with edit grant should be blocked from listing "
         f"permissions. Got {resp.status_code}."
     )
+
+
+async def test_owner_can_delegate_approval_event_authority(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Editors need an explicit owner grant before approving owner-run tools."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    session = await _create_session_as(auth_client, agent["id"], "user-a")
+    session_id = session["id"]
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="user-a",
+        target_user="user-b",
+        level=LEVEL_EDIT,
+    )
+    assert grant.status_code == 200
+
+    approval = {
+        "type": "approval",
+        "data": {"elicitation_id": "elicit_test", "action": "accept"},
+    }
+    editor_response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=approval,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert editor_response.status_code == 403, editor_response.text
+
+    editor_snapshot = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert editor_snapshot.status_code == 200, editor_snapshot.text
+    assert editor_snapshot.json()["can_approve"] is False
+    editor_rows = await _list_sessions_as(auth_client, "user-b")
+    assert next(row for row in editor_rows if row["id"] == session_id)["can_approve"] is False
+
+    decline_response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "approval",
+            "data": {"elicitation_id": "elicit_decline", "action": "decline"},
+        },
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert decline_response.status_code == 202, decline_response.text
+
+    delegated_grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="user-a",
+        target_user="user-b",
+        level=LEVEL_EDIT,
+        can_approve=True,
+    )
+    assert delegated_grant.status_code == 200, delegated_grant.text
+    assert delegated_grant.json()["can_approve"] is True
+
+    delegated_snapshot = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert delegated_snapshot.status_code == 200, delegated_snapshot.text
+    assert delegated_snapshot.json()["can_approve"] is True
+    delegated_rows = await _list_sessions_as(auth_client, "user-b")
+    assert next(row for row in delegated_rows if row["id"] == session_id)["can_approve"] is True
+
+    delegated_response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=approval,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert delegated_response.status_code == 202, delegated_response.text
+
+    revoked_grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="user-a",
+        target_user="user-b",
+        level=LEVEL_EDIT,
+        can_approve=False,
+    )
+    assert revoked_grant.status_code == 200, revoked_grant.text
+    assert revoked_grant.json()["can_approve"] is False
+
+    revoked_response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=approval,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert revoked_response.status_code == 403, revoked_response.text
+
+    owner_response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=approval,
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert owner_response.status_code == 202, owner_response.text
+
+
+async def test_manager_cannot_delegate_approval_authority(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Sharing managers cannot grant authority over owner credentials."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    session = await _create_session_as(auth_client, agent["id"], "user-a")
+    session_id = session["id"]
+    manager_grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="user-a",
+        target_user="user-b",
+        level=LEVEL_MANAGE,
+    )
+    assert manager_grant.status_code == 200
+
+    response = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="user-b",
+        target_user="user-c",
+        level=LEVEL_EDIT,
+        can_approve=True,
+    )
+
+    assert response.status_code == 403, response.text
 
 
 async def test_archive_requires_owner_access(
@@ -1022,7 +1154,7 @@ async def test_list_permissions_shows_all_grants(
         user="user-a",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     # user-a auto-got owner on creation; user-b and user-c were
     # granted explicitly above.
@@ -1277,7 +1409,7 @@ async def test_session_creator_gets_manage_grant(
         user="owner",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     # Exactly one grant: the creator with owner level.
     assert len(grants) == 1, (
         f"Expected exactly 1 auto-grant on a fresh session, "
@@ -1328,7 +1460,7 @@ async def test_grant_upgrade_via_upsert(
         session_id,
         user="user-a",
     )
-    grant_map = {g["user_id"]: g["level"] for g in resp.json()}
+    grant_map = {g["user_id"]: g["level"] for g in resp.json()["permissions"]}
     assert grant_map["user-b"] == LEVEL_MANAGE, (
         "After upgrade, user-b should have manage level in the store."
     )
@@ -1404,7 +1536,7 @@ async def test_no_header_defaults_to_local_user_in_single_user_mode(
         user=None,
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     assert any(g["user_id"] == "local" and g["level"] == LEVEL_OWNER for g in grants), (
         "The 'local' user (default from missing header) should have "
         "an owner auto-grant on the created session."
@@ -1799,7 +1931,7 @@ async def test_owner_grant_is_immutable(
         user="bryan",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     assert grant_map == {"bryan": LEVEL_OWNER, "corey": LEVEL_MANAGE}, (
         f"Expected bryan=owner(4) and corey=manage(3), got {grant_map}."
@@ -2531,14 +2663,18 @@ async def test_read_only_collaborator_can_fork_and_owns_the_fork(
     # Fork: corey owns it, bryan has no grant on it.
     fork_perms = {
         p["user_id"]: p["level"]
-        for p in (await _list_permissions(auth_client, fork_id, user="corey")).json()
+        for p in (await _list_permissions(auth_client, fork_id, user="corey")).json()[
+            "permissions"
+        ]
     }
     assert fork_perms == {"corey": LEVEL_OWNER}
 
     # Source grants unchanged by the fork.
     src_perms = {
         p["user_id"]: p["level"]
-        for p in (await _list_permissions(auth_client, source_id, user="bryan")).json()
+        for p in (await _list_permissions(auth_client, source_id, user="bryan")).json()[
+            "permissions"
+        ]
     }
     assert src_perms == {"bryan": LEVEL_OWNER, "corey": LEVEL_READ}
 

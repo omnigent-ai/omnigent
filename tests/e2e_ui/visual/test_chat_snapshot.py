@@ -61,7 +61,7 @@ _AGENTS_BODY = {
             "name": _AGENT_NAME,
             "display_name": "Claude Code",
             "description": "Anthropic's coding agent",
-            "harness": None,
+            "harness": "claude",
             "skills": [],
         }
     ]
@@ -115,6 +115,21 @@ _ITEMS_BODY = {
     "last_id": "msg_user",
     "has_more": False,
 }
+# Claude-native launch catalog, mirroring the model-picker e2e. The
+# ``omnigent.wrapper`` label below is what makes the composer render the config
+# gear (modelPickerKind="claude") + its read-only model/effort label, so the
+# baseline actually captures that surface. ``llm_model`` binds Sonnet 5 as the
+# resolved model so the label reads a friendly name.
+_MODEL_OPTIONS = [
+    {"id": "opus", "model": "system.ai.claude-opus-4-10", "displayName": "Opus 4.10"},
+    {
+        "id": "sonnet",
+        "model": "system.ai.claude-sonnet-5",
+        "displayName": "Sonnet 5",
+        "isDefault": True,
+    },
+    {"id": "haiku", "model": "system.ai.claude-haiku-4-5", "displayName": "Haiku 4.5"},
+]
 _SESSION_BODY = {
     "id": _SESSION_ID,
     "agent_id": _AGENT_ID,
@@ -122,13 +137,18 @@ _SESSION_BODY = {
     "status": "idle",
     "created_at": 1704067200,
     "updated_at": 1704067200,
+    # claude-native wrapper: drives the composer gear + model/effort label.
+    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+    "harness": "claude",
+    "llm_model": "system.ai.claude-sonnet-5",
+    "model_options": _MODEL_OPTIONS,
 }
 _AGENT_BODY = {
     "id": _AGENT_ID,
     "object": "agent",
     "name": _AGENT_NAME,
     "description": "Anthropic's coding agent",
-    "harness": None,
+    "harness": "claude",
     "mcp_servers": [],
     "policies": [],
     "terminals": [],
@@ -192,6 +212,11 @@ def test_chat_conversation_matches_baseline(
     expect(page.locator(f'{_BUBBLE}[data-role="assistant"]')).to_be_visible(timeout=30_000)
     # No live turn is in flight, so the working shimmer must be absent.
     expect(page.locator('[data-testid="working-indicator"]')).to_have_count(0)
+    # The claude-native wrapper labels drive the composer config gear + its
+    # read-only model/effort label; wait for both so the capture includes them
+    # (they hydrate from the same session snapshot the bubbles above wait on).
+    expect(page.locator('[data-testid="composer-config-gear"]')).to_be_visible(timeout=30_000)
+    expect(page.locator('[data-testid="composer-model-effort-label"]')).to_be_visible()
 
     # Shiki loads lazily: the colored token spans mount a frame after the block
     # first paints raw. Wait until the tokens resolve more than one distinct

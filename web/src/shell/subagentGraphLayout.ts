@@ -1,14 +1,8 @@
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
+import { childStatus, type AgentActivity } from "./subagentStatus";
 
-export type AgentActivity =
-  | "launching"
-  | "working"
-  | "awaiting"
-  | "done"
-  | "failed"
-  | "idle"
-  | "other";
+export type { AgentActivity };
 
 export interface AgentNodeData {
   label: string;
@@ -51,16 +45,8 @@ const HORIZONTAL_GAP = 40;
 const VERTICAL_GAP = 30;
 
 export function childActivity(child: ChildSessionInfo): { activity: AgentActivity; label: string } {
-  if (child.pending_elicitations_count > 0)
-    return { activity: "awaiting", label: "Needs response" };
-  if (child.current_task_status === "launching")
-    return { activity: "launching", label: "Launching" };
-  if (child.busy) return { activity: "working", label: "Working" };
-  if (child.last_task_error) return { activity: "failed", label: "Failed" };
-  if (child.current_task_status === "failed") return { activity: "failed", label: "Failed" };
-  if (child.current_task_status === "completed") return { activity: "done", label: "Done" };
-  if (child.current_task_status) return { activity: "other", label: child.current_task_status };
-  return { activity: "idle", label: "Idle" };
+  const status = childStatus(child);
+  return { activity: status.activity, label: status.label };
 }
 
 const edgeDefaults = {

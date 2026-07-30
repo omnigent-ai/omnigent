@@ -1389,6 +1389,8 @@ def test_build_spawn_env_applies_model_override(
         "    anthropic:\n"
         "      base_url: https://api.anthropic.com\n"
         "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
     )
     spec = AgentSpec(
         spec_version=1,
@@ -1430,6 +1432,8 @@ async def test_resolve_harness_config_applies_harness_override(
         "    anthropic:\n"
         "      base_url: https://api.anthropic.com\n"
         "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
     )
     spec = AgentSpec(
         spec_version=1,
@@ -2508,6 +2512,75 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
     assert session_inbox.empty()
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected_error"),
+    [
+        ("{", "malformed JSON arguments"),
+        ("", "malformed JSON arguments"),
+        ("   ", "malformed JSON arguments"),
+        ("[]", "arguments must be a JSON object"),
+        ("42", "arguments must be a JSON object"),
+        ("null", "arguments must be a JSON object"),
+        ('"scalar"', "arguments must be a JSON object"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_tool_rejects_non_object_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: str,
+    expected_error: str,
+) -> None:
+    """
+    Malformed or non-object argument payloads fail before tool dispatch.
+
+    A silent ``{}`` substitution would run a default/no-argument system
+    tool after bad input; the shared parser must reject these shapes and
+    the underlying OS-env handler must never be entered.
+    """
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    calls: list[object] = []
+
+    async def _spy_os_env_tool(*args: object, **kwargs: object) -> str:
+        calls.append((args, kwargs))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _spy_os_env_tool)
+
+    output = await execute_tool(tool_name="sys_os_read", arguments=arguments)
+
+    assert json.loads(output) == {"error": expected_error}
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_accepts_empty_object_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid ``{}`` still reaches the tool with an empty argument dict."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    calls: list[dict[str, Any]] = []
+
+    async def _spy_os_env_tool(
+        tool_name: str,
+        args: dict[str, Any],
+        **_kwargs: object,
+    ) -> str:
+        del tool_name
+        calls.append(args)
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _spy_os_env_tool)
+
+    output = await execute_tool(tool_name="sys_os_read", arguments="{}")
+
+    assert json.loads(output) == {"ok": True}
+    assert calls == [{}]
+
+
 # ── End-to-end with real harness subprocess + real LLM ──
 
 
@@ -2709,6 +2782,11 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         nonlocal create_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "bob@example.com"}},
+            )
         if (
             request.method == "GET"
             and request.url.path == "/v1/sessions/conv_parent/child_sessions"
@@ -2763,10 +2841,139 @@ async def test_sys_session_send_reuses_existing_child_session(
     assert payload["conversation_id"] == "conv_existing"
     assert payload["status"] == "launching"
     assert "continued ok" not in payload["message"]
+    assert event_posts[0]["created_by"] == "bob@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "continue"
     assert published[-1]["type"] == "session.child_session.updated"
     assert published[-1]["child"]["current_task_status"] == "launching"
     assert published[-1]["child"]["busy"] is False
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_named_child_retries_without_rejected_actor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing runner token cannot make new-child dispatch teardown the child."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    delete_posts = 0
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal delete_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_retry":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "bob@example.com"}},
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_retry/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(201, json={"id": "conv_child_retry"})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child_retry/events":
+            event_posts.append(json.loads(request.content))
+            if len(event_posts) == 1:
+                return httpx.Response(403, json={"error": "created_by rejected"})
+            return httpx.Response(202, json={"queued": True})
+        if request.method == "DELETE" and request.url.path == "/v1/sessions/conv_child_retry":
+            delete_posts += 1
+            return httpx.Response(204)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"agent": "worker", "title": "retry", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_retry",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_retry")
+            runner_app._session_inboxes_ref.pop("conv_parent_retry", None)
+
+    payload = json.loads(output)
+    assert payload["conversation_id"] == "conv_child_retry"
+    assert payload["status"] == "launching"
+    assert len(event_posts) == 2
+    assert event_posts[0]["created_by"] == "bob@example.com"
+    assert "created_by" not in event_posts[1]
+    assert delete_posts == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_existing_child_retries_without_rejected_actor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing runner token cannot make existing-child dispatch fail closed."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_existing":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "bob@example.com"}},
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_existing_retry":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_existing_retry",
+                    "parent_session_id": "conv_parent_existing",
+                    "title": "worker:retry",
+                },
+            )
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_existing_retry/events"
+        ):
+            event_posts.append(json.loads(request.content))
+            if len(event_posts) == 1:
+                return httpx.Response(403, json={"error": "created_by rejected"})
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_existing_retry", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_existing",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_existing_retry")
+            runner_app._session_inboxes_ref.pop("conv_parent_existing", None)
+
+    payload = json.loads(output)
+    assert payload["conversation_id"] == "conv_existing_retry"
+    assert payload["status"] == "launching"
+    assert len(event_posts) == 2
+    assert event_posts[0]["created_by"] == "bob@example.com"
+    assert "created_by" not in event_posts[1]
 
 
 def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
@@ -3630,6 +3837,7 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
     # exact ids an orchestrator may pass back as args.model.
     assert [m["id"] for m in worker["models"]] == [
         "claude-fable-5",
+        "claude-opus-5",
         "claude-opus-4-8",
         "claude-sonnet-5",
         "claude-sonnet-4-6",
@@ -7118,6 +7326,59 @@ async def test_approval_event_without_content_flattened() -> None:
     assert resp.status_code == 204
     assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
     ApprovalEvent.model_validate(captured["body"])
+
+
+@pytest.mark.asyncio
+async def test_spawn_handle_round_trips_to_sys_cancel_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawned handle can be passed directly to ``sys_cancel_async``."""
+    from omnigent.runner import tool_dispatch
+
+    async def _slow(**_kw: Any) -> str:
+        await asyncio.sleep(30)
+        return "late"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _slow)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    spawn_kw: dict[str, Any] = {
+        "server_client": None,
+        "terminal_registry": None,
+        "resource_registry": None,
+        "agent_spec": None,
+        "conversation_id": "conv_roundtrip",
+        "task_id": None,
+        "agent_id": None,
+        "agent_name": None,
+        "runner_workspace": None,
+        "mcp_manager": None,
+        "filesystem_registry": None,
+    }
+    handle_raw = tool_dispatch._spawn_async_tool(
+        {"tool": "slow", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    handle = json.loads(handle_raw)
+    assert handle["task_id"] == handle["handle_id"]
+    assert handle["status"] == "in_progress"
+    assert "sys_cancel_async" in handle["message"]
+    assert f"handle_id={handle['handle_id']!r}" in handle["message"]
+
+    bg_task, _evt = tasks[handle["handle_id"]]
+    cancel_raw = tool_dispatch._cancel_async_tool(
+        {"handle_id": handle["handle_id"]},
+        session_async_tasks=tasks,
+    )
+    assert json.loads(cancel_raw) == {
+        "cancelled": True,
+        "handle_id": handle["handle_id"],
+    }
+
+    await bg_task
+    assert inbox.get_nowait()["status"] == "cancelled"
 
 
 @pytest.mark.asyncio
