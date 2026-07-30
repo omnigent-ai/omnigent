@@ -145,6 +145,19 @@ The remaining exact compatibility exclusions in smart routing are temporary
 wire-API workarounds. They stay isolated until catalog wire metadata can express
 the affected harness constraints without model-name checks.
 
+## Context Window Migration
+
+Context sizing and pricing now share the onboarding/model-resolver MLflow
+catalog cache. Stable family patterns locate a bounded provider catalog, while
+provider-qualified and vendor-namespaced ids route directly to their catalog
+source. Exact catalog metadata wins; family-prefix matches are accepted only
+when every candidate agrees on the requested field.
+
+The stale exact-id Qwen window table and duplicate catalog downloader are gone.
+An explicit Anthropic `[1m]` marker remains self-describing metadata, and an
+uncatalogued/offline model keeps the conservative 128K fallback rather than a
+release-specific guess.
+
 ## Kiro Picker Migration
 
 The Kiro Web picker now runs `kiro-cli chat --list-models --format json` on the

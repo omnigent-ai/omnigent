@@ -9,6 +9,7 @@ from omnigent.onboarding.providers import (
     ModelInfo,
     ProviderConfig,
     default_chat_model,
+    find_catalog_models,
     get_all_providers,
     get_chat_models,
     get_models,
@@ -25,6 +26,12 @@ _FAKE_CATALOG: dict[str, dict] = {
                 "mode": "chat",
                 "capabilities": {"function_calling": True},
                 "context_window": {"max_input": 200000, "max_output": 32000},
+                "pricing": {
+                    "input_per_million_tokens": 15.0,
+                    "output_per_million_tokens": 75.0,
+                    "cache_read_per_million_tokens": 1.5,
+                    "cache_write_per_million_tokens": 18.75,
+                },
             },
             "claude-sonnet-4-6": {
                 "mode": "chat",
@@ -78,6 +85,16 @@ _FAKE_CATALOG: dict[str, dict] = {
                 "capabilities": {"function_calling": True},
                 "context_window": {"max_input": 128000, "max_output": 16384},
             },
+            "qwen/qwen3-coder": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 262100, "max_output": 262100},
+            },
+            "qwen/qwen3-coder-plus": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 997952, "max_output": 65536},
+            },
         }
     },
     "gemini": {
@@ -90,6 +107,8 @@ _FAKE_CATALOG: dict[str, dict] = {
         }
     },
 }
+
+_REAL_FETCH_PROVIDER_CATALOG = _providers_mod._fetch_provider_catalog
 
 
 @pytest.fixture(autouse=True)
@@ -178,6 +197,75 @@ def test_get_models_anthropic_returns_models() -> None:
         assert m.provider == "anthropic", (
             f"Model {m.name!r} has provider={m.provider!r}, expected 'anthropic'."
         )
+
+
+def test_get_models_preserves_context_and_cache_pricing_metadata() -> None:
+    """Shared model metadata includes fields needed by sizing and cost callers."""
+    model = next(model for model in get_models("anthropic") if model.name == "claude-opus-4-8")
+
+    assert model.max_input_tokens == 200000
+    assert model.max_output_tokens == 32000
+    assert model.input_price == 15.0
+    assert model.output_price == 75.0
+    assert model.cache_read_price == 1.5
+    assert model.cache_write_price == 18.75
+
+
+@pytest.mark.parametrize(
+    ("model_id", "provider", "name"),
+    [
+        ("anthropic/claude-opus-4-8", "anthropic", "claude-opus-4-8"),
+        ("ANTHROPIC/CLAUDE-OPUS-4-8", "anthropic", "claude-opus-4-8"),
+        ("claude-opus-4-8", "anthropic", "claude-opus-4-8"),
+        ("qwen/qwen3-coder", "openrouter", "qwen/qwen3-coder"),
+        ("qwen3-coder", "openrouter", "qwen/qwen3-coder"),
+        ("databricks-claude-opus-4-8", "anthropic", "claude-opus-4-8"),
+        ("databricks/databricks-claude-opus-4-8", "anthropic", "claude-opus-4-8"),
+        ("DATABRICKS-CLAUDE-OPUS-4-8", "anthropic", "claude-opus-4-8"),
+    ],
+)
+def test_find_catalog_models_resolves_provider_and_vendor_namespaces(
+    model_id: str,
+    provider: str,
+    name: str,
+) -> None:
+    """Catalog lookup uses provider metadata without exact release mappings."""
+    matches = find_catalog_models(model_id)
+
+    assert [(match.provider, match.name) for match in matches] == [(provider, name)]
+
+
+def test_find_catalog_models_matches_vendor_namespaced_families() -> None:
+    """OpenRouter family fallback preserves the vendor namespace."""
+    matches = find_catalog_models("qwen/qwen3-coder-new")
+
+    assert [(match.provider, match.name) for match in matches] == [
+        ("openrouter", "qwen/qwen3-coder"),
+        ("openrouter", "qwen/qwen3-coder-plus"),
+    ]
+
+
+def test_shared_provider_catalog_caches_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared TTL cache absorbs repeated lookups, including failures."""
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    _providers_mod._catalog_cache.clear()
+    calls: list[str] = []
+
+    def _download(provider: str) -> dict | None:
+        calls.append(provider)
+        if provider == "anthropic":
+            return _FAKE_CATALOG[provider]
+        return None
+
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", _download)
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    assert _REAL_FETCH_PROVIDER_CATALOG("xai") == {}
+    assert _REAL_FETCH_PROVIDER_CATALOG("xai") == {}
+    assert calls == ["anthropic", "xai"]
 
 
 def test_get_chat_models_filters_to_chat_mode() -> None:
