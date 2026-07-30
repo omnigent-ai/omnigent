@@ -2425,6 +2425,7 @@ def create_app(
         app.include_router(
             create_projects_router(
                 project_store=project_store,
+                conversation_store=conversation_store,
                 auth_provider=auth_provider,
             ),
             prefix="/v1",

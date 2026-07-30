@@ -4405,6 +4405,120 @@ def test_add_daily_cost_stacks_after_ask_approved(
     assert state["ask_approved_usd"] == pytest.approx(2.0)
 
 
+# ── Project monthly cost (PLAN.md, closes #1662) ───────────
+
+
+def test_get_project_monthly_cost_state_missing_returns_zeros(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A (project, month) with no row reads as zeros for both fields."""
+    state = conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")
+    assert state == {"cost_usd": 0.0, "ask_approved_usd": 0.0}
+
+
+def test_add_project_monthly_cost_accumulates(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Repeated adds for the same (project, month) sum into one total."""
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 5.0)
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 3.0)
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 8.0)
+
+    state = conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")
+    # 5.0 + 3.0 + 8.0 = 16.0 proves each delta was added, not overwritten.
+    assert state["cost_usd"] == pytest.approx(16.0)
+
+
+def test_add_project_monthly_cost_isolated_by_project_and_month(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Spend is partitioned by both project and UTC month; no cross-bleed."""
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 10.0)
+    conversation_store.add_project_monthly_cost("proj_1", "2026-07", 4.0)
+    conversation_store.add_project_monthly_cost("proj_2", "2026-06", 20.0)
+
+    # Same project, different month: only that month's delta.
+    assert conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")[
+        "cost_usd"
+    ] == pytest.approx(10.0)
+    assert conversation_store.get_project_monthly_cost_state("proj_1", "2026-07")[
+        "cost_usd"
+    ] == pytest.approx(4.0)
+    # Different project, same month: isolated from proj_1.
+    assert conversation_store.get_project_monthly_cost_state("proj_2", "2026-06")[
+        "cost_usd"
+    ] == pytest.approx(20.0)
+
+
+def test_add_project_monthly_cost_nonpositive_is_noop(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``delta <= 0`` never creates or mutates a row."""
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 0.0)
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", -1.0)
+    assert conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")[
+        "cost_usd"
+    ] == 0.0
+
+    # A subsequent positive add still works and isn't polluted by the no-ops.
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 2.5)
+    assert conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")[
+        "cost_usd"
+    ] == pytest.approx(2.5)
+
+
+def test_set_project_monthly_ask_approved_does_not_clobber_cost(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Recording an approved checkpoint leaves accumulated cost intact."""
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 30.0)
+    conversation_store.set_project_monthly_ask_approved("proj_1", "2026-06", 20.0)
+
+    state = conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")
+    # cost must survive the approval write (set touches only ask_approved_usd);
+    # if it dropped to 0 the UPSERT wrongly overwrote cost_usd.
+    assert state["cost_usd"] == pytest.approx(30.0)
+    assert state["ask_approved_usd"] == pytest.approx(20.0)
+
+
+def test_add_project_monthly_cost_does_not_clobber_ask_approved(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Accumulating cost after an approval leaves the approval intact."""
+    conversation_store.set_project_monthly_ask_approved("proj_1", "2026-06", 20.0)
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 15.0)
+
+    state = conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")
+    # The increment UPSERT must only touch cost_usd; ask_approved survives.
+    assert state["cost_usd"] == pytest.approx(15.0)
+    assert state["ask_approved_usd"] == pytest.approx(20.0)
+
+
+def test_set_project_monthly_ask_approved_creates_row_when_absent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Approving with no prior row inserts a cost=0 row carrying the approval."""
+    conversation_store.set_project_monthly_ask_approved("proj_1", "2026-06", 5.0)
+    state = conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")
+    assert state["cost_usd"] == 0.0
+    assert state["ask_approved_usd"] == pytest.approx(5.0)
+
+
+def test_add_project_monthly_cost_stacks_after_ask_approved(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Cost increments stack (not overwrite) even after an approval is set."""
+    conversation_store.set_project_monthly_ask_approved("proj_1", "2026-06", 20.0)
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 15.0)
+    conversation_store.add_project_monthly_cost("proj_1", "2026-06", 10.0)
+
+    state = conversation_store.get_project_monthly_cost_state("proj_1", "2026-06")
+    # 15.0 + 10.0 proves the second add incremented rather than overwrote;
+    # ask_approved untouched throughout.
+    assert state["cost_usd"] == pytest.approx(25.0)
+    assert state["ask_approved_usd"] == pytest.approx(20.0)
+
+
 # ── set_session_state ─────────────────────────────────────────────────────
 
 

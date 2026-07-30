@@ -93,6 +93,7 @@ def _to_entity(row: SqlProject) -> Project:
         created_at=row.created_at,
         updated_at=row.updated_at,
         config=_decode_config(row.config),
+        budget_config=_decode_config(row.budget_config),
     )
 
 
@@ -154,6 +155,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         name: str,
         owner_user_id: str | None,
         config: dict[str, Any] | None = None,
+        budget_config: dict[str, Any] | None = None,
     ) -> Project:
         """Insert a new, empty project.
 
@@ -178,6 +180,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 created_at=now_epoch(),
                 updated_at=None,
                 config=_encode_config(config),
+                budget_config=_encode_config(budget_config),
             )
             session.add(row)
             try:
@@ -199,6 +202,12 @@ class SqlAlchemyProjectStore(ProjectStore):
                 return None
             return _to_entity(row)
 
+    def get_by_id(self, project_id: str) -> Project | None:
+        """Return a project by id with no owner check, or ``None`` if not found."""
+        with self._session() as session:
+            row = session.get(SqlProject, (current_workspace_id(), project_id))
+            return _to_entity(row) if row is not None else None
+
     def list(self, *, owner_user_id: str | None) -> list[Project]:
         """List the owner's projects ordered by ``created_at ASC, id ASC``."""
         with self._session() as session:
@@ -218,12 +227,14 @@ class SqlAlchemyProjectStore(ProjectStore):
         owner_user_id: str | None,
         name: str | None = None,
         config: dict[str, Any] | None = None,
+        budget_config: dict[str, Any] | None = None,
     ) -> Project | None:
         """Update mutable fields of an owned project.
 
         ``None`` leaves a field unchanged. Returns ``None`` if the project does
-        not exist or is not owned by ``owner_user_id``. A ``config`` of ``{}``
-        clears the stored defaults (distinct from ``None`` = leave unchanged).
+        not exist or is not owned by ``owner_user_id``. A ``config``/
+        ``budget_config`` of ``{}`` clears the stored value (distinct from
+        ``None`` = leave unchanged).
         """
         with self._session() as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
@@ -244,6 +255,11 @@ class SqlAlchemyProjectStore(ProjectStore):
                 encoded = _encode_config(config)
                 if row.config != encoded:
                     row.config = encoded
+                    changed = True
+            if budget_config is not None:
+                encoded_budget = _encode_config(budget_config)
+                if row.budget_config != encoded_budget:
+                    row.budget_config = encoded_budget
                     changed = True
             if changed:
                 row.updated_at = now_epoch()

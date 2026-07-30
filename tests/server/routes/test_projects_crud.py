@@ -193,6 +193,126 @@ async def test_patch_empty_config_clears_it(project_client: httpx.AsyncClient) -
     assert resp.json()["config"] == {}
 
 
+async def test_create_defaults_to_empty_budget_config(project_client: httpx.AsyncClient) -> None:
+    """A project created without a budget_config field reports an empty one."""
+    body = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    assert body["budget_config"] == {}
+
+
+async def test_create_and_get_roundtrips_budget_config(project_client: httpx.AsyncClient) -> None:
+    """A budget_config passed on create round-trips through create + get."""
+    budget = {"limit_usd": 50.0, "ask_thresholds_usd": [25.0]}
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "Budgeted", "budget_config": budget}
+        )
+    ).json()
+    assert created["budget_config"] == budget
+    fetched = (await project_client.get(f"/v1/projects/{created['id']}")).json()
+    assert fetched["budget_config"] == budget
+
+
+async def test_create_budget_config_invalid_limit_rejected(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """A non-positive limit_usd is rejected with 422, not silently stored."""
+    resp = await project_client.post(
+        "/v1/projects", json={"name": "Bad", "budget_config": {"limit_usd": -5.0}}
+    )
+    assert resp.status_code == 422
+
+    resp_zero = await project_client.post(
+        "/v1/projects", json={"name": "BadZero", "budget_config": {"limit_usd": 0}}
+    )
+    assert resp_zero.status_code == 422
+
+
+async def test_create_budget_config_threshold_out_of_range_rejected(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """A threshold not in ``(0, limit_usd)`` is rejected with 422."""
+    resp = await project_client.post(
+        "/v1/projects",
+        json={"name": "Bad", "budget_config": {"limit_usd": 10.0, "ask_thresholds_usd": [10.0]}},
+    )
+    assert resp.status_code == 422
+
+
+async def test_patch_replaces_budget_config(project_client: httpx.AsyncClient) -> None:
+    """PATCH with a new budget_config replaces the stored one and stamps updated_at."""
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "budget_config": {"limit_usd": 10.0}}
+        )
+    ).json()
+    resp = await project_client.patch(
+        f"/v1/projects/{created['id']}", json={"budget_config": {"limit_usd": 20.0}}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["budget_config"] == {"limit_usd": 20.0}
+    assert body["updated_at"] is not None
+
+
+async def test_patch_without_budget_config_preserves_it(project_client: httpx.AsyncClient) -> None:
+    """A PATCH that omits budget_config (e.g. a rename) leaves it intact."""
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "budget_config": {"limit_usd": 10.0}}
+        )
+    ).json()
+    renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "P2"})
+    assert renamed.json()["budget_config"] == {"limit_usd": 10.0}
+
+
+async def test_patch_empty_budget_config_clears_it(project_client: httpx.AsyncClient) -> None:
+    """PATCH with budget_config={} clears the budget (distinct from omitting)."""
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "budget_config": {"limit_usd": 10.0}}
+        )
+    ).json()
+    resp = await project_client.patch(f"/v1/projects/{created['id']}", json={"budget_config": {}})
+    assert resp.json()["budget_config"] == {}
+
+
+async def test_get_budget_report_unlimited_project(project_client: httpx.AsyncClient) -> None:
+    """A project with no budget_config reports limit_usd: None but still reports spend."""
+    created = (await project_client.post("/v1/projects", json={"name": "Unlimited"})).json()
+    resp = await project_client.get(f"/v1/projects/{created['id']}/budget")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "project.budget"
+    assert body["limit_usd"] is None
+    assert body["ask_thresholds_usd"] == []
+    assert body["spend_usd"] == 0.0
+    assert len(body["month_utc"]) == 7  # "YYYY-MM"
+
+
+async def test_get_budget_report_configured_project(project_client: httpx.AsyncClient) -> None:
+    """A project's budget report surfaces its configured limit and thresholds."""
+    created = (
+        await project_client.post(
+            "/v1/projects",
+            json={
+                "name": "Budgeted",
+                "budget_config": {"limit_usd": 50.0, "ask_thresholds_usd": [25.0]},
+            },
+        )
+    ).json()
+    resp = await project_client.get(f"/v1/projects/{created['id']}/budget")
+    body = resp.json()
+    assert body["limit_usd"] == 50.0
+    assert body["ask_thresholds_usd"] == [25.0]
+    assert body["spend_usd"] == 0.0
+
+
+async def test_get_budget_missing_project_404(project_client: httpx.AsyncClient) -> None:
+    """The budget report 404s for an unknown/unowned project, like the other routes."""
+    resp = await project_client.get(f"/v1/projects/{'0' * 32}/budget")
+    assert resp.status_code == 404
+
+
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     """DELETE removes the project; a second delete 404s."""
     created = (await project_client.post("/v1/projects", json={"name": "Doomed"})).json()
@@ -304,6 +424,29 @@ async def test_cannot_get_another_users_project(
     # The owner still sees it.
     assert (
         await multi_user_client.get(f"/v1/projects/{created['id']}", headers=_as_user(BOB))
+    ).status_code == 200
+
+
+async def test_cannot_get_another_users_project_budget(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """Bob's budget report is 404 (not found), never readable, for Alice."""
+    created = (
+        await multi_user_client.post(
+            "/v1/projects",
+            json={"name": "Bob only", "budget_config": {"limit_usd": 10.0}},
+            headers=_as_user(BOB),
+        )
+    ).json()
+    resp = await multi_user_client.get(
+        f"/v1/projects/{created['id']}/budget", headers=_as_user(ALICE)
+    )
+    assert resp.status_code == 404
+    # The owner still sees it.
+    assert (
+        await multi_user_client.get(
+            f"/v1/projects/{created['id']}/budget", headers=_as_user(BOB)
+        )
     ).status_code == 200
 
 

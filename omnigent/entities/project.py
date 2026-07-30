@@ -32,6 +32,10 @@ class Project:
         empty dict when none are stored. The key vocabulary is owned by the
         client; the store persists and returns it whole. These are hints the
         new-chat dialog pre-fills, not enforced requirements.
+    :param budget_config: Optional monthly spend budget as an opaque JSON
+        object (``{"limit_usd": ..., "ask_thresholds_usd": [...]}``), or an
+        empty dict when no budget is configured (unlimited). Read by the
+        project monthly cost-budget policy (see ``PLAN.md``, closes #1662).
     """
 
     id: str
@@ -40,3 +44,4 @@ class Project:
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = field(default_factory=dict)
+    budget_config: dict[str, Any] = field(default_factory=dict)

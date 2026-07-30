@@ -30,8 +30,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
-import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
+import {
+  useProjectBudget,
+  useProjectConfig,
+  useUpdateProjectBudget,
+  useUpdateProjectConfig,
+} from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
@@ -39,7 +46,7 @@ import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
-import type { ProjectConfig } from "@/lib/projectsApi";
+import type { ProjectBudgetConfig, ProjectConfig } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
@@ -100,6 +107,15 @@ export function ProjectSettingsDialog({
   // never in this state.
   const loadFailed = projectId !== null && isError;
   const updateConfig = useUpdateProjectConfig();
+  // Budget: a label-only folder has no row, so no spend to report either —
+  // same "fetch only for a first-class project" gate as config above.
+  const {
+    data: budgetReport,
+    isLoading: isBudgetLoading,
+    isError: isBudgetError,
+  } = useProjectBudget(open ? projectId : null);
+  const budgetLoadFailed = projectId !== null && isBudgetError;
+  const updateBudget = useUpdateProjectBudget();
   const hosts = useHosts();
   const { data: agents } = useAvailableAgents();
   const info = useServerInfo();
@@ -119,6 +135,12 @@ export function ProjectSettingsDialog({
   const [useWorktree, setUseWorktree] = useState(false);
   const [agentId, setAgentId] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  // Budget draft: text inputs so an empty field unambiguously means "no
+  // limit / no warning" rather than coercing to 0, which the policy factory
+  // (and the update endpoint's own validation) would reject as <= 0.
+  const [limitUsd, setLimitUsd] = useState("");
+  const [askThresholdUsd, setAskThresholdUsd] = useState("");
+  const [budgetValidationError, setBudgetValidationError] = useState<string | null>(null);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
   // DialogContent, so their dismiss (pick an option / click the body while
@@ -165,11 +187,48 @@ export function ProjectSettingsDialog({
     setWorkspaceOpen(false);
   }, [open, stored, loadFailed]);
 
+  useEffect(() => {
+    if (!open || budgetLoadFailed) return;
+    setLimitUsd(budgetReport?.limit_usd != null ? String(budgetReport.limit_usd) : "");
+    // Only a single warning checkpoint is editable here (v1 of the budget
+    // UI); a budget saved with multiple thresholds (e.g. via the API
+    // directly) shows its lowest one and a save from this dialog collapses
+    // back to that single value.
+    const thresholds = budgetReport?.ask_thresholds_usd ?? [];
+    setAskThresholdUsd(thresholds.length > 0 ? String(Math.min(...thresholds)) : "");
+  }, [open, budgetReport, budgetLoadFailed]);
+
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    if (loadFailed || budgetLoadFailed) return;
+    setBudgetValidationError(null);
+
+    // Build budget_config from the two text inputs. An empty limit means "no
+    // budget" (`{}`), matching how an all-default config dialog clears to
+    // `{}` — validated client-side first so a typo doesn't round-trip to the
+    // server just to bounce back as a 422.
+    const trimmedLimit = limitUsd.trim();
+    let budgetConfig: ProjectBudgetConfig = {};
+    if (trimmedLimit !== "") {
+      const limit = Number(trimmedLimit);
+      if (!Number.isFinite(limit) || limit <= 0) {
+        setBudgetValidationError("Monthly limit must be a positive number.");
+        return;
+      }
+      budgetConfig = { limit_usd: limit };
+      const trimmedThreshold = askThresholdUsd.trim();
+      if (trimmedThreshold !== "") {
+        const threshold = Number(trimmedThreshold);
+        if (!Number.isFinite(threshold) || threshold <= 0 || threshold >= limit) {
+          setBudgetValidationError("Warning threshold must be a positive number below the limit.");
+          return;
+        }
+        budgetConfig.ask_thresholds_usd = [threshold];
+      }
+    }
+
     // Build the config from set fields only — an unset slot is an absent key,
     // so the whole object is `{}` when nothing is configured (the server treats
     // that as "clear the stored defaults").
@@ -186,9 +245,23 @@ export function ProjectSettingsDialog({
     // leaving it OFF stores nothing, so an all-default dialog still clears to {}.
     if (useWorktree) config.use_worktree = true;
 
+    // Sequenced, not parallel: both mutations independently promote a
+    // label-only folder (create a row when `projectId === null`) the same
+    // way `useUpdateProjectConfig` does. Firing them in parallel would race
+    // two `createProject` calls for the same name — the second loses to a
+    // 409. Saving config first and reusing ITS resolved id for the budget
+    // save (rather than the stale `projectId` closure) guarantees exactly
+    // one row is created either way.
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
-      { onSuccess: () => onOpenChange(false) },
+      {
+        onSuccess: (project) => {
+          updateBudget.mutate(
+            { id: project.id, name: projectName, budgetConfig },
+            { onSuccess: () => onOpenChange(false) },
+          );
+        },
+      },
     );
   };
 
@@ -416,6 +489,69 @@ export function ProjectSettingsDialog({
             </div>
           </Field>
 
+          <div className="flex flex-col gap-4 border-t pt-4">
+            <Field
+              label="Monthly budget"
+              hint="Cap this project's LLM spend for the calendar month (UTC)"
+              htmlFor="project-settings-budget-limit"
+            >
+              <div className="flex items-center gap-1.5">
+                <span className="text-muted-foreground text-sm">$</span>
+                <Input
+                  id="project-settings-budget-limit"
+                  data-testid="project-settings-budget-limit"
+                  type="number"
+                  step="any"
+                  inputMode="decimal"
+                  placeholder="No limit"
+                  value={limitUsd}
+                  onChange={(e) => setLimitUsd(e.target.value)}
+                  disabled={isBudgetLoading}
+                />
+              </div>
+            </Field>
+
+            {limitUsd.trim() !== "" && (
+              <Field
+                label="Warning at"
+                hint="Ask for confirmation once month-to-date spend crosses this — optional"
+                htmlFor="project-settings-budget-threshold"
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className="text-muted-foreground text-sm">$</span>
+                  <Input
+                    id="project-settings-budget-threshold"
+                    data-testid="project-settings-budget-threshold"
+                    type="number"
+                    step="any"
+                    inputMode="decimal"
+                    placeholder="No warning"
+                    value={askThresholdUsd}
+                    onChange={(e) => setAskThresholdUsd(e.target.value)}
+                    disabled={isBudgetLoading}
+                  />
+                </div>
+              </Field>
+            )}
+
+            {!budgetLoadFailed && budgetReport && (
+              <div className="flex flex-col gap-1.5" data-testid="project-settings-budget-report">
+                <div className="flex items-center justify-between text-muted-foreground text-xs">
+                  <span>Spent this month</span>
+                  <span>
+                    ${budgetReport.spend_usd.toFixed(2)}
+                    {budgetReport.limit_usd != null && ` / $${budgetReport.limit_usd.toFixed(2)}`}
+                  </span>
+                </div>
+                {budgetReport.limit_usd != null && budgetReport.limit_usd > 0 && (
+                  <Progress
+                    value={Math.min(100, (budgetReport.spend_usd / budgetReport.limit_usd) * 100)}
+                  />
+                )}
+              </div>
+            )}
+          </div>
+
           {loadFailed && (
             <p
               className="text-destructive text-sm"
@@ -426,9 +562,29 @@ export function ProjectSettingsDialog({
               disabled so your existing defaults aren't overwritten.
             </p>
           )}
+          {budgetLoadFailed && (
+            <p
+              className="text-destructive text-sm"
+              role="alert"
+              data-testid="project-settings-budget-load-error"
+            >
+              Couldn't load this project's budget. Close and reopen to try again — saving is
+              disabled so the existing budget isn't overwritten.
+            </p>
+          )}
+          {budgetValidationError && (
+            <p className="text-destructive text-sm" role="alert">
+              {budgetValidationError}
+            </p>
+          )}
           {updateConfig.isError && (
             <p className="text-destructive text-sm" role="alert">
               {(updateConfig.error as Error).message}
+            </p>
+          )}
+          {updateBudget.isError && (
+            <p className="text-destructive text-sm" role="alert">
+              {(updateBudget.error as Error).message}
             </p>
           )}
 
@@ -437,16 +593,23 @@ export function ProjectSettingsDialog({
               type="button"
               variant="ghost"
               onClick={() => onOpenChange(false)}
-              disabled={updateConfig.isPending}
+              disabled={updateConfig.isPending || updateBudget.isPending}
             >
               Cancel
             </Button>
             <Button
               type="submit"
               data-testid="project-settings-save"
-              disabled={updateConfig.isPending || isLoading || loadFailed}
+              disabled={
+                updateConfig.isPending ||
+                updateBudget.isPending ||
+                isLoading ||
+                isBudgetLoading ||
+                loadFailed ||
+                budgetLoadFailed
+              }
             >
-              {updateConfig.isPending ? "Saving…" : "Save"}
+              {updateConfig.isPending || updateBudget.isPending ? "Saving…" : "Save"}
             </Button>
           </DialogFooter>
         </form>

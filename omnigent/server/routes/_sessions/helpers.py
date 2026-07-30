@@ -72,6 +72,7 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
+    get_project_store,
     inflight_text,
     pending_elicitations,
     pending_inputs,
@@ -1705,13 +1706,52 @@ def _utc_day(epoch_seconds: int) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).date().isoformat()
 
 
+def _utc_month(epoch_seconds: int) -> str:
+    """
+    Convert a Unix epoch timestamp to its UTC calendar month.
+
+    :param epoch_seconds: Unix epoch seconds, e.g. ``1749081600``.
+    :returns: The UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime("%Y-%m")
+
+
+def _resolve_project_id(conv: Conversation, conversation_store: ConversationStore) -> str | None:
+    """
+    Resolve the project a turn's cost should be attributed to, if any.
+
+    Sub-agent conversations never carry ``project_id`` themselves — only
+    the top-level session a user explicitly files into a project does —
+    so a spawned child falls back to its spawn-tree root's
+    ``project_id``, mirroring the owner fallback in
+    :func:`_record_daily_cost`. This keeps sub-agent spend inside the
+    project monthly rollup instead of silently escaping it whenever the
+    parent session is filed into a budgeted project.
+
+    :param conv: The conversation row for the session that incurred the
+        cost.
+    :param conversation_store: Store for the root-session lookup.
+    :returns: The project id to attribute the cost to, or ``None`` when
+        the session (and its root, if a sub-agent) is unfiled.
+    """
+    if conv.project_id is not None:
+        return conv.project_id
+    if conv.root_conversation_id == conv.id:
+        return None
+    root = conversation_store.get_conversation(conv.root_conversation_id)
+    return root.project_id if root is not None else None
+
+
 def _record_daily_cost(
     conv: Conversation | None,
     delta_usd: float,
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Add a turn's LLM cost to the session owner's daily rollup.
+    Add a turn's LLM cost to the session owner's daily rollup, and to its
+    project's monthly rollup when the session is filed into one.
 
     A no-op when *delta_usd* is not positive or the session has no
     resolvable owner. Attributes the cost to the session creator
@@ -1736,11 +1776,16 @@ def _record_daily_cost(
     is attributed to the same user as the parent rather than silently
     dropped from the daily rollup.
 
+    The project monthly rollup (see :func:`_resolve_project_id`) uses the
+    same root-fallback idea for ``project_id`` and is skipped entirely
+    (no row ever created) when neither the session nor its root is filed
+    into a project.
+
     :param conv: The conversation row for the session, or ``None``
         (a no-op — no owner to attribute to).
     :param delta_usd: The turn's cost in USD; ``<= 0`` is a no-op.
-    :param conversation_store: Store for the owner lookup and the
-        daily-cost UPSERT.
+    :param conversation_store: Store for the owner/project lookups and
+        the daily-cost / monthly-cost UPSERTs.
     """
     if conv is None or delta_usd <= 0:
         return
@@ -1749,11 +1794,14 @@ def _record_daily_cost(
         # Sub-agent: no direct owner grant — fall back to the root session's
         # owner so sub-agent spend is attributed rather than silently dropped.
         owner = conversation_store.get_session_owner(conv.root_conversation_id)
-    if owner is None:
-        return
     from omnigent.db.utils import now_epoch
 
-    conversation_store.add_daily_cost(owner, _utc_day(now_epoch()), delta_usd)
+    now = now_epoch()
+    if owner is not None:
+        conversation_store.add_daily_cost(owner, _utc_day(now), delta_usd)
+    project_id = _resolve_project_id(conv, conversation_store)
+    if project_id is not None:
+        conversation_store.add_project_monthly_cost(project_id, _utc_month(now), delta_usd)
 
 
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
@@ -6317,6 +6365,7 @@ def _build_policy_engine_from_spec_impl(
         conversation_store=conversation_store,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
+        project_store=get_project_store(),
         server_llm=caps.llm,
         host_connection=host_connection,
     )
@@ -6771,7 +6820,12 @@ async def _evaluate_output_policy(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return None
-    if not spec.guardrails and not get_caps().default_policies and get_policy_store() is None:
+    if (
+        not spec.guardrails
+        and not get_caps().default_policies
+        and get_policy_store() is None
+        and get_project_store() is None
+    ):
         return None
 
     engine = await asyncio.to_thread(

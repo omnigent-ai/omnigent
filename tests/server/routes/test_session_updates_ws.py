@@ -861,3 +861,86 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
 
     # Sub-agent spend must appear in Alice's daily rollup via the root fallback.
     assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.75)
+
+
+# ── Project monthly cost rollup (PLAN.md, closes #1662) ──────────────────
+
+
+def test_project_monthly_cost_recorded_for_filed_session(app: FastAPI, stores) -> None:
+    """A turn on a session filed into a project rolls up into that project's
+    ``project_monthly_cost``, alongside (not instead of) the owner's daily cost."""
+    conversation_store, _agent_store, _permission_store = stores
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    sid = _seed_session(stores, owner=ALICE, title="filed session")
+    project_id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+    assert conversation_store.set_conversation_project(sid, project_id)
+
+    resp = TestClient(app).post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_session_usage", "data": {"cumulative_cost_usd": 1.5}},
+        headers={"X-Forwarded-Email": ALICE},
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert conversation_store.get_project_monthly_cost_state(project_id, month)[
+        "cost_usd"
+    ] == pytest.approx(1.5)
+    # The existing per-user daily rollup still fires too — the two are independent.
+    assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(1.5)
+
+
+def test_project_monthly_cost_not_recorded_for_unfiled_session(app: FastAPI, stores) -> None:
+    """A session with no ``project_id`` never creates a project_monthly_cost row."""
+    conversation_store, _agent_store, _permission_store = stores
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    sid = _seed_session(stores, owner=ALICE, title="unfiled session")
+
+    resp = TestClient(app).post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_session_usage", "data": {"cumulative_cost_usd": 3.0}},
+        headers={"X-Forwarded-Email": ALICE},
+    )
+    assert resp.status_code == 202, resp.text
+
+    # No project was ever filed — some_other_project must read as untouched zeros.
+    assert conversation_store.get_project_monthly_cost_state("some_other_project", month)[
+        "cost_usd"
+    ] == 0.0
+
+
+def test_project_monthly_cost_attributed_via_root_for_sub_agent(app: FastAPI, stores) -> None:
+    """Sub-agent spend rolls up into the ROOT session's project.
+
+    A sub-agent conversation never carries ``project_id`` itself (only a
+    user explicitly files a top-level session into a project) — this
+    mirrors ``test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant``
+    for the project rollup: the fix falls back to the spawn-tree root's
+    ``project_id`` when the child's own is unset, so sub-agent spend under a
+    budgeted project isn't silently dropped from the monthly total.
+    """
+    conversation_store, _agent_store, _permission_store = stores
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    parent_id = _seed_session(stores, owner=ALICE, title="parent session")
+    project_id = "f6a5b4c3d2e1f6a5b4c3d2e1f6a5b4c3"
+    assert conversation_store.set_conversation_project(parent_id, project_id)
+
+    child = conversation_store.create_conversation(
+        title="sub-agent",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        parent_conversation_id=parent_id,
+    )
+    # Sanity: the child itself carries no project_id (the gap being covered).
+    assert conversation_store.get_conversation(child.id).project_id is None
+
+    resp = TestClient(app).post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.4}},
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert conversation_store.get_project_monthly_cost_state(project_id, month)[
+        "cost_usd"
+    ] == pytest.approx(0.4)

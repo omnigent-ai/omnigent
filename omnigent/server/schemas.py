@@ -4286,6 +4286,45 @@ class SessionProjectSummary(BaseModel):
     name: str
 
 
+def _validate_project_budget_config(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Validate a project's ``budget_config`` shape, shared by create/update.
+
+    Mirrors the validation
+    :func:`omnigent.policies.builtins.cost.project_monthly_cost_budget`
+    itself applies at policy-build time, but at the API boundary so a
+    malformed budget is rejected immediately (422) rather than silently
+    never taking effect (the policy builder skips synthesis rather than
+    raising on a bad stored value — see
+    ``_load_project_budget_policy_specs`` — since a background workflow
+    build is the wrong place to surface a validation error to the user).
+
+    :param value: The raw ``budget_config`` from the request, or ``None`` /
+        ``{}`` (no budget / leave-unchanged / clear — callers distinguish
+        those, this only validates shape when a limit is present).
+    :returns: *value* unchanged, once validated.
+    :raises ValueError: If ``limit_usd`` is present but not a positive
+        number, or any ``ask_thresholds_usd`` entry is not in
+        ``(0, limit_usd)``.
+    """
+    if not value:
+        return value
+    limit_usd = value.get("limit_usd")
+    if limit_usd is None:
+        return value
+    if not isinstance(limit_usd, int | float) or isinstance(limit_usd, bool) or limit_usd <= 0:
+        raise ValueError(f"budget_config.limit_usd must be a positive number, got {limit_usd!r}")
+    thresholds = value.get("ask_thresholds_usd") or []
+    if not isinstance(thresholds, list):
+        raise ValueError("budget_config.ask_thresholds_usd must be a list of numbers")
+    for t in thresholds:
+        if not isinstance(t, int | float) or isinstance(t, bool) or not (0 < t < limit_usd):
+            raise ValueError(
+                "each budget_config.ask_thresholds_usd value must be a number in "
+                f"(0, limit_usd={limit_usd}), got {t!r}"
+            )
+    return value
+
+
 class CreateProjectRequest(BaseModel):
     """
     Request body for ``POST /v1/projects``.
@@ -4294,12 +4333,23 @@ class CreateProjectRequest(BaseModel):
         at most 100 characters; unique among the caller's projects.
     :param config: Optional default session settings (opaque JSON object).
         Omitted / empty stores no defaults.
+    :param budget_config: Optional monthly spend budget,
+        ``{"limit_usd": <float>, "ask_thresholds_usd": [<float>, ...]}``.
+        Omitted / empty means no budget (unlimited). See ``PLAN.md``,
+        closes #1662.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     config: dict[str, Any] = Field(default_factory=dict)
+    budget_config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("budget_config")
+    @classmethod
+    def _validate_budget_config(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Validate ``budget_config`` shape; see :func:`_validate_project_budget_config`."""
+        return _validate_project_budget_config(value) or {}
 
     @field_validator("name")
     @classmethod
@@ -4328,12 +4378,23 @@ class UpdateProjectRequest(BaseModel):
         trimmed, non-empty, at most 100 characters.
     :param config: New config object to replace the stored one. ``None`` leaves
         it unchanged; an empty object ``{}`` clears the stored defaults.
+    :param budget_config: New monthly budget object to replace the stored
+        one, ``{"limit_usd": <float>, "ask_thresholds_usd": [<float>, ...]}``.
+        ``None`` leaves it unchanged; an empty object ``{}`` clears the
+        budget (unlimited). See ``PLAN.md``, closes #1662.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
     config: dict[str, Any] | None = None
+    budget_config: dict[str, Any] | None = None
+
+    @field_validator("budget_config")
+    @classmethod
+    def _validate_budget_config(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Validate ``budget_config`` shape; see :func:`_validate_project_budget_config`."""
+        return _validate_project_budget_config(value)
 
     @field_validator("name")
     @classmethod

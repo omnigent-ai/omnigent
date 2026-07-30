@@ -36,6 +36,22 @@ export interface ProjectConfig {
   use_worktree?: boolean;
 }
 
+/**
+ * A project's optional monthly spend budget. Enforced by the
+ * `project_monthly_cost_budget` policy, synthesized automatically for any
+ * session filed into a project with a positive `limit_usd` — see
+ * `omnigent/policies/builtins/cost.py`, closes #1662. `{}` (both fields
+ * unset) means "no budget configured" (unlimited).
+ */
+export interface ProjectBudgetConfig {
+  /** Hard monthly limit in USD. Once month-to-date spend reaches this, the
+   *  project's sessions are gated onto cheaper models (not blocked outright)
+   *  until the owner raises the limit or the UTC month rolls over. */
+  limit_usd?: number;
+  /** Optional soft warning checkpoints in USD, each in `(0, limit_usd)`. */
+  ask_thresholds_usd?: number[];
+}
+
 /** A first-class project. Mirrors the `ProjectObject` response shape. */
 export interface Project {
   id: string;
@@ -46,6 +62,19 @@ export interface Project {
   updated_at?: number | null;
   /** Stored default session settings; `{}` when the project has none. */
   config?: ProjectConfig;
+  /** Stored monthly budget; `{}` when the project has none configured. */
+  budget_config?: ProjectBudgetConfig;
+}
+
+/** `GET /v1/projects/{id}/budget` response — config plus live spend. */
+export interface ProjectBudgetReport {
+  /** The configured monthly limit, or `null` when unlimited. */
+  limit_usd: number | null;
+  ask_thresholds_usd: number[];
+  /** Month-to-date spend in USD, reported even when unlimited. */
+  spend_usd: number;
+  /** The UTC calendar month this report covers, e.g. `"2026-07"`. */
+  month_utc: string;
 }
 
 interface ProjectListResponse {
@@ -112,6 +141,34 @@ export async function updateProjectConfig(id: string, config: ProjectConfig): Pr
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ config }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Project;
+}
+
+/** Fetch a project's budget config + current month-to-date spend. 404s if not owned. */
+export async function getProjectBudget(id: string): Promise<ProjectBudgetReport> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/budget`);
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as ProjectBudgetReport;
+}
+
+/**
+ * Replace a project's stored `budget_config`. Passing `{}` clears it (the
+ * server treats `{}` as "no budget configured" / unlimited, distinct from
+ * omitting the field, which leaves it unchanged). Only `budget_config` is
+ * sent, so the name and `config` are untouched. A `limit_usd` <= 0, or an
+ * `ask_thresholds_usd` entry outside `(0, limit_usd)`, is rejected with the
+ * server's 422 message.
+ */
+export async function updateProjectBudget(
+  id: string,
+  budgetConfig: ProjectBudgetConfig,
+): Promise<Project> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ budget_config: budgetConfig }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as Project;

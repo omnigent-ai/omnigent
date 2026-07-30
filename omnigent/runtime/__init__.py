@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     )
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
+    from omnigent.stores.project_store import ProjectStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
 
@@ -37,6 +38,7 @@ def init(
     artifact_store: ArtifactStore | None = None,
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
+    project_store: ProjectStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -61,6 +63,9 @@ def init(
     :param policy_store: The PolicyStore instance for
         session-scoped policies managed via the CRUD API.
         ``None`` when session policies are not configured.
+    :param project_store: The ProjectStore instance used to resolve a
+        project's ``budget_config`` when building a policy engine.
+        ``None`` when projects are not configured for this deployment.
     :param caps: Operator-configured execution ceiling.
         ``None`` uses :class:`RuntimeCaps` defaults.
     """
@@ -72,6 +77,7 @@ def init(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        project_store=project_store,
         caps=caps,
     )
 
@@ -154,6 +160,19 @@ def get_policy_store() -> PolicyStore | None:
     :returns: The PolicyStore set during :func:`init`, or ``None``.
     """
     return _globals._policy_store
+
+
+def get_project_store() -> ProjectStore | None:
+    """
+    Return the ProjectStore instance, or ``None`` if not configured.
+
+    Returns ``None`` (rather than raising) because project_store is
+    optional — the policy builder simply skips synthesizing a project
+    monthly cost-budget policy when no store is available.
+
+    :returns: The ProjectStore set during :func:`init`, or ``None``.
+    """
+    return _globals._project_store
 
 
 def get_agent_cache() -> AgentCache:

@@ -290,6 +290,117 @@ def test_decode_coerces_non_object_blob_to_empty(store: SqlAlchemyProjectStore) 
     assert got.config == {}
 
 
+# ── budget_config (monthly spend budget, PLAN.md, closes #1662) ─────────────
+
+
+def test_create_defaults_to_empty_budget_config(store: SqlAlchemyProjectStore) -> None:
+    """A project created without a budget reads back an empty dict (no limit)."""
+    project = store.create(_uid("p1"), "No Budget", "alice@example.com")
+    assert project.budget_config == {}
+    assert store.get(_uid("p1"), owner_user_id="alice@example.com").budget_config == {}
+
+
+def test_create_persists_budget_config(store: SqlAlchemyProjectStore) -> None:
+    """A budget_config passed to ``create`` round-trips through ``get``/``list``."""
+    budget = {"limit_usd": 50.0, "ask_thresholds_usd": [25.0]}
+    store.create(_uid("p1"), "Budgeted", "alice@example.com", budget_config=budget)
+    assert store.get(_uid("p1"), owner_user_id="alice@example.com").budget_config == budget
+    assert store.list(owner_user_id="alice@example.com")[0].budget_config == budget
+
+
+def test_config_and_budget_config_are_independent(store: SqlAlchemyProjectStore) -> None:
+    """Setting one of config/budget_config at create time never touches the other."""
+    project = store.create(
+        _uid("p1"),
+        "Both",
+        "alice@example.com",
+        config={"host_id": "h1"},
+        budget_config={"limit_usd": 10.0},
+    )
+    assert project.config == {"host_id": "h1"}
+    assert project.budget_config == {"limit_usd": 10.0}
+
+
+def test_update_replaces_budget_config_and_stamps_updated_at(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """Passing a new ``budget_config`` replaces the stored one and stamps updated_at."""
+    store.create(_uid("p1"), "P", "alice@example.com", budget_config={"limit_usd": 10.0})
+    updated = store.update(
+        _uid("p1"), owner_user_id="alice@example.com", budget_config={"limit_usd": 20.0}
+    )
+    assert updated is not None
+    assert updated.budget_config == {"limit_usd": 20.0}
+    assert updated.updated_at is not None
+
+
+def test_update_budget_config_none_leaves_it_unchanged(store: SqlAlchemyProjectStore) -> None:
+    """``budget_config=None`` (the default) leaves the stored budget untouched."""
+    store.create(_uid("p1"), "P", "alice@example.com", budget_config={"limit_usd": 10.0})
+    # Rename only — budget_config omitted — must not wipe the stored budget.
+    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", name="Renamed")
+    assert updated is not None
+    assert updated.budget_config == {"limit_usd": 10.0}
+
+
+def test_update_config_does_not_touch_budget_config(store: SqlAlchemyProjectStore) -> None:
+    """Updating ``config`` alone leaves an already-set ``budget_config`` intact."""
+    store.create(
+        _uid("p1"),
+        "P",
+        "alice@example.com",
+        config={"host_id": "old"},
+        budget_config={"limit_usd": 10.0},
+    )
+    updated = store.update(
+        _uid("p1"), owner_user_id="alice@example.com", config={"host_id": "new"}
+    )
+    assert updated is not None
+    assert updated.config == {"host_id": "new"}
+    assert updated.budget_config == {"limit_usd": 10.0}
+
+
+def test_update_empty_budget_config_clears_budget(store: SqlAlchemyProjectStore) -> None:
+    """An explicit ``budget_config={}`` clears the stored budget (unlimited)."""
+    store.create(_uid("p1"), "P", "alice@example.com", budget_config={"limit_usd": 10.0})
+    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", budget_config={})
+    assert updated is not None
+    assert updated.budget_config == {}
+    assert updated.updated_at is not None
+
+
+def test_update_same_budget_config_is_noop(store: SqlAlchemyProjectStore) -> None:
+    """Re-setting the identical budget_config changes nothing, leaving updated_at None."""
+    store.create(_uid("p1"), "P", "alice@example.com", budget_config={"limit_usd": 10.0})
+    updated = store.update(
+        _uid("p1"), owner_user_id="alice@example.com", budget_config={"limit_usd": 10.0}
+    )
+    assert updated is not None
+    assert updated.updated_at is None
+
+
+# ── get_by_id (internal, unscoped — PLAN.md, closes #1662) ──────────────────
+
+
+def test_get_by_id_returns_project_for_any_owner(store: SqlAlchemyProjectStore) -> None:
+    """Unlike ``get``, ``get_by_id`` needs no owner match to return the row.
+
+    This is the policy-builder's read path (build_policy_engine has no
+    authenticated caller to scope a request-shaped ``get`` to) — it must
+    resolve regardless of who owns the project.
+    """
+    store.create(_uid("p1"), "Alice's", "alice@example.com", budget_config={"limit_usd": 5.0})
+    got = store.get_by_id(_uid("p1"))
+    assert got is not None
+    assert got.owner_user_id == "alice@example.com"
+    assert got.budget_config == {"limit_usd": 5.0}
+
+
+def test_get_by_id_missing_returns_none(store: SqlAlchemyProjectStore) -> None:
+    """An unknown id returns ``None``, same as ``get``."""
+    assert store.get_by_id(_uid("nope")) is None
+
+
 # ── update ─────────────────────────────────────────────────────────────────
 
 

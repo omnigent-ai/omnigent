@@ -706,6 +706,12 @@ class SqlProject(OmnigentBase):
     # change. Stored values are hints the new-chat dialog pre-fills and the user
     # can always override.
     config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Optional monthly spend budget as a compact JSON object
+    # (``{"limit_usd": ..., "ask_thresholds_usd": [...]}) ``), or NULL for "no
+    # budget configured" (unlimited). Same opaque, whole-row JSON blob
+    # convention as ``config``. Read by the project monthly cost-budget
+    # policy; spend itself is tracked separately in ``project_monthly_cost``.
+    budget_config: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, owner_user_id) with
@@ -1351,6 +1357,56 @@ class SqlUserDailyCost(OmnigentBase):
     )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
+    updated_at: Mapped[int] = mapped_column(Integer)
+
+
+class SqlProjectMonthlyCost(OmnigentBase):
+    """
+    SQLAlchemy model for the ``project_monthly_cost`` table.
+
+    A running per-project, per-UTC-calendar-month rollup of LLM spend, used
+    by the project monthly cost-budget policy (see ``PLAN.md``, closes #1662)
+    to read a project's accumulated month-to-date cost as a single O(1) point
+    lookup, mirroring :class:`SqlUserDailyCost`.
+
+    One row per ``(workspace_id, project_id, month_utc)``. Incremented
+    (UPSERT ``cost_usd = cost_usd + delta``) at each turn boundary from the
+    same cost write sites as ``user_daily_cost`` — but only when the turn's
+    session resolves a ``project_id`` (directly, or via the spawn-tree root
+    for sub-agent sessions, which never carry ``project_id`` themselves) —
+    so the table is never touched for sessions unfiled from a project.
+
+    :param project_id: The project the cost is attributed to
+        (``SqlProject.id``, no DB foreign key — see ``SqlProject``'s
+        docstring on the no-FK convention for project membership).
+    :param month_utc: The UTC calendar month the spend occurred, as
+        ``"YYYY-MM"``, e.g. ``"2026-07"``. Bucketed by the turn's wall-clock
+        time, so a session spanning a month boundary splits its cost across
+        both months correctly.
+    :param cost_usd: Cumulative USD spend for this project in this month.
+    :param ask_approved_usd: Highest soft warning checkpoint (USD) the
+        project owner has already approved continuing past this month —
+        read and written by the project monthly cost-budget policy so an
+        approved checkpoint prompts at most once per month across all the
+        project's sessions. ``0.0`` (the server default) means no
+        checkpoint approved yet.
+    :param updated_at: Unix epoch seconds of the last increment.
+    """
+
+    __tablename__ = "project_monthly_cost"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    project_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    month_utc: Mapped[str] = mapped_column(String(7), primary_key=True)
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(Integer)
