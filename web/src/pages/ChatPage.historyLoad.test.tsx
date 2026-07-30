@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { Profiler } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { MAX_INITIAL_PAGES } from "@/lib/sessionsApi";
@@ -314,6 +315,7 @@ describe("LatestTurnSpacer", () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -381,6 +383,39 @@ describe("LatestTurnSpacer", () => {
 
     return parseFloat(spacer.style.height || "0");
   }
+
+  it("applies the initial height without a state-driven second render", () => {
+    class StubResizeObserver {
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const anchor = document.createElement("div");
+    anchor.dataset.role = "user";
+    scrollRoot.append(anchor);
+    vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(0));
+    vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLDivElement,
+    ) {
+      return this.getAttribute("aria-hidden") !== null ? rect(100) : rect(0);
+    });
+
+    const onRender = vi.fn();
+    const { container } = render(
+      <Profiler id="latest-turn-spacer" onRender={onRender}>
+        <LatestTurnSpacer />
+      </Profiler>,
+    );
+
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    expect(spacer.style.height).toBe("304px");
+    expect(onRender).toHaveBeenCalledTimes(1);
+  });
 
   it("pads a short reply so the anchor prompt pins to the top", () => {
     // anchor→end = 100px content, viewport 500 → spacer = 500 − 100 − 96 = 304.

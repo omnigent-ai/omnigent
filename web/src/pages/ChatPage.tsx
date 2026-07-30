@@ -2243,13 +2243,11 @@ export function LatestTurnSpacer() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
-  // Structural changes (new turn, prepend, conversation switch) flip block
-  // count; a streaming reply grows height without changing it, so the
-  // ResizeObserver below covers that (plus viewport resize and image/markdown
-  // reflow). Keying the measure on both keeps re-renders off the per-frame path.
+  // New turns and prepends change block count; conversation switches change
+  // history generation. Streaming growth is covered by the ResizeObserver.
   const blockCount = useChatStore((s) => s.blocks.length);
+  const historyGeneration = useChatStore((s) => s.historyGeneration);
   const spacerRef = useRef<HTMLDivElement>(null);
-  const [height, setHeight] = useState(0);
 
   const measure = useCallback(() => {
     const scrollEl = ctx.scrollRef?.current;
@@ -2265,23 +2263,22 @@ export function LatestTurnSpacer() {
         : texts.length > 0
           ? texts[texts.length - 1]!
           : null;
-    if (!anchor) {
-      setHeight(0);
-      return;
-    }
     // rect diffs are scroll-invariant (both edges shift together), and the
     // spacer's top is fixed by the content above it, so this is stable across
     // the height we're about to set — it converges in one pass.
-    const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
+    const anchorToEnd = anchor
+      ? spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top
+      : scrollEl.clientHeight;
     const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
-    setHeight((prev) => (Math.abs(prev - next) < 1 ? prev : next));
+    const current = Number.parseFloat(spacerEl.style.height) || 0;
+    if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
   }, [ctx.scrollRef]);
 
   useLayoutEffect(() => {
     measure();
-  }, [measure, blockCount]);
+  }, [measure, blockCount, historyGeneration]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const scrollEl = ctx.scrollRef?.current;
     const contentEl = spacerRef.current?.parentElement;
     if (!scrollEl || typeof ResizeObserver === "undefined") return;
@@ -2291,7 +2288,7 @@ export function LatestTurnSpacer() {
     return () => observer.disconnect();
   }, [ctx.scrollRef, measure]);
 
-  return <div ref={spacerRef} aria-hidden style={{ height, flexShrink: 0 }} />;
+  return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
 }
 
 /**
