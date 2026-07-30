@@ -3,8 +3,8 @@ Tenki sandbox launcher.
 
 Implements :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher`
 for `Tenki <https://tenki.cloud>`_ sandboxes on top of the official
-``tenki-sandbox`` Python SDK. Same posture as the Modal, Daytona, E2B,
-and CoreWeave launchers: the SDK is an optional dependency
+``tenki`` Python SDK. Same posture as the Modal, Daytona, E2B, and
+CoreWeave launchers: the SDK is an optional dependency
 (``pip install 'omnigent[tenki]'``) imported lazily, so the provider can
 be listed and the module probed without it.
 
@@ -59,7 +59,10 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
     from pathlib import Path
 
-    from tenki_sandbox import Client, Sandbox
+    from tenki import Client, Sandbox
+
+    # `Process` is not re-exported from the canonical `tenki` namespace, so
+    # the type comes from the implementation package.
     from tenki_sandbox.process import Process
 
 
@@ -83,12 +86,6 @@ IMAGE_ENV_VAR: str = "OMNIGENT_TENKI_IMAGE"
 (``<workspace>/<name>:tag``) the Omnigent host was baked into (see
 ``deploy/tenki/README.md``). ``sandbox.tenki.image`` takes precedence;
 there is no default because registry refs are workspace-scoped."""
-
-PROJECT_ENV_VAR: str = "OMNIGENT_TENKI_PROJECT"
-"""Environment variable naming the Tenki project id sessions are created
-in. The service requires an explicit project unless the API key is itself
-project-scoped, so this (or ``sandbox.tenki.project``, which takes
-precedence) is needed when using an account-wide key."""
 
 WORKSPACE_ENV_VAR: str = "OMNIGENT_TENKI_WORKSPACE"
 """Environment variable naming the Tenki workspace id sessions are created
@@ -124,11 +121,11 @@ def _ensure_sdk() -> None:
     an optional dependency — the base ``omnigent`` install does not
     pull it in.
 
-    :raises click.ClickException: When the ``tenki-sandbox`` package is
-        not installed.
+    :raises click.ClickException: When the ``tenki`` package is not
+        installed.
     """
     try:
-        import tenki_sandbox  # noqa: F401  # presence probe only
+        import tenki  # noqa: F401  # presence probe only
     except ImportError as exc:
         raise click.ClickException(
             "The Tenki SDK is required for the 'tenki' sandbox provider. "
@@ -271,8 +268,7 @@ class _TenkiRemoteProcess(RemoteProcess):
 
 class TenkiSandboxLauncher(SandboxLauncher):
     """
-    :class:`SandboxLauncher` for Tenki sandboxes, over the
-    ``tenki-sandbox`` SDK.
+    :class:`SandboxLauncher` for Tenki sandboxes, over the ``tenki`` SDK.
 
     All transport rides the SDK: ``Client.create`` / ``Client.get`` /
     ``Sandbox.close`` for lifecycle, ``sandbox.exec`` for commands (a
@@ -294,7 +290,6 @@ class TenkiSandboxLauncher(SandboxLauncher):
         image: str | None = None,
         env: Sequence[str] | None = None,
         base_url: str | None = None,
-        project: str | None = None,
         workspace: str | None = None,
         vcpus: int | None = None,
         memory_mb: int | None = None,
@@ -316,11 +311,6 @@ class TenkiSandboxLauncher(SandboxLauncher):
             (comma-separated) and falls back to no injected env.
         :param base_url: Optional Tenki API endpoint override. ``None``
             lets the SDK resolve :data:`BASE_URL_ENV_VAR` / its default.
-        :param project: Optional Tenki project id sessions are created in
-            — the server's ``sandbox.tenki.project`` config. Required when
-            the API key is not itself project-scoped (the service rejects
-            create with "project_id is required"). ``None`` resolves
-            :data:`PROJECT_ENV_VAR`.
         :param workspace: Optional Tenki workspace id — the server's
             ``sandbox.tenki.workspace`` config. ``None`` resolves
             :data:`WORKSPACE_ENV_VAR`.
@@ -331,7 +321,6 @@ class TenkiSandboxLauncher(SandboxLauncher):
         self._image_ref = image
         self._env_names = tuple(env) if env is not None else None
         self._base_url = base_url
-        self._project = project
         self._workspace = workspace
         self._vcpus = vcpus
         self._memory_mb = memory_mb
@@ -350,8 +339,7 @@ class TenkiSandboxLauncher(SandboxLauncher):
         """
         _ensure_sdk()
         if self._client is None:
-            from tenki_sandbox import Client
-            from tenki_sandbox.errors import MissingAuthTokenError
+            from tenki import Client, MissingAuthTokenError
 
             try:
                 self._client = Client(base_url=self._base_url)
@@ -372,10 +360,6 @@ class TenkiSandboxLauncher(SandboxLauncher):
         """
         return self._image_ref or os.environ.get(IMAGE_ENV_VAR) or None
 
-    def _resolved_project(self) -> str | None:
-        """Resolve the Tenki project id: ctor value → :data:`PROJECT_ENV_VAR`."""
-        return self._project or os.environ.get(PROJECT_ENV_VAR) or None
-
     def _resolved_workspace(self) -> str | None:
         """Resolve the Tenki workspace id: ctor value → :data:`WORKSPACE_ENV_VAR`."""
         return self._workspace or os.environ.get(WORKSPACE_ENV_VAR) or None
@@ -391,7 +375,7 @@ class TenkiSandboxLauncher(SandboxLauncher):
             session does not exist (e.g. terminated).
         """
         _ensure_sdk()
-        from tenki_sandbox.errors import SessionNotFoundError
+        from tenki import SessionNotFoundError
 
         handle = self._sandboxes.get(sandbox_id)
         if handle is None:
@@ -482,7 +466,7 @@ class TenkiSandboxLauncher(SandboxLauncher):
                 f"{IMAGE_ENV_VAR}."
             )
         _ensure_sdk()
-        from tenki_sandbox.errors import SandboxError
+        from tenki import SandboxError
 
         env_vars = self._resolve_sandbox_env()
         client = self._client_lazy()
@@ -491,7 +475,6 @@ class TenkiSandboxLauncher(SandboxLauncher):
             sandbox = client.create(
                 name=name,
                 image=image,
-                project_id=self._resolved_project(),
                 workspace_id=self._resolved_workspace(),
                 cpu_cores=self._vcpus,
                 memory_mb=self._memory_mb,
@@ -539,7 +522,7 @@ class TenkiSandboxLauncher(SandboxLauncher):
         :param sandbox_id: The sandbox to configure.
         """
         _ensure_sdk()
-        from tenki_sandbox.errors import SandboxError
+        from tenki import SandboxError
 
         sandbox = self._resolve(sandbox_id)
         try:
@@ -570,7 +553,7 @@ class TenkiSandboxLauncher(SandboxLauncher):
             executed, or *check* is ``True`` and it exited non-zero.
         """
         _ensure_sdk()
-        from tenki_sandbox.errors import SandboxError
+        from tenki import SandboxError
 
         sandbox = self._resolve(sandbox_id)
         try:
@@ -612,7 +595,7 @@ class TenkiSandboxLauncher(SandboxLauncher):
         :raises click.ClickException: If the transfer fails.
         """
         _ensure_sdk()
-        from tenki_sandbox.errors import SandboxError
+        from tenki import SandboxError
 
         sandbox = self._resolve(sandbox_id)
         staging = f".oa-put-{secrets.token_hex(8)}"
@@ -655,7 +638,7 @@ class TenkiSandboxLauncher(SandboxLauncher):
         """
         del pty  # unused (see docstring)
         _ensure_sdk()
-        from tenki_sandbox.errors import SandboxError
+        from tenki import SandboxError
 
         sandbox = self._resolve(sandbox_id)
         try:
@@ -721,7 +704,7 @@ class TenkiSandboxLauncher(SandboxLauncher):
             other than the sandbox already being gone.
         """
         _ensure_sdk()
-        from tenki_sandbox.errors import (
+        from tenki import (
             InvalidStateError,
             SandboxError,
             SessionNotFoundError,

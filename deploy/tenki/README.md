@@ -24,7 +24,7 @@ for running Omnigent hosts, two ways:
 ## Prerequisites
 
 ```bash
-pip install 'omnigent[tenki]'                     # installs the tenki-sandbox SDK extra
+pip install 'omnigent[tenki]'                     # installs the tenki SDK extra
 curl -fsSL https://tenki.cloud/install.sh | bash  # the Tenki CLI, for building the template
 ```
 
@@ -40,18 +40,17 @@ tenki login                    # one-time, authenticates the Tenki CLI too
 Optionally set `TENKI_API_ENDPOINT` to target a non-default Tenki API endpoint
 (the SDK also honors it; `sandbox.tenki.base_url` takes precedence for managed).
 
-> [!IMPORTANT]
-> **Sessions are created in a project.** The Tenki service rejects `create` with
-> `project_id is required` unless your API key is itself project-scoped. A key
-> from interactive `tenki login` is **not** project-scoped, so set the project id
-> via `sandbox.tenki.project` (managed) / `OMNIGENT_TENKI_PROJECT` (CLI) — and
-> optionally the workspace via `sandbox.tenki.workspace` /
-> `OMNIGENT_TENKI_WORKSPACE`. Find both ids with `tenki status`.
+> [!NOTE]
+> **Sessions are workspace-scoped.** Your API key determines the workspace
+> sessions land in, so no extra configuration is normally needed. To target a
+> specific workspace explicitly, set `sandbox.tenki.workspace` (managed) /
+> `OMNIGENT_TENKI_WORKSPACE` (CLI); find the id in the Tenki dashboard's
+> workspace settings.
 
 > [!NOTE]
 > **No forced lifetime cap or idle auto-pause by default.** Omnigent sets no
 > session `max_duration`, and Tenki's default idle timeout is `0` — auto-pause is
-> disabled (verified on Tenki CLI v0.18.1) — so a sandbox runs until it is
+> disabled (verified on Tenki CLI v1.0.0) — so a sandbox runs until it is
 > terminated (managed-session teardown, or your own `tenki sandbox terminate`).
 > `keep_alive` extends a live session on reconnect. Only if your *workspace* sets
 > a non-zero default idle timeout could a long-quiet host be paused; Omnigent does
@@ -59,7 +58,7 @@ Optionally set `TENKI_API_ENDPOINT` to target a non-default Tenki API endpoint
 > dead-sandbox relaunch path on the next message. Keep idle-pause disabled (or use
 > `--sticky`-style always-on sessions) to avoid that.
 
-_The CLI commands below were verified against **Tenki CLI v0.18.1**; re-check
+_The CLI commands below were verified against **Tenki CLI v1.0.0**; re-check
 `tenki … -h` if your version differs._
 
 ## Build the host template (one time)
@@ -109,8 +108,8 @@ Point the launcher at the published reference with `sandbox.tenki.image` /
 `OMNIGENT_TENKI_IMAGE` (there is no default — the ref is workspace-scoped).
 Rebuild + republish the template whenever the baked host version changes (the
 CLI flow still overlays your *local* wheels on top per-sandbox, so day-to-day
-code changes don't need a template rebuild). Find your workspace id with
-`tenki status`.
+code changes don't need a template rebuild). Find your workspace slug and id in
+the Tenki dashboard's workspace settings.
 
 ## CLI-launched sandboxes
 
@@ -174,7 +173,6 @@ sandbox:
   server_url: https://your-host              # public URL sandboxes dial back to
   tenki:
     image: <workspace>/omnigent-host:v1  # prepared registry image (required)
-    project: <project-id>                # required unless the key is project-scoped
 ```
 
 `server_url` must be reachable *from Tenki's cloud* — a public HTTPS URL, not
@@ -195,7 +193,6 @@ sandbox:
   tenki:
     image: <workspace>/omnigent-host:v1
     env: [OPENAI_API_KEY, ANTHROPIC_API_KEY, GIT_TOKEN]
-    project: <project-id>                     # required unless the key is project-scoped
     workspace: <workspace-id>                 # optional
     base_url: https://api.tenki.cloud        # optional API endpoint override
     vcpus: 4                                  # optional (1–16, default 2)
@@ -279,6 +276,5 @@ in-sandbox host forwards the same standard set to its runners, and
 | `TENKI_API_KEY` | CLI machine / server | Tenki API credentials (required; `TENKI_AUTH_TOKEN` also accepted) |
 | `TENKI_API_ENDPOINT` | CLI machine / server | Tenki API endpoint override (`sandbox.tenki.base_url` takes precedence for managed) |
 | `OMNIGENT_TENKI_IMAGE` | CLI machine / server | Prepared registry image reference to boot from (`sandbox.tenki.image` takes precedence; no default) |
-| `OMNIGENT_TENKI_PROJECT` | CLI machine / server | Tenki project id sessions are created in (`sandbox.tenki.project` takes precedence; required unless the key is project-scoped) |
 | `OMNIGENT_TENKI_WORKSPACE` | CLI machine / server | Tenki workspace id sessions are created in (`sandbox.tenki.workspace` takes precedence; optional) |
 | `OMNIGENT_TENKI_SANDBOX_ENV` | CLI machine / server | Comma-separated launcher-side env var names to inject (`sandbox.tenki.env` takes precedence for managed) |

@@ -13,18 +13,18 @@ import pytest
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.onboarding.sandboxes.tenki import (
     IMAGE_ENV_VAR,
-    PROJECT_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     WORKSPACE_ENV_VAR,
     TenkiSandboxLauncher,
 )
 
-# ── Fake tenki_sandbox SDK ──────────────────────────────────
+# ── Fake tenki SDK ──────────────────────────────────────────
 #
 # The SDK is an optional dependency the test env may not install, and
 # real Sandbox objects only exist server-side — so these are hand-rolled
 # stubs injected via sys.modules, resolving the launcher's function-local
-# `from tenki_sandbox import ...` / `from tenki_sandbox.errors import ...`.
+# `from tenki import ...`. `tenki` is the SDK's canonical namespace and
+# re-exports the error classes at top level, so the stub does too.
 
 
 class _SandboxError(Exception):
@@ -205,25 +205,21 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _State:
     state = _State()
     _FakeClient._state = state
 
-    mod = types.ModuleType("tenki_sandbox")
+    mod = types.ModuleType("tenki")
     mod.Client = _FakeClient  # type: ignore[attr-defined]
     mod.Sandbox = _FakeSandbox  # type: ignore[attr-defined]
     mod.CommandResult = _FakeCommandResult  # type: ignore[attr-defined]
-    err = types.ModuleType("tenki_sandbox.errors")
-    err.SandboxError = _SandboxError  # type: ignore[attr-defined]
-    err.MissingAuthTokenError = _MissingAuthTokenError  # type: ignore[attr-defined]
-    err.SessionNotFoundError = _SessionNotFoundError  # type: ignore[attr-defined]
-    err.SessionTerminatedError = _SessionTerminatedError  # type: ignore[attr-defined]
-    err.InvalidStateError = _InvalidStateError  # type: ignore[attr-defined]
-    mod.errors = err  # type: ignore[attr-defined]
+    mod.SandboxError = _SandboxError  # type: ignore[attr-defined]
+    mod.MissingAuthTokenError = _MissingAuthTokenError  # type: ignore[attr-defined]
+    mod.SessionNotFoundError = _SessionNotFoundError  # type: ignore[attr-defined]
+    mod.SessionTerminatedError = _SessionTerminatedError  # type: ignore[attr-defined]
+    mod.InvalidStateError = _InvalidStateError  # type: ignore[attr-defined]
 
-    monkeypatch.setitem(sys.modules, "tenki_sandbox", mod)
-    monkeypatch.setitem(sys.modules, "tenki_sandbox.errors", err)
+    monkeypatch.setitem(sys.modules, "tenki", mod)
     monkeypatch.setenv("TENKI_API_KEY", "tk_test")
     monkeypatch.delenv("TENKI_AUTH_TOKEN", raising=False)
     monkeypatch.delenv(IMAGE_ENV_VAR, raising=False)
     monkeypatch.delenv(SANDBOX_ENV_PASSTHROUGH_ENV_VAR, raising=False)
-    monkeypatch.delenv(PROJECT_ENV_VAR, raising=False)
     monkeypatch.delenv(WORKSPACE_ENV_VAR, raising=False)
     return state
 
@@ -251,8 +247,8 @@ def test_prepare_accepts_auth_token(sdk: _State, monkeypatch: pytest.MonkeyPatch
 
 
 def test_prepare_raises_install_hint_when_sdk_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A None entry in sys.modules makes `import tenki_sandbox` raise ImportError.
-    monkeypatch.setitem(sys.modules, "tenki_sandbox", None)
+    # A None entry in sys.modules makes `import tenki` raise ImportError.
+    monkeypatch.setitem(sys.modules, "tenki", None)
     monkeypatch.setenv("TENKI_API_KEY", "k")
     with pytest.raises(click.ClickException, match=r"pip install 'omnigent\[tenki\]'"):
         _launcher().prepare()
@@ -323,28 +319,27 @@ def test_provision_passes_base_url_to_client(sdk: _State) -> None:
     assert sdk.client_kwargs[0]["base_url"] == "https://api.tenki.cloud"
 
 
-def test_provision_passes_project_and_workspace(sdk: _State) -> None:
-    # The service requires an explicit project unless the key is project-scoped.
-    _launcher(project="proj-1", workspace="ws-1").provision("x")
-    assert sdk.create_kwargs["project_id"] == "proj-1"
+def test_provision_passes_workspace(sdk: _State) -> None:
+    _launcher(workspace="ws-1").provision("x")
     assert sdk.create_kwargs["workspace_id"] == "ws-1"
 
 
-def test_provision_project_workspace_from_env(
-    sdk: _State, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv(PROJECT_ENV_VAR, "env-proj")
+def test_provision_workspace_from_env(sdk: _State, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(WORKSPACE_ENV_VAR, "env-ws")
     _launcher().provision("x")
-    assert sdk.create_kwargs["project_id"] == "env-proj"
     assert sdk.create_kwargs["workspace_id"] == "env-ws"
 
 
-def test_provision_without_project_passes_none(sdk: _State) -> None:
-    # A project-scoped key needs no explicit project; unset resolves to None.
+def test_provision_without_workspace_passes_none(sdk: _State) -> None:
+    # An unset workspace resolves to None (the key's default applies).
     _launcher().provision("x")
-    assert sdk.create_kwargs["project_id"] is None
     assert sdk.create_kwargs["workspace_id"] is None
+
+
+def test_provision_never_passes_project_id(sdk: _State) -> None:
+    """The SDK dropped ``project_id``; passing it would be a TypeError."""
+    _launcher(workspace="ws-1").provision("x")
+    assert "project_id" not in sdk.create_kwargs
 
 
 def test_client_missing_auth_is_friendly(sdk: _State) -> None:
@@ -398,13 +393,13 @@ def test_resolve_missing_sandbox_is_friendly(sdk: _State) -> None:
 def test_run_missing_sdk_raises_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     # A direct primitive call (no prepare() first) with the SDK absent must
     # surface the omnigent[tenki] hint, not a raw ImportError.
-    monkeypatch.setitem(sys.modules, "tenki_sandbox", None)
+    monkeypatch.setitem(sys.modules, "tenki", None)
     with pytest.raises(click.ClickException, match=r"pip install 'omnigent\[tenki\]'"):
         TenkiSandboxLauncher(image="ws/host:latest").run("sb", "echo hi")
 
 
 def test_terminate_missing_sdk_raises_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(sys.modules, "tenki_sandbox", None)
+    monkeypatch.setitem(sys.modules, "tenki", None)
     with pytest.raises(click.ClickException, match=r"pip install 'omnigent\[tenki\]'"):
         TenkiSandboxLauncher(image="ws/host:latest").terminate("sb")
 
