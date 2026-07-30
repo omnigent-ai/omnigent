@@ -388,7 +388,7 @@ export function InboxPage() {
                   </span>
                 </div>
                 {comment.anchor_content && (
-                  <p className="truncate font-mono text-[11px] text-muted-foreground">
+                  <p className="truncate font-mono text-2xs text-muted-foreground">
                     {comment.anchor_content.trim()}
                   </p>
                 )}

@@ -84,18 +84,18 @@ export function ScheduledTaskRow({
     >
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-[15px] font-semibold">{task.name}</span>
+          <span className="truncate text-15 font-semibold">{task.name}</span>
           {paused && (
             <span
               data-testid="task-paused-pill"
-              className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+              className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-3xs font-medium text-muted-foreground"
             >
               Paused
             </span>
           )}
         </span>
         <span
-          className="truncate text-[13px] text-muted-foreground/80"
+          className="truncate text-13 text-muted-foreground/80"
           data-testid="task-schedule-line"
         >
           {scheduleSummary}

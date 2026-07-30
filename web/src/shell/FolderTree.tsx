@@ -490,7 +490,7 @@ function FileRowItem({
           {fileStatus && (
             <span
               className={cn(
-                "shrink-0 rounded px-1 py-0.5 font-mono text-[10px]",
+                "shrink-0 rounded px-1 py-0.5 font-mono text-3xs",
                 isDeleted
                   ? "bg-destructive/10 text-destructive"
                   : fileStatus === "created"
@@ -505,7 +505,7 @@ function FileRowItem({
         </button>
         {bytes !== null && !isDeleted ? (
           <div className="relative shrink-0 flex items-center">
-            <span className="text-muted-foreground text-[10px] group-hover:invisible">
+            <span className="text-muted-foreground text-3xs group-hover:invisible">
               {formatBytes(bytes)}
             </span>
             {conversationId && (
@@ -692,7 +692,7 @@ function TreeNodeRow({
         </span>
         {dirStatus && (
           <span className="flex w-[22px] shrink-0 items-center justify-center" aria-hidden>
-            <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
+            <span className={cn("text-nano leading-none", dirDotClass)}>●</span>
           </span>
         )}
       </button>

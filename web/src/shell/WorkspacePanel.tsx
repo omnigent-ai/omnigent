@@ -97,7 +97,7 @@ function FileTabsStrip({
               // sets. `group/tab` drives the hover-revealed close overlay below.
               // `overflow-hidden` clips the hover-close gradient overlay to the
               // pill's rounded corners so its rectangular edges can't poke out.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
+              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-13 font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:text-foreground",

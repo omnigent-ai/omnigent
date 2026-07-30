@@ -297,7 +297,7 @@ export function WorkspacePathField({
         >
           {filteredRecent.length > 0 && (
             <>
-              <div className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <div className="px-3 pt-2 pb-1 text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
                 Recent
               </div>
               {filteredRecent.map((path, i) => (
@@ -313,7 +313,7 @@ export function WorkspacePathField({
           )}
           {matches.length > 0 && (
             <>
-              <div className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <div className="px-3 pt-2 pb-1 text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
                 Matches
               </div>
               {matches.map((path, j) => (

@@ -1181,7 +1181,7 @@ function FileViewerBody({
               >
                 <ChevronLeftIcon className="size-4" />
               </Button>
-              <span className="text-[10px] text-muted-foreground tabular-nums">
+              <span className="text-3xs text-muted-foreground tabular-nums">
                 {currentNavIdx + 1}/{navigableFiles.length}
               </span>
               <Button
@@ -1216,7 +1216,7 @@ function FileViewerBody({
                   : undefined
               }
               className={cn(
-                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px]",
+                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-2xs",
                 saveStatus === "error" ? "text-destructive" : "text-muted-foreground",
               )}
             >

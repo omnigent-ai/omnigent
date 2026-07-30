@@ -285,7 +285,7 @@ function SaveButton({
 function OrDivider() {
   return (
     <div
-      className="flex items-center justify-center gap-2 text-[10px] uppercase tracking-wide text-muted-foreground"
+      className="flex items-center justify-center gap-2 text-3xs uppercase tracking-wide text-muted-foreground"
       aria-hidden
     >
       <span className="h-px w-6 bg-border" />

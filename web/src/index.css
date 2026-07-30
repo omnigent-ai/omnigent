@@ -21,11 +21,22 @@
     ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol",
     "Noto Color Emoji";
   --font-mono: "Geist Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  /* Compact text steps below text-xs (12px). The named 10px/11px rungs
+     * replace repeated arbitrary utilities across dense UI chrome. */
+  --text-3xs: 10px;
+  --text-3xs--line-height: 16px;
+  --text-2xs: 11px;
+  --text-2xs--line-height: 16px;
+  /* Micro glyph steps are reserved for tiny status marks and count badges. */
+  --text-nano: 8px;
+  --text-micro: 9px;
   /* 13px/20px text step between text-xs (12px) and text-sm (14px) —
      * generates the `text-13` utility. Used for compact UI chrome like
      * the composer footer selectors and slash-command menu rows. */
   --text-13: 13px;
   --text-13--line-height: 20px;
+  /* Intermediate title step used by compact list rows. */
+  --text-15: 15px;
   /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
      * with a slightly larger 32px face on the same 36px line. */
   --text-3xl: 32px;

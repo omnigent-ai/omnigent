@@ -12,4 +12,4 @@ export type RightRailTab = "files" | "subagents" | "terminals" | "todos" | "brow
  * single digit a circle while "1/2" / double digits grow into a pill.
  */
 export const TAB_BADGE_BASE =
-  "inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[9px] leading-none tabular-nums";
+  "inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-micro leading-none tabular-nums";

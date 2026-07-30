@@ -317,7 +317,7 @@ function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
         <span className="flex items-center gap-2">
           <span className="truncate text-xs">{host.name}</span>
           <span
-            className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
+            className={`inline-flex shrink-0 items-center gap-1 text-3xs font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
           >
             <span
               className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
@@ -326,7 +326,7 @@ function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
           </span>
         </span>
         {subtitle && (
-          <span className="text-[10px] leading-tight text-muted-foreground">{subtitle}</span>
+          <span className="text-3xs leading-tight text-muted-foreground">{subtitle}</span>
         )}
       </span>
     </span>
@@ -779,9 +779,7 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  * doesn't claim roving focus for it — mirrors the in-session picker). */
 function PickerSectionHeader({ children }: { children: ReactNode }) {
   return (
-    <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
-      {children}
-    </div>
+    <div className="px-2 pt-1.5 pb-0.5 text-2xs font-medium text-muted-foreground">{children}</div>
   );
 }
 
@@ -895,7 +893,7 @@ export function AgentHarnessPicker({
     const inner = (
       <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
         <span className="truncate">{agent.display_name}</span>
-        {blurb && <span className="truncate text-[11px] text-muted-foreground/70">{blurb}</span>}
+        {blurb && <span className="truncate text-2xs text-muted-foreground/70">{blurb}</span>}
       </div>
     );
     return withTooltip ? <AgentRowTooltip agent={agent}>{inner}</AgentRowTooltip> : inner;
@@ -905,7 +903,7 @@ export function AgentHarnessPicker({
     harnessUnconfiguredOnHost(agent.harness, host) ? (
       <Badge
         variant="outline"
-        className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+        className="ml-auto self-center border-amber-300 bg-amber-50 text-2xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
         data-testid={`new-chat-landing-agent-warning-${agent.id}`}
       >
         {harnessWarningBadgeText(
@@ -999,7 +997,7 @@ export function AgentHarnessPicker({
         >
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{pendingAgent.name}</span>
-            <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
+            <span className="truncate text-2xs text-muted-foreground/70">Custom</span>
           </div>
         </DropdownMenuItem>
       )}
@@ -1548,7 +1546,7 @@ function HarnessConfigModal({
                         {harnessUnconfiguredOnHost(id, host) && (
                           <Badge
                             variant="outline"
-                            className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+                            className="border-amber-300 bg-amber-50 text-2xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
                             data-testid={`new-chat-landing-harness-warning-${id}`}
                           >
                             {harnessWarningBadgeText(
@@ -2616,15 +2614,17 @@ export function NewChatLandingScreen() {
     if (mentionFsQuery.isPlaceholderData) return [];
     const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
-      .map((e): WorkspaceFile => ({
-        path: e.path.startsWith(workspaceRoot)
-          ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
-          : e.name,
-        name: e.name,
-        type: e.type === "directory" ? "directory" : "file",
-        bytes: e.bytes,
-        modified_at: e.modified_at,
-      }));
+      .map(
+        (e): WorkspaceFile => ({
+          path: e.path.startsWith(workspaceRoot)
+            ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
+            : e.name,
+          name: e.name,
+          type: e.type === "directory" ? "directory" : "file",
+          bytes: e.bytes,
+          modified_at: e.modified_at,
+        }),
+      );
     return rankMentionEntries(rows, mentionFilter);
   }, [
     mentionEnabled,
@@ -3806,7 +3806,7 @@ export function NewChatLandingScreen() {
                             className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-md"
                             data-testid="new-chat-landing-worktree-dropdown"
                           >
-                            <span className="px-2 pt-1 pb-0.5 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+                            <span className="px-2 pt-1 pb-0.5 text-2xs font-medium tracking-wide text-muted-foreground uppercase">
                               Existing worktrees
                             </span>
                             <ul className="flex flex-col gap-0.5">

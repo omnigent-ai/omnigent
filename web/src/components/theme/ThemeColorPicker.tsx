@@ -140,9 +140,7 @@ export function ThemeColorPicker({
         >
           <div className="flex items-center justify-between px-3.5 py-2.5">
             <span className="text-xs font-medium">{label}</span>
-            <span className="font-mono text-[11px] text-muted-foreground">
-              {value.toUpperCase()}
-            </span>
+            <span className="font-mono text-2xs text-muted-foreground">{value.toUpperCase()}</span>
           </div>
           <div className="px-2.5 pb-2.5">
             <div
