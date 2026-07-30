@@ -547,7 +547,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
           // Indented to align with the title text above: 14px icon + 4px gap.
           <p
             data-testid="subagent-main-preview"
-            className="truncate pl-[18px] text-[11px] text-muted-foreground"
+            className="truncate pl-[18px] text-2xs text-muted-foreground"
           >
             {preview}
           </p>
@@ -655,7 +655,7 @@ function SubagentRow({
             // above: 12px connector - 12px (-ml-3) + 4px gap + 14px bot
             // icon + 4px gap = 22px. Relative to the row's own padding,
             // so it tracks the depth-stepped gutter automatically.
-            <p className="truncate pl-[22px] text-[11px] text-muted-foreground">
+            <p className="truncate pl-[22px] text-2xs text-muted-foreground">
               {child.last_message_preview}
             </p>
           )}

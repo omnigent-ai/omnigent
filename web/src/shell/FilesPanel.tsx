@@ -179,7 +179,7 @@ function FileScopeSwitch({
   const changedSelected = flatView;
   const allSelected = !flatView;
   const pill =
-    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-[13px] font-medium leading-5 transition-colors";
+    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-13 font-medium leading-5 transition-colors";
   const activePill = "bg-muted text-foreground";
   const idlePill = "text-muted-foreground hover:text-foreground";
   return (
@@ -196,7 +196,7 @@ function FileScopeSwitch({
         <ListIcon className="size-3.5 shrink-0" />
         Changed
         {count > 0 && (
-          <span className="shrink-0 font-normal text-[11px] text-muted-foreground tabular-nums">
+          <span className="shrink-0 font-normal text-2xs text-muted-foreground tabular-nums">
             {count}
           </span>
         )}
@@ -234,7 +234,7 @@ function SearchFilterInput({
 }) {
   return (
     <label className="flex flex-col gap-0.5">
-      <span className="font-medium text-[10px] text-muted-foreground uppercase tracking-wide">
+      <span className="font-medium text-3xs text-muted-foreground uppercase tracking-wide">
         {label}
       </span>
       <input
@@ -390,7 +390,7 @@ export function FilesPanel({
               <TooltipTrigger asChild>
                 <span
                   data-testid="files-host-served-badge"
-                  className="flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                  className="flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-3xs text-muted-foreground"
                 >
                   <MoonIcon className="size-3 shrink-0" />
                   Asleep
@@ -565,7 +565,7 @@ function WorkingDirLabel({ dir }: { dir: string }) {
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="inline-block max-w-full truncate font-mono text-[11px] text-muted-foreground cursor-default">
+            <span className="inline-block max-w-full truncate font-mono text-2xs text-muted-foreground cursor-default">
               {dirBasename(dir)}
             </span>
           </TooltipTrigger>

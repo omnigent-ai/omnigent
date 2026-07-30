@@ -185,7 +185,7 @@ function AddDefaultPolicyDialog({
                       >
                         <span className="text-sm">{r.name}</span>
                         {r.description && (
-                          <span className="line-clamp-2 text-[11px] text-muted-foreground">
+                          <span className="line-clamp-2 text-2xs text-muted-foreground">
                             {r.description}
                           </span>
                         )}
@@ -212,7 +212,7 @@ function AddDefaultPolicyDialog({
                     setFactoryParams({});
                     setParamError(null);
                   }}
-                  className="text-[11px] text-muted-foreground hover:text-foreground"
+                  className="text-2xs text-muted-foreground hover:text-foreground"
                 >
                   Change
                 </button>
@@ -256,7 +256,7 @@ function AddDefaultPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="break-words text-[11px] text-muted-foreground">
+                      <p className="break-words text-2xs text-muted-foreground">
                         {prop.description}
                       </p>
                     )}
@@ -524,12 +524,12 @@ export function PoliciesPage() {
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-medium">{p.name}</span>
                         {p.source === "config" && (
-                          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                          <span className="rounded-full bg-muted px-1.5 py-0.5 text-3xs text-muted-foreground">
                             Config
                           </span>
                         )}
                         {!p.enabled && p.source !== "config" && (
-                          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                          <span className="rounded-full bg-muted px-1.5 py-0.5 text-3xs text-muted-foreground">
                             Disabled
                           </span>
                         )}
@@ -539,7 +539,7 @@ export function PoliciesPage() {
                           {registryEntry.description}
                         </p>
                       )}
-                      <code className="mt-1 block text-[11px] text-muted-foreground/70">
+                      <code className="mt-1 block text-2xs text-muted-foreground/70">
                         {p.handler}
                       </code>
                     </div>
@@ -573,7 +573,7 @@ export function PoliciesPage() {
                 </div>
                 {hasParams && (
                   <div className="ml-6.5 mt-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2">
-                    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+                    <span className="text-3xs font-medium uppercase tracking-wider text-muted-foreground/70">
                       Parameters
                     </span>
                     <div className="mt-1 flex flex-col gap-0.5">

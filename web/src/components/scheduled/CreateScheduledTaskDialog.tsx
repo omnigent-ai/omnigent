@@ -421,7 +421,7 @@ export function CreateScheduledTaskDialog({
               </div>
             )}
             {!showModelEffort && (
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-2xs text-muted-foreground">
                 Uses this agent&apos;s default model, effort, and permission settings
               </p>
             )}
@@ -440,7 +440,7 @@ export function CreateScheduledTaskDialog({
                 onEffortChange={setPickedEffort}
                 onSelectOpenChange={handleSelectOpenChange}
               />
-              <p className="mt-1.5 text-[11px] text-muted-foreground">
+              <p className="mt-1.5 text-2xs text-muted-foreground">
                 Leave on Default to use the agent&apos;s configured model and effort.
               </p>
             </div>
@@ -493,7 +493,7 @@ export function CreateScheduledTaskDialog({
                 ))}
               </SelectContent>
             </Select>
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-2xs text-muted-foreground">
               Leave unset to run on your connected host when the task fires.
             </p>
           </div>
@@ -501,7 +501,7 @@ export function CreateScheduledTaskDialog({
           {hostId !== "" && (
             <div className="flex flex-col gap-1.5">
               <Label>Workspace (optional)</Label>
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-2xs text-muted-foreground">
                 Defaults to the host&apos;s home directory. Pick a directory to pin it.
               </p>
               <div className="h-56 overflow-hidden rounded-md border border-border">
@@ -512,7 +512,7 @@ export function CreateScheduledTaskDialog({
                 />
               </div>
               {workspace && (
-                <p className="truncate font-mono text-[11px] text-muted-foreground">{workspace}</p>
+                <p className="truncate font-mono text-2xs text-muted-foreground">{workspace}</p>
               )}
             </div>
           )}

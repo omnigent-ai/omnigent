@@ -211,7 +211,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
                 )}
                 <span className="ml-auto shrink-0">
                   {rec !== null ? (
-                    <span className="inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground">
+                    <span className="inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-3xs font-medium leading-none text-foreground">
                       {shortModelName(rec.model)}
                     </span>
                   ) : judging ? (

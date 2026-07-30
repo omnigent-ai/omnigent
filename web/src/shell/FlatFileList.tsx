@@ -101,11 +101,11 @@ function FileListItem({
           >
             {file.name}
           </span>
-          {dir && <span className="truncate text-muted-foreground text-[11px]">{dir}</span>}
+          {dir && <span className="truncate text-muted-foreground text-2xs">{dir}</span>}
         </button>
         {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
           <span
-            className="shrink-0 font-mono text-[10px]"
+            className="shrink-0 font-mono text-3xs"
             aria-label={[
               file.lines_added !== null && `${file.lines_added} lines added`,
               file.lines_removed !== null && `${file.lines_removed} removed`,
@@ -125,7 +125,7 @@ function FileListItem({
         <span className="relative flex shrink-0 items-center justify-center">
           <span
             className={cn(
-              "rounded px-1 py-0.5 font-mono text-[10px]",
+              "rounded px-1 py-0.5 font-mono text-3xs",
               hasDownload && "group-hover:invisible",
               isDeleted
                 ? "bg-destructive/10 text-destructive"

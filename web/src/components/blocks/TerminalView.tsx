@@ -324,7 +324,7 @@ export function TerminalView({
       {!controlMode && (
         <div
           data-testid="terminal-selection-hint"
-          className="shrink-0 select-none px-2 py-1 text-[10px] text-muted-foreground/70"
+          className="shrink-0 select-none px-2 py-1 text-3xs text-muted-foreground/70"
         >
           {selectionHintText(isMacPlatform())}
         </div>

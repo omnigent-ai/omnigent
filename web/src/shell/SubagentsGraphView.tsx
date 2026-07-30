@@ -36,7 +36,7 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
   if (activity === "working") return <RunningDot />;
   if (activity === "awaiting") {
     return (
-      <Badge className="border-transparent bg-warning/15 text-warning text-[9px] px-1 py-0">
+      <Badge className="border-transparent bg-warning/15 text-warning text-micro px-1 py-0">
         !
       </Badge>
     );
@@ -81,10 +81,10 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
           <NodeStatusDot activity={activity} />
         </div>
         {preview && (
-          <p className="mt-1 truncate text-[10px] leading-tight text-muted-foreground">{preview}</p>
+          <p className="mt-1 truncate text-3xs leading-tight text-muted-foreground">{preview}</p>
         )}
         {!["idle", "done"].includes(activity) && (
-          <p className="mt-0.5 text-[10px] text-muted-foreground">{statusLabel}</p>
+          <p className="mt-0.5 text-3xs text-muted-foreground">{statusLabel}</p>
         )}
       </div>
       <Handle

@@ -186,7 +186,7 @@ export function CommentsPanel({
               key={t}
               type="button"
               className={cn(
-                "flex-1 py-1.5 text-[11px] font-medium capitalize transition-colors cursor-pointer",
+                "flex-1 py-1.5 text-2xs font-medium capitalize transition-colors cursor-pointer",
                 tab === t
                   ? "border-b-2 border-primary text-foreground"
                   : "text-muted-foreground hover:text-foreground",
@@ -195,7 +195,7 @@ export function CommentsPanel({
             >
               {t === "open" ? "Open" : "Addressed"}
               {count > 0 && (
-                <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
+                <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-3xs tabular-nums">
                   {count}
                 </span>
               )}
@@ -222,7 +222,7 @@ export function CommentsPanel({
           (canEdit ? (
             <div className="space-y-2 border-b border-border px-3 py-2">
               {activeSelection.anchor_content && (
-                <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-muted-foreground">
+                <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-3xs text-muted-foreground">
                   <span className="text-foreground/60">Selection: </span>
                   {displayAnchorContent(activeSelection.anchor_content).split("\n")[0]}
                 </div>
@@ -409,7 +409,7 @@ function CommentCard({
     >
       {/* Anchor */}
       {c.anchor_content && (
-        <p className="truncate font-mono text-[11px] text-muted-foreground">
+        <p className="truncate font-mono text-2xs text-muted-foreground">
           {displayAnchorContent(c.anchor_content)}
         </p>
       )}
@@ -452,7 +452,7 @@ function CommentCard({
             <button
               type="button"
               aria-expanded={expanded}
-              className="cursor-pointer text-[10px] font-medium text-blue-600 hover:underline dark:text-blue-400"
+              className="cursor-pointer text-3xs font-medium text-blue-600 hover:underline dark:text-blue-400"
               onClick={(e) => {
                 e.stopPropagation();
                 setExpanded((v) => !v);
@@ -470,7 +470,7 @@ function CommentCard({
           <div className="flex min-w-0 flex-col gap-0.5">
             <div className="flex min-w-0 items-center gap-1.5">
               <span
-                className="inline-flex size-4 shrink-0 items-center justify-center rounded-full text-[8px] font-semibold uppercase"
+                className="inline-flex size-4 shrink-0 items-center justify-center rounded-full text-nano font-semibold uppercase"
                 style={avatarStyle(c.created_by ?? "You")}
               >
                 {(c.created_by ?? "Y")[0].toUpperCase()}
@@ -478,7 +478,7 @@ function CommentCard({
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <span className="truncate text-[11px] text-muted-foreground">
+                    <span className="truncate text-2xs text-muted-foreground">
                       {c.created_by ?? "You"}
                     </span>
                   </TooltipTrigger>
@@ -486,13 +486,11 @@ function CommentCard({
                 </Tooltip>
               </TooltipProvider>
             </div>
-            <span className="text-[10px] text-muted-foreground/70">
+            <span className="text-3xs text-muted-foreground/70">
               {formatCommentTime(c.created_at)}
             </span>
             {statusLabel && (
-              <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] w-fit">
-                {statusLabel}
-              </span>
+              <span className="rounded bg-muted px-1.5 py-0.5 text-3xs w-fit">{statusLabel}</span>
             )}
           </div>
           {(onEdit || onDelete || onCopyLink) && (
@@ -500,7 +498,7 @@ function CommentCard({
               {onEdit && (
                 <button
                   type="button"
-                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                  className="cursor-pointer text-2xs text-muted-foreground transition-colors hover:text-foreground"
                   onClick={(e) => {
                     e.stopPropagation();
                     startEdit();
@@ -512,7 +510,7 @@ function CommentCard({
               {onDelete && (
                 <button
                   type="button"
-                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-destructive"
+                  className="cursor-pointer text-2xs text-muted-foreground transition-colors hover:text-destructive"
                   onClick={(e) => {
                     e.stopPropagation();
                     onDelete();
@@ -525,7 +523,7 @@ function CommentCard({
                 <button
                   type="button"
                   aria-label="Copy link to comment"
-                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                  className="cursor-pointer text-2xs text-muted-foreground transition-colors hover:text-foreground"
                   onClick={(e) => {
                     e.stopPropagation();
                     onCopyLink();

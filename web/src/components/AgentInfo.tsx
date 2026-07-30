@@ -94,7 +94,7 @@ export function McpServerList({
             <PopoverTrigger asChild>
               <button
                 type="button"
-                className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/80"
+                className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-3xs text-muted-foreground hover:bg-muted/80"
                 onClick={(e) => e.stopPropagation()}
               >
                 <ServerIcon className="size-2.5 shrink-0" />
@@ -130,7 +130,7 @@ export function McpServerList({
           <span
             key={srv.name}
             title={srv.description ?? srv.name}
-            className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+            className="flex items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-3xs text-muted-foreground"
           >
             <ServerIcon className="size-2.5 shrink-0" />
             {srv.name}
@@ -144,7 +144,7 @@ export function McpServerList({
 /** Small uppercase section label inside the agent-info popover. */
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+    <span className="text-3xs font-medium uppercase tracking-wider text-muted-foreground/70">
       {children}
     </span>
   );
@@ -208,7 +208,7 @@ function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, Mo
         <SectionLabel>
           <span className="inline-flex items-center gap-1">
             Token usage
-            <span className="text-[9px]">{isOpen ? "▼" : "▶"}</span>
+            <span className="text-micro">{isOpen ? "▼" : "▶"}</span>
           </span>
         </SectionLabel>
       </summary>
@@ -224,7 +224,7 @@ function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, Mo
               className="flex flex-col gap-0.5"
               data-testid={`agent-info-model-${model}`}
             >
-              <span className="truncate font-mono text-[11px] text-muted-foreground" title={model}>
+              <span className="truncate font-mono text-2xs text-muted-foreground" title={model}>
                 {model}
               </span>
               {rows.map((row) => (
@@ -416,7 +416,7 @@ function AddPolicyDialog({
                       >
                         <span className="text-sm">{r.name}</span>
                         {r.description && (
-                          <span className="line-clamp-2 text-[11px] text-muted-foreground">
+                          <span className="line-clamp-2 text-2xs text-muted-foreground">
                             {r.description}
                           </span>
                         )}
@@ -443,7 +443,7 @@ function AddPolicyDialog({
                     setFactoryParams({});
                     setParamError(null);
                   }}
-                  className="text-[11px] text-muted-foreground hover:text-foreground"
+                  className="text-2xs text-muted-foreground hover:text-foreground"
                 >
                   Change
                 </button>
@@ -487,7 +487,7 @@ function AddPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="break-words text-[11px] text-muted-foreground">
+                      <p className="break-words text-2xs text-muted-foreground">
                         {prop.description}
                       </p>
                     )}
@@ -847,7 +847,7 @@ function McpServerManagerDialog({
                       className="min-w-0 flex-1 text-left"
                     >
                       <span className="block truncate font-mono text-xs">{server.name}</span>
-                      <span className="block truncate text-[11px] text-muted-foreground">
+                      <span className="block truncate text-2xs text-muted-foreground">
                         {server.transport}
                       </span>
                     </button>
@@ -1183,7 +1183,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                 <PopoverTrigger asChild>
                   <button
                     type="button"
-                    className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/80"
+                    className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-3xs text-muted-foreground hover:bg-muted/80"
                     onClick={(e) => e.stopPropagation()}
                   >
                     <ShieldCheckIcon className="size-2.5 shrink-0" />
@@ -1418,7 +1418,7 @@ export function AgentInfoContent({
       {versionFooter && (
         <div className="py-3">
           <span
-            className="font-mono text-[10px] text-muted-foreground/70"
+            className="font-mono text-3xs text-muted-foreground/70"
             data-testid="agent-info-versions"
           >
             {versionFooter}

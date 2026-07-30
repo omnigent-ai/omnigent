@@ -565,7 +565,8 @@ export function TableHandles({
           // Scope hit-testing to the source table's rows only — prevents the
           // ghost/indicator from jumping to rows in other tables.
           const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
-            HTMLTableRowElement | undefined;
+            | HTMLTableRowElement
+            | undefined;
           const sourceTableEl = sourceRow?.closest("table");
           if (!sourceTableEl) return;
           const tableRows = Array.from(sourceTableEl.querySelectorAll("tr"));
@@ -601,7 +602,8 @@ export function TableHandles({
         } else {
           // Look up target column by X band within the source table only.
           const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
-            HTMLTableRowElement | undefined;
+            | HTMLTableRowElement
+            | undefined;
           const tableEl = sourceRow?.closest("table");
           const firstRow = tableEl?.querySelector("tr") as HTMLTableRowElement | null;
           if (!firstRow) return;
@@ -686,7 +688,7 @@ export function TableHandles({
   const buildRowItems = (h: HandlePos): MenuItemDef[] => [
     {
       label: "Insert row above",
-      icon: <span className="text-[10px] font-bold">↑</span>,
+      icon: <span className="text-3xs font-bold">↑</span>,
       onClick: () => {
         setCursorToCell(editor, h.rowIndex, 0);
         editor.chain().focus().addRowBefore().run();
@@ -694,7 +696,7 @@ export function TableHandles({
     },
     {
       label: "Insert row below",
-      icon: <span className="text-[10px] font-bold">↓</span>,
+      icon: <span className="text-3xs font-bold">↓</span>,
       onClick: () => {
         setCursorToCell(editor, h.rowIndex, 0);
         editor.chain().focus().addRowAfter().run();
@@ -716,7 +718,7 @@ export function TableHandles({
   const buildColItems = (h: HandlePos): MenuItemDef[] => [
     {
       label: "Insert column before",
-      icon: <span className="text-[10px] font-bold">←</span>,
+      icon: <span className="text-3xs font-bold">←</span>,
       onClick: () => {
         setCursorToCell(editor, h.rowIndex, h.colIndex);
         editor.chain().focus().addColumnBefore().run();
@@ -724,7 +726,7 @@ export function TableHandles({
     },
     {
       label: "Insert column after",
-      icon: <span className="text-[10px] font-bold">→</span>,
+      icon: <span className="text-3xs font-bold">→</span>,
       onClick: () => {
         setCursorToCell(editor, h.rowIndex, h.colIndex);
         editor.chain().focus().addColumnAfter().run();
