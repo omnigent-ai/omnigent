@@ -124,6 +124,17 @@ describe("FolderTree sorting", () => {
   });
 });
 
+describe("FolderTree ignored entries", () => {
+  it("fades ignored names without fading tracked names", () => {
+    renderTree({
+      files: [{ ...file("ignored.log"), ignored: true }, file("tracked.ts")],
+    });
+
+    expect(screen.getByText("ignored.log")).toHaveClass("opacity-50");
+    expect(screen.getByText("tracked.ts")).not.toHaveClass("opacity-50");
+  });
+});
+
 describe("FolderTree file size / download alignment", () => {
   it("overlays the download button on the file size so both share one slot", () => {
     // The size label and the hover download button must occupy the same

@@ -493,6 +493,16 @@ class FilesystemRegistry(ABC):
         """Stop any background observers.  Idempotent."""
         return
 
+    def ignored_paths(self, paths: list[str]) -> set[str]:
+        """Return workspace-relative paths ignored by the backing VCS.
+
+        Non-git workspaces have no ignore metadata, so the default is empty.
+
+        :param paths: Workspace-relative paths to classify.
+        :returns: The subset ignored by version control.
+        """
+        return set()
+
     # ── Abstract: must be implemented by subclasses ───────────────
 
     @abstractmethod
@@ -791,6 +801,39 @@ class GitFilesystemRegistry(FilesystemRegistry):
             name="omnigent-git-untracked-cache",
             daemon=True,
         ).start()
+
+    def ignored_paths(self, paths: list[str]) -> set[str]:
+        """Return untracked paths matched by git's standard ignore rules."""
+        normalized = [
+            normalized
+            for path in paths
+            if (normalized := _normalize_path(path, self._cwd)) is not None
+        ]
+        if not normalized:
+            return set()
+
+        argv = ["git", "check-ignore", "-z", "--stdin"]
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._cwd),
+                input=b"\0".join(os.fsencode(path) for path in normalized) + b"\0",
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _logger.info("git check-ignore unavailable in %s: %s", self._cwd, exc)
+            return set()
+        # git check-ignore returns 1 when no input paths are ignored.
+        if result.returncode not in (0, 1):
+            _logger.info(
+                "git check-ignore exited %d in %s: %s",
+                result.returncode,
+                self._cwd,
+                result.stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return set()
+        return {os.fsdecode(path) for path in result.stdout.split(b"\0") if path}
 
     def _enable_untracked_cache(self) -> None:
         """Best-effort ``core.untrackedCache=true`` on this repo.

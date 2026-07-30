@@ -281,6 +281,7 @@ export interface WorkspaceFile {
   type: "file" | "directory";
   bytes: number | null;
   modified_at: number | null;
+  ignored?: boolean;
 }
 
 export interface WorkspaceAllFilesResult {
@@ -297,6 +298,7 @@ interface FilesystemListResponse {
     type: string;
     bytes: number | null;
     modified_at: number | null;
+    ignored?: boolean;
   }>;
   has_more: boolean;
 }
@@ -309,6 +311,7 @@ function mapFilesystemEntries(json: FilesystemListResponse): WorkspaceFile[] {
     type: e.type === "directory" ? "directory" : "file",
     bytes: e.bytes,
     modified_at: e.modified_at,
+    ignored: e.ignored === true,
   }));
 }
 

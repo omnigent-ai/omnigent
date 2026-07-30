@@ -371,6 +371,34 @@ def _git_env() -> dict[str, str]:
     }
 
 
+def test_git_ignored_paths_excludes_tracked_matches(tmp_path: Path) -> None:
+    """Only untracked paths matched by gitignore rules are reported as ignored."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / ".gitignore").write_text("*.log\n")
+    (tmp_path / "tracked.log").write_text("tracked\n")
+    subprocess.run(
+        ["git", "add", "-f", ".gitignore", "tracked.log"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    (tmp_path / "ignored.log").write_text("ignored\n")
+    (tmp_path / "visible.txt").write_text("visible\n")
+
+    registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert registry.ignored_paths(["tracked.log", "ignored.log", "visible.txt"]) == {"ignored.log"}
+
+
 def test_get_baseline_uses_git_show_for_committed_file(tmp_path: Path) -> None:
     """``get_baseline`` returns committed content via ``git show HEAD:<path>`` in a git workspace.
 

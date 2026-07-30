@@ -2959,7 +2959,6 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(session_id: str) -> StreamingResponse:
-
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -4998,7 +4997,6 @@ def create_runner_app(
         *,
         error: dict[str, Any] | None = None,
     ) -> None:
-
         _active_turns.pop(conv_id, None)
         _live_response_id.pop(conv_id, None)
         if process_manager is not None:
@@ -5142,7 +5140,6 @@ def create_runner_app(
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
-
         _seq = _ingest_next_seq.get(session_id, 0)
         _ingest_next_seq[session_id] = _seq + 1
         _cond = _ingest_cond.get(session_id)
@@ -7452,6 +7449,10 @@ def create_runner_app(
             )
         return spec
 
+    async def _ignored_workspace_paths(session_id: str, paths: list[str]) -> set[str]:
+        registry = await _resolve_session_fs_registry(session_id)
+        return registry.ignored_paths(paths) if registry is not None else set()
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem")
     async def list_environment_root(
         session_id: str,
@@ -7499,7 +7500,8 @@ def create_runner_app(
             exclude=exclude_patterns,
             limit=limit,
         )
-        data = [_fs_entry_to_dict(e) for e in entries]
+        ignored = await _ignored_workspace_paths(session_id, [entry.path for entry in entries])
+        data = [_fs_entry_to_dict(entry, ignored=entry.path in ignored) for entry in entries]
         return JSONResponse(
             status_code=200,
             content={"object": "list", "data": data, "has_more": len(entries) >= limit},
@@ -8162,7 +8164,10 @@ def create_runner_app(
                 before=before,
                 order=order,
             )
-            data = [_fs_entry_to_dict(e) for e in page.data]
+            ignored = await _ignored_workspace_paths(
+                session_id, [entry.path for entry in page.data]
+            )
+            data = [_fs_entry_to_dict(entry, ignored=entry.path in ignored) for entry in page.data]
             return JSONResponse(
                 status_code=200,
                 content={
@@ -8193,8 +8198,12 @@ def create_runner_app(
             payload["content"] = base64.b64encode(content.data).decode()
         return JSONResponse(status_code=200, content=payload)
 
-    def _fs_entry_to_dict(entry: FilesystemEntry) -> dict[str, object]:
-        return {
+    def _fs_entry_to_dict(
+        entry: FilesystemEntry,
+        *,
+        ignored: bool | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
             "id": entry.id,
             "object": "session.environment.filesystem.entry",
             "name": entry.name,
@@ -8203,6 +8212,9 @@ def create_runner_app(
             "bytes": entry.bytes,
             "modified_at": entry.modified_at,
         }
+        if ignored is not None:
+            payload["ignored"] = ignored
+        return payload
 
     @app.post("/v1/sessions/{session_id}/resources/environments/{environment_id}/shell")
     async def run_environment_shell(

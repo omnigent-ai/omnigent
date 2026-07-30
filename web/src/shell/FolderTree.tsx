@@ -58,6 +58,7 @@ interface DirNode {
    *  directories can participate in the "last edited" sort. Undefined for dirs
    *  synthesized from a nested file's path, which carry no mtime of their own. */
   modifiedAt?: number | null;
+  ignored?: boolean;
   /** When true the children come from an explicit directory entry and must be
    *  fetched on demand rather than being statically known from file paths. */
   lazy?: boolean;
@@ -117,6 +118,7 @@ function buildTree(files: WorkspaceFile[], sort: ChangedSort = "alpha"): TreeNod
           path: file.path,
           children: [],
           modifiedAt: file.modified_at,
+          ignored: file.ignored,
           lazy: true,
         });
       }
@@ -429,6 +431,7 @@ function FileRowItem({
   labelIsPath = false,
   depth = 0,
   fileStatus,
+  ignored = false,
   bytes,
   onFileSelect,
   conversationId,
@@ -444,6 +447,7 @@ function FileRowItem({
    *  same column as a folder's chevron at this depth. */
   depth?: number;
   fileStatus: WorkspaceChangedFile["status"] | undefined;
+  ignored?: boolean;
   bytes: number | null;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
@@ -480,6 +484,7 @@ function FileRowItem({
               "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
               labelIsPath ? "[direction:rtl]" : fileStatus === "created" && "font-semibold",
               isDeleted && "line-through opacity-50",
+              ignored && "opacity-50",
               fileColorClass,
             )}
             {...handlers}
@@ -544,6 +549,7 @@ function SearchResultRow({
       displayLabel={file.path}
       labelIsPath={true}
       fileStatus={changedFileMap.get(file.path)}
+      ignored={file.ignored}
       bytes={file.bytes}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
@@ -574,6 +580,7 @@ function TreeFileRow({
       displayLabel={node.name}
       depth={depth}
       fileStatus={fileStatus}
+      ignored={node.file.ignored}
       bytes={node.file.bytes}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
@@ -643,6 +650,7 @@ function TreeNodeRow({
                 path: file.path,
                 children: [],
                 modifiedAt: file.modified_at,
+                ignored: file.ignored,
                 lazy: true,
               };
             }
@@ -684,6 +692,7 @@ function TreeNodeRow({
           className={cn(
             "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
             dirStatus === "created" && "font-semibold",
+            node.ignored && "opacity-50",
             dirDotClass,
           )}
         >
