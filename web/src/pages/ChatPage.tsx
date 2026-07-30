@@ -1749,7 +1749,7 @@ function MainAgentSurface({
             ) : (
               <>
                 {/* Older pages prepend here while their request is in flight. */}
-                {loadingMoreHistory && <HistoryLoadingSkeleton />}
+                {loadingMoreHistory && <HistoryLoadingIndicator />}
                 {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
                 ))}
@@ -2109,29 +2109,14 @@ function PreserveScrollDistanceOnResize() {
   return null;
 }
 
-function HistoryLoadingSkeleton() {
+function HistoryLoadingIndicator() {
   return (
-    <div role="status" aria-label="Loading earlier messages" className="flex flex-col gap-4 py-2">
-      <div aria-hidden className="flex flex-col gap-8 animate-pulse">
-        <Message from="assistant" className="max-w-3xl">
-          <MessageContent className="w-full">
-            <div className="h-3 w-3/4 rounded-full bg-muted" />
-            <div className="h-3 w-1/2 rounded-full bg-muted" />
-          </MessageContent>
-        </Message>
-        <Message from="user" className="max-w-3xl">
-          <MessageContent className="w-2/3">
-            <div className="h-3 w-full rounded-full bg-muted-foreground/15" />
-            <div className="h-3 w-2/3 rounded-full bg-muted-foreground/15" />
-          </MessageContent>
-        </Message>
-        <Message from="assistant" className="max-w-3xl">
-          <MessageContent className="w-full">
-            <div className="h-3 w-2/3 rounded-full bg-muted" />
-            <div className="h-3 w-5/12 rounded-full bg-muted" />
-          </MessageContent>
-        </Message>
-      </div>
+    <div
+      role="status"
+      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm"
+    >
+      <Loader2Icon className="size-4 animate-spin" aria-hidden />
+      Loading earlier messages…
     </div>
   );
 }
