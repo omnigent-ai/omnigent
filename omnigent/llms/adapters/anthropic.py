@@ -7,10 +7,12 @@ Messages API. Ported from MLflow AI Gateway's AnthropicAdapter.
 
 from __future__ import annotations
 
+import asyncio
 import base64
-import hashlib
+import hmac
 import json
 import logging
+import secrets
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -35,10 +37,12 @@ _DEFAULT_MAX_TOKENS = 16384
 _REQUEST_TIMEOUT = 120
 _STREAM_TIMEOUT = 300
 _MODEL_METADATA_TTL_S = 300.0
-_MODEL_METADATA_CACHE: TTLCache[tuple[str, str, bytes], ModelMetadata | None] = TTLCache(
+_MODEL_METADATA_CACHE_PARTITION_SECRET = secrets.token_bytes(32)
+_MODEL_METADATA_CACHE: TTLCache[tuple[str, str, bytes], ModelMetadata] = TTLCache(
     maxsize=128,
     ttl=_MODEL_METADATA_TTL_S,
 )
+_MODEL_METADATA_IN_FLIGHT: dict[tuple[str, str, bytes], asyncio.Task[ModelMetadata | None]] = {}
 _MODEL_METADATA_CACHE_LOCK = threading.Lock()
 
 
@@ -197,13 +201,13 @@ def _chat_to_anthropic(
                     )
                 payload["thinking"] = {"type": "adaptive"}
                 payload["output_config"] = {"effort": effort}
-                payload.pop("temperature", None)
-                payload.pop("top_p", None)
             else:
                 payload["thinking"] = {
                     "type": "enabled",
                     "budget_tokens": _effort_to_budget(effort, max_tokens),
                 }
+            payload.pop("temperature", None)
+            payload.pop("top_p", None)
 
     return payload
 
@@ -222,33 +226,73 @@ async def _get_anthropic_model_metadata(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ModelMetadata | None:
     """Fetch and cache one model's live capability metadata."""
-    credential_hash = hashlib.sha256(headers.get("x-api-key", "").encode()).digest()
-    cache_key = (base_url, model, credential_hash)
+    credential_partition = hmac.digest(
+        _MODEL_METADATA_CACHE_PARTITION_SECRET,
+        headers.get("x-api-key", "").encode(),
+        "sha256",
+    )
+    cache_key = (base_url, model, credential_partition)
     with _MODEL_METADATA_CACHE_LOCK:
         if cache_key in _MODEL_METADATA_CACHE:
-            cached: ModelMetadata | None = _MODEL_METADATA_CACHE[cache_key]
-            return cached
+            return _MODEL_METADATA_CACHE[cache_key]
+        task = _MODEL_METADATA_IN_FLIGHT.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(
+                _fetch_anthropic_model_metadata(
+                    headers,
+                    base_url,
+                    model,
+                    cache_key,
+                    transport=transport,
+                )
+            )
+            _MODEL_METADATA_IN_FLIGHT[cache_key] = task
 
+    return await asyncio.shield(task)
+
+
+async def _fetch_anthropic_model_metadata(
+    headers: dict[str, str],
+    base_url: str,
+    model: str,
+    cache_key: tuple[str, str, bytes],
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> ModelMetadata | None:
+    """Fetch model metadata and cache successful lookups."""
     try:
-        url = f"{_models_url(base_url)}/{quote(model, safe='')}"
-        async with httpx.AsyncClient(transport=transport, timeout=_REQUEST_TIMEOUT) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            payload = response.json()
-        metadata = parse_anthropic_model_metadata(payload) if isinstance(payload, dict) else None
-    except (httpx.HTTPError, ValueError):
-        _logger.debug("Anthropic model metadata lookup failed for %s", model, exc_info=True)
-        metadata = None
+        try:
+            url = f"{_models_url(base_url)}/{quote(model, safe='')}"
+            async with httpx.AsyncClient(transport=transport, timeout=_REQUEST_TIMEOUT) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+            metadata = (
+                parse_anthropic_model_metadata(payload) if isinstance(payload, dict) else None
+            )
+        except (httpx.HTTPError, ValueError):
+            _logger.debug("Anthropic model metadata lookup failed for %s", model, exc_info=True)
+            return None
 
-    with _MODEL_METADATA_CACHE_LOCK:
-        _MODEL_METADATA_CACHE[cache_key] = metadata
-    return metadata
+        if metadata is not None:
+            with _MODEL_METADATA_CACHE_LOCK:
+                _MODEL_METADATA_CACHE[cache_key] = metadata
+        return metadata
+    finally:
+        current_task = asyncio.current_task()
+        with _MODEL_METADATA_CACHE_LOCK:
+            if _MODEL_METADATA_IN_FLIGHT.get(cache_key) is current_task:
+                del _MODEL_METADATA_IN_FLIGHT[cache_key]
 
 
 def _clear_model_metadata_cache() -> None:
     """Clear cached model metadata for tests."""
     with _MODEL_METADATA_CACHE_LOCK:
         _MODEL_METADATA_CACHE.clear()
+        tasks = list(_MODEL_METADATA_IN_FLIGHT.values())
+        _MODEL_METADATA_IN_FLIGHT.clear()
+    for task in tasks:
+        task.cancel()
 
 
 def _convert_assistant_message(m: dict[str, Any]) -> dict[str, Any]:

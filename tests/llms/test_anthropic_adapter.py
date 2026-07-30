@@ -430,9 +430,16 @@ def test_effort_to_budget_low_clamped_to_max_tokens() -> None:
 def test_reasoning_effort_adds_thinking_to_payload() -> None:
     """Unknown model metadata preserves fixed-budget thinking."""
     messages = [{"role": "user", "content": "Hi"}]
-    payload = _chat_to_anthropic(messages, "claude-test", None, {"reasoning_effort": "high"})
+    payload = _chat_to_anthropic(
+        messages,
+        "claude-test",
+        None,
+        {"reasoning_effort": "high", "temperature": 0.4, "top_p": 0.9},
+    )
     assert payload["thinking"]["type"] == "enabled"
     assert payload["thinking"]["budget_tokens"] == 8192
+    assert "temperature" not in payload
+    assert "top_p" not in payload
 
 
 def test_adaptive_reasoning_uses_effort_and_removes_sampling_controls() -> None:
@@ -470,12 +477,14 @@ def test_fixed_budget_metadata_keeps_budget_tokens() -> None:
         [{"role": "user", "content": "Hi"}],
         "claude-haiku-4-5",
         None,
-        {"reasoning_effort": "medium"},
+        {"reasoning_effort": "medium", "temperature": 0.4, "top_p": 0.9},
         model_metadata=metadata,
     )
 
     assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4096}
     assert "output_config" not in payload
+    assert "temperature" not in payload
+    assert "top_p" not in payload
 
 
 def test_adaptive_reasoning_rejects_unsupported_model_effort() -> None:
@@ -549,6 +558,73 @@ async def test_model_metadata_lookup_uses_models_api_and_caches() -> None:
     assert first.reasoning.modes == frozenset({ModelReasoningMode.ADAPTIVE})
     assert first.reasoning.efforts == frozenset({"low", "high"})
     assert first.context_window == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_lookup_does_not_cache_failures() -> None:
+    """A transient lookup failure is retried on the next request."""
+    requests_seen = 0
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        if requests_seen == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"id": "claude-opus-4-8"})
+
+    transport = httpx.MockTransport(_handler)
+    headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
+
+    first = await _get_anthropic_model_metadata(
+        headers,
+        "https://api.anthropic.com/v1",
+        "claude-opus-4-8",
+        transport=transport,
+    )
+    second = await _get_anthropic_model_metadata(
+        headers,
+        "https://api.anthropic.com/v1",
+        "claude-opus-4-8",
+        transport=transport,
+    )
+
+    assert first is None
+    assert second is not None
+    assert requests_seen == 2
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_lookup_deduplicates_concurrent_fetches() -> None:
+    """Concurrent cold lookups share one Models API request."""
+    requests_seen = 0
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        await asyncio.sleep(0)
+        return httpx.Response(200, json={"id": "claude-opus-4-8"})
+
+    transport = httpx.MockTransport(_handler)
+    headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
+
+    first, second = await asyncio.gather(
+        _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        ),
+        _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        ),
+    )
+
+    assert first == second
+    assert first is not None
+    assert requests_seen == 1
 
 
 # ── Stop sequences ───────────────────────────────────────
