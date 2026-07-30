@@ -39,7 +39,8 @@ _STREAM_TIMEOUT = 300
 _MODEL_METADATA_TIMEOUT_S = 10.0
 _MODEL_METADATA_TTL_S = 300.0
 _MODEL_METADATA_CACHE_PARTITION_SALT = secrets.token_bytes(32)
-_MODEL_METADATA_CACHE_PARTITION_ITERATIONS = 200_000
+# One round avoids blocking the event loop; API keys are already high-entropy secrets.
+_MODEL_METADATA_CACHE_PARTITION_ITERATIONS = 1
 _MODEL_METADATA_CACHE: TTLCache[tuple[str, str, bytes], ModelMetadata] = TTLCache(
     maxsize=128,
     ttl=_MODEL_METADATA_TTL_S,
