@@ -11,14 +11,14 @@ from omnigent.entities.conversation import (
 )
 
 
-def _message_item(created_by: str | None) -> ConversationItem:
+def _message_item(created_by: str | None, created_at: int = 0) -> ConversationItem:
     """Build a persisted user-message item with the given author."""
     return ConversationItem(
         id="msg_1",
         type="message",
         status="completed",
         response_id="resp_1",
-        created_at=0,
+        created_at=created_at,
         data=MessageData(
             role="user",
             content=[{"type": "input_text", "text": "hi"}],
@@ -31,6 +31,12 @@ def test_to_api_dict_exposes_created_by_when_set() -> None:
     """A human-authored item surfaces ``created_by`` in the API shape."""
     api = _message_item("alice@example.com").to_api_dict()
     assert api["created_by"] == "alice@example.com"
+
+
+def test_to_api_dict_exposes_created_at() -> None:
+    """Flat API items carry the persisted creation timestamp."""
+    api = _message_item(None, created_at=1_704_067_200).to_api_dict()
+    assert api["created_at"] == 1_704_067_200
 
 
 def test_to_api_dict_omits_created_by_when_none() -> None:

@@ -1408,6 +1408,7 @@ def _publish_input_consumed(
             type=item.type,
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
+            created_at=item.created_at,
             cleared_pending_id=cleared_pending_id,
         ),
     )

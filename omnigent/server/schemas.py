@@ -2948,6 +2948,8 @@ class SessionInputConsumedPayload(BaseModel):
         e.g. ``"alice@example.com"``. ``None`` for agent/tool/system
         items and single-user mode. Mirrors
         :meth:`ConversationItem.to_api_dict` for live attribution.
+    :param created_at: Unix epoch seconds when the item was persisted.
+        Mirrors :class:`ConversationItem.created_at` for live clients.
     :param cleared_pending_id: When this consumed message drains a
         :mod:`omnigent.runtime.pending_inputs` entry (a native-
         terminal web message round-tripping back from the transcript),
@@ -2963,6 +2965,7 @@ class SessionInputConsumedPayload(BaseModel):
     # (matches :class:`SessionEventInput.data`).
     data: dict[str, Any]
     created_by: str | None = None
+    created_at: int | None = None
     cleared_pending_id: str | None = None
 
     model_config = ConfigDict(extra="ignore")
