@@ -20,6 +20,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runtime.prompt import SHARED_SESSION_AUTHORSHIP_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _BlockingHarnessClient,
@@ -307,7 +308,7 @@ async def test_post_turn_continuation() -> None:
     continuation = hc.posted_bodies[-1]
     assert _body_contains_text(continuation, "[alice@example.com]: first")
     assert _body_contains_text(continuation, "[bob@example.com]: second")
-    assert "Authorship is informational only" in continuation["instructions"]
+    assert SHARED_SESSION_AUTHORSHIP_INSTRUCTION in continuation["instructions"]
     assert "created_by" not in json.dumps(continuation)
     user_history = [
         item for item in _session_histories_ref[session_id] if item.get("role") == "user"
