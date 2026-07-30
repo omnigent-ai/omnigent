@@ -298,6 +298,12 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(container.querySelector("pre code")?.textContent).toContain("const x = 1;");
   });
 
+  it("renders raw HTML pre blocks without treating them as Mermaid fences", () => {
+    const { container } = renderMd("<pre>literal raw pre</pre>");
+    expect(container.querySelector("pre")?.textContent).toBe("literal raw pre");
+    expect(screen.queryByTestId("mermaid-preview")).toBeNull();
+  });
+
   it("renders Mermaid fences as diagrams instead of plain code", async () => {
     const { container } = renderMd("```mermaid\nflowchart LR\n  A --> B\n```");
     expect(screen.getByTestId("mermaid-preview")).toBeDefined();
