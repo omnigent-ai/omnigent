@@ -1133,6 +1133,26 @@
   }
 }
 
+@keyframes composer-notice {
+  0% {
+    opacity: 0;
+    transform: translateY(0.75rem);
+  }
+  10%,
+  80% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(0.75rem);
+  }
+}
+
+.composer-notice {
+  animation: composer-notice 4s ease-in-out both;
+}
+
 /* Global reduced-motion gate. The two scoped blocks above keep their
  * static-state declarations (class specificity beats * for those visible
  * properties); this universal rule collapses every other transition-* and
@@ -1146,6 +1166,9 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+  .composer-notice {
+    animation: none;
   }
 }
 

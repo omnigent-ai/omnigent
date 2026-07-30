@@ -8339,6 +8339,8 @@ def create_runner_app(
         await _teardown_session_terminals(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))
+        _session_histories.pop(session_id, None)
+        _last_server_item_id.pop(session_id, None)
         return JSONResponse(
             status_code=200,
             content={

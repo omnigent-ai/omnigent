@@ -291,6 +291,8 @@ from omnigent.server.schemas import (
     SessionResourceObject,
     SessionResourcePaginatedList,
     SessionResponse,
+    SessionRevertRequest,
+    SessionRevertResponse,
     SessionSwitchAgentRequest,
     SkillSummary,
     UpdateSessionRequest,

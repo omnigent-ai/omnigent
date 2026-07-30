@@ -5542,6 +5542,93 @@ async def _cmd_fork(
     )
 
 
+def _revert_user_messages(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return selectable, non-meta user messages newest first."""
+    return [
+        item
+        for item in reversed(items)
+        if item.get("type") == "message"
+        and item.get("role") == "user"
+        and not item.get("is_meta")
+        and not _extract_message_text(item).lstrip().startswith("[System:")
+        and isinstance(item.get("id"), str)
+    ]
+
+
+async def _pick_revert_message(items: list[dict[str, object]]) -> str | None:
+    """Open the prompt-toolkit message picker for ``/revert``."""
+    from prompt_toolkit.application import run_in_terminal
+    from prompt_toolkit.shortcuts import radiolist_dialog
+
+    candidates = _revert_user_messages(items)
+    if not candidates:
+        return None
+
+    def choose_message() -> str | None:
+        values = []
+        for item in candidates:
+            text = " ".join(_extract_message_text(item).split()) or "(attachments only)"
+            if len(text) > 88:
+                text = text[:87].rstrip() + "…"
+            values.append((str(item["id"]), text))
+        return radiolist_dialog(
+            title="Revert conversation",
+            text="Choose the user message to return to.",
+            values=values,
+        ).run()
+
+    return await run_in_terminal(choose_message, in_executor=True)
+
+
+@_cmd("/revert", "Revert to a past user message")
+async def _cmd_revert(
+    arg: str,
+    session: Session,
+    client: OmnigentClient,
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+) -> None:
+    """Rewind this session to before a selected user message."""
+    current_id = getattr(session, "session_id", None)
+    if current_id is None:
+        host.output(Text("  /revert requires the sessions API.", style="bold red"))
+        return
+    args = arg.split()
+    if len(args) > 1 or (args and args[0].startswith("-")):
+        host.output(Text("  Usage: /revert [user-message-id]", style="bold red"))
+        return
+    try:
+        items = await _list_all_conversation_items(client, current_id)
+        if args:
+            selected = args[0]
+        elif not _revert_user_messages(items):
+            host.output(Text(f"  [{fmt.muted}]No user messages to revert to.[/{fmt.muted}]"))
+            return
+        else:
+            selected = await _pick_revert_message(items)
+        if selected is None:
+            return
+        result = await client.sessions.revert(current_id, selected)
+        await _attach_to_conversation(
+            current_id,
+            session,
+            client,
+            host,
+            fmt,
+            ui_name=_humanize_agent_name(session.model),
+            redraw_screen=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — command boundary renders failures inline
+        _log.exception("Revert failed")
+        host.output(Text(f"  Revert failed: {exc}", style="bold red"))
+        return
+
+    host.output(Text.from_markup(f"  [{fmt.muted}]Reverted this session.[/{fmt.muted}]"))
+    draft = result.get("draft")
+    if isinstance(draft, str) and draft:
+        host.output(Text.from_markup(f"\n  [bold]Message to retry[/]\n  {escape(draft)}"))
+
+
 @_cmd("/history", "Show current conversation history")
 async def _cmd_history(
     arg: str,  # noqa: ARG001 — dispatch-contract params

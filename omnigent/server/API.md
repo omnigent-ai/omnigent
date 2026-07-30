@@ -1106,6 +1106,38 @@ shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
 
+### Revert Session
+
+```
+POST /v1/sessions/{source_id}/revert
+Content-Type: application/json
+
+{
+  "user_message_id": "msg_abc123"
+}
+
+200 OK
+{
+  "draft": "Original prompt text"
+}
+```
+
+Deletes the selected user message and every later conversation item
+while preserving the session ID, metadata, agent binding, and earlier
+history. Native runtime state is reset so discarded native history
+cannot reappear, and the selected prompt is returned for editing.
+
+Workspace files, Git state, and files outside the workspace are never
+read or modified by this endpoint.
+
+```
+400 Bad Request — the target is not a selectable user message, the
+  session is a sub-agent, or the session has no agent binding
+404 Not Found — no session or bound agent exists
+409 Conflict — the session has an active or waiting turn
+503 Service Unavailable — a connected native runtime could not reset
+```
+
 ### Stream Session
 
 ```
