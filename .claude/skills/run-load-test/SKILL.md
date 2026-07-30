@@ -1,20 +1,32 @@
 ---
 name: run-load-test
-description: Run a Locust load test against an Omnigent server and produce a results file explaining the latencies. Load when the user wants to load-test / stress-test / benchmark concurrency against an Omnigent server or deployment ("load test omnigent", "stress test the server", "how many websocket connections can it handle", "run a load test against staging"). Gathers the inputs (server URL, host id, users / spawn-rate / run-time, auth token), runs dev/loadtest/run.py, then reads the generated summary.md and explains the latency distribution (avg/median/p95/p99, throughput, failures) back to the user. NOT for single-request latency micro-benchmarks (that is dev/benchmarks/).
+description: Run an Omnigent load test and produce a results file explaining the latencies. Load when the user wants to load-test / stress-test / benchmark concurrency against an Omnigent server ("load test omnigent", "stress test the server", "how many websocket connections can it handle", "run a load test against staging", "load test real agent turns / conversations", "how many concurrent conversations can the runner handle"). Two scenarios: WebSocket fan-out (dev/loadtest/run.py — sockets, any server) and runner turns (dev/loadtest/turn_load.py — real multi-turn conversations through the runner with a mocked LLM, boots its own local stack). Gathers inputs, runs the right one, then reads the generated summary.md and explains the latency distribution (avg/median/p95/p99, throughput, failures). NOT for single-request latency micro-benchmarks (that is dev/benchmarks/).
 ---
 
 # Run an Omnigent load test
 
-Drives the load test in `dev/loadtest/` (Locust) end to end: collect inputs →
-run → read the generated result set → explain the latencies. The scenario opens
-**N concurrent WebSocket connections** to the client-facing live-updates socket
-`WS /v1/sessions/updates` and holds them open, so it measures the server's
-WebSocket fan-out under concurrency (handshake, auth/origin gating, watch-set
-diffing, heartbeat). It needs **no runner, LLM, or agent turns**, so it runs
-against any server — a fresh local one or a real deployment.
+Drives a load test in `dev/loadtest/` end to end: collect inputs → run → read the
+generated `summary.md` → explain the latencies. There are **two scenarios** —
+pick by what the user wants to stress:
 
-For single-request latency micro-benchmarks (not concurrency), that is a
-different tool: `dev/benchmarks/`.
+| If the user wants to test… | Use | Tool |
+|---|---|---|
+| WebSocket / connection fan-out, or load an existing/remote server | **Scenario A** | `dev/loadtest/run.py` (Locust) |
+| Real agent **turns / conversations** through the runner | **Scenario B** | `dev/loadtest/turn_load.py` (asyncio) |
+
+- **Scenario A** opens N concurrent WebSocket connections to `WS
+  /v1/sessions/updates` and holds them open — control-plane fan-out only (**no
+  runner, LLM, or agent turns**), so it runs against any server, local or remote.
+- **Scenario B** drives N concurrent conversations of M sequential turns each
+  through the runner with the **LLM mocked** (zero latency), measuring per-turn
+  overhead as history grows. It **boots its own local stack** (server + mock LLM
+  + runner) and runs from a repo checkout only — there is no server to point at.
+
+If it's ambiguous which they want, ask (AskUserQuestion). For single-request
+latency micro-benchmarks (not concurrency), that is a different tool:
+`dev/benchmarks/`.
+
+# Scenario A — WebSocket fan-out
 
 ## 1. Gather inputs
 
@@ -113,8 +125,58 @@ If failures appeared or tail latency looks high, suggest a concrete next step
 (ramp users up/down, lengthen run-time to see steady state, check the server's
 own logs/metrics).
 
+# Scenario B — Runner turns (real conversations, mocked LLM)
+
+Use this when the user wants to load-test **actual agent turns / conversations**
+through the runner. It boots its own local stack, so it needs no `--server`.
+
+## 1. Ensure deps
+
+Needs the harness + bench deps on top of the load-test extra:
+
+```bash
+pip install -e '.[loadtest,dev,agents-sdk]'   # or: uv sync --extra loadtest --extra dev --extra agents-sdk
+```
+
+Must run **from a repo checkout** (imports `dev.benchmarks` and `tests`), with
+the same interpreter the deps are installed in.
+
+## 2. Gather inputs
+
+| Input | Flag | Default | Notes |
+|---|---|---|---|
+| Conversations | `--conversations` | 10 | Concurrent conversations (N). |
+| Turns | `--turns` | 8 | Sequential turns per conversation (M) — history grows across them. |
+| Reply length | `--reply-words` | 80 | Words in the mocked (streamed) reply per turn. |
+| Turn timeout | `--turn-timeout` | 180 | Per-turn timeout (s). |
+
+Scale guidance: start at `--conversations 2 --turns 3` to confirm the stack
+boots on this machine (first boot spawns server + mock + runner, ~10-30s), then
+ramp. Booting can take a bit; don't treat a slow first run as a failure.
+
+## 3. Run
+
+```bash
+python dev/loadtest/turn_load.py --conversations 10 --turns 8
+```
+
+It prints the result dir (`dev/loadtest/results/turn_load-<timestamp>/`).
+
+## 4. Read and explain
+
+`Read` the `summary.md` and relay it. Focus on:
+
+- **Outcome / failures** first. A boot failure says "FAILED TO BOOT — see
+  console.log" (usually a missing dep — check the `agents-sdk` / `dev` extras).
+- **turn** latency — the headline: one full post→idle turn through the runner
+  with the model mocked, so it is Omnigent's own per-turn overhead. Note that it
+  **grows across a conversation** as history accumulates, so a rising p95/p99 as
+  `--turns` increases is expected and the interesting signal.
+- **Ops/s** — the runner's concurrent turn throughput (one runner serves all N).
+- **session create** — create + runner-bind cost, once per conversation.
+
 ## Notes
 
-- The scenario file is `dev/loadtest/ws_load_test.py`; run `--locustfile <other>`
-  to point the runner at a different scenario if one is added later.
+- Scenario A file: `dev/loadtest/ws_load_test.py` (`--locustfile <other>` points
+  `run.py` at a different locustfile). Scenario B file: `dev/loadtest/turn_load.py`.
 - Full reference: `dev/loadtest/README.md`.
