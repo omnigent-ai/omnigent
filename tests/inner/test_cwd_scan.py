@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner._cwd_scan import MaskedEntry, scan_cwd_mask_entries
+from omnigent.inner._cwd_scan import MaskedEntry, merge_scan_roots, scan_cwd_mask_entries
 
 # The walker contract says ``safe_roots`` should include cwd plus the
 # backend-specific exposed mounts. For these decision-level tests we
@@ -785,3 +785,49 @@ def test_unreadable_subdirectory_is_skipped_silently(tmp_path: Path) -> None:
         assert "locked" not in str(entry.path) or entry.path == sub, (
             f"Unreadable subdir leaked a child mask entry: {entry.path}"
         )
+
+
+def test_merge_scan_roots_dedupes_cwd_nested_and_duplicates(tmp_path: Path) -> None:
+    """
+    ``merge_scan_roots`` folds the read + write grant lists into one
+    set of roots to walk beyond cwd: it drops roots at-or-under cwd,
+    drops a root nested under another kept root, dedupes exact repeats
+    (including a path granted both read and write), and returns the
+    survivors ancestor-first.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    a.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
+    nested = a / "child"  # under ``a`` → subsumed
+    nested.mkdir()
+    under_cwd = cwd / "sub"  # under cwd → covered by the cwd scan
+    under_cwd.mkdir()
+
+    result = merge_scan_roots(
+        cwd,
+        [a, b, a, cwd],  # read grants: duplicate ``a`` and cwd itself
+        [b, nested, under_cwd],  # write grants: dup ``b``, a nested + under-cwd root
+    )
+
+    # Only the two distinct outside-cwd top roots survive, ancestor-
+    # first (siblings ordered lexicographically).
+    assert result == [a, b], result
+
+
+def test_merge_scan_roots_keeps_ancestor_of_cwd(tmp_path: Path) -> None:
+    """
+    A grant that is an ANCESTOR of cwd is still walked — cwd only
+    covers itself and its descendants, so the rest of the ancestor
+    tree (siblings of cwd) would otherwise go unscanned.
+    """
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    cwd = parent / "work"
+    cwd.mkdir()
+
+    result = merge_scan_roots(cwd, [parent], None)
+
+    assert result == [parent], result

@@ -1167,6 +1167,74 @@ def test_mask_paths_hides_explicit_file_and_dir(tmp_path: Path) -> None:
     )
 
 
+def test_write_paths_root_dotfiles_are_masked(tmp_path: Path) -> None:
+    """
+    A ``write_paths`` root outside cwd gets the same dotfile masking as
+    a ``read_paths`` root: its top-level ``.env`` / ``.aws`` are hidden
+    even though the grant is for writing, not reading. Without scanning
+    write roots the helper could read (and overwrite) secrets living in
+    a writable directory outside cwd.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    (external / ".aws").mkdir()
+    (external / ".aws" / "credentials").write_text("[default]")
+    (external / "notes.txt").write_text("ok")  # non-dotfile stays visible
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(
+        cwd,
+        write_roots=[external.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    ext = external.resolve(strict=False)
+    assert _has_pair(argv, "--bind-try", "/dev/null", str(ext / ".env")), (
+        ".env under a write_paths root must be masked — write grants are scanned too."
+    )
+    assert _has_pair_single_dest(argv, "--tmpfs", str(ext / ".aws")), (
+        ".aws/ under a write_paths root must be tmpfs-masked."
+    )
+    assert not _argv_mentions(argv, str(ext / "notes.txt"), after_token="--bind-try"), (
+        "Non-dotfiles under a write_paths root must stay visible."
+    )
+
+
+def test_read_write_overlap_scanned_once(tmp_path: Path) -> None:
+    """
+    A path granted as BOTH a read and a write root is walked once —
+    ``merge_scan_roots`` dedupes the grant lists, so the ``.env`` mask
+    triple is emitted a single time, not once per grant list.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    ext = external.resolve(strict=False)
+
+    backend = _make_backend()
+    policy = _make_policy(
+        cwd,
+        read_roots=[ext],
+        write_roots=[ext],
+        allow_hidden=[".venv"],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    target = str(ext / ".env")
+    count = sum(
+        1
+        for i in range(len(argv) - 2)
+        if argv[i] == "--bind-try" and argv[i + 1] == "/dev/null" and argv[i + 2] == target
+    )
+    assert count == 1, f"Expected a single .env mask across overlapping grants, got {count}."
+
+
 def test_dotfile_masking_skips_target_that_vanished_after_scan(
     tmp_path: Path,
 ) -> None:

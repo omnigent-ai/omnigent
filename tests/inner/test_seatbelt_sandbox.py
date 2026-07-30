@@ -2233,6 +2233,69 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
     )
 
 
+def test_write_paths_dotfile_masking_masks_external_write_root(tmp_path: Path) -> None:
+    """
+    A ``write_paths`` root outside cwd is dotfile-masked just like a
+    ``read_paths`` root: its top-level ``.env`` gets a ``(literal ...)``
+    deny and its ``.aws/`` a ``(subpath ...)`` deny, even though the
+    grant is for writing. Without scanning write roots the helper could
+    read (and clobber) secrets in a writable directory outside cwd.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    (external / ".aws").mkdir()
+    (external / ".aws" / "credentials").write_text("[default]")
+    (external / "notes.txt").write_text("ok")  # non-dotfile stays visible
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+
+    policy = _make_policy(
+        cwd,
+        write_roots=[external.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    ext = external.resolve(strict=False)
+    env_deny = f'(deny file-read* file-write* (literal "{ext / ".env"}"))'
+    aws_deny = f'(deny file-read* file-write* (subpath "{ext / ".aws"}"))'
+    notes_deny = f'(deny file-read* file-write* (literal "{ext / "notes.txt"}"))'
+    assert env_deny in profile, (
+        ".env under a write_paths root must be masked — write grants are scanned too."
+    )
+    assert aws_deny in profile, ".aws/ under a write_paths root must get a (subpath ...) deny."
+    assert notes_deny not in profile, "Non-dotfiles under a write_paths root must stay visible."
+
+
+def test_read_write_overlap_masked_once(tmp_path: Path) -> None:
+    """
+    A path granted as BOTH a read and a write root is walked once —
+    ``merge_scan_roots`` dedupes the grant lists, so its ``.env`` deny
+    lands a single time, not once per grant list.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    ext = external.resolve(strict=False)
+
+    policy = _make_policy(
+        cwd,
+        read_roots=[ext],
+        write_roots=[ext],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    env_deny = f'(deny file-read* file-write* (literal "{ext / ".env"}"))'
+    assert profile.count(env_deny) == 1, (
+        f"Expected a single .env deny across overlapping read+write grants, "
+        f"got {profile.count(env_deny)}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Exec-chain symlink hops + launcher target visibility (bwrap parity)
 # ---------------------------------------------------------------------------
