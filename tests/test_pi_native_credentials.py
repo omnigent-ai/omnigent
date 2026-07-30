@@ -719,6 +719,35 @@ def test_is_databricks_ai_gateway_url_rejects_lookalikes(gateway_url: str) -> No
     assert creds._is_databricks_ai_gateway_url(gateway_url) is False
 
 
+def test_workspace_url_for_dedicated_gateway_uses_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dedicated AI Gateway origin is not itself a workspace API host."""
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    def resolve(profile: str | None) -> db_creds_mod.WorkspaceCreds:
+        assert profile == "prod"
+        return db_creds_mod.WorkspaceCreds(
+            host="https://workspace.cloud.databricks.com",
+            token="unused",
+        )
+
+    monkeypatch.setattr(db_creds_mod, "resolve_databricks_workspace", resolve)
+
+    assert (
+        creds._databricks_workspace_url_for_gateway(
+            "https://123.ai-gateway.cloud.databricks.com/anthropic",
+            profile="prod",
+        )
+        == "https://workspace.cloud.databricks.com"
+    )
+
+
+def test_workspace_url_for_generic_provider_is_none() -> None:
+    """Generic compatible providers are not probed through Databricks APIs."""
+    assert creds._databricks_workspace_url_for_gateway("https://api.anthropic.com/v1") is None
+
+
 def test_anthropic_family_ignores_wire_api() -> None:
     """The Anthropic family always uses anthropic-messages, ignoring wire_api.
 
@@ -1022,6 +1051,8 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
             _make_service(
                 "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
             ),
+            # Future GPT metadata, deliberately Chat-only.
+            _make_service("system.ai.gpt-chat-only", ["mlflow/v1/chat/completions"]),
             # Llama - chat only
             _make_service("system.ai.llama-4-maverick", ["mlflow/v1/chat/completions"]),
             # Kimi - chat only (no Responses API per UC metadata)
@@ -1061,6 +1092,7 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
     # Llama routes to mlflow gateway (system.ai.* ids 404 at serving-endpoints).
     mlflow_ids = [m["id"] for m in _gemini]
     assert "system.ai.llama-4-maverick" in mlflow_ids
+    assert "system.ai.gpt-chat-only" in mlflow_ids
     completions_ids = [m["id"] for m in completions]
     assert not completions_ids  # no completions-only models in this test payload
     # Embedding excluded

@@ -159,6 +159,14 @@ An explicit Anthropic `[1m]` marker remains self-describing metadata, and an
 uncatalogued/offline model keeps the conservative 128K fallback rather than a
 release-specific guess.
 
+## Pi Wire Routing
+
+Pi gateway configuration consumes the same normalized Unity Catalog model
+service metadata. Databricks GPT models use the Responses or Chat surface the
+catalog advertises, while generic OpenAI-compatible providers honor their
+configured wire. If Databricks discovery is unavailable, an unknown GPT uses
+Responses rather than a release-specific completions allowlist.
+
 ## Kiro Picker Migration
 
 The Kiro Web picker now runs `kiro-cli chat --list-models --format json` on the
