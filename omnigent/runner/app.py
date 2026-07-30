@@ -7491,7 +7491,12 @@ def create_runner_app(
 
         agent_spec = await _require_os_env(session_id)  # also resolves spec
         await _ensure_session_registered(session_id)
-        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        env = resource_registry.resolve_environment(
+            session_id,
+            environment_id,
+            agent_spec,
+            session_workspace=_session_workspace_cache.get(session_id),
+        )
         fs = CallerProcessFilesystem(env)
         entries = await fs.search_files(
             q,
@@ -7626,7 +7631,12 @@ def create_runner_app(
 
         after: str | None = None
         if not is_deleted:
-            env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+            env = resource_registry.resolve_environment(
+                session_id,
+                environment_id,
+                agent_spec,
+                session_workspace=_session_workspace_cache.get(session_id),
+            )
             fs = CallerProcessFilesystem(env)
             content = await fs.read(relative_path, limit=None)
             after = content.data.decode(content.encoding or "utf-8", errors="replace")
@@ -7684,6 +7694,7 @@ def create_runner_app(
             session_id,
             environment_id,
             agent_spec,
+            session_workspace=_session_workspace_cache.get(session_id),
         )
         fs = CallerProcessFilesystem(env)
         body = await request.json()
@@ -7742,6 +7753,7 @@ def create_runner_app(
             session_id,
             environment_id,
             agent_spec,
+            session_workspace=_session_workspace_cache.get(session_id),
         )
         fs = CallerProcessFilesystem(env)
         try:
@@ -7795,6 +7807,7 @@ def create_runner_app(
             session_id,
             environment_id,
             agent_spec,
+            session_workspace=_session_workspace_cache.get(session_id),
         )
         fs = CallerProcessFilesystem(env)
         result = await fs.delete(relative_path, recursive=recursive)
@@ -8149,6 +8162,7 @@ def create_runner_app(
             session_id,
             environment_id,
             agent_spec,
+            session_workspace=_session_workspace_cache.get(session_id),
         )
 
         fs = CallerProcessFilesystem(env)
@@ -8219,6 +8233,7 @@ def create_runner_app(
             session_id,
             environment_id,
             agent_spec,
+            session_workspace=_session_workspace_cache.get(session_id),
         )
         body = await request.json()
         command = body.get("command")
