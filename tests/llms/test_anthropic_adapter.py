@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 
 import httpx
 import pytest
@@ -561,7 +562,9 @@ async def test_model_metadata_lookup_uses_models_api_and_caches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_metadata_lookup_does_not_cache_failures() -> None:
+async def test_model_metadata_lookup_does_not_cache_failures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A transient lookup failure is retried on the next request."""
     requests_seen = 0
 
@@ -575,12 +578,13 @@ async def test_model_metadata_lookup_does_not_cache_failures() -> None:
     transport = httpx.MockTransport(_handler)
     headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
 
-    first = await _get_anthropic_model_metadata(
-        headers,
-        "https://api.anthropic.com/v1",
-        "claude-opus-4-8",
-        transport=transport,
-    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.llms.adapters.anthropic"):
+        first = await _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        )
     second = await _get_anthropic_model_metadata(
         headers,
         "https://api.anthropic.com/v1",
@@ -591,6 +595,7 @@ async def test_model_metadata_lookup_does_not_cache_failures() -> None:
     assert first is None
     assert second is not None
     assert requests_seen == 2
+    assert "fixed-budget fallback may be unsupported" in caplog.text
 
 
 @pytest.mark.asyncio

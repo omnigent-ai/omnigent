@@ -280,7 +280,12 @@ async def _fetch_anthropic_model_metadata(
                 parse_anthropic_model_metadata(payload) if isinstance(payload, dict) else None
             )
         except (httpx.HTTPError, ValueError):
-            _logger.debug("Anthropic model metadata lookup failed for %s", model, exc_info=True)
+            _logger.warning(
+                "Anthropic model metadata lookup failed for %s; "
+                "fixed-budget fallback may be unsupported",
+                model,
+                exc_info=True,
+            )
             return None
 
         if metadata is not None:
