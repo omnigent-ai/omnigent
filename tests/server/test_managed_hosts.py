@@ -700,7 +700,6 @@ def test_parse_valid_tenki_config_builds_parameterized_factory(
                 "image": "myworkspace/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "base_url": "https://api.tenki.cloud/",
-                "project": "proj-123",
                 "workspace": "ws-123",
                 "vcpus": 4,
                 "memory_mb": 8192,
@@ -719,7 +718,6 @@ def test_parse_valid_tenki_config_builds_parameterized_factory(
     assert fake.image == "myworkspace/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.base_url == "https://api.tenki.cloud/"
-    assert fake.project == "proj-123"
     assert fake.workspace == "ws-123"
     assert fake.vcpus == 4
     assert fake.memory_mb == 8192
@@ -742,7 +740,6 @@ def test_parse_tenki_without_section_defaults(
     assert fake.image is None
     assert fake.env is None
     assert fake.base_url is None
-    assert fake.project is None
     assert fake.workspace is None
     assert fake.vcpus is None
     assert fake.memory_mb is None

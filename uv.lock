@@ -13,6 +13,7 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
+tenki = "2026-07-30T00:00:00Z"
 cwsandbox = "2026-06-12T00:00:00Z"
 google-antigravity = "2026-06-12T00:00:00Z"
 cryptography = "2026-06-26T00:00:00Z"
@@ -3059,7 +3060,7 @@ slack = [
     { name = "omnigent-slack" },
 ]
 tenki = [
-    { name = "tenki-sandbox" },
+    { name = "tenki" },
 ]
 vertex = [
     { name = "google-auth" },
@@ -3154,7 +3155,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
     { name = "sqlalchemy-cloudflare-d1", marker = "extra == 'dev'", specifier = "==0.3.10" },
     { name = "starlette", specifier = ">=1.0.1,<2" },
-    { name = "tenki-sandbox", marker = "extra == 'tenki'", specifier = ">=0.3.6,<0.4" },
+    { name = "tenki", marker = "extra == 'tenki'", specifier = ">=0.5.4,<0.6" },
     { name = "tiktoken", specifier = ">=0.7,<1" },
     { name = "tomlkit", specifier = ">=0.12,<1" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
@@ -5285,17 +5286,17 @@ wheels = [
 ]
 
 [[package]]
-name = "tenki-sandbox"
-version = "0.3.6"
+name = "tenki"
+version = "0.5.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },
     { name = "websocket-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c8/3e/319d553fb6bd266aed3f5e0ec5d9b1865ee7cb45388c9dc6dac1ee30a51f/tenki_sandbox-0.3.6.tar.gz", hash = "sha256:f4a6e0b7329a7fd42138d5eb582adb1356c084e6f6b3fe046530cbbcd426ffe2", upload-time = "2026-07-10T08:28:16.269Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/30/85/9f311f784b92639de2d0aaae7c6d67c76c5ebfd60543d56739724c07683a/tenki-0.5.4.tar.gz", hash = "sha256:3d900ca3eedf98aea0ace315246a3f2bbdc19149d966a320cdb99fd406b681fa", upload-time = "2026-07-29T11:08:41.791Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/4f/860d1ba154200904b493ed4353e1994aa14627f407144d975b21e4cf51be/tenki_sandbox-0.3.6-py3-none-any.whl", hash = "sha256:324fe804a0b561ffa129e6b1b1874e0d7747ebcb566d976e8485c9dd45ef6853", upload-time = "2026-07-10T08:28:14.925Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/de/244e8d8bffe6673ae3a58423016b8c03465214ab9101a3e61234b5d4c076/tenki-0.5.4-py3-none-any.whl", hash = "sha256:d5df29fa5f7f93fc6c420d3a0b50e68e0b35fda63e17ed57c0f302a522cbf9ef", upload-time = "2026-07-29T11:08:40.023Z" },
 ]
 
 [[package]]

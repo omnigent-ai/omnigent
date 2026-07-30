@@ -105,7 +105,7 @@ _LAUNCHERS: dict[str, str] = {
     # On-demand Kubernetes runner Pod via the official kubernetes client (the
     # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
     "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
-    # Tenki (https://tenki.cloud) via the official `tenki-sandbox` SDK (the
+    # Tenki (https://tenki.cloud) via the official `tenki` SDK (the
     # `omnigent[tenki]` extra), imported lazily like modal/daytona.
     "tenki": "omnigent.onboarding.sandboxes.tenki:TenkiSandboxLauncher",
 }

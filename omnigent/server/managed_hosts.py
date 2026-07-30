@@ -872,7 +872,6 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             image=_parse_provider_image(raw, "tenki"),
             env=_parse_provider_env(raw, "tenki"),
             base_url=_parse_provider_string(raw, "tenki", "base_url"),
-            project=_parse_provider_string(raw, "tenki", "project"),
             workspace=_parse_provider_string(raw, "tenki", "workspace"),
             vcpus=_parse_tenki_bounded_int(raw, "vcpus", _TENKI_MIN_VCPUS, _TENKI_MAX_VCPUS),
             memory_mb=_parse_tenki_bounded_int(
@@ -1555,7 +1554,6 @@ def _tenki_launcher_factory(
     image: str | None,
     env: list[str] | None,
     base_url: str | None,
-    project: str | None,
     workspace: str | None,
     vcpus: int | None,
     memory_mb: int | None,
@@ -1576,8 +1574,6 @@ def _tenki_launcher_factory(
         sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or ``None`` to
         resolve from the launcher's env-var fallback / inject nothing.
     :param base_url: Optional Tenki API endpoint override.
-    :param project: Optional Tenki project id to create sessions in
-        (required unless the API key is project-scoped).
     :param workspace: Optional Tenki workspace id to create sessions in.
     :param vcpus: Optional vCPU count.
     :param memory_mb: Optional memory allocation in MiB.
@@ -1593,7 +1589,6 @@ def _tenki_launcher_factory(
             image=image,
             env=env,
             base_url=base_url,
-            project=project,
             workspace=workspace,
             vcpus=vcpus,
             memory_mb=memory_mb,

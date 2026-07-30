@@ -195,7 +195,6 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.home_dir: str | None = None
         self.registry: dict[str, object] | None = None
         self.base_url: str | None = None
-        self.project: str | None = None
         self.workspace: str | None = None
         self.gateway_profile: str | None = None
         self.snapshot_name: str | None = None
@@ -504,7 +503,6 @@ def install_fake_tenki_launcher(
         image: str | None = None,
         env: list[str] | None = None,
         base_url: str | None = None,
-        project: str | None = None,
         workspace: str | None = None,
         vcpus: int | None = None,
         memory_mb: int | None = None,
@@ -514,7 +512,6 @@ def install_fake_tenki_launcher(
         fake.image = image
         fake.env = env
         fake.base_url = base_url
-        fake.project = project
         fake.workspace = workspace
         fake.vcpus = vcpus
         fake.memory_mb = memory_mb

@@ -38,7 +38,6 @@ import time
 try:
     from omnigent.onboarding.sandboxes.tenki import (
         IMAGE_ENV_VAR,
-        PROJECT_ENV_VAR,
         WORKSPACE_ENV_VAR,
         TenkiSandboxLauncher,
     )
@@ -62,12 +61,6 @@ def main() -> int:
         default=os.environ.get(IMAGE_ENV_VAR),
         help="Prepared Tenki registry image to boot from (<workspace>/<name>:tag); "
         f"defaults to {IMAGE_ENV_VAR}. Required — Tenki has no stock default image.",
-    )
-    parser.add_argument(
-        "--project",
-        default=os.environ.get(PROJECT_ENV_VAR),
-        help=f"Tenki project id (defaults to {PROJECT_ENV_VAR}); required unless your "
-        "API key is project-scoped.",
     )
     parser.add_argument(
         "--workspace",
@@ -96,9 +89,7 @@ def main() -> int:
     marker_value = f"smoke-{int(time.time())}"
     os.environ[marker_name] = marker_value
 
-    launcher = TenkiSandboxLauncher(
-        image=args.image, env=[marker_name], project=args.project, workspace=args.workspace
-    )
+    launcher = TenkiSandboxLauncher(image=args.image, env=[marker_name], workspace=args.workspace)
     name = f"smoke-{int(time.time())}"
     print(f"▸ Tenki launcher smoke  image={args.image}  tag={name}")
 
