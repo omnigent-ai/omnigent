@@ -140,7 +140,9 @@ sub-agents; it **requires** a `config.harness`:
 
 ## AGENTS.md Format
 
-Free-form markdown. This becomes the agent's system prompt. Best practices:
+Free-form markdown. This becomes the agent-authored portion of the system
+prompt; Omnigent may append framework-owned lifecycle or metadata instructions
+at runtime. Best practices:
 
 - Start with a clear identity statement ("You are a ...")
 - List capabilities and constraints

@@ -139,13 +139,15 @@ def _seed_session(
     conversation_store, agent_store, permission_store = stores
     # The conversations.agent_id FK requires a real agent row; create one
     # idempotently (the same agent backs every seeded session).
-    if agent_store.get("ag_test") is None:
+    if agent_store.get("087b7cb7ac30abf4debfaa578d052ec6") is None:
         agent_store.create(
-            agent_id="ag_test",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             name="test-agent",
-            bundle_location="ag_test/bundle",
+            bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
         )
-    conv = conversation_store.create_conversation(title=title, agent_id="ag_test")
+    conv = conversation_store.create_conversation(
+        title=title, agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
     permission_store.ensure_user(owner)
     permission_store.grant(owner, conv.id, LEVEL_OWNER)
     return conv.id
@@ -219,7 +221,7 @@ def test_child_busy_rollup_flows_through_updates_stream(
         kind="sub_agent",
         title="coder:auth",
         parent_conversation_id=parent_id,
-        agent_id="ag_test",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
     )
     sessions_routes._session_status_cache.pop(parent_id, None)
     sessions_routes._session_status_cache[child.id] = "waiting"
@@ -580,6 +582,44 @@ def test_session_added_for_inaccessible_session_is_not_pushed(
             )
 
 
+def test_pin_label_collapses_to_canonical_key_on_the_wire(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """Pins are stored per-user (``omnigent.pinned.<user>``), but the watch
+    stream collapses the caller's own pin key to the canonical
+    ``omnigent.pinned`` and never emits another user's per-user key. Exercised
+    via the normal rescan-diff path: pinning a watched session out of band
+    surfaces on the next ``changed`` frame (``fast_rescan`` shrinks the tick).
+    """
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    conversation_store, _agent_store, _permission_store = stores
+    s1 = _seed_session(stores, owner=ALICE, title="watched")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        _recv_until(ws, {"snapshot"})
+        # Pin s1 under Alice's per-user key (as PATCH does), plus a foreign pin
+        # under Bob's key that must NOT leak to Alice.
+        conversation_store.set_labels(
+            s1,
+            {
+                pinned_label_key(ALICE): "1721760000000",
+                pinned_label_key(BOB): "1700000000000",
+            },
+        )
+        changed = _recv_until(ws, {"changed"})
+        items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
+        assert s1 in items
+        labels = items[s1]["labels"]
+        # Alice's pin surfaces as the canonical bare key…
+        assert labels.get("omnigent.pinned") == "1721760000000"
+        # …and neither per-user key (hers or Bob's) leaks onto the wire.
+        assert pinned_label_key(ALICE) not in labels
+        assert pinned_label_key(BOB) not in labels
+
+
 # ── comments fingerprint ──────────────────────────────────────────────
 
 
@@ -732,7 +772,7 @@ def test_daily_cost_recorded_for_owned_session_without_a_policy(app: FastAPI, st
 
     The policy gate that previously suppressed the ``user_daily_cost`` write on
     no-policy sessions has been removed, so the daily rollup accrues for any
-    owned session that records spend. Here ``ag_test`` has no guardrails/policy,
+    owned session that records spend. Here the owned session has no guardrails/policy,
     yet posting cumulative spend must still land in the owner's daily rollup. A
     regression that re-added the gate would leave ``get_daily_cost`` at 0.0.
     """
@@ -777,3 +817,47 @@ def test_daily_cost_tracks_display_cost_not_policy_cost(app: FastAPI, stores) ->
     # mean the rollup tracked policy_cost_usd and inherited the gate's
     # mid-turn inflation — the daily over-report this split prevents.
     assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.20)
+
+
+def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
+    app: FastAPI, stores
+) -> None:
+    """Sub-agent spend is attributed to the root session's owner.
+
+    Relay / SDK sub-agents are spawned by the internal runner (no user
+    context in the POST), so their conversations never receive an owner
+    permission grant.  Previously ``_record_daily_cost`` called
+    ``get_session_owner(child.id)``, got ``None``, and silently dropped the
+    cost from the daily rollup — the per-user daily budget never saw it.
+
+    The fix: fall back to ``get_session_owner(root_conversation_id)`` when
+    the direct lookup misses.  This test creates a parent (owned) + a child
+    conversation (no grant, but ``root_conversation_id`` → parent), posts
+    cumulative spend on the child, and asserts the owner's daily total rises.
+    """
+    conversation_store, _agent_store, _permission_store = stores
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Parent session — owned by Alice.
+    parent_id = _seed_session(stores, owner=ALICE, title="parent session")
+
+    # Child conversation — simulates a relay sub-agent: no permission grant.
+    # Passing parent_conversation_id causes create_conversation to inherit
+    # root_conversation_id from the parent automatically.
+    child = conversation_store.create_conversation(
+        title="sub-agent",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        parent_conversation_id=parent_id,
+    )
+    # Sanity: child has no owner grant (the gap being fixed).
+    assert conversation_store.get_session_owner(child.id) is None
+
+    # Post cumulative cost on the child — no auth header (internal runner path).
+    resp = TestClient(app).post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.75}},
+    )
+    assert resp.status_code == 202, resp.text
+
+    # Sub-agent spend must appear in Alice's daily rollup via the root fallback.
+    assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.75)

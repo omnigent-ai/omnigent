@@ -37,7 +37,7 @@ def test_size_label_boundaries(total: int, expected: str) -> None:
 
 @pytest.mark.parametrize(
     "filename",
-    ["uv.lock", "package-lock.json", "ap-web/package-lock.json", "ap-web/electron/yarn.lock"],
+    ["uv.lock", "package-lock.json", "web/package-lock.json", "web/electron/yarn.lock"],
 )
 def test_lock_files_are_generated(filename: str) -> None:
     assert module.is_generated(filename)
@@ -55,7 +55,7 @@ def test_total_changes_excludes_generated() -> None:
     files = [
         {"filename": "omnigent/a.py", "additions": 30, "deletions": 10},
         {"filename": "uv.lock", "additions": 5000, "deletions": 4000},
-        {"filename": "ap-web/package-lock.json", "additions": 800, "deletions": 0},
+        {"filename": "web/package-lock.json", "additions": 800, "deletions": 0},
     ]
     # Only the source file counts: 30 + 10 = 40 -> size/S.
     assert module.total_changes(files) == 40

@@ -228,6 +228,103 @@ def test_store_and_load_databricks_record(token_dir) -> None:
     )
 
 
+def test_databricks_request_headers_org_only(token_dir) -> None:
+    """A recorded ?o= selector surfaces as the workspace-routing header.
+
+    When the bare host is the account, the request routes by this header
+    (equivalently to ``?o=``). A record with no org id (single-workspace
+    host) yields no header, so those callers are unaffected.
+    """
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+
+    store_databricks_auth(
+        server_url="https://acme.databricks.com/api/2.0/omnigent",
+        workspace_host="https://acme.databricks.com",
+        org_id="2850744067564480",
+    )
+    assert databricks_request_headers("https://acme.databricks.com/api/2.0/omnigent") == {
+        "X-Databricks-Org-Id": "2850744067564480"
+    }
+
+    store_databricks_auth(
+        server_url="https://single.databricks.com/api/2.0/omnigent",
+        workspace_host="https://single.databricks.com",
+    )
+    assert databricks_request_headers("https://single.databricks.com/api/2.0/omnigent") == {}
+
+
+def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
+    """The paired minter always emits the bearer and the ?o= header together.
+
+    The static-dict seams (WS handshakes, hook-config replay) call this so a
+    workspace request can never carry ``Authorization`` without the routing
+    header. A missing token or selector is omitted, so single-workspace and
+    local-unauthenticated callers are unaffected.
+    """
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+
+    store_databricks_auth(
+        server_url="https://acme.databricks.com/api/2.0/omnigent",
+        workspace_host="https://acme.databricks.com",
+        org_id="2850744067564480",
+    )
+    recorded = "https://acme.databricks.com/api/2.0/omnigent"
+    # Bearer + org travel together.
+    assert databricks_request_headers(recorded, bearer_token="tok") == {
+        "Authorization": "Bearer tok",
+        "X-Databricks-Org-Id": "2850744067564480",
+    }
+    # Recorded selector but no token (local/unauth): org still rides, no bearer.
+    assert databricks_request_headers(recorded) == {"X-Databricks-Org-Id": "2850744067564480"}
+    # No record (unknown server): bearer only, no routing header.
+    assert databricks_request_headers("https://other.example.com", bearer_token="tok") == {
+        "Authorization": "Bearer tok"
+    }
+
+
+def test_databricks_request_headers_folds_extra_headers(token_dir, monkeypatch) -> None:
+    """OMNIGENT_DATABRICKS_EXTRA_HEADERS rides every request built via the helper.
+
+    Databricks deployments set it to opaque request-routing selector headers so
+    a request pins to a specific server instance. Because it is folded into this
+    one helper, any caller that routes through it gets the selectors for free; a
+    caller that hand-rolls a bare bearer misses them. Malformed / unset input is
+    a no-op (prod-safe).
+    """
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+
+    store_databricks_auth(
+        server_url="https://acme.databricks.com/api/2.0/omnigent",
+        workspace_host="https://acme.databricks.com",
+        org_id="2850744067564480",
+    )
+    recorded = "https://acme.databricks.com/api/2.0/omnigent"
+    monkeypatch.setenv(
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
+        '{"x-databricks-route-hint": "instance-abc"}',
+    )
+    # Extra header travels alongside the bearer + ?o= routing header.
+    assert databricks_request_headers(recorded, bearer_token="tok") == {
+        "Authorization": "Bearer tok",
+        "X-Databricks-Org-Id": "2850744067564480",
+        "x-databricks-route-hint": "instance-abc",
+    }
+    # It rides even for an unknown server with no token (routing-only request).
+    assert databricks_request_headers("https://other.example.com") == {
+        "x-databricks-route-hint": "instance-abc",
+    }
+    # Malformed JSON is ignored (no crash) so a bad value can't break requests.
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_EXTRA_HEADERS", "not-json")
+    assert databricks_request_headers("https://other.example.com", bearer_token="tok") == {
+        "Authorization": "Bearer tok",
+    }
+    # Unset (prod default) is a no-op.
+    monkeypatch.delenv("OMNIGENT_DATABRICKS_EXTRA_HEADERS", raising=False)
+    assert databricks_request_headers("https://other.example.com", bearer_token="tok") == {
+        "Authorization": "Bearer tok",
+    }
+
+
 def test_load_token_returns_none_for_databricks_record(token_dir) -> None:
     """A Databricks pointer record carries NO bearer — load_token must miss.
 

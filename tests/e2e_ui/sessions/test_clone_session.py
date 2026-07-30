@@ -96,7 +96,7 @@ def test_clone_session_copies_transcript_and_navigates(
     # landed back on the source); a visible dialog means the fork call
     # failed and surfaced an inline error instead.
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     expect(dialog).not_to_be_visible()
@@ -195,7 +195,7 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
 
     # The fork succeeds and navigates to a NEW session id.
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]

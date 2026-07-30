@@ -16,6 +16,8 @@ from omnigent.server import schemas as _srv_events
 from ._events import (
     NATIVE_TOOL_TYPES,
     ClientTaskCancel,
+    CompactionCompleted,
+    CompactionFailed,
     CompactionInProgress,
     ElicitationRequest,
     ErrorEvent,
@@ -79,6 +81,8 @@ _T_RESPONSE_OUTPUT_FILE_DONE = _wire_type(_srv_events.OutputFileDoneEvent)
 _T_RESPONSE_RETRY = _wire_type(_srv_events.RetryEvent)
 _T_RESPONSE_ERROR = _wire_type(_srv_events.ErrorEvent)
 _T_RESPONSE_COMPACTION_IN_PROGRESS = _wire_type(_srv_events.CompactionInProgressEvent)
+_T_RESPONSE_COMPACTION_COMPLETED = _wire_type(_srv_events.CompactionCompletedEvent)
+_T_RESPONSE_COMPACTION_FAILED = _wire_type(_srv_events.CompactionFailedEvent)
 _T_RESPONSE_CLIENT_TASK_CANCEL = _wire_type(_srv_events.ClientTaskCancelEvent)
 _T_RESPONSE_ELICITATION_REQUEST = _wire_type(_srv_events.ElicitationRequestEvent)
 
@@ -235,6 +239,23 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
     # Compaction
     if event_type == _T_RESPONSE_COMPACTION_IN_PROGRESS:
         return CompactionInProgress()
+    if event_type == _T_RESPONSE_COMPACTION_COMPLETED:
+        raw_total_tokens = data.get("total_tokens")
+        raw_summary = data.get("summary")
+        raw_summary_model = data.get("summary_model")
+        raw_compacted_messages = data.get("compacted_messages")
+        return CompactionCompleted(
+            total_tokens=raw_total_tokens
+            if isinstance(raw_total_tokens, int) and not isinstance(raw_total_tokens, bool)
+            else None,
+            summary=raw_summary if isinstance(raw_summary, str) else None,
+            summary_model=raw_summary_model if isinstance(raw_summary_model, str) else None,
+            compacted_messages=raw_compacted_messages
+            if isinstance(raw_compacted_messages, list)
+            else None,
+        )
+    if event_type == _T_RESPONSE_COMPACTION_FAILED:
+        return CompactionFailed()
 
     # Async client-tool cancel notification
     if event_type == _T_RESPONSE_CLIENT_TASK_CANCEL:
@@ -252,7 +273,7 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
     # mirrors MCP's ``ElicitRequestFormParams`` field-for-field;
     # we surface it as a typed event so the stream consumer can
     # route it to the elicitation hook (not into a ToolHandler).
-    if event_type == "response.elicitation_request":
+    if event_type == _T_RESPONSE_ELICITATION_REQUEST:
         elicitation_id = data.get("elicitation_id")
         if not isinstance(elicitation_id, str) or not elicitation_id:
             _log.warning(
@@ -268,6 +289,7 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
             )
             return None
         requested_schema = params.get("requestedSchema")
+        target_session_id = params.get("target_session_id")
         return ElicitationRequest(
             elicitation_id=elicitation_id,
             message=str(params.get("message") or ""),
@@ -281,6 +303,9 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
             policy_name=str(params.get("policy_name") or ""),
             content_preview=str(params.get("content_preview") or ""),
             url=str(params["url"]) if isinstance(params.get("url"), str) else None,
+            target_session_id=target_session_id
+            if isinstance(target_session_id, str) and target_session_id
+            else None,
         )
 
     # Unknown event — skip gracefully for forward-compatibility

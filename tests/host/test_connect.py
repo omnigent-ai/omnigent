@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,21 +25,34 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -46,6 +60,43 @@ from omnigent.runner.identity import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_handle_model_options_uses_host_claude_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch picker is resolved on the host that will start Claude."""
+    from omnigent import claude_native
+
+    monkeypatch.setattr(claude_native, "resolve_native_claude_config", lambda *, spec: None)
+    monkeypatch.setattr(
+        claude_native,
+        "claude_native_model_options",
+        lambda config: [
+            {
+                "id": "sonnet",
+                "model": "system.ai.claude-sonnet-4-6[1m]",
+                "displayName": "Sonnet 4.6",
+            }
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[
+            {
+                "id": "sonnet",
+                "model": "system.ai.claude-sonnet-4-6[1m]",
+                "displayName": "Sonnet 4.6",
+            }
+        ],
+    )
 
 
 def _make_host_process() -> HostProcess:
@@ -89,6 +140,8 @@ async def test_handle_launch_spawns_subprocess(
     failed or the result frame construction is wrong.
     """
     host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
     workspace.mkdir()
 
@@ -138,6 +191,7 @@ async def test_handle_launch_spawns_subprocess(
     # Verify env vars passed to the subprocess.
     assert spawned_env.get("RUNNER_SERVER_URL") == "http://localhost:8000"
     assert spawned_env.get("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN") == "test_token_abc"
+    assert spawned_env.get(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR) == "host-bootstrap-bearer"
     assert spawned_env.get("OMNIGENT_RUNNER_WORKSPACE") == str(workspace)
 
     # Runners must get a clean /dev/null stdin, not the daemon's inherited fd:
@@ -185,7 +239,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
     not configured, with the structured error_code and a message that
-    names the harness, the host, and the `omnigent setup` fix.
+    names the harness, the host, and the `omni setup` fix.
 
     If this regresses, an unconfigured launch spawns a runner whose
     first turn dies inside the executor — the exact dead-session UX
@@ -218,7 +272,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
     # harness, the host, and the remediation command.
     assert "'codex'" in (result.error or "")
     assert "test-laptop" in (result.error or "")
-    assert "omnigent setup" in (result.error or "")
+    assert "omni setup" in (result.error or "")
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
@@ -230,7 +284,7 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
 ) -> None:
     """
     A native-Cursor refusal must name the ``cursor-agent`` installer and
-    login, not ``omnigent setup`` — which only configures the SDK ``cursor``
+    login, not ``omni setup`` — which only configures the SDK ``cursor``
     harness and never installs the ``cursor-agent`` CLI ``omni cursor`` boots.
 
     Here ``harness_setup_hint`` is the real function (only the readiness check
@@ -259,7 +313,7 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     assert "test-laptop" in message
     assert "cursor.com/install" in message
     assert "cursor-agent login" in message
-    assert "omnigent setup" not in message
+    assert "omni setup" not in message
     assert host._runners == {}
 
 
@@ -396,6 +450,7 @@ async def test_handle_launch_prints_exact_runner_log_path(
         request_id="req_log",
         binding_token="tok_log",
         workspace=str(workspace),
+        session_id="conv_log",
     )
 
     original_popen = subprocess.Popen
@@ -417,14 +472,15 @@ async def test_handle_launch_prints_exact_runner_log_path(
         result = await host._handle_launch(frame)
 
     assert result.status == "launched", result.error
-    # Exactly one runner-*.log was created under the host-runner dir.
-    runner_log_dir = tmp_path / ".omnigent" / "logs" / "host-runner"
+    # Exactly one runner-*.log was created under the runner log dir.
+    runner_log_dir = tmp_path / ".omnigent" / "logs" / "runner"
     log_files = list(runner_log_dir.glob("runner-*.log"))
     assert len(log_files) == 1
     out = capsys.readouterr().out
     assert "↑ Runner started:" in out
     # The exact file path is printed, home-collapsed to ``~`` for readability.
-    assert f"log: ~/.omnigent/logs/host-runner/{log_files[0].name}" in out
+    assert f"log: ~/.omnigent/logs/runner/{log_files[0].name}" in out
+    assert "session: conv_log" in out
 
     _cleanup_host(host)
 
@@ -457,6 +513,102 @@ class _FakeTunnel:
         :raises ConnectionError: Always — ends the serve loop.
         """
         raise ConnectionError("test disconnect")
+
+
+class _ReadinessChangingTunnel(_FakeTunnel):
+    """Trigger one idle refresh before disconnecting the fake tunnel."""
+
+    def __init__(self) -> None:
+        """Initialize the frame log and receive counter."""
+        super().__init__()
+        self.recv_count = 0
+
+    async def recv(self) -> str:
+        """Simulate one idle interval followed by a disconnect."""
+        self.recv_count += 1
+        if self.recv_count == 1:
+            await asyncio.Future()
+        raise ConnectionError("test disconnect")
+
+
+async def test_live_host_refreshes_harness_readiness_without_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A setup completed after connect must replace the advertised readiness."""
+    readiness = iter(({"pi": False}, {"pi": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: harness == "pi",
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    hello = decode_host_frame(tunnel.sent[0])
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == {"pi": False}
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"pi": True}
+
+
+async def test_live_host_full_refresh_detects_auth_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full-refresh fallback catches readiness changes beyond binary installs."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+
+
+async def test_live_host_does_not_repeat_unchanged_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A periodic full refresh sends nothing when the readiness map is unchanged."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": "needs-auth"}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 1
+    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
@@ -512,7 +664,7 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     # The exit code identifies the failure class without log-reading.
     assert "code 7" in error
     # The log path lets the user fetch the full log on the host.
-    assert "~/.omnigent/logs/host-runner/runner-" in error
+    assert "~/.omnigent/logs/runner/runner-" in error
     # The tail carries the actual cause — the whole point of the report.
     assert "RuntimeError: boom-traceback" in error
 
@@ -640,6 +792,66 @@ async def test_watch_runner_silent_on_intentional_stop(
     assert host._unreported_exits == {}
 
 
+async def test_watch_runner_silent_on_clean_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that exits cleanly (code 0) is NOT reported as a crash.
+
+    The runner-level idle reaper shuts an inactive runner down with a graceful
+    (exit-code-0) self-exit while it is still tracked in ``self._runners``
+    (unlike a ``host.stop_runner``, which pops the handle first). The watcher
+    must treat a zero exit code as a clean shutdown and send nothing — a false
+    ``host.runner_exited`` here would attach a scary "runner process exited"
+    error to a session the user only has to message to reactivate. A non-zero
+    exit is still a crash and is covered by
+    ``test_watch_runner_reports_unexpected_exit``.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that lives briefly, then exits 0 (graceful).
+
+        The initial sleep keeps ``poll()`` None at launch time so the launch
+        succeeds; the process then exits cleanly, mimicking an idle-reaper
+        shutdown while the handle is still tracked.
+
+        :param args: Command args (ignored).
+        :param kwargs: Popen kwargs from production, including log handles.
+        :returns: A live subprocess handle.
+        """
+        return original_popen(
+            ["sh", "-c", "sleep 0.2; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_clean",
+        binding_token="tok_clean",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+
+    # Let the watcher observe the clean exit and finish.
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    # A clean (code 0) exit is graceful, not a crash: no report, nothing parked.
+    assert tunnel.sent == []
+    assert host._unreported_exits == {}
+
+
 async def test_unreported_exit_flushes_after_reconnect(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -669,6 +881,28 @@ async def test_unreported_exit_flushes_after_reconnect(
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}
+
+
+async def test_hello_advertises_installed_version() -> None:
+    """The ``host.hello`` frame reports the omnigent version, not a placeholder.
+
+    A hard-coded placeholder would make every host look like the same
+    stale build in the server's version popover. The hello must carry the
+    shared resolved version this host is actually running.
+    """
+    from omnigent.version import VERSION
+
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.version == VERSION
+    # Guard against the old hard-coded literal creeping back.
+    assert hello.version != "0.1.0"
 
 
 def test_handle_stop_terminates_process(tmp_path: Path) -> None:
@@ -719,6 +953,77 @@ def test_handle_stop_unknown_runner() -> None:
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"
     assert "unknown runner" in (result.error or "")
+
+
+def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``alive`` for a tracked
+    runner whose process is still running.
+
+    This is the still-booting / still-serving case: the server must wait
+    for this runner's tunnel rather than relaunch a healthy process.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        host._runners["runner_live"] = _RunnerHandle(
+            proc=proc, log_path=tmp_path / "runner-live.log"
+        )
+        result = host._handle_runner_status(
+            HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
+        )
+        assert isinstance(result, HostRunnerStatusResultFrame)
+        assert result.request_id == "req_rs"
+        assert result.status == "alive"
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``dead`` for a tracked
+    runner whose process has exited.
+
+    A tracked-but-exited runner will never connect its tunnel, so the
+    server must relaunch immediately instead of burning the connect
+    grace on it.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait()  # ensure the process has exited before we query
+    host._runners["runner_gone"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-gone.log")
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_gone")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "dead"
+
+
+def test_handle_runner_status_unknown_for_untracked_runner() -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``unknown`` for a runner
+    this host has no record of.
+
+    Covers a runner that was stopped (``_handle_stop`` popped it) and a
+    fresh post-restart host that never spawned it — the exact
+    host-restart case that used to strand the server on a full connect
+    grace. Both must read ``unknown`` so the server relaunches at once.
+    """
+    host = _make_host_process()
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_never_seen")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "unknown"
 
 
 def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
@@ -785,6 +1090,157 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
         assert proc.poll() is not None, f"Runner pid={proc.pid} should be dead after cleanup"
     # Tracking dict should be empty.
     assert host._runners == {}
+
+
+def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
+    """Regression for #1782: orphaned children are reaped, not leaked.
+
+    In production the leak is a harness tool subprocess (node/chromium/tmux)
+    whose runner parent died: it is orphaned and reparented to the host
+    (PID 1 in a container, or a subreaper). Once reparented it is a *direct*
+    child of the host that nothing ``wait()``s — so it lingers as a
+    ``<defunct>`` zombie forever. This test models that end state directly by
+    forking a child the host does not track and never waits: ``os.fork`` is
+    portable (no ``PR_SET_CHILD_SUBREAPER``, which macOS lacks), and a
+    reparented orphan is indistinguishable from a plain unwaited child to the
+    reaper. ``_reap_orphans_once`` must drain it.
+    """
+    import errno
+    import os
+
+    host = _make_host_process()
+
+    # Fork a bare child (NOT a tracked runner, NOT wrapped in Popen) that
+    # exits immediately — the faithful model of an orphan reparented to us.
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — child leg never returns to pytest
+        os._exit(0)
+
+    # Let it exit and become a zombie parented to this process.
+    deadline = time.monotonic() + 5.0
+    reaped_total = 0
+    while time.monotonic() < deadline:
+        reaped_total += host._reap_orphans_once()
+        if reaped_total >= 1:
+            break
+        time.sleep(0.05)
+
+    assert reaped_total >= 1, "orphaned child was not reaped (zombie leak — #1782)"
+    # It is truly reaped: a direct waitpid now raises ECHILD (no such child).
+    with pytest.raises(OSError) as exc_info:
+        os.waitpid(pid, 0)
+    assert exc_info.value.errno == errno.ECHILD
+    # A second sweep with no orphans left is a clean no-op.
+    assert host._reap_orphans_once() == 0
+
+
+def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> None:
+    """The reaper must not consume a tracked runner's exit status (#1782).
+
+    A naive ``waitpid(-1)`` reaper would reap a just-exited tracked runner
+    behind ``Popen``'s back, making ``_watch_runner``'s ``poll()`` report a
+    bogus exit 0 for a crash. ``_reap_orphans_once`` peeks with ``WNOWAIT``
+    and skips tracked pids, so the runner's real exit code survives for the
+    ``host.runner_exited`` report.
+    """
+    host = _make_host_process()
+
+    # A tracked runner that exits non-zero (a "crash").
+    runner = subprocess.Popen(["python3", "-c", "import sys; sys.exit(42)"])
+    host._runners["runner_crash"] = _RunnerHandle(
+        proc=runner, log_path=tmp_path / "runner-crash.log"
+    )
+    # Wait until the OS reports it as exited (zombie), WITHOUT Popen.wait().
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and runner.poll() is None:
+        # poll() would itself reap; instead peek via the reaper repeatedly.
+        host._reap_orphans_once()
+        time.sleep(0.05)
+
+    # The reaper ran while the crashed runner was reapable; it must NOT have
+    # stolen it. Popen must still see the true exit code.
+    assert runner.poll() == 42, "reaper corrupted the tracked runner's exit code"
+
+    runner.wait()
+
+
+def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -> None:
+    """The reaper must not reap a host-owned subprocess's child (#1782).
+
+    Regression for the Polly-flagged race: the host also spawns *direct*
+    children that are not tracked runners — the ``git`` commands in
+    :mod:`omnigent.host.git_worktree`, run via ``subprocess.run`` under
+    ``asyncio.to_thread`` from the worktree handlers. If the 2s reaper sweep
+    fires after such a git child has exited but before ``subprocess``'s own
+    ``wait()`` collects it, a blind reaper would ``waitpid`` it — and CPython
+    then swallows the resulting ``ECHILD`` and reports ``returncode == 0``,
+    silently turning a *failed* ``git worktree`` op into a success.
+
+    ``_host_subprocess_op`` pauses the reaper for exactly that window. Here a
+    ``sh -c 'exit 42'`` stands in for a failing git command: while the op is
+    marked in flight, ``_reap_orphans_once`` must be a no-op and must NOT
+    consume the child, so the owner still reads the true exit code 42.
+    """
+    host = _make_host_process()
+
+    # A host-owned subprocess (git stand-in) that FAILS with a distinctive
+    # code. NOT a tracked runner — indistinguishable from an orphan to a naive
+    # reaper.
+    proc = subprocess.Popen(["sh", "-c", "exit 42"])
+    # Let it exit so it is reapable (the dangerous window subprocess.run has
+    # between the child exiting and its internal wait()).
+    time.sleep(0.3)
+
+    with host._host_subprocess_op():
+        # Every sweep during the op must be a no-op — the reaper is paused.
+        for _ in range(5):
+            assert host._reap_orphans_once() == 0, "reaper ran during a host-owned op"
+            time.sleep(0.02)
+
+    # The owner still collects its child's TRUE exit code — not corrupted to 0.
+    assert proc.poll() == 42, "reaper stole the host-owned subprocess's exit code (#1782)"
+    proc.wait()
+
+
+def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> None:
+    """``_host_subprocess_op`` nests correctly and always rebalances (#1782).
+
+    The reaper resumes only when the counter returns to 0, and the decrement
+    must survive an exception in the guarded body (``finally``), or a raising
+    worktree op would wedge the reaper off permanently.
+    """
+    host = _make_host_process()
+    assert host._owned_subprocess_ops == 0
+
+    with host._host_subprocess_op():
+        assert host._owned_subprocess_ops == 1
+        with host._host_subprocess_op():  # re-entrant
+            assert host._owned_subprocess_ops == 2
+        assert host._owned_subprocess_ops == 1
+    assert host._owned_subprocess_ops == 0
+
+    # An exception inside the guarded body must still rebalance the counter.
+    with pytest.raises(RuntimeError):
+        with host._host_subprocess_op():
+            assert host._owned_subprocess_ops == 1
+            raise RuntimeError("worktree op blew up")
+    assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
+
+
+def test_install_child_subreaper_is_safe_to_call() -> None:
+    """``_install_child_subreaper`` never raises and reports a bool.
+
+    ``True`` on Linux where ``prctl`` set the bit; ``False`` on non-Linux or
+    when ``prctl`` is unavailable — both are acceptable, non-fatal outcomes.
+    """
+    import sys
+
+    from omnigent.host.connect import _install_child_subreaper
+
+    result = _install_child_subreaper()
+    assert isinstance(result, bool)
+    if sys.platform != "linux":
+        assert result is False
 
 
 def test_host_spawned_runner_has_parent_pid_env(
@@ -1050,12 +1506,19 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "LC_CTYPE": "UTF-8",
         "DATABRICKS_CONFIG_PROFILE": "ambient",
         "DATABRICKS_CONFIG_FILE": "/tmp/databrickscfg",
+        "DATABRICKS_AUTH_STORAGE": "plaintext",
         "ANTHROPIC_API_KEY": "sk-harness",
         "IS_SANDBOX": "1",
         "DATABRICKS_TOKEN": "dapi-secret",
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "KUBECONFIG": "/home/alice/.kube/config",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
+        "OMNIGENT_LOG_LEVEL": "DEBUG",
+        "OMNIGENT_LOG_TO_STDERR": "1",
+        "OMNIGENT_LOG_TTY_FD": "9",
     }
 
     env = _build_runner_env(
@@ -1065,6 +1528,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         binding_token="tok",
         workspace="/ws",
         parent_pid=42,
+        initial_auth_token="host-bootstrap-bearer",
     )
 
     # Process essentials + the locale family pass through.
@@ -1076,6 +1540,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # the ambient value reaches the runner unmodified (no flag override).
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"
     assert env["DATABRICKS_CONFIG_FILE"] == "/tmp/databrickscfg"
+    # The token-storage backend selector forwards too — without it the runner
+    # falls back to the ~/.databrickscfg default and can read a different token
+    # store than the host/daemon, failing to mint a token (runner tunnel 401).
+    assert env["DATABRICKS_AUTH_STORAGE"] == "plaintext"
     # Harness credentials forward — they exist FOR the runner's
     # harnesses (laptop: exported keys; managed sandbox: the
     # deployment's injected provider secrets).
@@ -1089,6 +1557,23 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # must reach the runner without also forcing
     # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
+    # need it to resolve the user's cluster contexts and namespaces.
+    assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
+    # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    # Opaque request-routing headers forward host→runner so the runner's tunnel
+    # and server callbacks reach the same server instance the host registered on
+    # (without the operator also listing it in OMNIGENT_RUNNER_ENV_PASSTHROUGH).
+    assert (
+        env["OMNIGENT_DATABRICKS_EXTRA_HEADERS"] == '{"x-databricks-route-hint": "instance-abc"}'
+    )
+    # Process logging controls forward so host-spawned runners honor --debug
+    # and --log-to-stderr.
+    assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"
+    assert env["OMNIGENT_LOG_TO_STDERR"] == "1"
+    assert env["OMNIGENT_LOG_TTY_FD"] == "9"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
@@ -1098,6 +1583,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["RUNNER_SERVER_URL"] == "http://server"
     assert env[RUNNER_ID_ENV_VAR] == "runner_abc"
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
+    assert env[RUNNER_DELEGATED_AUTH_ENV_VAR] == "1"
+    assert env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] == "host-bootstrap-bearer"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
 
@@ -1116,6 +1603,7 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "HOME": "/root",
         "ANTHROPIC_API_KEY": "sk-a",
         "ANTHROPIC_BASE_URL": "https://gateway.example.com/anthropic",
+        "ANTHROPIC_MODEL": "gateway-served-claude",
         "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-sub",
         "CODEX_ACCESS_TOKEN": "codex-workspace-token",
         "OPENAI_API_KEY": "sk-o",
@@ -1123,6 +1611,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "GEMINI_API_KEY": "g-key",
         "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
         "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        # An unrelated secret must never ride the credential set.
+        "MY_UNRELATED_SECRET": "leak-me-not",
     }
 
     env = _build_runner_env(
@@ -1137,6 +1627,10 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     for name in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        # The gateway model pin travels with the key/endpoint — without it a
+        # LiteLLM-style gateway session launches Claude Code model-less and
+        # the gateway rejects Claude Code's own default model.
+        "ANTHROPIC_MODEL",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
@@ -1153,6 +1647,32 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     # but never invented into the env.
     assert "ANTHROPIC_AUTH_TOKEN" in HARNESS_CREDENTIAL_ENV_VARS
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+    # A secret not on the credential set / allowlist is not forwarded.
+    assert "MY_UNRELATED_SECRET" not in env
+
+
+def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:
+    """Prefixed harness credential aliases forward without creating raw names."""
+    from omnigent.host.connect import HARNESS_CREDENTIAL_ENV_VARS
+
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": "/root",
+        "OMNIGENT_ANTHROPIC_API_KEY": "sk-prefixed",
+    }
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert "OMNIGENT_ANTHROPIC_API_KEY" in HARNESS_CREDENTIAL_ENV_VARS
+    assert env["OMNIGENT_ANTHROPIC_API_KEY"] == "sk-prefixed"
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
@@ -1628,6 +2148,360 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     assert result.path == str(tmp_path / "scratch")
 
 
+# ── host.install_harness handler ────────────────────────
+
+
+def test_handle_install_harness_success_returns_refreshed_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A successful install returns ``ok`` and the recomputed readiness map.
+
+    The server flips the UI badge off this map, so the handler must run the
+    installer and then re-probe readiness, returning the fresh result.
+    """
+    import omnigent.host.connect as connect
+
+    # Not yet installed, so the handler runs the installer.
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
+    monkeypatch.setattr(
+        connect,
+        "configured_harness_map",
+        lambda: {"claude-native": True, "codex-native": "needs-auth"},
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i1", harness="claude")
+    )
+
+    assert isinstance(result, HostInstallHarnessResultFrame)
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.configured_harnesses == {"claude-native": True, "codex-native": "needs-auth"}
+
+
+def test_handle_install_harness_already_installed_skips_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An already-installed harness returns fresh readiness without running npm.
+
+    ``npm install -g`` re-resolves over the network and can take minutes even
+    when the binary is already present, so a re-request must short-circuit —
+    otherwise a user clicking Install on an installed harness waits pointlessly
+    (and can hit the request timeout).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: True)
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer ran despite the harness already being installed")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i0", harness="opencode")
+    )
+
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"opencode-native": True}
+
+
+def test_handle_install_harness_failure_surfaces_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed install returns ``failed`` with the installer's reason and no
+    readiness map (the server keeps its prior view).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(
+        connect,
+        "try_install_harness_cli",
+        lambda key: (False, "npm is not available on the host"),
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i2", harness="codex")
+    )
+
+    assert result.status == "failed"
+    assert result.error == "npm is not available on the host"
+    assert result.configured_harnesses is None
+
+
+def test_handle_install_harness_rejects_non_allowlisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-UI-installable harness is refused without invoking the installer.
+
+    Defence in depth: even if a stray frame reaches the daemon, a harness
+    whose installer is a ``curl | bash`` (e.g. hermes) must never run.
+    """
+    import omnigent.host.connect as connect
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer reached for a non-allowlisted harness")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i3", harness="hermes")
+    )
+
+    assert result.status == "failed"
+    assert result.error is not None and "hermes" in result.error
+    assert result.configured_harnesses is None
+
+
+def test_handle_store_secret_key_writes_and_returns_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key store-secret request calls the core and returns fresh readiness.
+
+    The handler is a thin wrapper: resolve family, call the non-interactive
+    core, then recompute readiness so the server flips the badge (yellow →
+    green) without a reconnect.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    calls: list[dict[str, object]] = []
+
+    def _store(**kwargs: object) -> StoreCredentialResult:
+        calls.append(kwargs)
+        return StoreCredentialResult(True, "anthropic", None)
+
+    monkeypatch.setattr(connect, "store_harness_credential", _store)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"claude-native": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c1",
+            harness="claude",
+            kind="key",
+            secret_value="sk-ant-x",
+            default_model="claude-sonnet-4-6",
+        )
+    )
+    assert isinstance(result, HostStoreSecretResultFrame)
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"claude-native": True}
+    # The core was called with the resolved family + the frame's fields.
+    assert calls == [
+        {
+            "family": "anthropic",
+            "kind": "key",
+            "secret": "sk-ant-x",
+            "base_url": None,
+            "default_model": "claude-sonnet-4-6",
+            "wire_api": None,
+        }
+    ]
+
+
+def test_handle_store_secret_pi_maps_to_anthropic_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi (which consumes both families) writes to its preferred anthropic family."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _store(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "anthropic", None)
+
+    monkeypatch.setattr(connect, "store_harness_credential", _store)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c2", harness="pi", kind="key", secret_value="sk-x")
+    )
+    assert result.status == "ok"
+    assert seen["family"] == "anthropic"
+
+
+def test_handle_store_secret_adopt_calls_adopt_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An adopt request references an env var via the adopt core."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential, StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _adopt(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "openai", None)
+
+    monkeypatch.setattr(connect, "adopt_env_credential", _adopt)
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
+        ],
+    )
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"codex-native": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c3", harness="codex", kind="adopt", env_var="OPENAI_API_KEY"
+        )
+    )
+    assert result.status == "ok"
+    assert seen == {"family": "openai", "env_var": "OPENAI_API_KEY"}
+
+
+def test_handle_store_secret_pi_adopt_uses_detected_family_not_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopting an OpenAI env var for pi writes it under the OPENAI family.
+
+    pi consumes both anthropic + openai, so the UI can offer $OPENAI_API_KEY as
+    adoptable for pi. The harness-derived family for pi is anthropic; adopting
+    under it would write an anthropic provider pointing at an OpenAI key
+    (mis-routed, fails at run time). The daemon must use the env var's OWN
+    detected family instead.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential, StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _adopt(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "openai", None)
+
+    monkeypatch.setattr(connect, "adopt_env_credential", _adopt)
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
+        ],
+    )
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c4", harness="pi", kind="adopt", env_var="OPENAI_API_KEY")
+    )
+    assert result.status == "ok"
+    # openai (the env var's family), NOT anthropic (pi's harness-derived default).
+    assert seen == {"family": "openai", "env_var": "OPENAI_API_KEY"}
+
+
+def test_handle_store_secret_adopt_refuses_undetected_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopt refuses an env var the host didn't detect, without writing.
+
+    The server is owner-authz'd but doesn't otherwise validate env_var, so the
+    handler must enforce the adopt boundary: only a var present in
+    detect_adoptable_credentials() may be adopted. Otherwise a caller could name
+    an arbitrary set env var (a DB password, an unrelated secret) and have it
+    persisted as a provider credential and sent to the vendor endpoint as auth.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential
+
+    def _must_not_write(**kwargs: object) -> object:
+        raise AssertionError("adopt core reached for an undetected env var")
+
+    monkeypatch.setattr(connect, "adopt_env_credential", _must_not_write)
+    # Detect surfaces only ANTHROPIC_API_KEY; the request names a different var.
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(
+                family="anthropic", source="$ANTHROPIC_API_KEY", env_var="ANTHROPIC_API_KEY"
+            )
+        ],
+    )
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c6", harness="pi", kind="adopt", env_var="DATABASE_PASSWORD"
+        )
+    )
+    assert result.status == "failed"
+    assert result.error is not None and "DATABASE_PASSWORD" in result.error
+    assert result.configured_harnesses is None
+
+
+def test_handle_store_secret_rejects_non_ui_harness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A harness outside the UI-auth families is refused without a write."""
+    import omnigent.host.connect as connect
+
+    def _must_not_write(**kwargs: object) -> object:
+        raise AssertionError("credential core reached for a non-UI-auth harness")
+
+    monkeypatch.setattr(connect, "store_harness_credential", _must_not_write)
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c4", harness="cursor", kind="key", secret_value="x")
+    )
+    assert result.status == "failed"
+    assert result.error is not None and "cursor" in result.error
+
+
+def test_handle_store_secret_surfaces_core_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A core write failure surfaces its non-secret reason as ``failed``."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    monkeypatch.setattr(
+        connect,
+        "store_harness_credential",
+        lambda **k: StoreCredentialResult(False, None, "a gateway requires a base_url"),
+    )
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c5", harness="codex", kind="gateway", secret_value="x")
+    )
+    assert result.status == "failed"
+    assert result.error == "a gateway requires a base_url"
+    assert result.configured_harnesses is None
+
+
+def test_handle_detect_credentials_returns_non_secret_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The detect handler returns the core's descriptors as plain dicts."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential
+
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [DetectedCredential("anthropic", "$ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")],
+    )
+    host = _make_host_process()
+    result = host._handle_detect_credentials(HostDetectCredentialsFrame(request_id="d1"))
+    assert isinstance(result, HostDetectCredentialsResultFrame)
+    assert result.credentials == [
+        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+    ]
+
+
 # --- Fail-loud on permanent tunnel failures ----------------------------
 #
 # Before the fix, HostProcess.run() caught every connection exception and
@@ -1806,6 +2680,63 @@ def _host(
     """
     identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
     return HostProcess(identity, server_url)
+
+
+def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recorded ?o= selector rides the tunnel handshake.
+
+    The WS upgrade must name the workspace via ``X-Databricks-Org-Id`` or it
+    routes to the account. The header rides alongside the Origin sentinel,
+    independent of the bearer/managed-token branch.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    # No managed token + no real Databricks creds: isolate the bearer
+    # branch so only the routing header is under test.
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+    )
+
+    headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
+
+    assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+def test_build_connect_headers_retains_auth_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host reconnects and runner launches share one warm auth factory."""
+    import omnigent.runner._entry as entry_mod
+
+    factory_builds: list[str | None] = []
+    token_calls: list[int] = []
+
+    def _factory() -> str:
+        token_calls.append(1)
+        return "warm-host-token"
+
+    def _make_factory(*, server_url: str | None = None) -> object:
+        factory_builds.append(server_url)
+        return _factory
+
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
+
+    host = _host("https://app.example.databricksapps.com")
+    first = host._build_connect_headers()
+    second = host._build_connect_headers()
+    launch_token = host._current_auth_token(initialize=False)
+
+    assert first["Authorization"] == "Bearer warm-host-token"
+    assert second["Authorization"] == "Bearer warm-host-token"
+    assert launch_token == "warm-host-token"
+    assert factory_builds == ["https://app.example.databricksapps.com"]
+    assert token_calls == [1, 1, 1]
 
 
 async def test_run_retries_on_login_redirect(
@@ -2118,4 +3049,5 @@ def test_run_host_process_announces_session_log_dir_on_start(
     )
 
     out = capsys.readouterr().out
-    assert "Session logs: ~/.omnigent/logs/host-runner/" in out
+    assert "Session logs: ~/.omnigent/logs/runner/" in out
+    assert "This host's log: ~/.omnigent/logs/host/host-" in out

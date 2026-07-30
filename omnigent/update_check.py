@@ -636,6 +636,8 @@ def _spawn_background_refresh() -> None:
     Any spawn failure is swallowed — the worst case is simply that the
     cache is refreshed on a later invocation instead.
     """
+    from omnigent.inner import _proc
+
     with contextlib.suppress(OSError, ValueError):
         subprocess.Popen(
             [
@@ -646,8 +648,8 @@ def _spawn_background_refresh() -> None:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
             close_fds=True,
+            **_proc.spawn_kwargs(),
         )
 
 

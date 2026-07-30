@@ -12,7 +12,7 @@ This exercises the cross-client path the single-context smoke test
 can't: the server broadcasts ``session.input.consumed`` to every
 subscriber, and ``chatStore.handleSessionEvent`` promotes a peer's
 consumed event into a user bubble when the local optimistic FIFO is
-empty (``ap-web/src/store/chatStore.ts`` ``session_input_consumed``
+empty (``web/src/store/chatStore.ts`` ``session_input_consumed``
 branch). If either the broadcast or that promotion regresses, the
 collaborator never renders the owner's message and this test goes red.
 

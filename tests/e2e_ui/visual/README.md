@@ -42,11 +42,11 @@ it.
 
 ## Is this check merge-blocking?
 
-The check **`UI Snapshot (visual baselines)`** blocks merges only if it's listed in
-the repo's required-checks set (branch protection / `.github/scripts/merge-ready`,
-which is generated and synced separately). Until it's added there it's an
-**advisory** red check — visible, but not enforced. Registering it as required is
-a one-line change to that synced config, outside this directory.
+The check **`UI Snapshot (visual baselines)`** is **merge-blocking**: it's listed
+in the repo's required-checks set (`.github/scripts/merge-ready/required.sh`, in
+both `REQUIRED` and `ALLOW_SKIP`). A drift against the committed baseline fails
+the check and blocks the merge until the baseline is regenerated (label the PR —
+see below) or the UI change is reverted.
 
 It's **safe to register as required**: a PR that touches none of the render
 inputs skips the render via the `detect` job's `if` gate, and a job skipped by
@@ -55,7 +55,7 @@ inputs skips the render via the `detect` job's `if` gate, and a job skipped by
 
 ## How the gate behaves
 
-- On every PR that touches a render input (ap-web, the visual tests + fixtures,
+- On every PR that touches a render input (web, the visual tests + fixtures,
   or the pinned toolchain — see the `detect` job in `ui-snapshot.yml`),
   `ui-snapshot.yml` renders each page and compares it to its committed baseline.
   Any pixel difference on any page fails the check; PRs that touch none of those
@@ -102,7 +102,7 @@ This renders inside the exact pinned image CI uses, so the PNGs it writes match
 the gate byte-for-byte. Only Docker is required (it builds the SPA in a Node
 container, then renders the suite and rewrites only the baselines that drift —
 passing ones stay untouched). **Review the image(s)**, then commit and push —
-your push re-runs the checks. Pass `--skip-build` to reuse an existing `ap-web`
+your push re-runs the checks. Pass `--skip-build` to reuse an existing `web`
 build.
 
 ### Fork PR without Docker — adopt the run's render
@@ -169,7 +169,8 @@ baseline and break CI. Use the Docker path above to produce a committable PNG.
 ```bash
 uv sync --extra all --extra dev
 uv run playwright install --with-deps chromium
-cd ap-web && npm ci --legacy-peer-deps && npm run build && cd ..
+pnpm install --frozen-lockfile --filter web
+pnpm --filter web run build
 # First run with no baseline creates one (and fails); subsequent runs compare:
 uv run pytest tests/e2e_ui/visual -m visual --ui-skip-build
 ```

@@ -220,6 +220,84 @@ def load_databricks_org_id(server_url: str) -> str | None:
     return org_id if isinstance(org_id, str) and org_id else None
 
 
+# Workspace-routing header. When a Databricks host fronts many workspaces
+# under one hostname, the bare host is the account; the API proxy routes a
+# workspace request by this header (equivalently to the ``?o=`` query param).
+DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
+
+
+# Opaque extra request headers for dev/test: a JSON object of header name→value
+# in :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR`. Databricks deployments use it to
+# carry request-routing selector headers so a request pins to a specific server
+# instance/replica instead of the default one. Folded into
+# :func:`databricks_request_headers` below so it travels with every
+# client→server connection built through that one helper — a per-call-site
+# bearer that skips this helper misses the selectors. Unset in prod.
+DATABRICKS_EXTRA_HEADERS_ENV_VAR = "OMNIGENT_DATABRICKS_EXTRA_HEADERS"
+
+
+def _databricks_extra_headers() -> dict[str, str]:
+    """Return the opaque extra request headers when configured, else ``{}``.
+
+    Reads :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR`, a JSON object of header
+    name→value. Missing or malformed (unset, not JSON, or not an object) →
+    ``{}``, so production and local runs are unaffected.
+
+    :returns: A header dict parsed from the env var, or an empty dict.
+    """
+    raw = os.environ.get(DATABRICKS_EXTRA_HEADERS_ENV_VAR, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(key): str(value) for key, value in parsed.items()}
+
+
+def databricks_request_headers(
+    server_url: str, *, bearer_token: str | None = None
+) -> dict[str, str]:
+    """Build the headers for a request to a Databricks-fronted server.
+
+    The single source of truth for server-request headers. It always
+    includes the :data:`DATABRICKS_ORG_ID_HEADER` workspace-routing header
+    when ``omnigent login https://<host>/?o=<id>`` recorded a selector, and
+    adds ``Authorization`` when a bearer is supplied. Folding both into one
+    builder makes routing travel with auth: a caller that has a token gets
+    routing for free, and a caller whose credential is set elsewhere (an
+    httpx ``Auth`` that mints per request, or the managed-host token header)
+    omits the token and still gets routing.
+
+    Both values are omitted when absent, so single-workspace and
+    local-unauthenticated callers get ``{}`` and are unaffected.
+
+    Also folds in any opaque dev/test headers from
+    :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR` (request-routing selectors set by
+    some Databricks deployments) so every chokepoint that builds headers through
+    this one helper carries them when set.
+
+    :param server_url: The server URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :param bearer_token: The workspace bearer token, or ``None`` when the
+        credential is supplied by a separate mechanism (or there is none).
+    :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
+        and/or the configured extra headers as available, possibly empty.
+    """
+    headers: dict[str, str] = {}
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    org_id = load_databricks_org_id(server_url)
+    if org_id:
+        headers[DATABRICKS_ORG_ID_HEADER] = org_id
+    # Opaque dev/test extra headers (request-routing selectors); no-op in prod
+    # (env unset).
+    headers.update(_databricks_extra_headers())
+    return headers
+
+
 def clear_token(server_url: str) -> None:
     """Remove a stored token for a server.
 

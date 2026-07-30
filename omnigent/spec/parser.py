@@ -30,6 +30,8 @@ from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
+    DatabricksProfileBinding,
+    DatabricksProxySpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
     TerminalEnvSpec,
@@ -53,11 +55,11 @@ from omnigent.spec.types import (
     ModalityConfig,
     Phase,
     PhaseSelector,
-    PolicyAction,
     PolicySpec,
     ProviderAuth,
     RetryPolicy,
     SandboxConfig,
+    SharePolicy,
     SkillSpec,
     ToolsConfig,
 )
@@ -101,7 +103,14 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS = frozenset({"cost_optimize"})
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+
+# Copy the resolver dict onto the subclass before mutating — it's inherited
+# from SafeLoader by reference, so in-place edits below would strip
+# SafeLoader's bool resolver process-wide.
+_ConfigYamlLoader.yaml_implicit_resolvers = {
+    key: value[:] for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
         (tag, regexp)
@@ -121,6 +130,49 @@ _ConfigYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
     _YAML_1_2_BOOL_RE,
     list("tTfF"),
 )
+
+
+def _parse_int_field(raw: object, field_name: str) -> int:
+    """
+    Coerce an integer config field while rejecting YAML booleans.
+
+    Python treats ``bool`` as a subclass of ``int``. Without this guard,
+    values like ``false`` silently become ``0`` for fields such as
+    ``executor.max_iterations``.
+    """
+    if isinstance(raw, bool):
+        raise OmnigentError(
+            f"{field_name} must be an integer, got boolean {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise OmnigentError(
+            f"{field_name} must be an integer, got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
+def _parse_float_field(raw: object, field_name: str) -> float:
+    """
+    Coerce a numeric config field while rejecting YAML booleans.
+
+    ``float(True)`` becomes ``1.0`` in Python, which is not a useful
+    interpretation for timing and threshold fields.
+    """
+    if isinstance(raw, bool):
+        raise OmnigentError(
+            f"{field_name} must be a number, got boolean {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise OmnigentError(
+            f"{field_name} must be a number, got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
 
 
 def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
@@ -163,7 +215,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     raw_tools = raw.get("tools")
     llm = _parse_llm(raw_llm, expand_env=expand_env)
     interaction = _parse_interaction(raw.get("interaction"))
-    tools_config = _parse_tools_config(raw_tools)
+    tools_config = _parse_tools_config(raw_tools, expand_env=expand_env)
     executor = _parse_executor(raw_executor, expand_env=expand_env)
     # ── Consolidate llm: → executor ────────────────────────────────
     # ``executor.model`` and ``executor.connection`` are the primary
@@ -192,6 +244,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             model=executor.model or llm.model,
             extra=llm.extra,
             connection=executor.connection,
+            profile=llm.profile,
             request_timeout=llm.request_timeout,
             retry=llm.retry,
         )
@@ -224,6 +277,13 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # the specified sub-agent types. Defaults to False — session
     # reads stay always-on, but every write grant is explicit.
     spawn = bool(raw.get("spawn", False))
+    # Top-level ``agent_session_sharing:`` flag is the SOLE enabler of
+    # the ``sys_session_share`` tool, independent of ``spawn`` /
+    # ``tools.agents`` (and unrelated to server-API / CLI sharing).
+    # ``none`` (default) leaves it unregistered; ``non-public`` allows
+    # granting named users; ``public`` also allows ``__public__``
+    # anonymous read.
+    agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
 
     # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
     # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
@@ -260,6 +320,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         terminals=terminals,
         timers=timers,
         spawn=spawn,
+        agent_session_sharing=agent_session_sharing,
     )
 
 
@@ -302,9 +363,34 @@ def _parse_llm(
         connection = expand_env_vars(raw_dict) if expand_env else raw_dict
     profile_raw = raw.get("profile")
     profile = str(profile_raw) if profile_raw is not None else None
-    request_timeout = int(raw["request_timeout"]) if "request_timeout" in raw else 300
+    request_timeout = (
+        _parse_int_field(raw["request_timeout"], "llm.request_timeout")
+        if "request_timeout" in raw
+        else 300
+    )
     retry = _parse_retry(raw.get("retry"))
-    reserved = {"model", "connection", "profile", "request_timeout", "retry"}
+    fallback_models_raw = raw.get("fallback_models")
+    if fallback_models_raw is None:
+        fallback_models = []
+    elif isinstance(fallback_models_raw, list):
+        fallback_models = [str(m) for m in fallback_models_raw]
+    else:
+        # A non-list value (e.g. a bare string) is almost certainly a
+        # config typo — a bare string would iterate per-character, so
+        # reject it loudly rather than silently dropping the fallbacks.
+        _log.warning(
+            "llm.fallback_models must be a list, got %s; ignoring it",
+            type(fallback_models_raw).__name__,
+        )
+        fallback_models = []
+    reserved = {
+        "model",
+        "connection",
+        "profile",
+        "request_timeout",
+        "retry",
+        "fallback_models",
+    }
     extra = {k: v for k, v in raw.items() if k not in reserved}
     return LLMConfig(
         model=str(model),
@@ -313,6 +399,7 @@ def _parse_llm(
         profile=profile,
         request_timeout=request_timeout,
         retry=retry,
+        fallback_models=fallback_models,
     )
 
 
@@ -349,6 +436,8 @@ def _parse_interaction(
 
 def _parse_tools_config(
     raw: dict[str, Any] | None,
+    *,
+    expand_env: bool = True,
 ) -> ToolsConfig:
     """
     Parse the ``tools:`` block from config.yaml into a
@@ -363,9 +452,9 @@ def _parse_tools_config(
     """
     if raw is None:
         return ToolsConfig()
-    timeout = int(raw["timeout"]) if "timeout" in raw else 60
+    timeout = _parse_int_field(raw["timeout"], "tools.timeout") if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
-    builtins = _parse_builtin_tools(raw.get("builtins", []))
+    builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
     return ToolsConfig(
         agents=raw.get("agents", []),
@@ -389,7 +478,7 @@ def _parse_sandbox_config(
 
         sandbox:
           container_image: python:3.12-slim
-          container_runtime: podman  # optional, defaults to docker
+          container_runtime: podman  # optional, defaults to OMNIGENT_CONTAINER_RUNTIME or docker
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).
@@ -397,20 +486,23 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
-    runtime = raw.get("container_runtime", "docker")
-    if runtime not in ("docker", "podman"):
-        raise ValueError(
-            f"Unsupported container_runtime {runtime!r}; expected 'docker' or 'podman'."
-        )
     image = raw.get("container_image") or raw.get("docker_image")
-    return SandboxConfig(
-        container_image=image,
-        container_runtime=runtime,
-    )
+    kwargs: dict[str, Any] = {"container_image": image}
+    if "container_runtime" in raw:
+        runtime = raw["container_runtime"]
+        if runtime not in SandboxConfig.ALLOWED_RUNTIMES:
+            raise ValueError(
+                f"Unsupported container_runtime {runtime!r}; "
+                f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
+            )
+        kwargs["container_runtime"] = runtime
+    return SandboxConfig(**kwargs)
 
 
 def _parse_builtin_tools(
     raw: list[str | dict[str, Any]],
+    *,
+    expand_env: bool = True,
 ) -> list[BuiltinToolConfig]:
     """
     Parse the ``tools.builtins`` list into
@@ -426,6 +518,8 @@ def _parse_builtin_tools(
             engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
 
     :param raw: The raw ``builtins`` list from config.yaml.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        tool-specific config fields. ``False`` keeps literals as-is.
     :returns: A list of :class:`BuiltinToolConfig` instances.
     :raises OmnigentError: If a dict entry is missing ``name``.
     """
@@ -441,7 +535,8 @@ def _parse_builtin_tools(
                     code=ErrorCode.INVALID_INPUT,
                 )
             # Everything except 'name' is tool-specific config.
-            config = {str(k): str(v) for k, v in entry.items() if k != "name"}
+            raw_config = {str(k): str(v) for k, v in entry.items() if k != "name"}
+            config = expand_env_vars(raw_config) if expand_env else raw_config
             result.append(
                 BuiltinToolConfig(
                     name=str(name),
@@ -472,17 +567,27 @@ def _parse_retry(
         return RetryPolicy()
     defaults = RetryPolicy()
     return RetryPolicy(
-        max_retries=int(raw.get("max_retries", defaults.max_retries)),
-        backoff_base_s=float(raw.get("backoff_base_s", defaults.backoff_base_s)),
-        backoff_max_s=float(raw.get("backoff_max_s", defaults.backoff_max_s)),
+        max_retries=_parse_int_field(
+            raw.get("max_retries", defaults.max_retries),
+            "retry.max_retries",
+        ),
+        backoff_base_s=_parse_float_field(
+            raw.get("backoff_base_s", defaults.backoff_base_s),
+            "retry.backoff_base_s",
+        ),
+        backoff_max_s=_parse_float_field(
+            raw.get("backoff_max_s", defaults.backoff_max_s),
+            "retry.backoff_max_s",
+        ),
         jitter=bool(raw.get("jitter", defaults.jitter)),
         timeout_per_request_s=(
-            float(raw["timeout_per_request_s"])
+            _parse_float_field(raw["timeout_per_request_s"], "retry.timeout_per_request_s")
             if raw.get("timeout_per_request_s") is not None
             else defaults.timeout_per_request_s
         ),
         retryable_status_codes=tuple(
-            int(c) for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
+            _parse_int_field(c, "retry.retryable_status_codes")
+            for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
         ),
     )
 
@@ -515,9 +620,6 @@ def _parse_executor(
     # type. Scalar values are coerced to strings so YAML booleans /
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
-    # Structured keys whose consumer needs the nested shape are kept
-    # verbatim: ``cost_optimize`` is the cost advisor's tier config (a
-    # nested mapping), which ``parse_advisor_config`` reads as a Mapping.
     raw_config = raw.get("config")
     config: dict[str, Any] = {}
     if isinstance(raw_config, dict):
@@ -537,7 +639,9 @@ def _parse_executor(
     if etype == "omnigent" and profile is not None and "profile" not in config:
         config["profile"] = profile
     raw_cw = raw.get("context_window")
-    context_window: int | None = int(raw_cw) if raw_cw is not None else None
+    context_window: int | None = (
+        _parse_int_field(raw_cw, "executor.context_window") if raw_cw is not None else None
+    )
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
     # Parse ``executor.connection:`` — same shape as ``llm.connection:``
@@ -552,8 +656,11 @@ def _parse_executor(
     auth = _parse_executor_auth(raw, expand_env=expand_env)
     return ExecutorSpec(
         type=etype,
-        timeout=int(raw.get("timeout", 3600)),
-        max_iterations=int(raw.get("max_iterations", 1000)),
+        timeout=_parse_int_field(raw.get("timeout", 3600), "executor.timeout"),
+        max_iterations=_parse_int_field(
+            raw.get("max_iterations", 1000),
+            "executor.max_iterations",
+        ),
         profile=profile,
         config=config,
         model=model,
@@ -764,7 +871,10 @@ def _parse_terminals(
             allow_cwd_override=bool(entry.get("allow_cwd_override", False)),
             allow_sandbox_override=bool(entry.get("allow_sandbox_override", False)),
             log_file=entry.get("log_file"),
-            scrollback=int(entry.get("scrollback", 10000)),
+            scrollback=_parse_int_field(
+                entry.get("scrollback", 10000),
+                f"terminals.{name}.scrollback",
+            ),
             session_prefix=str(entry.get("session_prefix", "omni_")),
             tmux_allow_passthrough=bool(entry.get("tmux_allow_passthrough", False)),
             tmux_start_on_attach=bool(entry.get("tmux_start_on_attach", False)),
@@ -832,7 +942,10 @@ def _parse_os_env_sandbox(
             "(Linux) or sandbox.type=darwin_seatbelt (macOS) for hard "
             "network enforcement: those backends restrict network access "
             "at spawn time so the MITM proxy is the only egress path. "
-            f"Got sandbox.type={sandbox_type!r}.",
+            f"Got sandbox.type={sandbox_type!r}. "
+            "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
+            "darwin_seatbelt on macOS; do not use sandbox.type=none with "
+            "egress_rules.",
             code=ErrorCode.INVALID_INPUT,
         )
     credential_proxy = _parse_credential_proxy(raw.get("credential_proxy"))
@@ -1228,12 +1341,14 @@ class _CredentialProxyItemModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["https_bearer", "https_basic", "git_https", "gh_basic"]
-    source: _CredentialSourceModel
+    type: Literal["https_bearer", "https_basic", "git_https", "gh_basic", "databricks_cli"]
+    source: _CredentialSourceModel | None = None
     target: str | None = None
     targets: list[str] | None = None
     env: str | None = None
     username: str | None = None
+    profiles: list[str] | None = None
+    default: str | None = None
 
     @field_validator("env")
     @classmethod
@@ -1272,12 +1387,23 @@ class _CredentialProxyItemModel(BaseModel):
         ``targets``; ``gh_basic`` allows neither (it defaults to the
         GitHub git + API hosts) but not both. The ``env`` shim is only
         meaningful for the ``https_*`` primitives, and ``username`` only
-        applies to the Basic schemes.
+        applies to the Basic schemes. ``databricks_cli`` is profile-keyed:
+        it takes ``profiles`` (+ optional ``default``) and none of the
+        host-keyed fields (``source`` is implicit — the profile).
 
         :returns: ``self`` once validated.
         :raises ValueError: On a cardinality violation or a per-type
             option that does not apply.
         """
+        if self.type == "databricks_cli":
+            return self._check_databricks_cli()
+        # The host-keyed types resolve their secret from an explicit source.
+        if self.source is None:
+            raise ValueError("source is required")
+        if self.profiles is not None:
+            raise ValueError(f"{self.type} does not accept 'profiles'")
+        if self.default is not None:
+            raise ValueError(f"{self.type} does not accept 'default'")
         has_target = self.target is not None
         has_targets = self.targets is not None
         if has_targets and not self.targets:
@@ -1291,6 +1417,44 @@ class _CredentialProxyItemModel(BaseModel):
             raise ValueError(f"{self.type} does not accept an 'env' injection shim")
         if self.username is not None and self.type == "https_bearer":
             raise ValueError("https_bearer does not accept a 'username'")
+        return self
+
+    def _check_databricks_cli(self) -> _CredentialProxyItemModel:
+        """
+        Validate a ``databricks_cli`` entry.
+
+        The Databricks CLI is profile-keyed: it takes a non-empty
+        ``profiles`` list and an optional ``default`` (which must be one of
+        the listed profiles). The host-keyed fields (``source`` — resolved
+        from the profile — ``target``/``targets``, ``env``, ``username``)
+        do not apply and are rejected so typos fail loud.
+
+        :returns: ``self`` once validated.
+        :raises ValueError: On a missing/empty/duplicate profile, a
+            ``default`` outside ``profiles``, or a host-keyed field set.
+        """
+        for name, value in (
+            ("source", self.source),
+            ("target", self.target),
+            ("targets", self.targets),
+            ("env", self.env),
+            ("username", self.username),
+        ):
+            if value is not None:
+                raise ValueError(f"databricks_cli does not accept {name!r}")
+        if not self.profiles:
+            raise ValueError("databricks_cli requires a non-empty 'profiles' list")
+        seen: set[str] = set()
+        for profile in self.profiles:
+            if not profile or not profile.strip():
+                raise ValueError("databricks_cli 'profiles' entries must be non-empty strings")
+            if profile in seen:
+                raise ValueError(f"databricks_cli lists profile {profile!r} more than once")
+            seen.add(profile)
+        if self.default is not None and self.default not in self.profiles:
+            raise ValueError(
+                f"databricks_cli 'default' {self.default!r} must be one of 'profiles'"
+            )
         return self
 
 
@@ -1364,6 +1528,9 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
     if not raw:
         return None
     entries: list[CredentialProxyEntry] = []
+    databricks_profiles: list[DatabricksProfileBinding] = []
+    databricks_default: str | None = None
+    databricks_seen: set[str] = set()
     for i, item in enumerate(raw):
         try:
             model = _CredentialProxyItemModel.model_validate(item)
@@ -1373,6 +1540,16 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
                 f"{_format_validation_error(exc)}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        if model.type == "databricks_cli":
+            databricks_default = _merge_databricks_cli(
+                model,
+                profiles=databricks_profiles,
+                seen=databricks_seen,
+                current_default=databricks_default,
+                index=i,
+            )
+            continue
+        assert model.source is not None  # guaranteed by the model validator
         source = model.source.to_spec()
         if model.type == "gh_basic":
             entries.extend(_normalize_gh_basic(model, source=source, index=i))
@@ -1382,12 +1559,11 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
             entries.extend(_normalize_https_basic(model, source=source, index=i))
         else:  # git_https
             entries.extend(_normalize_git_https(model, source=source, index=i))
-    if not entries:
-        return None
     # Fail loud on conflicting host bindings. The egress proxy keys its
     # rewrite table by host, so two entries binding the same host would
     # silently last-win (one credential dropped). Reject it at parse time
-    # rather than picking a binding nondeterministically.
+    # rather than picking a binding nondeterministically. (Databricks
+    # hosts are resolved at runtime, so their collision guard lives there.)
     seen_hosts: dict[str, str] = {}
     for entry in entries:
         host_key = entry.host.lower()
@@ -1400,7 +1576,65 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
                 code=ErrorCode.INVALID_INPUT,
             )
         seen_hosts[host_key] = entry.host
-    return CredentialProxySpec(entries=entries)
+    databricks = (
+        DatabricksProxySpec(profiles=databricks_profiles, default=databricks_default)
+        if databricks_profiles
+        else None
+    )
+    if not entries and databricks is None:
+        return None
+    return CredentialProxySpec(entries=entries, databricks=databricks)
+
+
+def _merge_databricks_cli(
+    model: _CredentialProxyItemModel,
+    *,
+    profiles: list[DatabricksProfileBinding],
+    seen: set[str],
+    current_default: str | None,
+    index: int,
+) -> str | None:
+    """
+    Merge one validated ``databricks_cli`` entry into the shared profile list.
+
+    Multiple ``databricks_cli`` entries are allowed and coalesced into a
+    single :class:`DatabricksProxySpec`. Profile names must be unique
+    across every entry (each profile maps to one materialized cfg section
+    and one workspace-host binding), and at most one ``default`` may be
+    declared in total.
+
+    :param model: The validated entry; ``profiles`` is non-empty and
+        ``default`` (if set) is one of them.
+    :param profiles: Accumulator of bindings, mutated in place.
+    :param seen: Accumulator of profile names already claimed.
+    :param current_default: The default declared by a prior entry, or
+        ``None``.
+    :param index: Entry index for error messages.
+    :returns: The (possibly updated) default profile name.
+    :raises OmnigentError: On a duplicate profile across entries or a
+        second conflicting ``default``.
+    """
+    assert model.profiles is not None  # guaranteed by the model validator
+    for profile in model.profiles:
+        if profile in seen:
+            raise OmnigentError(
+                f"os_env.sandbox.credential_proxy[{index}] lists Databricks "
+                f"profile {profile!r} which is already proxied by another "
+                "databricks_cli entry; each profile may appear once.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        seen.add(profile)
+        profiles.append(DatabricksProfileBinding(profile=profile))
+    if model.default is not None:
+        if current_default is not None and current_default != model.default:
+            raise OmnigentError(
+                "os_env.sandbox.credential_proxy declares conflicting "
+                f"databricks_cli defaults ({current_default!r} and "
+                f"{model.default!r}); declare at most one default profile.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return model.default
+    return current_default
 
 
 # Env names that are loader/interpreter hooks: brokering a value into one of
@@ -1575,16 +1809,30 @@ def _credential_proxy_macos_unsupported_reason(
     the original ``type`` keeps this check independent of how the presets
     normalize into bindings.
 
+    ``databricks_cli`` fails on macOS for the same reason — the ``databricks``
+    CLI is also a Go binary — so it is rejected here too.
+
     :param credential_proxy: Parsed credential-proxy spec, or ``None`` when the
         ``credential_proxy:`` field is absent.
     :param sandbox_type: Resolved sandbox backend, e.g. ``"darwin_seatbelt"``
         (macOS) or ``"linux_bwrap"`` (Linux).
     :returns: A human-readable rejection message when a ``gh_basic`` (i.e. a
-        ``token``-scheme) binding is configured on ``darwin_seatbelt``, else
-        ``None``.
+        ``token``-scheme) binding or a ``databricks_cli`` policy is configured
+        on ``darwin_seatbelt``, else ``None``.
     """
     if credential_proxy is None or sandbox_type != "darwin_seatbelt":
         return None
+    if credential_proxy.databricks is not None:
+        return (
+            "os_env.sandbox.credential_proxy type 'databricks_cli' does not work "
+            "on macOS (sandbox.type=darwin_seatbelt). The 'databricks' CLI is a Go "
+            "binary, and Go on macOS verifies TLS against the system keychain "
+            "(Security.framework) and ignores SSL_CERT_FILE -- the environment "
+            "variable the egress MITM proxy uses to publish its CA to sandboxed "
+            "tools. Every 'databricks' call would fail with 'certificate is not "
+            "trusted'. Use sandbox.type=linux_bwrap (Go honors SSL_CERT_FILE on "
+            "Linux)."
+        )
     if not any(entry.scheme == "token" for entry in credential_proxy.entries):
         return None
     return (
@@ -1841,8 +2089,14 @@ def _parse_compaction(
     if raw is None:
         return None
     return CompactionConfig(
-        trigger_threshold=float(raw.get("trigger_threshold", 0.8)),
-        recent_window=int(raw.get("recent_window", 5)),
+        trigger_threshold=_parse_float_field(
+            raw.get("trigger_threshold", 0.8),
+            "compaction.trigger_threshold",
+        ),
+        recent_window=_parse_int_field(
+            raw.get("recent_window", 5),
+            "compaction.recent_window",
+        ),
     )
 
 
@@ -1915,6 +2169,42 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
         except OSError:
             pass
     return None
+
+
+def _parse_share_policy(raw: object) -> SharePolicy:
+    """
+    Parse the top-level YAML ``agent_session_sharing:`` field into a
+    :class:`SharePolicy`.
+
+    This flag is the sole enabler of the ``sys_session_share`` tool
+    (independent of ``spawn`` / ``tools.agents``). Sharing mutates
+    access control, so it is off by default and an unrecognized value
+    fails loud rather than silently disabling the feature.
+
+    Supported YAML shapes:
+
+    - field omitted / ``null`` → :attr:`SharePolicy.NONE` (default;
+      tool not registered).
+    - ``"none"`` / ``"non-public"`` / ``"public"`` → the matching
+      :class:`SharePolicy` member.
+
+    :param raw: The raw YAML value (already parsed). ``None`` or one
+        of the three policy strings, e.g. ``"non-public"``.
+    :returns: The resolved :class:`SharePolicy`.
+    :raises OmnigentError: When the value is neither ``None`` nor one
+        of the recognized policy strings (e.g. a boolean, a typo like
+        ``"private"``, or a non-string).
+    """
+    if raw is None:
+        return SharePolicy.NONE
+    try:
+        return SharePolicy(raw)
+    except ValueError:
+        valid = ", ".join(repr(p.value) for p in SharePolicy)
+        raise OmnigentError(
+            f"top-level agent_session_sharing: must be one of {valid}; got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from None
 
 
 def _parse_skills_filter(raw: object) -> str | list[str]:
@@ -2080,8 +2370,19 @@ def _discover_skills(
     """
     if not skills_dir.is_dir():
         return []
+    try:
+        entries = sorted(skills_dir.iterdir())
+    except OSError as exc:
+        # Lenient mode (a skipped list was passed, e.g. host/plugin menu
+        # discovery): an unreadable skills dir must not 500 the caller —
+        # log and yield nothing. Strict mode (bundle parse) re-raises.
+        if skipped is None:
+            raise
+        _log.warning("Skipping unreadable skills dir %s: %s", skills_dir, exc)
+        skipped.append(f"{skills_dir}: {exc}")
+        return []
     skills: list[SkillSpec] = []
-    for skill_dir in sorted(skills_dir.iterdir()):
+    for skill_dir in entries:
         if not skill_dir.is_dir():
             continue
         skill_md = skill_dir / "SKILL.md"
@@ -2098,6 +2399,35 @@ def _discover_skills(
             continue
         skills.append(skill)
     return skills
+
+
+# Quoted string spellings treated as boolean false. PyYAML already parses the
+# *bare* YAML 1.1 false words (``false``/``False``/``no``/``off``) to a real
+# ``bool``, caught by the ``raw is False`` branch below; this set only catches
+# the *quoted* forms (e.g. ``user-invocable: "no"``) that arrive as ``str``.
+_FALSEY_STRINGS = frozenset({"false", "no", "off", "0"})
+
+
+def _falsey_flag(raw: object) -> bool:
+    """
+    Return whether a YAML frontmatter flag reads as boolean ``false``.
+
+    Accepts a genuine YAML bool (``raw is False`` — which already covers
+    the bare words ``false``/``no``/``off`` that PyYAML parses to a
+    ``bool``) and the quoted string spellings in :data:`_FALSEY_STRINGS`
+    (case-insensitive, surrounding whitespace ignored) — YAML keeps a
+    quoted value as a ``str``, so the string branch is the one that
+    silently regresses without a test. Every other value (absent ⇒
+    caller's default, ``true``, other strings, ``0`` as int) is not
+    falsey.
+
+    :param raw: The raw frontmatter value, e.g. ``False``, ``"no"``,
+        or ``True``.
+    :returns: ``True`` only when *raw* means boolean false.
+    """
+    if raw is False:
+        return True
+    return isinstance(raw, str) and raw.strip().lower() in _FALSEY_STRINGS
 
 
 def _parse_skill(skill_md: Path) -> SkillSpec:
@@ -2118,7 +2448,11 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     try:
         text = skill_md.read_text()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
+        # OSError — funnel it through OmnigentError too so the lenient
+        # scanner in _discover_skills and the per-skill guards in the menu
+        # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
             f"SKILL.md could not be read: {skill_md}: {exc}",
             code=ErrorCode.INVALID_INPUT,
@@ -2154,11 +2488,15 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
             f"SKILL.md frontmatter missing required field 'description': {skill_md}",
             code=ErrorCode.INVALID_INPUT,
         )
+    # ``user-invocable: false`` marks an internal orchestration skill that
+    # the user should not invoke directly; absent/true ⇒ invocable.
+    user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
     return SkillSpec(
         name=str(name),
         description=str(description),
         content=content.strip(),
         skill_dir=skill_md.parent,
+        user_invocable=user_invocable,
     )
 
 
@@ -2320,6 +2658,17 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
+        # Optional per-server tool allow-list (the YAML ``tools:`` whitelist) —
+        # only these tool names are exposed to the model; ``None`` exposes all.
+        # Mirrors ``MCPTool.tools`` and is filtered downstream in
+        # server/mcp_pool.py + runner/mcp_manager.py.
+        raw_allow = val.get("tools")
+        if raw_allow is not None and not isinstance(raw_allow, list):
+            raise OmnigentError(
+                f"Inline MCP server {name!r} 'tools' must be a list of tool names",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        tool_allowlist = [str(t) for t in raw_allow] if raw_allow else None
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -2334,6 +2683,7 @@ def _parse_inline_mcp_servers(
                 headers=headers,
                 env=env,
                 databricks_profile=databricks_profile,
+                tools=tool_allowlist,
             )
         )
     return servers
@@ -2446,7 +2796,11 @@ def _parse_http_mcp_server(
             expand_env_vars(raw.get("headers", {})) if expand_env else raw.get("headers", {})
         ),
         description=raw.get("description"),
-        timeout=int(raw["timeout"]) if "timeout" in raw else None,
+        timeout=(
+            _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
+            if "timeout" in raw
+            else None
+        ),
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
     )
 
@@ -2546,7 +2900,11 @@ def _parse_stdio_mcp_server(
         env={str(k): str(v) for k, v in env.items()},
         credential_groups=[str(g) for g in raw_groups],
         description=raw.get("description"),
-        timeout=int(raw["timeout"]) if "timeout" in raw else None,
+        timeout=(
+            _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
+            if "timeout" in raw
+            else None
+        ),
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
     )
 
@@ -2676,7 +3034,7 @@ def _parse_guardrails(
     :param raw: The ``guardrails:`` mapping from config.yaml,
         or ``None`` when the block was absent. Example:
         ``{"labels": {"integrity": {"initial": "1",
-        "values": ["0", "1"], "monotonic": "decreasing"}},
+        "values": ["0", "1"]}},
         "policies": {"block_canada_input": {"type": "prompt",
         ...}}, "ask_timeout": 30}``.
     :param expand_env: Whether to expand ``${VAR}`` references
@@ -2712,21 +3070,14 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
     rejects ``<= 0`` at spec load per POLICIES.md §13. The
     ambiguity between "instant DENY" and "wait forever"
     drove the strict > 0 rule — both intents have explicit
-    paths (omit ASK from action list; use a large finite
-    number).
+    paths (use a large finite number for long waits).
 
     :param raw: Raw ``guardrails.ask_timeout:`` value.
     :returns: Validated timeout in seconds.
     :raises OmnigentError: On non-integer or non-positive
         values.
     """
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise OmnigentError(
-            f"guardrails.ask_timeout must be an integer, got {raw!r}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+    value = _parse_int_field(raw, "guardrails.ask_timeout")
     if value <= 0:
         raise OmnigentError(
             "guardrails.ask_timeout must be > 0 "
@@ -2749,16 +3100,15 @@ def _parse_label_defs(
     - Bare string: ``integrity: "1"`` → schemaless with
       ``initial="1"``.
     - Dict (schema'd with initial):
-      ``{initial: "1", values: [...], monotonic: ...}``.
+      ``{initial: "1", values: [...]}``.
     - Dict (schema'd without initial):
-      ``{values: [...], monotonic: ...}``.
+      ``{values: [...]}``.
 
     :param raw: The ``labels:`` mapping, or ``None``.
     :returns: Dict mapping each label key to its
         :class:`LabelDef`. ``None`` when *raw* is ``None``.
     :raises OmnigentError: On malformed entries — empty
-        dict, ``initial`` not in ``values``, unknown
-        ``monotonic`` direction, etc.
+        dict, ``initial`` not in ``values``, etc.
     """
     if raw is None:
         return None
@@ -2781,7 +3131,7 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         ``"integrity"``.
     :param entry: Either a string (shorthand: value becomes
         ``initial``) or a dict with one or more of
-        ``initial``, ``values``, ``monotonic``.
+        ``initial``, ``values``.
     :returns: A populated :class:`LabelDef`.
     :raises OmnigentError: On any malformed value.
     """
@@ -2802,14 +3152,13 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         # Empty-dict typo guard — matches POLICIES.md §13.
         raise OmnigentError(
             f"label {key!r} declares an empty dict — must contain at "
-            f"least one of `initial`, `values`, or `monotonic`",
+            f"least one of `initial` or `values`",
             code=ErrorCode.INVALID_INPUT,
         )
     initial = _coerce_label_initial(entry.get("initial"))
     values = _coerce_label_values(key, entry.get("values"))
-    monotonic = _coerce_label_monotonic(key, entry.get("monotonic"))
-    _validate_label_def_cross_fields(key, initial, values, monotonic)
-    return LabelDef(initial=initial, values=values, monotonic=monotonic)
+    _validate_label_def_cross_fields(key, initial, values)
+    return LabelDef(initial=initial, values=values)
 
 
 def _coerce_label_initial(raw: Any) -> str | None:
@@ -2838,59 +3187,24 @@ def _coerce_label_values(key: str, raw: Any) -> list[str] | None:
     return [str(v) for v in raw]
 
 
-def _coerce_label_monotonic(
-    key: str,
-    raw: Any,
-) -> Literal["increasing", "decreasing"] | None:
-    """
-    Validate a ``monotonic:`` direction.
-
-    :param key: Label key, for error messages.
-    :param raw: Raw ``monotonic:`` value from YAML — must
-        be ``"increasing"``, ``"decreasing"``, or absent.
-    :returns: The validated direction, or ``None`` when
-        *raw* is ``None``.
-    :raises OmnigentError: On any other value.
-    """
-    if raw is None:
-        return None
-    if raw == "increasing":
-        return "increasing"
-    if raw == "decreasing":
-        return "decreasing"
-    raise OmnigentError(
-        f"label {key!r}: `monotonic` must be 'increasing' or 'decreasing', got {raw!r}",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
 def _validate_label_def_cross_fields(
     key: str,
     initial: str | None,
     values: list[str] | None,
-    monotonic: Literal["increasing", "decreasing"] | None,
 ) -> None:
     """
     Enforce cross-field constraints on a :class:`LabelDef`.
 
     Per POLICIES.md §13:
 
-    - ``monotonic`` requires ``values`` (no positions to
-      order without them).
     - When both ``initial`` and ``values`` are declared,
       ``initial`` must be in ``values``.
 
     :param key: Label key, for error messages.
     :param initial: Pre-coerced initial value.
     :param values: Pre-coerced values list.
-    :param monotonic: Pre-validated direction.
     :raises OmnigentError: On any cross-field violation.
     """
-    if monotonic is not None and values is None:
-        raise OmnigentError(
-            f"label {key!r}: `monotonic` requires a `values` list to order against",
-            code=ErrorCode.INVALID_INPUT,
-        )
     if initial is not None and values is not None and initial not in values:
         raise OmnigentError(
             f"label {key!r}: `initial` value {initial!r} is not in declared `values` {values!r}",
@@ -3054,7 +3368,6 @@ def _parse_function_policy(
             f"policy {name!r}: `function` policies require a `function:` or `handler:` field",
             code=ErrorCode.INVALID_INPUT,
         )
-    action = _parse_action_list(data["action"], policy_name=name) if "action" in data else None
     set_labels = (
         _parse_writable_labels(data["set_labels"], policy_name=name)
         if "set_labels" in data
@@ -3069,7 +3382,6 @@ def _parse_function_policy(
     return FunctionPolicySpec(
         **base_kwargs,
         function=_parse_function_ref(function_raw, policy_name=name),
-        action=action,
         set_labels=set_labels,
         config=config,
     )
@@ -3242,53 +3554,6 @@ def _parse_condition(
     return coerced
 
 
-def _parse_action_list(
-    raw: Any,
-    *,
-    policy_name: str,
-) -> list[PolicyAction]:
-    """
-    Parse a policy's ``action:`` whitelist into a list of
-    :class:`PolicyAction` enums.
-
-    Accepts a bare string (single-element list sugar) or a
-    list of strings. Validates each entry against the enum.
-
-    :param raw: The ``action:`` value from YAML.
-    :param policy_name: Enclosing policy name for error
-        messages.
-    :returns: List of :class:`PolicyAction` values.
-    :raises OmnigentError: On empty list or unknown
-        action value.
-    """
-    if isinstance(raw, str):
-        strings = [raw]
-    elif isinstance(raw, list):
-        strings = [str(s) for s in raw]
-    else:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `action:` must be a string or "
-            f"list of strings, got {type(raw).__name__}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not strings:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `action:` list must be non-empty",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    actions: list[PolicyAction] = []
-    for s in strings:
-        try:
-            actions.append(PolicyAction(s))
-        except ValueError as exc:
-            raise OmnigentError(
-                f"policy {policy_name!r}: invalid action {s!r} "
-                f"(must be one of 'allow', 'ask', 'deny')",
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
-    return actions
-
-
 def _parse_writable_labels(
     raw: Any,
     *,
@@ -3392,17 +3657,11 @@ def _parse_policy_ask_timeout(
     """
     if raw is None:
         return None
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `ask_timeout` must be an integer, got {raw!r}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+    value = _parse_int_field(raw, f"policy {policy_name!r}: `ask_timeout`")
     if value <= 0:
         raise OmnigentError(
             f"policy {policy_name!r}: `ask_timeout` must be > 0 "
-            f"(omit ASK from the policy's action list for instant-DENY)",
+            "(use large finite values for long waits)",
             code=ErrorCode.INVALID_INPUT,
         )
     return value

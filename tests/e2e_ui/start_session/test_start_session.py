@@ -1,18 +1,21 @@
 """E2E: starting a new session from the home composer ("/").
 
 The landing composer (``NewChatLandingScreen`` in
-``ap-web/src/shell/NewChatDialog.tsx``) owns session creation end to end:
+``web/src/shell/NewChatDialog.tsx``) owns session creation end to end:
 the textarea is the new session's first message and the footer chips —
-host, working directory, git worktree — plus the agent picker and its
-Advanced settings menu supply every create parameter. Hitting Send POSTs
-``/v1/sessions`` and navigates to the new session; there is no modal.
+host, working directory, git worktree — plus the unified agent/harness
+picker supply every create parameter. The picker is a single dropdown
+(``new-chat-landing-agent-select``) that only SELECTS the agent; each
+agent's run-config knobs live in a gear-icon **modal** beside it (see
+:func:`_open_entry_config`). Hitting Send POSTs ``/v1/sessions`` and
+navigates to the new session.
 
 These tests cover the three configuration affordances the user reaches
 before sending:
 
 1. **Permission mode** — Claude Code's ``--permission-mode`` choices, in
-   the agent picker's Advanced settings menu. A non-default pick rides
-   along as ``terminal_launch_args``.
+   the gear-icon config modal. A non-default pick rides along as
+   ``terminal_launch_args``.
 2. **Working directory** — the file-browser popover behind the working-
    directory chip. Browsing into a folder sets the session's
    ``workspace``.
@@ -64,6 +67,9 @@ _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 # ``…/filesystem/home/e2e/projects``; it never matches the bare
 # ``/v1/hosts`` list (no ``/filesystem`` segment).
 _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
+# The worktree-list endpoint the branch combobox queries for the picked repo.
+# Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
+_WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
 
 
 def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
@@ -139,8 +145,8 @@ def _codex_native_agents_body() -> str:
 
     ``codex-native-ui`` + ``harness: "codex-native"`` is what the frontend
     maps (via ``nativeCodingAgents``) to the ``approvalMode`` capability,
-    gating the Codex approval-mode UI in the Advanced menu. Sole agent, so
-    it auto-selects and no explicit pick is needed.
+    gating the Codex approval-mode pill. Sole agent, so it auto-selects and
+    no explicit pick is needed.
     """
     return json.dumps(
         {
@@ -158,14 +164,67 @@ def _codex_native_agents_body() -> str:
     )
 
 
+def _forked_codex_first_page_body() -> str:
+    """First ``GET /v1/agents`` page with stale Codex forks only.
+
+    Mirrors an older deployment where fork clones leaked into the built-in
+    catalog before the server-side forward fix. The canonical Codex row is on
+    page 2, so the picker must paginate before deduping native rows.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_codex_fork_1",
+                    "name": "codex-native-ui (fork ag_old1)",
+                    "display_name": "Codex",
+                    "description": "Stale Codex fork",
+                    "harness": "codex-native",
+                    "skills": [],
+                },
+                {
+                    "id": "ag_codex_fork_2",
+                    "name": "codex-native-ui (fork ag_old2)",
+                    "display_name": "Codex",
+                    "description": "Another stale Codex fork",
+                    "harness": "codex-native",
+                    "skills": [],
+                },
+            ],
+            "has_more": True,
+            "last_id": "ag_codex_fork_2",
+        }
+    )
+
+
+def _canonical_codex_second_page_body() -> str:
+    """Second ``GET /v1/agents`` page containing canonical Codex."""
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_codex_e2e",
+                    "name": "codex-native-ui",
+                    "display_name": "Codex",
+                    "description": "OpenAI's coding agent",
+                    "harness": "codex-native",
+                    "skills": [],
+                }
+            ],
+            "has_more": False,
+        }
+    )
+
+
 def _bundle_agents_body() -> str:
     """Stub body for ``GET /v1/agents``: the two harness-overridable bundle agents.
 
     Polly and Debby are multi-agent bundles, not native terminal wrappers, so
     their spec declares a brain harness (``harness: "claude-sdk"``) that lands
     them in ``BRAIN_HARNESS_LABELS``. That — and the fact that neither is named
-    ``claude-native-ui`` — is what makes the Advanced menu render the **Agent
-    Harness** radio group instead of Claude Code's permission modes. Polly is
+    ``claude-native-ui`` — is what makes the config modal render the harness
+    picker (an **Agent Harness** select) instead of Claude Code's permission
+    select. Polly is
     ranked ahead of Debby by ``AGENT_DISPLAY_ORDER``, so it auto-selects and no
     explicit agent pick is needed. ``harness: null`` would suppress the section
     entirely, so it must be a real harness id here.
@@ -221,6 +280,33 @@ def _pi_native_agents_body() -> str:
     )
 
 
+def _antigravity_native_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native Antigravity agent.
+
+    ``name: "antigravity-native-ui"`` + ``harness: "antigravity-native"`` is what
+    the frontend maps (via ``nativeCodingAgents``) to the display label
+    **"Antigravity"** and the antigravity-native wrapper labels. The wire
+    ``display_name`` is deliberately the raw ``"antigravity-native-ui"`` to prove
+    the picker derives "Antigravity" itself (``nativeDisplayNameForAgent`` ignores
+    the wire value) rather than echoing the server. Sole agent, so it auto-selects
+    and no explicit pick is needed.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_antigravity_e2e",
+                    "name": "antigravity-native-ui",
+                    "display_name": "antigravity-native-ui",
+                    "description": "Google's Gemini coding agent (agy CLI)",
+                    "harness": "antigravity-native",
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
 def _opencode_native_agents_body() -> str:
     """Stub body for ``GET /v1/agents``: the native OpenCode agent.
 
@@ -248,6 +334,67 @@ def _opencode_native_agents_body() -> str:
     )
 
 
+def _kimi_native_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native Kimi agent.
+
+    ``name: "kimi-native-ui"`` + ``harness: "kimi-native"`` is what the frontend
+    maps (via ``nativeCodingAgents``) to the display label **"Kimi"** and the
+    kimi-native wrapper labels. The wire ``display_name`` is deliberately the raw
+    ``"kimi-native-ui"`` to prove the picker derives "Kimi" itself
+    (``nativeDisplayNameForAgent`` ignores the wire value) rather than echoing the
+    server. Sole agent, so it auto-selects and no explicit pick is needed.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_kimi_native_e2e",
+                    "name": "kimi-native-ui",
+                    "display_name": "kimi-native-ui",
+                    "description": "Moonshot's Kimi Code agent",
+                    "harness": "kimi-native",
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
+def _kimi_with_sdk_agents_body() -> str:
+    """Stub body for ``GET /v1/agents``: the native Kimi agent AND the SDK kimi.
+
+    The headless SDK ``kimi`` harness is kept (sub-agents use it) but is hidden
+    from the new-session picker via ``NEW_SESSION_HIDDEN_AGENTS`` so there is one
+    "Kimi" to pick — the native TUI agent (``kimi-native-ui``). Returning both
+    here drives that dedup: the picker must offer only the native row and drop
+    the SDK ``kimi`` row by name.
+    """
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_kimi_native_e2e",
+                    "name": "kimi-native-ui",
+                    "display_name": "kimi-native-ui",
+                    "description": "Moonshot's Kimi Code agent",
+                    "harness": "kimi-native",
+                    "skills": [],
+                },
+                {
+                    # SDK kimi harness — present in the catalog, hidden from the
+                    # picker by NEW_SESSION_HIDDEN_AGENTS (name == "kimi").
+                    "id": "ag_kimi_sdk_e2e",
+                    "name": "kimi",
+                    "display_name": "Kimi",
+                    "description": "Headless Kimi Code (SDK)",
+                    "harness": "kimi",
+                    "skills": [],
+                },
+            ]
+        }
+    )
+
+
 def _hosts_body() -> str:
     """Stub body for ``GET /v1/hosts``: one online host the composer picks."""
     return json.dumps(
@@ -259,6 +406,25 @@ def _hosts_body() -> str:
                     "owner": "e2e",
                     "status": "online",
                 }
+            ]
+        }
+    )
+
+
+# Two online hosts for the sticky-default test. The composer auto-selects the
+# FIRST online host (alpha) when there's no stored pick; the test then picks
+# beta and asserts it's restored after a reload.
+_HOST_ALPHA = ("host_e2e_alpha", "e2e-host-alpha")
+_HOST_BETA = ("host_e2e_beta", "e2e-host-beta")
+
+
+def _two_hosts_body() -> str:
+    """Stub body for ``GET /v1/hosts``: two online, user-connected hosts."""
+    return json.dumps(
+        {
+            "hosts": [
+                {"host_id": hid, "name": name, "owner": "e2e", "status": "online"}
+                for hid, name in (_HOST_ALPHA, _HOST_BETA)
             ]
         }
     )
@@ -318,11 +484,48 @@ async def _register_common_routes(
     await page.route(_SESSIONS_RE, handle_sessions)
 
 
+async def _open_entry_config(page, agent_id: str) -> None:
+    """Select one agent and open its run-config modal via the composer gear.
+
+    The composer's agent/harness dropdown (``new-chat-landing-agent-select``)
+    only SELECTS the agent now; each agent's run-config (model / effort /
+    permission / approval / brain-harness override) lives in a **modal** opened
+    from the gear icon (``new-chat-landing-config-gear``) beside the picker.
+    Clicking a row commits the agent and closes the dropdown; the gear then
+    opens the selected agent's config modal — the Playwright counterpart of the
+    unit test's ``openAgentConfig`` helper.
+
+    :param page: The Playwright page (the landing picker is already mounted).
+    :param agent_id: The stubbed agent id whose config modal to open, e.g.
+        ``"ag_claude_e2e"``.
+    """
+    await page.get_by_test_id("new-chat-landing-agent-select").click()
+    await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+    await page.get_by_test_id("new-chat-landing-config-gear").click()
+
+
+async def _pick_config_select(page, trigger_test_id: str, option_label: str) -> None:
+    """Open a config-modal Radix Select and click the option with ``option_label``.
+
+    :param page: The Playwright page (the config modal is open).
+    :param trigger_test_id: The select trigger's test id, e.g.
+        ``"new-chat-landing-config-permission"``.
+    :param option_label: The visible option text to click, e.g. ``"Accept edits"``.
+    """
+    await page.get_by_test_id(trigger_test_id).click()
+    await page.get_by_role("option", name=option_label, exact=True).click()
+
+
+async def _save_config(page) -> None:
+    """Commit the config modal's draft by clicking Save."""
+    await page.get_by_test_id("new-chat-landing-config-save").click()
+
+
 def test_start_session_select_permission_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default permission mode rides along to the create call.
 
-    Selecting "Accept edits" in the agent picker's Advanced settings menu
-    must (a) surface in the agent chip label as immediate feedback and
+    Selecting "Accept edits" in the Claude Code config modal
+    must (a) update the permission select as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--permission-mode", "acceptEdits"]``.
     """
@@ -339,6 +542,23 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
+
+            # Neutralize agent discovery so ONLY the stubbed Claude agent feeds
+            # the picker. The landing picker merges `/v1/agents` with agents found
+            # by scanning the caller's sessions (`/v1/sessions?kind=any`); on the
+            # shared e2e_ui server a native agent another test left behind would
+            # otherwise leak in and — ranking ahead — auto-select, so the gear
+            # would open the wrong agent's config modal. Registered after
+            # _register_common_routes so it wins the kind=any scan.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
             # Seed a recent working directory for the stubbed host so the
             # working-directory chip auto-fills and Send can enable without
             # touching the (host-less) file browser. Set before the SPA boots
@@ -354,20 +574,27 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Claude Code auto-selects (only built-in, ranked first), so the
-            # Advanced chip — gated on the Claude-native agent — is present.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
-            # All six Claude permission modes render as radio rows.
-            for mode in ("default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"):
-                await expect(
-                    page.get_by_test_id(f"new-chat-landing-permission-{mode}")
-                ).to_be_visible()
-            await page.get_by_test_id("new-chat-landing-permission-acceptEdits").click()
-
-            # The chip label reflects the non-default pick immediately.
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Accept edits"
+            # Claude Code auto-selects (only built-in, ranked first); its config
+            # (model / effort / permission mode) lives in the gear-icon modal.
+            await _open_entry_config(page, "ag_claude_e2e")
+            # The permission select offers all six Claude permission modes.
+            perm = page.get_by_test_id("new-chat-landing-config-permission")
+            await expect(perm).to_be_visible()
+            await perm.click()
+            perm_labels = (
+                "Default",
+                "Auto",
+                "Accept edits",
+                "Plan",
+                "Don't ask",
+                "Bypass permissions",
             )
+            for label in perm_labels:
+                await expect(page.get_by_role("option", name=label, exact=True)).to_be_visible()
+            await page.get_by_role("option", name="Accept edits", exact=True).click()
+            # The trigger reflects the non-default pick; Save commits it.
+            await expect(perm).to_contain_text("Accept edits")
+            await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -382,17 +609,520 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_send_shows_busy_spinner(seeded_session: tuple[str, str]) -> None:
+    """Send shows a busy spinner while the create is in flight, then navigates.
+
+    The create awaits the backend (session bootstrap + git worktree setup)
+    before navigating, so the landing screen lingers for the whole round-trip.
+    Without feedback the Send button just goes inert and the typed message sits
+    in the composer, so the click reads as "frozen". This holds the create POST
+    open with a gate so that in-flight window is observable, and asserts the
+    Send button flips to a busy/spinning state (disabled + ``aria-busy`` +
+    "Starting session" label) before the response lands and navigation happens.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_send_busy_spinner(base_url, session_id))
+
+
+async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            # A gate the create handler awaits before responding, so the POST
+            # stays pending long enough to observe the button's busy state. The
+            # test opens it after asserting the spinner, letting navigation run.
+            release_create = asyncio.Event()
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_events(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            async def handle_sessions(route: Route) -> None:
+                if route.request.method == "POST":
+                    create_bodies.append(route.request.post_data_json)
+                    # Hold the create open so the composer stays in its
+                    # `creating` state — the window under test.
+                    await release_create.wait()
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"id": session_id}),
+                    )
+                else:
+                    await route.continue_()
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            await page.route("**/v1/sessions/*/events", handle_events)
+            await page.route(_SESSIONS_RE, handle_sessions)
+
+            # Keep the agent-discovery scan empty so only the stubbed Claude
+            # agent feeds the picker (see _drive_permission_mode for why).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            submit = page.get_by_test_id("new-chat-landing-submit")
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            # Idle with a message typed: enabled, not busy (arrow, no spin).
+            await expect(submit).to_be_enabled()
+            await expect(submit).to_have_attribute("aria-busy", "false")
+
+            await submit.click()
+
+            # The POST reached the server (proving we're truly in flight, not
+            # blocked by a disabled button) and the button shows the busy state.
+            await _wait_until(lambda: len(create_bodies) == 1)
+            await expect(submit).to_be_disabled()
+            await expect(submit).to_have_attribute("aria-busy", "true")
+            await expect(submit).to_have_attribute("aria-label", "Starting session")
+            # Still on the landing screen — the "frozen"-looking window.
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
+
+            # Release the create: the flow completes and navigates to the
+            # session, so the landing composer unmounts.
+            release_create.set()
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(
+                0, timeout=30_000
+            )
+        finally:
+            await browser.close()
+
+
+def test_start_session_remembers_last_picked_host(seeded_session: tuple[str, str]) -> None:
+    """The host chip restores the last explicitly-picked host after a reload.
+
+    With no stored pick the composer auto-selects the first online host
+    (alpha). After the user picks a different host (beta), that choice must be
+    persisted (``omnigent:last-host-choice`` in localStorage) and restored on
+    the next visit — instead of reverting to the first-online default. This is
+    the OSS mirror of the managed complaint where the picker always reverted to
+    the "Databricks Sandbox" default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_remembers_last_picked_host(base_url, session_id))
+
+
+async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> None:
+    alpha_id, alpha_name = _HOST_ALPHA
+    beta_id, beta_name = _HOST_BETA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Override the single-host stub with the two-host body (registered
+            # after the common routes so this handler wins).
+            async def handle_two_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_two_hosts_body()
+                )
+
+            await page.route("**/v1/hosts", handle_two_hosts)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # Seed recents for both hosts so the working-directory chip auto-fills
+            # and the composer never blocks on the (host-less) file browser.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{
+                        "{alpha_id}": ["/work/repo"],
+                        "{beta_id}": ["/work/repo"]
+                    }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # No stored pick yet → auto-selects the first online host (alpha).
+            await expect(chip).to_contain_text(alpha_name)
+
+            # Explicitly pick the second host.
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{beta_id}").click()
+            await expect(chip).to_contain_text(beta_name)
+
+            # Reload: a full document load resets the in-memory landing draft, so
+            # the only thing that can restore the pick is the persisted
+            # preference. The chip must come back on beta, NOT the alpha default.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text(beta_name)
+        finally:
+            await browser.close()
+
+
+def _managed_info_body() -> str:
+    """Stub body for ``GET /v1/info``: a managed deployment offering a sandbox.
+
+    ``managed_sandboxes_enabled: true`` + ``sandbox_provider: "lakebox"`` makes
+    the picker offer (and default to) the "Databricks Sandbox" option, exactly
+    the deployment shape behind the original complaint. Every field the SPA
+    reads is supplied so the boot probe resolves to a fully-managed capability
+    set rather than the fail-closed sentinel.
+    """
+    return json.dumps(
+        {
+            "accounts_enabled": False,
+            "login_url": None,
+            "needs_setup": False,
+            "databricks_features": True,
+            "managed_sandboxes_enabled": True,
+            "sandbox_provider": "lakebox",
+            "server_version": "0.0.0-e2e",
+            "smart_routing_enabled": False,
+        }
+    )
+
+
+def test_start_session_managed_remembers_host_over_sandbox_default(
+    seeded_session: tuple[str, str],
+) -> None:
+    """In a managed deployment, a picked host survives reload — not the sandbox.
+
+    This is the original complaint end-to-end: the managed picker defaults to
+    "Databricks Sandbox", so a user who picks a connected host used to lose it
+    on the next visit (the picker reverted to the sandbox default). With the
+    last-host preference persisted, picking the host and reloading must restore
+    the host, NOT snap back to the sandbox default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_managed_remembers_host(base_url, session_id))
+
+
+async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
+    host_id, host_name = _HOST_ALPHA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Managed capability probe: makes the sandbox the offered default.
+            # `/v1/info` is fetched once per document load and module-cached, so
+            # a full reload re-hits this stub and re-enters managed mode.
+            async def handle_info(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                )
+
+            await page.route("**/v1/info", handle_info)
+
+            # One connected online host alongside the managed sandbox default.
+            async def handle_one_host(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "hosts": [
+                                {
+                                    "host_id": host_id,
+                                    "name": host_name,
+                                    "owner": "e2e",
+                                    "status": "online",
+                                }
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/hosts", handle_one_host)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ "{host_id}": ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # Managed default with no stored pick: the sandbox, labeled by its
+            # provider ("Databricks Sandbox").
+            await expect(chip).to_contain_text("Databricks Sandbox")
+
+            # Explicitly pick the connected host instead.
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
+            await expect(chip).to_contain_text(host_name)
+
+            # Reload: the host must be restored, NOT reverted to the sandbox
+            # default — the exact regression this change fixes.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text(host_name)
+            await expect(chip).not_to_contain_text("Databricks Sandbox")
+        finally:
+            await browser.close()
+
+
+def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
+    """Picking a model + reasoning effort rides along to the create call.
+
+    For the Claude-native agent the config modal shows model/effort
+    selects that start with NOTHING selected — no model/effort default is
+    forced, so an untouched picker omits the override and Claude Code keeps its
+    own configured model. Explicitly selecting "Opus" and "High" must (a) update
+    those selects as immediate feedback and (b) reach ``POST /v1/sessions`` as
+    ``model_override: "opus"`` + ``reasoning_effort: "high"`` (the runner reads
+    them as ``--model`` / ``--effort`` at terminal launch).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
+
+
+async def _drive_model_effort(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Neutralize agent discovery so ONLY the stubbed Claude agent feeds
+            # the picker (see _drive_permission_mode for the full rationale): a
+            # leaked native agent auto-selecting ahead of Claude would open the
+            # wrong agent's config modal. Registered after _register_common_routes
+            # so it wins the kind=any scan.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # This isolated host fixture has no live harness bridge, so provide
+            # the catalog the new-session picker now resolves through the host.
+            async def handle_model_options(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "models": [
+                                {"id": "opus", "displayName": "Opus 4.8"},
+                                {"id": "sonnet", "displayName": "Sonnet 4.6"},
+                                {"id": "haiku", "displayName": "Haiku 4.5"},
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route(
+                f"**/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
+                handle_model_options,
+            )
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Claude Code auto-selects; open its config modal, which carries the
+            # model + effort selects. No default is forced, so both the model and
+            # effort selects sit at "Default" (unselected) — an untouched picker
+            # omits the override and Claude Code uses its own configured model.
+            # Verify the unselected defaults, then make an explicit pick.
+            await _open_entry_config(page, "ag_claude_e2e")
+            model = page.get_by_test_id("new-chat-landing-config-model")
+            effort = page.get_by_test_id("new-chat-landing-config-effort")
+            await expect(model).to_contain_text("Default")
+            await expect(effort).to_contain_text("Default")
+
+            # Pick model + effort in the same modal visit (each select commits to
+            # a local draft; Save commits both at once). The model rows carry the
+            # host catalog's live display names, not the static alias labels.
+            await _pick_config_select(page, "new-chat-landing-config-model", "Opus 4.8")
+            await expect(model).to_contain_text("Opus 4.8")
+            await _pick_config_select(page, "new-chat-landing-config-effort", "High")
+            await expect(effort).to_contain_text("High")
+            await _save_config(page)
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_claude_e2e", body
+            assert body.get("model_override") == "opus", body
+            assert body.get("reasoning_effort") == "high", body
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default approval preset rides along to the create call.
 
-    Selecting "Full access" in the agent picker's Advanced settings menu
-    must (a) surface in the agent chip label as immediate feedback and
-    (b) reach ``POST /v1/sessions`` as
+    Selecting "Full access" in the Codex config modal and saving must reach
+    ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--sandbox", "danger-full-access",
     "--ask-for-approval", "never"]``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_approval_mode(base_url, session_id))
+
+
+def test_start_session_agent_picker_paginates_and_dedupes_native_forks(
+    seeded_session: tuple[str, str],
+) -> None:
+    """The new-session picker recovers canonical Codex from page 2.
+
+    Older servers leaked fork clones into ``GET /v1/agents``. New servers stop
+    creating those rows, but existing databases can still have enough stale
+    forked native agents to push canonical built-ins off page 1. The picker must
+    follow pagination and then collapse all ``codex-native`` rows to the
+    canonical ``codex-native-ui`` row, so users see one top-level Codex choice.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_agent_picker_pagination_dedupe(base_url, session_id))
+
+
+async def _drive_agent_picker_pagination_dedupe(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_forked_codex_first_page_body(),
+            )
+
+            async def handle_agents_page_2(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=_canonical_codex_second_page_body(),
+                )
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route("**/v1/agents?after=ag_codex_fork_2", handle_agents_page_2)
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(picker).to_contain_text("Codex")
+            await picker.click()
+
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
+            ).to_be_visible()
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_1")
+            ).to_have_count(0)
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_codex_fork_2")
+            ).to_have_count(0)
+
+            await page.keyboard.press("Escape")
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_codex_e2e", body
+        finally:
+            await browser.close()
 
 
 async def _drive_approval_mode(base_url: str, session_id: str) -> None:
@@ -430,20 +1160,16 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in), so the Advanced chip —
-            # gated on the Codex-native agent — is present.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
-            # All three Codex approval presets render as radio rows.
-            for mode in ("default", "full-access", "read-only"):
-                await expect(
-                    page.get_by_test_id(f"new-chat-landing-approval-{mode}")
-                ).to_be_visible()
-            await page.get_by_test_id("new-chat-landing-approval-full-access").click()
-
-            # The chip label reflects the non-default pick immediately.
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Full access"
-            )
+            # Codex auto-selects (only built-in); its approval presets live in
+            # the gear-icon config modal.
+            await _open_entry_config(page, "ag_codex_e2e")
+            approval = page.get_by_test_id("new-chat-landing-config-approval")
+            await expect(approval).to_be_visible()
+            await approval.click()
+            for label in ("Default", "Full access", "Read only"):
+                await expect(page.get_by_role("option", name=label, exact=True)).to_be_visible()
+            await page.get_by_role("option", name="Full access", exact=True).click()
+            await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -463,14 +1189,99 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
-    """For a bundle agent (Polly/Debby), Advanced offers an agent-harness pick.
+def test_start_session_bypass_sandbox(seeded_session: tuple[str, str]) -> None:
+    """Arming DANGEROUS Codex full-bypass rides along to the create.
 
-    Unlike Claude Code — whose Advanced menu shows permission modes — Polly and
-    Debby declare a brain harness, so their Advanced menu renders an "Agent
-    Harness" radio group. Selecting a non-default harness ("Pi") must (a) show
-    all four harness options, (b) surface the pick in the agent chip label, and
-    (c) reach ``POST /v1/sessions`` as ``harness_override: "pi"``.
+    Bypass is the most-permissive option in the Codex config modal's Approval
+    dropdown — Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance.
+    Picking it and saving raises a persistent red banner under the composer —
+    surviving the modal's close. When armed, the create ``POST /v1/sessions``
+    must carry the ``omnigent.codex_native.bypass_sandbox: "1"`` conversation
+    label so the runner launches Codex with the bypass flag.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_bypass_sandbox(base_url, session_id))
+
+
+async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_codex_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so only the stubbed Codex agent
+            # feeds the picker.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Codex auto-selects (only built-in); bypass is the most-permissive
+            # option in its config-modal Approval dropdown.
+            await _open_entry_config(page, "ag_codex_e2e")
+
+            # Pick "Bypass approvals & sandbox" in the Approval dropdown; the
+            # in-modal danger banner confirms it, then Save to commit.
+            await _pick_config_select(
+                page, "new-chat-landing-config-approval", "Bypass approvals & sandbox"
+            )
+            await expect(
+                page.get_by_test_id("new-chat-landing-bypass-sandbox-banner")
+            ).to_be_visible()
+            await _save_config(page)
+
+            # After the modal closes, the persistent red banner under the
+            # composer must remain — proof the armed stance stays visible.
+            await expect(
+                page.get_by_test_id("new-chat-landing-bypass-sandbox-active-banner")
+            ).to_be_visible()
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_codex_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The dangerous opt-in rides along as the canonical conversation
+            # label alongside the codex-native wrapper labels.
+            labels = body.get("labels") or {}
+            assert labels.get("omnigent.codex_native.bypass_sandbox") == "1", body
+        finally:
+            await browser.close()
+
+
+def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
+    """For a bundle agent (Polly/Debby), the composer offers an agent-harness pick.
+
+    Unlike Claude Code — whose modal shows permission/model knobs — Polly and
+    Debby declare a brain harness, so their config modal renders an "Agent
+    Harness" select. Selecting a dynamically registered community harness
+    must (a) show the label from ``/v1/harnesses`` and (b) reach
+    ``POST /v1/sessions`` as ``harness_override: "community-brain"``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_select_harness(base_url, session_id))
@@ -489,13 +1300,24 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 agents_body=_bundle_agents_body(),
             )
 
+            async def handle_harness_catalog(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {"data": [{"id": "community-brain", "label": "Community Brain"}]}
+                    ),
+                )
+
+            await page.route("**/v1/harnesses", handle_harness_catalog)
+
             # Neutralize agent discovery so only the stubbed bundle agents
             # (Polly/Debby) feed the picker. The landing picker merges
             # `/v1/agents` with agents found by scanning the caller's sessions
             # (`/v1/sessions?kind=any`); on the shared e2e_ui server, a native
             # fork another test left behind sorts ahead of bundle agents and
-            # auto-selects, so the Advanced chip would open permission modes
-            # (or nothing) instead of Polly's harness group. Registered after
+            # auto-selects, so the composer would show a permission-mode pill
+            # (or nothing) instead of Polly's harness picker. Registered after
             # _register_common_routes so it wins the kind=any scan.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
@@ -519,20 +1341,25 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Polly auto-selects (ranked ahead of Debby), so the Advanced chip —
-            # present because Polly declares a harness — opens the harness group.
-            await page.get_by_test_id("new-chat-landing-advanced-chip").click()
-            # All four brain harnesses render as radio rows, in registry order.
-            for harness in ("claude-sdk", "openai-agents", "codex", "pi"):
+            # Polly auto-selects (ranked ahead of Debby); its brain-harness
+            # override select lives in the gear-icon config modal.
+            await _open_entry_config(page, "ag_polly_e2e")
+            await page.get_by_test_id("new-chat-landing-config-harness").click()
+            # The built-in brain harnesses render as options, in registry order
+            # (openai-agents is intentionally not offered in the picker).
+            for harness in ("claude-sdk", "codex", "pi"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-harness-{harness}")
                 ).to_be_visible()
-            await page.get_by_test_id("new-chat-landing-harness-pi").click()
-
-            # The chip label reflects the non-default harness immediately.
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Polly (Pi)"
-            )
+            # Dynamic harness labels from `/v1/harnesses` extend the built-in
+            # fallback catalog in the user-visible picker.
+            community_harness = page.get_by_test_id("new-chat-landing-harness-community-brain")
+            await expect(community_harness).to_be_visible()
+            await expect(community_harness).to_contain_text("Community Brain")
+            # Picking a harness updates the select; Save commits the override
+            # (the agent chip keeps the bare agent label "Polly").
+            await community_harness.click()
+            await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -542,7 +1369,7 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_polly_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            assert body.get("harness_override") == "pi", body
+            assert body.get("harness_override") == "community-brain", body
         finally:
             await browser.close()
 
@@ -639,6 +1466,88 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_antigravity_native_picker_and_wrapper_labels(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Native Antigravity: the picker shows "Antigravity" and create carries terminal labels.
+
+    Covers the user-facing Antigravity native-agent flow this PR adds:
+
+    1. **Picker label/icon** — the agent chip renders the harness-derived display
+       label **"Antigravity"** (via ``nativeCodingAgents``), NOT the raw agent name
+       ``"antigravity-native-ui"`` the server sends.
+    2. **Session-creation wrapper labels** — selecting Antigravity and sending must
+       POST ``/v1/sessions`` with the terminal-first wrapper labels
+       (``omnigent.ui: terminal`` + ``omnigent.wrapper: antigravity-native-ui``)
+       that make the runner launch the agy TUI and the web UI render the
+       Chat/Terminal view.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_antigravity_native_start(base_url, session_id))
+
+
+async def _drive_antigravity_native_start(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_antigravity_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so the picker shows ONLY the stubbed
+            # built-in Antigravity (sessions other tests left behind on the shared
+            # e2e_ui server would otherwise leak in and, ranking ahead, auto-select).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Antigravity auto-selects (sole agent). The chip shows the derived
+            # label "Antigravity" — and NOT "...native...": the raw agent name
+            # would surface "antigravity-native-ui" without the harness→display map.
+            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(agent_chip).to_contain_text("Antigravity")
+            await expect(agent_chip).not_to_contain_text("native")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_antigravity_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The terminal-first wrapper labels drive the runner-owned agy TUI and
+            # the web UI's Chat/Terminal view.
+            assert body.get("labels") == {
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "antigravity-native-ui",
+            }, body
+        finally:
+            await browser.close()
+
+
 def test_start_session_opencode_native_picker_and_wrapper_labels(
     seeded_session: tuple[str, str],
 ) -> None:
@@ -727,6 +1636,163 @@ async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "opencode-native-ui",
             }, body
+        finally:
+            await browser.close()
+
+
+def test_start_session_kimi_native_picker_and_wrapper_labels(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Native Kimi: the picker shows "Kimi" and create carries terminal labels.
+
+    Covers the user-facing Kimi native-agent flow this PR adds (mirrors the
+    Codex / Pi / OpenCode native rows):
+
+    1. **Picker label/icon** — the agent chip renders the harness-derived
+       display label **"Kimi"** (via ``nativeCodingAgents``), NOT the raw agent
+       name ``"kimi-native-ui"`` the server sends.
+    2. **Session-creation wrapper labels** — selecting Kimi and sending must POST
+       ``/v1/sessions`` with the terminal-first wrapper labels
+       (``omnigent.ui: terminal`` + ``omnigent.wrapper: kimi-native-ui``) that
+       make the runner launch the Kimi TUI and the web UI render the
+       Chat/Terminal view.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_kimi_native_start(base_url, session_id))
+
+
+async def _drive_kimi_native_start(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_kimi_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so the picker shows ONLY the stubbed
+            # built-in Kimi. The landing picker merges `/v1/agents` with agents
+            # found by scanning the caller's sessions (`/v1/sessions?kind=any`);
+            # on the shared e2e_ui server, sessions other tests left behind would
+            # otherwise leak in and — ranking ahead of Kimi — auto-select.
+            # Registered after _register_common_routes so it wins the kind=any
+            # scan; the bare POST /v1/sessions create still falls through.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Kimi auto-selects (sole agent). The chip shows the derived label
+            # "Kimi" — and crucially NOT "...native...": the raw agent name
+            # "kimi-native-ui" must never surface in the picker.
+            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(agent_chip).to_contain_text("Kimi")
+            await expect(agent_chip).not_to_contain_text("native")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_kimi_native_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            # The terminal-first wrapper labels are the contract that drives the
+            # runner-owned Kimi TUI and the web UI's Chat/Terminal view.
+            assert body.get("labels") == {
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "kimi-native-ui",
+            }, body
+        finally:
+            await browser.close()
+
+
+def test_start_session_picker_hides_sdk_kimi(
+    seeded_session: tuple[str, str],
+) -> None:
+    """The new-session picker offers only the native Kimi, not the SDK kimi.
+
+    The headless SDK ``kimi`` harness is retained for sub-agents but hidden from
+    the landing picker (``NEW_SESSION_HIDDEN_AGENTS``) so there is exactly one
+    "Kimi" to start — the native TUI agent (``kimi-native-ui``), which opens in
+    the user's workspace. This drives that dedup against the rendered picker: with
+    both rows in the catalog, only ``kimi-native-ui`` is offered and the SDK
+    ``kimi`` row is dropped (the regression surfaced two "Kimi" entries, and
+    picking the SDK one launched headless in a /tmp spec dir).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_kimi_picker_dedup(base_url, session_id))
+
+
+async def _drive_kimi_picker_dedup(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_kimi_with_sdk_agents_body(),
+            )
+
+            # Only the built-in catalog feeds the picker for this test.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open the agent picker dropdown.
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+
+            # The native Kimi row is offered...
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_kimi_native_e2e")
+            ).to_be_visible(timeout=30_000)
+            # ...and the SDK kimi row is dropped (hidden by NEW_SESSION_HIDDEN_AGENTS).
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-ag_kimi_sdk_e2e")
+            ).to_have_count(0)
+            # Two menu items total: the one native Kimi + the "Create custom
+            # agent" action — no second "Kimi" sneaks in via the SDK row.
+            await expect(page.get_by_role("menuitem")).to_have_count(2)
         finally:
             await browser.close()
 
@@ -1010,6 +2076,106 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_select_existing_worktree(seeded_session: tuple[str, str]) -> None:
+    """Picking an existing worktree starts in its directory in git bind mode.
+
+    The branch chip's input doubles as a combobox: focusing it lists the
+    repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
+    one must (a) point the workspace at that worktree's directory and
+    (b) send the ``git`` spec in bind mode on ``POST /v1/sessions`` —
+    ``existing_worktree: true`` with the worktree's branch as
+    ``branch_name`` — so no worktree is created but the sidebar shows the
+    branch and the delete flow can offer to remove it.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_select_existing_worktree(base_url, session_id))
+
+
+async def _drive_select_existing_worktree(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_worktrees(route: Route) -> None:
+                # The main tree (is_main) plus one linked worktree. The picker
+                # hides the main tree, so only "feature/x" is offered.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "path": "/work/repo",
+                                    "branch": "main",
+                                    "is_main": True,
+                                    "detached": False,
+                                },
+                                {
+                                    "path": "/work/repo-worktrees/feature-x",
+                                    "branch": "feature/x",
+                                    "is_main": False,
+                                    "detached": False,
+                                },
+                            ],
+                        }
+                    ),
+                )
+
+            # Registered after the common routes so it wins for its URL.
+            await page.route(_WORKTREES_RE, handle_worktrees)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open the worktree chip; focusing the branch combobox reveals the
+            # repo's existing (linked) worktrees. The main tree is filtered out,
+            # so only the one linked worktree is offered.
+            await page.get_by_test_id("new-chat-landing-branch-chip").click()
+            await page.get_by_test_id("new-chat-landing-branch-input").focus()
+            option = page.get_by_test_id("new-chat-landing-worktree-option")
+            await expect(option).to_have_count(1)
+            await expect(option).to_contain_text("feature/x")
+            await option.click()
+
+            # The warning confirms the session will start in the existing
+            # worktree (rather than creating a new one).
+            await expect(
+                page.get_by_test_id("new-chat-landing-existing-worktree-warning")
+            ).to_be_visible()
+
+            await page.get_by_test_id("new-chat-landing-input").fill("work in the worktree")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            # Workspace is the worktree dir; the git spec is in bind mode
+            # (existing_worktree) so no worktree is created, and the worktree's
+            # branch rides along as branch_name so the sidebar shows it and the
+            # delete flow can offer to remove it.
+            assert body["workspace"] == "/work/repo-worktrees/feature-x", body
+            assert body["git"]["existing_worktree"] is True, body
+            assert body["git"]["branch_name"] == "feature/x", body
+        finally:
+            await browser.close()
+
+
 # Session-bound agents the discovery scan returns. Both clone names below root
 # to the built-in "claude-native-ui", so the picker must drop both; the fork of
 # a fork (two nested suffixes) is the case a single-layer strip missed.
@@ -1125,21 +2291,21 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             # Open the agent picker dropdown.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
 
-            # The real built-in Claude Code is offered...
+            # The real built-in Claude Code is offered inline...
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
             ).to_be_visible(timeout=30_000)
-            # ...the genuinely custom agent survives...
-            await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
             # ...and BOTH fork clones of the built-in are dropped. Pre-fix the
             # fork-of-fork (ag_forkfork) rendered as a duplicate "Claude Code".
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_fork1")).to_have_count(0)
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Three options total: the built-in + the one custom agent +
-            # the "Create custom agent" action — no duplicate "Claude Code"
-            # sneaks in via a leaked clone.
-            await expect(page.get_by_role("menuitem")).to_have_count(3)
+            # Top level: the built-in Claude row + the "Custom agents" submenu
+            # trigger — no duplicate "Claude Code" sneaks in via a leaked clone.
+            await expect(page.get_by_role("menuitem")).to_have_count(2)
+            # The genuinely custom agent survives, inside the Custom agents submenu.
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
         finally:
             await browser.close()

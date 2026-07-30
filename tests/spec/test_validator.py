@@ -392,6 +392,26 @@ def test_omnigent_executor_accepts_valid_harness() -> None:
     assert result.valid, f"Expected valid spec, got errors: {result.errors}"
 
 
+def test_omnigent_executor_accepts_antigravity_native_harness() -> None:
+    """
+    ``omnigent`` executor with ``config.harness == "antigravity-native"``
+    validates cleanly.
+
+    Failure here means the antigravity-native harness is missing from
+    ``OMNIGENT_HARNESSES``, which would cause every spec that targets it
+    to be rejected at load time with an "unknown harness" validation error.
+    """
+    spec = _minimal_spec(
+        llm=LLMConfig(model="databricks-claude-sonnet-4-6"),
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "antigravity-native"},
+        ),
+    )
+    result = validate(spec)
+    assert result.valid, f"Expected valid spec, got errors: {result.errors}"
+
+
 def test_omnigent_executor_rejects_missing_harness() -> None:
     """
     ``omnigent`` executor without ``config.harness`` is rejected.
@@ -583,8 +603,11 @@ def test_os_env_egress_rules_requires_hard_enforcing_backend() -> None:
     assert not result.valid
     matches = [e for e in result.errors if e.path == "os_env.sandbox.egress_rules"]
     assert matches, f"expected egress_rules error, got: {result.errors}"
-    assert "linux_bwrap" in matches[0].message
-    assert "darwin_seatbelt" in matches[0].message
+    message = matches[0].message
+    assert "linux_bwrap" in message
+    assert "darwin_seatbelt" in message
+    assert "Fix:" in message
+    assert "do not use sandbox.type=none with egress_rules" in message
 
 
 def test_os_env_egress_rules_accepted_for_bwrap() -> None:

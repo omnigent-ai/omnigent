@@ -1,0 +1,1478 @@
+"""Bridge state for native Antigravity TUI sessions."""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+_logger = logging.getLogger(__name__)
+
+ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.antigravity_native.bridge_id"
+ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR"
+ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID"
+
+_STATE_FILE = "state.json"
+# Advertises the runner-owned tmux pane (socket + target) hosting agy, so the
+# executor can deliver a FIRST web turn into the idle agy TUI via send-keys (see
+# the tmux/TUI section at the end of this module). Written by the runner after
+# the agy terminal launches; read by the executor's first-turn bootstrap.
+_TMUX_FILE = "tmux.json"
+_BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+
+# Prefix of the launcher-minted placeholder conversation id (see
+# ``antigravity_native._mint_agy_conversation_id``). agy mints its own real
+# UUID, so the placeholder only seeds bridge state until the forwarder discovers
+# and overwrites it; consumers (e.g. the executor) must treat a placeholder id as
+# "not ready yet" rather than resolving an RPC against it.
+AGY_PLACEHOLDER_CONVERSATION_PREFIX = "agy_conv_"
+
+
+def is_placeholder_conversation_id(conversation_id: str) -> bool:
+    """Return whether *conversation_id* is the launcher placeholder, not agy's real id.
+
+    :param conversation_id: A bridge-state conversation id.
+    :returns: ``True`` when it is an ``agy_conv_*`` placeholder (the forwarder has
+        not yet discovered agy's real UUID); ``False`` for a real agy id.
+    """
+    return conversation_id.startswith(AGY_PLACEHOLDER_CONVERSATION_PREFIX)
+
+
+# Canonical root of agy's per-user app-data tree (``~/.gemini/antigravity-cli``).
+# Single-sourced here and imported by the forwarder (transcript / brain
+# discovery) so a change to agy's data-dir layout is a one-line edit. (The
+# onboarding/auth layer keeps its own ``~/.gemini`` OAuth root in ``gemini_auth``
+# — a broader, distinct concern that must not depend on this harness module.)
+AGY_APP_DATA_DIR = Path.home() / ".gemini" / "antigravity-cli"
+
+# agy persists onboarding completion in this HOME-global cache file. On a first
+# run where it is absent, agy launches an interactive TUI onboarding wizard
+# (login method, then color-scheme / telemetry steps) that has no pre-emptive
+# flag and no PermissionRequest-style hook. On a host-spawned (web-driven) or
+# otherwise headless launch there is no TTY to answer it, so agy hangs and the
+# web UI shows nothing. Seeding ``onboardingComplete`` here suppresses the
+# wizard, mirroring how ``claude_native_bridge.ensure_claude_workspace_trusted``
+# pre-accepts Claude's ``hasCompletedOnboarding`` gate. The agy OAuth token is a
+# separate per-host secret (seeded outside this code path); this file carries no
+# credential — only the three onboarding-state booleans.
+_AGY_ONBOARDING_MARKER = AGY_APP_DATA_DIR / "cache" / "onboarding.json"
+# The exact keys agy itself writes on a completed consumer (subscription)
+# onboarding — captured ground-truth from a real onboarded profile. Enterprise
+# onboarding is a distinct flow Omnigent does not drive, so it stays ``False``.
+_AGY_ONBOARDING_COMPLETE_STATE: dict[str, object] = {
+    "consumerOnboardingComplete": True,
+    "enterpriseOnboardingComplete": False,
+    "onboardingComplete": True,
+}
+
+
+def ensure_agy_onboarding_complete() -> None:
+    """Pre-accept agy's first-run onboarding wizard so a headless launch never blocks.
+
+    Idempotently seeds ``onboardingComplete`` (and the sibling consumer/enterprise
+    flags) into agy's ``~/.gemini/antigravity-cli/cache/onboarding.json`` so the
+    interactive TUI onboarding wizard does not stall a host-spawned or headless
+    ``agy`` launch that has no TTY to answer it. Call once before launching agy
+    (see :func:`omnigent.runner.app._auto_create_antigravity_terminal` and the CLI
+    ``_launch_and_record`` path).
+
+    Any unrecognised keys already in the file are preserved (the three known keys
+    are merged over them), and the write is skipped entirely when all three
+    already hold their exact boolean values — so a returning user's agy state is
+    never churned. Unlike
+    ``~/.claude.json`` (which holds the Claude OAuth account block and is treated
+    fail-loud), this file is a regenerable, non-secret agy cache: an existing
+    file that is unreadable or not a JSON object is treated as absent and
+    overwritten with the known-complete state rather than raising.
+
+    :returns: None.
+    :raises OSError: If the marker directory cannot be created or the file cannot
+        be written (e.g. an unwritable home directory). Surfaced rather than
+        swallowed: a missing marker means agy will hang on the wizard, so a write
+        failure is a real, launch-blocking fault worth failing loudly on.
+    """
+    marker = _AGY_ONBOARDING_MARKER
+    existing: dict[str, object] = {}
+    if marker.is_file():
+        try:
+            loaded = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # Regenerable non-secret cache: an unreadable (OSError), non-UTF-8
+            # (UnicodeDecodeError) or malformed-JSON (json.JSONDecodeError) marker
+            # would make agy re-run onboarding anyway, so overwrite from an empty
+            # base. ValueError is the common supertype of both decode failures.
+            loaded = None
+        if isinstance(loaded, dict):
+            existing = loaded
+    # Type-strict identity (``is``, not ``==``) so a stored numeric ``1``/``0``
+    # (which ``==`` True/False in Python) is NOT accepted as the boolean state but
+    # is normalised on write — matching this module's ``read_bridge_state``, which
+    # likewise rejects bool/int conflation.
+    if all(existing.get(key) is value for key, value in _AGY_ONBOARDING_COMPLETE_STATE.items()):
+        return
+    merged: dict[str, object] = {**existing, **_AGY_ONBOARDING_COMPLETE_STATE}
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{marker.name}.", dir=str(marker.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(merged, handle, sort_keys=True)
+            handle.write("\n")
+            # fsync before the atomic replace so a crash/power-loss cannot leave a
+            # present-but-empty marker that would send agy back into the wizard
+            # (matches ``claude_native_bridge._atomic_write_user_json``).
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, marker)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    _logger.info("Seeded agy onboarding-complete marker at %s", marker)
+
+
+def bridge_root() -> Path:
+    """
+    Return the configured Antigravity-native bridge root.
+
+    Tests may monkeypatch :data:`_BRIDGE_ROOT` to isolate bridge files.
+
+    :returns: Absolute root for Antigravity-native bridge directories, e.g.
+        ``Path("~/.omnigent/antigravity-native")``.
+    """
+    return _BRIDGE_ROOT
+
+
+@dataclass(frozen=True)
+class AntigravityNativeBridgeState:
+    """
+    Runtime state shared by the native Antigravity wrapper and harness.
+
+    :param session_id: Omnigent conversation id, e.g.
+        ``"conv_abc123"``.
+    :param conversation_id: agy's real conversation id, e.g.
+        ``"68caaeac-2eaf-4e2c-9b95-721b022f4903"``. Discovered by the forwarder
+        via by-pid ownership of this session's agy process (agy mints its own
+        UUID and ignores any ``ANTIGRAVITY_CONVERSATION_ID`` the launcher sets).
+        The launcher seeds this with its minted ``agy_conv_*`` placeholder, which
+        the forwarder overwrites once it discovers the real id.
+    :param active_turn_id: Current agy turn id, if one is running,
+        e.g. ``"turn_abc123"``.
+
+    .. note::
+        There is intentionally no durable read cursor. The retired transcript
+        forwarder persisted a ``forwarded_steps`` set (+ a ``forwarded_step_index``
+        mirror) so a tail (re)start did not re-mirror the whole JSONL. The RPC read
+        driver that superseded it (:mod:`omnigent.antigravity_native_reader`) keeps
+        an *in-memory* seen-set only and is recreated per session by the runner, so
+        no on-disk cursor is needed. Legacy ``forwarded_step_index`` /
+        ``forwarded_steps`` keys in an on-disk ``state.json`` are tolerated and
+        ignored on read.
+
+    .. note::
+        There is intentionally no ``agy_pid`` field. agy's pid is not stable to
+        capture at launch — the CLI terminal uses ``tmux_start_on_attach=True``
+        (agy does not exist until the human TTY attaches), and even the
+        runner-owned web terminal (``tmux_start_on_attach=False``, agy started
+        immediately) re-execs/supervises, so a captured pid can go stale. The
+        executor instead discovers agy's connect-RPC port at injection time by
+        enumerating agy processes and validating each against
+        :attr:`conversation_id` via ``GetConversationMetadata`` (see
+        :func:`omnigent.antigravity_native_rpc.resolve_language_server_port`).
+        A legacy ``agy_pid`` key in an on-disk ``state.json`` is tolerated and
+        ignored on read.
+    """
+
+    session_id: str
+    conversation_id: str
+    active_turn_id: str | None = None
+
+
+def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
+    """
+    Return the bridge directory for a native Antigravity bridge id.
+
+    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
+    :returns: Absolute bridge directory under
+        ``~/.omnigent/antigravity-native``.
+    """
+    digest = hashlib.sha256(bridge_id.encode("utf-8")).hexdigest()[:32]
+    return _BRIDGE_ROOT / digest
+
+
+def build_antigravity_native_spawn_env(
+    conversation_id: str,
+    *,
+    bridge_id: str | None = None,
+) -> dict[str, str]:
+    """
+    Build spawn env for the ``antigravity-native`` harness process.
+
+    :param conversation_id: Omnigent conversation id, e.g.
+        ``"conv_abc123"``.
+    :param bridge_id: Opaque bridge id from
+        :data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY`, e.g.
+        ``"bridge_abc123"``. ``None`` uses *conversation_id*.
+    :returns: Environment variables needed by the Antigravity-native
+        harness executor.
+    """
+    resolved_bridge_id = bridge_id or conversation_id
+    return {
+        ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR: str(bridge_dir_for_bridge_id(resolved_bridge_id)),
+        ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR: conversation_id,
+    }
+
+
+def prepare_bridge_dir(bridge_id: str) -> Path:
+    """
+    Create the bridge directory for *bridge_id*.
+
+    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
+    :returns: Prepared absolute bridge directory.
+    """
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(bridge_dir, 0o700)
+    return bridge_dir
+
+
+# ── Omnigent MCP relay wiring (sys_* tools) ──────────────────────────────────
+#
+# agy is otherwise tool-isolated from Omnigent: unlike claude/codex/cursor it
+# wires no MCP relay, so the wrapped agy cannot reach any ``sys_*`` tool (spawn
+# sub-agent sessions, drive Omnigent terminals, list agents/models, ``sys_os_*``).
+# This section wires the SAME relay cursor #742 uses — the shared
+# ``omnigent.claude_native_bridge serve-mcp`` stdio server — into agy.
+#
+# THE CONFIG-SCOPING FOOTGUN. agy has no ``--mcp-config`` flag and ignores every
+# ``ANTIGRAVITY_*`` env knob; it loads MCP servers from a single HOME-GLOBAL file,
+# ``$HOME/.gemini/config/mcp_config.json`` — the *same* file the user's
+# interactive agy reads (verified empirically against agy 1.0.12). Writing that
+# file directly would (a) clobber/pollute the user's interactive agy config and
+# (b) be incorrect under concurrency: the relay command is bridge-dir-specific, so
+# two antigravity-native sessions (or a session + the user's interactive agy)
+# would fight over the one global file.
+#
+# CHOSEN DESIGN — per-session ISOLATED GEMINI DIR. The runner keeps agy's real
+# ``HOME`` intact (needed for platform auth such as macOS keyring-backed tokens)
+# and launches agy with its hidden ``--gemini_dir=<bridge_dir>/agy-home/.gemini``
+# flag. That isolated Gemini dir is seeded with onboarding/migration markers and
+# a bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
+# This (1) NEVER touches the user's real ``~/.gemini/config/mcp_config.json`` and
+# (2) gives each session its own config so concurrent sessions never clobber one
+# another. Known file-based OAuth markers are copied best-effort for platforms
+# whose agy auth provider uses them, but HOME is deliberately not relocated.
+#
+# WHY NOT RELOCATE HOME (#1477). An earlier isolation design pointed ``HOME`` at
+# the per-session tree. That broke auth on macOS: agy stores its OAuth token in
+# the OS keyring (verified against agy 1.0.12 — the binary's auth path is
+# ``keyring`` / "load token from keyring", NOT a ``~/.gemini`` file), and the
+# keyring item is bound to the real login HOME, so any relocated HOME stalled
+# every turn at the interactive OAuth prompt. The alternative of dropping HOME
+# isolation entirely on macOS (#1493) restored auth but reintroduced the
+# HOME-global ``mcp_config.json`` footgun (#1194) there — concurrent sessions
+# would clobber one another's relay config. ``--gemini_dir`` resolves both at
+# once: real HOME ⇒ keyring auth works on every platform; isolated gemini dir ⇒
+# per-session MCP config. Verified live (agy 1.0.12): ``agy --gemini_dir=<dir>``
+# materializes its ``antigravity-cli`` + ``config`` state under ``<dir>`` while
+# authenticating from the real-HOME keyring.
+_MCP_CONFIG_DIR = "config"
+_MCP_CONFIG_FILE = "mcp_config.json"
+_BRIDGE_CONFIG_FILE = "bridge.json"
+_MCP_SERVER_NAME = "omnigent"
+# agy auto-approves a relay tool when it is named in the server's ``enabledTools``
+# allowlist (agy's per-server MCP schema; mirrors cursor's ``autoApprove``).
+# Omnigent's own TOOL_CALL policy + elicitation gate still applies on the server
+# side, so auto-approving the agy-side MCP gate only avoids a hidden in-terminal
+# prompt blocking the call before Omnigent ever sees it.
+_AGY_ENABLED_TOOLS = [
+    "list_comments",
+    "sys_add_policy",
+    "sys_agent_download",
+    "sys_agent_get",
+    "sys_agent_list",
+    "sys_call_async",
+    "sys_cancel_async",
+    "sys_cancel_task",
+    "sys_list_models",
+    "sys_os_edit",
+    "sys_os_read",
+    "sys_os_shell",
+    "sys_os_write",
+    "sys_policy_registry",
+    "sys_session_close",
+    "sys_session_create",
+    "sys_session_get_history",
+    "sys_session_get_info",
+    "sys_session_list",
+    "sys_session_send",
+    "sys_terminal_close",
+    "sys_terminal_launch",
+    "sys_terminal_list",
+    "sys_terminal_read",
+    "sys_terminal_send",
+    "update_comment",
+]
+
+# Files copied from the user's real ``~/.gemini`` into the per-session isolated
+# Gemini dir for platforms whose agy auth provider uses file-backed credentials,
+# plus installation markers. Keep the OAuth credential paths in sync with
+# ``omnigent.onboarding.gemini_auth``: macOS writes ``oauth_creds.json`` while
+# Linux writes ``antigravity-cli/antigravity-oauth-token``. The OAuth credential
+# is the only secret; it is COPIED (the real file is never moved or modified).
+# Missing files are skipped (agy regenerates onboarding/migration state, and a
+# missing credential only means agy re-auths in that session — never corruption
+# of the real tree).
+_AGY_SEED_FILES = (
+    Path("oauth_creds.json"),
+    Path("antigravity-cli") / "antigravity-oauth-token",
+    Path("installation_id"),
+    Path("antigravity-cli") / "installation_id",
+)
+
+
+def agy_home_dir(bridge_dir: Path) -> Path:
+    """Return the parent directory for this session's isolated agy state.
+
+    The actual agy config/state root is :func:`agy_gemini_dir`, passed to agy via
+    ``--gemini_dir``. Keeping this parent below *bridge_dir* makes it naturally
+    per-session and easy to tear down with the bridge, while preserving the real
+    ``HOME`` for auth providers that depend on platform state such as macOS
+    Keychain.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: Absolute parent path for this session's isolated agy state.
+    """
+    return bridge_dir / "agy-home"
+
+
+def agy_gemini_dir(bridge_dir: Path) -> Path:
+    """Return the per-session ``--gemini_dir`` path for an agy launch.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: Absolute ``.gemini`` directory that should receive agy's session
+        config/state and the Omnigent MCP config.
+    """
+    return agy_home_dir(bridge_dir) / ".gemini"
+
+
+def build_mcp_config(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Build agy's ``mcp_config.json`` payload for the Omnigent relay server.
+
+    Mirrors cursor #742's :func:`omnigent.cursor_native_bridge.build_mcp_config`
+    but emits agy's per-server MCP schema (lowercase ``command`` / ``args`` /
+    ``env`` keys plus ``enabledTools``, agy's auto-approve allowlist — verified
+    against agy 1.0.12's config struct) under the top-level ``mcpServers`` key.
+    The server command is the SAME shared relay claude/codex/cursor use:
+    ``<python> -I -m omnigent.claude_native_bridge serve-mcp --bridge-dir <dir>``.
+
+    **HOME pinning.** agy spawns this relay as a child. The relay validates its
+    ``--bridge-dir`` against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``),
+    which must resolve to the RUNNER's real home where the bridge dir actually
+    lives. Pinning ``HOME`` in the relay env keeps that invariant true even when a
+    future agy launch path customizes process environment. ``-I`` does not clear
+    ``HOME``; it only ignores ``PYTHON*`` vars and user site-packages.
+
+    :param bridge_dir: Native Antigravity bridge directory whose relay this
+        config points at.
+    :param python_executable: Python interpreter for the relay command;
+        defaults to the current interpreter (``sys.executable``).
+    :returns: The ``mcp_config.json`` payload as a dict.
+    """
+    python = python_executable or sys.executable
+    return {
+        "mcpServers": {
+            _MCP_SERVER_NAME: {
+                "command": python,
+                "args": [
+                    "-I",
+                    "-m",
+                    "omnigent.claude_native_bridge",
+                    "serve-mcp",
+                    "--bridge-dir",
+                    str(bridge_dir),
+                ],
+                "enabledTools": list(_AGY_ENABLED_TOOLS),
+                "env": {
+                    "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+                    # Pin the relay to the RUNNER's real home so its bridge-root
+                    # validation matches where the bridge dir lives. See docstring.
+                    "HOME": str(Path.home()),
+                },
+            }
+        }
+    }
+
+
+def write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write the token config the shared Omnigent MCP relay requires.
+
+    The relay's ``serve-mcp`` reads ``<bridge_dir>/bridge.json`` for a token that
+    authorizes its localhost control endpoint. Idempotent: an existing token is
+    left untouched so a resume/clear does not rotate a live relay's token.
+    Mirrors :func:`omnigent.cursor_native_bridge.write_mcp_bridge_config`.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: None.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config_path = bridge_dir / _BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    payload = {"token": secrets.token_urlsafe(32)}
+    tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, config_path)
+
+
+def write_mcp_config(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Write the per-session agy MCP config + relay token.
+
+    Writes (1) ``bridge.json`` (the relay token) into *bridge_dir* and (2) the
+    ``mcp_config.json`` for the Omnigent relay into the per-session isolated agy
+    Gemini dir at ``<bridge_dir>/agy-home/.gemini/config/mcp_config.json`` — the
+    path agy loads when launched with ``--gemini_dir``. Because the Gemini dir is
+    per-session and not the user's real ``~/.gemini``, this never clobbers the
+    user's interactive agy config and two concurrent sessions never share one
+    config. Mirrors cursor #742's :func:`omnigent.cursor_native_bridge.write_mcp_config`,
+    adapted to agy's hidden ``--gemini_dir`` flag.
+
+    :param bridge_dir: Native Antigravity bridge directory (holds ``bridge.json``
+        and the isolated agy Gemini dir).
+    :param python_executable: Python interpreter for the relay command;
+        defaults to the current interpreter.
+    :returns: Absolute path to the written ``mcp_config.json``.
+    """
+    write_mcp_bridge_config(bridge_dir)
+    config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
+    config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = config_dir / _MCP_CONFIG_FILE
+    payload = build_mcp_config(bridge_dir, python_executable=python_executable)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def seed_isolated_agy_home(
+    bridge_dir: Path,
+    *,
+    trusted_workspace: Path | str | None = None,
+) -> dict[str, str]:
+    """Seed the per-session isolated agy Gemini dir and return env overrides.
+
+    Copies known file-based agy OAuth markers + onboarding/migration state (NEVER
+    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini``.
+    The runner keeps agy's real ``HOME`` intact and passes this directory through
+    ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
+    auth that is not portable to a relocated ``HOME``. The relay's
+    ``mcp_config.json`` is written separately by :func:`write_mcp_config` so it
+    lands in this same isolated tree rather than the user's real ``~/.gemini``
+    (the footgun this whole design avoids).
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param trusted_workspace: Optional workspace path to pre-trust inside the
+        isolated agy settings file. This suppresses agy's unhookable first-run
+        "Do you trust this project?" TUI gate for host-spawned sessions, mirroring
+        ``ensure_claude_workspace_trusted`` while keeping trust scoped to this
+        bridge-owned ``--gemini_dir``.
+    :returns: Env overrides to layer onto the agy launch environment. Currently
+        empty because ``HOME`` must stay real for platform auth.
+    """
+    real_home = Path.home()
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
+    (iso_gemini / _MCP_CONFIG_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    # Copy the auth token + installation id (best-effort: a missing token only
+    # means agy re-auths this session; the real files are never touched).
+    for rel in _AGY_SEED_FILES:
+        src = real_home / ".gemini" / rel
+        if not src.is_file():
+            continue
+        dst = iso_gemini / rel
+        dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            dst.write_bytes(src.read_bytes())
+            os.chmod(dst, 0o600)
+
+    # Seed the onboarding-complete marker so the first-run wizard never blocks a
+    # headless launch (same state ``ensure_agy_onboarding_complete`` writes).
+    onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
+    with contextlib.suppress(OSError):
+        onboarding.write_text(
+            json.dumps(
+                {
+                    "consumerOnboardingComplete": True,
+                    "enterpriseOnboardingComplete": False,
+                    "onboardingComplete": True,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    # Seed the migration marker so agy does not churn a from-scratch migration on
+    # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
+    with contextlib.suppress(OSError):
+        (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
+
+    if trusted_workspace is not None:
+        _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
+
+    return {}
+
+
+# agy's periodic engagement survey ("How's the CLI experience so far?") is gated by
+# this ``settings.json`` key. Its modal footer line ``esc to cancel`` is identical
+# to :data:`_AGY_ACTIVE_MARKER` (the running-turn signal the TUI inject path keys
+# on), so a web turn typed into the pane while the survey is up is misread as a
+# mid-turn steer and silently lost (#1494). Disabling the survey removes the
+# trigger. Verified live: toggling agy's ``/config`` "Show Feedback Survey" off
+# writes exactly ``"showFeedbackSurvey": false`` here (``disableFeedback`` is an
+# unrelated internal proto field, NOT a settings key — it would be ignored).
+_AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
+
+
+def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+    """
+    Disable agy's feedback survey in the launch HOME's ``settings.json``.
+
+    agy periodically renders an engagement survey whose modal footer
+    (``esc to cancel``) collides with :data:`_AGY_ACTIVE_MARKER`; with it up, a
+    web turn injected into the TUI is mistaken for a running turn and lost
+    (#1494). The survey is governed by ``showFeedbackSurvey`` in
+    ``<home>/.gemini/antigravity-cli/settings.json`` — set it ``false`` before
+    launch so the survey never appears (deterministic prevention; text-matching
+    the survey itself would be brittle to agy wording changes).
+
+    Merge-only + idempotent: existing keys (``model``, ``trustedWorkspaces``,
+    ``enableTelemetry``, …) are preserved; a missing file is created with just
+    this key; a malformed / non-object file is left UNTOUCHED rather than
+    clobbered. Best-effort — a read/write failure is logged and the launch
+    proceeds (the survey is a degradation, not a hard blocker).
+
+    :param home: The HOME agy launches under (the per-session isolated home, or
+        the real home when the harness runs agy under it). Settings live at
+        ``<home>/.gemini/antigravity-cli/settings.json``.
+    :returns: None.
+    """
+    # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
+    # its real target, so the atomic os.replace below rewrites the linked file rather
+    # than silently replacing the symlink with a regular one. strict=False is a no-op
+    # for a normal or not-yet-existing path (it only resolves parent symlinks).
+    settings_path = (home / ".gemini" / "antigravity-cli" / "settings.json").resolve(strict=False)
+    data: dict[str, object] = {}
+    try:
+        raw = settings_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = ""  # no settings yet -> create a fresh one carrying just this key
+    except OSError:
+        # An EXISTING but unreadable file (perms, stale NFS, …) must NOT be
+        # recreated from scratch — that would drop the user's real settings.
+        _logger.warning(
+            "could not read agy settings.json at %s; leaving it untouched",
+            settings_path,
+            exc_info=True,
+        )
+        return
+    except UnicodeDecodeError:
+        # read_text raises this (a ValueError, not an OSError) on non-UTF-8 bytes;
+        # treat it like malformed JSON and never clobber the file (mirrors the
+        # ``(OSError, ValueError)`` read guard in ensure_agy_onboarding_complete).
+        _logger.warning(
+            "agy settings.json at %s is not valid UTF-8; leaving it untouched",
+            settings_path,
+        )
+        return
+    if raw.strip():
+        try:
+            loaded = json.loads(raw)
+        except ValueError:
+            # json.JSONDecodeError subclasses ValueError; catch the supertype to
+            # match the decode-family guard in ensure_agy_onboarding_complete.
+            _logger.warning(
+                "agy settings.json at %s is not valid JSON; leaving it untouched "
+                "(the feedback survey may still appear)",
+                settings_path,
+            )
+            return
+        if not isinstance(loaded, dict):
+            _logger.warning(
+                "agy settings.json at %s is not a JSON object; leaving it untouched",
+                settings_path,
+            )
+            return
+        data = loaded
+    if data.get(_AGY_FEEDBACK_SURVEY_SETTING) is False:
+        return  # already disabled — avoid a needless rewrite
+    data[_AGY_FEEDBACK_SURVEY_SETTING] = False
+    # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer
+    # never sees a torn file. On macOS the harness runs agy under the user's REAL
+    # ~/.gemini (the #1477 Keychain trade-off), so this file is shared across
+    # concurrent sessions and with agy itself: the atomic replace prevents
+    # corruption but not lost updates. That window is self-limiting — the
+    # idempotent short-circuit above makes every launch after the first disable
+    # read-only, so a racing agy trust/model write can only be clobbered on the
+    # one-time first disable, and the clobbered values fail safe (lost trust is
+    # re-prompted, lost model defaults). A cross-process lock is intentionally not
+    # taken (a separately-launched agy would not honor it).
+    try:
+        settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())  # crash-safe, mirrors ensure_agy_onboarding_complete
+            os.replace(tmp_name, settings_path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        _logger.warning(
+            "could not write agy settings.json at %s to disable the feedback survey",
+            settings_path,
+            exc_info=True,
+        )
+
+
+def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> None:
+    """Add *workspace* to isolated agy ``trustedWorkspaces`` settings."""
+    settings_path = iso_gemini / "antigravity-cli" / "settings.json"
+    data: dict[str, object] = {}
+    if settings_path.is_file():
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
+    workspace_key = str(workspace.resolve())
+    existing = data.get("trustedWorkspaces")
+    trusted = list(existing) if isinstance(existing, list) else []
+    if workspace_key in trusted:
+        return
+    trusted.append(workspace_key)
+    data["trustedWorkspaces"] = trusted
+    settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, settings_path)
+
+
+def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
+    """
+    Persist shared native Antigravity state atomically.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param state: State payload to persist.
+    :returns: None.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _STATE_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "session_id": state.session_id,
+                    "conversation_id": state.conversation_id,
+                    "active_turn_id": state.active_turn_id,
+                },
+                handle,
+                sort_keys=True,
+            )
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def clear_bridge_state(bridge_dir: Path) -> None:
+    """
+    Remove stale native Antigravity runtime state for a bridge directory.
+
+    New agy launches reuse the same bridge directory for a conversation id,
+    but the old ``state.json`` still names the *previous* agy run's discovered
+    conversation id. Clear it before the new launch so the forwarder
+    rediscovers the new run's real conversation id instead of binding to the
+    stale one. The advertised tmux pane (``tmux.json``) is cleared for the same
+    reason: a new launch opens a new pane (and, after a host restart, a new
+    socket), so the executor must not bootstrap the first turn against the prior
+    run's pane. The new launch re-advertises its pane via
+    :func:`write_tmux_target`.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: None.
+    """
+    for runtime_file in (_STATE_FILE, _TMUX_FILE):
+        with contextlib.suppress(FileNotFoundError):
+            (bridge_dir / runtime_file).unlink()
+
+
+def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
+    """
+    Read shared native Antigravity bridge state.
+
+    Legacy ``agy_pid`` / ``forwarded_step_index`` / ``forwarded_steps`` keys
+    written by an older build are tolerated and ignored: ``agy_pid`` because agy
+    does not exist at launch (the executor always discovers the connect-RPC port
+    at injection time), and the two cursor keys because the durable read cursor
+    was retired with the transcript forwarder (the RPC reader keeps an in-memory
+    seen-set only).
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: Parsed state, or ``None`` when no state exists or the file
+        is missing, corrupt, or has invalid field types.
+    """
+    path = bridge_dir / _STATE_FILE
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    session_id = raw.get("session_id")
+    conversation_id = raw.get("conversation_id")
+    active_turn_id = raw.get("active_turn_id")
+    # Validate required string fields are non-empty strings.
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return None
+    parsed_active_turn_id = (
+        active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None
+    )
+    return AntigravityNativeBridgeState(
+        session_id=session_id,
+        conversation_id=conversation_id,
+        active_turn_id=parsed_active_turn_id,
+    )
+
+
+def update_conversation_id(
+    bridge_dir: Path,
+    conversation_id: str,
+    active_turn_id: str | None = None,
+) -> bool:
+    """
+    Update the agy conversation id in bridge state.
+
+    Used when a native agy action creates a fresh conversation while the
+    Omnigent session stays the same (e.g. the runner cold-start replacing the
+    ``agy_conv_*`` placeholder with agy's real cascade id).
+
+    When there is no existing state to update (a missing or invalid state file),
+    the write is SKIPPED and a WARNING is logged naming the dropped id — silently
+    dropping it would leave the reader bound to the ``agy_conv_*`` placeholder
+    forever, surfaced only as a generic "conversation not ready". The caller
+    decides how to react (it stays best-effort; this never raises).
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param conversation_id: New agy conversation id, e.g.
+        ``"agy_conv_abc123"``.
+    :param active_turn_id: Active turn id for the new conversation, e.g.
+        ``"turn_abc123"``, or ``None`` when no turn is running yet.
+    :returns: ``True`` when the new id was written, ``False`` when there was no
+        existing state to update (the id was dropped; a WARNING was logged).
+    """
+    state = read_bridge_state(bridge_dir)
+    if state is None:
+        _logger.warning(
+            "Antigravity bridge: no existing state at %s to update; dropping "
+            "conversation_id=%s (the reader will stay on the placeholder id)",
+            bridge_dir,
+            conversation_id,
+        )
+        return False
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(
+            session_id=state.session_id,
+            conversation_id=conversation_id,
+            active_turn_id=active_turn_id,
+        ),
+    )
+    return True
+
+
+# ── Web-turn TUI delivery (tmux send-keys) ───────────────────────────────────
+#
+# The executor types EVERY web/mobile turn into the agy TUI over the runner-owned
+# tmux pane — never agy's connect-RPC ``SendAgentMessage``, which agy records as a
+# ``SYSTEM_MESSAGE`` the transcript forwarder would not mirror (so the user's
+# message would never be committed). Typing creates a real ``USER_INPUT`` step
+# that the forwarder mirrors in order (validated against agy 1.0.10: a
+# paste-buffer + Enter is recorded as ``USER_INPUT`` whether agy is idle or
+# mid-turn, and on a fresh session it also creates the conversation + brain dir
+# the forwarder then discovers). This mirrors the cursor/claude native send-keys
+# delivery; no shared tmux helper exists, so the small primitives are duplicated
+# per the established per-harness convention.
+
+# tmux probe/command timeout. Short: these are local IPC calls to the runner's
+# own tmux server.
+_TMUX_SEND_TIMEOUT_S = 5.0
+# Per-readiness-gate wait (tmux.json advertised, then the agy input box mounted).
+_TMUX_READY_TIMEOUT_S = 30.0
+# Poll cadence for the readiness / paste-commit / submit-verify loops.
+_TMUX_POLL_INTERVAL_S = 0.2
+# How long to wait for the pasted draft to render in the input box before Enter.
+_PASTE_COMMIT_TIMEOUT_S = 5.0
+# Settle pause after the draft renders, before the submit Enter.
+_PASTE_SETTLE_S = 0.2
+# How long one submit Enter is given to start a turn before it is re-sent.
+_SUBMIT_VERIFY_TIMEOUT_S = 5.0
+# Re-send budget for a submit Enter that the TUI folded into the paste burst.
+_MAX_SUBMIT_ATTEMPTS = 3
+# Named tmux buffer used to stream the paste (avoids the ~16KB send-keys argv cap).
+_PASTE_BUFFER = "omnigent-agy-paste"
+# agy TUI footer when idle (input box mounted, ready for a turn).
+_AGY_IDLE_MARKER = "? for shortcuts"
+# agy TUI footer while a turn is running. Used as a readiness hint and to detect
+# a mid-turn steer; submission itself is verified by draft disappearance, NOT by
+# this marker (footer text can change across agy builds or be truncated).
+_AGY_ACTIVE_MARKER = "esc to cancel"
+# Patterns redacted from a pane tail before it is surfaced in a delivery-failure
+# error. The agy header shows the signed-in account email, and the transcript
+# region can echo tokens/keys agy printed; redaction is best-effort and biased
+# toward over-redaction so a secret never leaks into a user-facing error.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
+_SECRET_RES = (
+    re.compile(r"\b(?:sk|rk)-[A-Za-z0-9_-]{16,}"),  # OpenAI-style keys
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),  # GitHub tokens
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),  # Slack tokens
+    re.compile(r"\bya29\.[A-Za-z0-9._-]{10,}"),  # Google OAuth access tokens
+    re.compile(r"\bAIza[A-Za-z0-9_-]{30,}"),  # Google API keys
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key ids
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"),  # JWTs
+    re.compile(r"(?i)\b(?:bearer|token|api[_-]?key|secret|password)\b\s*[:=]?\s*\S{6,}"),
+)
+# TUI horizontal separator around agy's bottom composer.
+_AGY_SEPARATOR_CHAR = "─"
+# Box-drawing glyphs agy may use to frame/decorate the composer rule. A rule is
+# detected when its non-space chars are all box-drawing AND it carries a run of
+# the horizontal rule char, so a future agy that frames the composer with
+# corner/join glyphs (e.g. ``╭────╮``) is still detected, while ordinary text
+# (which carries non-box chars) never matches.
+_AGY_BOX_GLYPHS = frozenset("─━╌╍┄┅┈┉╭╮╰╯┌┐└┘├┤┬┴┼│║╔╗╚╝═╠╣╦╩╬╴╵╶╷")
+
+
+def write_tmux_target(
+    bridge_dir: Path,
+    *,
+    socket_path: Path,
+    tmux_target: str,
+    pid: int | None = None,
+) -> None:
+    """
+    Advertise the tmux socket + target for the running agy terminal.
+
+    The runner calls this after launching the agy terminal so the executor can
+    shell out to ``tmux send-keys`` against the same private socket to bootstrap
+    the first web turn (see :func:`inject_user_message_via_tui`). Written
+    atomically next to ``state.json``.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param socket_path: Absolute path to the terminal's private tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param pid: Optional agy/pane pid, recorded for diagnostics only.
+    :returns: None.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "socket_path": str(socket_path),
+        "tmux_target": tmux_target,
+        "updated_at": time.time(),
+    }
+    if pid is not None:
+        payload["pid"] = pid
+    path = bridge_dir / _TMUX_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_TMUX_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def read_tmux_info(bridge_dir: Path) -> dict[str, str] | None:
+    """
+    Return the advertised ``{socket_path, tmux_target}`` for the agy terminal.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: A dict with non-empty ``socket_path`` and ``tmux_target`` string
+        values, or ``None`` when ``tmux.json`` is missing, unreadable, malformed,
+        or has invalid field types.
+    """
+    try:
+        raw = (bridge_dir / _TMUX_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    socket_path = data.get("socket_path")
+    tmux_target = data.get("tmux_target")
+    if (
+        isinstance(socket_path, str)
+        and socket_path
+        and isinstance(tmux_target, str)
+        and tmux_target
+    ):
+        return {"socket_path": socket_path, "tmux_target": tmux_target}
+    return None
+
+
+def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
+    """
+    Block until the agy terminal's tmux target is advertised, or raise.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param timeout_s: Maximum seconds to wait for ``tmux.json``.
+    :returns: The advertised ``{socket_path, tmux_target}``.
+    :raises RuntimeError: When the target is not advertised within *timeout_s*.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        info = read_tmux_info(bridge_dir)
+        if info is not None:
+            return info
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"antigravity-native tmux target was not advertised within {timeout_s:.0f}s "
+                "(is the agy terminal running on this host?)"
+            )
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+
+
+def _run_tmux(socket_path: str, *args: str) -> None:
+    """
+    Invoke ``tmux -S <socket> <args...>`` and raise on failure.
+
+    :param socket_path: tmux server socket path.
+    :param args: tmux subcommand and arguments, e.g.
+        ``("send-keys", "-t", "main", "Enter")``.
+    :returns: None.
+    :raises RuntimeError: On a non-zero exit or a timeout.
+    """
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S:.0f}s") from exc
+    except OSError as exc:
+        raise RuntimeError(f"tmux could not be executed: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
+        raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
+
+
+def _capture_pane(socket_path: str, tmux_target: str) -> str:
+    """
+    Capture the visible pane contents; ``""`` on any failure (treat as not-ready).
+
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :returns: The pane text, or ``""`` when the capture fails.
+    """
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "capture-pane", "-p", "-t", tmux_target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _session_alive(socket_path: str, tmux_target: str) -> bool:
+    """
+    Return whether the tmux session/pane still exists (the agy TUI is running).
+
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :returns: ``True`` when ``has-session`` reports the target exists.
+    """
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "has-session", "-t", tmux_target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def _paste_payload_bytes(text: str) -> bytes:
+    r"""
+    Encode text for ``tmux load-buffer``.
+
+    Line breaks become CR (0x0D) so the agy TUI keeps a multi-line message as a
+    single input under bracketed paste rather than submitting on each newline;
+    tabs are kept; other control bytes are dropped (a stray ESC would close the
+    bracketed paste early).
+
+    :param text: Raw message text.
+    :returns: The encoded paste payload.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    body = bytearray()
+    for ch in normalized:
+        if ch == "\n":
+            body.append(0x0D)
+            continue
+        if ch == "\t":
+            body.append(0x09)
+            continue
+        if ord(ch) < 0x20:
+            continue
+        body.extend(ch.encode("utf-8"))
+    return bytes(body)
+
+
+def _submit_needle(content: str) -> str:
+    """
+    A stable single-line substring used to confirm the paste rendered in the pane.
+
+    :param content: Message content.
+    :returns: Up to 24 chars of the first line with at least 4 non-space chars,
+        or ``""`` when no such line exists (the caller then skips the
+        paste-commit poll and submits after the settle pause).
+    """
+    for line in content.splitlines():
+        stripped = line.strip()
+        if len(stripped) >= 4:
+            return stripped[:24]
+    stripped = content.strip()
+    return stripped[:24] if len(stripped) >= 4 else ""
+
+
+def _redact_pane_secrets(text: str) -> str:
+    """Redact emails and common secret shapes from a pane tail.
+
+    Best-effort and biased toward over-redaction: the tail is embedded in a
+    user-facing delivery error, and agy may have printed the signed-in account
+    email or tokens/keys in the transcript region.
+    """
+    redacted = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+    for pattern in _SECRET_RES:
+        redacted = pattern.sub("[REDACTED_SECRET]", redacted)
+    return redacted
+
+
+def _format_pane_debug_tail(pane: str) -> str:
+    """
+    Return a short, redacted pane tail for delivery failure diagnostics.
+
+    The agy pane header can include the authenticated user's email address and
+    the transcript region can echo secrets agy printed. Keep this diagnostic safe
+    to surface in an executor error by redacting emails + common secret shapes
+    (see :func:`_redact_pane_secrets`) and limiting the output to a small tail.
+    """
+    lines = [line.rstrip() for line in pane.splitlines() if line.strip()]
+    tail = "\n".join(lines[-12:])
+    return _redact_pane_secrets(tail) or "<empty pane>"
+
+
+def _agy_input_region(pane: str) -> str:
+    """
+    Return agy's live bottom composer region, excluding transcript history.
+
+    agy renders the editable composer between horizontal separator lines. After
+    a successful submit, the submitted prompt remains in transcript history
+    above a fresh empty composer, so checking the full pane would falsely think
+    the draft is still present. The last separator pair scopes matching to the
+    currently editable input box, mirroring Kiro's input-region guard.
+    """
+    lines = pane.splitlines()
+    separator_indexes = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
+    if len(separator_indexes) >= 2:
+        start = separator_indexes[-2] + 1
+        end = separator_indexes[-1]
+        return "\n".join(lines[start:end])
+    return "\n".join(lines[-8:])
+
+
+def _agy_separator_line(line: str) -> bool:
+    """Return whether *line* is one of agy's composer separator rules.
+
+    Accepts a pure ``─`` rule (agy 1.0.14) and a box-decorated rule (corner/join
+    glyphs) so a future agy that frames the composer is still detected, while an
+    ordinary text/draft line (which carries non-box chars) never matches. A short
+    dash run (< 8 rule chars) is not treated as a separator.
+    """
+    stripped = line.strip()
+    if stripped.count(_AGY_SEPARATOR_CHAR) < 8:
+        return False
+    return all(char in _AGY_BOX_GLYPHS for char in stripped if not char.isspace())
+
+
+def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool:
+    """
+    Return whether the pasted draft is still visible in agy's composer.
+
+    The baseline region prevents matching the empty prompt or stale text that was
+    already present before this paste. Candidate lines are normalized by removing
+    agy's leading ``>`` prompt glyph.
+
+    When *needle* is empty (a message too short for a stable needle, e.g.
+    ``"ok"``), any draft-like content in a composer that differs from the
+    pre-paste baseline counts as present — so short messages are still render- and
+    submit-verified by composer state instead of being submitted blind.
+    """
+    region = _agy_input_region(pane)
+    if region == baseline_region:
+        return False
+    candidates = _agy_draft_candidate_lines(region)
+    normalized_needle = needle.strip() if needle else ""
+    if not normalized_needle:
+        return bool(candidates)
+    return any(
+        line == normalized_needle
+        or line.startswith(normalized_needle)
+        or normalized_needle in line
+        for line in candidates
+    )
+
+
+def _agy_draft_candidate_lines(region: str) -> list[str]:
+    """Return composer lines that can represent editable draft text.
+
+    A line carrying agy's ``>`` prompt glyph is editable draft content and is
+    kept verbatim (after the glyph is stripped) even when the user's own text
+    contains a word like ``Generating`` or a footer phrase — otherwise a
+    legitimate message would be filtered out and misread as "never rendered".
+    Status/footer rows (idle/active/"Generating …") carry no ``>`` prompt, so the
+    chrome filters apply only to those non-draft lines.
+    """
+    candidates: list[str] = []
+    for raw_line in region.splitlines():
+        line = raw_line.strip()
+        if not line or line == ">":
+            continue
+        if line.startswith(">"):
+            draft = line[1:].strip()
+            if draft:
+                candidates.append(draft)
+            continue
+        if _AGY_IDLE_MARKER in line or _AGY_ACTIVE_MARKER in line:
+            continue
+        if "Generating" in line:
+            continue
+        candidates.append(line)
+    return candidates
+
+
+def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+    """
+    Best-effort wait until agy's input box is mounted (its footer is rendered).
+
+    Polls ``capture-pane`` for EITHER footer marker: :data:`_AGY_IDLE_MARKER`
+    (ready for a new turn) or :data:`_AGY_ACTIVE_MARKER` (a turn is running). Both
+    mean the input box is mounted and can take a paste — agy accepts a mid-turn
+    paste and queues it as the next turn — so a mid-turn steer must NOT wait for
+    the idle footer that will not appear until the active turn ends (that would
+    burn the whole budget). Falls through after *timeout_s* rather than raising:
+    the submit step is the real guard, and a changed footer string in a future
+    agy build must not hard-block delivery.
+
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :param timeout_s: Maximum seconds to wait for a footer to render.
+    :returns: None.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _AGY_IDLE_MARKER in pane or _AGY_ACTIVE_MARKER in pane:
+            return
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+
+
+def _submit_and_verify(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str = "",
+    baseline_region: str = "",
+    draft_seen: bool = False,
+) -> None:
+    """
+    Press Enter to submit the pasted draft, verifying by composer state.
+
+    This mirrors the stronger Claude/Kiro native bridge contract. Footer text is
+    only a readiness hint: it can change across agy builds, be truncated in narrow
+    panes, or redraw independently from the editable draft. The reliable local
+    submit signal is that the draft which was visible before Enter is no longer
+    present in the live bottom composer region (for an empty needle this keys off
+    the composer returning to the pre-paste baseline). If the same draft remains
+    visible, Enter was likely folded into the paste burst and is re-sent within a
+    bounded retry budget. ``inject_user_message_via_tui`` fails earlier when a
+    text draft never renders into an idle composer.
+
+    **Mid-turn steer.** When agy already shows :data:`_AGY_ACTIVE_MARKER`, a turn
+    is running: the draft-disappearance signal is unreliable (agy queues the steer
+    as the next ``USER_INPUT`` and the composer may not clear promptly) and a
+    second Enter could queue a spurious empty turn. So a single best-effort Enter
+    is sent and the function returns without re-sending or hard-failing — the
+    forwarder is the system-of-record for whether the queued steer registered.
+
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :returns: None.
+    :raises RuntimeError: When the agy TUI exits mid-submit, or the visible
+        draft remains in the composer after :data:`_MAX_SUBMIT_ATTEMPTS` attempts.
+    """
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "the agy terminal exited before the message could be submitted; restart the session"
+        )
+    # Mid-turn steer: a turn is already running, so verifying via draft
+    # disappearance is unreliable and a re-sent Enter could queue an empty turn.
+    # Deliver one best-effort Enter and return (see the docstring).
+    if _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        return
+    if not draft_seen:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        return
+    last_pane = _capture_pane(socket_path, tmux_target)
+    for _ in range(_MAX_SUBMIT_ATTEMPTS):
+        # Re-check liveness each attempt: if the TUI exited between the paste and
+        # now, every capture returns "" and the draft never clears — so fail
+        # fast with the real cause instead of spinning the full budget and then
+        # blaming paste-coalescing.
+        if not _session_alive(socket_path, tmux_target):
+            raise RuntimeError(
+                "the agy terminal exited before the message could be submitted; "
+                "restart the session"
+            )
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if not _session_alive(socket_path, tmux_target):
+                raise RuntimeError(
+                    "the agy terminal exited before the message could be submitted; "
+                    "restart the session"
+                )
+            pane = _capture_pane(socket_path, tmux_target)
+            last_pane = pane or last_pane
+            if pane and not _draft_in_input_region(pane, needle, baseline_region):
+                return
+            time.sleep(_TMUX_POLL_INTERVAL_S)
+    draft_visible = _draft_in_input_region(last_pane, needle, baseline_region)
+    raise RuntimeError(
+        "agy did not accept the submitted message; the draft is still visible "
+        "in the input box; "
+        f"draft_visible={draft_visible}; pane_tail:\n{_format_pane_debug_tail(last_pane)}"
+    )
+
+
+def inject_user_message_via_tui(
+    bridge_dir: Path,
+    *,
+    content: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """
+    Deliver a user message into the agy TUI via a tmux bracketed paste + Enter.
+
+    The executor's delivery path for EVERY web/mobile turn (sequential and
+    mid-turn steer): a turn delivered over agy's connect-RPC ``SendAgentMessage``
+    is recorded as a ``SYSTEM_MESSAGE`` the forwarder would not mirror, whereas
+    typing into the TUI creates a real ``USER_INPUT`` step the forwarder mirrors
+    in order. On a fresh session this also creates agy's conversation (agy mints
+    its id only after processing a turn), which the forwarder then discovers.
+
+    Steps: wait for the advertised tmux target and the agy input box (idle OR a
+    running turn — agy accepts a mid-turn paste), clear any leftover draft (Home +
+    kill-to-end), stream the content through a named tmux buffer
+    (``load-buffer``/``paste-buffer -p`` so interior newlines stay data and a
+    large message is not capped by the send-keys argv limit), wait for the draft
+    to render, then submit and verify the draft left the live composer (see
+    :func:`_submit_and_verify`).
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param content: User text from the web UI. Must be non-empty.
+    :param timeout_s: Total readiness budget, shared across the two gates
+        (``tmux.json`` advertised, then the input box mounted) so the worst case
+        is one ``timeout_s``, not two stacked.
+    :returns: None.
+    :raises RuntimeError: When the tmux target is never advertised, the agy TUI
+        has exited, a tmux command fails, or the submit never starts a turn.
+    """
+    if not content:
+        raise RuntimeError("antigravity-native TUI injection requires non-empty content")
+    # One shared deadline across both readiness gates: the prompt-ready gate gets
+    # only the budget the tmux-target gate did not consume, capping total
+    # readiness latency at timeout_s (the gates were previously each given a full
+    # timeout_s, so a stuck launch cost 2x before delivery even began).
+    deadline = time.monotonic() + timeout_s
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    # Fast-fail if the TUI already exited: otherwise the readiness gate polls a
+    # dead pane for the full timeout and the web message is silently lost. A clear
+    # error lets the executor surface an ExecutorError so the UI can say "restart".
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "the agy terminal is no longer running (the TUI exited); restart the session"
+        )
+    _wait_for_agy_prompt_ready(
+        socket_path, tmux_target, timeout_s=max(0.0, deadline - time.monotonic())
+    )
+    # Clear any leftover draft before typing: Home (C-a) + kill-to-end (C-k).
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
+    # ``delete=False`` + name captured BEFORE the write, so a write failure still
+    # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
+    paste_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_path = paste_file.name
+            # Trailing newline absorbs any trailing backslash so it can't escape Enter.
+            paste_file.write(_paste_payload_bytes(content + "\n"))
+        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
+        _run_tmux(
+            socket_path,
+            "paste-buffer",
+            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+            "-d",  # drop the buffer after pasting (no stale copies server-side)
+            "-b",
+            _PASTE_BUFFER,
+            "-t",
+            tmux_target,
+        )
+    finally:
+        if paste_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+    # Wait until the paste is visibly committed to the input box before Enter, so
+    # the submit is not folded into the paste burst (see _submit_and_verify). This
+    # runs for EVERY message — including short ones with no stable needle — so a
+    # paste that never lands in the composer is caught rather than submitted blind
+    # (``_draft_in_input_region`` keys off composer change when the needle is "").
+    needle = _submit_needle(content)
+    # A mid-turn steer (agy already running a turn) is delivered best-effort: agy
+    # queues it as the next turn and may not surface the draft in the composer the
+    # same way an idle turn does, so a non-render is NOT a swallowed message here.
+    # The render hard-fail below is for the idle/sequential case, where a paste
+    # that never lands in the composer (e.g. eaten by an unhooked modal such as
+    # the first-run trust gate) must fail loudly instead of vanishing.
+    mid_turn = _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target)
+    draft_seen = False
+    last_commit_pane = ""
+    commit_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < commit_deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        last_commit_pane = pane or last_commit_pane
+        if _draft_in_input_region(pane, needle, baseline_region):
+            draft_seen = True
+            break
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+    if not draft_seen and not mid_turn:
+        raise RuntimeError(
+            "agy did not render the pasted message in its input box before submit; "
+            f"pane_tail:\n{_format_pane_debug_tail(last_commit_pane)}"
+        )
+    time.sleep(_PASTE_SETTLE_S)
+    _submit_and_verify(
+        socket_path,
+        tmux_target,
+        needle=needle,
+        baseline_region=baseline_region,
+        draft_seen=draft_seen,
+    )
+
+
+def send_interaction_keys_via_tui(
+    bridge_dir: Path,
+    *keys: str,
+) -> None:
+    """
+    Send raw key arguments to the agy TUI pane to answer its in-process prompt.
+
+    The companion to :func:`inject_user_message_via_tui` for the OTHER thing the
+    attended agy TUI maintains in parallel with the RPC step state: its
+    **in-process permission / question prompt**. When agy runs attended (the
+    web/mobile path types every turn into the TUI), an approval surfaces in the
+    Omnigent web UI AND as agy's own numbered TUI prompt ("Do you want to
+    proceed?", 1.Yes … 4.No). Delivering the verdict over
+    :func:`omnigent.antigravity_native_rpc.handle_user_interaction` flips the
+    backend trajectory step to DONE and the command runs, but the **TUI prompt
+    for that interaction can stay open** — and the next typed turn then lands in
+    that stale prompt's filter/amend buffer instead of starting a fresh turn
+    (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
+    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
+    prompt, mirroring cursor-native's
+    :func:`omnigent.cursor_native_bridge.send_cursor_pane_keys`.
+
+    Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
+    selects a numbered option, ``"Enter"`` confirms, ``"Escape"`` cancels — sent
+    in order as ONE ``send-keys`` invocation so the digit and its Enter cannot be
+    reordered or split across the pane's input handling. Keys are interpreted by
+    tmux (no ``-l``), so named keys like ``Enter`` / ``Escape`` work.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param keys: Ordered tmux key arguments, e.g. ``("1", "Enter")`` to approve.
+    :returns: None.
+    :raises RuntimeError: When the tmux target is not advertised, the agy TUI has
+        exited, or the ``send-keys`` invocation fails.
+    """
+    if not keys:
+        raise RuntimeError("antigravity-native TUI selection requires at least one key")
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        raise RuntimeError(
+            "antigravity-native tmux target not advertised (is the agy terminal running?)"
+        )
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "the agy terminal is no longer running (the TUI exited); restart the session"
+        )
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)

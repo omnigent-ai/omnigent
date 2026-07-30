@@ -18,6 +18,7 @@ import httpx
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec import AgentSpec
 
@@ -256,6 +257,11 @@ class RunnerRouter:
                     base_url="http://runner",
                     timeout=httpx.Timeout(5.0, read=None),
                 )
+                # The global httpx instrumentation can't see this client's
+                # custom WSTunnelTransport, so instrument the instance
+                # directly — otherwise server→runner forwards carry no
+                # traceparent and the runner roots a disconnected trace.
+                telemetry.instrument_httpx_client(client)
                 self._clients[runner_id] = client
             return client
 

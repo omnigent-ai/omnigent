@@ -30,6 +30,25 @@ _TOOL_CLASSES: dict[str, tuple[str, str]] = {
 }
 
 
+def _hindsight_available() -> bool:
+    """Return True when the optional ``hindsight-client`` SDK is installed."""
+    import importlib.util
+
+    return importlib.util.find_spec("hindsight_client") is not None
+
+
+# Hindsight memory tools (optional ``hindsight`` extra). Advertised only when
+# the SDK is installed, so the assistant never recommends unusable tools.
+if _hindsight_available():
+    _TOOL_CLASSES.update(
+        {
+            "hindsight_retain": ("omnigent.tools.builtins.hindsight", "HindsightRetainTool"),
+            "hindsight_recall": ("omnigent.tools.builtins.hindsight", "HindsightRecallTool"),
+            "hindsight_reflect": ("omnigent.tools.builtins.hindsight", "HindsightReflectTool"),
+        }
+    )
+
+
 @tool
 def list_builtin_tools() -> str:
     """

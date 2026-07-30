@@ -31,11 +31,13 @@ def upload_client(db_uri: str, tmp_path) -> Iterator[tuple[TestClient, str]]:
     file_store = SqlAlchemyFileStore(db_uri)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent_store.create(
-        agent_id="ag_test",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         name="test-agent",
-        bundle_location="ag_test/bundle",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
     )
-    conv = conversation_store.create_conversation(title="upload session", agent_id="ag_test")
+    conv = conversation_store.create_conversation(
+        title="upload session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
 
     app = FastAPI()
 

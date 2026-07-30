@@ -1,0 +1,29 @@
+node_modules
+dist
+../omnigent/server/static/web-ui
+src/components/ui
+package-lock.json
+
+# Xcode asset catalogs are tool-owned; Prettier fights Xcode's formatting.
+**/*.xcassets/**
+
+# Generated Apple Icon Composer bundles (machine-formatted; prettier fights the tooling)
+**/*.icon/**
+
+# iOS build/tooling artifacts. These are git-ignored via ios/.gitignore, but
+# Prettier doesn't read nested .gitignore files, so they're listed here too:
+# the local Bundler gem install, build output, and fastlane-generated files
+# (README.md regenerates on every run; see ios/RELEASE.md for the real docs).
+ios/vendor/
+ios/build/
+ios/fastlane/README.md
+ios/fastlane/report.xml
+ios/fastlane/Preview.html
+ios/fastlane/test_output/
+
+# Android build/tooling artifacts. Git-ignored via android/.gitignore, but
+# Prettier doesn't read nested .gitignore files, so they're listed here too
+# (Gradle output includes HTML lint reports Prettier would otherwise choke on).
+android/build/
+android/app/build/
+android/.gradle/

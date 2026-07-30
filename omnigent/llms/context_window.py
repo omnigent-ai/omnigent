@@ -54,16 +54,22 @@ _MODEL_PREFIX_TO_PROVIDER: dict[str, str] = {
 
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
-# Curated context windows for the Qwen models the qwen (``qwen --acp``) harness
-# drives. Qwen models are absent from both litellm's bundled registry and the
-# MLflow provider catalog, so without this they fall back to the conservative
-# 128K default — wrong by ~8x for the coding-plan defaults (qwen3-coder-plus is
-# 1M), leaving the UI context meter mis-sized. Keyed by the *normalized* base id
-# (provider prefix and ``:tag`` suffix stripped — see
-# :func:`_qwen_context_window`). Values are the published Alibaba Cloud Model
-# Studio / DashScope maxima; unrecognized qwen models keep the 128K fallback
-# (and a spec's ``executor.context_window`` always overrides this).
-_QWEN_CONTEXT_WINDOWS: dict[str, int] = {
+# Omnigent's authoritative context-window registry, consulted BEFORE litellm
+# and the MLflow catalog (see :func:`get_model_context_window`). The upstream
+# backends mis-size or omit several ids we actually serve, and offline both
+# collapse to the conservative 128K default — so for those models this registry
+# is our single source of truth, not a last-resort fallback. Keyed by the
+# *normalized* base id (provider prefix and OpenRouter ``:tag`` suffix stripped,
+# lowercased; the ``[1m]`` beta marker is PRESERVED so the 1M variant stays
+# distinct from its base — see :func:`_registry_context_window`). A spec's
+# ``executor.context_window`` still overrides everything.
+#
+# Covered today:
+#  - Qwen models (absent from litellm + the MLflow catalog) — published Alibaba
+#    Cloud Model Studio / DashScope maxima.
+#  - Anthropic 1M-context beta ids (the ``[1m]`` suffix) — handled by a rule in
+#    :func:`_registry_context_window` rather than enumerated per base model.
+_CONTEXT_WINDOW_REGISTRY: dict[str, int] = {
     "qwen3-coder-plus": 1_048_576,  # DashScope coding-plan default: 1M tokens
     "qwen3-coder-flash": 1_048_576,  # served flash variant: 1M tokens
     "qwen3-coder": 262_144,  # 480B open weights: 256K native (1M w/ YaRN)
@@ -73,21 +79,43 @@ _QWEN_CONTEXT_WINDOWS: dict[str, int] = {
     "qwen-flash": 1_000_000,
 }
 
+# The Anthropic 1M-context beta encodes its window in the model id via a
+# trailing ``[1m]`` marker (e.g. ``claude-opus-4-8[1m]``). Neither litellm nor
+# the MLflow catalog keys on the bracketed form, so without this it resolves to
+# the 128K default — under-sizing both the context meter and the compaction /
+# overflow threshold by ~8x. The suffix *is* the window, so we read it directly
+# rather than stripping it (the base id may legitimately have a smaller window).
+_ANTHROPIC_1M_BETA_SUFFIX = "[1m]"
+_ANTHROPIC_1M_BETA_WINDOW = 1_000_000
 
-def _qwen_context_window(model: str) -> int | None:
-    """Look up a Qwen model's context window from the curated table.
 
-    Normalizes the id the way model strings reach us — a provider prefix
-    (``qwen/qwen3-coder``, ``openrouter/qwen/qwen3-coder``) and an OpenRouter-
-    style ``:tag`` suffix (``qwen3-coder:free``) — down to the bare base id
-    before matching against :data:`_QWEN_CONTEXT_WINDOWS`.
+def _registry_context_window(model: str) -> int | None:
+    """Resolve a model's context window from Omnigent's authoritative registry.
+
+    Consulted BEFORE litellm and the MLflow catalog. Normalizes the id the way
+    model strings reach us — a provider prefix (``qwen/qwen3-coder``,
+    ``openrouter/qwen/qwen3-coder``) and an OpenRouter-style ``:tag`` suffix
+    (``qwen3-coder:free``) — down to the bare id, lowercased, with the ``[1m]``
+    beta marker preserved.
+
+    Resolution: an exact :data:`_CONTEXT_WINDOW_REGISTRY` entry, then the
+    Anthropic 1M-context beta rule (a trailing ``[1m]`` on a Claude id →
+    1,000,000). The rule is scoped to Claude ids so a custom/self-hosted model
+    that merely happens to end in ``[1m]`` isn't force-sized to 1M.
 
     :param model: The model identifier (any namespacing).
-    :returns: The context window in tokens, or ``None`` when the model isn't a
-        recognized Qwen entry (caller falls back to the 128K default).
+    :returns: The context window in tokens, or ``None`` when the model isn't in
+        our registry (caller falls back to litellm / the catalog / the default).
     """
     bare = model.rsplit("/", 1)[-1].split(":", 1)[0].strip().lower()
-    return _QWEN_CONTEXT_WINDOWS.get(bare)
+    if bare in _CONTEXT_WINDOW_REGISTRY:
+        return _CONTEXT_WINDOW_REGISTRY[bare]
+    # ``[1m]`` is an Anthropic-only beta convention, so gate on Claude ids
+    # (covers ``claude-*`` and ``databricks-claude-*``); other providers fall
+    # through to litellm/catalog rather than being forced to 1M.
+    if "claude" in bare and bare.endswith(_ANTHROPIC_1M_BETA_SUFFIX):
+        return _ANTHROPIC_1M_BETA_WINDOW
+    return None
 
 
 # Fallback cache pricing as a multiple of the plain input rate, used when the
@@ -265,13 +293,17 @@ def get_model_context_window(model: str) -> int:
 
     1. ``AP_CONTEXT_WINDOW_OVERRIDE`` env var — overrides everything.
        Supports custom/self-hosted models and e2e compaction tests.
-    2. ``litellm.get_model_info()`` — fast, local, no network. Also
+    2. :func:`_registry_context_window` — Omnigent's own authoritative
+       registry (Qwen models, Anthropic ``[1m]`` beta). Supersedes the
+       upstream backends, which mis-size or omit these ids and collapse to
+       the 128K default offline.
+    3. ``litellm.get_model_info()`` — fast, local, no network. Also
        tried with the ``databricks/`` prefix for Databricks models.
-    3. MLflow GitHub Release catalog — per-provider JSON fetched from
+    4. MLflow GitHub Release catalog — per-provider JSON fetched from
        ``github.com/mlflow/mlflow/releases``. Covers models not yet
        in litellm's bundled registry, with a family-prefix fallback
        for newly released variants.
-    4. ``_DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
+    5. ``_DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"`` or
         ``"databricks-gpt-5-5"``.
@@ -280,14 +312,17 @@ def get_model_context_window(model: str) -> int:
     override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
     if override is not None:
         return int(override)
+    # Our registry supersedes the upstream backends: litellm and the MLflow
+    # catalog mis-size or omit ids we serve (the Anthropic ``[1m]`` beta resolves
+    # to 128K; Qwen models are absent), and offline both collapse to the 128K
+    # default. Consult ours first.
+    registered = _registry_context_window(model)
+    if registered is not None:
+        return registered
     try:
         import litellm
     except ImportError:
-        return (
-            _fetch_context_window_from_mlflow(model)
-            or _qwen_context_window(model)
-            or _DEFAULT_CONTEXT_WINDOW
-        )
+        return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
     try:
         info = litellm.get_model_info(model)
         if info:
@@ -305,11 +340,7 @@ def get_model_context_window(model: str) -> int:
                     return int(limit)
         except Exception:
             pass
-    return (
-        _fetch_context_window_from_mlflow(model)
-        or _qwen_context_window(model)
-        or _DEFAULT_CONTEXT_WINDOW
-    )
+    return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
 
 
 def resolve_effective_context_window(

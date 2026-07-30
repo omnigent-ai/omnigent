@@ -182,6 +182,63 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert server.process.pid == 4242
 
 
+async def test_start_raises_on_unsupported_version_without_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.0")
+    monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        port=49231,
+        verify_version=True,
+    )
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    with pytest.raises(OpenCodeVersionError):
+        await server.start()
+
+
+async def test_start_skips_version_gate_when_env_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.0")
+    monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", "1")
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        port=49231,
+        verify_version=True,
+    )
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    await server.start()
+    assert server.version == "1.18.0"
+    assert server.process is not None
+
+
 def test_find_opencode_cli_absolute_executable(tmp_path: Path) -> None:
     exe = tmp_path / "opencode"
     exe.write_text("#!/bin/sh\n")
@@ -219,3 +276,32 @@ def test_resolve_opencode_version_unparseable_raises(monkeypatch: pytest.MonkeyP
     )
     with pytest.raises(appsrv.OpenCodeVersionError):
         appsrv.resolve_opencode_version("/x/opencode")
+
+
+def test_list_opencode_cli_model_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    monkeypatch.setattr(appsrv, "find_opencode_cli", lambda _path=None: "/x/opencode")
+
+    captured: dict[str, object] = {}
+
+    def _fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="\x1b[32mopencode-go/glm-5.2\x1b[0m\nopencode-go/kimi-k2.7-code\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(appsrv.subprocess, "run", _fake_run)
+
+    options = appsrv.list_opencode_cli_model_options(
+        env={"XDG_DATA_HOME": "/xdg/data", "XDG_CONFIG_HOME": "/xdg/config"},
+    )
+
+    assert [option["id"] for option in options] == [
+        "opencode-go/glm-5.2",
+        "opencode-go/kimi-k2.7-code",
+    ]
+    assert captured["env"] == {"XDG_DATA_HOME": "/xdg/data", "XDG_CONFIG_HOME": "/xdg/config"}

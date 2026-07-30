@@ -74,7 +74,6 @@ guardrails:
     integrity:
       initial: "1"
       values: ["0", "1"]
-      monotonic: decreasing
   policies:
     taint_web:
       type: function

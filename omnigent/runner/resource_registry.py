@@ -52,8 +52,16 @@ CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
 PI_NATIVE_TERMINAL_ROLE = "pi-native"
 OPENCODE_NATIVE_TERMINAL_ROLE = "opencode-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
+KIRO_NATIVE_TERMINAL_ROLE = "kiro-native"
 GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
+# Role marker for the runner-owned native Antigravity (agy) TUI terminal.
+# A generic terminal launched with ``terminal=antigravity`` shares the same
+# public resource id, so the ensure path uses this private marker to tell a
+# runner-owned agy TUI apart from an arbitrary terminal before reusing it.
+ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
+KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
+HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -295,6 +303,11 @@ class SessionResourceRegistry:
         # lifecycle relationship so the runner can decide whether the owning
         # session should fail.
         self._terminal_exit_publisher: Callable[[TerminalExitEvent], None] | None = None
+        # Strong reference to the fire-and-forget terminal-exit cleanup tasks,
+        # plus an event so loop-side callers can await scheduling/completion
+        # instead of polling. Entries self-remove on completion.
+        self._terminal_exit_tasks: set[asyncio.Task[None]] = set()
+        self._terminal_exit_scheduled: asyncio.Event = asyncio.Event()
 
     def set_terminal_activity_publisher(
         self,
@@ -352,6 +365,18 @@ class SessionResourceRegistry:
         """
         self._terminal_exit_publisher = publisher
 
+    async def wait_for_terminal_exit_cleanup(self) -> None:
+        """Await the scheduled terminal-exit cleanup to completion so its
+        ``session.resource.deleted`` publish is observable without polling.
+
+        Single-shot: the "scheduled" event is never cleared, so this
+        synchronizes on one terminal exit, not a sequence of them.
+        """
+        await self._terminal_exit_scheduled.wait()
+        tasks = list(self._terminal_exit_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+
     def _set_session_status_memo(self, session_id: str, status: str) -> None:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
@@ -373,6 +398,23 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         """
         self._set_session_status_memo(session_id, "running")
+
+    def note_external_session_status(self, session_id: str, status: str) -> None:
+        """Record a terminal-observed external status for exit classification.
+
+        Structured native forwarders can know turn completion more reliably than
+        a PTY diff heuristic. Keep the required-terminal exit memo aligned so a
+        terminal that closes after a forwarded ``idle`` edge is treated as a
+        clean shutdown, while ``running`` / ``waiting`` still classify a later
+        exit as mid-turn.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+        :param status: External native status, e.g. ``"running"`` or ``"idle"``.
+        """
+        if status == "idle":
+            self._set_session_status_memo(session_id, "idle")
+        elif status in {"running", "waiting"}:
+            self._set_session_status_memo(session_id, "running")
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
@@ -964,6 +1006,7 @@ class SessionResourceRegistry:
             # after the paste), so — like pi/claude — the PTY watcher is its only
             # status source. Without this the web "Working…" badge never clears.
             CURSOR_NATIVE_TERMINAL_ROLE,
+            KIRO_NATIVE_TERMINAL_ROLE,
             # goose-native injects then returns (its forwarder only mirrors the
             # transcript, not status), so the PTY watcher is its status source too.
             GOOSE_NATIVE_TERMINAL_ROLE,
@@ -971,6 +1014,14 @@ class SessionResourceRegistry:
             # JSON event transcript, not status), so the PTY watcher is its
             # status source too.
             QWEN_NATIVE_TERMINAL_ROLE,
+            # kimi-native also has no forwarder/hook (the injection run_turn
+            # returns right after the tmux paste), so the PTY watcher is its
+            # only running/idle status source — same as cursor/pi/claude.
+            KIMI_NATIVE_TERMINAL_ROLE,
+            # hermes-native injects then returns (its forwarder only mirrors the
+            # SQLite transcript, not status), so the PTY watcher is its status
+            # source too.
+            HERMES_NATIVE_TERMINAL_ROLE,
         }
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return
@@ -1028,6 +1079,9 @@ class SessionResourceRegistry:
                         instance=instance,
                     )
                 )
+                self._terminal_exit_tasks.add(task)
+                self._terminal_exit_scheduled.set()
+                task.add_done_callback(self._terminal_exit_tasks.discard)
                 task.add_done_callback(_log_terminal_exit_task_result)
 
             try:

@@ -30,7 +30,6 @@ from omnigent.spec import (
     MCPServerConfig,
     Phase,
     PhaseSelector,
-    PolicyAction,
     ToolRuntime,
     ToolsConfig,
 )
@@ -216,7 +215,6 @@ def test_policies_dropped_from_forward_translation(
                 function=FunctionRef(
                     path="tests.spec.test_omnigent_translator.sample_tool_callable"
                 ),
-                action=[PolicyAction.ALLOW],
             ),
         ],
     )

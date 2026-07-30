@@ -1,0 +1,48 @@
+name: kimi-hello
+description: >-
+  Smallest possible Kimi Code agent — single-file launcher YAML that hands
+  every turn to Moonshot AI's Kimi Code CLI (https://github.com/MoonshotAI/Kimi-Code)
+  running headlessly behind the standard Omnigent REPL. Useful as a sanity
+  check that the harness wires up end-to-end on a fresh machine, and as a
+  starting point for a real Kimi-backed agent.
+
+# Single-file launcher shape — matches what ``omnigent run --harness kimi``
+# generates internally. For multi-agent bundles, prefer the directory layout
+# under ``examples/polly/`` / ``examples/debby/``.
+executor:
+  harness: kimi
+  # Override per-invocation via ``-m kimi-k2-turbo`` or ``/model`` in the REPL.
+  # With no model pinned, Kimi picks the default model set in its config.
+  model: kimi-k2-turbo
+
+prompt: |
+  You are Kimi Code, running headlessly inside Omnigent. Help the user with
+  software engineering tasks — read files, edit code, run tests, and explain
+  your reasoning. Keep responses concise and prefer showing the user diffs /
+  commands over describing them in prose.
+
+# Kimi Code is a multi-provider coding agent (Moonshot AI's Kimi models by
+# default; also OpenAI / Anthropic / OpenRouter via its config). Credentials
+# live inside Kimi's own ``kimi login`` flow (OAuth or a Moonshot API key),
+# NOT in Omnigent's provider config — so this spec declares no ``executor.auth``
+# block.
+#
+# To route through a gateway (Databricks AI gateway / vendor-neutral proxy)
+# instead, either set ``HARNESS_KIMI_GATEWAY_BASE_URL`` +
+# ``HARNESS_KIMI_GATEWAY_API_KEY`` in the shell, or declare a
+# ``executor.auth: {type: databricks, profile: …}`` block and let Omnigent
+# resolve the workspace.
+#
+# Kimi owns its own file/shell tools (bash, edit, read, …) and runs them
+# inside its own loop. The harness therefore advertises
+# ``handles_tools_internally=True`` and does NOT need an ``os_env`` block to
+# inject ``sys_os_*`` tools — adding one would just duplicate every operation
+# against Omnigent's dispatch path.
+
+# Try it:
+#   omnigent run examples/kimi_hello.yaml
+#   omnigent run examples/kimi_hello.yaml -p "summarise the README"
+#   omnigent run examples/kimi_hello.yaml -m kimi-k2-turbo
+#
+# Or as a shortcut for any kimi-harness run:
+#   omnigent kimi -p "list the files in the current directory"

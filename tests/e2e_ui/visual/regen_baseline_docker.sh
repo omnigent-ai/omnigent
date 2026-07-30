@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the committed UI-snapshot baseline locally, using Docker.
+# Regenerate the committed UI-snapshot baseline locally using a container runtime.
 #
 # Visual baselines must be rendered in the SAME environment the CI gate uses, or
 # they won't match (fonts/anti-aliasing differ across renderers). This script
@@ -7,8 +7,9 @@
 # in, so the baseline it produces is byte-identical to what CI will compare
 # against -- commit it directly.
 #
-# Only Docker is required (no local Node/Python/uv). It:
-#   1. builds the ap-web SPA in a Node 20 container, then
+# Only a container runtime is required (no local Node/Python/uv).  Set
+# OMNIGENT_CONTAINER_RUNTIME=podman to use Podman instead of Docker.  It:
+#   1. builds the web SPA in a Node 20 container, then
 #   2. compares the whole visual suite in the pinned Playwright image and
 #      rewrites only the baselines that drift (or are missing) -- baselines that
 #      already match are left byte-for-byte untouched, mirroring the label-driven
@@ -19,7 +20,7 @@
 #   tests/e2e_ui/visual/regen_baseline_docker.sh [--skip-build]
 #
 #   --skip-build  Reuse an existing omnigent/server/static/web-ui build (e.g.
-#                 from a prior `cd ap-web && npm run build`) instead of building
+#                 from a prior `cd web && npm run build`) instead of building
 #                 in a container. The bundle is platform-independent, so a host
 #                 build renders the same pixels.
 set -euo pipefail
@@ -47,7 +48,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-command -v docker >/dev/null || { echo "error: docker is required." >&2; exit 1; }
+CONTAINER_RUNTIME="${OMNIGENT_CONTAINER_RUNTIME:-docker}"
+command -v "$CONTAINER_RUNTIME" >/dev/null || { echo "error: $CONTAINER_RUNTIME is required." >&2; exit 1; }
 cd "$(git rev-parse --show-toplevel)"
 
 if [ "$SKIP_BUILD" = true ]; then
@@ -57,8 +59,8 @@ if [ "$SKIP_BUILD" = true ]; then
   }
   echo "Reusing existing SPA build at $BUILD_OUTPUT."
 else
-  echo "Building the ap-web SPA (Node container) ..."
-  docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work/ap-web "$NODE_IMAGE" \
+  echo "Building the web SPA (Node container) ..."
+  "$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work/web "$NODE_IMAGE" \
     bash -c "npm install -g npm@${NPM_VERSION} && npm ci --legacy-peer-deps --no-audit --no-fund && npm run build"
 fi
 
@@ -71,7 +73,7 @@ echo "Rendering + comparing the baselines in the pinned Playwright image ..."
 # below is the real signal. The run "fails" by design on any drift, so `|| true` is
 # expected. UV_PROJECT_ENVIRONMENT lives in the container (not the mounted repo) so
 # no root-owned .venv leaks out.
-docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
+"$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
   -e CI=1 \
   -e GITHUB_ACTIONS=true \
   -e OMNIGENT_PW_NO_SANDBOX=1 \
@@ -85,10 +87,10 @@ docker run --rm --platform "$PLATFORM" -v "$PWD":/work -w /work \
       -p no:rerunfailures --ui-skip-build
   ' || true
 
-# Files Docker wrote are root-owned; hand them back so git add works unprivileged.
-# Includes ap-web (node_modules + build intermediates the Node container wrote).
-docker run --rm --platform "$PLATFORM" -v "$PWD":/work "$PW_IMAGE" \
-  chown -R "$(id -u):$(id -g)" /work/tests/e2e_ui/visual /work/"$BUILD_OUTPUT" /work/ap-web 2>/dev/null || true
+# Files the container wrote are root-owned; hand them back so git add works unprivileged.
+# Includes web (node_modules + build intermediates the Node container wrote).
+"$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work "$PW_IMAGE" \
+  chown -R "$(id -u):$(id -g)" /work/tests/e2e_ui/visual /work/"$BUILD_OUTPUT" /work/web 2>/dev/null || true
 
 echo
 if git diff --quiet -- "$SNAP_ROOT"; then

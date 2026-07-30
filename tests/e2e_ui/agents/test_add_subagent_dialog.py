@@ -35,23 +35,27 @@ _ADD_AGENT_SUBMIT = '[data-testid="add-agent-submit"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 
 
-def _hello_world_agent_id(base_url: str) -> str:
-    """Return the ``hello_world`` built-in agent's id from ``GET /v1/agents``.
+def _picker_hello_world_id(base_url: str, session_id: str) -> str:
+    """Return the ``hello_world`` agent id the Add-agent picker surfaces.
 
-    The picker keys each card on the agent id (``agent-card-<id>``), so the
-    test resolves the id from the catalog rather than guessing the display
-    name (which the SPA prettifies).
+    The picker keys each card on the agent id (``agent-card-<id>``). Its hook
+    (``useAvailableAgents``) lets a newer same-named session upload supersede the
+    ``--agent`` template — and this session is already bound to a session-scoped
+    ``hello_world`` (created after the template), so the picker surfaces THAT
+    copy, not the template. Resolve it from the session's bound agent so the card
+    selector matches what the picker renders (rather than guessing the display
+    name, which the SPA prettifies).
 
     :param base_url: Spawned server base URL.
-    :returns: The ``hello_world`` agent id.
+    :param session_id: The session whose page hosts the dialog; its bound
+        ``hello_world`` is what the picker shows.
+    :returns: The ``hello_world`` agent id the picker renders.
     """
-    resp = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
+    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/agent", timeout=10.0)
     resp.raise_for_status()
-    agents = resp.json().get("data", resp.json())
-    for agent in agents:
-        if agent.get("name") == "hello_world":
-            return str(agent["id"])
-    raise AssertionError(f"hello_world not in agent catalog: {agents}")
+    agent = resp.json()
+    assert agent.get("name") == "hello_world", f"session not bound to hello_world: {agent}"
+    return str(agent["id"])
 
 
 def _child_sessions(base_url: str, session_id: str) -> list[dict]:
@@ -68,7 +72,7 @@ def test_add_subagent_from_dialog(
 ) -> None:
     """Add-agent dialog → pick agent → name → submit → child session is created."""
     base_url, session_id = seeded_session
-    agent_id = _hello_world_agent_id(base_url)
+    agent_id = _picker_hello_world_id(base_url, session_id)
     page.goto(f"{base_url}/c/{session_id}")
 
     # The Add-agent button lives in the Agents rail panel, so open the rail and

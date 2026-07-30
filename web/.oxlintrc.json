@@ -1,0 +1,85 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "react-hooks", "typescript", "import"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "rules": {
+    "react/react-in-jsx-scope": "off",
+    "import/no-unassigned-import": "off",
+    "no-restricted-globals": [
+      "error",
+      {
+        "name": "fetch",
+        "message": "Don't call the bare global fetch(). Use hostFetch (@/lib/host) or authenticatedFetch (@/lib/identity) so requests route through the embed host transport. The only allowed bare fetch() is the choke point in src/lib/host.ts."
+      }
+    ],
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "react-router-dom",
+            "importNames": [
+              "useNavigate",
+              "useParams",
+              "useSearchParams",
+              "useLocation",
+              "Link",
+              "Outlet"
+            ],
+            "message": "Import routing primitives (useNavigate/useParams/useSearchParams/useLocation/Link/Outlet) from @/lib/routing — the routing IoC seam the embed overrides. Route/Routes/BrowserRouter/MemoryRouter are structural and may stay on react-router-dom."
+          },
+          {
+            "name": "react-router",
+            "importNames": [
+              "useNavigate",
+              "useParams",
+              "useSearchParams",
+              "useLocation",
+              "Link",
+              "Outlet"
+            ],
+            "message": "Import routing primitives (useNavigate/useParams/useSearchParams/useLocation/Link/Outlet) from @/lib/routing — the routing IoC seam the embed overrides."
+          }
+        ]
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["src/lib/host.ts", "src/lib/accountsApi.ts"],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
+    },
+    {
+      "files": ["src/lib/routing.tsx"],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    },
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx"],
+      "rules": {
+        "no-restricted-globals": "off",
+        "no-restricted-imports": "off"
+      }
+    },
+    {
+      "files": ["electron/**"],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
+    },
+    {
+      "files": ["sw-src/**"],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
+    }
+  ],
+  "ignorePatterns": ["dist", "node_modules", "src/components/ui", "src/components/ai-elements"]
+}

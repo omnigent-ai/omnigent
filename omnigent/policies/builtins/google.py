@@ -102,9 +102,22 @@ _FILE_ID_ARG_KEYS: tuple[str, ...] = (
     "presentation_id",
 )
 
-# Result keys whose string value is a newly-created file ID.
+# Result keys whose string value is a newly-created file ID. Covers both the
+# raw Google API camelCase (``documentId``) and the snake_case a wrapping MCP
+# may re-emit (``document_id``) — the Databricks Google MCP filters create
+# results down to snake_case fields, so both spellings must be recognized.
 _FILE_RESULT_ID_KEYS: frozenset[str] = frozenset(
-    {"id", "documentId", "spreadsheetId", "presentationId", "fileId"}
+    {
+        "id",
+        "documentId",
+        "spreadsheetId",
+        "presentationId",
+        "fileId",
+        "document_id",
+        "spreadsheet_id",
+        "presentation_id",
+        "file_id",
+    }
 )
 
 # Max recursion depth when scanning a tool-result payload for created IDs.
@@ -161,6 +174,7 @@ _DRIVE_COMMENT_TOOLS: frozenset[str] = frozenset(
 _DRIVE_WRITE_TOOLS: frozenset[str] = frozenset(
     {
         "docs_document_batch_update",
+        "docs_document_edit_section",
         "docs_document_apply_template_styles",
         "drive_file_update",
         "drive_file_delete",
@@ -173,6 +187,29 @@ _DRIVE_WRITE_TOOLS: frozenset[str] = frozenset(
 )
 # Canonical-name prefixes the Drive policy owns (unrecognized → fail closed).
 _DRIVE_OWNED_PREFIXES: tuple[str, ...] = ("docs_", "drive_", "sheets_", "slides_")
+
+# ── Bell-LaPadula "no write-down" constants ────────────────────────────────────
+#
+# Bell-LaPadula is the classic lattice-based *confidentiality* model. Its
+# "*-property" (star property) forbids a **write down**: a subject cleared for a
+# sensitive level must not write to a less-classified object, because that moves
+# classified data into a less-protected place (a leak).
+#
+# We model a simple two-level lattice — *confidential* vs. everything else — from
+# a caller-supplied allowlist of confidential file IDs (``confidential_files``).
+# There is intentionally no dependence on any per-document classification label:
+# the set of confidential documents is declared explicitly, so the policy works
+# on any Drive tenant. Once the session has read a confidential file, its writes
+# are confined to the confidential set (a write elsewhere would be a write-down).
+#
+# Scope: this enforces only the write-down rule. It deliberately does NOT enforce
+# the "simple security property" (no read-up) — the agent must be able to read
+# confidential files for the containment to engage. It is a one-directional
+# write-side guard, not a full multilevel-security kernel.
+
+# Session-state key: has the session read any confidential file this session?
+# Public: it surfaces in the conversation's persisted ``session_state``.
+READ_CONFIDENTIAL_STATE_KEY = "gdrive_read_confidential"
 
 # ── Gmail tool sets ───────────────────────────────────────────────────────────
 
@@ -454,6 +491,11 @@ class _DriveCfg:
     :param write_ids: Normalized file IDs writable regardless of creation.
     :param comment_ids: Normalized file IDs the agent may comment on.
     :param allow_create: Whether new-file creation is permitted.
+    :param confidential_ids: Normalized file IDs that form the confidential
+        compartment. Non-empty enables Bell-LaPadula "no write-down": once the
+        session reads any of these, writes are confined to this set.
+    :param write_down_action: Verdict on a write-down violation — ``"DENY"``
+        (default) or ``"ASK"`` (human approval).
     :param deny_reason: Reason prefix for DENY decisions.
     """
 
@@ -462,7 +504,86 @@ class _DriveCfg:
     write_ids: set[str]
     comment_ids: set[str]
     allow_create: bool
+    confidential_ids: set[str]
+    write_down_action: str
     deny_reason: str
+
+
+def _escalate(cfg: _DriveCfg, reason: str) -> PolicyResponse:
+    """
+    Build the configured write-down escalation response (DENY or ASK).
+
+    :param cfg: Resolved Drive configuration (carries ``write_down_action``).
+    :param reason: Human-readable explanation of the violated rule.
+    :returns: A :class:`PolicyResponse` with the configured verdict.
+    """
+    action = cfg.write_down_action
+    return {"result": action, "reason": f"{cfg.deny_reason} {reason}"}  # type: ignore[typeddict-item]
+
+
+def _read_confidential_update(event: PolicyEvent, cfg: _DriveCfg) -> list[StateUpdateEntry]:
+    """
+    Flag the session as having read a confidential file, if this read is one.
+
+    Inspects the originating read's target file IDs (from ``request_data``) and,
+    when any is in the configured confidential compartment, emits a state-update
+    setting :data:`READ_CONFIDENTIAL_STATE_KEY`. This is the "clearance rises on
+    read" step of Bell-LaPadula, reduced to a single latch (the compartment is
+    two-level: confidential vs. not).
+
+    :param event: A ``tool_result`` event for a Drive read tool.
+    :param cfg: Resolved Drive configuration (holds ``confidential_ids``).
+    :returns: A one-element ``state_updates`` list when a confidential file was
+        read (and the latch isn't already set), else empty.
+    """
+    if not cfg.confidential_ids:
+        return []
+    session_state = event.get("session_state") or {}
+    if session_state.get(READ_CONFIDENTIAL_STATE_KEY):
+        return []  # already latched — nothing to update
+    request_data = event.get("request_data")
+    args = request_data.get("arguments") if isinstance(request_data, dict) else None
+    read_ids = _extract_ids_from_args(args if isinstance(args, dict) else {}, _FILE_ID_ARG_KEYS)
+    if read_ids & cfg.confidential_ids:
+        return [{"key": READ_CONFIDENTIAL_STATE_KEY, "action": "set", "value": True}]
+    return []
+
+
+def _check_no_write_down(
+    target_ids: set[str],
+    event: PolicyEvent,
+    cfg: _DriveCfg,
+) -> PolicyResponse | None:
+    """
+    Apply Bell-LaPadula's "no write-down" rule to a write / comment / create.
+
+    Only meaningful once ``confidential_ids`` is configured. When the session
+    has read a confidential file, a write is allowed only if its target is
+    itself in the confidential compartment; any other target (a less-protected
+    file, or a brand-new one) is a write-down and is DENYed (or ASKed). Returns
+    ``None`` to abstain (session hasn't read confidential material, or the write
+    stays inside the compartment).
+
+    :param target_ids: Normalized target file IDs from the call (empty for a
+        create, which has no pre-existing target).
+    :param event: The ``tool_call`` event.
+    :param cfg: Resolved Drive configuration.
+    :returns: A DENY/ASK :class:`PolicyResponse` on violation, else ``None``.
+    """
+    if not cfg.confidential_ids:
+        return None
+    session_state = event.get("session_state") or {}
+    if not session_state.get(READ_CONFIDENTIAL_STATE_KEY):
+        return None  # no confidential data read yet — no containment
+    # A write stays legal only when every target is inside the compartment.
+    if target_ids and target_ids <= cfg.confidential_ids:
+        return None
+    return _escalate(
+        cfg,
+        "Bell-LaPadula (no write-down): this session has read a confidential "
+        "document, so writes are confined to the confidential set; this target "
+        "is outside it.",
+    )
 
 
 def _decide_drive_tool_call(
@@ -493,6 +614,19 @@ def _decide_drive_tool_call(
             f"{cfg.deny_reason} Read restricted to the configured allowlist; "
             f"this call targets a file outside it (or cannot be scoped)."
         )
+    # Bell-LaPadula "no write-down" runs *before* the access-scope rules on any
+    # tool that emits data into a file: once the session has read confidential
+    # material, a write-down leak is blocked even if the file is otherwise
+    # writable (e.g. one the agent created this session).
+    if cfg.confidential_ids and (
+        canonical in _DRIVE_WRITE_TOOLS
+        or canonical in _DRIVE_COMMENT_TOOLS
+        or canonical in _DRIVE_CREATE_TOOLS
+    ):
+        violation = _check_no_write_down(target_ids, event, cfg)
+        if violation is not None:
+            return violation
+
     if canonical in _DRIVE_CREATE_TOOLS:
         return (
             None
@@ -506,6 +640,11 @@ def _decide_drive_tool_call(
     if canonical in _DRIVE_WRITE_TOOLS:
         if not target_ids:
             return _deny(f"{cfg.deny_reason} Write call carries no identifiable target file.")
+        # ``confidential_files`` is purely a containment declaration: it does NOT
+        # by itself grant write access. Writing to a confidential file still
+        # requires it to be created this session or in ``write_files`` — so a
+        # confidential doc the agent created stays writable (until it reads
+        # another confidential file, which the no-write-down check above gates).
         if target_ids <= (cfg.write_ids | created_ids):
             return None
         extra = " or the configured write allowlist" if cfg.write_ids else ""
@@ -543,6 +682,40 @@ def _record_created_drive(event: PolicyEvent, prefixes: tuple[str, ...]) -> Poli
     return {"result": "ALLOW", "state_updates": updates}
 
 
+def _record_drive_result(
+    event: PolicyEvent, prefixes: tuple[str, ...], cfg: _DriveCfg
+) -> PolicyResponse | None:
+    """
+    Handle a Drive ``tool_result``: track created IDs and confidential reads.
+
+    Merges two independent state effects into one response so both survive:
+
+    - Created-file tracking (:func:`_record_created_drive`) — always on.
+    - Confidential-read latch (:func:`_read_confidential_update`) — only when
+      ``confidential_ids`` is configured; flags the session once it reads a file
+      from the confidential compartment.
+
+    :param event: A ``tool_result`` event.
+    :param prefixes: Server prefixes for canonicalization.
+    :param cfg: Resolved Drive configuration.
+    :returns: ALLOW with the combined ``state_updates``, or ``None`` when there
+        is nothing to record.
+    """
+    created = _record_created_drive(event, prefixes)
+    updates: list[StateUpdateEntry] = list(created["state_updates"]) if created else []
+
+    if cfg.confidential_ids:
+        raw_tool = event.get("target")
+        if isinstance(raw_tool, str) and _canonical_tool_name(raw_tool, prefixes) in (
+            _DRIVE_READ_TOOLS
+        ):
+            updates.extend(_read_confidential_update(event, cfg))
+
+    if not updates:
+        return None
+    return {"result": "ALLOW", "state_updates": updates}
+
+
 def gdrive_policy(
     *,
     read_all: bool = True,
@@ -550,6 +723,8 @@ def gdrive_policy(
     allow_create: bool = False,
     write_files: list[str] | None = None,
     comment_files: list[str] | None = None,
+    confidential_files: list[str] | None = None,
+    write_down_action: str = "DENY",
     tool_prefixes: list[str] | None = None,
     deny_reason: str = "Google Drive operation blocked by policy.",
 ) -> Callable[[PolicyEvent], PolicyResponse | None]:
@@ -566,31 +741,59 @@ def gdrive_policy(
         means none.
     :param comment_files: File IDs / URLs the agent may comment on (in addition
         to files it created). ``None`` means none.
+    :param confidential_files: File IDs / Google URLs that form the confidential
+        compartment. When non-empty, this layers Bell-LaPadula's classic
+        confidentiality rule — the "*-property", i.e. **no write down** — on top
+        of the access rules: once the session reads any file in this set, its
+        writes are confined to the same set. A write to any other file (or a
+        brand-new one) would move confidential data into a less-protected place
+        and is blocked. The compartment is declared explicitly (rather than
+        inferred from a per-document label), so it works on any Drive tenant.
+        ``None`` / empty means the rule is off and the base access policy behaves
+        exactly as before. This enforces only the write-down rule; it does NOT
+        restrict reads (the agent must read a confidential file for the
+        containment to engage) and does NOT by itself grant write access to the
+        listed files — writing to a confidential file still requires it to be
+        created this session or in ``write_files``. Note the latch engages only
+        on reads that target a confidential file *by id*; content-returning
+        reads that don't name a specific file (e.g. ``drive_search``, listing,
+        or exports) can surface confidential text without engaging containment.
+    :param write_down_action: Verdict on a write-down violation — ``"DENY"``
+        (default, hard block) or ``"ASK"`` (human approval). Ignored when
+        ``confidential_files`` is empty.
     :param tool_prefixes: Server prefixes to strip when canonicalizing tool
         names. ``None`` uses the standard + Databricks defaults.
     :param deny_reason: Reason text attached to DENY decisions.
     :returns: A one-argument policy callable.
+    :raises ValueError: If ``write_down_action`` is not ``"DENY"`` or ``"ASK"``.
     """
+    normalized_action = write_down_action.strip().upper()
+    if normalized_action not in {"DENY", "ASK"}:
+        raise ValueError(
+            f"gdrive_policy: write_down_action must be 'DENY' or 'ASK', got {write_down_action!r}"
+        )
     cfg = _DriveCfg(
         read_all=read_all,
         read_ids=_normalize_file_refs(read_files),
         write_ids=_normalize_file_refs(write_files),
         comment_ids=_normalize_file_refs(comment_files),
         allow_create=allow_create,
+        confidential_ids=_normalize_file_refs(confidential_files),
+        write_down_action=normalized_action,
         deny_reason=deny_reason,
     )
     prefixes = _resolve_prefixes(tool_prefixes)
 
     def _evaluate(event: PolicyEvent) -> PolicyResponse | None:
         """
-        Route a Drive event: record created files on results, gate tool calls.
+        Route a Drive event: track created files / confidential reads, gate calls.
 
         :param event: The policy event.
         :returns: A :class:`PolicyResponse`, or ``None`` to abstain.
         """
         phase = event.get("type")
         if phase == "tool_result":
-            return _record_created_drive(event, prefixes)
+            return _record_drive_result(event, prefixes, cfg)
         if phase == "tool_call":
             return _decide_drive_tool_call(event, prefixes, cfg)
         return None
@@ -864,7 +1067,10 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
             "Controls access to Google Drive files, Docs, Sheets, and Slides through "
             "any Google MCP server. Restricts reads to an allowlist and restricts "
             "writes/comments to files the agent created this session plus explicitly "
-            "allowed files."
+            "allowed files. Optionally enforces Bell-LaPadula's 'no write-down' rule "
+            "via a confidential-file compartment: once the session reads a confidential "
+            "file, its writes are confined to that set so classified data can't leak "
+            "into a less-protected file."
         ),
         "params_schema": {
             "type": "object",
@@ -893,6 +1099,21 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "File IDs or URLs the agent may comment on.",
+                },
+                "confidential_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "File IDs or Google URLs forming the confidential "
+                    "compartment. When set, Bell-LaPadula 'no write-down' engages: "
+                    "after the session reads one of these, writes are confined to the "
+                    "set. Empty (default) disables the rule.",
+                },
+                "write_down_action": {
+                    "type": "string",
+                    "enum": ["DENY", "ASK"],
+                    "description": "Verdict on a write-down violation. "
+                    "Ignored unless confidential_files is set.",
+                    "default": "DENY",
                 },
                 "tool_prefixes": {
                     "type": "array",

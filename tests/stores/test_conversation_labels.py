@@ -104,6 +104,32 @@ def test_set_labels_empty_dict_is_noop(
     assert got.labels == {"x": "1"}
 
 
+def test_set_labels_clamps_overlong_value_to_column_width(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Values longer than the column width are clamped at the store
+    chokepoint so no writer can raise ``DataError`` on PostgreSQL.
+
+    SQLite (used here) doesn't enforce ``VARCHAR`` length, so this proves
+    the Python-side clamp in ``_upsert_labels`` — not the DB — does the
+    trimming, which is exactly what protects the Postgres production path.
+    """
+    from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+
+    conv = conversation_store.create_conversation()
+    overlong = "z" * (LABEL_VALUE_MAX_LEN + 50)
+    conversation_store.set_labels(conv.id, {"omnigent.last_task_error_message": overlong})
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    stored = got.labels["omnigent.last_task_error_message"]
+    assert len(stored) == LABEL_VALUE_MAX_LEN
+    # Head preserved (the clamp keeps the front, not a tail or empty string).
+    assert stored == overlong[:LABEL_VALUE_MAX_LEN]
+    # Every label writer (client ``body.labels`` on create, policy writes,
+    # session error labels) funnels through ``_upsert_labels``, so clamping
+    # here is the single guarantee that the column can never overflow.
+
+
 def test_set_labels_many_keys_atomic(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -280,7 +306,7 @@ def test_get_conversation_missing_returns_none(
     """get_conversation on a non-existent ID returns None,
     not a zero-value Conversation. Must not attempt the
     label fetch for a missing parent (no SELECT error)."""
-    got = conversation_store.get_conversation("conv_does_not_exist")
+    got = conversation_store.get_conversation("1d0b12236c77f69f5073a53583de1a3f")
     assert got is None
 
 

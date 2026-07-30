@@ -55,22 +55,30 @@ def upgrade() -> None:
         # SET NULL clears the binding when a host is removed, which keeps
         # the workspace-required check satisfied (host_id -> NULL).
         batch_op.create_index("ix_conversations_host_id", ["host_id"])
-        batch_op.create_foreign_key(
-            "fk_conversations_host_id_hosts",
-            "hosts",
-            ["host_id"],
-            ["host_id"],
-            ondelete="SET NULL",
-        )
+        # MySQL 8.0.16+ forbids a column from appearing in both a CHECK
+        # constraint and a FK referential action. Skip FK creation on MySQL
+        # since migration p1a2b3c4d5e6 removes all FKs anyway.
+        if op.get_bind().dialect.name != "mysql":
+            batch_op.create_foreign_key(
+                "fk_conversations_host_id_hosts",
+                "hosts",
+                ["host_id"],
+                ["host_id"],
+                ondelete="SET NULL",
+            )
 
 
 def downgrade() -> None:
     """Drop the host_id FK + index, then the workspace column and check."""
+    mysql = op.get_bind().dialect.name == "mysql"
     with op.batch_alter_table("conversations") as batch_op:
-        batch_op.drop_constraint(
-            "fk_conversations_host_id_hosts",
-            type_="foreignkey",
-        )
+        # FK was never created on MySQL (skipped in upgrade due to MySQL 8.0.16+
+        # restriction on columns used in both CHECK and FK referential actions).
+        if not mysql:
+            batch_op.drop_constraint(
+                "fk_conversations_host_id_hosts",
+                type_="foreignkey",
+            )
         batch_op.drop_index("ix_conversations_host_id")
         batch_op.drop_constraint(
             "ck_conversations_workspace_required_for_host",

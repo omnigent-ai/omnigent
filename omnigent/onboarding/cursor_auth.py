@@ -27,11 +27,10 @@ there would be mis-consumed by claude-sdk / codex / pi / openai-agents.
 from __future__ import annotations
 
 import importlib.util
-import shutil
 import subprocess
-import sys
 
 from omnigent.errors import OmnigentError
+from omnigent.onboarding.extra_install import extra_install_command
 from omnigent.onboarding.provider_config import load_config, resolve_secret
 
 # The secret-store name (and thus ``keychain:<name>``) under which a Cursor
@@ -40,11 +39,7 @@ CURSOR_SECRET_NAME = "cursor"
 
 # The OPTIONAL pip extra that ships the Cursor SDK (``cursor-sdk``) — not in
 # the default install, so the ``cursor:`` key can be set with no SDK present.
-# Setup surfaces the command verbatim when the extra is missing. Mirrors
-# antigravity's ``ANTIGRAVITY_EXTRA`` / ``ANTIGRAVITY_EXTRA_INSTALL_COMMAND``.
-# The name carries literal brackets — markup-rendered surfaces must escape it.
 CURSOR_EXTRA = "cursor"
-CURSOR_EXTRA_INSTALL_COMMAND = 'pip install "omnigent[cursor]"'
 
 
 def cursor_sdk_installed() -> bool:
@@ -72,20 +67,12 @@ def cursor_sdk_installed() -> bool:
 def cursor_install_command() -> list[str]:
     """Return the argv that installs the ``cursor`` extra into this env.
 
-    Prefers ``uv pip install`` when ``uv`` is on ``PATH``, else this
-    interpreter's own pip (``sys.executable -m pip``) so the package lands in
-    the running install. Carries **no index URL** — pip/uv pick up the user's
-    configured index, so a private proxy is honored without hardcoding one.
-    Mirrors :func:`omnigent.onboarding.antigravity_auth.antigravity_install_command`.
+    Delegates to :func:`~omnigent.onboarding.extra_install.extra_install_command`
+    which detects ``uv tool`` / ``uv`` / ``pip`` installs automatically.
 
-    :returns: The install argv, e.g.
-        ``["uv", "pip", "install", "omnigent[cursor]"]`` or
-        ``[sys.executable, "-m", "pip", "install", "omnigent[cursor]"]``.
+    :returns: The install argv.
     """
-    target = f"omnigent[{CURSOR_EXTRA}]"
-    if shutil.which("uv") is not None:
-        return ["uv", "pip", "install", target]
-    return [sys.executable, "-m", "pip", "install", target]
+    return extra_install_command(CURSOR_EXTRA)
 
 
 def install_cursor_sdk() -> bool:

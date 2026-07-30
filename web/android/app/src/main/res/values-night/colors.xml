@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Brand palette (dark scheme), ported from the iOS DesignTokens dark values. -->
+<resources>
+    <color name="ic_launcher_background">#1E2742</color>
+
+    <color name="brand_background">#1E1927</color>
+    <color name="brand_foreground">#E8ECF0</color>
+    <color name="brand_muted_foreground">#92A4B3</color>
+    <color name="brand_border">#37383B</color>
+    <color name="brand_primary">#E8ECF0</color>
+    <color name="brand_on_primary">#11171C</color>
+    <color name="brand_error">#C8324C</color>
+</resources>

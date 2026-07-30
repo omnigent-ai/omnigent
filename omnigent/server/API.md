@@ -471,7 +471,7 @@ Fields:
     means no override is active and the bound agent's spec model
     applies. Persisted on `conversations.model_override`; set via
     `PATCH /v1/sessions/{id}` (also the path the REPL's `/model`
-    command uses) so the ap-web picker and the TUI stay in sync.
+    command uses) so the web picker and the TUI stay in sync.
 
   cost_control_mode_override (string or null)
     Per-session cost-control switch: `"on"` activates the spec's
@@ -570,7 +570,7 @@ Request parts:
 
 The server stores the bundle, then creates the `conversations` row
 and the session-scoped `agents` row in one database transaction. The
-new agent row has `agents.session_id` set to the new conversation id,
+new agent row has `agents.kind` set to `'session'`,
 and `conversations.agent_id` points at that agent. If the database
 agent write fails, the conversation row rolls back. If multipart or
 bundle parsing fails, no database row is written.
@@ -835,6 +835,11 @@ serves create-bind, resume-bind, and recover-bind: the client starts a
 runner, waits for registration, then PATCHes the session to the new
 runner id. The write replaces any previous value in
 `conversations.runner_id`; no history table is maintained.
+
+### Codex-specific APIs
+
+Codex-native session routes, including the Codex Goal subresource, are
+documented in [codex-API.md](codex-API.md).
 
 ### Post Event
 

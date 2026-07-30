@@ -2009,23 +2009,20 @@ def test_databricks_slash_model_without_profile_leaves_connection_none() -> None
     assert spec.llm.connection is None
 
 
-def test_labels_and_schema_merge_and_monotonic_maps() -> None:
+def test_labels_and_schema_merge() -> None:
     """
     Top-level ``labels:`` (initial values) and ``label_schema:``
-    (values + monotonic) merge into Omnigent'
-    :attr:`GuardrailsSpec.labels` as :class:`LabelDef` entries,
-    and ``monotonic: max`` / ``min`` map to ``increasing`` /
-    ``decreasing``.
+    (values) merge into Omnigent's
+    :attr:`GuardrailsSpec.labels` as :class:`LabelDef` entries.
 
     What breaks if this fails: the workflow runs with the wrong
-    schema — monotonic constraint inverted, initial value lost,
-    or the label missing entirely.
+    schema — initial value lost or the label missing entirely.
     """
     agent_def, raw_yaml = _build_agent_def_with_raw_yaml(
         labels={"confidentiality": "0", "integrity": "1"},
         label_schema={
-            "confidentiality": {"values": ["0", "1"], "monotonic": "max"},
-            "integrity": {"values": ["0", "1"], "monotonic": "min"},
+            "confidentiality": {"values": ["0", "1"]},
+            "integrity": {"values": ["0", "1"]},
         },
     )
     spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
@@ -2035,14 +2032,8 @@ def test_labels_and_schema_merge_and_monotonic_maps() -> None:
     integ = spec.guardrails.labels["integrity"]
     assert conf.initial == "0"
     assert conf.values == ["0", "1"]
-    assert conf.monotonic == "increasing"
     assert integ.initial == "1"
     assert integ.values == ["0", "1"]
-    # ``min`` → ``decreasing`` — the inverse of confidentiality.
-    # If these got swapped or either mapped to None, the
-    # workflow would accept label writes the YAML intended to
-    # forbid, silently widening the trust boundary.
-    assert integ.monotonic == "decreasing"
 
 
 def test_ask_timeout_top_level_propagates_to_guardrails() -> None:
@@ -2188,6 +2179,18 @@ def test_use_responses_absent_omits_key_from_executor_config() -> None:
     }
     spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
     assert "use_responses" not in spec.executor.config
+
+
+def test_malformed_acp_agent_propagates_for_runtime_validation() -> None:
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "harness": "acp:helper",
+        "acp_agent": "not-a-mapping",
+    }
+
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+
+    assert spec.executor.config["acp_agent"] == "not-a-mapping"
 
 
 def test_unknown_policy_type_rejected_with_clear_message() -> None:

@@ -63,7 +63,7 @@ class _TtyPickResult:
     """
     Result from driving the resume picker through a pseudo-terminal.
 
-    :param selected: Selected conversation id, e.g. ``"conv_0001"``,
+    :param selected: Selected conversation id, e.g. ``"c7934759fbb38c6e5bbecc1903d2c011"``,
         or ``None`` when the picker cancelled.
     :param rendered: Plain rendered picker transcript captured from
         the prompt-toolkit output stream.
@@ -670,7 +670,7 @@ def test_last_message_preview_from_entities_skips_meta_messages() -> None:
     """
     items = [
         ConversationItem(
-            id="msg_meta",
+            id="00f7a759442a8656f0cdbc9951cf7c1a",
             type="message",
             status="completed",
             response_id="turn_skill",
@@ -682,7 +682,7 @@ def test_last_message_preview_from_entities_skips_meta_messages() -> None:
             ),
         ),
         ConversationItem(
-            id="msg_visible",
+            id="54abbec68f5c80d43d1ec374c48c730d",
             type="message",
             status="completed",
             response_id="turn_visible",
@@ -769,14 +769,14 @@ def test_pick_conversation_from_store_scopes_by_agent_name(
     conv_store = SqlAlchemyConversationStore(db_uri)
     agent_store = SqlAlchemyAgentStore(db_uri)
     agent_store.create(
-        agent_id="ag_one",
+        agent_id="e9b83f6f16155dc05644581c7041f53b",
         name="agent_one",
-        bundle_location="ag_one/dummy",
+        bundle_location="e9b83f6f16155dc05644581c7041f53b/dummy",
     )
     agent_store.create(
-        agent_id="ag_two",
+        agent_id="92b6ac2f8ecd0752b4c88d4f8b692be1",
         name="agent_two",
-        bundle_location="ag_two/dummy",
+        bundle_location="92b6ac2f8ecd0752b4c88d4f8b692be1/dummy",
     )
     # No conversations are bound to either name, so the scoped list is empty.
     out = io.StringIO()
@@ -802,9 +802,9 @@ def test_pick_conversation_from_store_finds_session_scoped_agent_by_name(
     """Session-scoped agents with no template row remain resumable by name."""
     conv_store = SqlAlchemyConversationStore(db_uri)
     created = conv_store.create_session_with_agent(
-        agent_id="ag_session_resume",
+        agent_id="ca2bab107b2b200f0512ef5285de4dee",
         agent_name="session_scoped_resume_agent",
-        agent_bundle_location="ag_session_resume/dummy",
+        agent_bundle_location="ca2bab107b2b200f0512ef5285de4dee/dummy",
         agent_description=None,
         title="resume me",
     )
@@ -836,7 +836,7 @@ class _BadgeRow:
     silently passing.
     """
 
-    id: str = "conv_test"
+    id: str = "e1f7c651c9f97fac088ea70ef633409d"
     title: str | None = "test"
     created_at: int = 0
     labels: dict[str, str] | None = None
@@ -983,11 +983,11 @@ async def test_cross_agent_picker_selection_returns_id_with_runtime_badge_render
 
     rows = [
         _BadgeRow(
-            id="conv_one",
+            id="dbb8b733fdfaca2c150b42317d3829f6",
             title="claude session",
             labels={"omnigent.wrapper": "claude-code-native-ui"},
         ),
-        _BadgeRow(id="conv_two", title="chat session", labels={}),
+        _BadgeRow(id="f8fb0016d56510e7e6b3ee8618d78415", title="chat session", labels={}),
     ]
     client = _FakeAPClient(rows=rows)
     out = io.StringIO()
@@ -1001,7 +1001,7 @@ async def test_cross_agent_picker_selection_returns_id_with_runtime_badge_render
     assert "[chat]" in rendered
     # The selection routed correctly. If this fails, the picker's
     # index→id mapping in the cross-agent path is off.
-    assert selected == "conv_two"
+    assert selected == "f8fb0016d56510e7e6b3ee8618d78415"
 
 
 async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
@@ -1018,13 +1018,13 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
     rows = [
         _BadgeRow(
-            id="conv_claude_1",
+            id="ad9fa6806e0d3c94166f9b4dafcc1069",
             title="claude one",
             labels={"omnigent.wrapper": "claude-code-native-ui"},
         ),
-        _BadgeRow(id="conv_chat", title="chat one", labels={}),
+        _BadgeRow(id="11dc2163ab84c5afa09348998a2b6690", title="chat one", labels={}),
         _BadgeRow(
-            id="conv_claude_2",
+            id="260b9c4331a54a53fc1d1c5720cb4bc2",
             title="claude two",
             labels={"omnigent.wrapper": "claude-code-native-ui"},
         ),
@@ -1040,16 +1040,16 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
         out=out,
         in_=io.StringIO("2\n"),
     )
-    assert selected == "conv_claude_2"
+    assert selected == "260b9c4331a54a53fc1d1c5720cb4bc2"
     assert client.sessions.last_kwargs == {
         "limit": 200,
         "agent_id": None,
         "order": "desc",
     }
     rendered = out.getvalue()
-    assert "conv_claude_1" in rendered
-    assert "conv_claude_2" in rendered
-    assert "conv_chat" not in rendered
+    assert "ad9fa6806e0d3c94166f9b4dafcc1069" in rendered
+    assert "260b9c4331a54a53fc1d1c5720cb4bc2" in rendered
+    assert "11dc2163ab84c5afa09348998a2b6690" not in rendered
     # No launch state was recorded for these fake rows, so the
     # picker should not render empty workspace placeholders.
     assert "Workspace" not in rendered
@@ -1072,7 +1072,7 @@ def test_render_workspace_cell_no_state_returns_none(
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
-    row = _BadgeRow(id="conv_no_state", labels={"omnigent.wrapper": "x"})
+    row = _BadgeRow(id="fdae2ccf4f08f386de6f9dabb02ddf22", labels={"omnigent.wrapper": "x"})
     cell = _render_workspace_cell(row, current_cwd=tmp_path.resolve())
     assert cell is None
 
@@ -1094,8 +1094,10 @@ def test_render_workspace_cell_matching_cwd_no_flag(
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.chdir(tmp_path)
-    write_launch_state("conv_match", str(tmp_path.resolve()))
-    row = _BadgeRow(id="conv_match", labels={"omnigent.wrapper": "claude-code-native-ui"})
+    write_launch_state("d27bd0e48c10689c10e6ae23e869877a", str(tmp_path.resolve()))
+    row = _BadgeRow(
+        id="d27bd0e48c10689c10e6ae23e869877a", labels={"omnigent.wrapper": "claude-code-native-ui"}
+    )
 
     cell = _render_workspace_cell(row, current_cwd=tmp_path.resolve())
     assert cell is not None
@@ -1127,8 +1129,10 @@ def test_render_workspace_cell_mismatched_cwd_shows_cd_flag(
     recorded.mkdir()
     current = tmp_path / "current"
     current.mkdir()
-    write_launch_state("conv_mismatch", str(recorded.resolve()))
-    row = _BadgeRow(id="conv_mismatch", labels={"omnigent.wrapper": "claude-code-native-ui"})
+    write_launch_state("3d86a9c5a27d38d42e1ff818058816e3", str(recorded.resolve()))
+    row = _BadgeRow(
+        id="3d86a9c5a27d38d42e1ff818058816e3", labels={"omnigent.wrapper": "claude-code-native-ui"}
+    )
 
     cell = _render_workspace_cell(row, current_cwd=current.resolve())
     assert cell is not None
@@ -1164,9 +1168,9 @@ def test_workspace_metadata_appears_in_wrapper_picker_list(
     workspace = tmp_path / "ws-marker"
     workspace.mkdir()
     monkeypatch.chdir(workspace)
-    write_launch_state("conv_ws", str(workspace.resolve()))
+    write_launch_state("3ed07f9b6e6fd72020467ffd0f5dfd80", str(workspace.resolve()))
     row = _BadgeRow(
-        id="conv_ws",
+        id="3ed07f9b6e6fd72020467ffd0f5dfd80",
         title="with ws",
         labels={"omnigent.wrapper": "claude-code-native-ui"},
     )
@@ -1181,7 +1185,7 @@ def test_workspace_metadata_appears_in_wrapper_picker_list(
     )
 
     rendered = out.getvalue()
-    assert selected == "conv_ws"
+    assert selected == "3ed07f9b6e6fd72020467ffd0f5dfd80"
     workspace_text = str(workspace.resolve())
     assert "Workspace" not in rendered
     assert workspace_text in rendered, (
@@ -1189,7 +1193,7 @@ def test_workspace_metadata_appears_in_wrapper_picker_list(
         "either dropped on the way to item rendering or item "
         "rendering regressed."
     )
-    assert rendered.index(workspace_text) < rendered.index("conv_ws"), (
+    assert rendered.index(workspace_text) < rendered.index("3ed07f9b6e6fd72020467ffd0f5dfd80"), (
         f"Workspace metadata should render before the conversation id. Output:\n{rendered!r}"
     )
 
@@ -1212,9 +1216,9 @@ def test_render_workspace_cell_codex_native_uses_codex_state(
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "claude-state"))
     workspace = tmp_path / "codex-workspace"
     workspace.mkdir()
-    write_launch_state("conv_codex_ws", str(workspace.resolve()))
+    write_launch_state("07e373dac8325f8b8821267a54336f42", str(workspace.resolve()))
     row = _BadgeRow(
-        id="conv_codex_ws",
+        id="07e373dac8325f8b8821267a54336f42",
         title="codex ws",
         labels={"omnigent.wrapper": "codex-native-ui"},
     )
@@ -1242,7 +1246,7 @@ def test_workspace_metadata_omits_unrecorded_workspace_segment(
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
     row = _BadgeRow(
-        id="conv_without_ws",
+        id="eadade68b1f6e5f2f5e0c57a00d8d378",
         title="without ws",
         labels={"omnigent.wrapper": "claude-code-native-ui"},
     )
@@ -1257,6 +1261,6 @@ def test_workspace_metadata_omits_unrecorded_workspace_segment(
     )
 
     rendered = out.getvalue()
-    assert selected == "conv_without_ws"
+    assert selected == "eadade68b1f6e5f2f5e0c57a00d8d378"
     assert "Workspace" not in rendered
     assert "—" not in rendered

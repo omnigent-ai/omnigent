@@ -32,8 +32,15 @@ import time
 
 from sqlalchemy import and_, delete, exists, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlAccountToken, SqlUser
+from omnigent.db.db_models import (
+    SqlAccountToken,
+    SqlSessionPermission,
+    SqlUser,
+    current_workspace_id,
+)
+from omnigent.db.enum_codecs import decode_account_token_kind, encode_account_token_kind
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
@@ -61,7 +68,7 @@ def _to_account_token(row: SqlAccountToken) -> AccountToken:
     """Convert a :class:`SqlAccountToken` row to a domain entity."""
     return AccountToken(
         id=row.id,
-        kind=row.kind,
+        kind=decode_account_token_kind(row.kind),
         user_id=row.user_id,
         created_by=row.created_by,
         created_at=row.created_at,
@@ -87,6 +94,15 @@ class SqlAlchemyAccountStore:
         self.storage_location = storage_location
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        # Immediate session: for the last-admin invariant in delete_user,
+        # which must lock the current admin set before counting it. On
+        # SQLite, ``BEGIN IMMEDIATE`` acquires the write lock before the
+        # first read, so a second concurrent delete/demote blocks instead
+        # of reading the same stale admin count. On other dialects this is
+        # a no-op — those paths lock explicitly with ``SELECT ... FOR
+        # UPDATE`` instead (see ``_supports_for_update``).
+        self._session_immediate = make_managed_session_maker(self._engine, immediate=True)
+        self._supports_for_update = self._engine.dialect.name != "sqlite"
 
     # ── User credentials (extends rows in the `users` table) ──────
 
@@ -115,7 +131,7 @@ class SqlAlchemyAccountStore:
         """
         now = int(time.time())
         with self._session() as session:
-            existing = session.get(SqlUser, user_id)
+            existing = session.get(SqlUser, (current_workspace_id(), user_id))
             if existing is not None:
                 raise ValueError(f"user {user_id!r} already exists")
             row = SqlUser(
@@ -138,7 +154,7 @@ class SqlAlchemyAccountStore:
     def get_user(self, user_id: str) -> Account | None:
         """Look up a user by id. Returns ``None`` if missing."""
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
             return _to_account(row) if row is not None else None
 
     def is_admin(self, user_id: str) -> bool:
@@ -151,7 +167,7 @@ class SqlAlchemyAccountStore:
         construction (single source of truth: the column).
         """
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row is not None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
@@ -169,7 +185,14 @@ class SqlAlchemyAccountStore:
         :param is_admin: The flag value to set.
         """
         with self._session() as session:
-            session.execute(update(SqlUser).where(SqlUser.id == user_id).values(is_admin=is_admin))
+            session.execute(
+                update(SqlUser)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
+                .values(is_admin=is_admin)
+            )
 
     def list_users(self) -> list[Account]:
         """Return all users for the admin members page.
@@ -191,21 +214,76 @@ class SqlAlchemyAccountStore:
         Result is unordered; UI sorts.
         """
         with self._session() as session:
-            rows = session.execute(select(SqlUser)).scalars().all()
+            rows = (
+                session.execute(
+                    select(SqlUser).where(SqlUser.workspace_id == current_workspace_id())
+                )
+                .scalars()
+                .all()
+            )
             return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
 
-    def delete_user(self, user_id: str) -> bool:
-        """Delete a user row and cascade their permission grants.
+    def _locked_admin_ids(self, session: Session) -> list[str]:
+        """Return every admin's user id, locked against concurrent change.
 
-        Cascade is via the existing ``ON DELETE CASCADE`` foreign
-        key on ``session_permissions`` (set up by the original
-        permissions migration).
+        Must be called on a session opened via ``self._session_immediate``
+        (SQLite) or ``self._session`` with ``_supports_for_update`` True
+        (other dialects) — see callers. On Postgres this issues
+        ``SELECT ... FOR UPDATE`` on the admin rows, so a second
+        transaction doing the same read blocks until this one commits
+        instead of observing the same stale count. On SQLite the
+        immediate session already holds the write lock, so no per-row
+        clause is needed.
 
-        :returns: ``True`` if a row was deleted, ``False`` otherwise.
+        Excludes ``_HIDDEN_LIST_USERS`` (``"local"``, ``"__public__"``)
+        the same way :meth:`list_users` does — the legacy ``"local"``
+        row can carry ``is_admin=True`` from the pre-accounts backfill,
+        but it's reserved and can't authenticate in accounts mode, so
+        counting it as a real admin would let the actual last admin
+        get deleted believing a usable admin remains.
         """
-        with self._session() as session:
-            result = session.execute(delete(SqlUser).where(SqlUser.id == user_id))
-            return result.rowcount > 0
+        query = select(SqlUser.id).where(
+            SqlUser.workspace_id == current_workspace_id(),
+            SqlUser.is_admin.is_(True),
+            SqlUser.id.not_in(_HIDDEN_LIST_USERS),
+        )
+        if self._supports_for_update:
+            query = query.with_for_update()
+        return list(session.execute(query).scalars().all())
+
+    def delete_user(self, user_id: str) -> bool | None:
+        """Delete a user row and their permission grants, refusing to
+        remove the last admin.
+
+        Explicitly deletes all ``session_permissions`` rows for the user
+        before removing the user row — the DB no longer cascades this.
+        The admin-invariant check and the delete run in the same locked
+        transaction (see :meth:`_locked_admin_ids`), so this is atomic
+        against a concurrent delete of a different admin — unlike a
+        plain read-then-delete, the two can't both observe "an admin
+        remains" and both apply.
+
+        :returns: ``True`` if deleted, ``False`` if refused because
+            ``user_id`` is the last remaining admin, ``None`` if no such
+            user exists.
+        """
+        session_maker = self._session if self._supports_for_update else self._session_immediate
+        with session_maker() as session:
+            target = session.get(SqlUser, (current_workspace_id(), user_id))
+            if target is None:
+                return None
+            if target.is_admin:
+                other_admins = [uid for uid in self._locked_admin_ids(session) if uid != user_id]
+                if not other_admins:
+                    return False
+            session.execute(
+                delete(SqlSessionPermission).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == user_id,
+                )
+            )
+            session.delete(target)
+            return True
 
     def get_password_hash(self, user_id: str) -> str | None:
         """Fetch a user's password hash for verification.
@@ -216,7 +294,7 @@ class SqlAlchemyAccountStore:
         log, return, or store the value elsewhere.
         """
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row.password_hash if row is not None else None
 
     def update_password(self, user_id: str, password_hash: str) -> None:
@@ -228,7 +306,12 @@ class SqlAlchemyAccountStore:
         """
         with self._session() as session:
             session.execute(
-                update(SqlUser).where(SqlUser.id == user_id).values(password_hash=password_hash)
+                update(SqlUser)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
+                .values(password_hash=password_hash)
             )
 
     def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
@@ -240,7 +323,10 @@ class SqlAlchemyAccountStore:
         with self._session() as session:
             session.execute(
                 update(SqlUser)
-                .where(SqlUser.id == user_id)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
                 .values(last_login_at=when_epoch_seconds)
             )
 
@@ -278,7 +364,7 @@ class SqlAlchemyAccountStore:
         with self._session() as session:
             row = SqlAccountToken(
                 id=token_id,
-                kind=kind,
+                kind=encode_account_token_kind(kind),
                 user_id=user_id,
                 created_by=created_by,
                 created_at=created_at,
@@ -310,8 +396,9 @@ class SqlAlchemyAccountStore:
                 update(SqlAccountToken)
                 .where(
                     and_(
+                        SqlAccountToken.workspace_id == current_workspace_id(),
                         SqlAccountToken.id == token_id,
-                        SqlAccountToken.kind == kind,
+                        SqlAccountToken.kind == encode_account_token_kind(kind),
                         SqlAccountToken.redeemed_at.is_(None),
                         SqlAccountToken.expires_at > now_epoch_seconds,
                     )
@@ -320,7 +407,7 @@ class SqlAlchemyAccountStore:
             )
             if result.rowcount == 0:
                 return None
-            row = session.get(SqlAccountToken, token_id)
+            row = session.get(SqlAccountToken, (current_workspace_id(), token_id))
             return _to_account_token(row) if row is not None else None
 
     def purge_expired_tokens(self, now_epoch_seconds: int) -> int:
@@ -335,7 +422,10 @@ class SqlAlchemyAccountStore:
         """
         with self._session() as session:
             result = session.execute(
-                delete(SqlAccountToken).where(SqlAccountToken.expires_at <= now_epoch_seconds)
+                delete(SqlAccountToken).where(
+                    SqlAccountToken.workspace_id == current_workspace_id(),
+                    SqlAccountToken.expires_at <= now_epoch_seconds,
+                )
             )
             return result.rowcount
 
@@ -371,8 +461,9 @@ class SqlAlchemyAccountStore:
                 update(SqlAccountToken)
                 .where(
                     and_(
+                        SqlAccountToken.workspace_id == current_workspace_id(),
                         SqlAccountToken.id == token_id,
-                        SqlAccountToken.kind == "invite",
+                        SqlAccountToken.kind == encode_account_token_kind("invite"),
                         SqlAccountToken.redeemed_at.is_(None),
                         SqlAccountToken.expires_at > now_epoch_seconds,
                     )
@@ -398,7 +489,8 @@ class SqlAlchemyAccountStore:
                 select(
                     exists().where(
                         and_(
-                            SqlAccountToken.kind == "invite",
+                            SqlAccountToken.workspace_id == current_workspace_id(),
+                            SqlAccountToken.kind == encode_account_token_kind("invite"),
                             SqlAccountToken.user_id == email,
                             SqlAccountToken.redeemed_at.is_not(None),
                         )

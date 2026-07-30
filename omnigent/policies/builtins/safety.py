@@ -8,10 +8,18 @@ Python. Each callable follows the :class:`PolicyEvent` →
 
 from __future__ import annotations
 
+import hashlib as _hashlib
+import json as _json
 import re as _re
 from typing import Any
 
-from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
+from omnigent.policies.schema import (
+    PolicyCallable,
+    PolicyEvent,
+    PolicyResponse,
+    request_attachments,
+    request_user_text,
+)
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
@@ -37,6 +45,38 @@ _CURSOR_NATIVE_OS_TOOLS = frozenset({"Shell"})
 # as the Omnigent ``sys_os_*`` tools (``path`` / ``command``), so the
 # previews below resolve without a Pi-specific arg branch.
 _PI_NATIVE_OS_TOOLS = frozenset({"read", "bash", "write", "edit"})
+
+# Hermes Agent tool names surfaced via the ``pre_tool_call`` shell hook
+# (see ``omnigent.inner.hermes_policy_hook``). Hermes uses its own naming
+# convention for file/shell operations.
+_HERMES_OS_TOOLS = frozenset(
+    {"terminal", "execute_code", "read_file", "write_file", "search_files"}
+)
+
+# Goose native tool names. Goose namespaces its built-in "developer" extension
+# tools as ``developer__<tool>``; ``shell`` is the terminal tool and
+# ``write`` / ``edit`` / ``text_editor`` / ``read_image`` / ``tree`` are the file
+# tools (names vary slightly by Goose version, so cover both the split write/edit
+# and the unified text_editor spellings).
+_GOOSE_NATIVE_OS_TOOLS = frozenset(
+    {
+        "developer__shell",
+        "developer__write",
+        "developer__edit",
+        "developer__text_editor",
+        "developer__read_image",
+        "developer__tree",
+    }
+)
+
+# opencode-native permission CATEGORIES (the ``permission`` field of a
+# ``permission.asked`` event, mapped to the policy-event tool name by the SSE
+# forwarder — live-verified against 1.17.7). opencode collapses write/edit/patch
+# into ``edit``; ``bash`` is its shell tool (``ShellID.ToolID``). ``bash`` /
+# ``read`` / ``edit`` overlap the lowercase pi set above, but list them
+# explicitly so opencode coverage does not silently depend on that set, and add
+# the file-search categories (``grep`` / ``glob``) pi lacks.
+_OPENCODE_NATIVE_OS_TOOLS = frozenset({"bash", "edit", "read", "grep", "glob"})
 
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
@@ -79,13 +119,99 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
     return evaluate  # type: ignore[return-value]
 
 
+_LOOP_STATE_KEY = "_policy_loop_recent_hashes"
+
+
+def _args_hash(tool_name: str, arguments: Any) -> str:  # type: ignore[explicit-any]
+    """Deterministic hash of (tool_name, arguments).
+
+    :param tool_name: Tool being called.
+    :param arguments: Arguments dict (or any JSON-serializable value).
+    :returns: SHA-256 hex digest identifying this (tool, args) pair.
+    """
+    blob = _json.dumps({"t": tool_name, "a": arguments}, sort_keys=True, default=str)
+    return _hashlib.sha256(blob.encode()).hexdigest()
+
+
+def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
+    """Factory: detect repeated identical tool calls.
+
+    Tracks recent tool-call hashes in ``session_state`` as a
+    bounded list of SHA-256 hex digests keyed by
+    ``_policy_loop_recent_hashes``.  When the same hash
+    appears *threshold* times within the last *window* calls,
+    returns ASK so the user can break the loop.
+
+    This catches the #1 token-waste pattern — an agent retrying
+    the exact same failing tool call — which
+    ``max_tool_calls_per_session`` cannot detect because it only
+    counts total calls.
+
+    :param window: Number of recent calls to consider.
+        Defaults to ``10``. Clamped to a minimum of ``1``.
+    :param threshold: How many times a call must repeat within
+        *window* to trigger. Defaults to ``3``. Clamped to a
+        minimum of ``1``.
+    :returns: A policy callable that ASKs when a loop is
+        detected.
+    """
+    window = max(1, window)
+    threshold = max(1, threshold)
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate whether the current tool call is a repeated loop.
+
+        :param event: Policy event dict.
+        :returns: ASK if loop detected, ALLOW otherwise.
+        """
+        if event.get("type") != "tool_call":
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+
+        tool_name = data.get("name", "")
+        arguments = data.get("arguments", {})
+        h = _args_hash(tool_name, arguments)
+
+        state = event.get("session_state") or {}
+        recent: list[str] = list(state.get(_LOOP_STATE_KEY) or [])
+
+        recent.append(h)
+        # Trim to sliding window.
+        recent = recent[-window:]
+
+        count = recent.count(h)
+        if count >= threshold:
+            return {
+                "result": "ASK",
+                "reason": (
+                    f"The agent appears stuck in a retry loop — "
+                    f"tool '{tool_name}' called with identical arguments "
+                    f"{count} times in the last {len(recent)} calls."
+                ),
+                "state_updates": [
+                    {"key": _LOOP_STATE_KEY, "action": "set", "value": recent},
+                ],
+            }
+
+        return {
+            "result": "ALLOW",
+            "state_updates": [
+                {"key": _LOOP_STATE_KEY, "action": "set", "value": recent},
+            ],
+        }
+
+    return evaluate  # type: ignore[return-value]
+
+
 # ── OS tool approval ────────────────────────────────────────────────────────
 
 
 def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before any file or shell tool call.
 
-    Covers five tool-name families:
+    Covers six tool-name families:
 
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
@@ -100,6 +226,13 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Pi native tools** (``read``, ``bash``, ``write``, ``edit``)
       — surfaced via the pi ``tool_call`` extension hook. Lowercase
       and distinct from the Claude/Codex casing.
+    - **Hermes Agent tools** (``terminal``, ``execute_code``,
+      ``read_file``, ``write_file``, ``search_files``) — surfaced
+      via the ``pre_tool_call`` shell hook.
+    - **opencode native tools** (``bash``, ``edit``, ``read``,
+      ``grep``, ``glob``) — opencode's permission CATEGORIES, surfaced
+      via the SSE forwarder's ``permission.asked`` → policy-evaluate
+      path. opencode collapses write/edit/patch into ``edit``.
 
     Returns ASK so the user sees an approval prompt before the tool
     executes.
@@ -115,15 +248,23 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         return _ALLOW
     tool = data.get("name", "")
     _all_os_tools = (
-        _SYS_OS_TOOLS | _NATIVE_OS_TOOLS | _CURSOR_NATIVE_OS_TOOLS | _PI_NATIVE_OS_TOOLS
+        _SYS_OS_TOOLS
+        | _NATIVE_OS_TOOLS
+        | _CURSOR_NATIVE_OS_TOOLS
+        | _PI_NATIVE_OS_TOOLS
+        | _HERMES_OS_TOOLS
+        | _GOOSE_NATIVE_OS_TOOLS
+        | _OPENCODE_NATIVE_OS_TOOLS
     )
     if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash", "bash", "Shell"):
+        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"):
             preview = args.get("command", "") if isinstance(args, dict) else ""
-        elif tool in ("Grep", "Glob"):
+        elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
+        elif tool == "execute_code":
+            preview = args.get("code", "")[:80] if isinstance(args, dict) else ""
         else:
             # Omnigent tools use ``path``; Claude native tools use ``file_path``.
             preview = (
@@ -255,8 +396,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
         # user message ``"/<name> <args>"`` and evaluates it at the
         # REQUEST phase.  Match ``/<blocked-name>`` at the start.
         if event_type == "request":
-            data = event.get("data")
-            text = data if isinstance(data, str) else ""
+            text = request_user_text(event.get("data"))
             if text.startswith("/"):
                 # Extract the command name: first token after "/".
                 # ``split(None, ...)`` drops empty tokens, so a bare "/"
@@ -455,19 +595,18 @@ def deny_pii_in_llm_request(
         event_type = event.get("type")
 
         if event_type == "request":
-            # REQUEST phase: ``data`` is the user message string.
-            text = event.get("data")
-            if isinstance(text, str):
-                return _scan_text(text)
-            # Content-block list (multimodal input).
-            if isinstance(text, list):
-                for block in text:
-                    if isinstance(block, dict):
-                        t = block.get("text", "")
-                        if isinstance(t, str):
-                            result = _scan_text(t)
-                            if result is not _ALLOW:
-                                return result
+            # REQUEST phase: scan the typed message plus each text attachment.
+            # ``data`` is {"user_content", "attachments"} from the input gate.
+            data = event.get("data")
+            result = _scan_text(request_user_text(data))
+            if result is not _ALLOW:
+                return result
+            for attachment in request_attachments(data):
+                att_text = attachment.get("text", "")
+                if isinstance(att_text, str) and att_text:
+                    result = _scan_text(att_text)
+                    if result is not _ALLOW:
+                        return result
             return _ALLOW
 
         if event_type == "llm_request":
@@ -526,12 +665,39 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         },
     },
     {
+        "handler": "omnigent.policies.builtins.safety.detect_loop",
+        "kind": "factory",
+        "name": "Detect Tool Call Retry Loops",
+        "description": "Detects when the agent is stuck retrying the same tool call with "
+        "identical arguments. ASKs for user approval when the same (tool, args) "
+        "repeats N times within a sliding window of recent calls",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "window": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of recent tool calls to consider",
+                    "default": 10,
+                },
+                "threshold": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of identical repeats within the window to trigger",
+                    "default": 3,
+                },
+            },
+        },
+    },
+    {
         "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
         "kind": "callable",
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
         "covers Omnigent sys_os_* tools, Claude Code native tools "
-        "(Bash, Read, Write, Edit, Glob, Grep), and Codex native tools",
+        "(Bash, Read, Write, Edit, Glob, Grep), Codex native tools, "
+        "opencode native tools (bash, edit, read, grep, glob), "
+        "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
         "params_schema": None,
     },
     {

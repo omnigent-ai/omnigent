@@ -81,8 +81,10 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 
 # Cursor's auto model-select, used when a spec pins no cursor model (the SDK
 # requires a model for local agents, so unlike the old ACP path we can't pass
-# ``None``).
-_DEFAULT_CURSOR_MODEL = "auto"
+# ``None``). The SDK renamed the id from ``auto`` to ``auto-smart``; keep
+# mapping the legacy id for specs/env that still say ``auto``.
+_DEFAULT_CURSOR_MODEL = "auto-smart"
+_LEGACY_AUTO_MODEL = "auto"
 
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
@@ -98,10 +100,11 @@ _HOOK_APPROVAL_TIMEOUT_S = 86400
 def _resolve_model(model: str | None) -> str:
     """Resolve the cursor model id, dropping ids cursor can't honor.
 
-    cursor-sdk accepts only Cursor model ids (``auto``, ``gpt-5``,
+    cursor-sdk accepts only Cursor model ids (``auto-smart``, ``gpt-5``,
     ``composer-2.5``, ...), so a gateway-routed model id (carried by a spec
     authored for another harness) falls back to cursor's auto-select. ``None``
-    likewise resolves to ``auto`` (the SDK requires a model).
+    likewise resolves to :data:`_DEFAULT_CURSOR_MODEL` (the SDK requires a model).
+    The legacy ``auto`` id is remapped to ``auto-smart``.
     """
     if not model or model.startswith(("databricks-", "databricks/")):
         if model:
@@ -114,6 +117,8 @@ def _resolve_model(model: str | None) -> str:
                 model,
                 _DEFAULT_CURSOR_MODEL,
             )
+        return _DEFAULT_CURSOR_MODEL
+    if model == _LEGACY_AUTO_MODEL:
         return _DEFAULT_CURSOR_MODEL
     return model
 
@@ -161,6 +166,16 @@ def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
             if val is not None:
                 usage[dst] = val
                 break
+    # cursor's inputTokens is INCLUSIVE of cache read + write. compute_llm_cost
+    # expects input_tokens to be the NON-cached portion and prices the cache
+    # buckets additively, so subtract the cached tokens here — otherwise they
+    # are billed twice (once at the full input rate, once at their cache rate).
+    # Mirrors the qwen / antigravity executors. Clamp so a malformed cached >
+    # input never goes negative. total_tokens keeps the reported inclusive total.
+    cached = (usage.get("cache_read_input_tokens") or 0) + (
+        usage.get("cache_creation_input_tokens") or 0
+    )
+    usage["input_tokens"] = max(0, in_tok - cached)
     return usage
 
 
@@ -406,15 +421,14 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
     hooks_dir.mkdir(parents=True, exist_ok=True)
     hooks_file = hooks_dir / "hooks.json"
 
-    # Write a wrapper script that sets env vars and execs the hook.
+    # Write a wrapper script that sets env vars and execs the hook. It bakes a
+    # one-shot auth token + workspace-routing header, so it is owner-only
+    # (0o700) — the secret is never world-readable.
+    from omnigent.native_policy_hook import policy_hook_wrapper_script
+
     wrapper = hooks_dir / "omnigent-hook.sh"
-    wrapper.write_text(
-        f"#!/bin/sh\n"
-        f"export _OMNIGENT_SERVER_URL='{server_url}'\n"
-        f"export _OMNIGENT_SESSION_ID='{session_id}'\n"
-        f"exec '{sys.executable}' '{hook_script_path}'\n"
-    )
-    wrapper.chmod(0o755)
+    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
+    wrapper.chmod(0o700)
     command = str(wrapper)
     config = {
         "version": 1,
@@ -429,6 +443,42 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
     }
     hooks_file.write_text(json.dumps(config, indent=2))
     return hooks_file
+
+
+_BRIDGE_SPAWN_CWD_LOCK: asyncio.Lock | None = None
+
+
+def _bridge_spawn_cwd_lock() -> asyncio.Lock:
+    """Process-global lock serialising the cwd change around a bridge spawn.
+
+    Created lazily so it binds to the running event loop.
+    """
+    global _BRIDGE_SPAWN_CWD_LOCK
+    if _BRIDGE_SPAWN_CWD_LOCK is None:
+        _BRIDGE_SPAWN_CWD_LOCK = asyncio.Lock()
+    return _BRIDGE_SPAWN_CWD_LOCK
+
+
+@contextlib.asynccontextmanager
+async def _bridge_spawn_in_cwd(cwd: str) -> AsyncIterator[None]:
+    """Set the process cwd to *cwd* across a cursor-sdk bridge launch.
+
+    ``AsyncClient.launch_bridge`` spawns the bridge subprocess without a
+    ``cwd=`` argument, so the bridge -- and the shell tools Cursor runs inside
+    it -- inherit the launching process's directory. ``--workspace`` only routes
+    indexing, not command execution, so a bridge started from the runner
+    daemon's directory would run ``pwd`` / git / relative paths there rather than
+    in the declared workspace. We chdir only across the spawn and restore
+    afterwards; a process-global lock serialises the window so an overlapping
+    launch can't observe a half-applied cwd.
+    """
+    async with _bridge_spawn_cwd_lock():
+        prev_cwd = os.getcwd()
+        os.chdir(cwd)
+        try:
+            yield
+        finally:
+            os.chdir(prev_cwd)
 
 
 @dataclass
@@ -457,6 +507,7 @@ class CursorExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        permission_mode: str = "auto",
     ) -> None:
         """Create a CursorExecutor.
 
@@ -465,12 +516,17 @@ class CursorExecutor(Executor):
         :param os_env: Optional OS environment / sandbox spec (its ``cwd`` is
             used when *cwd* is unset).
         :param model: Cursor model id (e.g. ``"gpt-5"``); a gateway-routed id
-            or ``None`` falls back to cursor's ``auto`` select.
+            or ``None`` falls back to cursor's ``auto-smart`` select. Legacy
+            ``"auto"`` is remapped to ``auto-smart``.
         :param api_key: Cursor API key. ``None`` falls back to ``CURSOR_API_KEY``
             in the environment.
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
         :param agent_name: Optional agent name passed to the SDK.
         :param skills_filter: Accepted for parity; cursor has no skill mechanism here.
+        :param permission_mode: Omnigent permission stance. ``"auto"`` (default)
+            and ``"bypassPermissions"`` skip web-UI elicitation for native
+            tools (policy DENY still blocks). Any other value keeps the
+            interactive per-tool approval card.
         """
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
@@ -479,6 +535,7 @@ class CursorExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._permission_mode = permission_mode or "auto"
         self._session_states: dict[str, _CursorSessionState] = {}
         # Installed by the runtime adapter; routes a bridged-tool call back into
         # Omnigent's session (policy gating, sub-agent dispatch, logging).
@@ -537,10 +594,12 @@ class CursorExecutor(Executor):
            ``POLICY_ACTION_DENY``, block immediately without prompting the
            user (the admin already decided).
 
-        2. **Native elicitation**: for any other outcome (ALLOW, ASK, or no
-           evaluator wired), invoke ``_elicitation_handler`` so the user can
-           review the call and approve or abort the remainder of the turn
-           from the web-UI approval card.
+        2. **Native elicitation**: for interactive permission modes, invoke
+           ``_elicitation_handler`` so the user can review the call from the
+           web-UI approval card. Under ``auto`` / ``bypassPermissions``
+           (the default for headless / Polly workers) this step is skipped
+           so native tools don't stall on ApprovalCards — matching
+           claude-sdk's ``permission_mode: auto`` ergonomics.
 
         Cursor native tools execute inside the Cursor process, so they have
         already started by the time the executor observes
@@ -558,8 +617,11 @@ class CursorExecutor(Executor):
                     "reason": getattr(verdict, "reason", "") or "blocked by policy",
                 }
 
-        # Stage 2 — native elicitation: surface an approval card so the
-        # user can decide whether the rest of the turn should continue.
+        # Stage 2 — native elicitation: skip under auto / bypass so headless
+        # Cursor SDK workers (and Polly dispatches) don't prompt per tool.
+        if self._permission_mode in ("auto", "bypassPermissions"):
+            return {"block": False, "reason": ""}
+
         handler = self._elicitation_handler
         if handler is not None:
             logger.info("surfacing elicitation for native cursor tool %s", name)
@@ -661,9 +723,12 @@ class CursorExecutor(Executor):
         try:
             from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
         except ImportError as exc:
+            from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
+            from omnigent.onboarding.extra_install import extra_install_display
+
             raise ImportError(
                 "CursorExecutor requires the 'cursor-sdk' package. "
-                "Install it with: uv pip install cursor-sdk"
+                f"Install it with: {extra_install_display(CURSOR_EXTRA)}"
             ) from exc
 
         loop = asyncio.get_running_loop()
@@ -681,7 +746,12 @@ class CursorExecutor(Executor):
             hook_script = str(Path(__file__).with_name("cursor_policy_hook.py"))
             state.hooks_file = _write_cursor_hooks(cwd, hook_script, server_url, conv_id)
 
-        client = await AsyncClient.launch_bridge(workspace=cwd)
+        # Spawn the bridge with the process cwd pointing at the workspace so
+        # Cursor's shell tools execute there, not in the runner daemon's
+        # directory (the SDK spawns the bridge without a cwd=). See
+        # _bridge_spawn_in_cwd.
+        async with _bridge_spawn_in_cwd(cwd):
+            client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
             local_kwargs: dict[str, Any] = {
                 "cwd": cwd,

@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest_asyncio
 
-from omnigent.db.utils import generate_agent_id
+from omnigent.db.utils import builtin_agent_id, generate_agent_id
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 
 
@@ -63,3 +63,27 @@ async def test_list_builtin_agents_response_shape(
         assert "id" in agent
         assert "name" in agent
         assert "created_at" in agent
+
+
+async def test_builtin_flag_distinguishes_seeded_from_registered(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``builtin`` is True only for a server-seeded agent (deterministic,
+    name-derived id); an operator/user-registered template (random id)
+    reports False. The Web UI picker keys its supersession policy on this:
+    a same-named upload may shadow a registered template but never a seeded
+    built-in.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    seeded_id = builtin_agent_id("polly")
+    agent_store.create(seeded_id, name="polly", bundle_location="test:///polly")
+    registered_id = generate_agent_id()
+    agent_store.create(registered_id, name="my-agent", bundle_location="test:///mine")
+
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200
+    by_id = {a["id"]: a for a in resp.json()["data"]}
+    assert by_id[seeded_id]["builtin"] is True
+    assert by_id[registered_id]["builtin"] is False

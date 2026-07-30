@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from omnigent.server.smart_routing import RoutingClient
     from omnigent.spec.types import LLMConfig, PolicySpec
 
 
@@ -26,10 +27,13 @@ class RuntimeCaps:
         default. This is a runtime security policy — agents cannot
         opt out. The agent spec controls ``container_image``
         (what container to use) and ``container_runtime`` (docker
-        or podman). Note: ``container_runtime`` determines which
-        binary is invoked via subprocess — it is validated to a
-        fixed allowlist (``"docker"`` | ``"podman"``) at both
-        the dataclass and parser layers.
+        or podman).  The runtime can also be set globally via the
+        ``OMNIGENT_CONTAINER_RUNTIME`` environment variable; the
+        per-agent ``container_runtime`` key takes precedence.
+        Note: ``container_runtime`` determines which binary is
+        invoked via subprocess — it is validated to a fixed
+        allowlist (``"docker"`` | ``"podman"``) at both the
+        dataclass and parser layers.
     :param default_policies: Server-wide policies appended after
         per-agent policies on every session. Loaded from the
         ``policies:`` key in the server ``--config`` YAML
@@ -69,3 +73,8 @@ class RuntimeCaps:
     # propagate the caller's auth token instead of using static
     # server-level credentials.
     policy_llm_connection_factory: Callable[[], dict[str, str] | None] | None = None
+    # Pluggable model routing client.  The default LLMRoutingClient
+    # uses the server-level ``llm:`` config to call a lightweight judge.
+    # Managed deployments can supply a different implementation (e.g.
+    # a rules engine or remote service).  ``None`` disables routing.
+    routing_client: RoutingClient | None = None

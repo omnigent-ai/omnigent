@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from omnigent.onboarding import providers as _providers_mod
 from omnigent.onboarding.providers import (
     ModelInfo,
     ProviderConfig,
@@ -11,6 +14,79 @@ from omnigent.onboarding.providers import (
     get_models,
     get_provider_config,
 )
+
+# Minimal catalog fixture that mirrors the real MLflow JSON schema.
+# Keyed by provider name; each value is what _fetch_provider_catalog returns
+# (the full parsed dict with a "models" key).
+_FAKE_CATALOG: dict[str, dict] = {
+    "anthropic": {
+        "models": {
+            "claude-opus-4-8": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 200000, "max_output": 32000},
+            },
+            "claude-sonnet-4-6": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 200000, "max_output": 8192},
+            },
+            "claude-haiku-4-5": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 200000, "max_output": 8192},
+            },
+            "claude-3-embedding": {
+                "mode": "embedding",
+                "capabilities": {},
+            },
+        }
+    },
+    "openai": {
+        "models": {
+            "gpt-5.5-audio-preview-2026-06-01": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 128000, "max_output": 16384},
+            },
+            "gpt-5.5": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 128000, "max_output": 16384},
+            },
+            "gpt-4.1": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 128000, "max_output": 16384},
+            },
+            "gpt-3.5-turbo": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 16385, "max_output": 4096},
+            },
+        }
+    },
+    "gemini": {
+        "models": {
+            "gemini/gemini-2.5-flash": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 1000000, "max_output": 8192},
+            },
+        }
+    },
+}
+
+
+@pytest.fixture(autouse=True)
+def mock_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch _fetch_provider_catalog to return fixture data without network calls."""
+    monkeypatch.setattr(
+        _providers_mod,
+        "_fetch_provider_catalog",
+        lambda provider: _FAKE_CATALOG.get(provider, {}),
+    )
+
 
 # ── get_all_providers ──────────────────────────────────────
 
@@ -117,6 +193,27 @@ def test_get_chat_models_sorted_newest_first() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("provider-gpt-5-6", 5.6),
+        ("provider-claude-opus-4-8", 4.8),
+        ("provider/llama-3.1-instruct", 3.1),
+        ("o3", 3.0),
+        ("provider-gpt-audio-2025-12-15", 0.0),
+        ("provider-gpt-oss-120b", 0.0),
+        ("provider-qwen35-122b", 0.0),
+    ],
+)
+def test_extract_model_version_ignores_dates_sizes_and_unknown_families(
+    name: str, expected: float
+) -> None:
+    """Only vendor version tokens influence newest-first ordering."""
+    from omnigent.onboarding.providers import _extract_model_version
+
+    assert _extract_model_version(name) == expected
+
+
 # ── default_chat_model ─────────────────────────────────────
 
 
@@ -175,6 +272,26 @@ def test_default_chat_model_dynamic_skips_specialty_variants() -> None:
     # dynamic rule's exclusion genuinely changes the result.
     assert general[0] != get_chat_models("openai")[0].name
     assert general[0].startswith("gpt-")
+
+
+def test_default_chat_model_limits_dynamic_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callers can constrain dynamic defaults before policy selection."""
+    models = [
+        ModelInfo(name="gpt-audio-new", provider="vendor", mode="chat"),
+        ModelInfo(name="gpt-new", provider="vendor", mode="chat"),
+        ModelInfo(name="gpt-compatible", provider="vendor", mode="chat"),
+    ]
+    monkeypatch.setattr(_providers_mod, "get_chat_models", lambda _provider: models)
+
+    assert (
+        default_chat_model(
+            "vendor",
+            allowed_models={"gpt-audio-new", "gpt-compatible"},
+        )
+        == "gpt-compatible"
+    )
 
 
 def test_default_chat_model_unknown_provider_is_none() -> None:

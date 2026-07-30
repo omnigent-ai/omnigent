@@ -51,7 +51,7 @@ jobs:
       pull-requests: read   # resolve the PR head SHA
     steps:
       - name: Download recorded PR number
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');
@@ -134,12 +134,12 @@ jobs:
           # `labeled` trigger is in-progress/green and skipped -- no double-run.
           WORKFLOWS=(
             "Lint" "CI" "E2E Tests" "E2E UI Tests" "Integration Tests"
-            "ap-web Tests" "Polly AI Review"
+            "web Tests" "Polly AI Review"
           )
 
           for wf in "${WORKFLOWS[@]}"; do
             # Reset per iteration: `read` leaves these UNTOUCHED on EOF (a
-            # workflow with no run for this SHA -- e.g. path-filtered ap-web
+            # workflow with no run for this SHA -- e.g. path-filtered web
             # Tests), which would otherwise carry over the previous workflow's
             # run id/conclusion and re-run the wrong run.
             id=""; conclusion=""

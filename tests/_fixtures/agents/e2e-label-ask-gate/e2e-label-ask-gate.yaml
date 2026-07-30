@@ -17,7 +17,6 @@ labels:
 label_schema:
   tainted:
     values: ["0", "1"]
-    monotonic: max
 
 policies:
   taint_on_banana:

@@ -12,9 +12,7 @@ labels:
 label_schema:
   integrity:
     values: ["0", "1"]
-    monotonic: min
   confidentiality:
     values: ["0", "1"]
-    monotonic: max
 
 ask_timeout: 30

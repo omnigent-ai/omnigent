@@ -428,37 +428,121 @@ def test_pre_tool_use_fails_closed_when_verdict_unavailable(
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "ls"},
-            "tool_output": "ok",
-        },
-        {"hook_event_name": "UserPromptSubmit", "prompt": "hello"},
-    ],
-)
-def test_non_tool_call_phases_fail_open_on_error(
+def test_user_prompt_submit_fails_closed_on_error(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    payload: dict[str, object],
 ) -> None:
     """
-    Off the tool-call gate, an unobtainable verdict stays fail-open.
+    A governed UserPromptSubmit blocks when no usable verdict is returned.
 
-    PostToolUse runs after the tool executed and the request gate is
-    advisory, so neither denies on a transport error — mirroring the
-    runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    The request gate is the sole pre-turn enforcement point for native
+    sessions — a server outage must not let a blocked request proceed.
     """
     write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
+
+    payload: dict[str, object] = {"hook_event_name": "UserPromptSubmit", "prompt": "hello"}
+    exit_code = _run_hook(bridge_dir, payload, monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["decision"] == "block"
+    assert result["reason"]
+
+
+def test_post_tool_use_fails_open_on_error(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    PostToolUse fails OPEN on a transport error — the tool already ran.
+
+    Mirroring the runner-side ``FAIL_CLOSED_PHASES``.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
+    payload: dict[str, object] = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+        "tool_output": "ok",
+    }
 
     exit_code = _run_hook(bridge_dir, payload, monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out == ""
+
+
+def test_pre_tool_use_uses_relay_when_tool_relay_json_has_session_id(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Hook POSTs to relay /policies/evaluate when tool_relay.json has session_id."""
+    from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+
+    relay_token = "relay-tok-abc"
+    relay_url = "http://127.0.0.1:19999"
+    (bridge_dir / _TOOL_RELAY_FILE).write_text(
+        json.dumps({"url": relay_url, "token": relay_token, "session_id": "conv_active"})
+    )
+    _DenyHttpxClient.captured = {}
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    assert exit_code == 0
+    # Route is relay, not direct server.
+    assert _DenyHttpxClient.captured["url"] == f"{relay_url}/policies/evaluate"
+    # Auth is relay token, not a server bearer.
+    assert _DenyHttpxClient.captured["headers"] == {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {relay_token}",
+    }
+    # Verdict still applied.
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_id(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Hook falls back to policy_hook.json when tool_relay.json has no session_id."""
+    from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+
+    # Relay present but no session_id — not policy-capable.
+    (bridge_dir / _TOOL_RELAY_FILE).write_text(
+        json.dumps({"url": "http://127.0.0.1:19999", "token": "tok"})
+    )
+    write_policy_hook_config(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer direct-token"},
+    )
+    _DenyHttpxClient.captured = {}
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
+
+    _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}},
+        monkeypatch,
+    )
+
+    # Falls back to direct server URL.
+    assert _DenyHttpxClient.captured["url"] == (
+        "http://127.0.0.1:8787/v1/sessions/conv_active/policies/evaluate"
+    )
+    assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}

@@ -48,13 +48,15 @@ from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 from urllib.parse import urlparse as _urlparse
 
+from omnigent import model_catalog
+from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -738,36 +740,59 @@ def _build_models_json(
     """
     h = host.rstrip("/")
     serving_endpoints_url = f"{h}/serving-endpoints"
+    codex_gateway_url = f"{h}/ai-gateway/codex/v1"
+    mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
     # ucode's ``openai`` gateway is the Codex Responses gateway
     # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
     # ``/chat/completions`` POST. Re-route only that case to serving-endpoints;
-    # generic providers (no ``/ai-gateway/codex``) pass through. Gemini rides
-    # this path via databricks-completions since pi can't speak generateContent.
+    # generic providers (no ``/ai-gateway/codex``) pass through.
     if raw_openai_base_url and "/ai-gateway/codex" in raw_openai_base_url:
         openai_base_url = serving_endpoints_url
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
+    # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
+    # /ai-gateway/* paths don't exist — use the generic base URL for all paths.
+    is_generic_provider = bool(raw_openai_base_url and "/ai-gateway/" not in raw_openai_base_url)
+    if is_generic_provider:
+        codex_gateway_url = openai_base_url
+        mlflow_gateway_url = openai_base_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
+    _openai_responses_compat: dict[str, Any] = {  # type: ignore[explicit-any]
+        "supportsDeveloperRole": False,
+        "supportsStore": False,
+        "supportsStrictMode": False,
+        "supportsReasoningEffort": False,
+    }
     config: dict[str, Any] = {  # type: ignore[explicit-any]  # Pi-owned schema, see note above
         "providers": {
-            # GPT models → OpenAI Chat Completions API.
-            # We use completions (not responses) because the Databricks
-            # Responses API rejects tool-result chaining on subsequent turns.
-            # The ``compat`` settings ensure Pi uses ``system`` role (not
-            # ``developer``) and avoids other OpenAI-specific features that
-            # Databricks doesn't support.
+            # Newer GPT models (gpt-5-5, gpt-5-6-*, gpt-5-3-codex) → OpenAI
+            # Responses API at the AI Gateway. These models reject function
+            # tools via /chat/completions but work via /responses. The Responses
+            # API now supports tool-result chaining on subsequent turns.
+            "databricks-openai": {
+                "baseUrl": codex_gateway_url,
+                "apiKey": token,
+                "api": "openai-responses",
+                "authHeader": True,
+                "compat": _openai_responses_compat,
+                "models": [
+                    m
+                    for m in _DATABRICKS_RESPONSES_MODELS
+                    if isinstance(m.get("id"), str) and _pi_needs_responses_api(m["id"])
+                ],
+            },
+            # Older GPT models → OpenAI Chat Completions at serving-endpoints.
             "databricks": {
                 "baseUrl": openai_base_url,
                 "apiKey": token,
                 "api": "openai-completions",
-                "compat": {
-                    "supportsDeveloperRole": False,
-                    "supportsStore": False,
-                    "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
-                },
-                "models": _DATABRICKS_RESPONSES_MODELS,
+                "compat": _openai_responses_compat,
+                "models": [
+                    m
+                    for m in _DATABRICKS_RESPONSES_MODELS
+                    if not (isinstance(m.get("id"), str) and _pi_needs_responses_api(m["id"]))
+                ],
             },
             # Claude models → Anthropic Messages API.
             # ``authHeader`` sends ``Authorization: Bearer <token>`` instead
@@ -779,6 +804,21 @@ def _build_models_json(
                 "authHeader": True,
                 "models": _DATABRICKS_ANTHROPIC_MODELS,
             },
+            # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
+            "databricks-mlflow": {
+                "baseUrl": mlflow_gateway_url,
+                "apiKey": token,
+                "api": "openai-completions",
+                "authHeader": True,
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsStore": False,
+                    "supportsStrictMode": False,
+                    "supportsReasoningEffort": False,
+                    "supportsUsageInStreaming": False,
+                },
+                "models": [],
+            },
             # Everything else (Llama, etc.) → same endpoint, same API
             "databricks-completions": {
                 "baseUrl": openai_base_url,
@@ -789,6 +829,9 @@ def _build_models_json(
                     "supportsStore": False,
                     "supportsStrictMode": False,
                     "supportsReasoningEffort": False,
+                    # Gemini/Qwen/Llama/inkling models reject stream_options
+                    # (which carries include_usage) with 400 "unknown field".
+                    "supportsUsageInStreaming": False,
                 },
                 "models": _DATABRICKS_COMPLETIONS_MODELS,
             },
@@ -809,11 +852,45 @@ def _build_models_json(
             # provider-side 400 on image turns — a deliberate trade (loud error
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
-            provider["models"] = [
-                *provider["models"],
-                {"id": model, "input": ["text", "image"]},
-            ]
+            entry: dict[str, Any] = {"id": model, "input": ["text", "image"]}  # type: ignore[explicit-any]
+            if _pi_model_is_reasoning(model):
+                entry["reasoning"] = True
+            provider["models"] = [*provider["models"], entry]
     return config
+
+
+# Model-id fragments of completions-gateway models that stream their output on
+# the ``reasoning_content`` channel (DeepSeek-R1, ...). Pi's openai-completions
+# parser only consumes that channel when the model entry declares
+# ``reasoning: true``; without it the stream carries no ``content`` and the
+# turn dies with "Stream ended without finish_reason".
+# Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
+# so they no longer need this flag.
+_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
+
+
+def _pi_model_is_reasoning(model: str) -> bool:
+    """Return whether *model* needs Pi's ``reasoning: true`` model flag."""
+    lower = model.lower()
+    return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
+
+
+def _pi_needs_responses_api(model: str) -> bool:
+    """Return True when a model requires the Responses API at /ai-gateway/codex/v1.
+
+    Covers two cases:
+    - Newer GPT models that reject function tools via /chat/completions.
+    - Kimi/inkling/qwen3/glm (system.ai.* ids) that need the Responses API to
+      avoid the missing finish_reason issue on /chat/completions.
+    """
+    from omnigent.pi_native_credentials import _SYSTEM_AI_MODEL_KEYWORDS, _needs_responses_api
+
+    lower = model.lower()
+    # system.ai.* ids: only kimi/inkling/qwen3/glm variants need Responses API.
+    # Claude/llama system.ai.* ids route to their own providers (Anthropic, completions).
+    if lower.startswith("system.ai.") and any(kw in lower for kw in _SYSTEM_AI_MODEL_KEYWORDS):
+        return True
+    return _needs_responses_api(lower)
 
 
 def _pi_provider_for_model(model: str) -> str:
@@ -821,8 +898,12 @@ def _pi_provider_for_model(model: str) -> str:
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
+    if lower.startswith("system.ai."):
+        # system.ai.* ids never work at serving-endpoints — always use a gateway path.
+        # kimi/inkling/qwen3/glm → Responses API; others (Llama, Gemini, GPT) → mlflow.
+        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks-mlflow"
     if "gpt" in lower:
-        return "databricks"
+        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
     return "databricks-completions"
 
 
@@ -849,30 +930,24 @@ def _clean_pi_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the Pi subprocess.
 
-    Deny-by-default allowlist mirroring the codex path's
-    :func:`omnigent.inner.codex_executor._clean_codex_env`. The previous
-    additive ``{**os.environ, **env}`` merge leaked every host secret
+    Thin wrapper over :func:`omnigent.inner.agent_env.clean_agent_env`. The
+    previous additive ``{**os.environ, **env}`` merge leaked every host secret
     — cloud tokens, API keys — into the Pi process, sandboxed or not.
-    Credential families are deliberately not allowlisted:
-    gateway runs authenticate through the generated ``models.json``,
-    and a spec that legitimately needs a variable inside the Pi
-    process opts in via ``os_env.sandbox.env_passthrough``.
+    Credential families are deliberately not allowlisted: gateway runs
+    authenticate through the generated ``models.json``, and a spec that
+    legitimately needs a variable inside the Pi process opts in via
+    ``os_env.sandbox.env_passthrough``.
 
-    :param extra_allowed: Extra exact names to pass through, e.g. the
-        spec's ``os_env.sandbox.env_passthrough`` entries
-        (``["ANTHROPIC_API_KEY"]`` for an env-key-authenticated
-        non-gateway run). ``None`` means no extras.
-    :returns: Filtered environment dict, ready to extend with the
-        executor's own variables (``PI_CODING_AGENT_DIR``, ...).
+    :param extra_allowed: Extra exact names to pass through, e.g. the spec's
+        ``os_env.sandbox.env_passthrough`` entries. ``None`` means no extras.
+    :returns: Filtered environment dict, ready to extend with the executor's
+        own variables (``PI_CODING_AGENT_DIR``, ...).
     """
-    allow_exact = set(_PI_ENV_ALLOW_EXACT)
-    if extra_allowed is not None:
-        allow_exact.update(extra_allowed)
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key in allow_exact or key.startswith(_PI_ENV_ALLOW_PREFIXES)
-    }
+    return clean_agent_env(
+        allow_prefixes=_PI_ENV_ALLOW_PREFIXES,
+        allow_exact=_PI_ENV_ALLOW_EXACT,
+        extra_allowed=extra_allowed or (),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1315,9 +1390,12 @@ def _try_sandbox_pi(
         # Pi needs to read its own installation + node_modules.
         pi_dir = pathlib.Path(pi_path).resolve().parent.parent
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
-        # Pi writes to ~/.pi and to /tmp.
+        # Pi writes to ~/.pi, /tmp, and $TMPDIR (on macOS $TMPDIR is a
+        # per-user dir under /var/folders/, not /tmp — grant both so
+        # PI_CODING_AGENT_DIR (created via tempfile.mkdtemp) is reachable.
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
-        sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp")])
+        sys_tmpdir = pathlib.Path(tempfile.gettempdir())
+        sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp"), sys_tmpdir])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         launcher = create_exec_launcher(pi_path, sandbox)
         return SandboxedPiCli(launch_path=launcher, sandboxed=True)
@@ -1615,7 +1693,15 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
+        from omnigent.pi_native import pi_supports_approve
+
         self._extra_args: list[str] = ["--no-tools"]
+        if pi_supports_approve(self._pi_path):
+            # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
+            # blocking TUI prompt on first launch in a directory with .pi/
+            # resources. In a runner-driven session there is nobody at the
+            # terminal to answer it, so we approve when the flag is supported.
+            self._extra_args.append("--approve")
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
@@ -1771,16 +1857,15 @@ class PiExecutor(Executor):
                 return str(meta["session_id"])
         return "__default__"
 
-    def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
+    async def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
         """
         Determine the model name to pass to Pi.
 
         ``cfg.model`` (per-request /model override) wins over the spec
         default (``HARNESS_PI_MODEL`` → ``self._model_override``). On the
-        Databricks-profile gateway path a missing model falls back to
-        :data:`DATABRICKS_CLAUDE_DEFAULT_MODEL` — Pi's own default is an
-        Anthropic-direct id the gateway rejects. Elsewhere ``None`` falls
-        through to let Pi pick its own default.
+        Databricks-profile gateway path a missing model resolves from the
+        Databricks Claude catalog — Pi's own default may be a direct-provider
+        id the gateway rejects. Elsewhere ``None`` lets Pi pick its own default.
 
         :param config: Optional :class:`ExecutorConfig` whose ``model``
             takes precedence when set.
@@ -1790,7 +1875,12 @@ class PiExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            return DATABRICKS_CLAUDE_DEFAULT_MODEL
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="claude",
+            )
+            return resolution.model_id
         return model
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
@@ -1864,50 +1954,53 @@ class PiExecutor(Executor):
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
+            effective_model = model
             models_json = _build_models_json(
                 self._databricks_host,
                 self._databricks_token,
                 self._base_urls_override,
-                model=model,
+                model=effective_model,
             )
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
                 json.dump(models_json, f)
             env["PI_CODING_AGENT_DIR"] = tmp_dir
+            # Gateway mode relocates Pi's agent root — copy the user's global
+            # settings (extensions, packages, …) and symlink install trees so
+            # ``pi install`` packages still resolve. See #1423.
+            from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
+
+            prepare_managed_pi_agent_dir(
+                pathlib.Path(tmp_dir),
+                overlay=self._retry_policy.pi.settings(),
+            )
 
         # Pi natively supports retry config via ``.pi/settings.json``
-        # (see ``RetryPolicy.pi.settings()`` for schema). Write the
-        # retry block to ``<tmp_dir>/.pi/settings.json`` so Pi picks
-        # it up when spawned with ``cwd=tmp_dir`` (when the user
-        # didn't override cwd) or merge into ``<cwd>/.pi/settings.json``
-        # when they did. This sets max_retries, backoff base/cap from
-        # the spec policy.
-        retry_settings = self._retry_policy.pi.settings()
-        # Decide where to write. Project-level (cwd/.pi/settings.json)
-        # is Pi's documented project override; merge into existing
-        # file if present, else create.
-        settings_dir_root = self._cwd or tmp_dir
-        settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
-        try:
-            if os.path.exists(settings_path):
-                with open(settings_path) as f:
-                    existing_settings = json.load(f)
-                if not isinstance(existing_settings, dict):
+        # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway
+        # path, merge the retry block into ``<cwd>/.pi/settings.json``.
+        # Gateway runs apply retry via :func:`prepare_managed_pi_agent_dir`
+        # into the managed agent dir instead.
+        if not self._gateway:
+            retry_settings = self._retry_policy.pi.settings()
+            settings_dir_root = self._cwd or tmp_dir
+            settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
+            try:
+                if os.path.exists(settings_path):
+                    with open(settings_path) as f:
+                        existing_settings = json.load(f)
+                    if not isinstance(existing_settings, dict):
+                        existing_settings = {}
+                else:
                     existing_settings = {}
-            else:
-                existing_settings = {}
-            existing_settings.update(retry_settings)
-            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-            with open(settings_path, "w") as f:
-                json.dump(existing_settings, f, indent=2)
-        except OSError:
-            # If we can't write to the user's cwd (read-only fs,
-            # permissions), fall back to tmp_dir; Pi will use its
-            # own defaults if neither location works.
-            fallback_path = os.path.join(tmp_dir, ".pi", "settings.json")
-            os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
-            with open(fallback_path, "w") as f:
-                json.dump(retry_settings, f, indent=2)
+                existing_settings.update(retry_settings)
+                os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+                with open(settings_path, "w") as f:
+                    json.dump(existing_settings, f, indent=2)
+            except OSError:
+                fallback_path = os.path.join(tmp_dir, ".pi", "settings.json")
+                os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+                with open(fallback_path, "w") as f:
+                    json.dump(retry_settings, f, indent=2)
 
         # Generate the Omnigent tool bridge extension if tools are available.
         if tools and tool_server_port is not None:
@@ -1956,12 +2049,14 @@ class PiExecutor(Executor):
         """Get or create a Pi RPC subprocess for the given session."""
         state = self._session_states.setdefault(session_key, _PiSessionState())
 
+        effective_model = model
+
         if (
             state.rpc is not None
             and state.rpc.process is not None
             and state.rpc.process.returncode is None
             and state.system_prompt == system_prompt
-            and state.model == model
+            and state.model == effective_model
         ):
             return state.rpc
 
@@ -1971,7 +2066,7 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, model
+            tools, tool_server_port, tool_server_token, effective_model
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -1983,11 +2078,11 @@ class PiExecutor(Executor):
         # For Databricks models, prefix with the provider name so Pi resolves
         # the model from our custom provider in models.json.
         pi_model: str | None
-        if self._gateway and model:
-            provider = _pi_provider_for_model(model)
-            pi_model = f"{provider}/{model}"
+        if self._gateway and effective_model:
+            provider = _pi_provider_for_model(effective_model)
+            pi_model = f"{provider}/{effective_model}"
         else:
-            pi_model = model
+            pi_model = effective_model
 
         await rpc.start(
             self._pi_launch_path,
@@ -1999,7 +2094,7 @@ class PiExecutor(Executor):
         )
         state.rpc = rpc
         state.system_prompt = system_prompt
-        state.model = model
+        state.model = effective_model
         state._has_sent_prompt = False
         return rpc
 
@@ -2021,7 +2116,7 @@ class PiExecutor(Executor):
                 if token:
                     self._databricks_token = token
         session_key = self._session_key(messages)
-        model = self._resolve_model(config)
+        model = await self._resolve_model(config)
 
         try:
             rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
@@ -2081,11 +2176,18 @@ class PiExecutor(Executor):
         # multi-step (tool-loop) turn bills for every call, not just the
         # last. Empty when pi reports no usage — cost tracking is skipped.
         message_usages: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        # Error reported by a ``message_end`` (stopReason=error); surfaced at
+        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        pending_error: str | None = None
 
         while True:
-            line = await rpc.read_line(timeout=120.0)
+            # After an errored message the only thing left to drain is the
+            # already-emitted agent_end, so don't wait the full idle budget.
+            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
             if line is None:
-                if not streamed_any and not response_text:
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
                     yield ExecutorError(
@@ -2218,6 +2320,9 @@ class PiExecutor(Executor):
 
             # Agent ended — the turn is complete.
             if event_type == "agent_end":
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
                 end_messages = event.get("messages", [])
                 if not response_text:
                     for m in reversed(end_messages):
@@ -2261,10 +2366,17 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    if stop in ("error", "aborted"):
+                    if stop == "aborted":
                         err = msg.get("errorMessage", stop)
                         yield ExecutorError(message=str(err))
                         return
+                    if stop == "error":
+                        # Pi emits the turn-terminal ``agent_end`` after an
+                        # errored LLM call; returning here would leave it
+                        # queued, so the next turn on this RPC session reads
+                        # the stale event as its own end. Record the error
+                        # and keep draining until ``agent_end``.
+                        pending_error = str(msg.get("errorMessage", stop))
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

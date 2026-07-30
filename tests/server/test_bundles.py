@@ -286,3 +286,159 @@ def test_validate_bundle_accepts_registered_handler_in_sub_agent() -> None:
     )
     spec = validate_agent_bundle(bundle)
     assert spec.name == "root_agent"
+
+
+# ── os_env.cwd containment on the upload path (GHSA-p8rw-8qj3-hf33) ──
+
+
+def _bundle_with_cwd(cwd: str) -> bytes:
+    """Pack a minimal valid bundle whose ``os_env.cwd`` is *cwd*."""
+    return _make_bundle_bytes(
+        {
+            "config.yaml": yaml.dump(
+                {
+                    "spec_version": 1,
+                    "name": "uploaded-agent",
+                    "executor": {
+                        "type": "omnigent",
+                        "config": {"harness": "claude-sdk"},
+                    },
+                    "prompt": "hi",
+                    "os_env": {
+                        "type": "caller_process",
+                        "cwd": cwd,
+                        "sandbox": {"type": "none"},
+                    },
+                }
+            )
+        }
+    )
+
+
+@pytest.mark.parametrize("bad_cwd", ["/", "/etc", "/etc/passwd", "../../etc", "a/../../b"])
+def test_validate_agent_bundle_rejects_escaping_os_env_cwd(bad_cwd: str) -> None:
+    """An uploaded bundle may not pin an absolute or ``..``-escaping cwd.
+
+    On a runner without ``OMNIGENT_RUNNER_WORKSPACE`` such a cwd becomes the
+    agent environment root / ``copytree`` source, exposing the host
+    filesystem (GHSA-p8rw-8qj3-hf33). The untrusted upload path must reject it.
+    """
+    with pytest.raises(OmnigentError, match=r"os_env\.cwd must be a relative path"):
+        validate_agent_bundle(_bundle_with_cwd(bad_cwd))
+
+
+@pytest.mark.parametrize("ok_cwd", ["sub", "sub/dir", "a/b/c", ".", "./"])
+def test_validate_agent_bundle_allows_contained_relative_cwd(ok_cwd: str) -> None:
+    """A relative, non-escaping ``os_env.cwd`` is accepted on the upload path."""
+    spec = validate_agent_bundle(_bundle_with_cwd(ok_cwd))
+    assert spec.name == "uploaded-agent"
+
+
+def test_validate_agent_bundle_allows_absolute_cwd_for_trusted_local_server() -> None:
+    """The trusted single-user/local path keeps the documented absolute-cwd
+    behavior.
+
+    With ``enforce_handler_allowlist=False`` the operator uploads their OWN
+    bundle and legitimately controls cwd, so containment is not enforced —
+    matching ``designs/SESSION_WORKSPACE_SELECTION.md`` for direct/local runs.
+    """
+    spec = validate_agent_bundle(
+        _bundle_with_cwd("/abs/operator/path"), enforce_handler_allowlist=False
+    )
+    assert spec.name == "uploaded-agent"
+
+
+# ── no server-side `callable:` tools on the upload path (GHSA-756x) ──
+
+
+# A omnigent function tool whose ``callable:`` is a dotted import path the
+# runner resolves with ``importlib`` and invokes — the RCE gadget.
+_CALLABLE_TOOL_YAML = (
+    "name: {name}\n"
+    "prompt: hi\n"
+    "executor:\n"
+    "  harness: claude-sdk\n"
+    "tools:\n"
+    "  run_cmd:\n"
+    "    type: function\n"
+    "    description: run a shell command\n"
+    "    callable: subprocess.check_output\n"
+    "    parameters:\n"
+    "      type: object\n"
+    "      properties:\n"
+    "        cmd:\n"
+    "          type: string\n"
+    "      required: [cmd]\n"
+)
+
+
+def test_validate_bundle_rejects_server_callable_tool() -> None:
+    """An uploaded bundle may not declare a server-side Python ``callable:`` tool.
+
+    The runner imports the dotted path and invokes it (GHSA-756x), so a
+    tenant-uploaded ``callable: subprocess.check_output`` is authenticated
+    RCE on the shared runner. The upload boundary must refuse it.
+    """
+    bundle = _single_file_yaml_bundle(_CALLABLE_TOOL_YAML.format(name="rce_tool_agent"))
+    with pytest.raises(OmnigentError, match=r"may not declare a server-side Python callable tool"):
+        validate_agent_bundle(bundle)
+
+
+def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None:
+    """``enforce_handler_allowlist=False`` accepts a server ``callable:`` tool.
+
+    The trusted single-user / local-server path uploads the operator's own
+    bundle through this same function; Python callable tools are the intended
+    operator feature there (the operator already has code execution), so the
+    guard must not block them — mirroring the handler-allowlist exemption.
+    """
+    spec = validate_agent_bundle(
+        _single_file_yaml_bundle(_CALLABLE_TOOL_YAML.format(name="local_tool_agent")),
+        enforce_handler_allowlist=False,
+    )
+    assert spec.name == "local_tool_agent"
+
+
+def test_validate_bundle_allows_bundled_python_tool_file() -> None:
+    """A bundled ``tools/python/*.py`` tool file is not a ``callable:`` and is allowed.
+
+    File tools ship the agent's own code (path ``tools/python/echo.py``), not a
+    dotted import of an arbitrary server-installed module, so the GHSA-756x
+    guard must not over-block them.
+    """
+    bundle = _make_bundle_bytes(
+        {
+            "config.yaml": _MIN_CONFIG.format(name="filetool_agent"),
+            "tools/python/echo.py": "def echo(text: str) -> str:\n    return text\n",
+        }
+    )
+    spec = validate_agent_bundle(bundle)
+    assert spec.name == "filetool_agent"
+    assert any(t.name == "echo" for t in spec.local_tools)
+
+
+def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:
+    """The callable-tool guard catches a malicious callable hidden in a sub-agent.
+
+    Exercised directly: the directory ``config.yaml`` sub-agent shape does not
+    surface YAML ``tools:`` callables through the parser, so this guards the
+    recursion itself — the defense-in-depth that any future surfacing path
+    relies on, matching the handler-allowlist guard's sub-agent coverage.
+    """
+    from omnigent.server.bundles import _reject_uploaded_callable_tools
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import LocalToolInfo, ToolRuntime
+
+    sub = AgentSpec(name="evil_sub", spec_version=1)
+    sub.local_tools = [
+        LocalToolInfo(
+            name="run_cmd",
+            path="subprocess.check_output",
+            language="omnigent-python-callable",
+            runtime=ToolRuntime.SERVER,
+        )
+    ]
+    root = AgentSpec(name="root", spec_version=1)
+    root.sub_agents = [sub]
+    with pytest.raises(OmnigentError, match=r"may not declare a server-side Python callable tool"):
+        _reject_uploaded_callable_tools(root)

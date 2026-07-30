@@ -24,7 +24,9 @@ services:
           property: connectionString
       - key: ARTIFACT_DIR
         value: /data/artifacts
-      # Keep the first-boot admin password on the disk across redeploys.
+      # Anchor the server's data dir on the persistent disk (this path's
+      # parent, /data) so file-backed operator config and the auto-minted
+      # cookie secret survive redeploys. No credentials file is written here.
       - key: OMNIGENT_ADMIN_CREDENTIALS_PATH
         value: /data/admin-credentials
       - key: HOST

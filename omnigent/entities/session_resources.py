@@ -159,8 +159,29 @@ def terminal_resource_view(session_id: str, entry: TerminalListEntry) -> Session
             "running": entry.instance.running,
             "tmux_socket": str(entry.instance.socket_path),
             "tmux_target": entry.instance.tmux_target,
+            # Effective web-attach transport (``"pty"`` / ``"control"``) absent
+            # a per-attach ``?transport=`` override, so the browser can pick
+            # the matching mouse/selection behavior. Control mode lets xterm
+            # own scrollback + selection; PTY mode still needs the modifier
+            # workarounds + hint bar.
+            "terminal_transport": _resolve_transport_for_view(entry),
         },
     )
+
+
+def _resolve_transport_for_view(entry: TerminalListEntry) -> str:
+    """Resolve a terminal's default web-attach transport for metadata.
+
+    Mirrors :func:`omnigent.inner.terminal.resolve_terminal_transport` with no
+    per-attach override — the spec's declared transport, else the global
+    default. Imported lazily to keep this projection import-light.
+
+    :param entry: The terminal registry entry to project.
+    :returns: ``"pty"`` or ``"control"``.
+    """
+    from omnigent.inner.terminal import resolve_terminal_transport
+
+    return resolve_terminal_transport(spec_transport=entry.instance.terminal_transport)
 
 
 def _terminal_environment_resource(

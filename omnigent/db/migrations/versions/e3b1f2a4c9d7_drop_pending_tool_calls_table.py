@@ -25,6 +25,12 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # MySQL requires dropping FK constraints before the indexes that back them.
+    if op.get_bind().dialect.name == "mysql":
+        with op.batch_alter_table("pending_tool_calls") as batch_op:
+            for fk in sa.inspect(op.get_bind()).get_foreign_keys("pending_tool_calls"):
+                if fk["name"]:
+                    batch_op.drop_constraint(fk["name"], type_="foreignkey")
     op.drop_index("ix_pending_tool_calls_task_id", table_name="pending_tool_calls")
     op.drop_index("ix_pending_tool_calls_root_task_id", table_name="pending_tool_calls")
     op.drop_table("pending_tool_calls")

@@ -151,6 +151,7 @@ class _FakeBoxOptions:
         memory_mib: int | None = None,
         env: object = None,
         auto_remove: bool | None = None,
+        detach: bool | None = None,
         **kwargs: object,
     ) -> None:
         self.image = image
@@ -158,6 +159,7 @@ class _FakeBoxOptions:
         self.memory_mib = memory_mib
         self.env = env if env is not None else []
         self.auto_remove = auto_remove
+        self.detach = detach
         self.extra = kwargs
 
 
@@ -357,9 +359,9 @@ def test_provision_defaults_official_image_and_persists(
     fake_boxlite: _FakeBoxliteState,
 ) -> None:
     """
-    A bare provision uses the official host image, is persistent
-    (auto_remove=False so the managed machinery owns teardown), injects
-    no env, sizes like Modal/Daytona, and runs LOCAL by default.
+    A bare provision uses the official host image, stays alive after the SDK
+    handle is dropped, lets managed machinery own teardown, injects no env,
+    sizes like Modal/Daytona, and runs LOCAL by default.
     """
     box_id = BoxliteSandboxLauncher().provision("managed-abc")
 
@@ -367,6 +369,7 @@ def test_provision_defaults_official_image_and_persists(
     [create] = fake_boxlite.create_calls
     assert create.options.image == DEFAULT_HOST_IMAGE
     assert create.options.auto_remove is False
+    assert create.options.detach is True
     assert create.options.cpus == 2
     assert create.options.memory_mib == 4096
     assert create.options.env == []
@@ -541,7 +544,7 @@ def test_local_registry_missing_cred_env_fails_loud(
 def test_run_drains_output_and_returns_exit_code(fake_boxlite: _FakeBoxliteState) -> None:
     """
     ``run`` wraps the command in ``sh -lc``, drains the stdout stream, and
-    returns the exit code — the shape ``_start_host_in_sandbox`` relies on
+    returns the exit code — the shape ``SandboxLauncher.start_host`` relies on
     for ``printf %s "$HOME"`` (no trailing newline, ``.strip()`` on the
     caller side).
     """

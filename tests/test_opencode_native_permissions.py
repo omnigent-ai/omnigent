@@ -30,6 +30,28 @@ def test_parse_permission_request_from_event_properties() -> None:
     assert req.source == "tool"
 
 
+def test_parse_permission_request_v1_uses_permission_field() -> None:
+    """opencode 1.17.x emits v1 ``permission.asked`` with the category in
+    ``permission`` (not ``action``). Missing this left the policy tool name as
+    the literal "permission" so no tool-name policy fired (e.g. "Require
+    Approval for File & Shell Operations"). Live-verified payload shape.
+    """
+    req = parse_permission_request(
+        {
+            "id": "per_v1",
+            "sessionID": "ses_1",
+            "permission": "bash",
+            "patterns": ["echo hello"],
+            "metadata": {"command": "echo hello"},
+            "always": ["echo *"],
+            "tool": {"messageID": "msg_1", "callID": "call_1"},
+        }
+    )
+    assert req is not None
+    assert req.action == "bash"  # from the v1 ``permission`` field
+    assert req.resources == ["echo hello"]  # from v1 ``patterns``
+
+
 def test_parse_permission_request_accepts_request_id_alias() -> None:
     req = parse_permission_request({"requestID": "per_2", "action": "edit"})
     assert req is not None
@@ -80,7 +102,10 @@ def test_map_verdict_unknown_fails_closed_to_ask() -> None:
 
 def test_decision_to_reply() -> None:
     assert decision_to_reply("allow_once") == "once"
-    assert decision_to_reply("allow_always") == "always"
+    # allow_always must map to "once", NOT "always": an "always" reply makes
+    # opencode persist the grant locally and stop emitting permission.asked,
+    # bypassing the server policy engine and breaking live policy toggles.
+    assert decision_to_reply("allow_always") == "once"
     assert decision_to_reply("reject") == "reject"
     # ask has no automatic reply (needs a human).
     assert decision_to_reply("ask") is None

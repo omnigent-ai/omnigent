@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Signing entitlements for the packaged macOS app (electron-builder
+  `mac.entitlements`; helpers use entitlements.mac.inherit.plist).
+
+  (This lives in signing/, not build/, because the repo-root .gitignore
+  ignores all build/ directories.)
+-->
+<plist version="1.0">
+  <dict>
+    <!-- Electron under the hardened runtime needs JIT for V8. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <!-- Voice dictation (mic level meter / Web Speech). -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+  </dict>
+</plist>

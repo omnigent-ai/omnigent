@@ -32,8 +32,14 @@ from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native_dispatch import resolve_hook_for_key
 
 _logger = logging.getLogger(__name__)
+
+# Characters a copy-paste commonly drags along around an id (sentence
+# punctuation, quoting, brackets). Never valid in any id spelling, so
+# stripping them from the ends cannot change which conversation resolves.
+_PASTE_PUNCTUATION = " \t`'\"()[]{}<>.,;:"
 
 
 def run_resume(
@@ -164,10 +170,24 @@ def _dispatch_by_runtime(
     :param server: Optional remote Omnigent server URL. ``None`` when
         the lookup should hit a freshly-started local server (the
         claude-native wrapper owns its own local server lifecycle).
-    :raises click.ClickException: When the conversation can't be
-        resolved, can't be classified, or is not a terminal-native
-        session.
+    :raises click.ClickException: When *target* is not a valid
+        conversation id, the conversation can't be resolved, can't be
+        classified, or is not a terminal-native session.
     """
+    from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+
+    # Resolve the id the argument contains, then canonicalize to bare hex
+    # before any lookup: a paste drags punctuation along (trailing period,
+    # wrapping quotes or backticks), and none of it can ever be part of a
+    # valid id — so strip it and resume rather than erroring. A malformed
+    # id would otherwise surface as a raw StatementError traceback from
+    # the local store's Uuid16 bind, and downstream consumers key
+    # sessions on the bare spelling.
+    try:
+        target = uuid_to_bytes(target.strip(_PASTE_PUNCTUATION)).hex()
+    except InvalidUuidError as exc:
+        raise click.ClickException("Invalid session id.") from exc
+
     if server is not None:
         wrapper = _read_wrapper_label_remote(server=server, conv_id=target)
         if _dispatch_wrapper(
@@ -216,61 +236,11 @@ def _dispatch_wrapper(
     native_agent = native_coding_agent_for_wrapper_label(wrapper)
     if native_agent is None:
         return False
-    if native_agent.key == "claude":
-        from omnigent.claude_native import run_claude_native
-
-        run_claude_native(
-            server=server,
-            session_id=session_id,
-            claude_args=(),
-        )
-        return True
-    if native_agent.key == "codex":
-        from omnigent.codex_native import run_codex_native
-
-        run_codex_native(
-            server=server,
-            session_id=session_id,
-            codex_args=(),
-        )
-        return True
-    if native_agent.key == "pi":
-        from omnigent.pi_native import run_pi_native
-
-        run_pi_native(
-            server=server,
-            session_id=session_id,
-            pi_args=(),
-        )
-        return True
-    if native_agent.key == "cursor":
-        from omnigent.cursor_native import run_cursor_native
-
-        run_cursor_native(
-            server=server,
-            session_id=session_id,
-            cursor_args=(),
-        )
-        return True
-    if native_agent.key == "goose":
-        from omnigent.goose_native import run_goose_native
-
-        run_goose_native(
-            server=server,
-            session_id=session_id,
-            goose_args=(),
-        )
-        return True
-    if native_agent.key == "qwen":
-        from omnigent.qwen_native import run_qwen_native
-
-        run_qwen_native(
-            server=server,
-            session_id=session_id,
-            qwen_args=(),
-        )
-        return True
-    return False
+    run_native = resolve_hook_for_key(native_agent.key, "run_native")
+    if run_native is None:
+        return False
+    run_native(server=server, session_id=session_id, extra_args=())
+    return True
 
 
 def _read_wrapper_label_local(*, conv_id: str) -> str | None:

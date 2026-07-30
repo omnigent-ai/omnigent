@@ -50,22 +50,25 @@ the secret and redeploy.
 
 The first boot runs DB migrations over the network (~1 minute on Neon).
 
-**Get the admin password:** the first boot prints it to the app log:
+**Create the first admin.** No credentials are auto-generated. First boot
+prints a "No admin yet" line pointing at your `*.modal.run` URL:
 
 ```bash
 modal app logs omnigent
 ```
 
-```
-✓ Created initial admin account (accounts auth provider).
-    password: <generated>
-```
+Open that URL and use the web Create-admin form to pick your own username +
+password, then invite teammates from **Members** in the web UI.
 
-Log in as the admin and invite teammates from **Members** in the web UI.
-
-> To set a known admin password instead, add
-> `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<password>` to the
+> To create the admin directly instead of claiming it through the web form,
+> add `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<password>` to the
 > `omnigent-deploy` secret before the first deploy.
+
+> **Security note for public deployments:** `POST /auth/setup` is
+> unauthenticated while no password-bearing account exists, so an instance
+> exposed before you reach the Create-admin form can be claimed by the first
+> visitor. Pre-seed `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`, or complete setup
+> promptly after the deploy goes live.
 
 ### Modal-specific caveats
 
@@ -164,7 +167,7 @@ Sandboxes boot from `ghcr.io/omnigent-ai/omnigent-host:latest`, an image
 published by CI from the `host` target of
 [`deploy/docker/Dockerfile`](../docker/Dockerfile) with Omnigent
 and its dependencies preinstalled — including the coding-harness CLIs
-(`claude`, `codex`, `pi`), so agents on any harness run without an
+(`claude`, `codex`, `pi`, `kiro-cli`), so agents on any harness run without an
 in-sandbox install.
 
 To use a different image (a fork, or extra tooling baked in), build the
@@ -302,6 +305,18 @@ sandbox:
     secrets: [omnigent-llm]                       # Modal secrets to inject
 ```
 
+A top-level `sandbox.host_config:` (provider-agnostic) holds verbatim
+in-sandbox `~/.omnigent/config.yaml` content — e.g. a `providers:`
+block routing a harness through a self-hosted gateway — installed into
+the sandbox before `omnigent host` starts. The block is server-managed:
+entries injected by a previous launch are replaced or removed on the
+next launch/resume, while config created inside the sandbox survives.
+Keep secrets out via
+`api_key_ref: env:VAR` (resolved in the sandbox against the injected
+env). See the [sandbox-runners config
+table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-configyaml)
+for the shape.
+
 ### LLM credentials for managed sandboxes
 
 A fresh sandbox has no API keys. Park your provider credentials in a
@@ -312,7 +327,7 @@ credential vars to its runners:
 
 ```bash
 modal secret create omnigent-llm \
-  ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
+  OMNIGENT_ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
 ```
 
 The forwarded set covers the variables the harnesses themselves
@@ -324,7 +339,7 @@ like [OpenRouter](https://openrouter.ai) and
 
 | Variable | Enables |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude models on the Anthropic API (claude-sdk, pi, claude-code harnesses) |
+| `OMNIGENT_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY` | Claude models on the Anthropic API (claude-sdk, pi, claude-code harnesses). Prefer the `OMNIGENT_` form for Claude Code so the raw `ANTHROPIC_API_KEY` env var is not present in the CLI process. |
 | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | Anthropic-compatible gateways — point claude-code at a LiteLLM proxy, a Bedrock/Vertex bridge, or a corporate gateway |
 | `CLAUDE_CODE_OAUTH_TOKEN` | claude-code with a Claude subscription (no API key) |
 | `OPENAI_API_KEY` | OpenAI models on the OpenAI API (codex, openai-agents harnesses) |
@@ -334,7 +349,10 @@ like [OpenRouter](https://openrouter.ai) and
 
 Common setups:
 
-- **Claude with an API key** — put `ANTHROPIC_API_KEY` in the secret.
+- **Claude with an API key** — put `OMNIGENT_ANTHROPIC_API_KEY` in the secret.
+  Omnigent resolves it into Claude Code's `apiKeyHelper`; do not also set
+  `ANTHROPIC_API_KEY` unless you are okay with Claude Code detecting the raw
+  custom key env var.
 - **Claude with a subscription** — run `claude setup-token` on your own
   machine (one-time browser auth) and store the resulting long-lived
   token as `CLAUDE_CODE_OAUTH_TOKEN`.

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.onboarding import cursor_auth
+from omnigent.onboarding import cursor_auth, extra_install
 from omnigent.onboarding import secrets as secret_store
 from omnigent.onboarding.cursor_auth import (
     CURSOR_SECRET_NAME,
@@ -196,25 +196,42 @@ def test_cursor_sdk_installed_false_when_module_not_found(
 
 def test_cursor_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> None:
     """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
-    monkeypatch.setattr(cursor_auth.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/usr/bin/uv")
     cmd = cursor_install_command()
     assert cmd == ["uv", "pip", "install", "omnigent[cursor]"]
-    # No hardcoded index / proxy leaks into committed code.
     assert not any("index" in part or "://" in part for part in cmd)
 
 
 def test_cursor_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without ``uv``, it falls back to this interpreter's pip — still no index."""
-    monkeypatch.setattr(cursor_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     cmd = cursor_install_command()
     assert cmd == [
-        cursor_auth.sys.executable,
+        extra_install.sys.executable,
         "-m",
         "pip",
         "install",
         "omnigent[cursor]",
     ]
     assert not any("index" in part or "://" in part for part in cmd)
+
+
+def test_cursor_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inside a ``uv tool`` venv, the install uses ``uv tool install --with``."""
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
+    monkeypatch.setattr(extra_install, "_installed_vcs_url", lambda: None)
+    cmd = cursor_install_command()
+    assert cmd == [
+        "uv",
+        "tool",
+        "install",
+        "--with",
+        "omnigent[cursor]",
+        "omnigent",
+        "--force",
+    ]
 
 
 def test_install_cursor_sdk_runs_command_then_rechecks(
@@ -235,12 +252,13 @@ def test_install_cursor_sdk_runs_command_then_rechecks(
         state["installed"] = True
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr(cursor_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     monkeypatch.setattr(cursor_auth.subprocess, "run", _run)
     monkeypatch.setattr(cursor_auth, "cursor_sdk_installed", lambda: state["installed"])
 
     assert install_cursor_sdk() is True
-    assert calls == [[cursor_auth.sys.executable, "-m", "pip", "install", "omnigent[cursor]"]]
+    assert calls == [[extra_install.sys.executable, "-m", "pip", "install", "omnigent[cursor]"]]
 
 
 def test_install_cursor_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -249,6 +267,7 @@ def test_install_cursor_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPat
     def _boom(*args: object, **kwargs: object) -> object:
         raise OSError("no pip")
 
-    monkeypatch.setattr(cursor_auth.shutil, "which", lambda name: None)
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
+    monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     monkeypatch.setattr(cursor_auth.subprocess, "run", _boom)
     assert install_cursor_sdk() is False

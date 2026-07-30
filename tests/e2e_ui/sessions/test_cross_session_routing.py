@@ -1,38 +1,34 @@
-"""E2E: a queued message is delivered to the session it was composed in.
+"""E2E: a queued message is delivered to its origin session, never another.
 
-Guards the cross-session message-routing regression:
+Guards cross-session message routing under the client-side queue +
+background-flush model:
 
-    Session B's runner is slow to come up, so B's first message POST
-    stays in flight. A second message typed into B queues behind it on
-    the SPA's module-level send chain. While the chain is stalled the
-    user switches to a different, already-running session A. The queued
-    second message MUST still be POSTed to B — the session it was
-    composed in — not to whatever session is active when the chain
-    finally unblocks.
+    Session B is busy (its first message's POST is held open, so B stays
+    "streaming"), so a follow-up typed into B is held in B's client-side
+    queue — NOT POSTed. The user switches to a different, idle session A.
+    Once B's turn settles and B reads idle, **background flush** delivers
+    the queued message to B — its origin — even though A is now active. It
+    must go to B and never leak into A.
 
-The bug routed the second message to A because the POST target was
-re-resolved from the live ``conversationId`` only AFTER the chain
-unblocked (``chatStore.ensureBoundSession``), by which point the user
-had navigated to A. The fix pins the destination at submit time.
+The queue is a per-conversation client-side buffer keyed by ``conversationId``;
+``flushBackgroundQueues`` POSTs a queued message to its own conversation when
+that conversation is idle in the ``["conversations"]`` cache, regardless of
+which session is being viewed. These tests pin both halves: delivered-to-B and
+never-to-A — once for a plain-text follow-up, and once for a follow-up carrying
+an image (upload → ``input_image`` post, both addressed to B). (The FIFO/idle
+unit behavior is covered by the ``chatStore`` tests.)
 
-Why async Playwright (not the sync ``page`` fixture the other e2e_ui
-tests use): the repro requires B's first ``POST /events`` to stay
-outstanding WHILE the test performs more UI actions (type + send the
-second message, then switch sessions). Holding a request open across
-interleaved page actions needs a deferred ``route.continue_`` /
-``route.fulfill``, which only the async API supports — a sync route
-handler blocks the single greenlet and would deadlock. It is a sync
-test that drives the async flow in a fresh thread (see
-:func:`_run_in_fresh_loop`) rather than a pytest-asyncio test: the
-suite's many sync pytest-playwright tests leave the main-thread loop in
-a state where pytest-asyncio can't start one. The session switch is
-driven via the in-app sidebar link (client-side navigation), NOT
-``page.goto`` — a full reload would reset the JS module state (the send
-chain) and dissolve the very race under test.
-
-The route handler fulfills every ``/events`` POST itself, so no real
-turn runs and the test needs no working LLM — it asserts purely on
-where the SPA addressed each POST.
+Why async Playwright (not the sync ``page`` fixture): the test inspects the
+body of every ``/events`` POST via a route handler and asserts on which
+session each was addressed to, across interleaved UI actions (send, switch
+sessions, switch back). The route handler fulfills every POST itself, so no
+real turn runs and the test needs no working LLM. It is a sync test driving
+the async flow in a fresh thread (see :func:`_run_in_fresh_loop`) because the
+suite's many sync pytest-playwright tests leave the main-thread loop in a
+state where pytest-asyncio can't start one. Session switches are driven via
+the in-app sidebar link (client-side navigation), NOT ``page.goto`` — a full
+reload would reset the JS module state (the client-side queue lives in the
+store) and dissolve the scenario under test.
 """
 
 from __future__ import annotations
@@ -99,10 +95,10 @@ async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
     raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
-def test_queued_send_routes_to_origin_session_not_active_session(
+def test_queued_message_stays_bound_to_origin_session(
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Second message queued in B reaches B after switching to A.
+    """A follow-up queued in B reaches B, never the active session A.
 
     Failure mode this catches: the queued ``_MSG2`` POST is addressed to
     session A (the now-active session) instead of session B (where it was
@@ -112,11 +108,154 @@ def test_queued_send_routes_to_origin_session_not_active_session(
     _run_in_fresh_loop(_drive_cross_session_routing(base_url, session_a, session_b))
 
 
+def test_queued_message_with_image_flushes_to_origin(
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """A follow-up with an image queued in B is uploaded then posted to B.
+
+    Background flush mirrors ``send()``'s two-phase sequence for attachments:
+    upload the file (→ real ``file_id``) then POST a message carrying an
+    ``input_image`` block that references it. This pins that an image queued
+    while B is busy is delivered — upload + post — to B once it idles, even
+    with A active, and never leaks the upload or the message into A.
+
+    Failure mode this catches: the queued image is dropped (no upload / no
+    ``input_image`` block) or its upload/post is addressed to the active
+    session A instead of its origin B.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _run_in_fresh_loop(_drive_cross_session_image_flush(base_url, session_a, session_b))
+
+
+async def _drive_cross_session_image_flush(base_url: str, session_a: str, session_b: str) -> None:
+    """Async body of the queued-image background-flush test.
+
+    :param base_url: Spawned server base URL.
+    :param session_a: The idle session the user switches to.
+    :param session_b: The session the image message is composed in.
+    """
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            # Every (session_id, content-blocks) POSTed to a /events endpoint,
+            # and every session_id an upload (/resources/files) was addressed to.
+            event_posts: list[tuple[str, list[dict[str, Any]]]] = []
+            upload_targets: list[str] = []
+            release_first = asyncio.Event()
+            first_b_post_held = False
+
+            async def handle_uploads(route: Route) -> None:
+                # Record which session each upload hits, then hand back a real
+                # file_id so the follow-up post can reference it.
+                match = re.search(r"/v1/sessions/([^/]+)/resources/files$", route.request.url)
+                assert match is not None, f"unexpected upload url: {route.request.url}"
+                upload_targets.append(match.group(1))
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "id": "file_e2e_img",
+                            "name": "shot.png",
+                            "metadata": {"filename": "shot.png", "bytes": 4, "created_at": 0},
+                        }
+                    ),
+                )
+
+            async def handle_events(route: Route) -> None:
+                nonlocal first_b_post_held
+                request = route.request
+                match = _EVENTS_RE.search(request.url)
+                assert match is not None, f"unexpected /events url: {request.url}"
+                session_id = match.group(1)
+                content = request.post_data_json["data"]["content"]
+                event_posts.append((session_id, content))
+                # Hold ONLY B's first message open so B stays busy (streaming)
+                # while the image follow-up is attached and queued.
+                if session_id == session_b and not first_b_post_held:
+                    first_b_post_held = True
+                    await release_first.wait()
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            await page.route("**/v1/sessions/*/resources/files", handle_uploads)
+            await page.route("**/v1/sessions/*/events", handle_events)
+
+            await page.goto(f"{base_url}/c/{session_b}")
+            composer = page.get_by_label("Message the agent")
+            await page.get_by_placeholder(_COMPOSER_PLACEHOLDER).wait_for(
+                state="visible", timeout=15_000
+            )
+            send_button = page.get_by_role("button", name="Send", exact=True)
+
+            # msg1 → POST to B, held open by the route handler → B stays busy.
+            await composer.fill(_MSG1)
+            await send_button.click()
+            await _wait_until(lambda: first_b_post_held)
+
+            # Attach an image + text while B is busy → held in B's client-side
+            # queue. Set the hidden file input directly (the attach button just
+            # click()s it); wait for the chip so the file is registered before
+            # sending.
+            await page.locator('input[type="file"]').set_input_files(
+                {"name": "shot.png", "mimeType": "image/png", "buffer": b"png!"}
+            )
+            await page.get_by_label("Remove shot.png").wait_for(state="visible", timeout=15_000)
+            await composer.fill(_MSG2)
+            await send_button.click()
+            await page.get_by_test_id("composer-queued-strip").wait_for(
+                state="visible", timeout=15_000
+            )
+            # Nothing uploaded or posted for msg2 yet — it's held client-side.
+            assert upload_targets == [], f"image uploaded while queued: {upload_targets}"
+
+            # Switch to idle A (client-side nav preserves the store) and release
+            # B's first POST so B idles → background flush fires.
+            await page.locator(f'a[href="/c/{session_a}"]').click()
+            await page.wait_for_url(re.compile(rf"/c/{re.escape(session_a)}"))
+            release_first.set()
+
+            # Background flush uploads the image to B then posts an input_image
+            # block referencing the returned file_id — all addressed to B.
+            def _msg2_posted() -> bool:
+                return any(
+                    any(b.get("type") == "input_text" and b.get("text") == _MSG2 for b in content)
+                    for _, content in event_posts
+                )
+
+            await _wait_until(_msg2_posted)
+            msg2 = next(
+                content
+                for sid, content in event_posts
+                if sid == session_b
+                and any(b.get("type") == "input_text" and b.get("text") == _MSG2 for b in content)
+            )
+            # The image block precedes the text and carries the uploaded id.
+            image_block = next((b for b in msg2 if b.get("type") == "input_image"), None)
+            assert image_block is not None, f"no input_image block in the flushed post: {msg2}"
+            assert image_block["file_id"] == "file_e2e_img", image_block
+            assert any(b.get("type") == "input_text" and b.get("text") == _MSG2 for b in msg2)
+
+            # The upload and the post both went to B, never to the active A.
+            assert upload_targets == [session_b], (
+                f"image upload must target origin B, got {upload_targets}"
+            )
+            assert all(sid != session_a for sid, _ in event_posts), (
+                f"a message leaked into the active session A: {event_posts}"
+            )
+        finally:
+            await browser.close()
+
+
 async def _drive_cross_session_routing(base_url: str, session_a: str, session_b: str) -> None:
     """Async body of the cross-session routing test. See the test docstring.
 
     :param base_url: Spawned server base URL.
-    :param session_a: The running session the user switches to.
+    :param session_a: The idle session the user switches to.
     :param session_b: The session both messages are composed in.
     """
     async with async_playwright() as pw:
@@ -125,8 +264,8 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
         try:
             # Every (session_id, text) POSTed to a /events endpoint.
             event_posts: list[tuple[str, str]] = []
-            # Released to let B's first POST (msg1) finally complete; until
-            # then it stays in flight and the send chain is stalled.
+            # Held so B's first POST stays in flight → the local send lifecycle
+            # keeps B "streaming", so the follow-up queues instead of sending.
             release_first = asyncio.Event()
             first_b_post_held = False
 
@@ -139,8 +278,8 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
                 body = request.post_data_json
                 text = body["data"]["content"][0]["text"]
                 event_posts.append((session_id, text))
-                # Hold ONLY B's first message open so a second send queues
-                # behind it on the chain while we switch sessions.
+                # Hold ONLY B's first message open, so B stays busy (streaming)
+                # while the follow-up is typed and queued.
                 if session_id == session_b and not first_b_post_held:
                     first_b_post_held = True
                     await release_first.wait()
@@ -152,56 +291,52 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
 
             await page.route("**/v1/sessions/*/events", handle_events)
 
-            # Start in session B (initial load may reload freely — the send
-            # chain only matters once we begin sending).
+            # Start in session B.
             await page.goto(f"{base_url}/c/{session_b}")
             # Locate the textarea by its stable aria-label, not the
-            # placeholder — the placeholder text changes once a turn starts
-            # streaming ("Send a follow-up (queued)…"), which would break a
-            # placeholder-pinned locator for the second send.
+            # placeholder — the placeholder changes once a turn starts
+            # streaming ("Send a follow-up (queued)…").
             composer = page.get_by_label("Message the agent")
-            # The "Ask the agent anything…" placeholder only renders in the
-            # idle/enabled state, so waiting on it confirms the chat surface
-            # is ready to accept input (not "Waiting for agents…").
             await page.get_by_placeholder(_COMPOSER_PLACEHOLDER).wait_for(
                 state="visible", timeout=15_000
             )
             send_button = page.get_by_role("button", name="Send", exact=True)
 
-            # msg1 → POST to B, held open by the route handler above.
+            # msg1 → POST to B, held open by the route handler → B stays busy.
             await composer.fill(_MSG1)
             await send_button.click()
             await _wait_until(lambda: first_b_post_held)
 
-            # msg2 → parked behind msg1 on the module-level send chain. The
-            # composer keeps a working Send button while it holds a draft.
+            # msg2 → typed while B is busy → held in B's client-side queue,
+            # shown in the docked strip, NOT POSTed.
             await composer.fill(_MSG2)
             await send_button.click()
-
-            # No msg2 POST has fired yet — it is blocked on the stalled chain.
-            # (If it had, serialization is broken and the repro is invalid.)
+            await page.get_by_test_id("composer-queued-strip").wait_for(
+                state="visible", timeout=15_000
+            )
             assert all(text != _MSG2 for _, text in event_posts), (
-                f"msg2 POSTed before the chain unblocked: {event_posts}"
+                f"msg2 was POSTed while queued (should be held client-side): {event_posts}"
             )
 
-            # Switch to the running session A via the sidebar link — a
-            # client-side navigation that preserves the JS send chain (a full
-            # page reload would reset it and dissolve the race).
+            # Switch to the idle session A via the sidebar link — a client-side
+            # navigation that preserves the store (a full reload would drop the
+            # queue).
             await page.locator(f'a[href="/c/{session_a}"]').click()
             await page.wait_for_url(re.compile(rf"/c/{re.escape(session_a)}"))
-
-            # Release B's first POST → the chain unblocks and msg2 is sent.
+            # Release B's first POST so its turn settles and B reads idle in the
+            # conversations cache — the trigger for background flush.
             release_first.set()
 
-            # msg2 must be delivered to B (origin), never to A (now active).
+            # Background flush now delivers the queued msg2 to B (its origin),
+            # even though A is the active session — the key guarantee. It must
+            # go to B, never to A.
             await _wait_until(lambda: any(text == _MSG2 for _, text in event_posts))
             msg2_targets = [sid for sid, text in event_posts if text == _MSG2]
             assert msg2_targets == [session_b], (
                 f"msg2 was composed in session B ({session_b}) and must be "
-                f"delivered there, but POST targets were {msg2_targets}. A "
-                f"target of {session_a} (session A) is the cross-session leak."
+                f"delivered there via background flush, but POST targets were "
+                f"{msg2_targets}."
             )
-            # And nothing leaked into the running session A at all.
             assert all(sid != session_a for sid, _ in event_posts), (
                 f"a message leaked into the active session A: {event_posts}"
             )

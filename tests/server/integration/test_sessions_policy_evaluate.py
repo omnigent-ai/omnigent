@@ -63,6 +63,25 @@ def _deny_bash_tool(event: dict[str, Any]) -> dict[str, Any]:
     return {"result": "ALLOW"}
 
 
+def _deny_bash_tool_result(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies tool RESULTS from Bash, scoped by tool name.
+
+    Reads the name from the container the engine populates, so it fires only
+    when the route resolved a tool name for this phase — which is what makes
+    the normalization of alternative wire spellings observable.
+
+    :param event: V0 event dict.
+    :returns: DENY for Bash tool results, ALLOW otherwise.
+    """
+    if event.get("type") != "tool_result":
+        return {"result": "ALLOW"}
+    # ``target`` is the resolved tool name in the V0 event dict.
+    if event.get("target") == "Bash":
+        return {"result": "DENY", "reason": "Bash results are blocked."}
+    return {"result": "ALLOW"}
+
+
 def _deny_sensitive_output(event: dict[str, Any]) -> dict[str, Any]:
     """
     Policy that denies tool results containing ``SECRET``.
@@ -516,6 +535,148 @@ async def test_evaluate_endpoint_passes_actor_to_policy(
     assert body["reason"] == "Blocked user"
 
 
+async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the server has stashed a turn-initiating actor for the session
+    (set at forward time from the human's verified ``created_by``), that
+    identity is used for policy evaluation instead of the HTTP request's
+    ``user_id`` (the runner's service-account credential).
+
+    No actor field in the request body is needed or trusted.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    # HTTP request carries the runner's service-account identity.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "runner-svc@example.com",
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Simulate the server persisting the turn-initiating human's identity
+    # (normally written by _forward_event_to_runner via set_labels).
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes.sessions import _TURN_ACTOR_LABEL
+
+    await asyncio.to_thread(
+        get_conversation_store().set_labels,
+        session_id,
+        {_TURN_ACTOR_LABEL: "blocked@test.com"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY", (
+        "persisted turn actor label should override the request user_id"
+    )
+    assert body["reason"] == "Blocked user"
+
+
+async def test_evaluate_body_actor_field_is_ignored(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A caller cannot spoof the policy actor by injecting ``context.actor``
+    into the event payload — the body field is ignored; only the
+    server-stashed turn actor (or the request ``user_id``) is used.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    # HTTP request is unauthenticated; no turn actor stashed server-side.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: None,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Caller tries to spoof actor via the event context body field.
+    payload = _tool_call_request("Read")
+    payload["event"]["context"] = {"actor": {"run_as": "blocked@test.com"}}
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+    assert resp.status_code == 200
+    # Policy should NOT fire — the body field is ignored, actor is None.
+    assert resp.json()["result"] == "POLICY_ACTION_ALLOW", (
+        "body-injected context.actor must not influence the policy actor"
+    )
+
+
+async def test_evaluate_falls_back_to_request_user_id_when_no_turn_actor(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When no turn actor is stashed (direct API callers, no-auth mode),
+    the HTTP request's ``user_id`` is used — no regression.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "blocked@test.com",
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY"
+    assert body["reason"] == "Blocked user"
+
+
 # ── Native ASK gate (URL-based elicitation) ──────────────────
 
 
@@ -712,15 +873,20 @@ def test_native_ask_gate_lock_keys_by_session_and_policy() -> None:
     """
     from omnigent.server.routes.sessions import _native_ask_gate_lock
 
-    lock_a = _native_ask_gate_lock("conv_1", "session_cost_guard")
+    lock_a = _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "session_cost_guard")
     # Same key → same lock: this is what makes parallel tool calls that
     # all trip one checkpoint share a single gate.
-    assert _native_ask_gate_lock("conv_1", "session_cost_guard") is lock_a
+    assert (
+        _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "session_cost_guard") is lock_a
+    )
     # Different policy on the same session → different lock, so a cost ask
     # and (say) a destructive-file ask can prompt concurrently.
-    assert _native_ask_gate_lock("conv_1", "other_policy") is not lock_a
+    assert _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "other_policy") is not lock_a
     # Different session → different lock, so sessions stay independent.
-    assert _native_ask_gate_lock("conv_2", "session_cost_guard") is not lock_a
+    assert (
+        _native_ask_gate_lock("19b2d8e5c4e1733f25034907cb7d05ed", "session_cost_guard")
+        is not lock_a
+    )
 
 
 async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
@@ -1015,3 +1181,181 @@ async def test_llm_response_allow_when_no_matching_policy(
     assert body["result"] in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"), (
         f"Expected ALLOW or UNSPECIFIED for no-policy session, got {body['result']}."
     )
+
+
+# The wire phases the evaluate route accepts, and whether ``event.data`` may
+# be a bare string on that phase. Both the guard and this table are derived
+# from the same rule, so a phase cannot be validated in production and left
+# out of the oracle — which is how null and empty-string survived a round.
+_EVALUATE_PHASES: tuple[tuple[str, bool], ...] = (
+    ("PHASE_TOOL_CALL", False),
+    ("PHASE_TOOL_RESULT", False),
+    ("PHASE_LLM_REQUEST", False),
+    ("PHASE_LLM_RESPONSE", False),
+    ("PHASE_REQUEST", True),
+)
+
+# Everything that is not an object, including the two that normalize to an
+# empty object rather than erroring. A non-empty list is included alongside
+# the empty one deliberately: both are non-dict and must be rejected the
+# same way, but a mutation that special-cased "falsy" values (None, False,
+# 0, "", []) while accepting any truthy non-dict would have passed with only
+# the empty list present — [] is falsy, [1] is not.
+_NON_OBJECT_DATA: tuple[tuple[object, str], ...] = (
+    (None, "null"),
+    (False, "false"),
+    (0, "zero"),
+    ("", "empty-string"),
+    ("a string", "raw-string"),
+    ([], "empty-list"),
+    ([1], "non-empty-list"),
+    (7, "int"),
+)
+
+
+def _valid_name_fields(phase: str) -> dict[str, object]:
+    """Fields that satisfy the tool-name rule for *phase*, if it has one."""
+    if phase == "PHASE_TOOL_RESULT":
+        return {"request_data": {"name": "Bash"}}
+    return {}
+
+
+def _malformed_evaluate_events() -> list[tuple[dict[str, object], str]]:
+    """Build the malformed-payload table from the rules being enforced.
+
+    Generated rather than hand-listed so neither rule can be covered for one
+    phase and missed for another — the defect this guard was written for, and
+    then repeated twice: once by validating raw ``data`` only on phases that
+    keep their tool name there, and once by accepting every falsy value that
+    normalizes to an empty object.
+    """
+    cases: list[tuple[dict[str, object], str]] = [
+        ({"type": ["not", "hashable"]}, "unhashable event.type"),
+    ]
+    for phase, allows_string in _EVALUATE_PHASES:
+        for bad, why in _NON_OBJECT_DATA:
+            if allows_string and isinstance(bad, str):
+                continue  # a legitimate wire form on this phase
+            event: dict[str, object] = {"type": phase, **_valid_name_fields(phase)}
+            if bad is not None:
+                event["data"] = bad
+            cases.append((event, f"{why} data on {phase}"))
+    cases += [
+        ({"type": "PHASE_TOOL_CALL", "data": {}}, "no name key in TOOL_CALL data"),
+        ({"type": "PHASE_TOOL_CALL", "data": {"name": ""}}, "empty TOOL_CALL name"),
+        ({"type": "PHASE_TOOL_CALL", "data": {"name": 7}}, "non-string TOOL_CALL name"),
+        ({"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}}, "no name source at all"),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "request_data": {"name": ""}},
+            "empty request_data.name and no target",
+        ),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "target": ""},
+            "empty target and no request_data",
+        ),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "request_data": "a string"},
+            "non-object request_data with no target",
+        ),
+        (
+            {"type": "PHASE_TOOL_CALL", "data": {"name": "Bash"}, "context": 7},
+            "non-object context",
+        ),
+    ]
+    return cases
+
+
+@pytest.mark.asyncio
+async def test_policy_evaluate_rejects_malformed_event_shapes(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Malformed hook payloads must be rejected with a structured 400.
+
+    Every falsy ``data`` here used to normalize to ``{}`` before validation
+    and return 200/ALLOW — on a tool phase that means tool-name-scoped
+    policies were skipped entirely on a BLOCKING hook, which is worse than
+    the 500s the earliest guards were added for. The phase strings are the
+    wire values (``PHASE_*``); using the internal names short-circuits at the
+    unknown-type check and never reaches these guards, so the suite once
+    stayed green with the validation deleted.
+
+    One session for the whole table: each case is an independent request, so a
+    fresh session per case bought nothing but setup time. Every acceptance is
+    collected before asserting, so one run reports every case that regressed,
+    and the structured error code is checked rather than the status alone.
+    """
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="malformed-events")
+    accepted: list[str] = []
+    for event, why in _malformed_evaluate_events():
+        resp = await client.post(
+            f"/v1/sessions/{snap['id']}/policies/evaluate",
+            json={"event": event},
+        )
+        if resp.status_code != 400:
+            accepted.append(f"{why}: {resp.status_code} {resp.text[:120]}")
+            continue
+        body = resp.json()
+        code = (body.get("error") or {}).get("code") if isinstance(body, dict) else None
+        if code != "invalid_input":
+            accepted.append(f"{why}: 400 but code={code!r}")
+    assert not accepted, "malformed payloads accepted:\n" + "\n".join(accepted)
+
+
+@pytest.mark.asyncio
+async def test_policy_evaluate_gates_every_first_party_tool_result_shape(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Both established spellings of the tool name are accepted AND gated.
+
+    Requiring ``request_data.name`` rejected the OpenCode plugin's shape,
+    which sends the tool in ``event.target`` — and that producer converts any
+    non-2xx into ALLOW, so a stricter guard silently disabled its policies
+    instead of tightening them.
+
+    Asserting a 200 would not be enough: the guard could accept the shape
+    while the engine still saw no tool name, leaving tool-scoped policies
+    skipped exactly as before. A tool-scoped DENY is asserted instead, so the
+    resolved name has to reach the container the engine reads.
+    """
+    deny_policy = FunctionPolicySpec(
+        name="admin__deny_bash_result",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool_result"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[deny_policy],
+        ),
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    shapes = {
+        "request_data.name (claude-native, tool dispatch)": {
+            "type": "PHASE_TOOL_RESULT",
+            "data": {"result": "ok"},
+            "request_data": {"name": "Bash"},
+        },
+        "target (opencode plugin)": {
+            "type": "PHASE_TOOL_RESULT",
+            "data": {"result": "ok"},
+            "target": "Bash",
+        },
+    }
+    for why, event in shapes.items():
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json={"event": event},
+        )
+        assert resp.status_code == 200, f"{why}: {resp.status_code} {resp.text[:160]}"
+        assert resp.json()["result"] == "POLICY_ACTION_DENY", (
+            f"{why}: the tool-scoped policy did not see a tool name — {resp.text[:160]}"
+        )

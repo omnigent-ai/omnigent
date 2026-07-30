@@ -13,6 +13,7 @@ import shutil
 import socket
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,7 @@ from omnigent.codex_native_app_server import (
     client_for_transport,
     codex_session_meta_model_provider,
     codex_terminal_env,
+    normalize_codex_permission_launch_args,
     preload_codex_thread_for_resume,
     resolve_native_codex_launch,
 )
@@ -60,12 +62,19 @@ from omnigent.codex_native_forwarder import supervise_forwarder
 from omnigent.codex_native_state import read_launch_state, write_launch_state
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HARNESS_NEEDS_AUTH,
+    HARNESS_VERSION_TOO_LOW,
+    HarnessUnavailableReason,
+)
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -77,6 +86,9 @@ from omnigent.native_terminal import (
 )
 from omnigent.native_terminal import (
     bind_session_runner as _bind_session_runner,
+)
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
@@ -105,6 +117,146 @@ _UNBOUND_RUNNER_MESSAGE_FRAGMENT = "not bound to a runner"
 # hex + hyphens keeps it safe to interpolate into a rollout filename and a
 # ``codex resume`` argument (no path separators / traversal).
 _CODEX_THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
+
+
+@dataclass(frozen=True)
+class _CodexAuthSource:
+    """Resolved source for Codex authentication material."""
+
+    auth_path: Path
+
+
+def _resolve_codex_auth_source() -> _CodexAuthSource:
+    """
+    Resolve the local Codex auth source used for availability checks.
+
+    This is the seam for future managed credentials: once Omnigent can provide
+    centrally managed Codex credentials, this resolver can return that source
+    instead. For now it deliberately defaults to Codex's local ``auth.json`` via
+    the same ``CODEX_HOME`` source resolver used when launching native Codex, so
+    inherited private Omnigent homes map back to the user's real Codex home.
+
+    :returns: Local Codex auth source to inspect synchronously.
+    """
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+    return _CodexAuthSource(auth_path=_codex_home_config_source_from_env() / "auth.json")
+
+
+def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
+    """Return whether ``auth.json`` parses and carries a usable credential.
+
+    Presence-based by design. A real Codex ``auth.json`` (see the openai/codex
+    ``AuthDotJson`` shape) is one of:
+
+    * **API-key** auth — a top-level ``OPENAI_API_KEY`` (or a
+      ``personal_access_token`` from ``codex login --with-access-token``).
+    * **ChatGPT / OAuth** auth — a ``tokens`` object holding ``access_token`` /
+      ``refresh_token`` (and an ``id_token``).
+
+    There is intentionally **no expiry judgement**. Codex stores no top-level
+    expiry field; ChatGPT-mode access tokens are short-lived JWTs that Codex
+    silently refreshes via the long-lived ``refresh_token`` (recorded in
+    ``last_refresh``), so an "expired" ``access_token`` is the normal
+    between-refresh state, not a deauth. Whether the ``refresh_token`` itself is
+    still valid is server-side and opaque, so this local-only, side-effect-free
+    check only asks whether a credential is *configured* — not whether it would
+    authenticate. A revoked/truly-expired session can therefore still surface as
+    available and fail at run time; catching that needs a network probe, which
+    is out of scope here.
+
+    :param auth_path: Path to the Codex ``auth.json``.
+    :returns: ``True`` when the file parses and contains a credential field;
+        ``False`` when it is missing, malformed, or carries no credential.
+    """
+    try:
+        raw = auth_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+
+    for key in ("OPENAI_API_KEY", "personal_access_token"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        for field in ("access_token", "refresh_token"):
+            value = tokens.get(field)
+            if isinstance(value, str) and value.strip():
+                return True
+    return False
+
+
+def _find_codex_cli() -> str | None:
+    """Return the resolved path to the Codex CLI binary, if any."""
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.onboarding.harness_install import OPENAI_FAMILY, harness_install_spec
+
+    spec = harness_install_spec(OPENAI_FAMILY)
+    if spec is None:
+        return None
+    return resolve_cli_binary(spec.binary)
+
+
+def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
+    """
+    Return why local Codex is unavailable, or ``None`` when available.
+
+    Readiness must ask the same question the launch resolver answers, not read a
+    credential file the launch ignores. :func:`resolve_native_codex_launch`
+    routes a Databricks-gateway / provider-configured setup through a Databricks
+    profile or a ``model_provider`` override and mints its bearer at run time
+    (``databricks auth token`` / a provider auth command) — it never reads
+    ``auth.json``. So on such a host ``auth.json`` is legitimately empty, and
+    gating on it is a false negative (the launch works). Only when the launch
+    defers to Codex's *own* login is ``auth.json`` the credential that decides
+    availability, so that is the only case gated on it. This mirrors the
+    fail-open the ``claude-sdk`` / ``openai-agents`` gateway harnesses already
+    rely on: their gateway token is a runtime mint the daemon can't observe.
+
+    The check stays synchronous, side-effect free, and local: it resolves the
+    launch (local config reads) and, only on the defer-to-login path, inspects
+    the local auth source. It never runs ``codex login``, a status command, or a
+    network probe; any resolver failure fails safe onto the ``auth.json`` check.
+
+    :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
+        when the launch would defer to Codex's own login but ``auth.json`` is
+        missing, malformed, or carries no credential, and ``None`` when a
+        provider will route the launch or a login credential is configured.
+        Token *validity* (revoked/expired refresh, an unreachable gateway) is
+        not judged locally — it surfaces at the first turn via the executor.
+    """
+    from omnigent.onboarding.harness_install import (
+        OPENAI_FAMILY,
+        harness_cli_installed,
+    )
+
+    if _find_codex_cli() is None:
+        return HARNESS_BINARY_MISSING
+    if not harness_cli_installed(OPENAI_FAMILY):
+        return HARNESS_VERSION_TOO_LOW
+    # On a host with no configured provider this may run ambient detection.
+    # configured_harness_map shares one probe across all Codex aliases.
+    try:
+        launch = resolve_native_codex_launch(model=None)
+        routes_through_provider = (
+            launch.profile is not None or codex_session_meta_model_provider(launch) != "openai"
+        )
+    except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
+        _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
+        routes_through_provider = False
+    if routes_through_provider:
+        return None
+    source = _resolve_codex_auth_source()
+    if not _codex_auth_json_has_available_credential(source.auth_path):
+        return HARNESS_NEEDS_AUTH
+    return None
 
 
 def _update_startup_progress(
@@ -199,7 +351,8 @@ def run_codex_native(
     *,
     server: str | None,
     session_id: str | None,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    codex_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str = _DEFAULT_CODEX_COMMAND,
     model: str | None = None,
@@ -223,6 +376,9 @@ def run_codex_native(
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup fails.
     """
+    codex_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=codex_args, legacy_param="codex_args"
+    )
     resolved_command = command.strip()
     if not resolved_command:
         raise click.ClickException("Codex command must not be empty.")
@@ -398,21 +554,11 @@ def _materialize_codex_agent_spec(
         },
         # Declare a default shell terminal so the relay advertises the
         # ``sys_terminal_*`` family to the wrapped codex (the relay's
-        # gate is a non-empty ``terminals:`` block on this spec).
-        # Caller process / no sandbox matches the ``os_env`` stance
-        # above — the native CLI already runs unsandboxed on the
-        # user's workspace.
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # gate is a non-empty ``terminals:`` block on this spec). Its
+        # command follows the user's ``$SHELL`` (zsh/fish/bash); caller
+        # process / no sandbox matches the ``os_env`` stance above — the
+        # native CLI already runs unsandboxed on the user's workspace.
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path
@@ -964,6 +1110,7 @@ async def _prepare_codex_terminal(
                 workspace=Path.cwd().resolve(),
                 model_provider=codex_session_meta_model_provider(_codex_launch),
                 codex_path=command,
+                terminal_launch_args=codex_args,
             )
         # Listen on a loopback WebSocket, mirroring the host-spawned
         # runner (``runner/app.py`` ``_auto_create_codex_terminal``).
@@ -999,7 +1146,11 @@ async def _prepare_codex_terminal(
                 )
                 await event_client.connect()
             else:
-                await preload_codex_thread_for_resume(codex_ws_url, thread_id)
+                await preload_codex_thread_for_resume(
+                    codex_ws_url,
+                    thread_id,
+                    terminal_launch_args=codex_args,
+                )
                 write_bridge_state(
                     bridge_dir,
                     CodexNativeBridgeState(
@@ -1595,6 +1746,7 @@ async def _ensure_local_codex_resume_rollout(
     workspace: Path,
     model_provider: str,
     codex_path: str | None,
+    terminal_launch_args: Sequence[str] | None = None,
 ) -> Path:
     """
     Ensure Codex has a local rollout JSONL for cold resume.
@@ -1628,6 +1780,7 @@ async def _ensure_local_codex_resume_rollout(
         codex >= 0.133 requires the field to be *present* to parse the
         rollout, but treats the value as informational, so a flaky probe
         must not cost the carried history.
+    :param terminal_launch_args: Persisted Codex approval/sandbox launch args.
     :returns: Path to the existing or written rollout.
     :raises click.ClickException: If Omnigent history cannot be fetched or the
         rollout cannot be written, or if the persisted Codex thread id is
@@ -1657,6 +1810,7 @@ async def _ensure_local_codex_resume_rollout(
         cwd=workspace,
         model_provider=model_provider,
         cli_version=cli_version or "0.0.0",
+        terminal_launch_args=terminal_launch_args,
     )
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
@@ -1761,6 +1915,7 @@ def _codex_rollout_records_from_session_items(
     cwd: Path,
     model_provider: str,
     cli_version: str,
+    terminal_launch_args: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Convert Omnigent session items into Codex rollout JSONL records.
@@ -1790,9 +1945,13 @@ def _codex_rollout_records_from_session_items(
         e.g. ``"omnigent_databricks"``.
     :param cli_version: Codex CLI version string for
         ``session_meta.cli_version``, e.g. ``"0.136.0"``.
+    :param terminal_launch_args: Persisted Codex approval/sandbox launch args.
     :returns: Codex rollout record dictionaries.
     """
     timestamp = _codex_rollout_timestamp()
+    turn_context_policy_fields = _codex_turn_context_policy_fields_from_launch_args(
+        terminal_launch_args
+    )
     records: list[dict[str, Any]] = [
         {
             "timestamp": timestamp,
@@ -1812,6 +1971,30 @@ def _codex_rollout_records_from_session_items(
     for index, item in enumerate(items):
         if _session_item_response_id(item) in interrupted_response_ids:
             continue
+        # Compaction items carry the post-compaction context. Emit a
+        # Compacted rollout record and discard all prior records — the
+        # replacement_history replaces them.
+        if item.get("type") == "compaction":
+            compacted_msgs = item.get("compacted_messages")
+            if compacted_msgs:
+                compacted_record: dict[str, Any] = {
+                    "timestamp": timestamp,
+                    "type": "compacted",
+                    "payload": {
+                        "message": item.get("summary", ""),
+                        "replacement_history": compacted_msgs,
+                    },
+                }
+                w_id = item.get("window_id")
+                if w_id is not None:
+                    compacted_record["payload"]["window_id"] = w_id
+                # Replace all prior response_item records — the
+                # replacement_history is the new context baseline.
+                # Keep only session_meta and turn_context records.
+                records = [r for r in records if r.get("type") in ("session_meta",)]
+                records.append(compacted_record)
+                seen_turn_ids.clear()
+            continue
         payload = _codex_response_item_from_session_item(item)
         if payload is None:
             continue
@@ -1829,7 +2012,7 @@ def _codex_rollout_records_from_session_items(
                     "payload": {
                         "turn_id": turn_id,
                         "cwd": str(cwd),
-                        "approval_policy": "on-request",
+                        **turn_context_policy_fields,
                     },
                 }
             )
@@ -1845,6 +2028,48 @@ def _codex_rollout_records_from_session_items(
         if event_msg is not None:
             records.append(event_msg)
     return records
+
+
+def _codex_turn_context_policy_fields_from_launch_args(
+    terminal_launch_args: Sequence[str] | None,
+) -> dict[str, Any]:
+    """Return rollout policy fields matching persisted Codex launch args."""
+    approval_policy = "on-request"
+    sandbox_mode: str | None = None
+    args = normalize_codex_permission_launch_args(terminal_launch_args)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            approval_policy = "never"
+            sandbox_mode = "danger-full-access"
+        elif arg in ("--ask-for-approval", "-a") and i + 1 < len(args):
+            approval_policy = args[i + 1]
+            i += 1
+        elif arg.startswith("--ask-for-approval="):
+            approval_policy = arg.split("=", 1)[1]
+        elif arg in ("--sandbox", "-s") and i + 1 < len(args):
+            sandbox_mode = args[i + 1]
+            i += 1
+        elif arg.startswith("--sandbox="):
+            sandbox_mode = arg.split("=", 1)[1]
+        elif arg in ("--config", "-c") and i + 1 < len(args):
+            key, _, value = args[i + 1].partition("=")
+            if key == "approval_policy":
+                approval_policy = value.strip().strip('"')
+            elif key == "sandbox_mode":
+                sandbox_mode = value.strip().strip('"')
+            elif (
+                key == "default_permissions"
+                and value.strip().strip('"').strip("'") == ":danger-full-access"
+            ):
+                sandbox_mode = "danger-full-access"
+            i += 1
+        i += 1
+    fields: dict[str, Any] = {"approval_policy": approval_policy}
+    if sandbox_mode in {"read-only", "workspace-write", "danger-full-access"}:
+        fields["sandbox_policy"] = {"type": sandbox_mode}
+    return fields
 
 
 def _codex_event_msg_record_for_message(

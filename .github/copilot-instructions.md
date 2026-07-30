@@ -50,7 +50,7 @@ Most backend areas mirror their source directory under `tests/`:
 
 ## Frontend Test Coverage
 
-A pull request that changes behaviour under `ap-web/` should add or update a
+A pull request that changes behaviour under `web/` should add or update a
 **colocated Vitest unit test** — a `*.test.ts` or `*.test.tsx` file beside the
 component or module it touches. If a behaviour change ships without one, flag it.
 
@@ -58,6 +58,10 @@ component or module it touches. If a behaviour change ships without one, flag it
   under `tests/e2e_ui/`. That requirement is already enforced by the
   `E2E UI Required` status check, so do not re-flag it here — focus the review
   on the colocated unit test.
+- A UI / frontend PR should also include a **video or images** in the `Demo`
+  section of the PR description (with the "UI / frontend change" box checked).
+  If a UI PR has an empty Demo section, flag it as a request for a screenshot
+  or recording.
 - Do not ask for a test for styling/formatting-only changes, copy tweaks with
   no flow change, type-only changes, dependency bumps, or refactors with no
   observable behaviour change.

@@ -2,11 +2,11 @@
 ASK flow + LabelDef schema validation composition tests.
 
 Verifies that the schema checks engine.apply_label_writes
-performs (POLICIES.md §10 — values whitelist + monotonic
-direction) ALSO apply to writes that get approved through
-the ASK cycle. Without this, a policy could "launder" an
-invalid label write by emitting it only on ASK (where the
-engine defers the write to post-approval apply).
+performs (POLICIES.md §10 — values whitelist) ALSO apply
+to writes that get approved through the ASK cycle. Without
+this, a policy could "launder" an invalid label write by
+emitting it only on ASK (where the engine defers the write
+to post-approval apply).
 
 Load-bearing: the omnigent parity promise is that the
 same label write rules apply regardless of which path
@@ -91,64 +91,6 @@ async def _drive_ask(
     )
 
 
-# ── ASK + monotonic enforcement ────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_ask_approve_respects_monotonic_drop(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """A policy ASKs to write integrity="1" on a
-    decreasing-monotonic label that's already "0". Even if
-    the user APPROVES, the engine's apply_label_writes drops
-    the violation.
-
-    If this regresses, an ASK-path approval could undo taint
-    in a way that direct ALLOW cannot — breaking IFC parity
-    between the two paths."""
-    policy = make_fixed_policy(
-        name="try_untaint",
-        on=[PhaseSelector(phase=Phase.REQUEST)],
-        action=PolicyAction.ASK,
-        reason="untaint",
-        set_labels={"integrity": "1"},  # attempting to restore
-    )
-    conv = conversation_store.create_conversation()
-    engine = PolicyEngine(
-        policies=[policy],
-        label_defs={
-            "integrity": LabelDef(
-                values=["0", "1"],
-                monotonic="decreasing",
-            ),
-        },
-        ask_timeout=30,
-        conversation_id=conv.id,
-        # Pre-tainted — integrity already at "0".
-        initial_labels={"integrity": "0"},
-        conversation_store=conversation_store,
-    )
-
-    # Pre-seed the store so we can check persisted state
-    # matches the hot cache.
-    conversation_store.set_labels(conv.id, {"integrity": "0"})
-
-    approved = await _drive_ask(
-        engine,
-        EvaluationContext(phase=Phase.REQUEST, content="x"),
-        '{"action": "accept"}',
-    )
-    # User approved, but the write violated monotonic → dropped.
-    assert approved is True
-    # Hot cache unchanged — "1" was dropped.
-    assert engine.labels["integrity"] == "0"
-    # Persisted state matches — the drop prevented the
-    # rogue "1" from overwriting the stored "0".
-    conv_refetch = conversation_store.get_conversation(conv.id)
-    assert conv_refetch is not None
-    assert conv_refetch.labels["integrity"] == "0"
-
-
 @pytest.mark.asyncio
 async def test_ask_approve_respects_enum_constraint(
     conversation_store: SqlAlchemyConversationStore,
@@ -197,7 +139,7 @@ async def test_ask_approve_mixed_valid_invalid_batch(
         action=PolicyAction.ASK,
         reason="approve",
         set_labels={
-            "integrity": "1",  # monotonic violation
+            "integrity": "rogue",  # out-of-enum violation
             "role": "admin",  # valid
             "schemaless": "free",  # unknown key, set freely
         },
@@ -206,10 +148,7 @@ async def test_ask_approve_mixed_valid_invalid_batch(
     engine = PolicyEngine(
         policies=[policy],
         label_defs={
-            "integrity": LabelDef(
-                values=["0", "1"],
-                monotonic="decreasing",
-            ),
+            "integrity": LabelDef(values=["0", "1"]),
             "role": LabelDef(values=["admin", "user"]),
         },
         ask_timeout=30,
@@ -224,7 +163,7 @@ async def test_ask_approve_mixed_valid_invalid_batch(
         '{"action": "accept"}',
     )
     assert approved is True
-    # integrity stays at 0 (monotonic drop).
+    # integrity stays at 0 (out-of-enum drop).
     # role lands (valid enum value).
     # schemaless lands (unknown key = free write).
     assert engine.labels == {

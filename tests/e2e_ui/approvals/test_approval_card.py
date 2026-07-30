@@ -2,7 +2,7 @@
 
 When a tool call trips a policy that returns ASK, the runner forwards the
 gate to the server, which publishes a ``response.elicitation_request`` the
-chat renders as an ``ApprovalCard`` (``ap-web/src/components/blocks/
+chat renders as an ``ApprovalCard`` (``web/src/components/blocks/
 ApprovalCard.tsx``). This test drives the full loop on the openai-agents
 harness: send a turn that makes the agent attempt a gated ``git push``,
 wait for the pending card, click **Approve**, and assert the card flips to

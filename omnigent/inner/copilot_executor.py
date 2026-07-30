@@ -21,15 +21,25 @@ handlers *in its own event loop* (``CopilotSession._execute_tool_and_respond``),
 so the bridged handler is a plain coroutine that ``await``\\s ``_tool_executor``
 directly — no ``run_coroutine_threadsafe`` hop.
 
-Known limitation — Copilot's **native** tools (its own ``create`` / ``view`` /
-``edit`` / ``bash``) run *inside* the SDK and never flow through Omnigent's
-bridged-tool dispatch, so (a) they are NOT gated by ``on:[tool_call]`` policies
-(e.g. ``blast_radius``) and (b) they leave no ``function_call`` item in the
-persisted transcript — only the streamed narration is recorded. This mirrors the
-cursor harness's built-in tools. Bridged ``sys_*`` tools ARE policy-gated and
-recorded. Don't rely on ``on:[tool_call]`` guardrails to constrain Copilot's
-built-in file/shell tools; gate at the LLM phase (``PHASE_LLM_REQUEST`` /
-``PHASE_LLM_RESPONSE``, which DO fire) or via the OS-env sandbox instead.
+Native tools — Copilot's built-in ``create`` / ``view`` / ``edit`` / ``bash`` run
+*inside* the SDK rather than through Omnigent's bridged-tool dispatch. They are
+gated through a two-stage check inside the SDK ``on_permission_request`` handler
+(:meth:`CopilotExecutor._on_permission_request`, parity with the cursor harness):
+
+1. **Policy hard-deny**: if the policy evaluator returns ``POLICY_ACTION_DENY``
+   the call is rejected immediately (the model sees the denial and continues,
+   rather than aborting the whole turn).
+2. **User elicitation**: for any other outcome (ALLOW, ASK, or no evaluator
+   wired), ``_elicitation_handler`` is invoked so the user can approve or
+   reject from the web-UI approval card. If no handler is wired (single-process
+   / pre-turn paths) the call is approved, preserving prior behavior.
+
+Native tool calls still leave no ``function_call`` item in the persisted
+transcript — only the streamed narration is recorded — so an ``on:[tool_call]``
+guardrail won't *see* them as items, but the policy IS evaluated for them at
+permission time. Bridged ``sys_*`` tools are gated + recorded server-side via
+``_tool_executor`` (and registered ``skip_permission=True``, so they never reach
+the permission handler).
 
 Auth: a **GitHub token** that carries Copilot access — a fine-grained PAT with
 the "Copilot Requests" permission, or an OAuth token from the GitHub CLI (``gh``)
@@ -56,9 +66,11 @@ from pathlib import Path
 from typing import Any, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.reasoning_effort import COPILOT_EFFORTS, validate_effort
 
 from .datamodel import OSEnvSpec
 from .executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -114,6 +126,36 @@ def _resolve_model(model: str | None) -> str | None:
             )
         return None
     return model
+
+
+def _resolve_reasoning_effort(config: ExecutorConfig | None) -> str | None:
+    """Resolve the per-turn Copilot reasoning effort from ``config.extra``.
+
+    The runtime adapter threads a web ``/reasoning`` pick into
+    ``config.extra["reasoning_effort"]`` (see
+    :class:`~omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`).
+    The Copilot SDK exposes it only as ``create_session(reasoning_effort=...)``,
+    so like the model it is fixed at session creation (a change recreates the
+    session in :meth:`run_turn`). ``None`` lets the model use its default.
+
+    A value Copilot can't honor is dropped with a warning rather than raising:
+    an unsupported effort must not sink the whole turn (parity with the codex
+    native path). Per-model support is enforced by the Copilot backend.
+
+    Note: ``config.extra`` may also carry ``max_tokens`` (set by the adapter),
+    but the Copilot SDK has no per-turn output-token cap — the only
+    ``max_output_tokens`` lever is a model *capability* override folded into
+    context-window math, not a generation limit — so it is intentionally not
+    forwarded here.
+    """
+    if config is None:
+        return None
+    raw_effort = config.extra.get("reasoning_effort")
+    try:
+        return validate_effort(raw_effort, "copilot", COPILOT_EFFORTS)
+    except ValueError:
+        logger.warning("Ignoring unsupported copilot reasoning effort: %r", raw_effort)
+        return None
 
 
 def _tools_fingerprint(tools: list[ToolSpec]) -> str:
@@ -227,6 +269,7 @@ class _CopilotSessionState:
     session: Any = None  # copilot.CopilotSession
     system_prompt: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
     # call_id -> tool name, populated on TOOL_EXECUTION_START so the matching
@@ -279,6 +322,10 @@ class CopilotExecutor(Executor):
         # PHASE_LLM_RESPONSE policies (the same round-trip pi / claude-sdk /
         # cursor use). ``None`` on single-process / pre-turn paths (no-op).
         self._policy_evaluator: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
+        # Installed by the runtime adapter; surfaces native-tool calls to the
+        # user via the web-UI elicitation approval card. ``None`` when no
+        # handler is wired (single-process / test paths → default approve).
+        self._elicitation_handler: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
 
     def supports_streaming(self) -> bool:
         return True
@@ -376,12 +423,59 @@ class CopilotExecutor(Executor):
 
     # -- session lifecycle --------------------------------------------------
 
+    async def _on_permission_request(self, request: Any, _invocation: dict[str, str]) -> Any:  # type: ignore[explicit-any]
+        """Gate a Copilot NATIVE-tool permission request through policy + elicitation.
+
+        Installed as ``create_session(on_permission_request=...)``. The SDK awaits
+        this in its own event loop, so it ``await``\\s ``_policy_evaluator`` and
+        ``_elicitation_handler`` directly (no thread hop). Only Copilot's built-in
+        tools (``bash`` / ``edit`` / ``view`` / ``create`` / ``url``) reach here;
+        bridged ``sys_*`` tools are registered ``skip_permission=True`` and are
+        gated + recorded server-side via ``_tool_executor`` instead.
+
+        Two-stage gate (parity with the cursor harness):
+
+        1. **Policy hard-deny**: if the policy evaluator returns
+           ``POLICY_ACTION_DENY``, reject immediately without prompting the user.
+           The model sees the denial and continues (individual call blocked, not
+           the whole turn).
+        2. **User elicitation**: for any other outcome (ALLOW, ASK, or no
+           evaluator wired), invoke ``_elicitation_handler`` so the user can
+           approve or reject from the web-UI card. When no handler is wired
+           (single-process / pre-turn paths) the call is approved by default,
+           preserving prior behavior.
+        """
+        from copilot.rpc import (  # lazy: optional dependency
+            PermissionDecisionApproveOnce,
+            PermissionDecisionReject,
+        )
+
+        name, args = _permission_policy_input(request)
+
+        # Stage 1 — hard policy deny: block immediately, no elicitation.
+        evaluator = self._policy_evaluator
+        if evaluator is not None:
+            verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
+            if getattr(verdict, "action", "") == "POLICY_ACTION_DENY":
+                reason = getattr(verdict, "reason", "") or "blocked by policy"
+                return PermissionDecisionReject(feedback=f"Denied by Omnigent policy: {reason}")
+
+        # Stage 2 — user elicitation: surface an approval card.
+        handler = self._elicitation_handler
+        if handler is not None:
+            approved = await handler(name, args)
+            if not approved:
+                return PermissionDecisionReject(feedback="Denied via Omnigent approval UI")
+
+        return PermissionDecisionApproveOnce()
+
     async def _ensure_session(
         self,
         state: _CopilotSessionState,
         model: str | None,
         tools: list[ToolSpec],
         system_prompt: str,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Start the SDK client and create the session if not already live.
 
@@ -392,12 +486,14 @@ class CopilotExecutor(Executor):
         if state.session is not None:
             return
         try:
-            from copilot import CopilotClient, PermissionHandler
+            from copilot import CopilotClient
         except ImportError as exc:
+            from omnigent.onboarding.copilot_auth import COPILOT_EXTRA
+            from omnigent.onboarding.extra_install import extra_install_display
+
             raise ImportError(
                 "CopilotExecutor requires the 'github-copilot-sdk' package. "
-                "Install it with: uv pip install github-copilot-sdk "
-                "(or `pip install 'omnigent[copilot]'`)."
+                f"Install it with: {extra_install_display(COPILOT_EXTRA)}"
             ) from exc
 
         # The Copilot SDK rejects a relative working_directory ("Directory path
@@ -428,8 +524,9 @@ class CopilotExecutor(Executor):
                 streaming=True,
                 system_message=system_message,
                 tools=self._make_tools(tools) or None,
-                on_permission_request=PermissionHandler.approve_all,
+                on_permission_request=self._on_permission_request,
                 working_directory=cwd,
+                reasoning_effort=reasoning_effort or None,
             )
         except BaseException:
             await _safe_stop(client)
@@ -446,15 +543,18 @@ class CopilotExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         session_key = self._session_key(messages)
         model = _resolve_model((config.model if config else None) or self._model_override)
+        reasoning_effort = _resolve_reasoning_effort(config)
         tools_fp = _tools_fingerprint(tools)
         state = self._session_states.setdefault(session_key, _CopilotSessionState())
 
-        # System prompt, model, and tool set are all fixed at session creation,
-        # so a change to any of them means a fresh session (otherwise a changed
-        # tool set would leave the initial ``tools`` stale for the conversation).
+        # System prompt, model, reasoning effort, and tool set are all fixed at
+        # session creation, so a change to any of them means a fresh session
+        # (otherwise a changed tool set would leave the initial ``tools`` stale
+        # for the conversation, and a new ``/reasoning`` pick would never apply).
         if state.session is not None and (
             state.system_prompt != system_prompt
             or state.model != model
+            or state.reasoning_effort != reasoning_effort
             or state.tools_fingerprint != tools_fp
         ):
             await self._close_state(state)
@@ -463,10 +563,11 @@ class CopilotExecutor(Executor):
         is_first_turn = not state.has_sent_prompt
         state.system_prompt = system_prompt
         state.model = model
+        state.reasoning_effort = reasoning_effort
         state.tools_fingerprint = tools_fp
 
         try:
-            await self._ensure_session(state, model, tools, system_prompt)
+            await self._ensure_session(state, model, tools, system_prompt, reasoning_effort)
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
             await self.close_session(session_key)
             yield ExecutorError(message=f"Failed to start copilot-sdk session: {exc}")
@@ -580,6 +681,32 @@ class CopilotExecutor(Executor):
                 turn_error = str(
                     data.get("message") or data.get("errorMessage") or "copilot session error"
                 )
+            elif etype.endswith("SESSION_COMPACTION_COMPLETE"):
+                # The Copilot SDK auto-compacted the session's context window.
+                # Surface it as a CompactionComplete so the runner persists a
+                # compaction item and a resumed session gets the pre-compacted
+                # summary instead of replaying the full transcript (parity with
+                # claude-sdk / openai-agents). Only a *successful* compaction
+                # counts; ``success`` is False on a failed/aborted attempt.
+                if data.get("success"):
+                    post_tokens = data.get("postCompactionTokens")
+                    yield CompactionComplete(
+                        # Copilot uniquely reports the real summary text; fall
+                        # back to a synthetic placeholder like the peers do.
+                        summary=str(
+                            data.get("summaryContent")
+                            or "[GitHub Copilot compaction: context was automatically compacted]"
+                        ),
+                        # Post-compaction context size (same semantic as the
+                        # peers' ``context_tokens``).
+                        token_count=(
+                            int(post_tokens) if isinstance(post_tokens, (int, float)) else 0
+                        ),
+                        model=usage_model or model,
+                        # The event carries no message list; resume falls back to
+                        # the summary (allowed by the field's contract).
+                        compacted_messages=None,
+                    )
 
         try:
             while True:
@@ -666,9 +793,22 @@ class CopilotExecutor(Executor):
         state = self._session_states.get(session_key)
         if state is None:
             return False
-        # Drop the session so the next turn starts a fresh one — mirrors the
-        # cursor / pi executors (a resumed turn would bypass the runner's
-        # interrupt marker).
+        # Best-effort SDK abort first, to cleanly cancel the in-flight turn on
+        # the bundled CLI *before* teardown. ``session.abort()`` is the SDK's
+        # blessed cancel (it keeps the session valid), so it stops the next
+        # ``stop()`` from racing a live generation — which can orphan the CLI's
+        # tool subprocesses or dump a post-cancel stream. Mirrors pi / claude-sdk.
+        if state.session is not None:
+            try:
+                await asyncio.wait_for(state.session.abort(), timeout=0.5)
+            except Exception as exc:  # noqa: BLE001 — abort is best-effort
+                logger.debug("CopilotExecutor: interrupt abort failed: %s", exc)
+        # Always drop the session so the next turn starts a fresh one — mirrors
+        # the cursor / pi executors. A resumed Copilot session sends only the
+        # latest user message (see ``_build_copilot_prompt``), which would bypass
+        # the runner's "[System: interrupted]" marker and silently continue the
+        # abandoned request; a fresh session replays full history (marker
+        # included). See ``claude_sdk_executor.interrupt_session`` for the rationale.
         try:
             await self.close_session(session_key)
             return True
@@ -710,6 +850,23 @@ def _coerce_args(raw: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _permission_policy_input(request: Any) -> tuple[str, dict[str, Any]]:  # type: ignore[explicit-any]
+    """Map a Copilot ``PermissionRequest`` variant to a (name, arguments) policy input.
+
+    The permission-request union is non-uniform: only the ``mcp`` / ``custom-tool``
+    / ``hook`` variants carry ``tool_name``, while ``shell`` / ``read`` / ``write``
+    / ``url`` identify themselves by their ``kind`` discriminator. Fall back to
+    ``kind`` for the name, and pass the variant's ``to_dict()`` (camelCase wire
+    form, carrying all fields) as the policy ``arguments``.
+    """
+    name = getattr(request, "tool_name", None) or getattr(request, "kind", None) or "tool"
+    try:
+        args = request.to_dict()
+    except Exception:  # noqa: BLE001 — defensive: hand the policy a best-effort dict
+        args = {}
+    return str(name), args if isinstance(args, dict) else {}
 
 
 def _event_data(event: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
@@ -788,17 +945,25 @@ def _accumulate_usage(acc: dict[str, int], data: dict[str, Any]) -> None:  # typ
     """Sum the token counts from one ASSISTANT_USAGE event into *acc*.
 
     Copilot emits one usage event per underlying model call, so a turn with
-    tool round-trips reports usage several times; we accumulate.
+    tool round-trips reports usage several times; we accumulate. The
+    authoritative AI-credit cost (``copilotUsage.totalNanoAiu``, in nano-AIU) is
+    summed too and converted to ``cost_usd`` in :func:`_finalize_usage`.
     """
     mapping = {
         "inputTokens": "input_tokens",
         "outputTokens": "output_tokens",
         "cacheReadTokens": "cache_read_input_tokens",
+        "cacheWriteTokens": "cache_creation_input_tokens",
     }
     for wire_key, usage_key in mapping.items():
         value = data.get(wire_key)
         if isinstance(value, (int, float)):
             acc[usage_key] = acc.get(usage_key, 0) + int(value)
+    copilot_usage = data.get("copilotUsage")
+    if isinstance(copilot_usage, dict):
+        nano_aiu = copilot_usage.get("totalNanoAiu")
+        if isinstance(nano_aiu, (int, float)):
+            acc["_cost_nano_aiu"] = acc.get("_cost_nano_aiu", 0) + int(nano_aiu)
 
 
 def _finalize_usage(acc: dict[str, int]) -> dict[str, Any] | None:  # type: ignore[explicit-any]
@@ -806,7 +971,11 @@ def _finalize_usage(acc: dict[str, int]) -> dict[str, Any] | None:  # type: igno
     if not acc:
         return None
     usage: dict[str, Any] = dict(acc)  # type: ignore[explicit-any]
+    nano_aiu = usage.pop("_cost_nano_aiu", 0)
     usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    if nano_aiu:
+        # 1 AIC = 1e9 nano-AIU = $0.01, so nano-AIU / 1e11 = USD.
+        usage["cost_usd"] = nano_aiu / 1e11
     return usage
 
 

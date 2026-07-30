@@ -1,0 +1,134 @@
+# A contributor comments `/rerun` on a PR to re-run its failed CI **on the
+# existing head commit** -- no empty commit, no rebase, so no push event and
+# thus no dismissed approvals (branch protection keeps dismiss-stale-reviews
+# on to block approve-then-swap). Use for flaky-test recovery instead of
+# pushing a throwaway commit to re-trigger checks.
+#
+# CI here runs entirely against the in-process mock LLM (no gateway spend), so
+# a re-run costs only Actions minutes; `cancel-in-progress` on each suite caps
+# concurrent burn. Polly AI Review (the one real-LLM path) is gated by
+# maintainer approval elsewhere and is intentionally NOT re-run here.
+#
+# Authorization: the PR author (so fork contributors can re-run their own PR)
+# OR a write-access commenter (OWNER/MEMBER/COLLABORATOR). `issue_comment` runs
+# from the base repo, so its token is writable even for fork PRs and is not
+# held behind the fork-approval gate -- unlike `pull_request_target`, this
+# needs no privileged `workflow_run` relay (cf. rerun-security-gate*.yml).
+name: Rerun CI on /rerun comment
+
+on:
+  issue_comment:
+    types: [created]
+
+# Read-only at the top level; write scopes live on the job below.
+permissions:
+  contents: read
+
+concurrency:
+  # One re-run in flight per PR; a second `/rerun` supersedes the first.
+  group: rerun-ci-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  rerun:
+    name: Re-run failed CI for the PR head
+    permissions:
+      actions: write        # gh run rerun
+      pull-requests: read   # resolve the PR head SHA
+      issues: write         # react to the comment + post the result
+    # PR comment, body starts with `/rerun`, not a bot, in this repo, AND the
+    # commenter is the PR author or has write access. `issue.user.login` is the
+    # PR author; `comment.user.login` is the commenter.
+    if: >-
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event.issue.pull_request != null
+      && startsWith(github.event.comment.body, '/rerun')
+      && !endsWith(github.actor, '[bot]')
+      && (
+        github.event.comment.author_association == 'OWNER'
+        || github.event.comment.author_association == 'MEMBER'
+        || github.event.comment.author_association == 'COLLABORATOR'
+        || github.event.comment.user.login == github.event.issue.user.login
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The job `if` startsWith() also matches `/rerunfoo`; re-validate `/rerun`
+      # as a command (first non-space token is exactly `/rerun`, optional args).
+      - name: Validate command
+        id: cmd
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          if ! grep -qE '^[[:space:]]*/rerun([[:space:]]|$)' <<<"$COMMENT_BODY"; then
+            echo "::notice::Comment mentions '/rerun' but not as a command; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Acknowledge
+        if: steps.cmd.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes --silent || true
+
+      - name: Re-run failed CI runs for the PR head
+        if: steps.cmd.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Integer from the payload, but sanitised to digits before shell use.
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="$(tr -dc '0-9' <<<"$PR_NUMBER")"
+          [ -n "$PR_NUMBER" ] || { echo "::error::Empty PR number."; exit 1; }
+
+          # Resolve the PR's CURRENT head SHA (a push could have superseded any
+          # SHA recorded at comment time).
+          SHA="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')"
+          echo "PR #$PR_NUMBER head $SHA"
+
+          # Latest run per workflow for this SHA, restricted to `pull_request`
+          # events -- this is the test-suite set (CI, Lint, E2E, E2E UI,
+          # Integration, Docker build, web Tests). It deliberately EXCLUDES the
+          # merge machinery (Merge Ready, Maintainer Approval, Polly) which run
+          # on pull_request_target / workflow_run / issue_comment, so `/rerun`
+          # never re-triggers a gate or the real-LLM review.
+          mapfile -t FAILED < <(
+            gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
+              --jq '[.workflow_runs[] | select(.event=="pull_request")]
+                    | group_by(.name)
+                    | map(sort_by(.created_at) | last)
+                    | .[] | select(.conclusion=="failure")
+                    | "\(.id)\t\(.name)"'
+          )
+
+          if [ "${#FAILED[@]}" -eq 0 ]; then
+            echo "No failed pull_request CI runs for $SHA."
+            gh pr comment "$PR_NUMBER" --repo "$REPO" \
+              --body "🔁 \`/rerun\`: no failed CI runs on the current head (\`${SHA:0:7}\`) to re-run. If a check is stuck *pending*, it needs a push or a maintainer, not a re-run."
+            exit 0
+          fi
+
+          RERAN=""
+          while IFS=$'\t' read -r id name; do
+            [ -n "$id" ] || continue
+            echo "• Re-running failed jobs in '$name' (run $id)"
+            # --failed: re-run only the failed jobs (cheapest path for a flake).
+            # --repo is REQUIRED: this job has no checkout, so `gh run rerun`
+            # cannot infer the repo from a git remote and would fail client-side.
+            if gh run rerun "$id" --repo "$REPO" --failed; then
+              RERAN="$RERAN"$'\n'"- $name"
+            else
+              echo "::warning::Could not re-run '$name' (run $id) -- may be in progress."
+              RERAN="$RERAN"$'\n'"- $name ⚠️ (skipped: already running or not re-runnable)"
+            fi
+          done < <(printf '%s\n' "${FAILED[@]}")
+
+          NOTE="The \`Merge Ready\` gate re-evaluates automatically when these complete."
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "🔁 \`/rerun\`: re-running failed jobs on \`${SHA:0:7}\`:${RERAN}"$'\n\n'"$NOTE"

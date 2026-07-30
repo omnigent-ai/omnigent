@@ -13,16 +13,16 @@ The process is launched by the runner-side popup helper (e.g.
 :func:`omnigent.claude_native_bridge.display_cost_approval_popup`) as::
 
     python -I -m omnigent.native_cost_popup \
-        --config-file <bridge_dir>/permission_hook.json \
+        --config-file <bridge_dir>/cost_popup.json \
         --session-id conv_abc123 \
         --elicitation-id elicit_deadbeef \
         --message "Session cost $0.12 crossed the $0.10 checkpoint. Continue?"
 
 AP routing (base URL + auth headers) is read from ``--config-file``
 rather than argv so the bearer token never lands in the process list /
-tmux command line. The file is the harness's existing AP-routing config
-(``permission_hook.json`` for claude-native, ``policy_hook.json`` for
-codex-native); both carry ``ap_server_url`` + ``ap_auth_headers``.
+tmux command line. The runner writes a freshly-minted ``cost_popup.json``
+snapshot at popup launch (a stale launch-token snapshot would 401 the
+verdict POST); the file carries ``ap_server_url`` + ``ap_auth_headers``.
 
 Dismissing the popup (Escape / Ctrl-C / EOF) exits **without** posting a
 verdict, leaving the elicitation outstanding so it can still be answered
@@ -32,6 +32,7 @@ in the web UI or resolved by the server-side approval timeout.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
@@ -149,8 +150,9 @@ def launch_cost_popup(
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux target of the pane, e.g. ``"main"``.
     :param config_file: AP-routing config the popup reads for
-        ``ap_server_url`` + ``ap_auth_headers`` — ``permission_hook.json``
-        for claude-native, ``policy_hook.json`` for codex-native.
+        ``ap_server_url`` + ``ap_auth_headers`` — the runner mints a fresh
+        ``cost_popup.json`` snapshot per launch so the verdict POST carries a
+        live bearer rather than the stale launch token.
     :param session_id: Omnigent session id that owns the elicitation, e.g.
         ``"conv_abc123"``. Used in the resolve URL the popup POSTs to.
     :param elicitation_id: Outstanding elicitation correlation id, e.g.
@@ -209,6 +211,67 @@ def launch_cost_popup(
             inner_cmd,
         ]
         # Detached: do NOT wait (display-popup blocks until answered).
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def launch_blocked_notice(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    message: str,
+    policy_name: str | None = None,
+    python_executable: str | None = None,
+) -> None:
+    """
+    Overlay a dismissable HARD-block notice on every client attached to a pane.
+
+    The DENY counterpart of :func:`launch_cost_popup` — no approve/decline, no
+    resolution, just the reason. opencode can only hard-block a prompt by the
+    plugin throwing (which opencode renders as a generic "Unexpected server
+    error"); this surfaces the policy reason cleanly on the pane so the user
+    knows WHY. Reuses the same client-targeting + ``display-popup`` spawn; skips
+    silently when no client is attached.
+
+    :param socket_path: tmux socket of the pane.
+    :param tmux_target: tmux target of the pane.
+    :param message: The block reason shown in the popup.
+    :param policy_name: Deciding policy (popup header); ``None`` → generic.
+    :param python_executable: Python to run the notice with; ``None`` uses
+        :data:`sys.executable`.
+    :returns: None.
+    """
+    import subprocess
+
+    clients = _list_tmux_clients(socket_path, tmux_target)
+    if not clients:
+        return
+    python = python_executable or sys.executable
+    argv = [python, "-I", "-m", "omnigent.native_cost_popup", "--notice", "--message", message]
+    if policy_name:
+        argv += ["--policy-name", policy_name]
+    inner_cmd = shlex.join(argv)
+    for client in clients:
+        cmd = [
+            "tmux",
+            "-S",
+            socket_path,
+            "display-popup",
+            "-E",
+            "-c",
+            client,
+            "-t",
+            tmux_target,
+            "-w",
+            "80%",
+            "-h",
+            "50%",
+            inner_cmd,
+        ]
         subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -281,6 +344,28 @@ def _prompt_verdict(message: str, *, policy_name: str | None = None) -> str | No
         if answer in ("n", "no"):
             return "decline"
         print("  Please type 'y' or 'n'.")
+
+
+def _show_notice(message: str, *, policy_name: str | None = None) -> None:
+    """
+    Render an informational HARD-block notice and wait for dismissal.
+
+    Used for a DENY with no approve option (the prompt is blocked, not gated).
+    There is nothing to resolve — just show the reason and block until the user
+    presses Enter (or dismisses the popup), then exit so the ``display-popup``
+    closes.
+
+    :param message: The block reason, e.g. ``"You've hit the $0.10 budget."``.
+    :param policy_name: Deciding policy, used as the header. ``None`` → generic.
+    """
+    header = f"Blocked by policy — {policy_name}" if policy_name else "Blocked by policy"
+    print(f"\n  ⛔  {header}\n")
+    for line in message.splitlines() or [message]:
+        print(f"  {line}")
+    print("\n  This prompt was blocked and not sent to the model.")
+    print("\n  Press Enter to dismiss.")
+    with contextlib.suppress(EOFError, KeyboardInterrupt):
+        input()
 
 
 def _post_verdict(
@@ -395,16 +480,34 @@ def main(argv: list[str] | None = None) -> int:
         the helpers on a hard failure.
     """
     parser = argparse.ArgumentParser(prog="omnigent.native_cost_popup")
-    parser.add_argument("--config-file", required=True, help="Path to AP-routing config JSON.")
-    parser.add_argument("--session-id", required=True, help="AP session id owning the prompt.")
-    parser.add_argument("--elicitation-id", required=True, help="Outstanding elicitation id.")
-    parser.add_argument("--message", required=True, help="Approval reason to display.")
+    parser.add_argument(
+        "--notice",
+        action="store_true",
+        help="Informational mode: show the reason for a HARD block and wait for "
+        "dismissal — no approve/decline, no server resolution.",
+    )
+    parser.add_argument("--config-file", help="Path to AP-routing config JSON.")
+    parser.add_argument("--session-id", help="AP session id owning the prompt.")
+    parser.add_argument("--elicitation-id", help="Outstanding elicitation id.")
+    parser.add_argument("--message", required=True, help="Approval / block reason to display.")
     parser.add_argument(
         "--policy-name",
         default=None,
         help="Name of the deciding policy, shown as the modal header.",
     )
     args = parser.parse_args(argv)
+
+    if args.notice:
+        # Hard DENY with no approve option (e.g. an opencode cost-budget cap,
+        # where the block is enforced by the plugin throwing). Just surface the
+        # reason and wait for the user to dismiss — no resolution to POST.
+        _show_notice(args.message, policy_name=args.policy_name)
+        return 0
+
+    if not (args.config_file and args.session_id and args.elicitation_id):
+        parser.error(
+            "--config-file / --session-id / --elicitation-id are required without --notice"
+        )
 
     config = _read_omnigent_routing(Path(args.config_file))
     ap_server_url = str(config["ap_server_url"])

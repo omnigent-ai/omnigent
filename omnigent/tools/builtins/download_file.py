@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
 from omnigent.tools.builtins.upload_file import safe_resolve
 
 
@@ -72,10 +73,16 @@ class DownloadFileTool(Tool):
         :param ctx: Provides workspace path for saving.
         :returns: JSON string with the local file path, or error.
         """
-        args: dict[str, Any] = json.loads(arguments)
+        args, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return json.dumps({"error": error})
+        assert args is not None
+
         file_id = args.get("file_id")
-        if not file_id:
+        if file_id is None or file_id == "":
             return json.dumps({"error": "missing required 'file_id'"})
+        if not isinstance(file_id, str):
+            return json.dumps({"error": "'file_id' must be a string"})
 
         from omnigent.runtime import get_artifact_store, get_file_store
 

@@ -56,10 +56,22 @@ def parse_permission_request(payload: Mapping[str, Any]) -> OpenCodePermissionRe
     """
     Parse a raw permission payload into :class:`OpenCodePermissionRequest`.
 
-    Accepts both the ``permission.v2.asked`` event ``properties`` object
-    (keys ``id`` / ``sessionID`` / ``action`` / ``resources`` / ``metadata``
-    / ``source``) and entries from ``GET /permission`` (which may use
-    ``requestID`` / ``sessionID``).
+    Accepts BOTH opencode permission event shapes (live-verified against
+    1.17.7, which emits v1 ``permission.asked``):
+
+    - **v1** (``permission.asked``): ``{id, sessionID, permission, patterns,
+      metadata, always, tool}`` — the tool/category is in ``permission``
+      (e.g. ``"bash"``/``"edit"``/``"read"``) and the resources are string
+      ``patterns``.
+    - **v2** (``permission.v2.asked``): ``{id, sessionID, action, resources,
+      save, metadata, source}`` — the category is in ``action``.
+
+    The category MUST be extracted (it becomes the policy-evaluation tool
+    name): reading only ``action``/``type`` left v1's ``permission`` field
+    unread, so every opencode tool reached the policy engine as the literal
+    name ``"permission"`` and matched no tool-name policy (e.g. "Require
+    Approval for File & Shell Operations" never fired). Also accepts entries
+    from ``GET /permission``.
 
     :param payload: Raw permission object.
     :returns: Parsed request, or ``None`` when no request id is present.
@@ -68,8 +80,10 @@ def parse_permission_request(payload: Mapping[str, Any]) -> OpenCodePermissionRe
     if not isinstance(request_id, str) or not request_id:
         return None
     session_id = payload.get("sessionID") or payload.get("session_id")
-    action = payload.get("action") or payload.get("type")
-    resources = payload.get("resources")
+    # v2 → ``action``; v1 → ``permission`` (the tool category, e.g. "bash").
+    action = payload.get("action") or payload.get("type") or payload.get("permission")
+    # v2 → ``resources`` (dicts); v1 → ``patterns`` (strings).
+    resources = payload.get("resources") or payload.get("patterns")
     metadata = payload.get("metadata")
     source = payload.get("source")
     return OpenCodePermissionRequest(
@@ -176,15 +190,25 @@ def decision_to_reply(decision: PolicyDecision) -> OpenCodeReply | None:
     """
     Map a normalized decision onto an OpenCode reply token.
 
+    Both ``allow_once`` and ``allow_always`` map to opencode ``"once"`` — the
+    forwarder NEVER replies ``"always"``. opencode persists an ``"always"``
+    reply into its local ``approved`` ruleset and then auto-allows every future
+    matching tool WITHOUT re-emitting ``permission.asked`` (see opencode
+    ``permission/index.ts``), which bypasses the Omnigent policy engine and
+    breaks live policy changes — e.g. toggling "Require Approval" mid-session
+    would never take effect because opencode stopped asking. Replying ``"once"``
+    forces opencode to re-ask on every call so the server engine stays
+    authoritative; the "always allow" semantics live SERVER-side (the engine
+    persists an approved ASK and returns ``allow`` on later evaluations, so the
+    forwarder simply replies ``"once"`` again with no card).
+
     :param decision: One of ``allow_once`` / ``allow_always`` / ``reject``
         / ``ask``.
-    :returns: ``"once"`` / ``"always"`` / ``"reject"``, or ``None`` for
-        ``ask`` (no automatic reply — needs a human).
+    :returns: ``"once"`` / ``"reject"``, or ``None`` for ``ask`` (no automatic
+        reply — needs a human).
     """
-    if decision == "allow_once":
+    if decision in ("allow_once", "allow_always"):
         return "once"
-    if decision == "allow_always":
-        return "always"
     if decision == "reject":
         return "reject"
     return None

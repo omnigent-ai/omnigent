@@ -6,8 +6,9 @@ Omnigent can run an agent from a single YAML file:
 omnigent run path/to/agent.yaml
 ```
 
-Use this file to choose the harness/model, write the system prompt, and declare
-which tools, sub-agents, OS access, and policies the agent can use.
+Use this file to choose the harness/model, write the agent-owned system
+instructions, and declare which tools, sub-agents, OS access, and policies the
+agent can use.
 
 ## Minimal agent
 
@@ -28,12 +29,17 @@ executor:
 `prompt` may also be replaced by `instructions: AGENTS.md`; relative paths are
 resolved from the YAML file's directory.
 
+These fields define the portable, agent-authored portion of the system prompt.
+Omnigent may append framework-owned lifecycle or metadata instructions at
+runtime after agent and per-request instructions; those additions are not part
+of the agent YAML.
+
 ## Common top-level fields
 
 | Field | Required? | Purpose |
 | --- | --- | --- |
 | `name` | Recommended | Stable identifier shown in sessions and logs. |
-| `prompt` | Usually | Inline system prompt. |
+| `prompt` | Usually | Inline agent-owned system instructions. |
 | `instructions` | Optional | Inline instructions or a path to an instructions file. If set, it takes precedence over `prompt`. |
 | `executor` | Recommended | Harness, model, and auth settings. |
 | `tools` | Optional | MCP tools, Python function tools, sub-agents, handoffs, or inherited tools. |
@@ -49,7 +55,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, qwen, copilot, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -65,6 +71,14 @@ gateway / `auth.type: databricks` does not apply. Authenticate it with
 `CURSOR_API_KEY` (or a prior `cursor-agent login`), optionally pinned via
 `auth: {type: api_key, api_key: ${CURSOR_API_KEY}}`, and choose a Cursor model
 id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
+
+The `kiro-native` harness is the native Kiro CLI terminal path used by
+`omnigent kiro`. It requires `kiro-cli` on `PATH` and Kiro's own login/auth; it
+does not use Databricks, OpenAI, or Anthropic provider credentials. Plain
+`harness: kiro` is not a generic Omnigent harness id. Kiro's TUI remains the
+authoritative approval surface; supported one-time tool approvals can also be
+mirrored into Chat cards, while persistent trust choices remain explicit Kiro
+TUI/flag actions. See `kiro-native-elicitation.md`.
 
 ### Antigravity (Gemini)
 
@@ -113,6 +127,27 @@ To route through OpenRouter / a gateway, declare a key/gateway provider in
 `~/.omnigent/config.yaml` and reference it (`auth: {type: provider, name: …}`),
 or set `auth.base_url` to the OpenAI-compatible endpoint alongside the key.
 For Databricks, use `auth: {type: databricks, profile: …}`.
+
+### Kimi Code
+
+`harness: kimi` runs the agent through Moonshot AI's
+[Kimi Code CLI](https://github.com/MoonshotAI/Kimi-Code) headlessly via
+`kimi --print --output-format stream-json` per turn. Install the binary
+with `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash`
+and authenticate once with `kimi login` (OAuth or a Moonshot API key).
+
+```yaml
+executor:
+  harness: kimi               # alias: kimi-code
+  model: kimi-k2-turbo
+```
+
+By default Kimi authenticates against Moonshot AI's backend — Omnigent
+declares no `executor.auth` block. To route through a gateway, either set
+`HARNESS_KIMI_GATEWAY_BASE_URL` + `HARNESS_KIMI_GATEWAY_API_KEY` in the
+shell, declare a key/gateway provider in `~/.omnigent/config.yaml`, or use
+`executor.auth: {type: databricks, profile: …}` and let Omnigent resolve
+the workspace.
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
@@ -167,6 +202,40 @@ the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS), so th
 same YAML works across platforms. For the full set of sandbox options, how to
 share one policy across `sys_os_*` and terminals, and how to set up network
 egress rules, see the `sandbox:` examples below and the sandbox source under `omnigent/inner/`.
+
+### Secretless credential proxy
+
+`sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts
+without the real secret ever entering the sandbox: the mandatory L7 egress proxy
+attaches the credential on the way out. It requires `egress_rules` and a
+network-isolating backend (`linux_bwrap` or `darwin_seatbelt`). See
+`designs/SANDBOX_CREDENTIAL_PROXY.md` for the full type table.
+
+The `databricks_cli` type proxies the Databricks CLI. List the profiles to
+proxy; only those are materialized into the sandbox (with placeholder tokens)
+and swapped by the proxy. As with every other credential-proxy type, you must
+list each workspace host in `egress_rules` yourself — the proxy does not widen
+egress on its own. OAuth tokens are refreshed for the life of the session.
+Requires the `databricks` extra and `linux_bwrap` (the Go CLI ignores
+`SSL_CERT_FILE` on macOS, so `darwin_seatbelt` is rejected).
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    egress_rules:
+      - "* pypi.org/**"                              # your other egress needs
+      - "* dbc-adb7b1a3-9097.cloud.databricks.com/**"  # the proxied workspace
+    credential_proxy:
+      - type: databricks_cli
+        profiles: [dbc-adb7b1a3-9097, oss]
+        default: dbc-adb7b1a3-9097   # optional; sets DATABRICKS_CONFIG_PROFILE
+```
+
+Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
+works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
 ## Tools
 
@@ -225,11 +294,15 @@ Use `container_image` for new specs; `docker_image` remains accepted as a
 deprecated alias for backwards compatibility. Set `container_runtime: podman` to
 run the image with Podman instead of Docker.
 
+The runtime can also be set globally via the `OMNIGENT_CONTAINER_RUNTIME`
+environment variable (accepted values: `docker`, `podman`). The per-agent
+`container_runtime` YAML key takes precedence over the environment variable.
+
 ```yaml
 tools:
   sandbox:
     container_image: python:3.12-slim
-    container_runtime: podman  # optional; defaults to docker
+    container_runtime: podman  # optional; defaults to docker (or OMNIGENT_CONTAINER_RUNTIME)
 ```
 
 ### Sub-agent tool

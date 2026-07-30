@@ -208,6 +208,45 @@ async def test_context_coin_bar_low_usage(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_context_free_space_count_matches_its_percentage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Free-space token count partitions the window with messages + buffer.
+
+    Regression for the count/percent mismatch: free space used to be
+    ``window - messages`` (omitting the 20% compaction buffer) while its
+    percentage subtracted the buffer — so it read e.g. "920,150 tokens (72%)",
+    a count that is 92% of the window. With window=100k, messages=10k, buffer
+    20k, free must be 70k (70%): count and percent now agree, and the three
+    rows sum to the window.
+    """
+    _patch_count_tokens(monkeypatch, message_tokens=10_000)
+    host = CapturingHost()
+    session = _Session(model_override="openai/gpt-4o", context_window=100_000)
+    await handle_slash_command(
+        "/context",
+        session,
+        None,
+        host,
+        RichBlockFormatter(),  # type: ignore[arg-type]
+    )
+    output = host.text
+    # Compute the expected partition the way the renderer does (the buffer
+    # fraction is 1 - trigger, i.e. ~0.2 with float wobble).
+    from omnigent.repl._repl import _CONTEXT_COMPACTION_TRIGGER
+
+    window, msgs = 100_000, 10_000
+    buf = int(window * (1.0 - _CONTEXT_COMPACTION_TRIGGER))
+    free = window - msgs - buf
+    assert msgs + free + buf == window  # the three rows partition the window
+    # Each row's rendered count agrees with its percentage (the bug was free
+    # showing window-messages while its % subtracted the buffer).
+    assert f"{free:,} tokens (70%)" in output  # buffer now excluded from free
+    assert f"{buf:,} tokens (20%)" in output
+    assert f"{msgs:,} tokens (10%)" in output
+
+
+@pytest.mark.asyncio
 async def test_context_coin_bar_over_trigger_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -34,6 +33,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+
+from omnigent.inner import _proc
 
 
 def _is_socket_listening(socket_path: str) -> bool:
@@ -113,10 +114,10 @@ class RunnerSubprocess:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            # Detach into its own session so we can SIGTERM the whole
-            # group on shutdown — uvicorn spawns child workers we
-            # need to clean up too.
-            start_new_session=True,
+            # Detach into its own session/group so the whole tree can be
+            # torn down on shutdown — uvicorn spawns child workers we need
+            # to clean up too.
+            **_proc.spawn_kwargs(),
             env=env,
         )
         # Poll until the socket is accepting or we time out.
@@ -146,16 +147,12 @@ class RunnerSubprocess:
             self._tmp_dir.cleanup()
 
     def _kill(self) -> None:
-        if self._process is None:
+        if self._process is None or self._process.poll() is not None:
             return
+        _proc.terminate_tree(self._process, grace=5)
         if self._process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+            _proc.kill_tree(self._process)
+            with contextlib.suppress(subprocess.TimeoutExpired):
                 self._process.wait(timeout=2)
 
 
