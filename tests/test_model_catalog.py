@@ -563,6 +563,12 @@ def test_databricks_listing_filters_to_chat_llms(
     assert by_id["system.ai.claude-sonnet-4-6"].family == "claude"
     assert by_id["system.ai.gpt-5-4"].family == "openai"
     assert by_id["system.ai.meta-llama-3-3-70b-instruct"].family == "other"
+    assert by_id["system.ai.claude-sonnet-4-6"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_CHAT}
+    )
+    assert by_id["system.ai.gpt-5-4"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_CHAT, ModelWireAPI.OPENAI_RESPONSES}
+    )
 
 
 def test_databricks_listing_skips_explicitly_non_ready_endpoints(

@@ -141,9 +141,10 @@ source. Provider-relative cost metadata orders candidates for the stable `fast`,
 cost is unknown. If discovery is unavailable, routing skips the override and the
 harness keeps the provider-resolved default instead of consulting a stale table.
 
-The remaining exact compatibility exclusions in smart routing are temporary
-wire-API workarounds. They stay isolated until catalog wire metadata can express
-the affected harness constraints without model-name checks.
+Smart routing retains the runner's normalized wire metadata when building the
+id-only candidate set expected by routing clients. Compatibility post-processing
+uses those catalog facts and treats missing metadata from older runners as
+unknown instead of inferring protocol support from model names.
 
 ## Kiro Picker Migration
 
