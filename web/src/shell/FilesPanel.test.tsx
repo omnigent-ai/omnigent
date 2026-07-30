@@ -1337,7 +1337,12 @@ describe("FilesPanel scroll position persistence", () => {
     // expires), then user scrolls are saved again.
     const expired = performance.now() + SCROLL_RESTORE_BUDGET_MS + 1;
     vi.spyOn(performance, "now").mockReturnValue(expired);
-    await act(() => new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))));
+    await act(
+      () =>
+        new Promise((resolve) => {
+          requestAnimationFrame(() => resolve(undefined));
+        }),
+    );
     vi.mocked(performance.now).mockRestore();
     section.scrollTop = 40;
     fireEvent.scroll(section);

@@ -137,9 +137,9 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
     // main.tsx) so the chat UI still paints instead of hanging on "loading".
     void Promise.race([
       resolveServerInfo(),
-      new Promise<ServerInfo>((resolve) =>
-        setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), 1500),
-      ),
+      new Promise<ServerInfo>((resolve) => {
+        setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), 1500);
+      }),
     ]).then((resolved) => {
       if (alive) setInfo(resolved);
     });
