@@ -3110,7 +3110,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0,<2.45" },
     { name = "openai-agents", specifier = ">=0.0.17" },
     { name = "openai-agents", marker = "extra == 'agents-sdk'", specifier = ">=0.1,<1" },
-    { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.86,<1" },
+    { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.88,<1" },
     { name = "opentelemetry-distro", marker = "extra == 'databricks'", specifier = ">=0,<1" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.20,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.20,<2" },

@@ -368,6 +368,7 @@ class _SDKState:
     stream_exit_code: int = 0
     last_workdir: str | None = None
     last_env: dict[str, str] | None = None
+    created_workspace: str | None = None
 
 
 @pytest.fixture
@@ -407,6 +408,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
 
         def create(self, *, workspace: str, spec: Any) -> _SandboxRef:
             state.created_spec = spec
+            state.created_workspace = workspace
             return _SandboxRef(id="id-1", name="petname-new")
 
         def wait_ready(
@@ -507,7 +509,16 @@ def test_client_create_sandbox(sdk: _SDKState) -> None:
     assert name == "petname-new"
     assert sdk.created_spec.template.image == "ghcr.io/x/host:1"
     assert sdk.created_spec.environment == {"A": "1"}
+    assert sdk.created_workspace == "default"
     assert sdk.waited == ("petname-new", 300)
+
+
+def test_client_create_sandbox_custom_workspace(sdk: _SDKState) -> None:
+    """A custom workspace reaches the SDK create call."""
+    client = _OpenShellClient(workspace="team-beta")
+    client.create_sandbox(image="img", env={})
+
+    assert sdk.created_workspace == "team-beta"
 
 
 def test_client_execute_maps_name_to_id(sdk: _SDKState) -> None:

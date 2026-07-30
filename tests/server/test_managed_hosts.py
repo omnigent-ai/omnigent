@@ -464,6 +464,7 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
                 "image": "docker.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cluster": "my-gateway",
+                "workspace": "team-alpha",
             },
         }
     )
@@ -478,6 +479,7 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.cluster == "my-gateway"
+    assert fake.workspace == "team-alpha"
 
 
 def test_parse_openshell_without_section_defaults(
@@ -496,6 +498,7 @@ def test_parse_openshell_without_section_defaults(
     assert fake.image is None
     assert fake.env is None
     assert fake.cluster is None
+    assert fake.workspace is None
 
 
 def test_parse_valid_kubernetes_config_builds_parameterized_factory(
