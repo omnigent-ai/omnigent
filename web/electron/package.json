@@ -23,14 +23,14 @@
     "build:mac:release": "electron-builder --mac -c.mac.notarize=true",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win",
-    "build:overlay": "npm --prefix ../ run build:overlay",
-    "predev": "npm run build:overlay",
-    "prestart": "npm run build:overlay",
-    "prebuild": "npm run build:overlay",
-    "prebuild:mac": "npm run build:overlay",
-    "prebuild:mac:release": "npm run build:overlay",
-    "prebuild:linux": "npm run build:overlay",
-    "prebuild:win": "npm run build:overlay"
+    "build:overlay": "pnpm --filter web run build:overlay",
+    "predev": "pnpm run build:overlay",
+    "prestart": "pnpm run build:overlay",
+    "prebuild": "pnpm run build:overlay",
+    "prebuild:mac": "pnpm run build:overlay",
+    "prebuild:mac:release": "pnpm run build:overlay",
+    "prebuild:linux": "pnpm run build:overlay",
+    "prebuild:win": "pnpm run build:overlay"
   },
   "devDependencies": {
     "electron": "^42.3.2",

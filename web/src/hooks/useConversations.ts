@@ -72,6 +72,8 @@ export interface Conversation {
   updated_at: number;
   labels: Record<string, string>;
   permission_level: number | null;
+  /** Whether this viewer may accept privileged actions for the session. */
+  can_approve?: boolean | null;
   owner?: string | null;
   runner_id?: string | null;
   /** Host that launched the runner for this session, e.g. ``"host_a1b2"``. */
@@ -200,6 +202,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
+    can_approve: wire.can_approve ?? null,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
@@ -584,6 +587,13 @@ export function useStopAndDeleteConversation() {
       }
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
+      // The Pinned section reads a separate, sibling cache that the
+      // ["conversations"] sweep above deliberately skips, so a deleted pinned
+      // row lingers there until a reload unless we drop it explicitly. Patched
+      // (not invalidated) for the same reindex-lag reason as the list.
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !ids.has(c.id)) } : old,
+      );
       // Deleting the last member of a project empties it, so refresh the
       // project list to drop the now-empty folder. Unlike the conversations
       // list, /v1/sessions/projects reads the DB directly (no search-index
@@ -703,6 +713,10 @@ export function useBulkDeleteConversations() {
         queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
         queryClient.removeQueries({ queryKey: ["session", id] });
       }
+      // Drop deleted rows from the sibling Pinned cache the sweep above skips.
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !idSet.has(c.id)) } : old,
+      );
       // Refresh the project list so a project emptied by these deletes drops
       // its now-empty folder (DB-direct read, no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
@@ -723,6 +737,10 @@ export function useBulkDeleteConversations() {
           queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
+        // Drop the successfully-deleted rows from the sibling Pinned cache too.
+        queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+          old ? { ...old, conversations: old.conversations.filter((c) => !idSet.has(c.id)) } : old,
+        );
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
         void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
       }

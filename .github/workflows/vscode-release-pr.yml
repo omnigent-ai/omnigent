@@ -62,6 +62,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
+
       - name: Validate version
         env:
           VERSION: ${{ inputs.version }}
@@ -80,10 +83,10 @@ jobs:
         working-directory: editors/vscode
         env:
           VERSION: ${{ inputs.version }}
-        # `npm pkg set` edits ONLY package.json (unlike `npm version`, which also
-        # rewrites package-lock.json). Keeps the release PR to package.json +
+        # `pnpm pkg set` edits ONLY package.json (unlike `pnpm version`, which
+        # also rewrites the lockfile). Keeps the release PR to package.json +
         # CHANGELOG.md.
-        run: npm pkg set version="$VERSION"
+        run: pnpm pkg set version="$VERSION"
 
       - name: Add the CHANGELOG section (placeholder)
         working-directory: editors/vscode

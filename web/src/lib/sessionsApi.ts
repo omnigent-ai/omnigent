@@ -185,6 +185,8 @@ interface SessionResponseWire {
    * entirely, and absent on older recorded fixtures.
    */
   permission_level?: number | null;
+  /** Whether this viewer may accept privileged actions for the session. */
+  can_approve?: boolean | null;
   /**
    * Parent conversation id when this session is a sub-agent (child),
    * e.g. ``"conv_parent987"``. ``null`` (or absent on older fixtures)
@@ -198,6 +200,7 @@ interface SessionResponseWire {
    * absent) for top-level sessions.
    */
   sub_agent_name?: string | null;
+  kind?: "default" | "sub_agent" | null;
   todos?: Array<{
     content: string;
     status: "pending" | "in_progress" | "completed";
@@ -309,8 +312,10 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
     })),
     permissionLevel: wire.permission_level ?? null,
+    canApprove: wire.can_approve ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
+    kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
     codexModelOptions: wire.model_options ?? [],
@@ -854,6 +859,8 @@ function isUserPrompt(item: ConversationItem): boolean {
 export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
   let items: ConversationItem[] = [];
   let hasMore = true;
+  // Each page starts before the cursor returned by the prior page.
+  /* oxlint-disable no-await-in-loop */
   for (let pages = 0; pages < MAX_INITIAL_PAGES; pages++) {
     const cursor = items[0]?.id;
     const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
@@ -864,6 +871,7 @@ export async function fetchInitialHistoryWindow(sessionId: string): Promise<Sess
     if (items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2) break;
     if (!items[0]?.id) break; // no cursor to page further; avoid a spin
   }
+  /* oxlint-enable no-await-in-loop */
   // If the cap stopped us before the previous user prompt (a pathological
   // single turn spanning >MAX_INITIAL_PAGES pages), `hasMore` stays true so
   // the rest remains reachable via scroll-up — same fallback as the default.

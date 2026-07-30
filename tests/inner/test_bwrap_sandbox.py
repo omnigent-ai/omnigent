@@ -36,12 +36,17 @@ from unittest.mock import patch
 
 import pytest
 
+from omnigent.inner import bwrap_sandbox
 from omnigent.inner.bwrap_sandbox import (
     _ALLOWED_SOCKET_FAMILIES,
     _CLONE_NEW_FLAG_BITS,
     _DEFAULT_CWD_ALLOW_HIDDEN,
+    _HOST_SANDBOX_BACKEND_ENV,
+    _PROC_BIND_HOST_BACKENDS,
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
+    _detect_host_sandbox_backend,
+    _should_bind_host_proc,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
@@ -410,6 +415,28 @@ def test_wrap_launcher_argv_includes_required_mounts_and_chdir(
     # The chdir target is the resolved cwd.
     chdir_idx = argv.index("--chdir")
     assert argv[chdir_idx + 1] == str(tmp_path.resolve(strict=False))
+
+
+def test_wrap_launcher_argv_binds_etc_alternatives(tmp_path: Path) -> None:
+    """
+    ``/etc/alternatives`` is bound read-only by default.
+
+    Tools invoked by generic name (awk, python3, editor, ...) resolve
+    through ``/usr/bin/<name> -> /etc/alternatives/<name> -> real
+    binary``. Without the ``/etc/alternatives`` dir bind the middle
+    symlink node is missing inside the jail and the lookup fails with
+    "command not found", even though the real binary under ``/usr`` is
+    mounted.
+    """
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    assert "/etc/alternatives" in argv
+    # Emitted as ``--ro-bind-try <src> <dest>`` with src == dest, like the
+    # other default /etc dir binds; never read-write.
+    idx = argv.index("/etc/alternatives")
+    assert argv[idx - 1] == "--ro-bind-try"
+    assert argv[idx + 1] == "/etc/alternatives"
 
 
 @pytest.mark.parametrize(
@@ -877,6 +904,124 @@ def test_wrap_launcher_argv_reexposes_interpreter_under_masked_dotdir(
     assert not _has_pair(argv, "--ro-bind-try", local_dir, local_dir), (
         ".local was re-bound wholesale, defeating the dotfile mask."
     )
+
+
+# ---------------------------------------------------------------------------
+# Nested-sandbox /proc handling (lakebox proc bind)
+# ---------------------------------------------------------------------------
+
+
+def _clear_host_backend_signals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Neutralise every host-backend signal so detection returns ``None``.
+
+    Removes the declaration env var and repoints the lakebox marker at a
+    path that does not exist, isolating the test from the machine it runs
+    on — which must not be assumed to be (or not to be) a lakebox microVM.
+    """
+    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", tmp_path / "no-such-marker")
+
+
+def test_detect_host_backend_none_without_signals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    With no env declaration and no marker, no outer backend is detected,
+    so the proc bind stays off (fresh procfs is kept everywhere by
+    default).
+    """
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    assert _detect_host_sandbox_backend() is None
+    assert _should_bind_host_proc() is False
+
+
+def test_detect_host_backend_env_declaration_is_normalised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``OMNIGENT_HOST_SANDBOX_BACKEND`` is the explicit, authoritative
+    signal; it is trimmed and lower-cased so callers don't have to match
+    an exact casing, and ``lakebox`` is on the proc-bind allow-list.
+    """
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "  LakeBox  ")
+    assert _detect_host_sandbox_backend() == "lakebox"
+    assert _should_bind_host_proc() is True
+
+
+def test_detect_host_backend_env_non_lakebox_keeps_fresh_proc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A declared backend that is NOT on :data:`_PROC_BIND_HOST_BACKENDS`
+    must not trigger the proc downgrade — even if the lakebox marker
+    happens to exist — because the explicit declaration is authoritative.
+    """
+    marker = tmp_path / "run-lakebox"
+    marker.mkdir()
+    monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
+    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "modal")
+    assert _detect_host_sandbox_backend() == "modal"
+    assert "modal" not in _PROC_BIND_HOST_BACKENDS
+    assert _should_bind_host_proc() is False
+
+
+def test_detect_host_backend_marker_autodetects_lakebox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    When no env var is set, the ``/run/lakebox`` marker directory
+    autodetects lakebox. This is the prune-proof fallback the re-exec
+    launcher path relies on (the env var may be stripped by the spawn
+    allow-list, but the filesystem marker survives).
+    """
+    marker = tmp_path / "run-lakebox"
+    marker.mkdir()
+    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
+    assert _detect_host_sandbox_backend() == "lakebox"
+    assert _should_bind_host_proc() is True
+
+
+def test_wrap_launcher_argv_fresh_proc_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    On an ordinary host the wrap emits ``--proc /proc`` (a fresh procfs
+    tied to the new PID namespace) and never binds the host ``/proc``.
+    """
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    assert _has_pair_single_dest(argv, "--proc", "/proc")
+    assert not _has_pair(argv, "--bind", "/proc", "/proc")
+
+
+def test_wrap_launcher_argv_binds_proc_on_lakebox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    On a lakebox host the wrap binds the existing ``/proc`` instead of
+    mounting a fresh procfs (lakebox's masked ``/proc`` overmounts make
+    the fresh mount fail under ``--unshare-pid``). ``/dev`` and ``/tmp``
+    are unaffected.
+    """
+    _clear_host_backend_signals(monkeypatch, tmp_path)
+    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "lakebox")
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    assert _has_pair(argv, "--bind", "/proc", "/proc"), (
+        "lakebox host must bind the existing /proc; got no `--bind /proc /proc`."
+    )
+    assert not _has_pair_single_dest(argv, "--proc", "/proc"), (
+        "lakebox host must NOT also mount a fresh procfs — the two would "
+        "conflict at the same mountpoint."
+    )
+    assert _has_pair_single_dest(argv, "--dev", "/dev")
+    assert "--tmpfs" in argv
 
 
 # ---------------------------------------------------------------------------

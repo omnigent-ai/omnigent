@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastapi import (
     APIRouter,
@@ -405,16 +405,74 @@ def register_hooks_routes(
             media_type="application/json",
         )
 
-    # ── Proto event-type → internal Phase mapping ────────────────────
-    _PROTO_EVENT_TYPE_TO_PHASE: dict[str, Phase] = {
-        "PHASE_TOOL_CALL": Phase.TOOL_CALL,
-        "PHASE_TOOL_RESULT": Phase.TOOL_RESULT,
-        "PHASE_LLM_REQUEST": Phase.LLM_REQUEST,
-        "PHASE_LLM_RESPONSE": Phase.LLM_RESPONSE,
+    # ── Proto event-type → validation schema, as ONE total mapping ────
+    #
+    # This used to be three independent structures: which wire types are
+    # accepted, which phases require an object payload, and which phases
+    # need a tool name and where it may come from. The docstring on each
+    # said "one schema per phase" while the code let you add a wire type to
+    # the first table alone — the new phase was then accepted, validated as
+    # permissively as possible (``dict | str``), and got no tool-name rule
+    # at all, because the other two tables simply had no entry for it and
+    # every lookup against them used a permissive default (``in a
+    # frozenset`` / ``.get(phase, ())``).
+    #
+    # A NamedTuple with no defaults on either field makes that impossible:
+    # you cannot add a wire type without also deciding, right there, both
+    # whether its payload must be an object and where its tool name (if any)
+    # comes from. There is deliberately no fallback path for a phase this
+    # dict doesn't recognize — the "Unknown event type" branch below is the
+    # only way to reach past it, and it 400s rather than silently allowing.
+    #
+    # ``data`` shape: tool and LLM phases carry a structured payload, so a
+    # string there is a malformed call. REQUEST carries prompt text and is
+    # the only phase where a bare string is a legitimate wire form.
+    #
+    # Tool name containers are listed in precedence order because two
+    # first-party producers spell it differently: claude-native and the
+    # in-process tool dispatch send ``request_data.name``, while the OpenCode
+    # plugin sends the tool in ``event.target``. Both are established wire
+    # shapes; requiring one spelling 400s the other, and that producer treats
+    # any non-2xx as ALLOW — so a stricter guard silently disabled its
+    # policies instead of tightening them.
+    class _PhaseSchema(NamedTuple):
+        phase: Phase
+        data_must_be_object: bool
+        tool_name_sources: tuple[tuple[str, str], ...]
+
+    _PHASE_SCHEMA_BY_WIRE_TYPE: dict[str, _PhaseSchema] = {
+        "PHASE_TOOL_CALL": _PhaseSchema(
+            phase=Phase.TOOL_CALL,
+            data_must_be_object=True,
+            tool_name_sources=(("data", "event.data.name"),),
+        ),
+        "PHASE_TOOL_RESULT": _PhaseSchema(
+            phase=Phase.TOOL_RESULT,
+            data_must_be_object=True,
+            tool_name_sources=(
+                ("request_data", "event.request_data.name"),
+                ("target", "event.target"),
+            ),
+        ),
+        "PHASE_LLM_REQUEST": _PhaseSchema(
+            phase=Phase.LLM_REQUEST,
+            data_must_be_object=True,
+            tool_name_sources=(),
+        ),
+        "PHASE_LLM_RESPONSE": _PhaseSchema(
+            phase=Phase.LLM_RESPONSE,
+            data_must_be_object=True,
+            tool_name_sources=(),
+        ),
         # A native session's UserPromptSubmit hook posts the request phase
         # here (the server-level _evaluate_input_policy skips native message
-        # events). The prompt text rides in ``event.data.text``.
-        "PHASE_REQUEST": Phase.REQUEST,
+        # events). The prompt text rides in ``event.data.text``, and this is
+        # the only phase where ``data`` as a bare string is legitimate.
+        "PHASE_REQUEST": _PhaseSchema(
+            phase=Phase.REQUEST,
+            data_must_be_object=False,
+            tool_name_sources=(),
+        ),
     }
     _PHASE_TO_PROTO_ACTION: dict[PolicyAction, str] = {
         PolicyAction.ALLOW: "POLICY_ACTION_ALLOW",
@@ -487,13 +545,21 @@ def register_hooks_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         event_type = event.get("type")
-        phase = _PROTO_EVENT_TYPE_TO_PHASE.get(event_type or "")
-        if phase is None:
+        if event_type is not None and not isinstance(event_type, str):
+            # An unhashable type (list / dict) would raise inside the phase
+            # lookup below and surface as a 500 instead of a client error.
             raise OmnigentError(
-                f"Unknown event type: {event_type!r}. "
-                f"Expected one of {list(_PROTO_EVENT_TYPE_TO_PHASE)}.",
+                f"Policy evaluate 'event.type' must be a string; got {type(event_type).__name__}.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        schema = _PHASE_SCHEMA_BY_WIRE_TYPE.get(event_type or "")
+        if schema is None:
+            raise OmnigentError(
+                f"Unknown event type: {event_type!r}. "
+                f"Expected one of {list(_PHASE_SCHEMA_BY_WIRE_TYPE)}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        phase = schema.phase
         # Optional stable re-attach id for hook retries. Validated but not
         # required — absent on non-retrying callers (old hooks, direct API use).
         raw_elicitation_id = payload.get("_omnigent_elicitation_id")
@@ -508,7 +574,80 @@ def register_hooks_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             hook_elicitation_id = raw_elicitation_id
-        data = event.get("data") or {}
+        # Validation is driven from the per-phase schema above rather than
+        # from a chain of conditionals: rules that live in branches get
+        # applied to whichever phase happens to reach that branch. The three
+        # rules below are independent and all of them run for every phase.
+        #
+        # Everything is checked BEFORE normalizing. ``or {}`` turns null,
+        # false, 0, "" and [] into an empty object, and a tool phase
+        # evaluating with no name gates with ``tool_name=None``, which skips
+        # every tool-scoped policy — on a hook that blocks, that fails open.
+        raw_data = event.get("data")
+        if schema.data_must_be_object:
+            # An absent payload is as malformed as a wrongly typed one here:
+            # ``None`` normalized to ``{}`` and evaluated as an empty call,
+            # which was the original defect's headline vector.
+            if not isinstance(raw_data, dict):
+                raise OmnigentError(
+                    f"Policy evaluate 'event.data' must be an object for "
+                    f"{event_type!r}; got {type(raw_data).__name__}.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        elif not isinstance(raw_data, (dict, str)):
+            # Absent is malformed here too: every first-party producer of this
+            # phase sends the prompt text, and ``None`` normalized to ``{}``
+            # gates on an empty prompt.
+            raise OmnigentError(
+                f"Policy evaluate 'event.data' must be an object or string for "
+                f"{event_type!r}; got {type(raw_data).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # A tool-scoped gate cannot run without a tool name, and allowing by
+        # default is the wrong direction on a blocking hook. Producers spell
+        # the name in different places, so any declared source satisfies the
+        # rule; the resolved name is written back to the container the engine
+        # reads, so the guard and the gate agree on it.
+        name_sources = schema.tool_name_sources
+        if name_sources:
+            resolved_name: str | None = None
+            for container_key, _field_path in name_sources:
+                if container_key == "data":
+                    candidate = raw_data.get("name") if isinstance(raw_data, dict) else None
+                elif container_key == "target":
+                    candidate = event.get("target")
+                else:
+                    container = event.get(container_key)
+                    candidate = container.get("name") if isinstance(container, dict) else None
+                if isinstance(candidate, str) and candidate:
+                    resolved_name = candidate
+                    break
+            if resolved_name is None:
+                paths = " or ".join(repr(path) for _key, path in name_sources)
+                raise OmnigentError(
+                    f"Policy evaluate requires a non-empty tool name in {paths} "
+                    f"for {event_type!r}.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            primary_key = name_sources[0][0]
+            if primary_key != "data":
+                # Normalize onto the container the engine reads, so a producer
+                # that names the tool elsewhere gets tool-scoped policies too
+                # instead of merely passing validation.
+                primary = event.get(primary_key)
+                event[primary_key] = (
+                    {**primary, "name": resolved_name}
+                    if isinstance(primary, dict)
+                    else {"name": resolved_name}
+                )
+        data = raw_data or {}
+        raw_event_context = event.get("context")
+        if raw_event_context is not None and not isinstance(raw_event_context, dict):
+            raise OmnigentError(
+                f"Policy evaluate 'event.context' must be an object; got "
+                f"{type(raw_event_context).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
         conv = conversation_store.get_conversation(session_id)
         if conv is None:

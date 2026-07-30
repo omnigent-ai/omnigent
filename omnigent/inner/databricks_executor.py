@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 
 import httpx
 
+from omnigent import model_catalog
+
 if TYPE_CHECKING:
     from openai import OpenAI, Stream
     from openai.types.chat import ChatCompletionChunk
@@ -897,7 +899,12 @@ class DatabricksExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model
         if not model:
-            model = "databricks-claude-sonnet-4-6"
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="claude",
+            )
+            model = resolution.model_id
         session_key = self._session_key(messages)
         state = self._get_or_create_session_state(session_key)
         state.interrupt_requested = False

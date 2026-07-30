@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
+
+from omnigent.claude_native import ClaudeNativeUcodeConfig, claude_native_model_options
 
 _EXPECTED_ROWS = [
     ("opus", "Opus 4.10"),
@@ -39,6 +43,8 @@ def _patch_session_as_claude_native(
     session_id: str,
     model_override: str | None = None,
     catalog_state: dict[str, bool] | None = None,
+    model_options: list[dict] | None = None,
+    llm_model: str = "system.ai.claude-sonnet-5",
 ) -> list[dict]:
     """Patch the browser's session snapshot into a claude-native response.
 
@@ -52,6 +58,8 @@ def _patch_session_as_claude_native(
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
     :param model_override: Optional session-scoped model override to expose.
     :param catalog_state: Optional mutable readiness gate for delayed options.
+    :param model_options: Catalog rows to expose; defaults to the live-alias set.
+    :param llm_model: Bound model id shown for the session.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
@@ -85,9 +93,10 @@ def _patch_session_as_claude_native(
             "omnigent.wrapper": "claude-code-native-ui",
         }
         payload["harness"] = "claude"
-        payload["llm_model"] = "system.ai.claude-sonnet-5"
+        payload["llm_model"] = llm_model
+        catalog = _MODEL_OPTIONS if model_options is None else model_options
         payload["model_options"] = (
-            _MODEL_OPTIONS if catalog_state is None or catalog_state["ready"] else []
+            catalog if catalog_state is None or catalog_state["ready"] else []
         )
         if model_override is not None:
             payload["model_override"] = model_override
@@ -139,6 +148,7 @@ def test_claude_native_picker_lists_only_live_databricks_models(
     expect(sonnet_row).to_have_attribute("data-active", "true")
     expect(page.locator('[role="option"][data-model-id="fable"]')).to_have_count(0)
     expect(page.locator('[role="option"][data-model-id="sonnet_5"]')).to_have_count(0)
+    _screenshot(page, "pinned-catalog-picker")
 
 
 def test_claude_native_picker_updates_after_delayed_catalog(
@@ -241,6 +251,61 @@ def test_claude_native_alias_selection_persists(
     assert patch_bodies[-1] == {"model_override": "opus"}
     # The read-only composer label reflects the new pick.
     expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Opus 4.10")
+
+
+def _screenshot(page: Page, name: str) -> None:
+    """Save a demo screenshot when E2E_SCREENSHOT_DIR is set (local runs)."""
+    shot_dir = os.environ.get("E2E_SCREENSHOT_DIR")
+    if shot_dir:
+        page.screenshot(path=str(Path(shot_dir) / f"{name}.png"))
+
+
+def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A pin-less gateway config renders one concrete row and no alias rows.
+
+    The catalog is produced by the real ``claude_native_model_options`` for a
+    provider config with no ``ANTHROPIC_DEFAULT_*_MODEL`` pins — the setup
+    where the subscription aliases used to appear and canonicalize to
+    Anthropic ids the gateway rejects at launch.
+    """
+    base_url, session_id = seeded_session
+    default_model = "databricks-claude-sonnet-4-5"
+    catalog = claude_native_model_options(
+        ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+            model=default_model,
+        )
+    )
+    _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_options=catalog,
+        llm_model=default_model,
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # The composer label already shows the concrete routable id.
+    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text(
+        default_model, timeout=15_000
+    )
+    _screenshot(page, "unpinned-gateway-composer")
+
+    page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-config-model").click()
+
+    # Exactly one row — the provider's routable default, pre-selected — so no
+    # alias row exists to canonicalize into an id the gateway rejects. Picking
+    # it can only ever PATCH the concrete gateway id, which the launch
+    # resolver passes through verbatim.
+    rows = page.locator('[role="option"][data-model-id]')
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_have_attribute("data-model-id", default_model)
+    expect(rows.first).to_have_attribute("data-active", "true")
+    _screenshot(page, "unpinned-gateway-picker")
 
 
 def test_claude_native_picker_prefers_session_override_over_sticky_model(

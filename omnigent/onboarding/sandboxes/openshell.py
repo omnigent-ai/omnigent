@@ -55,6 +55,7 @@ from omnigent.onboarding.sandboxes.base import (
     foreground_record_prefix,
     host_image_wheel_install_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -117,6 +118,19 @@ class _OpenShellClient:
     and translates SDK / gRPC errors into ``click.ClickException`` so
     the launcher surface stays clean.
     """
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=True,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=True,
+            streaming_exec=False,
+            foreground_exec=True,
+        )
 
     def __init__(self, *, cluster: str | None = None) -> None:
         _ensure_sdk()

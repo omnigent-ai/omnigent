@@ -372,6 +372,8 @@ export interface Session {
    * permissively, so that's fine for unblocking interaction.
    */
   permissionLevel: number | null;
+  /** Whether this viewer may accept privileged actions for the session. */
+  canApprove?: boolean | null;
   /**
    * Parent conversation id when this session is a sub-agent (child),
    * e.g. ``"conv_parent987"``. ``null`` for top-level sessions.
@@ -390,6 +392,12 @@ export interface Session {
    * tab), since ``agentName`` carries the parent bundle's name.
    */
   subAgentName: string | null;
+  /**
+   * Conversation kind: ``"sub_agent"`` for child sessions spawned by a
+   * parent agent (they have no host binding and recover via their parent's
+   * runner), ``"default"`` for all other sessions.
+   */
+  kind: "default" | "sub_agent";
   /**
    * Current Claude Code todo list for `omnigent claude` sessions.
    * Sourced from the server's `_session_todos_cache` at snapshot
@@ -455,12 +463,7 @@ export interface Session {
  * only — the snapshot field clears to null on success).
  */
 export type SandboxLaunchStage =
-  | "provisioning"
-  | "cloning"
-  | "starting"
-  | "connecting"
-  | "ready"
-  | "failed";
+  "provisioning" | "cloning" | "starting" | "connecting" | "ready" | "failed";
 
 /**
  * Managed-sandbox launch progress — mirrors

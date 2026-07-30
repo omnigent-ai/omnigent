@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -547,10 +548,7 @@ class TestConstructor(unittest.TestCase):
         generic-provider gateway path never does this (see
         ``test_neutral_gateway_no_model_does_not_inject_databricks_default``).
         """
-        from omnigent.inner.claude_sdk_executor import (
-            _DATABRICKS_CLAUDE_DEFAULT_MODEL,
-            ClaudeSDKExecutor,
-        )
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
 
         async def _t():
@@ -564,21 +562,33 @@ class TestConstructor(unittest.TestCase):
                 executor = ClaudeSDKExecutor(gateway=True)
 
             captured: dict[str, str | None] = {}
+            event_loop_thread = threading.get_ident()
+
+            def _resolve_model(provider_name: str, *, family: str) -> SimpleNamespace:
+                self.assertNotEqual(threading.get_ident(), event_loop_thread)
+                self.assertEqual((provider_name, family), ("databricks", "claude"))
+                return SimpleNamespace(model_id="catalog-databricks-claude-default")
 
             async def fake_get_or_create_client(sdk, *, session_key, options, model):
                 captured["model"] = model
                 raise RuntimeError("stop after model resolution")
 
-            with patch.object(
-                executor,
-                "_get_or_create_client",
-                side_effect=fake_get_or_create_client,
+            with (
+                patch(
+                    "omnigent.model_catalog.resolve_catalog_model",
+                    side_effect=_resolve_model,
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
             ):
                 with self.assertRaises(RuntimeError):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
-            self.assertEqual(captured["model"], _DATABRICKS_CLAUDE_DEFAULT_MODEL)
+            self.assertEqual(captured["model"], "catalog-databricks-claude-default")
 
         _run(_t())
 
@@ -2832,20 +2842,26 @@ def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> 
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd
     — so the sandbox root matches the tmux terminal and never falls back
-    to ``$HOME``. Absolute paths are honored verbatim."""
+    to ``$HOME``. Absolute paths keep their root and are resolved by
+    ``Path.resolve(strict=False)``."""
     from omnigent.inner.claude_sdk_executor import _resolve_sandbox_cwd
 
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/bobby/code/agents")
     monkeypatch.chdir("/tmp")
 
-    assert str(_resolve_sandbox_cwd(".")) == "/home/bobby/code/agents"
-    assert str(_resolve_sandbox_cwd(None)) == "/home/bobby/code/agents"
-    assert str(_resolve_sandbox_cwd("src")) == "/home/bobby/code/agents/src"
-    assert str(_resolve_sandbox_cwd("/etc/foo")) == "/etc/foo"
+    # ``_resolve_sandbox_cwd`` ends in ``Path.resolve(strict=False)``. On macOS,
+    # these literal paths route through firmlinks (``/home`` -> the automounter,
+    # ``/tmp`` -> ``/private/tmp``), so compare against the same resolution
+    # instead of literal strings. On Linux both sides are identical.
+    workspace = Path("/home/bobby/code/agents").resolve(strict=False)
+    assert _resolve_sandbox_cwd(".") == workspace
+    assert _resolve_sandbox_cwd(None) == workspace
+    assert _resolve_sandbox_cwd("src") == (workspace / "src").resolve(strict=False)
+    assert _resolve_sandbox_cwd("/etc/foo") == Path("/etc/foo").resolve(strict=False)
 
     # No workspace set → falls back to the process cwd (prior behavior).
     monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
-    assert str(_resolve_sandbox_cwd(".")) == "/tmp"
+    assert _resolve_sandbox_cwd(".") == Path("/tmp").resolve(strict=False)
 
 
 @pytest.mark.parametrize("env_value", ["1", "true", "yes"])

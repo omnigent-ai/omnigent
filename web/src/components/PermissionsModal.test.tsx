@@ -141,7 +141,7 @@ describe("PermissionsModal", () => {
     fireEvent.click(grantBtn);
 
     await waitFor(() => {
-      expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol@example.com", 1);
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol@example.com", 1, false);
     });
   });
 
@@ -190,7 +190,7 @@ describe("PermissionsModal", () => {
     fireEvent.click(await screen.findByRole("option", { name: "Edit" }));
 
     await waitFor(() => {
-      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2);
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2, false);
     });
     // Editing the level must never delete the existing grant.
     expect(revokeMock).not.toHaveBeenCalled();
@@ -232,6 +232,43 @@ describe("PermissionsModal", () => {
     await waitFor(() => {
       expect(grantMock).toHaveBeenCalledWith("conv_abc", "__public__", 1);
     });
+  });
+
+  it("lets owners grant edit plus approval authority", async () => {
+    listMock.mockResolvedValue([]);
+    grantMock.mockResolvedValue({
+      user_id: "bob@example.com",
+      conversation_id: "conv_abc",
+      level: 2,
+      can_approve: true,
+    });
+
+    render(
+      <PermissionsModal
+        sessionId="conv_abc"
+        open={true}
+        onOpenChange={() => {}}
+        canDelegateApprovals
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(listMock).toHaveBeenCalled());
+    fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+      target: { value: "bob@example.com" },
+    });
+    const formSelect = screen.getByRole("combobox");
+    formSelect.focus();
+    fireEvent.keyDown(formSelect, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Edit + approve" }));
+    fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+
+    await waitFor(() => {
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2, true);
+    });
+    expect(
+      screen.getByText("Approvers can authorize actions that use your session credentials."),
+    ).toBeInTheDocument();
   });
 
   it("displays server error messages from failed grant", async () => {
@@ -278,6 +315,8 @@ describe("PermissionsModal", () => {
     // The manage grant's level is still visible to the viewer as static text.
     expect(screen.getByText("Manage")).toBeInTheDocument();
 
+    // Only one listbox can be open, so each interaction must finish first.
+    /* oxlint-disable no-await-in-loop */
     for (const trigger of triggers) {
       trigger.focus();
       fireEvent.keyDown(trigger, { key: "Enter" });
@@ -290,6 +329,7 @@ describe("PermissionsModal", () => {
       fireEvent.keyDown(listbox, { key: "Escape" });
       await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("does not fetch permissions when closed", () => {

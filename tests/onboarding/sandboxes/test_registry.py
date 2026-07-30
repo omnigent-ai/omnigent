@@ -309,5 +309,5 @@ def test_instantiate_rejects_non_launcher_class(
         lambda _: _NotALauncher,
     )
 
-    with pytest.raises(SandboxRegistryError, match="not a SandboxLauncher subclass"):
+    with pytest.raises(SandboxRegistryError, match="not a SandboxLifecycle subclass"):
         instantiate("not-a-launcher")

@@ -34,9 +34,9 @@ async def _drain_runner_skills(session_id: str) -> None:
 
 
 async def _drain_model_options(session_id: str) -> None:
-    """Pump the loop until the background Codex model-options fetch lands.
+    """Pump the loop until the background native model-options fetch lands.
 
-    Codex model options are eventual-consistent like skills: the first
+    Runner model options are eventual-consistent like skills: the first
     snapshot returns ``[]`` and starts the runner query; a later snapshot
     serves the cache.
     """
@@ -781,6 +781,87 @@ async def test_session_snapshot_includes_model_options_from_runner(
         {"reasoningEffort": "high", "description": "High"},
         {"reasoningEffort": "xhigh", "description": "Extra high"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_kiro_session_snapshot_loads_runner_model_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            del timeout
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/kiro-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "provider-latest",
+                                "displayName": "Provider Latest",
+                                "isDefault": True,
+                                "description": "Provider supplied description",
+                                "contextWindow": 256_000,
+                                "rateMultiplier": 0.5,
+                                "rateUnit": "Credit",
+                            }
+                        ]
+                    }
+                )
+            return _FakeResponse({"status": "idle"})
+
+    session_id = "5c782829093f4ebcbf18684eed8a9155"
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._KIRO_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert f"/v1/sessions/{session_id}/kiro-model-options" in fake_client.get_calls
+    assert [model.id for model in snapshot.model_options] == ["provider-latest"]
+    assert snapshot.model_options[0].model_dump()["description"] == (
+        "Provider supplied description"
+    )
+    assert snapshot.model_options[0].model_dump()["contextWindow"] == 256_000
+    assert snapshot.model_options[0].model_dump()["rateMultiplier"] == 0.5
+    assert snapshot.model_options[0].model_dump()["rateUnit"] == "Credit"
 
 
 @pytest.mark.asyncio

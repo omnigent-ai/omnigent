@@ -194,7 +194,7 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
 }
 
 function functionCallToBlock(item: FunctionCallItem): ToolGroup {
-  let args: Record<string, unknown> = {};
+  let args: Record<string, unknown>;
   try {
     args = JSON.parse(item.arguments) as Record<string, unknown>;
   } catch {

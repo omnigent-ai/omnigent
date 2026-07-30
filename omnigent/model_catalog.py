@@ -37,14 +37,27 @@ import logging
 import os
 import subprocess
 import threading
-from dataclasses import dataclass, replace
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.model_metadata import (
+    ModelCapability,
+    ModelCostTier,
+    ModelIntent,
+    ModelMetadata,
+    ModelWireAPI,
+)
 from omnigent.model_override import model_family_mismatch
+from omnigent.model_resolver import (
+    ModelResolution,
+    ModelResolutionError,
+    ModelResolutionRequest,
+    resolve_model,
+)
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     CLI_CONFIG_KIND,
@@ -55,6 +68,9 @@ from omnigent.onboarding.provider_config import (
     ProviderEntry,
 )
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+if TYPE_CHECKING:
+    from omnigent.onboarding.providers import ModelInfo
 
 _logger = logging.getLogger(__name__)
 
@@ -154,13 +170,18 @@ class ModelEntry:
         ``"databricks-claude-sonnet-4-6"`` or ``"gpt-5.4-mini"``.
     :param family: Vendor family token — ``"claude"``, ``"openai"``, or
         ``"other"``.
-    :param context_window: Context window in tokens when the provider
-        reports one (e.g. OpenRouter ``context_length``), else ``None``.
+    :param metadata: Provider-neutral capabilities and limits. Metadata fields
+        remain unknown when the listing API reports only a model id.
     """
 
     id: str
     family: str
-    context_window: int | None = None
+    metadata: ModelMetadata = field(default_factory=ModelMetadata)
+
+    @property
+    def context_window(self) -> int | None:
+        """Return the normalized context window for compatibility callers."""
+        return self.metadata.context_window
 
 
 @dataclass(frozen=True)
@@ -294,6 +315,142 @@ def model_family_token(model_id: str) -> str:
     if "gpt" in lower or "codex" in lower:
         return "openai"
     return "other"
+
+
+def catalog_model_entries(provider_name: str) -> tuple[ModelEntry, ...]:
+    """Load provider chat models as normalized resolver candidates.
+
+    The upstream MLflow catalog is fetched and cached by
+    :func:`omnigent.onboarding.providers.get_chat_models`. This adapter keeps
+    provider discovery separate from selection while preserving catalog order
+    as the resolver's deterministic tie-breaker.
+
+    :param provider_name: MLflow catalog provider, e.g. ``"openai"`` or
+        ``"databricks"``.
+    :returns: Normalized model entries, newest/preferred catalog entries first.
+    """
+    from omnigent.onboarding.providers import get_chat_models
+
+    models = get_chat_models(provider_name)
+    cost_tiers = _catalog_cost_tiers(models)
+    entries: list[ModelEntry] = []
+    for index, model in enumerate(models):
+        supported: set[ModelCapability] = set()
+        unsupported: set[ModelCapability] = set()
+        for capability, value in (
+            (ModelCapability.TOOL_USE, model.supports_function_calling),
+            (ModelCapability.REASONING, model.supports_reasoning),
+            (ModelCapability.VISION, model.supports_vision),
+            (ModelCapability.STRUCTURED_OUTPUT, model.supports_structured_output),
+        ):
+            if value is True:
+                supported.add(capability)
+            elif value is False:
+                unsupported.add(capability)
+        entries.append(
+            ModelEntry(
+                id=model.name,
+                family=model_family_token(model.name),
+                metadata=ModelMetadata(
+                    supported_capabilities=frozenset(supported),
+                    unsupported_capabilities=frozenset(unsupported),
+                    context_window=model.max_input_tokens,
+                    cost_tier=cost_tiers.get(index),
+                ),
+            )
+        )
+    return tuple(entries)
+
+
+def resolve_catalog_model(
+    provider_name: str,
+    *,
+    intent: ModelIntent = ModelIntent.DEFAULT,
+    configured_default: str | None = None,
+    family: str | None = None,
+) -> ModelResolution:
+    """Resolve a model from the live bundled provider catalog.
+
+    Default intent preserves the onboarding provider's general-purpose model
+    policy after family and gateway-routing constraints are applied. Other
+    intents continue to rank all compatible catalog candidates by metadata.
+
+    :param provider_name: MLflow catalog provider name.
+    :param intent: Stable selection intent.
+    :param configured_default: Optional provider-configured model. It is
+        represented as a candidate in *family* so provider configuration keeps
+        precedence even when the remote catalog has not learned the id yet.
+    :param family: Optional normalized catalog family (``"claude"`` /
+        ``"openai"`` / ``"other"``).
+    :returns: The resolver result with source and normalized metadata.
+    :raises ModelResolutionError: When no compatible catalog model exists.
+    """
+    from omnigent.onboarding.providers import default_chat_model
+
+    models = list(catalog_model_entries(provider_name))
+    if provider_name.lower() == "databricks":
+        models = [model for model in models if model.id.lower().startswith("databricks-")]
+
+    if configured_default is None and intent == ModelIntent.DEFAULT:
+        compatible_ids = {model.id for model in models if family is None or model.family == family}
+        preferred_default = default_chat_model(
+            provider_name,
+            allowed_models=compatible_ids,
+        )
+        if preferred_default is not None and (
+            family is None or model_family_token(preferred_default) == family
+        ):
+            configured_default = preferred_default
+
+    if configured_default is not None and all(model.id != configured_default for model in models):
+        models.insert(
+            0,
+            ModelEntry(
+                id=configured_default,
+                family=family or model_family_token(configured_default),
+            ),
+        )
+    try:
+        return resolve_model(
+            ModelResolutionRequest(
+                intent=intent,
+                configured_default=configured_default,
+                allowed_families=(frozenset({family}) if family is not None else frozenset()),
+            ),
+            models,
+        )
+    except ModelResolutionError as exc:
+        family_detail = f" for family {family!r}" if family is not None else ""
+        raise ModelResolutionError(
+            f"no compatible model resolved from provider {provider_name!r}{family_detail}; "
+            "configure an explicit model or retry when catalog discovery is available"
+        ) from exc
+
+
+def _catalog_cost_tiers(models: list[ModelInfo]) -> dict[int, ModelCostTier]:
+    """Assign provider-relative thirds from reported token prices."""
+    priced: list[tuple[int, float]] = []
+    for index, model in enumerate(models):
+        input_price = getattr(model, "input_price", None)
+        output_price = getattr(model, "output_price", None)
+        if isinstance(input_price, (int, float)) and isinstance(output_price, (int, float)):
+            priced.append((index, float(input_price) + float(output_price)))
+    distinct = sorted({price for _, price in priced})
+    if not distinct:
+        return {}
+    if len(distinct) == 1:
+        return {index: ModelCostTier.STANDARD for index, _ in priced}
+    tiers: dict[int, ModelCostTier] = {}
+    price_rank = {price: rank / (len(distinct) - 1) for rank, price in enumerate(distinct)}
+    for index, price in priced:
+        percentile = price_rank[price]
+        if percentile <= 1 / 3:
+            tiers[index] = ModelCostTier.ECONOMY
+        elif percentile >= 2 / 3:
+            tiers[index] = ModelCostTier.PREMIUM
+        else:
+            tiers[index] = ModelCostTier.STANDARD
+    return tiers
 
 
 def spec_harness(spec: Any) -> str | None:  # type: ignore[explicit-any]  # structural spec stubs in tests
@@ -715,8 +872,23 @@ def _listing_payload(listing: ModelListing) -> dict[str, Any]:  # type: ignore[e
     models: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON-shaped tool payload
     for entry in listing.models:
         row: dict[str, Any] = {"id": entry.id, "family": entry.family}  # type: ignore[explicit-any]
-        if entry.context_window is not None:
-            row["context_window"] = entry.context_window
+        metadata = entry.metadata
+        if metadata.context_window is not None:
+            row["context_window"] = metadata.context_window
+        capabilities = {
+            capability.value: supported
+            for supported, values in (
+                (True, metadata.supported_capabilities),
+                (False, metadata.unsupported_capabilities),
+            )
+            for capability in sorted(values, key=lambda value: value.value)
+        }
+        if capabilities:
+            row["capabilities"] = capabilities
+        if metadata.cost_tier is not None:
+            row["cost_tier"] = metadata.cost_tier.value
+        if metadata.wire_apis:
+            row["wire_apis"] = sorted(wire_api.value for wire_api in metadata.wire_apis)
         models.append(row)
     return {
         "source": listing.source,
@@ -983,15 +1155,33 @@ def _fetch_databricks_uc_listing(
         if not name:
             continue
         api_types = service.get("supported_api_types", [])
-        has_chat = any("chat" in t for t in api_types)
-        has_embed = any("embed" in t.lower() for t in api_types)
+        normalized_api_types = {
+            api_type.lower() for api_type in api_types if isinstance(api_type, str)
+        }
+        has_chat = any("chat" in api_type for api_type in normalized_api_types)
+        has_embed = any("embed" in api_type for api_type in normalized_api_types)
         if not has_chat or has_embed:
             continue
         from omnigent.pi_native_credentials import _unsupported_in_pi
 
         if _unsupported_in_pi(name.lower()):
             continue
-        models.append(ModelEntry(id=name, family=model_family_token(name)))
+        wire_apis: set[ModelWireAPI] = set()
+        if any("chat/completions" in api_type for api_type in normalized_api_types):
+            wire_apis.add(ModelWireAPI.OPENAI_CHAT)
+        if "openai/v1/responses" in normalized_api_types:
+            wire_apis.add(ModelWireAPI.OPENAI_RESPONSES)
+        if any(
+            "anthropic" in api_type and "messages" in api_type for api_type in normalized_api_types
+        ):
+            wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
+        models.append(
+            ModelEntry(
+                id=name,
+                family=model_family_token(name),
+                metadata=ModelMetadata(wire_apis=frozenset(wire_apis)),
+            )
+        )
     return ModelListing(
         source="gateway",
         verified=True,
@@ -1084,7 +1274,9 @@ def _fetch_openai_compatible_listing(
             ModelEntry(
                 id=model_id,
                 family=model_family_token(model_id),
-                context_window=context_length if isinstance(context_length, int) else None,
+                metadata=ModelMetadata(
+                    context_window=context_length if isinstance(context_length, int) else None
+                ),
             )
         )
     return ModelListing(

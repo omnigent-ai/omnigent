@@ -180,9 +180,11 @@ def test_catalog_rows_carry_setup_steps() -> None:
             # JSON-serializable primitives only.
             for value in step.values():
                 assert value is None or isinstance(value, str)
-    # Codex is a first-class harness: install (one-click) then a login command.
+    # Codex is a first-class harness: install (one-click) then a UI-authable
+    # auth step. The step opens the credential form (action "auth"); its
+    # subscription option still carries the `codex login` command.
     codex = rows["codex"]["setup_steps"]
-    assert [s["action"] for s in codex] == ["install", "command"]
+    assert [s["action"] for s in codex] == ["install", "auth"]
     assert codex[1]["command"] == "codex login"
 
 

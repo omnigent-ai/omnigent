@@ -1,7 +1,7 @@
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
@@ -56,6 +56,10 @@ import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
+
+const MCP_SERVERS_UPDATED_TOAST = (
+  <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>
+);
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -661,9 +665,15 @@ interface McpFormState {
   description: string;
   url: string;
   /** Key-value pairs for HTTP headers. Values from existing servers are "[REDACTED]". */
-  headers: { key: string; value: string }[];
+  headers: { id: string; key: string; value: string }[];
   command: string;
   argsText: string;
+}
+
+let nextMcpHeaderId = 0;
+
+function mcpHeader(key = "", value = "") {
+  return { id: `mcp-header-${nextMcpHeaderId++}`, key, value };
 }
 
 const EMPTY_MCP_FORM: McpFormState = {
@@ -684,7 +694,7 @@ function mcpFormFromServer(server: McpServerSummary): McpFormState {
     transport: server.transport === "stdio" ? "stdio" : "http",
     description: server.description ?? "",
     url: server.url ?? "",
-    headers: Object.entries(server.headers ?? {}).map(([key, value]) => ({ key, value })),
+    headers: Object.entries(server.headers ?? {}).map(([key, value]) => mcpHeader(key, value)),
     command: server.command ?? "",
     argsText: (server.args ?? []).join("\n"),
   };
@@ -932,7 +942,7 @@ function McpServerManagerDialog({
                       onClick={() =>
                         setForm((prev) => ({
                           ...prev,
-                          headers: [...prev.headers, { key: "", value: "" }],
+                          headers: [...prev.headers, mcpHeader()],
                         }))
                       }
                       className="rounded p-0.5 hover:bg-muted"
@@ -942,7 +952,7 @@ function McpServerManagerDialog({
                     </button>
                   </div>
                   {form.headers.map((header, i) => (
-                    <div key={i} className="flex items-center gap-1">
+                    <div key={header.id} className="flex items-center gap-1">
                       <Input
                         value={header.key}
                         onChange={(e) =>
@@ -1069,10 +1079,13 @@ function McpServersSection({
   const dirtyControlled = controlledDirty !== undefined;
   const mcpDirty = controlledDirty ?? localDirty;
 
-  function setMcpDirty(dirty: boolean) {
-    if (!dirtyControlled) setLocalDirty(dirty);
-    onDirtyChange?.(dirty);
-  }
+  const setMcpDirty = useCallback(
+    (dirty: boolean) => {
+      if (!dirtyControlled) setLocalDirty(dirty);
+      onDirtyChange?.(dirty);
+    },
+    [dirtyControlled, onDirtyChange],
+  );
 
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   // Clear the dirty flag when the session restarts (launching picks up
@@ -1085,6 +1098,16 @@ function McpServersSection({
   }, [dirtyControlled, sessionId]);
   const canEdit = !!(sessionId && editable);
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
+  const handleDeleteServer = useCallback(
+    (name: string) =>
+      deleteServer.mutate(name, {
+        onSuccess: () => {
+          setMcpDirty(true);
+          showToast(MCP_SERVERS_UPDATED_TOAST);
+        },
+      }),
+    [deleteServer, setMcpDirty],
+  );
   const showSection = servers.length > 0 || canEdit;
   if (!showSection) return null;
 
@@ -1111,24 +1134,7 @@ function McpServersSection({
         </p>
       )}
       {servers.length > 0 ? (
-        <McpServerList
-          servers={servers}
-          onDelete={
-            canEdit
-              ? (name) =>
-                  deleteServer.mutate(name, {
-                    onSuccess: () => {
-                      setMcpDirty(true);
-                      showToast(
-                        <span className="text-sm">
-                          MCP servers updated. Restart the session to apply changes.
-                        </span>,
-                      );
-                    },
-                  })
-              : undefined
-          }
-        />
+        <McpServerList servers={servers} onDelete={canEdit ? handleDeleteServer : undefined} />
       ) : (
         <p className="text-xs text-muted-foreground">No MCP servers</p>
       )}
@@ -1600,8 +1606,8 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
           sessionId={sessionId}
           mcpDirty={mcpDirty}
           onMcpDirtyChange={setMcpDirty}
-          onSubdialogOpenChange={(open) => {
-            subdialogOpenRef.current = open;
+          onSubdialogOpenChange={(isOpen) => {
+            subdialogOpenRef.current = isOpen;
           }}
         />
       </PopoverContent>

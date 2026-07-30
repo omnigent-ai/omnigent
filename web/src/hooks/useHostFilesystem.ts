@@ -117,7 +117,7 @@ async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDi
   let truncated = false;
   // Sequential by necessity: each page's cursor is the previous
   // page's last entry path, so the requests can't be parallelized.
-  /* oxlint-disable eslint(no-await-in-loop) */
+  /* oxlint-disable no-await-in-loop */
   for (let page = 0; page < MAX_PAGES; page++) {
     const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
     if (after !== null) {
@@ -143,7 +143,7 @@ async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDi
       truncated = true;
     }
   }
-  /* oxlint-enable eslint(no-await-in-loop) */
+  /* oxlint-enable no-await-in-loop */
   return { entries, truncated };
 }
 
@@ -208,7 +208,7 @@ export async function createHostDirectory(hostId: string, path: string): Promise
   if (!res.ok) {
     // Surface the server's detail (e.g. "directory already exists") so
     // the user sees why creation failed rather than a bare status code.
-    let detail: string | null = null;
+    let detail: string | null;
     try {
       const body = (await res.json()) as { detail?: string };
       detail = typeof body.detail === "string" ? body.detail : null;

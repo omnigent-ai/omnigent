@@ -172,6 +172,9 @@ _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboratio
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE: str = "external_codex_collaboration_mode_change"
 
 
+_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE: str = "external_codex_approval_mode_change"
+
+
 _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
 
 
@@ -365,6 +368,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
 }
 
 
@@ -624,6 +628,7 @@ _UPLOAD_READ_CHUNK_BYTES: int = 1024 * 1024
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE: "claude-model-options",
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
@@ -705,6 +710,7 @@ __all__ = [
     "_DENY_SENTINEL_PREFIX",
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
+    "_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE",
     "_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE",
     "_EXTERNAL_CODEX_SUBAGENT_START_TYPE",
     "_EXTERNAL_COMPACTION_STATUS_TYPE",

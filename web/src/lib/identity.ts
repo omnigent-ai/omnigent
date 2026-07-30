@@ -22,20 +22,20 @@ import { getOmnigentHostConfig, hostFetch } from "./host";
 // not a real actor, so never used as an author label.
 const RESERVED_USER_LOCAL = "local";
 
-let _currentUserId: string | null = null;
+let currentUserId: string | null = null;
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
 // `users.is_admin` column), so the SPA can gate admin chrome in EVERY
 // auth mode — including OIDC/SSO, where the accounts-only `/auth/me`
 // endpoint doesn't exist. Defaults false until the probe resolves.
-let _currentIsAdmin = false;
-let _resolved = false;
-let _resolvePromise: Promise<string | null> | null = null;
+let currentIsAdmin = false;
+let identityResolved = false;
+let identityPromise: Promise<string | null> | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
 // path per provider — "/login" for accounts, "/auth/login" for OIDC.
 // Hardcoding "/login" here previously sent OIDC users to an accounts
 // password form that had no connection to their IdP.
-let _serverLoginUrl: string | null = null;
+let serverLoginUrl: string | null = null;
 
 /**
  * Whether the current page IS the login or register page, so we
@@ -49,7 +49,7 @@ let _serverLoginUrl: string | null = null;
  * OIDC server-side path (``/auth/login``) so the guard covers
  * every mode.
  */
-function _isOnLoginPath(): boolean {
+function isOnLoginPath(): boolean {
   const path = window.location.pathname;
   return path === "/login" || path === "/register" || path.startsWith("/auth/login");
 }
@@ -62,9 +62,9 @@ function _isOnLoginPath(): boolean {
  * redirects the browser to the login page.
  */
 export async function resolveIdentity(): Promise<string | null> {
-  if (_resolved) return _currentUserId;
-  if (_resolvePromise) return _resolvePromise;
-  _resolvePromise = (async () => {
+  if (identityResolved) return currentUserId;
+  if (identityPromise) return identityPromise;
+  identityPromise = (async () => {
     try {
       const res = await hostFetch("/v1/me");
       if (res.status === 401) {
@@ -78,8 +78,8 @@ export async function resolveIdentity(): Promise<string | null> {
             login_url?: string;
           };
           if (data.login_url) {
-            _serverLoginUrl = data.login_url;
-            if (!_isOnLoginPath()) {
+            serverLoginUrl = data.login_url;
+            if (!isOnLoginPath()) {
               const returnTo = encodeURIComponent(
                 window.location.pathname + window.location.search,
               );
@@ -96,21 +96,21 @@ export async function resolveIdentity(): Promise<string | null> {
           user_id: string | null;
           is_admin?: boolean;
         };
-        _currentUserId = data.user_id;
-        _currentIsAdmin = data.is_admin ?? false;
+        currentUserId = data.user_id;
+        currentIsAdmin = data.is_admin ?? false;
       }
     } catch {
       // Server unreachable — leave as null.
     }
-    _resolved = true;
-    return _currentUserId;
+    identityResolved = true;
+    return currentUserId;
   })();
-  return _resolvePromise;
+  return identityPromise;
 }
 
 /** Return the cached user ID (null before resolveIdentity completes). */
 export function getCurrentUserId(): string | null {
-  return _currentUserId;
+  return currentUserId;
 }
 
 /**
@@ -119,7 +119,7 @@ export function getCurrentUserId(): string | null {
  * AND OIDC. Returns false before `resolveIdentity` completes.
  */
 export function getCurrentIsAdmin(): boolean {
-  return _currentIsAdmin;
+  return currentIsAdmin;
 }
 
 /**
@@ -128,10 +128,10 @@ export function getCurrentIsAdmin(): boolean {
  * resolves and for the `"local"` sentinel, so those stay unlabeled.
  */
 export function getCurrentAuthorId(): string | null {
-  if (_currentUserId === null || _currentUserId === RESERVED_USER_LOCAL) {
+  if (currentUserId === null || currentUserId === RESERVED_USER_LOCAL) {
     return null;
   }
-  return _currentUserId;
+  return currentUserId;
 }
 
 /**
@@ -146,12 +146,8 @@ export async function authenticatedFetch(
   init?: RequestInit,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
-  if (
-    _currentUserId &&
-    _currentUserId !== RESERVED_USER_LOCAL &&
-    !headers.has("X-Forwarded-Email")
-  ) {
-    headers.set("X-Forwarded-Email", _currentUserId);
+  if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
+    headers.set("X-Forwarded-Email", currentUserId);
   }
   // Bypass the browser HTTP cache for all API calls. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
@@ -173,7 +169,7 @@ export async function authenticatedFetch(
     res.status === 401 &&
     !input.toString().includes("/v1/me") &&
     !input.toString().includes("/auth/") &&
-    !_isOnLoginPath()
+    !isOnLoginPath()
   ) {
     // Session expired or cookie invalid — redirect to login IFF the
     // server actually has a login page. Don't redirect on /auth/*
@@ -185,9 +181,9 @@ export async function authenticatedFetch(
     // **null for header mode (no login)**. In header mode a stray 401
     // must NOT bounce the user to a phantom /login form — header is
     // the default for a bare local server, so we surface the 401 to
-    // the caller instead. (_serverLoginUrl from the /v1/me probe is a
+    // the caller instead. (serverLoginUrl from the /v1/me probe is a
     // fallback for the brief window before capabilities resolves.)
-    const loginUrl = getCachedServerInfo()?.login_url ?? _serverLoginUrl;
+    const loginUrl = getCachedServerInfo()?.login_url ?? serverLoginUrl;
     if (loginUrl) {
       window.location.href = `${loginUrl}?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`;
     }

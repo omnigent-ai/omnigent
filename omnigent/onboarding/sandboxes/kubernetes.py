@@ -66,10 +66,10 @@ from omnigent.host.identity import (
 )
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
-    RemoteCommandResult,
-    SandboxLauncher,
+    SandboxHostLauncher,
     render_host_config_write_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -808,7 +808,7 @@ def _current_wait_reason(pod: object) -> str | None:
     return None
 
 
-class KubernetesSandboxLauncher(SandboxLauncher):
+class KubernetesSandboxLauncher(SandboxHostLauncher):
     """
     :class:`SandboxLauncher` for on-demand Kubernetes Pods.
 
@@ -822,9 +822,16 @@ class KubernetesSandboxLauncher(SandboxLauncher):
     """
 
     provider: ClassVar[str] = "kubernetes"
-    # Managed-only: no CLI bootstrap, no local→sandbox port forward.
-    supports_cli_bootstrap: ClassVar[bool] = False
-    supports_local_port_forward: ClassVar[bool] = False
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=False,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+        )
 
     def __init__(
         self,
@@ -1532,20 +1539,4 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             f"{_POD_DELETE_MAX_ATTEMPTS} attempts ({reason}); it may still exist "
             "and carries the omnigent managed-by/role labels for GC.",
             err=True,
-        )
-
-    # ── unsupported: no exec transport (the host is the Pod entrypoint) ──
-
-    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
-        """
-        Unsupported: the host runs as the Pod's entrypoint, so there is no
-        exec-in transport.
-
-        :param sandbox_id: Unused.
-        :param command: Unused.
-        :param check: Unused.
-        :raises SandboxCapabilityError: Always.
-        """
-        raise self._capability_error(
-            "run a command via exec — the host runs as the Pod entrypoint"
         )

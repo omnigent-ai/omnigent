@@ -5,10 +5,21 @@ from __future__ import annotations
 import json
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from omnigent import pi_native_credentials as creds
+
+
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
 
 
 def _databricks_config() -> dict[str, object]:
@@ -40,7 +51,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
     assert provider is not None
     assert provider.api == "anthropic-messages"
     assert provider.base_url == "https://wkspc.example.com/ai-gateway/anthropic"
-    assert provider.model == "databricks-claude-sonnet-4-6"
+    assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
     # apiKey is a "!command" so Pi refreshes the gateway token per request.
     assert provider.api_key.startswith("!")
@@ -398,7 +409,7 @@ def test_cli_config_databricks_resolves_to_anthropic_gateway(
     assert (
         provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
     )
-    assert provider.model == "databricks-claude-sonnet-4-6"
+    assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
     # apiKey is a "!command" rebuilt from the table's [X.auth] command + args
     # so Pi refreshes the gateway token per request.

@@ -657,7 +657,6 @@ jobs:
   # never re-freezes and doc-sync keeps deriving the right X.Y-docs branch.
   bump-main:
     needs: [authorize, plan, cut]
-    if: ${{ !inputs.dry_run && needs.plan.outputs.branch_exists == 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -667,8 +666,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.plan.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          BRANCH_EXISTS: ${{ needs.plan.outputs.branch_exists }}
         run: |
           set -euo pipefail
+          # Gate in shell, not a job-level `if`: a CLI/API dispatch delivers
+          # boolean inputs as the STRING "false", which is truthy in an
+          # expression, so `!inputs.dry_run` silently skipped this job at the
+          # v0.7.0 cut. Shell string comparison is dispatch-channel-proof and
+          # logs its decision instead of vanishing from the run.
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run — not dispatching the main bump." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$BRANCH_EXISTS" != "false" ]; then
+            echo "Release branch pre-existed (not the first cut of this cycle) — main bump not needed." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # A cut below main's current line (a throwaway rehearsal rc, or
           # resurrecting an old series for a backport) must not walk main's
           # version backwards.

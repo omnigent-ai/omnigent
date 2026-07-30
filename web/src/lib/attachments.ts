@@ -19,6 +19,17 @@ export const ATTACHMENT_SIZE_LIMITS_MB = {
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
 
+const attachmentIds = new WeakMap<File, string>();
+let nextAttachmentId = 0;
+
+export function attachmentKey(file: File): string {
+  const existing = attachmentIds.get(file);
+  if (existing) return existing;
+  const id = `attachment-${nextAttachmentId++}`;
+  attachmentIds.set(file, id);
+  return id;
+}
+
 // Text-bearing application/* MIME types (the rest of the text-like surface
 // is text/*). Mirrors _TEXT_LIKE_APPLICATION_MIMES on the server.
 const TEXT_LIKE_APPLICATION_MIMES = new Set([

@@ -24,7 +24,7 @@ def _fulfill_hosts(route: Route) -> None:
                         "name": _HOST_NAME,
                         "owner": "e2e",
                         "status": "online",
-                        "configured_harnesses": {"cursor-native": False},
+                        "configured_harnesses": {"cursor-native": "binary-missing"},
                     }
                 ]
             }
@@ -85,10 +85,13 @@ def test_cursor_missing_cli_shows_install_and_login_guidance(
 
     warning = page.get_by_test_id("new-chat-landing-harness-warning")
     expect(warning).to_be_visible(timeout=30_000)
-    expect(warning).to_contain_text(f"Cursor needs cursor-agent on {_HOST_NAME}")
-    expect(warning).to_contain_text("curl https://cursor.com/install -fsS | bash")
-    expect(warning).to_contain_text("cursor-agent login")
-    expect(warning.locator("code")).to_have_count(2)
+    # A missing cursor-agent binary now reports the uniform "binary-missing"
+    # reason — the same structured signal as Codex / Claude / OpenCode — so the
+    # feature-OFF warning is the generic "run omni setup" guidance, not the
+    # Cursor-specific curl instructions (those live in the setup dialog when the
+    # install feature is ON, and in `omni cursor` on the CLI).
+    expect(warning).to_contain_text(f"Cursor isn't configured on {_HOST_NAME}")
+    expect(warning).to_contain_text("omni setup")
 
     # The guidance is visible before launch and remains warning-only.
     composer.fill("help me inspect this repository")
@@ -98,9 +101,8 @@ def test_cursor_missing_cli_shows_install_and_login_guidance(
     page.get_by_test_id("new-chat-landing-agent-select").click()
     badge = page.get_by_test_id(f"new-chat-landing-agent-warning-{_AGENT_ID}")
     expect(badge).to_be_visible()
-    # This test doesn't enable OMNIGENT_HARNESS_INSTALL_ENABLED, so the picker
-    # runs on the feature-OFF default — where the badge keeps the original
-    # per-reason text ("install & login" for a missing cursor-agent CLI). (With
-    # the feature ON the badge collapses to a single "needs setup" and the steps
-    # move into the setup dialog.)
-    expect(badge).to_have_text("install & login")
+    # Feature-OFF picker keeps the per-reason badge text; with the structured
+    # "binary-missing" reason that is now "binary missing" — the same label
+    # Codex / Claude / OpenCode show for a missing CLI, instead of the legacy
+    # bespoke "install & login".
+    expect(badge).to_have_text("binary missing")

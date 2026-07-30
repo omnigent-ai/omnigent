@@ -3294,6 +3294,8 @@ def start_tool_relay(
     tools: list[dict[str, Any]],
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
+    policy_client: Any | None = None,
+    session_id: str | None = None,
 ) -> ClaudeNativeToolRelay:
     """
     Start a relay for Omnigent tool calls from Claude.
@@ -3303,26 +3305,39 @@ def start_tool_relay(
     whole session) and must call :meth:`ClaudeNativeToolRelay.close` when
     that scope ends.
 
+    When ``policy_client`` and ``session_id`` are provided the relay also
+    exposes ``POST /policies/evaluate``, which proxies requests to the
+    Omnigent server using the runner's refresh-capable client — so hook
+    subprocesses never need a server bearer token of their own.
+
     :param bridge_dir: Bridge directory path.
-    :param tools: Omnigent tool schemas to advertise, e.g.
-        ``[{"name": "sys_os_read", "parameters": {...}}]``.
-    :param tool_executor: Callback used to dispatch one tool call through
-        AP/runner.
+    :param tools: Omnigent tool schemas to advertise.
+    :param tool_executor: Callback used to dispatch one tool call.
     :param loop: Event loop that owns ``tool_executor``.
-    :returns: Started relay handle. Call :meth:`close` when the relay's
-        scope ends (e.g. on session delete).
+    :param policy_client: Runner's async httpx client for policy eval proxy.
+    :param session_id: Session id written into ``tool_relay.json`` so hook
+        subprocesses can construct the correct ``/policies/evaluate`` URL.
+    :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
-    handler_cls = _tool_relay_handler_factory(token, tool_executor, loop)
+    handler_cls = _tool_relay_handler_factory(
+        token,
+        tool_executor,
+        loop,
+        policy_client=policy_client,
+        session_id=session_id,
+    )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     host, port = httpd.server_address
-    relay_info = {
+    relay_info: dict[str, Any] = {
         "url": f"http://{host}:{port}",
         "token": token,
         "tools": _normalize_relay_tool_specs(tools),
         "pid": os.getpid(),
         "updated_at": time.time(),
     }
+    if session_id is not None:
+        relay_info["session_id"] = session_id
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -3515,6 +3530,9 @@ def _tool_relay_handler_factory(
     token: str,
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
+    *,
+    policy_client: Any | None = None,
+    session_id: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -3523,6 +3541,9 @@ def _tool_relay_handler_factory(
     :param tool_executor: Existing harness callback used to
         dispatch one tool call.
     :param loop: Event loop that owns ``tool_executor``.
+    :param policy_client: Optional async httpx client for proxying
+        ``/policies/evaluate`` to the Omnigent server.
+    :param session_id: Session id for the ``/policies/evaluate`` path.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
@@ -3542,11 +3563,11 @@ def _tool_relay_handler_factory(
 
         def do_POST(self) -> None:
             """
-            Accept one MCP tool call from the Claude helper process.
+            Accept one MCP tool call or policy evaluation from the Claude helper process.
 
             :returns: None.
             """
-            if self.path != "/tool":
+            if self.path not in ("/tool", "/policies/evaluate"):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             if self.headers.get("Authorization") != f"Bearer {token}":
@@ -3556,6 +3577,9 @@ def _tool_relay_handler_factory(
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
+            if self.path == "/policies/evaluate":
+                self._handle_policy_evaluate(payload)
+                return
             name = payload.get("name")
             arguments = payload.get("arguments")
             if not isinstance(name, str) or not name:
@@ -3564,6 +3588,31 @@ def _tool_relay_handler_factory(
             if not isinstance(arguments, dict):
                 arguments = {}
             self._send_json(_run_relay_tool(tool_executor, loop, name, arguments))
+
+        def _handle_policy_evaluate(self, payload: dict[str, Any]) -> None:
+            if policy_client is None or session_id is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            import urllib.parse as _up
+
+            session_component = _up.quote(session_id, safe="")
+            url = f"/v1/sessions/{session_component}/policies/evaluate"
+            future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
+            try:
+                resp = future.result(timeout=86400.0)
+            except Exception:  # noqa: BLE001
+                self.send_error(HTTPStatus.BAD_GATEWAY)
+                return
+            raw = resp.content
+            self.send_response(resp.status_code)
+            for header in ("Content-Type", "Content-Length"):
+                val = resp.headers.get(header)
+                if val is not None:
+                    self.send_header(header, val)
+            if "Content-Length" not in resp.headers:
+                self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
 
         def _read_json_body(self) -> dict[str, Any] | None:
             """

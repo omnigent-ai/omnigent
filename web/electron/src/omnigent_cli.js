@@ -241,10 +241,10 @@ function localServerStatus() {
 async function localServerHealthy(timeoutMs = 1500) {
   const rec = readLocalServerPidfile();
   if (!rec || !isPidAlive(rec.pid)) return null;
-  const url = `http://127.0.0.1:${rec.port}`;
+  const localUrl = `http://127.0.0.1:${rec.port}`;
   try {
-    const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(timeoutMs) });
-    if (resp.ok) return { url, pid: rec.pid, port: rec.port };
+    const resp = await fetch(`${localUrl}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (resp.ok) return { url: localUrl, pid: rec.pid, port: rec.port };
   } catch {
     // Refused / unreachable / timed out → not a healthy server we can reuse.
   }

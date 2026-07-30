@@ -82,7 +82,7 @@ applyThemePalette(readThemePalette());
 // missing server doesn't deadlock first paint. We add a small
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
-const _bootProbe: Promise<ServerInfo> = Promise.race([
+const bootProbe: Promise<ServerInfo> = Promise.race([
   resolveServerInfo(),
   new Promise<ServerInfo>((resolve) =>
     setTimeout(
@@ -108,7 +108,7 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
   ),
 ]);
 
-void _bootProbe.then((info) => {
+void bootProbe.then((info) => {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <CapabilitiesProvider info={info}>

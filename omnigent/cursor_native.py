@@ -30,6 +30,7 @@ import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_cold_resume_hint, echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -52,6 +53,9 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
 
 _DEFAULT_CURSOR_COMMAND = "cursor-agent"
@@ -161,7 +165,7 @@ def resolve_cursor_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_cursor_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
             "Native Cursor requires the 'cursor-agent' CLI on PATH. Install it with: "
@@ -272,7 +276,8 @@ def run_cursor_native(
     *,
     server: str | None,
     session_id: str | None,
-    cursor_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    cursor_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     model: str | None = None,
     auto_open_conversation: bool = False,
@@ -294,6 +299,9 @@ def run_cursor_native(
         Injected as ``--mode <mode>`` unless already present in *cursor_args*.
     :returns: None after the terminal attach session ends.
     """
+    cursor_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=cursor_args, legacy_param="cursor_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
