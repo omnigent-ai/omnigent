@@ -226,6 +226,7 @@ async def _get_anthropic_model_metadata(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ModelMetadata | None:
     """Fetch and cache one model's live capability metadata."""
+    # HMAC creates an opaque process-local cache partition, not a persisted credential hash.
     credential_partition = hmac.digest(
         _MODEL_METADATA_CACHE_PARTITION_SECRET,
         headers.get("x-api-key", "").encode(),
