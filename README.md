@@ -46,8 +46,8 @@ Omnigent lets you:
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
-  [Boxlite](https://github.com/boxlite-ai/boxlite), or
-  [Databricks](https://www.databricks.com) sandboxes, launched from the
+  [Boxlite](https://github.com/boxlite-ai/boxlite), [Tenki](https://tenki.cloud),
+  or [Databricks](https://www.databricks.com) sandboxes, launched from the
   CLI or provisioned by the server per session (*managed hosts*).
 
 - **🛡️ Govern your agents.** Create
@@ -81,7 +81,7 @@ Available user-facing extras include:
 
 - **Model providers:** `databricks`, `bedrock`, `vertex`
 - **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
-  `openshell`, `kubernetes`
+  `openshell`, `kubernetes`, `tenki`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`
 
