@@ -727,7 +727,7 @@ export function AppShell() {
     // (no ?view=, no persisted tab, no file to surface). In that case we leave
     // ``rightRailTab`` untouched so the tab-fallback effect can still land on
     // the first *available* tab — forcing "files" here would shadow it.
-    let nextTab: RightRailTab | null = null;
+    let nextTab: RightRailTab | null;
     if (viewParam === "changed") {
       setFilesPanelFlatView(true);
       nextTab = "files";

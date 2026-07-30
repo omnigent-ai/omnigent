@@ -208,7 +208,7 @@ export async function createHostDirectory(hostId: string, path: string): Promise
   if (!res.ok) {
     // Surface the server's detail (e.g. "directory already exists") so
     // the user sees why creation failed rather than a bare status code.
-    let detail: string | null = null;
+    let detail: string | null;
     try {
       const body = (await res.json()) as { detail?: string };
       detail = typeof body.detail === "string" ? body.detail : null;

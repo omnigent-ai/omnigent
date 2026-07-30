@@ -47,7 +47,7 @@ function makeTerminal(id: string, name: string, session: string): TerminalInfo {
   };
 }
 
-function useTerminalList(terminals: TerminalInfo[]) {
+function mockTerminalList(terminals: TerminalInfo[]) {
   useTerminalsMock.mockReturnValue({
     terminals,
     isLoading: false,
@@ -67,7 +67,7 @@ function renderPanel({
   readOnly?: boolean;
   terminals?: TerminalInfo[];
 } = {}) {
-  useTerminalList(terminals);
+  mockTerminalList(terminals);
   return render(
     <TerminalsPanel
       open
