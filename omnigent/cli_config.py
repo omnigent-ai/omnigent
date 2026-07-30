@@ -2201,6 +2201,8 @@ def _print_acp_examples() -> None:
         "  Omnigent stores no credential — log into each agent via its own CLI first.\n\n"
         "  Example commands to paste:\n"
         "    • Gemini CLI     [bold]gemini --experimental-acp[/bold]\n"
+        "    • Qoder          [bold]qodercli --acp[/bold]\n"
+        "    • Qoder CN       [bold]qoderclicn --acp[/bold]\n"
         "    • Qwen Code      [bold]qwen --acp[/bold]\n"
         "    • Goose          [bold]goose acp[/bold]\n"
         "    • Claude Code    [bold]npx -y @zed-industries/claude-code-acp[/bold]\n"

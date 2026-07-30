@@ -55,7 +55,7 @@ of the agent YAML.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, qoder, qoder-cn, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -168,6 +168,38 @@ executor:
 
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
+
+## Qoder and Qoder CN
+
+The first-class `qoder` and `qoder-cn` harnesses run the vendor CLIs through
+their supported ACP interfaces. Install and authenticate the variant for your
+region:
+
+```bash
+npm install -g @qoder-ai/qodercli
+qodercli login
+
+npm install -g @qodercn-ai/qoderclicn
+qoderclicn login
+```
+
+You can also provide `QODER_PERSONAL_ACCESS_TOKEN` or
+`QODERCN_PERSONAL_ACCESS_TOKEN`, respectively. Omnigent forwards only the token
+for the selected harness into its deny-by-default ACP child environment.
+
+```yaml
+executor:
+  harness: qoder
+```
+
+```yaml
+executor:
+  harness: qoder-cn           # alias: qodercn
+```
+
+These launch `qodercli --acp` and `qoderclicn --acp`. Qoder owns model selection
+and authentication for these sessions, so no Omnigent `model` or `auth` block is
+required.
 
 ## Local OS access
 

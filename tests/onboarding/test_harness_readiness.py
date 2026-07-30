@@ -131,6 +131,9 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "goose-native",
         "native-goose",
         "hermes",
+        "qoder",
+        "qoder-cn",
+        "qodercn",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -330,6 +333,10 @@ def test_configured_harness_map_covers_all_spellings(
         "qwen-code",
         "qwen-native",
         "native-qwen",
+        # Qoder ACP harnesses + the compact CN alias; each gates on its vendor CLI.
+        "qoder",
+        "qoder-cn",
+        "qodercn",
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
@@ -384,6 +391,9 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "goose-native",
         "native-goose",
         "qwen",
+        "qoder",
+        "qoder-cn",
+        "qodercn",
         "hermes",
     ):
         assert result[cli] is not True, f"{cli} should be gated on its CLI binary"

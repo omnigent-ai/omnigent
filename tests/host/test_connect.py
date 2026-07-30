@@ -1609,6 +1609,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY": "sk-o",
         "OPENAI_BASE_URL": "https://gateway.example.com/openai",
         "GEMINI_API_KEY": "g-key",
+        "QODER_PERSONAL_ACCESS_TOKEN": "qoder-token",
+        "QODERCN_PERSONAL_ACCESS_TOKEN": "qoder-cn-token",
         "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
         "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
         # An unrelated secret must never ride the credential set.
@@ -1636,6 +1638,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "GEMINI_API_KEY",
+        "QODER_PERSONAL_ACCESS_TOKEN",
+        "QODERCN_PERSONAL_ACCESS_TOKEN",
         "AWS_BEARER_TOKEN_BEDROCK",
         "ANTHROPIC_BEDROCK_BASE_URL",
     ):

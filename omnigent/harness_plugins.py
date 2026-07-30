@@ -548,6 +548,28 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    "qoder": _C(
+        _IM.ACP_SUBPROCESS,
+        _EL.SSE_PERMISSION,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    ),
+    "qoder-cn": _C(
+        _IM.ACP_SUBPROCESS,
+        _EL.SSE_PERMISSION,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    ),
     "kimi": _C(
         _IM.CLI_SUBPROCESS,
         _EL.NONE,
@@ -626,6 +648,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "opencode-native",
             "pi",
             "pi-native",
+            "qoder",
+            "qoder-cn",
             "qwen",
             "qwen-native",
         }
@@ -652,6 +676,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "opencode-native": "omnigent.inner.opencode_native_harness",
         "pi": "omnigent.inner.pi_harness",
         "pi-native": "omnigent.inner.pi_native_harness",
+        "qoder": "omnigent.inner.acp_harness",
+        "qoder-cn": "omnigent.inner.acp_harness",
         "qwen": "omnigent.inner.qwen_harness",
         "qwen-native": "omnigent.inner.qwen_native_harness",
     },
@@ -671,6 +697,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "native-qwen": "qwen-native",
         "opencode": "opencode-native",
         "openai-agents-sdk": "openai-agents",
+        "qodercn": "qoder-cn",
         "qwen-code": "qwen",
     },
     native_harnesses=frozenset(
@@ -713,6 +740,29 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         HERMES_NATIVE_CODING_AGENT,
     ),
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
+    install_specs={
+        "qoder": HarnessInstallSpec(
+            "Qoder",
+            "qodercli",
+            "@qoder-ai/qodercli",
+            login_args=("login",),
+        ),
+        "qoder-cn": HarnessInstallSpec(
+            "Qoder CN",
+            "qoderclicn",
+            "@qodercn-ai/qoderclicn",
+            login_args=("login",),
+        ),
+    },
+    harness_install_keys={
+        "qoder": "qoder",
+        "qoder-cn": "qoder-cn",
+        "qodercn": "qoder-cn",
+    },
+    spawn_env_builders={
+        "qoder": "omnigent.runtime.workflow:_build_qoder_spawn_env",
+        "qoder-cn": "omnigent.runtime.workflow:_build_qoder_cn_spawn_env",
+    },
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",
         "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
@@ -751,6 +801,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
+        "qoder": "Qoder",
+        "qoder-cn": "Qoder CN",
     },
     capabilities=_BUILTIN_CAPABILITIES,
 )

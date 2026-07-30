@@ -358,6 +358,8 @@ _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
     PI_KEY: PI_KEY,
     OPENCODE_KEY: OPENCODE_KEY,
     QWEN_KEY: QWEN_KEY,
+    "qoder": "qoder",
+    "qoder-cn": "qoder-cn",
 }
 
 
@@ -507,6 +509,22 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
         detail="Qwen needs an API key or gateway. Set it up on the host for now.",
         action="setup",
         command="omni setup",
+        status_key=None,
+    ),
+    "qoder": SetupStep(
+        kind="auth",
+        title="Sign in to Qoder",
+        detail="Qoder manages its own credentials — sign in on the host.",
+        action="command",
+        command="qodercli login",
+        status_key=None,
+    ),
+    "qoder-cn": SetupStep(
+        kind="auth",
+        title="Sign in to Qoder CN",
+        detail="Qoder CN manages its own credentials — sign in on the host.",
+        action="command",
+        command="qoderclicn login",
         status_key=None,
     ),
 }

@@ -1495,6 +1495,64 @@ def _build_goose_spawn_env(
     return env
 
 
+def _build_named_acp_spawn_env(
+    spec: AgentSpec,
+    *,
+    binary: str,
+    name: str,
+    credential_env: str,
+    cwd: Path | None = None,
+) -> dict[str, str]:
+    """Build generic-ACP env for a first-class vendor CLI."""
+    from omnigent._platform import resolve_cli_binary
+
+    executable = resolve_cli_binary(binary) or binary
+    env = {
+        "HARNESS_ACP_COMMAND": shlex.join([executable, "--acp"]),
+        "HARNESS_ACP_NAME": name,
+        "HARNESS_ACP_SESSION_ID_MODE": "server",
+        "HARNESS_ACP_ENV_PASSTHROUGH": json.dumps([credential_env]),
+    }
+    if cwd is not None:
+        env["HARNESS_ACP_CWD"] = str(cwd)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    return env
+
+
+def _build_qoder_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build spawn env for Qoder CLI's ACP server."""
+    return _build_named_acp_spawn_env(
+        spec,
+        binary="qodercli",
+        name="Qoder",
+        credential_env="QODER_PERSONAL_ACCESS_TOKEN",
+        cwd=cwd,
+    )
+
+
+def _build_qoder_cn_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build spawn env for Qoder CN CLI's ACP server."""
+    return _build_named_acp_spawn_env(
+        spec,
+        binary="qoderclicn",
+        name="Qoder CN",
+        credential_env="QODERCN_PERSONAL_ACCESS_TOKEN",
+        cwd=cwd,
+    )
+
+
 def _build_acp_spawn_env(
     spec: AgentSpec,
     *,
