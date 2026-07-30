@@ -34,6 +34,7 @@ from omnigent.runtime.workflow import (
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
     _build_qwen_spawn_env,
+    _resolve_catalog_default_model,
     _resolve_provider_for_build,
 )
 from omnigent.spec.types import (
@@ -629,6 +630,31 @@ def _key_family_no_model(base_url: str, api_key: str) -> dict[str, object]:
     :returns: A family mapping with no ``models`` key.
     """
     return {"base_url": base_url, "api_key": api_key}
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "catalog_family"),
+    [("anthropic", "claude"), ("openai", "openai")],
+)
+def test_catalog_default_fails_clearly_when_discovery_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+    catalog_family: str,
+) -> None:
+    """Known-family runtime defaults fail clearly without catalog data."""
+    from omnigent.errors import OmnigentError
+
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda _provider: [])
+
+    with pytest.raises(
+        OmnigentError,
+        match=r"Set 'executor.model'.*provider 'models.default'.*retry",
+    ):
+        _resolve_catalog_default_model(
+            provider_name,
+            catalog_family,
+            context=f"provider family {provider_name!r}",
+        )
 
 
 def test_claude_sdk_falls_back_to_catalog_default_model(config_home: Path) -> None:

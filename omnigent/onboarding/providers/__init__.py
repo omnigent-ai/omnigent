@@ -433,9 +433,8 @@ _PREFERRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "anthropic": "sonnet",
 }
 
-# Providers whose default must remain within a specific catalog family. If the
-# family is absent, onboarding asks for an explicit model instead of silently
-# choosing an incompatible or unexpectedly proprietary alternative.
+# Required provider → case-insensitive model-id substring. If no entry matches,
+# onboarding asks explicitly instead of choosing an unexpected alternative.
 _REQUIRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "openrouter": "kimi",
 }

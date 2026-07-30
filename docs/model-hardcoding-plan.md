@@ -167,3 +167,7 @@ excluding specialty modalities. Stable family preferences choose broadly
 accessible Anthropic and OpenRouter tiers without naming a release. When the
 catalog is unavailable, onboarding accepts an explicit value instead of
 prefilling a source-controlled model pin.
+
+The same policy supplies the final runtime fallback for key, gateway, and local
+providers. Explicit agent and provider defaults still win; without either,
+runtime discovery fails with configuration guidance when no catalog is available.
