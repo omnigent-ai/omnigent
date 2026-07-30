@@ -46,6 +46,7 @@ pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
 const SCALE_STEP = 0.25;
+const EMPTY_COMMENTS: Comment[] = [];
 
 interface FloatingAnchor {
   x: number;
@@ -116,7 +117,7 @@ function PdfCommentHighlights({
 export function PdfViewer({
   data,
   conversationId,
-  comments = [],
+  comments = EMPTY_COMMENTS,
   activeSelection = null,
   onSetActiveSelection,
 }: PdfViewerProps) {

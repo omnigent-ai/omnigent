@@ -1,7 +1,7 @@
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
@@ -56,6 +56,10 @@ import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
+
+const MCP_SERVERS_UPDATED_TOAST = (
+  <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>
+);
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -1069,10 +1073,13 @@ function McpServersSection({
   const dirtyControlled = controlledDirty !== undefined;
   const mcpDirty = controlledDirty ?? localDirty;
 
-  function setMcpDirty(dirty: boolean) {
-    if (!dirtyControlled) setLocalDirty(dirty);
-    onDirtyChange?.(dirty);
-  }
+  const setMcpDirty = useCallback(
+    (dirty: boolean) => {
+      if (!dirtyControlled) setLocalDirty(dirty);
+      onDirtyChange?.(dirty);
+    },
+    [dirtyControlled, onDirtyChange],
+  );
 
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   // Clear the dirty flag when the session restarts (launching picks up
@@ -1085,6 +1092,16 @@ function McpServersSection({
   }, [dirtyControlled, sessionId]);
   const canEdit = !!(sessionId && editable);
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
+  const handleDeleteServer = useCallback(
+    (name: string) =>
+      deleteServer.mutate(name, {
+        onSuccess: () => {
+          setMcpDirty(true);
+          showToast(MCP_SERVERS_UPDATED_TOAST);
+        },
+      }),
+    [deleteServer, setMcpDirty],
+  );
   const showSection = servers.length > 0 || canEdit;
   if (!showSection) return null;
 
@@ -1111,24 +1128,7 @@ function McpServersSection({
         </p>
       )}
       {servers.length > 0 ? (
-        <McpServerList
-          servers={servers}
-          onDelete={
-            canEdit
-              ? (name) =>
-                  deleteServer.mutate(name, {
-                    onSuccess: () => {
-                      setMcpDirty(true);
-                      showToast(
-                        <span className="text-sm">
-                          MCP servers updated. Restart the session to apply changes.
-                        </span>,
-                      );
-                    },
-                  })
-              : undefined
-          }
-        />
+        <McpServerList servers={servers} onDelete={canEdit ? handleDeleteServer : undefined} />
       ) : (
         <p className="text-xs text-muted-foreground">No MCP servers</p>
       )}

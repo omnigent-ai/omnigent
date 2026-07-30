@@ -1717,67 +1717,16 @@ function ConversationList({
                     title="Projects"
                     collapsed={effectiveCollapsedSections.includes("Projects")}
                     onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                    headerAction={(() => {
-                      const allNames = sections.projectGroups.map((g) => g.name);
-                      // "New project" is always available (even when collapsed) so
-                      // the create-empty flow is reachable; the expand/revert control
-                      // is only meaningful when there are folders and the group is open.
-                      const showExpandControls =
-                        !effectiveCollapsedSections.includes("Projects") && allNames.length > 0;
-                      // Once every folder is open the only useful move is to undo it,
-                      // so the control flips to "revert" — which restores the set open
-                      // before "Expand all", or collapses everything when there's no
-                      // real last state (folders opened by hand). Otherwise it expands.
-                      const allExpanded =
-                        allNames.length > 0 && allNames.every((n) => expandedProjects.includes(n));
-                      return (
-                        // gap-0.5 between the two controls mirrors the row/folder
-                        // icon spacing, so every right-gutter pair lines up.
-                        <div className="flex items-center gap-0.5">
-                          {showExpandControls &&
-                            (allExpanded ? (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-xs"
-                                    aria-label="Collapse to previous"
-                                    data-testid="revert-projects"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      revertProjects();
-                                    }}
-                                  >
-                                    <Minimize2Icon className="size-3.5" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent side="bottom">Collapse to previous</TooltipContent>
-                              </Tooltip>
-                            ) : (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-xs"
-                                    aria-label="Expand all"
-                                    data-testid="expand-all-projects"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      expandAllProjects(allNames);
-                                    }}
-                                  >
-                                    <Maximize2Icon className="size-3.5" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent side="bottom">Expand all</TooltipContent>
-                              </Tooltip>
-                            ))}
-                          <NewProjectButton onCreated={expandProject} />
-                        </div>
-                      );
-                    })()}
+                    headerAction={
+                      <ProjectHeaderActions
+                        projectNames={sections.projectGroups.map((group) => group.name)}
+                        collapsed={effectiveCollapsedSections.includes("Projects")}
+                        expandedProjects={expandedProjects}
+                        onExpandAll={expandAllProjects}
+                        onRevert={revertProjects}
+                        onProjectCreated={expandProject}
+                      />
+                    }
                   >
                     {sections.projectGroups.map((group) => (
                       <ProjectFolder
@@ -2078,6 +2027,72 @@ function SectionHeader({
         )}
       </button>
     </h2>
+  );
+}
+
+function ProjectHeaderActions({
+  projectNames,
+  collapsed,
+  expandedProjects,
+  onExpandAll,
+  onRevert,
+  onProjectCreated,
+}: {
+  projectNames: string[];
+  collapsed: boolean;
+  expandedProjects: string[];
+  onExpandAll: (projectNames: string[]) => void;
+  onRevert: () => void;
+  onProjectCreated: (projectName: string) => void;
+}) {
+  const showExpandControls = !collapsed && projectNames.length > 0;
+  const allExpanded =
+    projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
+
+  return (
+    <div className="flex items-center gap-0.5">
+      {showExpandControls &&
+        (allExpanded ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Collapse to previous"
+                data-testid="revert-projects"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onRevert();
+                }}
+              >
+                <Minimize2Icon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Collapse to previous</TooltipContent>
+          </Tooltip>
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Expand all"
+                data-testid="expand-all-projects"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onExpandAll(projectNames);
+                }}
+              >
+                <Maximize2Icon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Expand all</TooltipContent>
+          </Tooltip>
+        ))}
+      <NewProjectButton onCreated={onProjectCreated} />
+    </div>
   );
 }
 
