@@ -171,6 +171,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND`` instead. Its live round-trip is
     covered by the dedicated ``test_per_harness_qwen.py`` suite.
 
+    ``qoder`` and ``qoder-cn`` are excluded for the same reason as ``qwen`` /
+    ``goose``: each launches its vendor CLI in ACP mode and uses Qoder-owned
+    authentication/model configuration rather than this matrix's Databricks
+    gateway wiring. Their ACP command, credential isolation, streaming, and
+    completion path is covered by ``tests/e2e/test_qoder_harness_e2e.py``.
+
     ``goose`` (headless ACP) is excluded for the same reason as ``qwen``: it
     authenticates from Goose's own config (``goose configure``), not the shared
     gateway/profile probe wiring, so ``_build_goose_spawn_env`` emits no
@@ -239,6 +245,8 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "copilot",
         "qwen",
         "qwen-native",
+        "qoder",
+        "qoder-cn",
         "goose",
         "goose-native",
         "kiro-native",
