@@ -44,6 +44,7 @@ import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
 from omnigent.model_metadata import ModelCapability, ModelCostTier, ModelIntent, ModelMetadata
 from omnigent.model_override import model_family_mismatch
 from omnigent.model_resolver import (
@@ -883,6 +884,11 @@ def _listing_payload(listing: ModelListing) -> dict[str, Any]:  # type: ignore[e
             row["cost_tier"] = metadata.cost_tier.value
         if metadata.wire_apis:
             row["wire_apis"] = sorted(wire_api.value for wire_api in metadata.wire_apis)
+        if metadata.reasoning is not None:
+            row["reasoning"] = {
+                "modes": sorted(mode.value for mode in metadata.reasoning.modes),
+                "efforts": sorted(metadata.reasoning.efforts),
+            }
         models.append(row)
     return {
         "source": listing.source,
@@ -1295,7 +1301,13 @@ def _fetch_anthropic_listing(
         model_id = item.get("id")
         if not isinstance(model_id, str) or not model_id:
             continue
-        models.append(ModelEntry(id=model_id, family=model_family_token(model_id)))
+        models.append(
+            ModelEntry(
+                id=model_id,
+                family=model_family_token(model_id),
+                metadata=parse_anthropic_model_metadata(item),
+            )
+        )
     return ModelListing(
         source="anthropic-api",
         verified=True,
