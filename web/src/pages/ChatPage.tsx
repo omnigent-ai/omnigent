@@ -1794,13 +1794,14 @@ function MainAgentSurface({
                     Working… shimmer — it is strictly more specific about why
                     the turn hasn't produced output yet. */}
                 <McpStartupIndicator />
-                {/* Pins the latest turn's anchor to the top of the viewport
-                    (question at top, reply grows below) and keeps the pane
-                    scrollable so older history stays reachable. Last child so
-                    it measures everything above it. */}
-                <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
               </>
             )}
+            {/* Frames the initially loaded turn at the top of the viewport and
+                keeps the pane scrollable so older history stays reachable.
+                Always mounted — including for an empty new conversation — so
+                a fast first send cannot become the captured initial anchor.
+                Last child so it measures everything above it. */}
+            <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
           </ConversationContent>
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
@@ -2238,12 +2239,16 @@ export function HistoryAutoLoader({
 const PINNED_ANCHOR_TOP_GAP_PX = 96;
 
 /**
- * Trailing spacer that pins the latest turn's anchor to the top of the
- * viewport — the newest real user prompt, or (on a page deep in a long tool
- * chain with no prompt yet) the newest assistant text output — leaving the
- * reply free to grow below it. As a side effect it keeps the transcript taller
- * than its scroll container whenever any content sits above the anchor, so
- * older history stays reachable by scroll-up without a viewport-fill loop.
+ * Trailing spacer that pins the initially loaded turn's anchor to the top of
+ * the viewport — the newest committed user prompt, or (on a page deep in a
+ * long tool chain with no prompt yet) the newest assistant text output. The
+ * anchor is captured once when the hydrated chat surface mounts. Live sends
+ * therefore consume the reserved space instead of becoming a new anchor and
+ * jumping to the top before the harness starts processing them.
+ *
+ * As a side effect it keeps the transcript taller than its scroll container
+ * whenever any content sits above the anchor, so older history stays reachable
+ * by scroll-up without a viewport-fill loop.
  *
  * Height = clientHeight − (anchor-top → content-bottom) − top gap, clamped to
  * ≥ 0: a short reply leaves empty space below (anchor stays pinned at top);
@@ -2260,32 +2265,64 @@ export function LatestTurnSpacer({
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
-  // New turns and prepends change block count; conversation switches change
-  // history generation. Streaming growth is covered by the ResizeObserver.
+  // Block changes remeasure the frozen anchor; streaming growth is covered by
+  // the ResizeObserver. The hydration gate remounts this component on a
+  // conversation switch, which captures that conversation's initial anchor.
   const blockCount = useChatStore((s) => s.blocks.length);
-  const historyGeneration = useChatStore((s) => s.historyGeneration);
   const spacerRef = useRef<HTMLDivElement>(null);
+  // `undefined` means capture has not run; `null` is a completed capture with
+  // no suitable initial anchor (for example a brand-new empty conversation).
+  const initialAnchorRef = useRef<HTMLElement | null | undefined>(undefined);
+  const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
+  if (initialCommittedUserIdsRef.current === null) {
+    const ids = new Set<string>();
+    for (const block of useChatStore.getState().blocks) {
+      if (
+        block.type === "user_message" &&
+        !isSystemUserContent(block.content) &&
+        block.ctx.itemId !== null
+      ) {
+        ids.add(block.ctx.itemId);
+      }
+    }
+    initialCommittedUserIdsRef.current = ids;
+  }
 
   const measure = useCallback(() => {
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;
     const spacerEl = spacerRef.current;
     if (!scrollEl || !spacerEl) return;
-    // Newest real user prompt, else newest assistant text output. System
-    // markers render without data-role="user", so they're correctly skipped.
-    const users = scrollEl.querySelectorAll<HTMLElement>('[data-role="user"]');
-    const texts = scrollEl.querySelectorAll<HTMLElement>('[data-testid="assistant-text-section"]');
-    const anchor =
-      users.length > 0
-        ? users[users.length - 1]!
-        : texts.length > 0
-          ? texts[texts.length - 1]!
-          : null;
+    if (initialAnchorRef.current === undefined) {
+      // Match DOM bubbles against committed blocks so an optimistic pending
+      // send visible during this first layout can never become the anchor.
+      const users = scrollEl.querySelectorAll<HTMLElement>(
+        '[data-role="user"][data-user-message-id]',
+      );
+      let initialUser: HTMLElement | null = null;
+      for (let index = users.length - 1; index >= 0; index -= 1) {
+        const candidate = users[index]!;
+        const itemId = candidate.dataset.userMessageId;
+        if (itemId !== undefined && initialCommittedUserIdsRef.current!.has(itemId)) {
+          initialUser = candidate;
+          break;
+        }
+      }
+      const texts = scrollEl.querySelectorAll<HTMLElement>(
+        '[data-testid="assistant-text-section"]',
+      );
+      initialAnchorRef.current = initialUser ?? texts[texts.length - 1] ?? null;
+    }
+    const anchor = initialAnchorRef.current;
+    if (!anchor) {
+      // Do not let the always-mounted sentinel become a zero-height flex item:
+      // the content column's gap would otherwise shift an empty-state layout.
+      spacerEl.style.display = "none";
+      return;
+    }
     // rect diffs are scroll-invariant (both edges shift together), and the
     // spacer's top is fixed by the content above it, so this is stable across
     // the height we're about to set — it converges in one pass.
-    const anchorToEnd = anchor
-      ? spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top
-      : scrollEl.clientHeight;
+    const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
     const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
@@ -2293,7 +2330,7 @@ export function LatestTurnSpacer({
 
   useLayoutEffect(() => {
     measure();
-  }, [measure, blockCount, historyGeneration]);
+  }, [measure, blockCount]);
 
   useLayoutEffect(() => {
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;

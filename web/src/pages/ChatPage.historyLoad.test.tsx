@@ -418,8 +418,13 @@ describe("LatestTurnSpacer", () => {
 
     if (opts.anchor !== "none") {
       const anchor = document.createElement("div");
-      if (opts.anchor === "user") anchor.dataset.role = "user";
-      else anchor.dataset.testid = "assistant-text-section";
+      if (opts.anchor === "user") {
+        anchor.dataset.role = "user";
+        anchor.dataset.userMessageId = "initial-user";
+        useChatStore.setState({ blocks: [userBlock("initial-user")] });
+      } else {
+        anchor.dataset.testid = "assistant-text-section";
+      }
       vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
       scrollRoot.append(anchor);
     }
@@ -446,7 +451,9 @@ describe("LatestTurnSpacer", () => {
 
     const anchor = document.createElement("div");
     anchor.dataset.role = "user";
+    anchor.dataset.userMessageId = "initial-user";
     scrollRoot.append(anchor);
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
     vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(0));
     vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (
       this: HTMLDivElement,
@@ -492,6 +499,82 @@ describe("LatestTurnSpacer", () => {
     expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 0, anchor: "none" })).toBe(
       0,
     );
+  });
+
+  it("keeps the initial committed prompt anchored when a pending prompt is promoted", () => {
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const initial = document.createElement("div");
+    initial.dataset.role = "user";
+    initial.dataset.userMessageId = "initial-user";
+    vi.spyOn(initial, "getBoundingClientRect").mockReturnValue(rect(0));
+    scrollRoot.append(initial);
+
+    const pending = document.createElement("div");
+    pending.dataset.role = "user";
+    pending.dataset.userMessageId = "pending-user";
+    vi.spyOn(pending, "getBoundingClientRect").mockReturnValue(rect(150));
+    scrollRoot.append(pending);
+
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(200));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("204px");
+
+    // The consumed event moves the pending prompt into committed blocks. The
+    // spacer still measures from the initial prompt instead of retargeting.
+    act(() => {
+      useChatStore.setState({ blocks: [userBlock("initial-user"), userBlock("pending-user")] });
+      holder.cb?.();
+    });
+    expect(spacer.style.height).toBe("204px");
+  });
+
+  it("does not create an anchor after an initially empty conversation's first prompt commits", () => {
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(100));
+
+    const pending = document.createElement("div");
+    pending.dataset.role = "user";
+    pending.dataset.userMessageId = "first-user";
+    vi.spyOn(pending, "getBoundingClientRect").mockReturnValue(rect(0));
+    scrollRoot.append(pending);
+
+    act(() => {
+      useChatStore.setState({ blocks: [userBlock("first-user")] });
+      holder.cb?.();
+    });
+    expect(spacer.style.display).toBe("none");
+    expect(spacer.style.height || "0px").toBe("0px");
   });
 });
 
