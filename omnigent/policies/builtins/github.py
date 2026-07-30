@@ -723,8 +723,7 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
         # --force-if-includes[=…], or -f inside combined short flags like -uf.
         _FORCE_LONG = {"--force", "-f", "--force-with-lease", "--force-if-includes"}
         is_force = any(
-            t in _FORCE_LONG
-            or t.startswith(("--force-with-lease=", "--force-if-includes="))
+            t in _FORCE_LONG or t.startswith(("--force-with-lease=", "--force-if-includes="))
             for t in args
         )
         return _ShellOp(
