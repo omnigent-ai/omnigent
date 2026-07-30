@@ -29,7 +29,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
@@ -237,6 +237,17 @@ export function ForkSessionForm({
     sourceAgentBaseName ??
     sourceAgentName ??
     "the original agent";
+
+  // Eagerly prefetch harness/description for session-discovered agents (those
+  // with harness=null and a sessionId). Without this, forkTargetCarriesHistory
+  // returns false for all of them and custom agents never appear in the picker.
+  // prefetchAvailableAgentDetails is a no-op for agents whose harness is already
+  // known, so re-running on every agents change is safe.
+  useEffect(() => {
+    for (const agent of agents ?? []) {
+      void prefetchAvailableAgentDetails(agent, queryClient);
+    }
+  }, [agents, queryClient]);
 
   // Switch targets, excluding:
   //   1. the source's OWN agent — "Same as source" already represents

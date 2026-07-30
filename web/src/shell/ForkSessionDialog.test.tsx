@@ -6,7 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -48,6 +48,7 @@ const useHostsMock = vi.mocked(useHosts);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
+const prefetchAvailableAgentDetailsMock = vi.mocked(prefetchAvailableAgentDetails);
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -154,6 +155,7 @@ beforeEach(() => {
   forkSessionMock.mockReset();
   launchRunnerMock.mockReset();
   navigateMock.mockReset();
+  prefetchAvailableAgentDetailsMock.mockReset();
   setAgents(AVAILABLE_AGENTS, "claude-sdk");
   // Defaults for the coding-fork wiring; the non-coding tests don't render
   // these fields but the hooks still run (with isCodingSource false).
@@ -429,6 +431,30 @@ describe("ForkSessionDialog", () => {
 
     expect(screen.getByTestId("fork-session-agent-option-ag_opencode")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-agent-option-ag_hermes")).toBeInTheDocument();
+  });
+
+  it("prefetches harness details for all agents on mount so custom agents appear", async () => {
+    // Custom agents discovered from session scans start with harness=null and
+    // a sessionId. Without eager prefetch, forkTargetCarriesHistory(null)
+    // returns false and they never appear in the fork picker.
+    const customAgent = {
+      id: "ag_custom",
+      name: "my-agent",
+      display_name: "My Agent",
+      description: null,
+      harness: null,
+      sessionId: "conv_custom",
+    };
+    setAgents([...AVAILABLE_AGENTS, customAgent], "claude-sdk");
+
+    renderDialog();
+
+    await waitFor(() =>
+      expect(prefetchAvailableAgentDetailsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "ag_custom" }),
+        expect.anything(),
+      ),
+    );
   });
 
   it("passes the chosen agent_id when switching agent", async () => {
