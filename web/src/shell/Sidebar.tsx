@@ -801,35 +801,33 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 onExit={exitSelectionMode}
               />
             ) : (
-              <>
-                <Button
-                  asChild
-                  variant="ghost"
-                  className={cn(
-                    "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
-                    SIDEBAR_HOVER_HIGHLIGHT,
-                    isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="inbox-button"
+              >
+                <Link to="/inbox" onClick={onNavClick}>
+                  <InboxIcon className="size-3.5 text-muted-foreground" />
+                  Inbox
+                  {inboxCount > 0 && (
+                    <span
+                      aria-label={
+                        inboxCount === 1
+                          ? "1 inbox item waiting"
+                          : `${inboxCount} inbox items waiting`
+                      }
+                      className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
+                    >
+                      {inboxCount}
+                    </span>
                   )}
-                  data-testid="inbox-button"
-                >
-                  <Link to="/inbox" onClick={onNavClick}>
-                    <InboxIcon className="size-3.5 text-muted-foreground" />
-                    Inbox
-                    {inboxCount > 0 && (
-                      <span
-                        aria-label={
-                          inboxCount === 1
-                            ? "1 inbox item waiting"
-                            : `${inboxCount} inbox items waiting`
-                        }
-                        className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
-                      >
-                        {inboxCount}
-                      </span>
-                    )}
-                  </Link>
-                </Button>
-              </>
+                </Link>
+              </Button>
             )}
           </div>
 
