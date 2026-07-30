@@ -83,7 +83,7 @@ function mockChildTree(tree: Record<string, ChildSessionInfo[]>) {
   }));
 }
 
-function defaultSession() {
+function defaultSession(): ReturnType<typeof useSession> {
   return {
     session: {
       id: "conv_root",
@@ -99,6 +99,7 @@ function defaultSession() {
       permissionLevel: 4,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     },
     isLoading: false,
     error: null,
@@ -135,7 +136,7 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
-  useSessionMock.mockReturnValue(defaultSession() as ReturnType<typeof useSession>);
+  useSessionMock.mockReturnValue(defaultSession());
 });
 
 afterEach(cleanup);

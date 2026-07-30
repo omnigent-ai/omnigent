@@ -8,7 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Dialog as DialogPrimitive } from "radix-ui";
+import * as DialogPrimitive from "radix-ui/dialog";
 import { XIcon, ZoomInIcon, ZoomOutIcon } from "lucide-react";
 
 import { getEmbedRoot } from "@/lib/host";

@@ -444,6 +444,7 @@ describe("useStopAndDeleteConversation cache eviction", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     } satisfies Session);
     // The deleted session is also pinned. The Pinned section reads a sibling
     // cache the ["conversations"] sweep skips, so delete must drop it here too.
@@ -575,6 +576,7 @@ describe("useRenameConversation cache patching", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     } satisfies Session);
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);

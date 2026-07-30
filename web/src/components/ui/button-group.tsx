@@ -1,5 +1,5 @@
 import { cva, type VariantProps } from "class-variance-authority";
-import { Slot } from "radix-ui";
+import * as Slot from "radix-ui/slot";
 
 import { cn } from "@/lib/utils";
 import { Separator } from "@/components/ui/separator";
