@@ -859,6 +859,8 @@ function isUserPrompt(item: ConversationItem): boolean {
 export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
   let items: ConversationItem[] = [];
   let hasMore = true;
+  // Each page starts before the cursor returned by the prior page.
+  /* oxlint-disable no-await-in-loop */
   for (let pages = 0; pages < MAX_INITIAL_PAGES; pages++) {
     const cursor = items[0]?.id;
     const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
@@ -869,6 +871,7 @@ export async function fetchInitialHistoryWindow(sessionId: string): Promise<Sess
     if (items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2) break;
     if (!items[0]?.id) break; // no cursor to page further; avoid a spin
   }
+  /* oxlint-enable no-await-in-loop */
   // If the cap stopped us before the previous user prompt (a pathological
   // single turn spanning >MAX_INITIAL_PAGES pages), `hasMore` stays true so
   // the rest remains reachable via scroll-up — same fallback as the default.

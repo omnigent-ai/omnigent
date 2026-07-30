@@ -2358,6 +2358,7 @@ export function JumpToTopButton({
       // history or on error. The rAF wait yields a frame for the prepend to
       // commit and for the in-flight flag to settle between pages. The
       // iteration cap is a backstop against a server that never reports done.
+      /* oxlint-disable no-await-in-loop */
       for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
         await useChatStore.getState().loadMoreHistory();
         // Keep the lock released — a prepend that briefly lands us near the
@@ -2379,6 +2380,7 @@ export function JumpToTopButton({
         }
         await nextFrame();
       }
+      /* oxlint-enable no-await-in-loop */
     } finally {
       setJumping(false);
     }

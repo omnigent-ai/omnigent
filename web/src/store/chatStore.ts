@@ -732,6 +732,19 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
   return block;
 }
 
+async function uploadFileBlocks(
+  sessionId: string,
+  files: readonly File[],
+): Promise<ContentBlock[]> {
+  const blocks: ContentBlock[] = [];
+  // Stop at the first failure so later uploads cannot outlive a requeued send.
+  for (const file of files) {
+    // oxlint-disable-next-line no-await-in-loop
+    blocks.push(await uploadFileBlock(sessionId, file));
+  }
+  return blocks;
+}
+
 // Must match the @keyframes user-msg-flash duration in index.css.
 const FLASH_DURATION_MS = 800;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
@@ -1113,12 +1126,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // the next trigger backs off instead of hammering a failing runner.
       void (async () => {
         await priorSend;
-        const fileBlocks: ContentBlock[] = [];
-        for (const file of head.files ?? []) {
-          // Reuse a prior successful upload so the cooldown-paced retry doesn't
-          // re-upload files that already landed (orphaning the earlier blobs).
-          fileBlocks.push(await uploadFileBlock(conversationId, file));
-        }
+        // Reuse prior successful uploads so cooldown-paced retries do not
+        // orphan blobs that already landed.
+        const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
         const content: ContentBlock[] = [
           ...fileBlocks,
           ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
@@ -1229,12 +1239,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
       // a prior successful upload of the same File so a retry after a
       // post-phase failure doesn't re-upload — and orphan — blobs that landed.
-      const fileBlocks: ContentBlock[] = [];
-      if (files && files.length > 0) {
-        for (const file of files) {
-          fileBlocks.push(await uploadFileBlock(sessionId, file));
-        }
-      }
+      const fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
       const serverContent: ContentBlock[] = [
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
@@ -1919,6 +1924,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     };
     try {
+      // Each page starts before the cursor returned by the prior page.
+      /* oxlint-disable no-await-in-loop */
       for (let pages = 0; pages < MAX_EAGER_PAGES && hasMore && cursor; pages++) {
         const page = await fetchSessionItemsPage(conversationId, {
           olderThan: cursor,
@@ -1942,6 +1949,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (existingUsers + countUsers(older) >= minUserMessages) break;
         if (!page.items[0]?.id) break;
       }
+      /* oxlint-enable no-await-in-loop */
       commit();
     } catch {
       if (stale()) return;
@@ -3020,6 +3028,8 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
   let items = page.items;
   let hasMore = page.hasMore;
   let covered = !hasMore || items.some((it) => preGapIds.has(it.id));
+  // Each page starts before the cursor returned by the prior page.
+  /* oxlint-disable no-await-in-loop */
   for (let fetched = 1; !covered && fetched < RECONNECT_BACKFILL_MAX_PAGES; fetched += 1) {
     const cursor = items[0]?.id;
     if (!cursor) break;
@@ -3035,6 +3045,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     covered = !hasMore || older.items.some((it) => preGapIds.has(it.id));
     if (older.items.length === 0) break; // no progress; avoid refetching the same cursor
   }
+  /* oxlint-enable no-await-in-loop */
   if (!covered) {
     await rehydrateWindowOnReconnect(id, session, preGapIds, preGapElicitations, set, get);
     return;

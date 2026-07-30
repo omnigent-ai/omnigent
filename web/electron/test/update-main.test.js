@@ -262,13 +262,15 @@ describe("auto-update main-process wiring", () => {
       ["omnigent:update-install", []],
       ["omnigent:set-update-config", [{ mode: "manual" }]],
     ];
-    for (const [channel, args] of cases) {
-      const handler = harness.ipcHandlers.get(channel);
-      await assert.rejects(
-        Promise.resolve().then(() => handler(harness.events.unpinned, ...args)),
-        /connected server page/,
-      );
-    }
+    await Promise.all(
+      cases.map(([channel, args]) => {
+        const handler = harness.ipcHandlers.get(channel);
+        return assert.rejects(
+          Promise.resolve().then(() => handler(harness.events.unpinned, ...args)),
+          /connected server page/,
+        );
+      }),
+    );
   });
 
   it("prompts for every privileged update channel before running it", async (t) => {
@@ -305,6 +307,8 @@ describe("auto-update main-process wiring", () => {
       },
     ];
 
+    // Harnesses install process-level module mocks and must run one at a time.
+    /* oxlint-disable no-await-in-loop */
     for (const item of cases) {
       const harness = loadMainHarness({
         forceDevUpdateConfig: true,
@@ -327,6 +331,7 @@ describe("auto-update main-process wiring", () => {
       ]);
       item.assertRan(harness);
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("does not let a cached hosting grant bypass update-control consent", async (t) => {
@@ -360,6 +365,8 @@ describe("auto-update main-process wiring", () => {
       },
     ];
 
+    // Harnesses install process-level module mocks and must run one at a time.
+    /* oxlint-disable no-await-in-loop */
     for (const item of cases) {
       const harness = loadMainHarness({
         forceDevUpdateConfig: true,
@@ -382,6 +389,7 @@ describe("auto-update main-process wiring", () => {
       assert.equal(harness.calls.showMessageBox.length, 1, item.channel);
       item.assertBlocked(harness);
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("routes approved update-install through before-quit cleanup to quitAndInstall", async (t) => {

@@ -6952,9 +6952,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   /** Drain reconcile's sequential await chain under fake timers. */
   async function drainAsync(turns = 25): Promise<void> {
+    /* oxlint-disable no-await-in-loop */
     for (let i = 0; i < turns; i += 1) {
       await vi.advanceTimersByTimeAsync(1);
     }
+    /* oxlint-enable no-await-in-loop */
   }
 
   function gapUser(prefix: string, idx: number): ConversationItem {
@@ -8049,9 +8051,11 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
 
   /** Drain the pump + reconcile's sequential await chain under fake timers. */
   async function drainAsync(turns = 25): Promise<void> {
+    /* oxlint-disable no-await-in-loop */
     for (let i = 0; i < turns; i += 1) {
       await vi.advanceTimersByTimeAsync(1);
     }
+    /* oxlint-enable no-await-in-loop */
   }
 
   /** Open the stream-pump loop for `id` and drain until the first sink exists. */
