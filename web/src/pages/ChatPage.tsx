@@ -1470,8 +1470,6 @@ function MainAgentSurface({
   // staring at a fresh session during a slow MCP boot sees the startup band
   // instead of a bare "What should we work on?" empty state.
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
-  // True while the post-render loader builds the initial history window.
-  const loadingInitialWindow = useChatStore((s) => s.loadingInitialWindow);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1748,8 +1746,8 @@ function MainAgentSurface({
               )
             ) : (
               <>
-                {/* The newest page renders first; older initial pages arrive here. */}
-                {loadingInitialWindow && <InitialHistorySkeleton />}
+                {/* Older pages prepend here while their request is in flight. */}
+                {loadingMoreHistory && <HistoryLoadingSkeleton />}
                 {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
                 ))}
@@ -2109,14 +2107,9 @@ function PreserveScrollDistanceOnResize() {
   return null;
 }
 
-function InitialHistorySkeleton() {
+function HistoryLoadingSkeleton() {
   return (
-    <div
-      role="status"
-      aria-label="Loading earlier messages"
-      data-initial-history-skeleton
-      className="flex flex-col gap-4 py-2"
-    >
+    <div role="status" aria-label="Loading earlier messages" className="flex flex-col gap-4 py-2">
       <div aria-hidden className="flex flex-col gap-4 animate-pulse">
         <Message from="assistant" className="max-w-3xl">
           <MessageContent className="w-full">
@@ -2156,9 +2149,6 @@ export function HistoryAutoLoader() {
   // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
   // still changes when many fetched tool calls collapse into one visual row.
   const oldestItemId = useChatStore((s) => s.oldestItemId);
-  // This only terminates the initial skeleton when a request exhausts history
-  // or fails without advancing the cursor; it never initiates a page by itself.
-  const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const pagesFetchedRef = useRef(1);
   const generationRef = useRef(historyGeneration);
   const [scrollRevision, setScrollRevision] = useState(0);
@@ -2204,20 +2194,11 @@ export function HistoryAutoLoader() {
       0,
     );
     const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
-    const showInitialSkeleton = buildingInitialWindow && state.hasMoreHistory;
 
     if (itemsChanged && prevScrollHeightRef.current !== null) {
-      let delta = el.scrollHeight - prevScrollHeightRef.current;
-      if (state.loadingInitialWindow && !showInitialSkeleton) {
-        const skeleton = el.querySelector<HTMLElement>("[data-initial-history-skeleton]");
-        delta -= skeleton?.getBoundingClientRect().height ?? 0;
-      }
+      const delta = el.scrollHeight - prevScrollHeightRef.current;
       if (delta !== 0) el.scrollTop = Math.max(0, el.scrollTop + delta);
       prevScrollHeightRef.current = null;
-    }
-
-    if (state.loadingInitialWindow !== showInitialSkeleton) {
-      useChatStore.setState({ loadingInitialWindow: showInitialSkeleton });
     }
 
     if (
@@ -2233,7 +2214,7 @@ export function HistoryAutoLoader() {
     prevScrollHeightRef.current = el.scrollHeight;
     if (buildingInitialWindow) pagesFetchedRef.current += 1;
     void state.loadMoreHistory();
-  }, [ctx.scrollRef, hasMoreHistory, historyGeneration, oldestItemId, scrollRevision]);
+  }, [ctx.scrollRef, historyGeneration, oldestItemId, scrollRevision]);
 
   // No visible control — history loads purely on scroll-up / the initial-window
   // build above.

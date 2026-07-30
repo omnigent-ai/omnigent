@@ -397,8 +397,6 @@ export interface ChatState {
   hasMoreHistory: boolean;
   /** True while a `loadMoreHistory` fetch is in flight. */
   loadingMoreHistory: boolean;
-  /** True while the post-render history loader is building the initial window. */
-  loadingInitialWindow: boolean;
   /**
    * The item id at the start of the current `blocks` history window —
    * used as the `before` cursor for the next `loadMoreHistory` page
@@ -922,7 +920,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   codexPlanMode: false,
   hasMoreHistory: false,
   loadingMoreHistory: false,
-  loadingInitialWindow: false,
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
@@ -1608,7 +1605,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
         conversationLoadError: null,
         hasMoreHistory: false,
         loadingMoreHistory: false,
-        loadingInitialWindow: false,
         oldestItemId: null,
         llmModel: null,
         sessionHarness: null,
@@ -2493,7 +2489,6 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
-        loadingInitialWindow: false,
         sessionStatus: session.status,
         // Re-show "N background tasks still running" after a reload/navigate-back: the
         // live SSE edge that set this is long gone, so the count rides in on
