@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hmac
+import hashlib
 import json
 import logging
 import secrets
@@ -37,7 +37,8 @@ _DEFAULT_MAX_TOKENS = 16384
 _REQUEST_TIMEOUT = 120
 _STREAM_TIMEOUT = 300
 _MODEL_METADATA_TTL_S = 300.0
-_MODEL_METADATA_CACHE_PARTITION_SECRET = secrets.token_bytes(32)
+_MODEL_METADATA_CACHE_PARTITION_SALT = secrets.token_bytes(32)
+_MODEL_METADATA_CACHE_PARTITION_ITERATIONS = 200_000
 _MODEL_METADATA_CACHE: TTLCache[tuple[str, str, bytes], ModelMetadata] = TTLCache(
     maxsize=128,
     ttl=_MODEL_METADATA_TTL_S,
@@ -226,11 +227,12 @@ async def _get_anthropic_model_metadata(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ModelMetadata | None:
     """Fetch and cache one model's live capability metadata."""
-    # HMAC creates an opaque process-local cache partition, not a persisted credential hash.
-    credential_partition = hmac.digest(
-        _MODEL_METADATA_CACHE_PARTITION_SECRET,
-        headers.get("x-api-key", "").encode(),
+    # PBKDF2 creates an opaque process-local cache partition, not a persisted credential hash.
+    credential_partition = hashlib.pbkdf2_hmac(
         "sha256",
+        headers.get("x-api-key", "").encode(),
+        _MODEL_METADATA_CACHE_PARTITION_SALT,
+        _MODEL_METADATA_CACHE_PARTITION_ITERATIONS,
     )
     cache_key = (base_url, model, credential_partition)
     with _MODEL_METADATA_CACHE_LOCK:
