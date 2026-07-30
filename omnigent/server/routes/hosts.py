@@ -30,6 +30,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostInstallHarnessFrame,
@@ -977,6 +978,18 @@ def create_hosts_router(
                 raise OmnigentError(
                     f"host failed to launch runner: {result.get('error')}",
                     code=ErrorCode.HARNESS_NOT_CONFIGURED,
+                )
+            workspace_error = f"workspace path does not exist: {workspace}"
+            if result.get("error_code") == WORKSPACE_MISSING_ERROR_CODE or (
+                # Rolling upgrade: an older host sends this exact
+                # categorical reason without an error_code.
+                result.get("error_code") is None and result.get("error") == workspace_error
+            ):
+                # Rebuild the message from the authorized, canonical
+                # workspace rather than reflecting arbitrary host output.
+                raise OmnigentError(
+                    f"host failed to launch runner: {workspace_error}",
+                    code=ErrorCode.WORKSPACE_MISSING,
                 )
             raise HTTPException(
                 status_code=502,
