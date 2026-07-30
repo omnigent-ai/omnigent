@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { Profiler } from "react";
+import { Profiler, useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { MAX_INITIAL_PAGES } from "@/lib/sessionsApi";
@@ -183,6 +183,32 @@ describe("HistoryAutoLoader", () => {
     render(<HistoryAutoLoader />);
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
+
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("observes scroll changes made by a later sibling layout effect", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 600, scrollHeight: 1000 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    function AdjustScrollDuringLayout() {
+      useLayoutEffect(() => {
+        metrics.scrollTop = 499;
+        scrollRoot.dispatchEvent(new Event("scroll"));
+      }, []);
+      return null;
+    }
+
+    render(
+      <>
+        <HistoryAutoLoader />
+        <AdjustScrollDuringLayout />
+      </>,
+    );
 
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });

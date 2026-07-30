@@ -2150,7 +2150,9 @@ export function HistoryAutoLoader() {
   const prevScrollHeightRef = useRef<number | null>(null);
   const prevScrollTopRef = useRef(0);
 
-  useEffect(() => {
+  // Register before sibling layout effects can resize the transcript and make
+  // StickToBottom adjust scrollTop; otherwise that first scroll can be missed.
+  useLayoutEffect(() => {
     const el = ctx.scrollRef?.current;
     if (!el) return;
     const handleScroll = () => {
