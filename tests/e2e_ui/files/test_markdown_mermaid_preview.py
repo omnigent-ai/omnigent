@@ -81,7 +81,12 @@ def test_mermaid_fence_renders_as_preview_diagram(
 
     mermaid_preview = file_viewer.get_by_test_id("mermaid-preview")
     expect(mermaid_preview).to_be_visible(timeout=10_000)
-    expect(mermaid_preview.locator("svg")).to_be_visible(timeout=10_000)
+    # The panel mounts progressively (copy button, toolbar icons, then diagram),
+    # so a bare `svg` locator is ambiguous and trips Playwright's one-match
+    # strictness. Only the rendered diagram carries aria-roledescription, and CI
+    # can take a while to render it, hence the long timeout.
+    diagram = mermaid_preview.locator("svg[aria-roledescription]")
+    expect(diagram).to_be_visible(timeout=30_000)
     expect(file_viewer.locator("pre > code.language-mermaid")).to_have_count(0)
 
     js_code = file_viewer.locator("pre > code.language-js")
