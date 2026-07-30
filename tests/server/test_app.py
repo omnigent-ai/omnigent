@@ -605,37 +605,37 @@ def test_ensure_extra_builtin_agents_skips_bad_path_and_seeds_good(
     assert seed_stores.agent_store.get_by_name("does-not-exist") is None
 
 
-def test_ensure_default_qwen_agent_seeds_card(seed_stores: _SeedStores) -> None:
+def test_ensure_default_native_agents_seeds_qwen_card(seed_stores: _SeedStores) -> None:
     """
-    Seeding registers qwen-native-ui as a built-in the picker can render.
+    The native seeding loop registers qwen-native-ui as a picker-renderable built-in.
 
     The new-session picker reads built-ins from ``GET /v1/agents``; without this
     seeder Qwen Code only appears after the ``omnigent qwen`` CLI first registers
     it, so it was absent from the Web UI dropdown.
     """
-    server_app._ensure_default_qwen_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
 
-    seeded = seed_stores.agent_store.get_by_name(server_app._QWEN_NATIVE_AGENT_NAME)
+    seeded = seed_stores.agent_store.get_by_name("qwen-native-ui")
     assert seeded is not None, "qwen-native-ui was not registered"
     assert seeded.name == "qwen-native-ui"
     # The bundle must be retrievable, not just referenced.
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
-def test_ensure_default_qwen_agent_is_idempotent(seed_stores: _SeedStores) -> None:
+def test_ensure_default_native_agents_is_idempotent(seed_stores: _SeedStores) -> None:
     """A second seed call is a no-op — startup runs the seeder every boot."""
-    server_app._ensure_default_qwen_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
-    first = seed_stores.agent_store.get_by_name(server_app._QWEN_NATIVE_AGENT_NAME)
+    first = seed_stores.agent_store.get_by_name("qwen-native-ui")
     assert first is not None
-    server_app._ensure_default_qwen_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
@@ -677,13 +677,13 @@ def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -
     NULL (a built-in) and carry the ``antigravity-native`` harness so the
     runner boots the agy native terminal rather than an SDK harness.
     """
-    server_app._ensure_default_antigravity_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
 
-    seeded = seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME)
+    seeded = seed_stores.agent_store.get_by_name("antigravity-native-ui")
     assert seeded is not None, "antigravity-native-ui was not registered"
     assert seeded.name == "antigravity-native-ui"
     # Built-ins are session-scope NULL so ``GET /v1/agents`` (which filters on
@@ -711,9 +711,7 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
         seed_stores.agent_cache,
     )
 
-    assert (
-        seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
-    )
+    assert seed_stores.agent_store.get_by_name("antigravity-native-ui") is not None
 
 
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:

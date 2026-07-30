@@ -440,7 +440,8 @@ Phase 2: 2.1–2.4).
 | 1.5b-i Runner launch (scaffolding + 8 uniform arms) | landed | #3500 |
 | 1.5b-ii Runner launch (3 special arms + turn-path opencode) | landed | #3501 |
 | 1.5c Runner terminal-ensure (attach path) | landed | #3543 |
-| 1.6 Runner interrupt/stop (migration; gap-fill deferred) | in review | (this PR) |
+| 1.6 Runner interrupt/stop (migration; gap-fill deferred) | landed | #3568 |
+| 1.7 Server seeding loop | in review | (this PR) |
 
 ## Risks and open questions
 

@@ -504,7 +504,7 @@ def test_codex_native_builtin_registered_at_startup(
     """
     The server auto-registers ``codex-native-ui`` as a built-in agent.
 
-    ``_ensure_default_codex_agent`` runs during lifespan startup and
+    ``_ensure_default_native_agents`` runs during lifespan startup and
     inserts the agent into the store. ``GET /v1/agents`` must list it
     so the Web UI new-session picker can offer Codex alongside Claude.
     """
@@ -513,7 +513,7 @@ def test_codex_native_builtin_registered_at_startup(
     agent_names = {a["name"] for a in resp.json()["data"]}
     assert _CODEX_NATIVE_AGENT_NAME in agent_names, (
         f"Expected {_CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
-        f"{agent_names}. _ensure_default_codex_agent did not run or "
+        f"{agent_names}. _ensure_default_native_agents did not run or "
         f"used a different name."
     )
 
