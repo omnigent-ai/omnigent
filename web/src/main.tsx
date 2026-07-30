@@ -84,7 +84,7 @@ applyThemePalette(readThemePalette());
 // something on screen.
 const bootProbe: Promise<ServerInfo> = Promise.race([
   resolveServerInfo(),
-  new Promise<ServerInfo>((resolve) =>
+  new Promise<ServerInfo>((resolve) => {
     setTimeout(
       () =>
         resolve({
@@ -104,8 +104,8 @@ const bootProbe: Promise<ServerInfo> = Promise.race([
           dictation_available: false,
         }),
       1500,
-    ),
-  ),
+    );
+  }),
 ]);
 
 void bootProbe.then((info) => {

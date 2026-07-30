@@ -103,7 +103,7 @@ vi.mock("@/hooks/useConversations", async () => {
 // so the stub lifts it from the trigger child onto the native <select>.
 vi.mock("@/components/ui/select", async () => {
   const { Children, isValidElement } = await import("react");
-  const SelectTrigger = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
   const Select = ({
     value,
     onValueChange,
@@ -133,7 +133,7 @@ vi.mock("@/components/ui/select", async () => {
     Select,
     SelectTrigger,
     SelectValue: () => null,
-    SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
     SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
       <option value={value}>{children}</option>
     ),

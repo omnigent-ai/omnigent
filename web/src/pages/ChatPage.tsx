@@ -2484,7 +2484,10 @@ export function JumpToTopButton({
   const jumpToTop = useCallback(async () => {
     if (!scroller) return;
     const { el, state, stopScroll } = scroller;
-    const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const nextFrame = () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
     setJumping(true);
     try {
       // Release StickToBottom's bottom-lock. Without this, every history prepend

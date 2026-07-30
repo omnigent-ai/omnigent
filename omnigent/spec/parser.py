@@ -885,6 +885,8 @@ def _parse_os_env_sandbox(
         ["/home/me/.claude.json"], "cwd_allow_hidden": [".venv",
         ".git"], "cwd_hidden_scan_max_entries": 100000,
         "cwd_hidden_scan_overflow": "warn",
+        "cwd_hidden_scan_recursive": False,
+        "mask_paths": ["config/production.key"],
         "env_passthrough": ["AWS_PROFILE", "GITHUB_TOKEN"],
         "allow_network": False}``.
     :returns: A populated :class:`OSEnvSandboxSpec` when the
@@ -894,8 +896,10 @@ def _parse_os_env_sandbox(
         ``cwd_allow_hidden`` entry contains a path separator, or
         ``cwd_hidden_scan_max_entries`` is not a positive integer,
         or ``cwd_hidden_scan_overflow`` is not one of ``"error"``,
-        ``"warn"``, ``"unlimited"``, or ``env_passthrough`` is not
-        a list of POSIX environment variable names.
+        ``"warn"``, ``"unlimited"``, or ``cwd_hidden_scan_recursive``
+        is not a boolean, or ``mask_paths`` is not a list of non-empty
+        strings, or ``env_passthrough`` is not a list of POSIX
+        environment variable names.
     """
     if raw is None:
         return None
@@ -910,6 +914,8 @@ def _parse_os_env_sandbox(
     cwd_allow_hidden = _parse_cwd_allow_hidden(raw.get("cwd_allow_hidden"))
     max_entries = _parse_cwd_hidden_scan_max_entries(raw.get("cwd_hidden_scan_max_entries"))
     overflow = _parse_cwd_hidden_scan_overflow(raw.get("cwd_hidden_scan_overflow"))
+    recursive = _parse_cwd_hidden_scan_recursive(raw.get("cwd_hidden_scan_recursive"))
+    mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
     raw_type = raw.get("type")
@@ -971,6 +977,8 @@ def _parse_os_env_sandbox(
         cwd_allow_hidden=cwd_allow_hidden,
         cwd_hidden_scan_max_entries=max_entries,
         cwd_hidden_scan_overflow=overflow,
+        cwd_hidden_scan_recursive=recursive,
+        mask_paths=mask_paths,
         env_passthrough=env_passthrough,
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
@@ -1092,6 +1100,68 @@ def _parse_cwd_hidden_scan_overflow(raw: object) -> str:
             code=ErrorCode.INVALID_INPUT,
         )
     return raw
+
+
+def _parse_cwd_hidden_scan_recursive(raw: object) -> bool:
+    """
+    Parse ``os_env.sandbox.cwd_hidden_scan_recursive``.
+
+    Falls back to the dataclass default (``False`` — top-level-only
+    scan) when the field is absent. Rejects non-boolean values.
+
+    :param raw: Raw value from the YAML, e.g. ``True`` or ``None``.
+    :returns: ``True`` to recurse the full tree, ``False`` to scan
+        only the top level of each root.
+    :raises OmnigentError: If ``raw`` is not a boolean.
+    """
+    if raw is None:
+        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_recursive"].default
+    if not isinstance(raw, bool):
+        raise OmnigentError(
+            "os_env.sandbox.cwd_hidden_scan_recursive must be a boolean, "
+            f"got {type(raw).__name__}: {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return raw
+
+
+def _parse_mask_paths(raw: object) -> list[str] | None:
+    """
+    Parse and validate the ``mask_paths:`` field of ``os_env.sandbox``.
+
+    Each entry is a path string the backend resolves like
+    ``read_paths`` (``~`` expanded, relative-to-cwd, ``$VAR`` left
+    intact). We only validate shape here; path resolution happens in
+    the backend's ``resolve()``.
+
+    :param raw: Raw value from the YAML — ``None``, or a list of
+        non-empty path strings.
+    :returns: The list of path strings, or ``None`` when absent.
+    :raises OmnigentError: If ``raw`` is not a list, or any entry is
+        not a non-empty string.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise OmnigentError(
+            f"os_env.sandbox.mask_paths must be a list, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    sanitized: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise OmnigentError(
+                "os_env.sandbox.mask_paths entries must be strings, "
+                f"got {type(entry).__name__}: {entry!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not entry:
+            raise OmnigentError(
+                "os_env.sandbox.mask_paths entries must not be empty strings",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        sanitized.append(entry)
+    return sanitized
 
 
 # POSIX-portable environment variable name: starts with a letter or

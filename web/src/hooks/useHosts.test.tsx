@@ -260,7 +260,9 @@ describe("useHosts", () => {
     focusManager.setFocused(false);
     focusManager.setFocused(true);
     // Give any (unwanted) refetch a chance to fire, then assert it didn't.
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     focusManager.setFocused(undefined);
   });
@@ -286,7 +288,9 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
   // the cache patch must therefore NOT ride on per-call callbacks.
   function deferred<T>() {
     let resolve!: (v: T) => void;
-    const promise = new Promise<T>((r) => (resolve = r));
+    const promise = new Promise<T>((settle) => {
+      resolve = settle;
+    });
     return { promise, resolve };
   }
 

@@ -389,7 +389,10 @@ afterEach(() => {
 });
 
 /** Yield to the microtask queue so background pump kicks off. */
-const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+const tick = () =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
 
 /** Seed the session snapshot returned by GET /v1/sessions/{id}. */
 function seedSession(id: string, items: ConversationItem[] = []): void {
@@ -1137,9 +1140,9 @@ describe("chatStore — switchTo", () => {
 
     await Promise.race([
       useChatStore.getState().switchTo("conv_waiting"),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("switchTo timed out waiting for stalled stream")), 200),
-      ),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("switchTo timed out waiting for stalled stream")), 200);
+      }),
     ]);
 
     const elicitation = useChatStore

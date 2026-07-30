@@ -331,5 +331,5 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     };
   }, [queryClient, pushWatched]);
 
-  return <>{children}</>;
+  return children;
 }
