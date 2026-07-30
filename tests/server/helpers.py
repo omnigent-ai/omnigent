@@ -500,11 +500,13 @@ def install_fake_openshell_launcher(
         image: str | None = None,
         env: list[str] | None = None,
         cluster: str | None = None,
+        workspace: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
         fake.env = env
         fake.cluster = cluster
+        fake.workspace = workspace
         return fake
 
     monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
