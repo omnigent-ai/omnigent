@@ -20,10 +20,12 @@ from __future__ import annotations
 import re
 
 # Leading tokens to skip when finding the real command in a segment — command
-# wrappers that take the real command as their trailing arguments. These take
-# no options of their own in the forms we gate, so the wrapper word is simply
-# skipped (``sudo git push`` → ``git push``).
-CMD_WRAPPERS: frozenset[str] = frozenset({"sudo", "env", "command", "time", "nohup", "exec"})
+# wrappers that take the real command as their trailing arguments and accept no
+# options of their own, so the wrapper word is simply skipped
+# (``nohup git push`` → ``git push``). A wrapper with options belongs in
+# :data:`_FLAG_WRAPPERS` instead: skipping only its word would leave a flag as
+# the apparent command and let the real invocation slip past the gate.
+CMD_WRAPPERS: frozenset[str] = frozenset({"nohup"})
 
 # Wrappers that carry their OWN option flags (and, for ``timeout``, a leading
 # duration positional) before the real command. Skipping only the wrapper word
@@ -31,13 +33,48 @@ CMD_WRAPPERS: frozenset[str] = frozenset({"sudo", "env", "command", "time", "noh
 # command and let the real ``git push`` slip past the gate
 # (GHSA-7mqg-cx4g-x2rf). Each entry maps the wrapper to the set of its option
 # flags that consume a SEPARATE following value token (``nice -n 10`` /
-# ``stdbuf -o L`` / ``timeout -s KILL``); combined forms (``-n10`` / ``-oL`` /
-# ``--signal=KILL``) are a single token and need no entry.
+# ``stdbuf -o L`` / ``timeout -s KILL`` / ``sudo -u root`` / ``env -u VAR``);
+# combined forms (``-n10`` / ``-oL`` / ``--signal=KILL`` / ``--unset=VAR``) are
+# a single token and need no entry. An end-of-options ``--`` needs no entry
+# either — it is consumed as a valueless flag, leaving the command next.
 _FLAG_WRAPPERS: dict[str, frozenset[str]] = {
     "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
     "nice": frozenset({"-n", "--adjustment"}),
     "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
     "setsid": frozenset(),
+    # ``sudo -u root git push`` / ``env -i git push`` / ``command -p git push``
+    # / ``time -p git push`` / ``exec -a name git push`` all put a flag where a
+    # bare-word skip expects the command.
+    "sudo": frozenset(
+        {
+            "-C",
+            "--close-from",
+            "-D",
+            "--chdir",
+            "-g",
+            "--group",
+            "-h",
+            "--host",
+            "-p",
+            "--prompt",
+            "-R",
+            "--chroot",
+            "-r",
+            "--role",
+            "-T",
+            "--command-timeout",
+            "-t",
+            "--type",
+            "-U",
+            "--other-user",
+            "-u",
+            "--user",
+        }
+    ),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "command": frozenset(),
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
+    "exec": frozenset({"-a"}),
 }
 
 # Flag-wrappers that ALSO consume a leading positional (a duration) after their
@@ -174,6 +211,26 @@ def real_invocation_tokens(tokens: list[str]) -> list[str]:
     return tokens[index:]
 
 
+def is_unresolved_invocation(tokens: list[str]) -> bool:
+    """
+    Whether :func:`real_invocation_tokens` failed to reach a real command.
+
+    A leading ``-`` means the head is still an option belonging to some wrapper
+    whose flags this module does not model, so the segment's real command was
+    never reached. Treating that as "not a gated command" is what let
+    ``sudo -u root git push`` slip past the gate, so each policy must instead
+    route it through its own un-parseable handling (ASK / the configured
+    action) — the same fail-safe it applies to a segment ``shlex`` cannot
+    tokenize. This is the backstop for :data:`_FLAG_WRAPPERS` being an
+    enumeration that can fall behind a new wrapper.
+
+    :param tokens: The output of :func:`real_invocation_tokens`, e.g.
+        ``["-u", "root", "git", "push"]``.
+    :returns: ``True`` when the head is an option rather than a command.
+    """
+    return bool(tokens) and tokens[0].startswith("-")
+
+
 def _skip_flag_wrapper_args(
     tokens: list[str],
     index: int,
@@ -189,6 +246,13 @@ def _skip_flag_wrapper_args(
     *value_flag* (``-s KILL``) — and then, for a duration wrapper, the single
     required duration positional, leaving *index* at the real command.
 
+    Short options bundle (``sudo -nu root``, ``env -iu FOO``), so a value-taking
+    option is matched against each character of a single-dash token rather than
+    only against the whole token. Its value is a separate token only when the
+    option is the bundle's LAST character; otherwise the rest of the token is
+    the attached value (``nice -n10`` / ``stdbuf -oL``) and nothing further is
+    consumed.
+
     :param tokens: The full token list of the segment.
     :param index: Index of the first token after the wrapper word.
     :param value_flags: The wrapper's flags that consume a separate value token.
@@ -199,7 +263,20 @@ def _skip_flag_wrapper_args(
     while index < len(tokens) and tokens[index].startswith("-"):
         flag = tokens[index]
         index += 1
-        if flag in value_flags and index < len(tokens):
+        if index >= len(tokens):
+            break
+        if flag.startswith("--"):
+            # Long options take a separate value only in the ``--flag value``
+            # form; ``--flag=value`` is a single token needing no lookahead.
+            if flag in value_flags:
+                index += 1
+            continue
+        bundle = flag[1:]
+        position = next(
+            (pos for pos, opt in enumerate(bundle) if f"-{opt}" in value_flags),
+            None,
+        )
+        if position is not None and position == len(bundle) - 1:
             index += 1
     if has_duration and index < len(tokens):
         index += 1
