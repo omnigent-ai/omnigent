@@ -3063,7 +3063,7 @@ def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
             return_value="gateway-token",
         ),
         patch(
-            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            "omnigent.pi_native_credentials.resolve_databricks_workspace",
             return_value=SimpleNamespace(host="https://workspace.cloud.databricks.com"),
         ),
         patch(

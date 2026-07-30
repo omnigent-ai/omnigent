@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +44,11 @@ from omnigent.onboarding.provider_config import (
     default_provider_for_harness,
     load_config,
 )
+from omnigent.pi_model_compatibility import (
+    SYSTEM_AI_RESPONSES_KEYWORDS,
+    unsupported_in_pi,
+)
+from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
 if TYPE_CHECKING:
     # Annotation-only import (the runtime import is lazy inside the function,
@@ -68,15 +75,6 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 # work via /chat/completions: Kimi, Llama, GLM, Gemini, older GPT models).
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 _PI_MLFLOW_PROVIDER_ID = "omnigent-mlflow"
-
-# Keyword fragments that identify Databricks serving-endpoint models which
-# require the Responses API. These models don't send finish_reason via
-# /chat/completions but work correctly via /ai-gateway/codex/v1/responses
-# using their system.ai.* alias (derived by stripping "databricks-" prefix).
-# Use specific enough fragments to avoid false-positives (e.g. bare "glm" would
-# match "zai-org-glm-4-7" which has no system.ai.* alias; "glm-" avoids that).
-_SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "glm-")
-
 
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
@@ -170,8 +168,6 @@ def _databricks_workspace_url_for_gateway(
     if _DATABRICKS_AI_GATEWAY_LABEL not in hostname.lower().split("."):
         return f"https://{hostname}"
     try:
-        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-
         return resolve_databricks_workspace(profile).host
     except Exception:  # noqa: BLE001 — absent profile disables optional discovery
         return None
@@ -233,7 +229,7 @@ class PiProviderConfig:
             if (
                 not any(m.get("id") == self.model for m in models)
                 and not in_additional
-                and not _unsupported_in_pi(self.model.lower())
+                and not unsupported_in_pi(self.model.lower())
             ):
                 models.append({"id": self.model, "input": ["text", "image"]})
         else:
@@ -287,8 +283,6 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     completions_models: list[dict[str, Any]] = []
     gemini_models: list[dict[str, Any]] = []
     try:
-        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-
         creds = resolve_databricks_workspace(entry.profile)
     except Exception:  # noqa: BLE001 — credential failure must not break launch
         _LOGGER.info(
@@ -398,9 +392,6 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
     :returns: Stripped stdout (the token), or ``None`` when the command
         fails, times out, or produces empty output.
     """
-    import shlex
-    import subprocess
-
     try:
         result = subprocess.run(
             shlex.split(auth_command),
@@ -413,21 +404,6 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         return result.stdout.strip() or None
     except Exception:  # noqa: BLE001 — any subprocess failure should just return None
         return None
-
-
-def _unsupported_in_pi(model_id_lower: str) -> bool:
-    """Return True for models Pi can't handle at all.
-
-    - gemini-2-5: returns ``content`` as a typed array with ``thoughtSignature``
-      that Pi's completions handler mangles; Responses API returns 400 for it.
-    - gpt-oss: returns typed-array content that Pi's openai-completions handler
-      can't parse (same ``[object Object]`` issue as gemini-2-5).
-
-    Other Gemini variants route via /ai-gateway/mlflow/v1/chat/completions.
-
-    Expects a pre-lowercased model id.
-    """
-    return "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower
 
 
 def _fetch_pi_model_lists(
@@ -481,11 +457,11 @@ def _fetch_pi_model_lists(
         if "deepseek" in name_lower:
             entry["reasoning"] = True
         needs_responses = ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis or any(
-            keyword in name_lower for keyword in _SYSTEM_AI_MODEL_KEYWORDS
+            keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
         )
         if "claude" in name_lower:
             claude.append(entry)
-        elif _unsupported_in_pi(name_lower):
+        elif unsupported_in_pi(name_lower):
             pass  # exclude (e.g. gemini-2-5 thinking models)
         elif needs_responses:
             # Responses API: GPT models that need it + kimi/inkling/qwen3/glm keywords.
@@ -599,7 +575,6 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
         # Try to build a !command using the SDK, same as the databricks-kind path.
         try:
             from omnigent.inner.codex_executor import _databricks_codex_auth_command
-            from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
             ws = resolve_databricks_workspace(None)
             auth_cmd = _databricks_codex_auth_command(ws.host, None)

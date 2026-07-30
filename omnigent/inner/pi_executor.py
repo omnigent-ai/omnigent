@@ -54,6 +54,11 @@ from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.model_metadata import ModelWireAPI
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.pi_model_compatibility import SYSTEM_AI_RESPONSES_KEYWORDS
+from omnigent.pi_native_credentials import (
+    _databricks_workspace_url_for_gateway,
+    _is_databricks_ai_gateway_url,
+)
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
@@ -751,8 +756,6 @@ def _build_models_json(
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
     mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
-    from omnigent.pi_native_credentials import _is_databricks_ai_gateway_url
-
     is_databricks_openai_gateway = bool(
         raw_openai_base_url
         and (
@@ -919,11 +922,9 @@ def _pi_needs_responses_api(
     finish reason Pi requires. Unknown GPT metadata fails toward Responses,
     which is the forward-compatible tool-capable surface.
     """
-    from omnigent.pi_native_credentials import _SYSTEM_AI_MODEL_KEYWORDS
-
     lower = model.lower()
     if lower.startswith("system.ai.") and any(
-        keyword in lower for keyword in _SYSTEM_AI_MODEL_KEYWORDS
+        keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
     ):
         return True
     if wire_apis is not None:
@@ -1964,8 +1965,6 @@ class PiExecutor(Executor):
         """Return the configured wire only for a non-Databricks gateway."""
         openai_base_url = (self._base_urls_override or {}).get("openai")
         if openai_base_url:
-            from omnigent.pi_native_credentials import _is_databricks_ai_gateway_url
-
             is_databricks_gateway = (
                 "/ai-gateway/" in openai_base_url or _is_databricks_ai_gateway_url(openai_base_url)
             )
@@ -1977,8 +1976,6 @@ class PiExecutor(Executor):
         """Return the workspace API origin for Databricks catalog discovery."""
         if self._gateway_uses_databricks_profile:
             return self._databricks_host
-        from omnigent.pi_native_credentials import _databricks_workspace_url_for_gateway
-
         candidates = [
             *(self._base_urls_override or {}).values(),
             self._base_url_override,

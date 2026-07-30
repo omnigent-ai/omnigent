@@ -67,6 +67,7 @@ from omnigent.onboarding.provider_config import (
     SUBSCRIPTION_KIND,
     ProviderEntry,
 )
+from omnigent.pi_model_compatibility import unsupported_in_pi
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
 if TYPE_CHECKING:
@@ -1134,8 +1135,6 @@ def _fetch_databricks_uc_listing(
     :raises OSError: When the profile resolves no credentials.
     """
     creds = resolve_databricks_workspace(provider.profile)
-    from omnigent.pi_native_credentials import _unsupported_in_pi
-
     models = tuple(
         model
         for model in fetch_databricks_model_service_entries(
@@ -1143,7 +1142,7 @@ def _fetch_databricks_uc_listing(
             creds.token,
             transport=transport,
         )
-        if not _unsupported_in_pi(model.id.lower())
+        if not unsupported_in_pi(model.id.lower())
     )
     return ModelListing(
         source="gateway",

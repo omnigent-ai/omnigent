@@ -78,7 +78,6 @@ def test_databricks_unresolvable_credentials_sets_warning(
     session is worse than a visible notice — so the resolver flags it.
     """
     from omnigent.inner import databricks_executor
-    from omnigent.runtime.credentials import databricks as rt_databricks
 
     monkeypatch.setattr(
         databricks_executor,
@@ -89,7 +88,7 @@ def test_databricks_unresolvable_credentials_sets_warning(
     def _boom(profile: str | None):
         raise OSError("refresh token is invalid")
 
-    monkeypatch.setattr(rt_databricks, "resolve_databricks_workspace", _boom)
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -112,7 +111,7 @@ def test_databricks_model_list_failure_has_no_warning(
         lambda profile: "https://wkspc.example.com/",
     )
     monkeypatch.setattr(
-        rt_databricks,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: rt_databricks.WorkspaceCreds(
             host="https://wkspc.example.com", token="tok"
@@ -732,7 +731,7 @@ def test_workspace_url_for_dedicated_gateway_uses_profile(
             token="unused",
         )
 
-    monkeypatch.setattr(db_creds_mod, "resolve_databricks_workspace", resolve)
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", resolve)
 
     assert (
         creds._databricks_workspace_url_for_gateway(
@@ -942,7 +941,7 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     monkeypatch.setattr(
-        db_creds_mod,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
     )
@@ -992,7 +991,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     monkeypatch.setattr(
-        db_creds_mod,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(
             host="https://dbc-a5d4177a-49dc.cloud.databricks.com", token="sdk-tok"
