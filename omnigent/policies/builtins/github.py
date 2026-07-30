@@ -640,6 +640,8 @@ class _ShellOp:
         content (``gh issue create``, ``gh pr merge`` …).
     :param detail: Short description for the decision reason, e.g.
         ``"git push"`` or ``"gh pr create"``.
+    :param force_push: Whether this ``git push`` uses a force flag
+        (``--force``, ``-f``, ``--force-with-lease``, ``--force-if-includes``).
     """
 
     kind: str
@@ -647,6 +649,7 @@ class _ShellOp:
     branches: frozenset[str]
     branch_targeted: bool
     detail: str
+    force_push: bool = False
 
 
 def _repo_from_tokens(tokens: list[str]) -> str | None:
@@ -716,12 +719,22 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
             branch = _normalize_branch(dest)
             if branch:
                 branches.add(branch)
+        # Detect force-push flags: --force, -f, --force-with-lease[=…],
+        # --force-if-includes[=…], or -f inside combined short flags like -uf.
+        _FORCE_LONG = {"--force", "-f", "--force-with-lease", "--force-if-includes"}
+        is_force = any(
+            t in _FORCE_LONG
+            or t.startswith("--force-with-lease=")
+            or t.startswith("--force-if-includes=")
+            for t in args
+        )
         return _ShellOp(
             kind="write",
             repo=repo,
             branches=frozenset(branches),
             branch_targeted=True,
             detail="git push",
+            force_push=is_force,
         )
     return None
 
@@ -866,6 +879,7 @@ def github_policy(
     read_repos: list[str] | None = None,
     write_repos: list[str] | None = None,
     write_branches: list[str] | None = None,
+    deny_force_push: bool = True,
     mcp_tool_prefixes: list[str] | None = None,
     shell_tools: list[str] | None = None,
     deny_reason: str = "GitHub operation blocked by policy.",
@@ -883,6 +897,11 @@ def github_policy(
     :param write_branches: Branches writable within an allowed repo, e.g.
         ``["main", "develop"]``. ``None`` / empty means branches are not
         restricted (any branch on an allowed repo is writable).
+    :param deny_force_push: When ``True`` (default), ``git push`` with force
+        flags (``--force``, ``-f``, ``--force-with-lease``,
+        ``--force-if-includes``) is denied regardless of repo/branch
+        allowlists. Set to ``False`` to allow force pushes through normal
+        repo/branch gating.
     :param mcp_tool_prefixes: GitHub MCP server name-prefixes to strip when
         canonicalizing MCP tool names. ``None`` uses the standard
         ``mcp__github__`` / ``github__``.
@@ -1057,6 +1076,12 @@ def github_policy(
                     f"of `{op.detail}` could not be determined. Approve?"
                 ),
             )
+        if op.kind == "write" and op.force_push and deny_force_push:
+            return _deny(
+                "Force push is blocked by policy. Remove the force flag "
+                "(--force / -f / --force-with-lease / --force-if-includes) "
+                "or set deny_force_push=False."
+            )
         if op.kind == "write":
             return _gate_write(
                 {op.repo} if op.repo else set(),
@@ -1158,6 +1183,12 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Branches writable within an allowed repo. Empty = any branch.",
+                },
+                "deny_force_push": {
+                    "type": "boolean",
+                    "description": "Deny git push with force flags (--force, -f, "
+                    "--force-with-lease, --force-if-includes). Default true.",
+                    "default": True,
                 },
                 "mcp_tool_prefixes": {
                     "type": "array",

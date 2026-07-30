@@ -699,6 +699,60 @@ def test_shell_gh_ignore_groups_abstain(command: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Layer 1 — force-push protection
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_force_push_denied_by_default() -> None:
+    """git push --force is denied by default even to an allowed repo+branch."""
+    policy = github_policy(write_repos=["octo/hello"], write_branches=["main"])
+    result = policy(_sh("git push --force https://github.com/octo/hello main"))
+    assert result is not None and result["result"] == "DENY"
+    assert "force" in result.get("reason", "").lower()
+
+
+def test_force_push_short_flag_denied() -> None:
+    """git push -f is denied (short flag form)."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push -f https://github.com/octo/hello main"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_force_with_lease_denied_by_default() -> None:
+    """git push --force-with-lease is also denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push --force-with-lease https://github.com/octo/hello main"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_force_push_allowed_when_opt_out() -> None:
+    """deny_force_push=False lets force pushes through normal repo/branch gating."""
+    policy = github_policy(write_repos=["octo/hello"], deny_force_push=False)
+    assert policy(_sh("git push --force https://github.com/octo/hello main")) is None
+
+
+def test_force_push_alias_asks() -> None:
+    """Force push to an alias still DENYs (repo undeterminable), not silently allows."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push --force origin main"))
+    assert result is not None and result["result"] == "DENY"
+    assert "force" in result.get("reason", "").lower()
+
+
+def test_non_force_push_still_allowed() -> None:
+    """A normal push to an allowed repo is not affected by force-push protection."""
+    policy = github_policy(write_repos=["octo/hello"])
+    assert policy(_sh("git push https://github.com/octo/hello main")) is None
+
+
+def test_force_push_wrapped_in_bash_denied() -> None:
+    """bash -c wrapper does not bypass force-push detection."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh('bash -c "git push --force https://github.com/octo/hello main"'))
+    assert result is not None and result["result"] == "DENY"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Layer 2 — spec resolution through resolve_function_policy
 # ══════════════════════════════════════════════════════════════════════════════
 
