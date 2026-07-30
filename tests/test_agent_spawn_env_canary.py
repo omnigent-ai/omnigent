@@ -11,6 +11,8 @@ and still missed five siblings.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from omnigent.inner.agent_env import (
@@ -56,6 +58,127 @@ def hostile_env():
         "HTTPS_PROXY": "http://proxy:8080",
         **CANARY_SECRETS,
     }
+
+
+# --- the real builders -----------------------------------------------------
+#
+# The prefix table above is a hand copy of what each executor passes, so on its
+# own it only proves clean_agent_env works. These drive each executor's OWN
+# spawn-env builder against a planted os.environ, which is what actually makes
+# the "next harness fails here" claim true: if qwen reverts to
+# os.environ.copy(), or harness number ten never calls the helper, this fails.
+
+
+def _bare(cls, **attrs):
+    """An executor carrying only the attributes its env builder reads.
+
+    The constructors want a live config, an event loop and a spawned CLI. The
+    builders do not — they read ``_os_env`` and, for hermes, ``_hermes_home``.
+    Bypassing ``__init__`` keeps the canary on the real method without dragging
+    in the rest of the executor.
+    """
+    obj = object.__new__(cls)
+    obj._os_env = None
+    for name, value in attrs.items():
+        setattr(obj, name, value)
+    return obj
+
+
+def _acp_spawn_env():
+    from omnigent.inner.acp_executor import AcpExecutor
+
+    return _bare(AcpExecutor)._build_spawn_env()
+
+
+def _goose_spawn_env():
+    from omnigent.inner.goose_executor import GooseExecutor
+
+    # Provider/gateway overrides are deliberate additions layered on top of the
+    # filtered base, not leaks; stub them so this asserts the filtering alone.
+    return _bare(GooseExecutor, _provider_env=dict)._build_spawn_env()
+
+
+def _qwen_spawn_env():
+    from omnigent.inner.qwen_executor import QwenExecutor
+
+    async def _no_gateway():
+        return {}
+
+    return asyncio.run(_bare(QwenExecutor, _resolve_gateway_env=_no_gateway)._build_spawn_env())
+
+
+def _kimi_spawn_env():
+    from omnigent.inner.kimi_executor import KimiExecutor
+
+    return _bare(KimiExecutor)._build_spawn_env()
+
+
+def _hermes_spawn_env():
+    from omnigent.inner.hermes_executor import HermesExecutor
+
+    # The no-HERMES_HOME branch: the one that used to pass env=None and inherit
+    # the entire host environment, so it is the branch worth pinning.
+    return _bare(HermesExecutor, _hermes_home=None)._build_spawn_env()
+
+
+def _pi_spawn_env():
+    from omnigent.inner.pi_executor import _clean_pi_env
+
+    return _clean_pi_env()
+
+
+def _codex_spawn_env():
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    return _clean_codex_env()
+
+
+SPAWN_ENV_BUILDERS = {
+    "acp": _acp_spawn_env,
+    "codex": _codex_spawn_env,
+    "goose": _goose_spawn_env,
+    "hermes": _hermes_spawn_env,
+    "kimi": _kimi_spawn_env,
+    "pi": _pi_spawn_env,
+    "qwen": _qwen_spawn_env,
+}
+
+
+def test_every_harness_is_covered_by_a_real_builder():
+    """A harness added to the prefix table must also be wired up above."""
+    assert set(SPAWN_ENV_BUILDERS) == set(HARNESS_PREFIXES)
+
+
+@pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
+def test_real_builder_does_not_leak_host_secrets(harness, hostile_env, monkeypatch):
+    """Drive the executor's own builder against a planted host environment."""
+    monkeypatch.setattr("os.environ", dict(hostile_env))
+
+    env = SPAWN_ENV_BUILDERS[harness]()
+
+    leaked = {k: v for k, v in env.items() if k in CANARY_SECRETS}
+    # qwen owns OPENAI_, so an OPENAI_ canary is its own family, not a leak.
+    leaked = {k: v for k, v in leaked.items() if not k.startswith(HARNESS_PREFIXES[harness] or ())}
+    assert not leaked, f"{harness}'s real spawn env leaked {sorted(leaked)}"
+
+
+@pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
+def test_real_builder_still_yields_a_usable_environment(harness, hostile_env, monkeypatch):
+    monkeypatch.setattr("os.environ", dict(hostile_env))
+
+    env = SPAWN_ENV_BUILDERS[harness]()
+
+    assert env["HOME"] == "/home/user"
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["HTTPS_PROXY"] == "http://proxy:8080"
+
+
+def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
+    """A corporate CA must survive filtering, or every Node CLI breaks on TLS."""
+    monkeypatch.setattr("os.environ", {"NODE_EXTRA_CA_CERTS": "/etc/corp-ca.pem"})
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
 @pytest.mark.parametrize("harness", sorted(HARNESS_PREFIXES))

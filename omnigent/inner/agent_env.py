@@ -51,6 +51,12 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         "TMPDIR",
         "TMP",
         "TEMP",
+        # Node's equivalent of SSL_CERT_FILE, so it belongs in the same
+        # reach-the-network category as the proxy and SSL_ entries. Most agent
+        # CLIs are Node programs that honour this and ignore SSL_CERT_FILE;
+        # without it a corporate-CA user upgrading would hit TLS failures from
+        # every harness that does not happen to own a NODE_ prefix of its own.
+        "NODE_EXTRA_CA_CERTS",
         OMNIGENT_SESSION_ENV_VAR,
     }
 )
