@@ -8193,6 +8193,7 @@ def _mcp_input_required_response(
     message: str,
     request_state: str,
     session_id: str | None = None,
+    ask_timeout: int | None = None,
 ) -> Response:
     """
     Return an MCP ``InputRequiredResult`` asking the runner to collect
@@ -8217,6 +8218,9 @@ def _mcp_input_required_response(
     :param session_id: Session/conversation id for constructing the
         approval page URL, e.g. ``"conv_abc123"``. ``None`` omits the
         URL (form mode).
+    :param ask_timeout: Spec-resolved approval window in seconds, e.g.
+        ``600``. Carried as ``timeoutSeconds`` so the runner's park honors
+        it instead of its own one-day fallback. ``None`` omits the field.
     :returns: A :class:`Response` carrying the JSON-RPC 2.0
         ``InputRequiredResult`` envelope.
     """
@@ -8229,6 +8233,8 @@ def _mcp_input_required_response(
             "required": ["approved"],
         },
     }
+    if ask_timeout is not None:
+        params["timeoutSeconds"] = ask_timeout
     if session_id is not None and _ELICITATION_MODE == "url":
         params["mode"] = "url"
         params["url"] = f"/approve/{session_id}/{elicitation_id}"

@@ -6089,6 +6089,7 @@ async def _handle_mcp_tools_call(
                 message=call_result.reason or "Approval required to run this tool",
                 request_state=request_state,
                 session_id=session_id,
+                ask_timeout=resolve_ask_timeout(engine, call_result),
             )
         # ALLOW — apply labels now that we know the action is not ASK.
         if call_result.set_labels:
