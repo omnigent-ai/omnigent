@@ -144,15 +144,15 @@ class Pcm16Downsampler extends AudioWorkletProcessor {
 registerProcessor("omnigent-pcm16-downsampler", Pcm16Downsampler);
 `;
 
-let _workletUrl: string | null = null;
+let cachedWorkletUrl: string | null = null;
 
 function workletUrl(): string {
-  if (_workletUrl === null) {
-    _workletUrl = URL.createObjectURL(
+  if (cachedWorkletUrl === null) {
+    cachedWorkletUrl = URL.createObjectURL(
       new Blob([WORKLET_SOURCE], { type: "application/javascript" }),
     );
   }
-  return _workletUrl;
+  return cachedWorkletUrl;
 }
 
 /**

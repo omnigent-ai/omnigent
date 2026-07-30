@@ -212,6 +212,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.in_cluster: bool | None = None
         self.resources: dict[str, object] | None = None
         self.pvc_mounts: list[dict[str, object]] | None = None
+        self.secret_mounts: list[dict[str, object]] | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -542,6 +543,7 @@ def install_fake_kubernetes_launcher(
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
         pvc_mounts: list[dict[str, object]] | None = None,
+        secret_mounts: list[dict[str, object]] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -554,6 +556,7 @@ def install_fake_kubernetes_launcher(
         fake.in_cluster = in_cluster
         fake.resources = resources
         fake.pvc_mounts = pvc_mounts
+        fake.secret_mounts = secret_mounts
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)

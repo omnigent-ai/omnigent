@@ -70,6 +70,17 @@ describe("normalizeUrl", () => {
   it("rejects a non-http(s) scheme", () => {
     assert.throws(() => normalizeUrl("ftp://example.com"), /unsupported scheme/);
   });
+
+  it("preserves the parser error when rejecting an invalid URL", () => {
+    assert.throws(
+      () => normalizeUrl("http://["),
+      (error) => {
+        assert.match(error.message, /invalid URL/);
+        assert.ok(error.cause instanceof TypeError);
+        return true;
+      },
+    );
+  });
 });
 
 describe("isPlainHttpRemote", () => {

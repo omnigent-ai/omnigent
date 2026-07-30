@@ -494,6 +494,30 @@ const NOT_FOUND_RESPONSE = {
   json: async () => ({ error: { code: "not_found" } }),
 } as unknown as Response;
 
+interface TestFileViewerContext {
+  openFile: (path: string) => void;
+  isChangedPath: (path: string) => boolean;
+  conversationId: string | undefined;
+  workspaceRoot: string | null;
+  workspaceHome: string | null;
+}
+
+function TestProviders({
+  children,
+  queryClient,
+  fileViewerContext,
+}: {
+  children: ReactNode;
+  queryClient: QueryClient;
+  fileViewerContext: TestFileViewerContext;
+}) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <FileViewerContext.Provider value={fileViewerContext}>{children}</FileViewerContext.Provider>
+    </QueryClientProvider>
+  );
+}
+
 function renderMessage(
   text: string,
   ctx: {
@@ -504,7 +528,7 @@ function renderMessage(
     workspaceHome?: string | null;
   },
 ) {
-  const fullCtx = {
+  const fullCtx: TestFileViewerContext = {
     workspaceRoot: null,
     workspaceHome: null,
     ...ctx,
@@ -513,17 +537,10 @@ function renderMessage(
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 0 } },
   });
-  function Wrap({ children }: { children: ReactNode }) {
-    return (
-      <QueryClientProvider client={qc}>
-        <FileViewerContext.Provider value={fullCtx}>{children}</FileViewerContext.Provider>
-      </QueryClientProvider>
-    );
-  }
   return render(
-    <Wrap>
+    <TestProviders queryClient={qc} fileViewerContext={fullCtx}>
       <BlockRenderer items={items} sessionStatus="idle" />
-    </Wrap>,
+    </TestProviders>,
   );
 }
 

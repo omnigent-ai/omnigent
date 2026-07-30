@@ -97,7 +97,9 @@ export function moveColumnToIndex(
     const row = node.child(r);
     if (fromCol < 0 || fromCol >= row.childCount) return row;
     if (toCol < 0 || toCol >= row.childCount) return row;
-    const cells = Array.from({ length: row.childCount }, (_, c) => row.child(c));
+    const cells = Array.from({ length: row.childCount }, (__, columnIndex) =>
+      row.child(columnIndex),
+    );
     const [cell] = cells.splice(fromCol, 1);
     cells.splice(toCol, 0, cell);
     return row.type.create(row.attrs, Fragment.fromArray(cells));
@@ -189,8 +191,8 @@ function setCursorToCell(editor: Editor, rowIndex: number, colIndex: number): vo
 // ---------------------------------------------------------------------------
 
 type MenuItemDef =
-  | { label: string; icon: React.ReactNode; onClick: () => void; destructive?: boolean }
-  | { separator: true };
+  | { id: string; label: string; icon: React.ReactNode; onClick: () => void; destructive?: boolean }
+  | { id: string; separator: true };
 
 function HandleMenu({
   items,
@@ -226,12 +228,12 @@ function HandleMenu({
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
     >
-      {items.map((item, i) =>
+      {items.map((item) =>
         "separator" in item ? (
-          <div key={i} className="mx-2 my-1 h-px bg-border" />
+          <div key={item.id} className="mx-2 my-1 h-px bg-border" />
         ) : (
           <button
-            key={i}
+            key={item.id}
             type="button"
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => {
@@ -685,6 +687,7 @@ export function TableHandles({
   // Build row menu items (Insert / Delete only — drag handles Move)
   const buildRowItems = (h: HandlePos): MenuItemDef[] => [
     {
+      id: "insert-row-above",
       label: "Insert row above",
       icon: <span className="text-[10px] font-bold">↑</span>,
       onClick: () => {
@@ -693,6 +696,7 @@ export function TableHandles({
       },
     },
     {
+      id: "insert-row-below",
       label: "Insert row below",
       icon: <span className="text-[10px] font-bold">↓</span>,
       onClick: () => {
@@ -700,8 +704,9 @@ export function TableHandles({
         editor.chain().focus().addRowAfter().run();
       },
     },
-    { separator: true },
+    { id: "row-actions-separator", separator: true },
     {
+      id: "delete-row",
       label: "Delete row",
       icon: <Trash2 className="size-3.5" />,
       destructive: true,
@@ -715,6 +720,7 @@ export function TableHandles({
   // Build column menu items (Insert / Delete only — drag handles Move)
   const buildColItems = (h: HandlePos): MenuItemDef[] => [
     {
+      id: "insert-column-before",
       label: "Insert column before",
       icon: <span className="text-[10px] font-bold">←</span>,
       onClick: () => {
@@ -723,6 +729,7 @@ export function TableHandles({
       },
     },
     {
+      id: "insert-column-after",
       label: "Insert column after",
       icon: <span className="text-[10px] font-bold">→</span>,
       onClick: () => {
@@ -730,8 +737,9 @@ export function TableHandles({
         editor.chain().focus().addColumnAfter().run();
       },
     },
-    { separator: true },
+    { id: "column-actions-separator", separator: true },
     {
+      id: "delete-column",
       label: "Delete column",
       icon: <Trash2 className="size-3.5" />,
       destructive: true,
@@ -972,6 +980,7 @@ export function TableHandles({
         <HandleMenu
           items={[
             {
+              id: "delete-table",
               label: "Delete table",
               icon: <Trash2 className="size-3.5" />,
               destructive: true,

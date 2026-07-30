@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
+    SessionResourceView,
     resolve_terminal_entry_by_resource_id,
     session_resource_view_to_dict,
     terminal_resource_id,
@@ -53,6 +54,10 @@ from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
     extract_summary_text,
+)
+from omnigent.native_coding_agents import (
+    native_coding_agent_for_harness,
+    native_coding_agent_for_terminal_name,
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runner import native as _native
@@ -73,18 +78,10 @@ from omnigent.runner.native import (
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
     NativeLaunchContext,
+    PreLaunchResult,
     ResolvedSpec,
     _antigravity_native_terminal_arrives_via_transfer,
-    _auto_create_antigravity_terminal,
-    _auto_create_claude_terminal,
-    _auto_create_codex_terminal,
-    _auto_create_cursor_terminal,
-    _auto_create_goose_terminal,
-    _auto_create_hermes_terminal,
-    _auto_create_kimi_terminal,
-    _auto_create_kiro_terminal,
     _auto_create_opencode_terminal,
-    _auto_create_pi_terminal,
     _auto_create_qwen_terminal,
     _auto_create_repl_terminal,
     _cancel_auto_forwarder_task,
@@ -97,6 +94,7 @@ from omnigent.runner.native import (
     _codex_session_needs_runner_terminal,
     _CodexNativeModelOptionsNotReady,
     _delete_native_bridge_dirs,
+    _ensure_native_terminal,
     _ensure_orchestrator_skills_in_bundle,
     _forward_harness_response,
     _is_runner_owned_antigravity_terminal,
@@ -104,8 +102,6 @@ from omnigent.runner.native import (
     _is_spec_local_native_python_tool,
     _launch_native_terminal,
     _log_terminal_lookup_miss,
-    _native_terminal_start_error_response,
-    _publish_native_terminal_start_error,
     _publish_terminal_pending,
     _publish_tmux_target_for_bridge,
     _required_runner_env,
@@ -143,7 +139,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleResponse,
 )
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
-from omnigent.spec.types import LocalToolInfo, SkillSpec
+from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -2615,354 +2611,214 @@ def create_runner_app(
 
         terminal_ready: bool | None = None
 
-        if harness_name == "claude-native":
-            terminal_ready = False
-            _ensure_lock = _claude_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_terminal = (
-                    _tr is not None and _tr.get(session_id, "claude", "main") is not None
-                )
-                if _has_terminal and await _claude_native_session_wants_rebuild(
-                    server_client,
-                    session_id,
-                    init_context.envelope,
-                ):
-                    _logger.info(
-                        "Claude terminal stale after agent switch; tearing it down to "
-                        "rebuild from current items: session=%s",
-                        session_id,
+        _native_agent = native_coding_agent_for_harness(harness_name)
+        if _native_agent is not None:
+            # Each native harness contributes only its launch parameters here;
+            # a single _launch_native_terminal call at the end runs them. The
+            # 8 uniform harnesses differ only in their lock dict and whether
+            # they pass an agent-spec resolver; the 3 special harnesses
+            # (claude/codex/antigravity) add a pre_launch check and, for
+            # claude/codex, a build_context enrichment. All wire the comment
+            # relay (pi/opencode route their policy hook through it).
+            _launch_locks = {
+                "claude": _claude_terminal_ensure_locks,
+                "codex": _codex_terminal_ensure_locks,
+                "pi": _pi_terminal_ensure_locks,
+                "cursor": _cursor_terminal_ensure_locks,
+                "kiro": _kiro_terminal_ensure_locks,
+                "antigravity": _antigravity_terminal_ensure_locks,
+                "opencode": _opencode_terminal_ensure_locks,
+                "goose": _goose_terminal_ensure_locks,
+                "hermes": _hermes_terminal_ensure_locks,
+                "qwen": _qwen_terminal_ensure_locks,
+                "kimi": _kimi_terminal_ensure_locks,
+            }[_native_agent.key]
+            _launch_ctx = NativeLaunchContext(
+                session_id=session_id,
+                resource_registry=resource_registry,
+                publish_event=_publish_event,
+                server_client=server_client,
+                ensure_comment_relay=_ensure_comment_relay_started,
+            )
+            _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
+            _launch_build: (
+                Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
+            ) = None
+            _launch_resolve_spec: (
+                Callable[[], Awaitable[AgentSpec | ResolvedSpec | None]] | None
+            ) = None
+
+            if harness_name == "claude-native":
+
+                async def _claude_pre_launch(has_terminal: bool) -> PreLaunchResult:
+                    # Mirror the inline arm exactly: a rebuild (agent switch) tears
+                    # the stale terminal down, but the transfer-inbound check still
+                    # runs on the resulting terminal-absent state and, if a sibling
+                    # session's terminal is rotating in, wins over create. So the
+                    # combined rebuild+inbound case is teardown + wait-for-transfer,
+                    # NOT teardown + fresh create (which would race the rotation).
+                    wants_rebuild = has_terminal and await _claude_native_session_wants_rebuild(
+                        server_client, session_id, init_context.envelope
                     )
-                    if _tr is not None:
-                        await _tr.cleanup_conversation(session_id)
-                    _has_terminal = False
-                _logger.info(
-                    "Claude terminal auto-create decision: session=%s terminal_registry=%s "
-                    "has_existing_terminal=%s",
-                    session_id,
-                    _tr is not None,
-                    _has_terminal,
-                )
-                _terminal_inbound = False
-                if not _has_terminal:
-                    _terminal_inbound = await _claude_native_terminal_arrives_via_transfer(
-                        server_client=server_client,
-                        session_id=session_id,
-                        resource_registry=resource_registry,
-                        session_labels=init_context.labels,
-                    )
-                    _logger.info(
-                        "Claude terminal transfer-inbound check: session=%s terminal_inbound=%s",
-                        session_id,
-                        _terminal_inbound,
-                    )
-                if not _has_terminal and not _terminal_inbound:
-                    _native_bundle_dir: Path | None = None
-                    _native_agent_name: str | None = None
-                    _native_skills_filter: str | list[str] = "all"
+                    if wants_rebuild:
+                        _logger.info(
+                            "Claude terminal stale after agent switch; tearing it down to "
+                            "rebuild from current items: session=%s",
+                            session_id,
+                        )
+                    # The inline arm ran the transfer check whenever the terminal was
+                    # (or just became, via rebuild) absent. Return force_recreate and
+                    # skip together: the shell tears down first (rebuild), then honors
+                    # skip (inbound) — so rebuild+inbound is teardown + wait-for-transfer.
+                    inbound = False
+                    if not has_terminal or wants_rebuild:
+                        inbound = await _claude_native_terminal_arrives_via_transfer(
+                            server_client=server_client,
+                            session_id=session_id,
+                            resource_registry=resource_registry,
+                            session_labels=init_context.labels,
+                        )
+                        _logger.info(
+                            "Claude terminal transfer-inbound check: session=%s "
+                            "terminal_inbound=%s",
+                            session_id,
+                            inbound,
+                        )
+                    return PreLaunchResult(force_recreate=wants_rebuild, skip=inbound)
+
+                async def _claude_build_context(ctx: NativeLaunchContext) -> NativeLaunchContext:
+                    bundle_dir: Path | None = None
+                    agent_name: str | None = None
+                    skills_filter: str | list[str] = "all"
                     try:
-                        _native_spec = await _resolve_session_agent_spec(session_id)
+                        spec = await _resolve_session_agent_spec(session_id)
                     except OmnigentError:
-                        _native_spec = None
+                        spec = None
                         _logger.info(
                             "Claude terminal spec resolution failed; continuing without "
                             "bundle skills: session=%s",
                             session_id,
                         )
-                    if _native_spec is not None:
-                        _native_entry = _session_spec_cache.get(session_id)
-                        _native_bundle_dir = (
-                            _resolved_spec_workdir(_native_entry)
-                            if _native_entry is not None
-                            else None
-                        )
-                        _native_agent_name = getattr(_native_spec, "name", None)
-                        _native_skills_filter = getattr(_native_spec, "skills_filter", "all")
-                    if _native_bundle_dir is None:
-                        _native_bundle_dir = Path(
-                            tempfile.mkdtemp(prefix="omnigent-skill-bundle-")
-                        )
+                    if spec is not None:
+                        entry = _session_spec_cache.get(session_id)
+                        bundle_dir = _resolved_spec_workdir(entry) if entry is not None else None
+                        agent_name = getattr(spec, "name", None)
+                        skills_filter = getattr(spec, "skills_filter", "all")
+                    if bundle_dir is None:
+                        bundle_dir = Path(tempfile.mkdtemp(prefix="omnigent-skill-bundle-"))
                     _logger.info(
                         "Claude terminal auto-create inputs resolved: session=%s "
                         "bundle_dir=%s agent_name=%s skills_filter=%s",
                         session_id,
-                        _native_bundle_dir,
-                        _native_agent_name,
-                        _native_skills_filter,
+                        bundle_dir,
+                        agent_name,
+                        skills_filter,
                     )
-                    _ensure_orchestrator_skills_in_bundle(_native_bundle_dir, _native_spec)
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_claude_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            bundle_dir=_native_bundle_dir,
-                            agent_name=_native_agent_name,
-                            agent_spec=_native_spec,
-                            skills_filter=_native_skills_filter,
-                            session_init=init_context.envelope,
-                            auth_token_factory=auth_token_factory,
-                            resolve_launch_config=lambda: _resolve_session_claude_launch_config(
-                                session_id
-                            ),
-                            record_launch_config=_session_claude_launch_configs.__setitem__,
-                        )
-                        terminal_ready = True
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create claude terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Claude",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
-                elif _has_terminal:
-                    terminal_ready = True
-                elif _terminal_inbound:
-                    _logger.info(
-                        "Skipping claude terminal auto-create for %s; a sibling "
-                        "session's terminal will transfer in (rotation target).",
-                        session_id,
+                    _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                    return dataclasses.replace(
+                        ctx,
+                        bundle_dir=bundle_dir,
+                        agent_name=agent_name,
+                        agent_spec=spec,
+                        skills_filter=skills_filter,
+                        session_init=init_context.envelope,
+                        auth_token_factory=auth_token_factory,
+                        resolve_launch_config=lambda: _resolve_session_claude_launch_config(
+                            session_id
+                        ),
+                        record_launch_config=_session_claude_launch_configs.__setitem__,
                     )
 
-        if harness_name == "codex-native":
-            _codex_ensure_lock = _codex_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
-            )
-            async with _codex_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_codex_terminal = (
-                    _tr is not None and _tr.get(session_id, "codex", "main") is not None
-                )
-                _needs_terminal = await _codex_session_needs_runner_terminal(
-                    server_client, session_id
-                )
-                if not _has_codex_terminal and _needs_terminal:
-                    _codex_bundle_dir: Path | None = None
-                    _codex_skills_filter: str | list[str] = "all"
+                _launch_pre = _claude_pre_launch
+                _launch_build = _claude_build_context
+
+            elif harness_name == "codex-native":
+
+                async def _codex_pre_launch(has_terminal: bool) -> PreLaunchResult:
+                    needs = await _codex_session_needs_runner_terminal(server_client, session_id)
+                    if not needs and not has_terminal:
+                        _logger.info(
+                            "Skipping codex terminal auto-create for %s; session "
+                            "snapshot was not available.",
+                            session_id,
+                        )
+                    return PreLaunchResult(needs_terminal=needs)
+
+                async def _codex_build_context(ctx: NativeLaunchContext) -> NativeLaunchContext:
+                    bundle_dir: Path | None = None
+                    skills_filter: str | list[str] = "all"
                     try:
-                        _codex_spec = await _resolve_session_agent_spec(session_id)
+                        spec = await _resolve_session_agent_spec(session_id)
                     except OmnigentError:
-                        _codex_spec = None
-                    if _codex_spec is not None:
-                        _codex_entry = _session_spec_cache.get(session_id)
-                        _codex_bundle_dir = (
-                            _resolved_spec_workdir(_codex_entry)
-                            if _codex_entry is not None
-                            else None
-                        )
-                        _codex_skills_filter = getattr(_codex_spec, "skills_filter", "all")
-                    if _codex_bundle_dir is not None and _codex_spec is not None:
-                        _ensure_orchestrator_skills_in_bundle(_codex_bundle_dir, _codex_spec)
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_codex_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            bundle_dir=_codex_bundle_dir,
-                            skills_filter=_codex_skills_filter,
-                            agent_spec=spec_entry,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create codex terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Codex",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
-                elif not _needs_terminal:
-                    _logger.info(
-                        "Skipping codex terminal auto-create for %s; session "
-                        "snapshot was not available.",
-                        session_id,
+                        spec = None
+                    if spec is not None:
+                        entry = _session_spec_cache.get(session_id)
+                        bundle_dir = _resolved_spec_workdir(entry) if entry is not None else None
+                        skills_filter = getattr(spec, "skills_filter", "all")
+                    if bundle_dir is not None and spec is not None:
+                        _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                    # Preserve the inline arm's use of the outer spec_entry (not the
+                    # locally-resolved spec) as agent_spec.
+                    return dataclasses.replace(
+                        ctx,
+                        bundle_dir=bundle_dir,
+                        skills_filter=skills_filter,
+                        agent_spec=spec_entry,
                     )
 
-        if harness_name == "pi-native":
-            # pi resolves its spec unwrapped — a resolution error surfaces as a
-            # terminal-start error (preserved by not swallowing in the resolver).
-            await _launch_native_terminal(
-                harness_name,
-                NativeLaunchContext(
-                    session_id=session_id,
-                    resource_registry=resource_registry,
-                    publish_event=_publish_event,
-                    server_client=server_client,
-                    ensure_comment_relay=_ensure_comment_relay_started,
-                ),
-                ensure_locks=_pi_terminal_ensure_locks,
-                resolve_agent_spec=lambda: _resolve_session_agent_spec(session_id),
-            )
+                _launch_pre = _codex_pre_launch
+                _launch_build = _codex_build_context
 
-        if harness_name == "cursor-native":
-            await _launch_native_terminal(
-                harness_name,
-                NativeLaunchContext(
-                    session_id=session_id,
-                    resource_registry=resource_registry,
-                    publish_event=_publish_event,
-                    server_client=server_client,
-                    ensure_comment_relay=_ensure_comment_relay_started,
-                ),
-                ensure_locks=_cursor_terminal_ensure_locks,
-                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
-            )
+            elif harness_name == "antigravity-native":
 
-        if harness_name == "kiro-native":
-            await _launch_native_terminal(
-                harness_name,
-                NativeLaunchContext(
-                    session_id=session_id,
-                    resource_registry=resource_registry,
-                    publish_event=_publish_event,
-                    server_client=server_client,
-                    ensure_comment_relay=_ensure_comment_relay_started,
-                ),
-                ensure_locks=_kiro_terminal_ensure_locks,
-            )
+                async def _antigravity_pre_launch(has_terminal: bool) -> PreLaunchResult:
+                    needs = (
+                        await _session_payload_for_host_spawn_check(server_client, session_id)
+                    ) is not None
+                    if not has_terminal:
+                        inbound = await _antigravity_native_terminal_arrives_via_transfer(
+                            server_client=server_client,
+                            session_id=session_id,
+                            resource_registry=resource_registry,
+                        )
+                        _logger.info(
+                            "Antigravity terminal transfer-inbound check: session=%s "
+                            "terminal_inbound=%s",
+                            session_id,
+                            inbound,
+                        )
+                        if inbound:
+                            return PreLaunchResult(skip=True)
+                    if not needs:
+                        _logger.info(
+                            "Skipping antigravity terminal auto-create for %s; session "
+                            "snapshot was not available.",
+                            session_id,
+                        )
+                    return PreLaunchResult(needs_terminal=needs)
 
-        if harness_name == "antigravity-native":
-            _antigravity_ensure_lock = _antigravity_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
-            )
-            async with _antigravity_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_antigravity_terminal = (
-                    _tr is not None and _tr.get(session_id, "antigravity", "main") is not None
+                _launch_pre = _antigravity_pre_launch
+
+            elif harness_name == "pi-native":
+                # pi resolves its spec unwrapped — a resolution error surfaces as
+                # a terminal-start error (the resolver does not swallow it).
+                _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
+            elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
+                _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
+                    session_id
                 )
-                _needs_terminal = (
-                    await _session_payload_for_host_spawn_check(server_client, session_id)
-                ) is not None
-                _antigravity_inbound = False
-                if not _has_antigravity_terminal:
-                    _antigravity_inbound = await _antigravity_native_terminal_arrives_via_transfer(
-                        server_client=server_client,
-                        session_id=session_id,
-                        resource_registry=resource_registry,
-                    )
-                    _logger.info(
-                        "Antigravity terminal transfer-inbound check: session=%s "
-                        "terminal_inbound=%s",
-                        session_id,
-                        _antigravity_inbound,
-                    )
-                if not _has_antigravity_terminal and _needs_terminal and not _antigravity_inbound:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_antigravity_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create antigravity terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Antigravity",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
-                elif _antigravity_inbound:
-                    _logger.info(
-                        "Skipping antigravity terminal auto-create for %s; a sibling "
-                        "session's terminal will transfer in (rotation target).",
-                        session_id,
-                    )
-                elif not _needs_terminal:
-                    _logger.info(
-                        "Skipping antigravity terminal auto-create for %s; session "
-                        "snapshot was not available.",
-                        session_id,
-                    )
 
-        if harness_name == "opencode-native":
-            await _launch_native_terminal(
+            _launch_result = await _launch_native_terminal(
                 harness_name,
-                NativeLaunchContext(
-                    session_id=session_id,
-                    resource_registry=resource_registry,
-                    publish_event=_publish_event,
-                    server_client=server_client,
-                    ensure_comment_relay=_ensure_comment_relay_started,
-                ),
-                ensure_locks=_opencode_terminal_ensure_locks,
-                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
+                _launch_ctx,
+                ensure_locks=_launch_locks,
+                pre_launch=_launch_pre,
+                build_context=_launch_build,
+                resolve_agent_spec=_launch_resolve_spec,
             )
-
-        if harness_name == "goose-native":
-            await _launch_native_terminal(
-                harness_name,
-                NativeLaunchContext(
-                    session_id=session_id,
-                    resource_registry=resource_registry,
-                    publish_event=_publish_event,
-                    server_client=server_client,
-                    ensure_comment_relay=_ensure_comment_relay_started,
-                ),
-                ensure_locks=_goose_terminal_ensure_locks,
-            )
-
-        if harness_name == "hermes-native":
-            await _launch_native_terminal(
-                harness_name,
-                NativeLaunchContext(
-                    session_id=session_id,
-                    resource_registry=resource_registry,
-                    publish_event=_publish_event,
-                    server_client=server_client,
-                    ensure_comment_relay=_ensure_comment_relay_started,
-                ),
-                ensure_locks=_hermes_terminal_ensure_locks,
-            )
-
-        if harness_name == "qwen-native":
-            await _launch_native_terminal(
-                harness_name,
-                NativeLaunchContext(
-                    session_id=session_id,
-                    resource_registry=resource_registry,
-                    publish_event=_publish_event,
-                    server_client=server_client,
-                    ensure_comment_relay=_ensure_comment_relay_started,
-                ),
-                ensure_locks=_qwen_terminal_ensure_locks,
-            )
-
-        if harness_name == "kimi-native":
-            await _launch_native_terminal(
-                harness_name,
-                NativeLaunchContext(
-                    session_id=session_id,
-                    resource_registry=resource_registry,
-                    publish_event=_publish_event,
-                    server_client=server_client,
-                    ensure_comment_relay=_ensure_comment_relay_started,
-                ),
-                ensure_locks=_kimi_terminal_ensure_locks,
-                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
-            )
+            # Only claude reported terminal_ready in the create-session response.
+            if harness_name == "claude-native":
+                terminal_ready = _launch_result
 
         if (
             spec is not None
@@ -5934,42 +5790,32 @@ def create_runner_app(
             _version_cache[conv_id] = agent_version
 
         if harness_name == "opencode-native":
-            _oc_lock = _opencode_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
-            async with _oc_lock:
-                _oc_tr = resource_registry.terminal_registry
-                _oc_ready = (
-                    _oc_tr is not None and _oc_tr.get(conv_id, "opencode", "main") is not None
+            # Turn-path cold-boot: ensure the terminal exists before the turn.
+            # A launch failure here aborts the turn with a 503 (reraise=True),
+            # unlike the create-session arms that publish a start-error event.
+            try:
+                await _launch_native_terminal(
+                    harness_name,
+                    NativeLaunchContext(
+                        session_id=conv_id,
+                        resource_registry=resource_registry,
+                        publish_event=_publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    ),
+                    ensure_locks=_opencode_terminal_ensure_locks,
+                    resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
+                    reraise=True,
                 )
-                if not _oc_ready:
-                    _publish_terminal_pending(_publish_event, conv_id, True)
-                    try:
-                        try:
-                            _oc_spec = await _resolve_session_agent_spec(conv_id)
-                        except OmnigentError:
-                            _oc_spec = None
-                        await _auto_create_opencode_terminal(
-                            conv_id,
-                            resource_registry,
-                            _publish_event,
-                            agent_spec=_oc_spec,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "opencode-native cold-boot ensure failed for %s", conv_id
-                        )
-                        return JSONResponse(
-                            status_code=503,
-                            content={
-                                "error": "opencode_native_boot_failed",
-                                "detail": _client_safe_error_detail(
-                                    exc, context="opencode-native boot"
-                                ),
-                            },
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, conv_id, False)
+            except Exception as exc:
+                _logger.exception("opencode-native cold-boot ensure failed for %s", conv_id)
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "opencode_native_boot_failed",
+                        "detail": _client_safe_error_detail(exc, context="opencode-native boot"),
+                    },
+                )
 
         try:
             client = await process_manager.get_client(conv_id, harness_name, env=spawn_env)
@@ -7065,41 +6911,58 @@ def create_runner_app(
                 },
             )
 
+        _ensure_agent = native_coding_agent_for_terminal_name(terminal_name)
         if (
             body.get("ensure_native_terminal")
-            and terminal_name == "claude"
+            and _ensure_agent is not None
             and session_key == "main"
+            # antigravity's ensure arm declined to auto-create when the request
+            # carried a spec (the CLI-wrapper launch path owns that case).
+            and not (terminal_name == "antigravity" and body.get("spec"))
         ):
-            claude_terminal_id = terminal_resource_id("claude", "main")
-            _ensure_lock = _claude_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, claude_terminal_id
-                )
-                if existing is not None:
-                    _logger.info(
-                        "Claude terminal ensure returning existing resource: session=%s "
-                        "terminal_id=%s",
-                        session_id,
-                        claude_terminal_id,
-                    )
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
-                    )
-                _logger.info(
-                    "Claude terminal ensure auto-creating missing resource: session=%s "
-                    "terminal_id=%s",
-                    session_id,
-                    claude_terminal_id,
-                )
-                try:
+            # Each native harness contributes only the ensure hooks that differ
+            # from the uniform base; a single _ensure_native_terminal call runs
+            # them. The 4 uniform harnesses (goose/kiro/hermes/qwen) need only the
+            # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
+            # via build_context; codex/antigravity add an ownership check (and
+            # codex a one-shot policy-notice response wrap).
+            _ensure_locks = {
+                "claude": _claude_terminal_ensure_locks,
+                "codex": _codex_terminal_ensure_locks,
+                "pi": _pi_terminal_ensure_locks,
+                "cursor": _cursor_terminal_ensure_locks,
+                "kiro": _kiro_terminal_ensure_locks,
+                "antigravity": _antigravity_terminal_ensure_locks,
+                "opencode": _opencode_terminal_ensure_locks,
+                "goose": _goose_terminal_ensure_locks,
+                "hermes": _hermes_terminal_ensure_locks,
+                "qwen": _qwen_terminal_ensure_locks,
+                "kimi": _kimi_terminal_ensure_locks,
+            }[_ensure_agent.key]
+            _ensure_ctx = NativeLaunchContext(
+                session_id=session_id,
+                resource_registry=resource_registry,
+                publish_event=_publish_event,
+                server_client=server_client,
+                ensure_comment_relay=_ensure_comment_relay_started,
+            )
+            _ensure_build: (
+                Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
+            ) = None
+            _ensure_is_owned: (
+                Callable[[SessionResourceRegistry, SessionResourceView], bool] | None
+            ) = None
+            _ensure_finalize: Callable[[SessionResourceView], JSONResponse] | None = None
+            _ensure_conflict: str | None = None
+
+            if terminal_name == "claude":
+
+                async def _claude_ensure_build(
+                    ctx: NativeLaunchContext,
+                ) -> NativeLaunchContext:
                     claude_agent_spec = await _resolve_session_agent_spec(session_id)
-                    terminal_view = await _auto_create_claude_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
+                    return dataclasses.replace(
+                        ctx,
                         agent_spec=claude_agent_spec,
                         auth_token_factory=auth_token_factory,
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
@@ -7107,413 +6970,69 @@ def create_runner_app(
                         ),
                         record_launch_config=_session_claude_launch_configs.__setitem__,
                     )
-                except Exception as exc:
-                    _logger.exception(
-                        "Claude terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Claude")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
-            )
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "codex"
-            and session_key == "main"
-        ):
-            codex_terminal_id = terminal_resource_id("codex", "main")
-            ensure_lock = _codex_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, codex_terminal_id
-                )
-                if existing is not None:
-                    if _is_runner_owned_codex_terminal(resource_registry, existing):
-                        return _codex_ensure_response_with_policy_notice(session_id, existing)
-                    _logger.info(
-                        "Replacing non-native codex terminal %s for session %s",
-                        codex_terminal_id,
-                        session_id,
-                    )
-                    closed = await resource_registry.close_terminal(session_id, codex_terminal_id)
-                    if not closed:
-                        return JSONResponse(
-                            status_code=409,
-                            content={
-                                "error": {
-                                    "code": "terminal_conflict",
-                                    "message": (
-                                        "Existing codex terminal is not a runner-owned "
-                                        "Codex TUI and could not be closed."
-                                    ),
-                                }
-                            },
-                        )
-                try:
+
+                _ensure_build = _claude_ensure_build
+
+            elif terminal_name == "codex":
+
+                async def _codex_ensure_build(
+                    ctx: NativeLaunchContext,
+                ) -> NativeLaunchContext:
                     codex_agent_spec = await _resolve_session_agent_spec(session_id)
-                    terminal_view = await _auto_create_codex_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        agent_spec=codex_agent_spec,
-                        server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "Codex terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Codex")
-                return _codex_ensure_response_with_policy_notice(session_id, terminal_view)
+                    return dataclasses.replace(ctx, agent_spec=codex_agent_spec)
 
-        if body.get("ensure_native_terminal") and terminal_name == "pi" and session_key == "main":
-            pi_terminal_id = terminal_resource_id("pi", "main")
-            ensure_lock = _pi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, pi_terminal_id
+                _ensure_build = _codex_ensure_build
+                _ensure_is_owned = _is_runner_owned_codex_terminal
+                _ensure_finalize = lambda view: _codex_ensure_response_with_policy_notice(  # noqa: E731
+                    session_id, view
                 )
-                if existing is not None:
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
+                _ensure_conflict = (
+                    "Existing codex terminal is not a runner-owned Codex TUI "
+                    "and could not be closed."
+                )
+
+            elif terminal_name == "antigravity":
+                _ensure_is_owned = _is_runner_owned_antigravity_terminal
+                _ensure_conflict = (
+                    "Existing antigravity terminal is not a runner-owned agy TUI "
+                    "and could not be closed."
+                )
+
+            elif terminal_name in ("pi", "opencode"):
+                # pi/opencode resolve the spec unwrapped — a resolution error
+                # surfaces as a terminal-start error (the resolver does not
+                # swallow it).
+                async def _spec_ensure_build(
+                    ctx: NativeLaunchContext,
+                ) -> NativeLaunchContext:
+                    return dataclasses.replace(
+                        ctx, agent_spec=await _resolve_session_agent_spec(session_id)
                     )
-                try:
-                    _pi_ensure_spec = await _resolve_session_agent_spec(session_id)
-                    terminal_view = await _auto_create_pi_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                        agent_spec=_pi_ensure_spec,
-                        ensure_comment_relay=_ensure_comment_relay_started,
+
+                _ensure_build = _spec_ensure_build
+
+            elif terminal_name in ("cursor", "kimi"):
+
+                async def _spec_or_none_ensure_build(
+                    ctx: NativeLaunchContext,
+                ) -> NativeLaunchContext:
+                    return dataclasses.replace(
+                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
                     )
-                except Exception as exc:
-                    _logger.exception(
-                        "Pi terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Pi")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
+
+                _ensure_build = _spec_or_none_ensure_build
+
+            _ensure_result = await _ensure_native_terminal(
+                terminal_name,
+                _ensure_ctx,
+                ensure_locks=_ensure_locks,
+                build_context=_ensure_build,
+                is_owned=_ensure_is_owned,
+                conflict_message=_ensure_conflict,
+                finalize=_ensure_finalize,
             )
-
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "opencode"
-            and session_key == "main"
-        ):
-            opencode_terminal_id = terminal_resource_id("opencode", "main")
-            ensure_lock = _opencode_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, opencode_terminal_id
-                )
-                if existing is not None:
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
-                    )
-                try:
-                    opencode_agent_spec = await _resolve_session_agent_spec(session_id)
-                    terminal_view = await _auto_create_opencode_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        agent_spec=opencode_agent_spec,
-                        server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "OpenCode terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "OpenCode")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
-            )
-
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "cursor"
-            and session_key == "main"
-        ):
-            cursor_terminal_id = terminal_resource_id("cursor", "main")
-            ensure_lock = _cursor_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, cursor_terminal_id
-                )
-                if existing is not None:
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
-                    )
-                try:
-                    try:
-                        cursor_agent_spec = await _resolve_session_agent_spec(session_id)
-                    except OmnigentError:
-                        cursor_agent_spec = None
-                    terminal_view = await _auto_create_cursor_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
-                        agent_spec=cursor_agent_spec,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "Cursor terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Cursor")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
-            )
-
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "goose"
-            and session_key == "main"
-        ):
-            goose_terminal_id = terminal_resource_id("goose", "main")
-            ensure_lock = _goose_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, goose_terminal_id
-                )
-                if existing is not None:
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
-                    )
-                try:
-                    terminal_view = await _auto_create_goose_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "Goose terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Goose")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
-            )
-
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "kiro"
-            and session_key == "main"
-        ):
-            kiro_terminal_id = terminal_resource_id("kiro", "main")
-            ensure_lock = _kiro_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, kiro_terminal_id
-                )
-                if existing is not None:
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
-                    )
-                try:
-                    terminal_view = await _auto_create_kiro_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "Kiro terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Kiro")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
-            )
-
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "hermes"
-            and session_key == "main"
-        ):
-            hermes_terminal_id = terminal_resource_id("hermes", "main")
-            ensure_lock = _hermes_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, hermes_terminal_id
-                )
-                if existing is not None:
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
-                    )
-                try:
-                    terminal_view = await _auto_create_hermes_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "Hermes terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Hermes")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
-            )
-
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "antigravity"
-            and session_key == "main"
-            and not body.get("spec")
-        ):
-            antigravity_terminal_id = terminal_resource_id("antigravity", "main")
-            ensure_lock = _antigravity_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, antigravity_terminal_id
-                )
-                if existing is not None:
-                    if _is_runner_owned_antigravity_terminal(resource_registry, existing):
-                        return JSONResponse(
-                            status_code=200,
-                            content=session_resource_view_to_dict(existing),
-                        )
-                    _logger.info(
-                        "Replacing non-native antigravity terminal %s for session %s",
-                        antigravity_terminal_id,
-                        session_id,
-                    )
-                    closed = await resource_registry.close_terminal(
-                        session_id, antigravity_terminal_id
-                    )
-                    if not closed:
-                        return JSONResponse(
-                            status_code=409,
-                            content={
-                                "error": {
-                                    "code": "terminal_conflict",
-                                    "message": (
-                                        "Existing antigravity terminal is not a "
-                                        "runner-owned agy TUI and could not be closed."
-                                    ),
-                                }
-                            },
-                        )
-                try:
-                    terminal_view = await _auto_create_antigravity_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "Antigravity terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Antigravity")
-                return JSONResponse(
-                    status_code=200,
-                    content=session_resource_view_to_dict(terminal_view),
-                )
-
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "qwen"
-            and session_key == "main"
-        ):
-            qwen_terminal_id = terminal_resource_id("qwen", "main")
-            ensure_lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, qwen_terminal_id
-                )
-                if existing is not None:
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
-                    )
-                try:
-                    terminal_view = await _auto_create_qwen_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "qwen terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "qwen")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
-            )
-
-        if (
-            body.get("ensure_native_terminal")
-            and terminal_name == "kimi"
-            and session_key == "main"
-        ):
-            kimi_terminal_id = terminal_resource_id("kimi", "main")
-            ensure_lock = _kimi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with ensure_lock:
-                existing = await resource_registry.get_terminal_resource(
-                    session_id, kimi_terminal_id
-                )
-                if existing is not None:
-                    return JSONResponse(
-                        status_code=200,
-                        content=session_resource_view_to_dict(existing),
-                    )
-                try:
-                    try:
-                        kimi_agent_spec = await _resolve_session_agent_spec(session_id)
-                    except OmnigentError:
-                        kimi_agent_spec = None
-                    terminal_view = await _auto_create_kimi_terminal(
-                        session_id,
-                        resource_registry,
-                        _publish_event,
-                        server_client=server_client,
-                        ensure_comment_relay=_ensure_comment_relay_started,
-                        agent_spec=kimi_agent_spec,
-                    )
-                except Exception as exc:
-                    _logger.exception(
-                        "Kimi terminal ensure failed for session=%s",
-                        session_id,
-                    )
-                    return _native_terminal_start_error_response(exc, "Kimi")
-            return JSONResponse(
-                status_code=200,
-                content=session_resource_view_to_dict(terminal_view),
-            )
+            if _ensure_result is not None:
+                return _ensure_result
 
         from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 

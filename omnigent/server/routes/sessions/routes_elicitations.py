@@ -25,7 +25,6 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
-    LEVEL_OWNER,
     AuthProvider,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -33,6 +32,9 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_approval_access as _require_approval_access,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import *
@@ -92,7 +94,7 @@ def register_elicitations_routes(
         The ``elicitation_id`` is taken from the URL rather than the
         body, so the unguessable id (``secrets.token_hex(16)``) is
         the capability scoping the resolution — combined with the
-        session-owner ``LEVEL_OWNER`` gate below and the server-side
+        delegated approval gate below and the server-side
         ownership check inside :func:`_resolve_elicitation`.
 
         :param request: The inbound request, used for identity
@@ -110,14 +112,27 @@ def register_elicitations_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        if body.action == "accept":
+            await _require_approval_access(
+                user_id, session_id, permission_store, conversation_store
+            )
+        else:
+            await _require_access_and_level(
+                user_id,
+                session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+            )
+        _logger.info(
+            "approval verdict submitted: session=%s actor=%s action=%s",
+            session_id,
+            user_id,
+            body.action,
         )
-        conv = access.conversation
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
+            raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate
@@ -176,6 +191,7 @@ def register_elicitations_routes(
         params = event.get("params") if isinstance(event.get("params"), dict) else {}
         return {
             "status": "pending",
+            "can_approve": access.can_approve,
             "message": params.get("message", "Approval required"),
             "phase": params.get("phase", ""),
             "policy_name": params.get("policy_name", ""),

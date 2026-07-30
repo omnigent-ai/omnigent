@@ -130,10 +130,6 @@ import type { RightRailTab } from "./railTabs";
  * more than one agent (the root has at least one child).
  */
 export function AppShell() {
-  // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
-  // here so it works on every chat route, regardless of where focus sits.
-  useApproveHotkey();
-
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
@@ -334,6 +330,10 @@ export function AppShell() {
     conversationId,
     conversationsData !== undefined,
   );
+  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
+  // Cmd/Ctrl+Enter accepts the pending prompt only when this viewer has
+  // owner or delegated approval authority.
+  useApproveHotkey(canApprove);
   // Labels can come from the sidebar row (``activeConv``) for top-level
   // sessions OR the per-session snapshot (``activeSession``) for ALL
   // sessions including children. The sidebar list omits child (sub-agent)
@@ -727,7 +727,7 @@ export function AppShell() {
     // (no ?view=, no persisted tab, no file to surface). In that case we leave
     // ``rightRailTab`` untouched so the tab-fallback effect can still land on
     // the first *available* tab — forcing "files" here would shadow it.
-    let nextTab: RightRailTab | null = null;
+    let nextTab: RightRailTab | null;
     if (viewParam === "changed") {
       setFilesPanelFlatView(true);
       nextTab = "files";
@@ -1487,6 +1487,7 @@ export function AppShell() {
               sessionId={conversationId}
               open={shareOpen}
               onOpenChange={setShareOpen}
+              canDelegateApprovals={isOwnerLevel(permissionLevel)}
             />
           )}
           {conversationId && (

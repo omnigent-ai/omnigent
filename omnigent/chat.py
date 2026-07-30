@@ -57,6 +57,8 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
+from omnigent.model_catalog import resolve_catalog_model
+from omnigent.model_resolver import ModelResolutionError
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
@@ -103,15 +105,6 @@ _SERVER_READY_FAST_POLL_WINDOW_SECONDS = 1.0
 # leaving zombie codex/claude processes.
 _REMOTE_RUNNER_STOP_GRACE_SECONDS = 8.0
 
-# Fallback model when the YAML declares neither ``executor.model``
-# nor ``executor.harness`` AND no ``--model`` / ``--harness``
-# override is supplied. Mirrors the legacy argparse CLI's
-# ``_DEFAULT_AD_HOC_MODEL`` so ``omnigent run examples/hello_world.yaml``
-# (a spec with no executor block) launches cleanly instead of
-# failing the strict omnigent validator with a cryptic
-# "executor.config.harness: required" error.
-_DEFAULT_AD_HOC_MODEL = "databricks-gpt-5-4"
-
 # How many of the NEWEST transcript items ``_persisted_turn_text``
 # fetches when reconciling a headless ``-p`` turn against the durable
 # store. The current turn's items are always the newest, and no single
@@ -146,20 +139,23 @@ def _default_cli_model() -> str:
     """
     Return the model used when neither YAML nor CLI flag picks one.
 
-    Reads ``OMNIGENT_MODEL`` from the environment with
-    :data:`_DEFAULT_AD_HOC_MODEL` as the final fallback. The read
-    happens at YAML-materialization time so the resolved model
-    gets baked into the bundle's executor block — the materialized
-    spec is self-contained and independent of any later env state.
+    Reads ``OMNIGENT_MODEL`` first, then resolves the Databricks OpenAI-family
+    default from the provider catalog. Resolution happens during materialization
+    so the bundle remains self-contained on its eventual runner.
 
-    Mirrors :func:`omnigent.inner.cli._default_cli_model` so
-    legacy and Omnigent paths agree on the env-var contract.
-
-    :returns: The default model identifier, e.g.
-        ``"databricks-gpt-5-4"`` or whatever the user pinned in
-        ``OMNIGENT_MODEL``.
+    :returns: The explicit environment model or discovered catalog default.
+    :raises click.ClickException: If no explicit or catalog model is available.
     """
-    return os.environ.get(_OMNIGENT_MODEL_ENV_VAR, _DEFAULT_AD_HOC_MODEL)
+    configured = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
+    if configured is not None:
+        return configured
+    try:
+        return resolve_catalog_model("databricks", family="openai").model_id
+    except ModelResolutionError as exc:
+        raise click.ClickException(
+            "No default model is available for this ad-hoc agent. Pass --model, "
+            "set OMNIGENT_MODEL, or retry when Databricks catalog discovery is available."
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -2671,8 +2667,8 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
     Also materializes when the spec is a single-file YAML with no
     ``executor.harness`` AND no ``executor.model`` — the strict
     omnigent validator rejects that shape, and the legacy
-    argparse CLI used to paper over it by injecting
-    :data:`_DEFAULT_AD_HOC_MODEL`. This preserves that behavior so
+    argparse CLI used to paper over it by injecting a model. This preserves
+    that behavior through catalog resolution so
     ``omnigent run examples/hello_world.yaml`` (minimal spec) still
     launches cleanly.
 
@@ -2801,9 +2797,8 @@ def _spec_declares_harness_or_model(raw: _YamlMapping) -> bool:
     Recognizes the harness in either shape: a flat ``executor.harness``
     or the bundle-style nested ``executor.config.harness`` (e.g.
     ``examples/polly``). Without the nested check, an unpinned bundle
-    that declares its harness only under ``config`` would look
-    harness-less and get force-fed :data:`_DEFAULT_AD_HOC_MODEL` — a
-    GPT endpoint the claude-sdk harness can't speak.
+    that declares its harness only under ``config`` would look harness-less
+    and get paired with an unrelated model family.
 
     :param raw: Parsed top-level YAML mapping.
     :returns: True if ``executor.harness``, ``executor.model``, or
@@ -3020,12 +3015,7 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     # the Databricks FM API rejects for Claude-typed entities.
     # Uses ``_spec_declares_harness_or_model`` — must agree with the
     # ``needs_fallback`` gate in :func:`_materialize_override_bundle`.
-    # Uses ``_default_cli_model`` (env-var-aware) instead of
-    # ``_DEFAULT_AD_HOC_MODEL`` directly so ``OMNIGENT_MODEL=foo``
-    # is honored on the ``omnigent/cli.py`` → ``run_chat`` direct
-    # path. Without this, that env var was silently dropped on the
-    # Omnigent path invoked through the ``omnigent`` console
-    # script (see ``designs/RUN_OMNIGENT_REPL_PARITY.md``).
+    # Resolve once before bundling so the runner receives a self-contained spec.
     if not _spec_declares_harness_or_model(raw):
         executor_block["model"] = _default_cli_model()
     _inject_openai_env_auth_if_needed(raw)

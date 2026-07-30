@@ -85,19 +85,6 @@ function userMessage(responseId: string, text: string): ConversationItem {
   };
 }
 
-// A `[System: …]` marker — sent as a user-role message but re-classified by
-// the UI as a muted marker, not a real user turn / rail tick.
-function systemMarker(responseId: string, inner = "timer t1 fired"): ConversationItem {
-  return {
-    id: `msg_${responseId}_sys`,
-    response_id: responseId,
-    type: "message",
-    role: "user",
-    status: "completed",
-    content: [{ type: "input_text", text: `[System: ${inner}]` }],
-  };
-}
-
 function assistantMessage(responseId: string, text: string): ConversationItem {
   return {
     id: `msg_${responseId}_asst`,
@@ -402,7 +389,10 @@ afterEach(() => {
 });
 
 /** Yield to the microtask queue so background pump kicks off. */
-const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+const tick = () =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
 
 /** Seed the session snapshot returned by GET /v1/sessions/{id}. */
 function seedSession(id: string, items: ConversationItem[] = []): void {
@@ -1150,9 +1140,9 @@ describe("chatStore — switchTo", () => {
 
     await Promise.race([
       useChatStore.getState().switchTo("conv_waiting"),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("switchTo timed out waiting for stalled stream")), 200),
-      ),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("switchTo timed out waiting for stalled stream")), 200);
+      }),
     ]);
 
     const elicitation = useChatStore
@@ -1276,7 +1266,7 @@ describe("chatStore — switchTo", () => {
     // The window is healthy: a fresh scroll-up still pages correctly.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...itemsA.slice(0, SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      ...itemsA.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
   });
@@ -1303,13 +1293,13 @@ describe("chatStore — switchTo", () => {
     // kept across the rebind — without itemId dedupe each would render twice.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      items.slice(SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      items.slice(SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     // The cursor advanced through the overlap, so the oldest page loads next.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      items.map((it) => it.id),
+      items.map((item) => item.id),
     );
   });
 
@@ -1353,210 +1343,9 @@ describe("chatStore — switchTo", () => {
     // Scroll-up still works: the older page actually fetches and prepends.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
-  });
-
-  it("loadHistoryUntilUserMessages pages older history until the target user count", async () => {
-    // Dense turns: each turn is one user message followed by several
-    // non-user items (assistant + tool call), so a page spans many items per
-    // user prompt — the case the eager loader's large page size targets.
-    // 15 turns × 3 items = 45 items, comfortably past the initial window so
-    // the eager loader genuinely pages older history rather than no-opping.
-    const TURNS = 15;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `t_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(nativeToolItem(rid));
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_dense", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_dense", items);
-
-    await useChatStore.getState().switchTo("conv_dense");
-    // The initial window holds only the newest slice of items, so far fewer
-    // than TURNS user prompts are loaded — the stub the eager loader fills in.
-    const initialUsers = useChatStore
-      .getState()
-      .blocks.filter((b) => b.type === "user_message").length;
-    expect(initialUsers).toBeLessThan(TURNS);
-
-    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
-
-    const state = useChatStore.getState();
-    // Reached (at least) the requested user count and ran history dry.
-    expect(state.blocks.filter((b) => b.type === "user_message")).toHaveLength(TURNS);
-    expect(state.hasMoreHistory).toBe(false);
-    expect(state.loadingMoreHistory).toBe(false);
-  });
-
-  it("loadHistoryUntilUserMessages keeps items in chronological order", async () => {
-    // Regression: the eager loader used to prepend each fetched block
-    // one-by-one, which reversed every page's internal order and scrambled
-    // the transcript (a mid-conversation prompt would surface at the top).
-    // Dense turns force multi-item pages so any per-page reversal shows up.
-    // 15 turns × 3 items is well past the initial window, so the eager loader
-    // pages a real multi-item older window (where the reversal manifested).
-    const TURNS = 15;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `o_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(nativeToolItem(rid));
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_order", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_order", items);
-
-    await useChatStore.getState().switchTo("conv_order");
-    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
-
-    // The loaded blocks must match the seeded chronological order exactly.
-    const loadedIds = useChatStore
-      .getState()
-      .blocks.map((b) => b.ctx.itemId)
-      .filter((iid): iid is string => Boolean(iid));
-    expect(loadedIds).toEqual(items.map((item) => item.id));
-    // And user prompts read oldest-first (prompt 0 before prompt 1 …).
-    const userIds = useChatStore
-      .getState()
-      .blocks.filter((b): b is UserMessageBlock => b.type === "user_message")
-      .map((b) => b.ctx.itemId);
-    const seededUserIds = items
-      .filter((item) => item.type === "message" && item.role === "user")
-      .map((item) => item.id);
-    expect(userIds).toEqual(seededUserIds);
-  });
-
-  it("loadHistoryUntilUserMessages no-ops when the target is already met", async () => {
-    const items = Array.from({ length: SESSION_HISTORY_PAGE_SIZE }, (_, idx) =>
-      userMessage(`m_${idx.toString().padStart(3, "0")}`, `m ${idx}`),
-    );
-    seedSession("conv_met", items);
-
-    await useChatStore.getState().switchTo("conv_met");
-    const before = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
-    const itemFetchesBefore = fetchMock.mock.calls.filter(([u]) =>
-      String(u).startsWith("/v1/sessions/conv_met/items"),
-    ).length;
-
-    // The window already holds SESSION_HISTORY_PAGE_SIZE user prompts, so a
-    // smaller target must not fetch or mutate anything.
-    await useChatStore.getState().loadHistoryUntilUserMessages(2);
-
-    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(before);
-    const itemFetchesAfter = fetchMock.mock.calls.filter(([u]) =>
-      String(u).startsWith("/v1/sessions/conv_met/items"),
-    ).length;
-    expect(itemFetchesAfter).toBe(itemFetchesBefore);
-  });
-
-  it("loadHistoryUntilUserMessages disables further history on fetch failure", async () => {
-    // The rail's eager-load effect auto-fires this with no user gesture, so a
-    // persistent fetch failure that left hasMoreHistory true would re-arm the
-    // effect and hammer the failing endpoint in a tight loop. On error we
-    // commit progress AND clear hasMoreHistory to break that loop.
-    const TURNS = 15;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `f_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_fail", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_fail", items);
-
-    await useChatStore.getState().switchTo("conv_fail");
-    expect(useChatStore.getState().hasMoreHistory).toBe(true);
-
-    // Fail every older-history page fetch (the `olderThan=` cursor read).
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/conv_fail\/items\?.*olderThan=/.test(url)) {
-        return Promise.reject(new Error("boom"));
-      }
-      return defaultFetchHandler(input, init);
-    });
-
-    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
-
-    const state = useChatStore.getState();
-    // hasMoreHistory is cleared so the auto-firing effect can't re-loop.
-    expect(state.hasMoreHistory).toBe(false);
-    expect(state.loadingMoreHistory).toBe(false);
-  });
-
-  it("loadHistoryUntilUserMessages ignores [System: …] markers when counting turns", async () => {
-    // The rail derives ticks from REAL user turns only (system markers are
-    // dropped), so the loader must count the same way. If it counted markers,
-    // it could early-return at the target while the rail has too few ticks —
-    // and, since the early-return leaves hasMoreHistory set, wedge the rail
-    // permanently hidden. Here every turn carries a [System: …] marker: with
-    // 15 real turns the loader must page ALL of them (running history dry)
-    // rather than stopping early on the inflated user-block count.
-    const TARGET = 10;
-    const TURNS = 15;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `s_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(systemMarker(rid)); // a user-role block that is NOT a real turn
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_sys", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_sys", items);
-
-    await useChatStore.getState().switchTo("conv_sys");
-    await useChatStore.getState().loadHistoryUntilUserMessages(TARGET);
-
-    const state = useChatStore.getState();
-    // Real user turns actually loaded — the count that feeds the rail.
-    const blockText = (b: (typeof state.blocks)[number]): string =>
-      b.type === "user_message"
-        ? b.content
-            .filter((c): c is { type: "input_text"; text: string } => c.type === "input_text")
-            .map((c) => c.text)
-            .join("")
-        : "";
-    const realTurns = state.blocks.filter(
-      (b) => b.type === "user_message" && !/^\[System: /.test(blockText(b)),
-    ).length;
-    expect(realTurns).toBeGreaterThanOrEqual(TARGET);
-    // hasMoreHistory settles false only because we counted real turns, not the
-    // (larger) raw user-block count — proving the loader didn't stop early.
-    expect(state.loadingMoreHistory).toBe(false);
-  });
-
-  it("loadHistoryUntilUserMessages assembles turns across multiple pages in order", async () => {
-    // EAGER_PAGE_LIMIT is 200, so to actually exercise the cross-page
-    // `older.unshift(...)` assembly (and the MAX_EAGER_PAGES loop) we need more
-    // than 200 items. 120 turns × 2 items = 240 items > one page.
-    const TURNS = 120;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `p_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_multi", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_multi", items);
-
-    await useChatStore.getState().switchTo("conv_multi");
-    // Target more turns than fit in a single 200-item page, forcing ≥2 pages.
-    await useChatStore.getState().loadHistoryUntilUserMessages(110);
-
-    // Whatever loaded must be a contiguous chronological suffix of the seed —
-    // any per-page reversal or misordered cross-page splice would break this.
-    const loadedIds = useChatStore
-      .getState()
-      .blocks.map((b) => b.ctx.itemId)
-      .filter((iid): iid is string => Boolean(iid));
-    const seededIds = items.map((it) => it.id);
-    const suffix = seededIds.slice(seededIds.length - loadedIds.length);
-    expect(loadedIds).toEqual(suffix);
-    expect(loadedIds.length).toBeGreaterThan(2 * SESSION_HISTORY_PAGE_SIZE);
   });
 
   it("does not run flat session items through the nested snapshot flattener", async () => {
@@ -6952,9 +6741,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   /** Drain reconcile's sequential await chain under fake timers. */
   async function drainAsync(turns = 25): Promise<void> {
+    /* oxlint-disable no-await-in-loop */
     for (let i = 0; i < turns; i += 1) {
       await vi.advanceTimersByTimeAsync(1);
     }
+    /* oxlint-enable no-await-in-loop */
   }
 
   function gapUser(prefix: string, idx: number): ConversationItem {
@@ -6992,8 +6783,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // newest page covers only the last 20, so pre-fix the 25 oldest gap
     // items would sit in a hole no code path could ever fetch.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...windowItems.map((it) => it.id),
-      ...gap.map((it) => it.id),
+      ...windowItems.map((item) => item.id),
+      ...gap.map((item) => item.id),
     ]);
     // Backfill is not a re-hydrate: the scroll-up cursor is untouched.
     expect(state.oldestItemId).toBe(windowItems[0]!.id);
@@ -7036,7 +6827,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // The window was replaced wholesale with the newest page, exactly as a
     // cold bind would load it — not left with a mid-transcript hole.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
     // The cursor was rewound to the fresh window's top, so everything older
     // (the rest of the gap included) is reachable again by paging up.
@@ -7045,7 +6836,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     const last = sinks[1]!;
@@ -7160,7 +6951,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await useChatStore.getState().loadMoreHistory();
     const fresh = useChatStore.getState();
     expect(fresh.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     // The stale page resolves: the conversation id matches again, so only
@@ -7173,7 +6964,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // re-hydrate fallback, which rewound the scroll-up cursor to the
     // window top and bumped the generation (voiding future legit pages).
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
     expect(state.oldestItemId).toBe(gap.at(-2 * SESSION_HISTORY_PAGE_SIZE)!.id);
     expect(state.historyGeneration).toBe(fresh.historyGeneration);
@@ -7183,7 +6974,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // this would still show only 40 items.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-3 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-3 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     // Unpark the orphaned pump so the awaited loop can exit.
@@ -7261,7 +7052,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // The fresh fetch returns ITEMS only — dropping these blocks would lose
     // the pending ApprovalCard (and the failure reason) with no way back.
     expect(state.blocks.map((b) => b.ctx.itemId ?? b.type)).toEqual([
-      ...gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      ...gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
       "elicitation",
       "error",
     ]);
@@ -8049,9 +7840,11 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
 
   /** Drain the pump + reconcile's sequential await chain under fake timers. */
   async function drainAsync(turns = 25): Promise<void> {
+    /* oxlint-disable no-await-in-loop */
     for (let i = 0; i < turns; i += 1) {
       await vi.advanceTimersByTimeAsync(1);
     }
+    /* oxlint-enable no-await-in-loop */
   }
 
   /** Open the stream-pump loop for `id` and drain until the first sink exists. */

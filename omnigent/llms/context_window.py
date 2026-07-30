@@ -1,120 +1,42 @@
 """
 Context window resolution for LLM models.
 
-Provides :func:`get_model_context_window` which resolves a model's
-context window size via multiple backends (env var override, litellm
-registry, MLflow GitHub Release catalog) with a conservative 128K
-fallback.
+Provides :func:`get_model_context_window` which resolves a model's context
+window from the shared MLflow catalog, then optional local metadata, with a
+conservative 128K fallback.
 """
 
 from __future__ import annotations
 
 import os
-import threading
 from dataclasses import dataclass
 from typing import Any
 
-import cachetools
-
-_MLFLOW_CATALOG_URL = (
-    "https://github.com/mlflow/mlflow/releases/download/model-catalog%2Flatest/{provider}.json"
-)
-
-# Process-level cache of the per-provider MLflow catalog. The catalog is
-# a remote GitHub release asset that changes at most a few times a day,
-# but the response builder for ``GET /v1/sessions/{id}`` calls
-# ``get_model_context_window`` on every snapshot — without this cache,
-# every conversation load for a provider-prefixed model (claude-*, gpt-*,
-# databricks-*, …) paid a ~490ms uncached ``urlopen`` to GitHub. A 1-hour
-# TTL keeps it fresh enough while collapsing that to one fetch per
-# provider per hour. ``maxsize`` comfortably exceeds the provider count.
-# Guarded by a lock because the fetch runs under ``asyncio.to_thread``,
-# so concurrent requests can race the same key.
-_CATALOG_TTL_SECONDS = 3600
-_catalog_cache: cachetools.TTLCache[str, dict[str, object] | None] = cachetools.TTLCache(
-    maxsize=32, ttl=_CATALOG_TTL_SECONDS
-)
-_catalog_cache_lock = threading.Lock()
-# Sentinel distinguishing "absent from cache" from a cached ``None``
-# (a cached fetch failure). ``object()`` is unique so it can never
-# collide with a real catalog value.
-_CATALOG_MISS = object()
-
-_MODEL_PREFIX_TO_PROVIDER: dict[str, str] = {
-    "databricks-": "databricks",
-    "gpt-": "openai",
-    "o1-": "openai",
-    "o3-": "openai",
-    "o4-": "openai",
-    "claude-": "anthropic",
-    "gemini-": "google",
-    "llama-": "meta",
-    "mistral-": "mistral",
-}
+from omnigent.onboarding.providers import ModelInfo, find_catalog_models
 
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
-# Omnigent's authoritative context-window registry, consulted BEFORE litellm
-# and the MLflow catalog (see :func:`get_model_context_window`). The upstream
-# backends mis-size or omit several ids we actually serve, and offline both
-# collapse to the conservative 128K default — so for those models this registry
-# is our single source of truth, not a last-resort fallback. Keyed by the
-# *normalized* base id (provider prefix and OpenRouter ``:tag`` suffix stripped,
-# lowercased; the ``[1m]`` beta marker is PRESERVED so the 1M variant stays
-# distinct from its base — see :func:`_registry_context_window`). A spec's
-# ``executor.context_window`` still overrides everything.
-#
-# Covered today:
-#  - Qwen models (absent from litellm + the MLflow catalog) — published Alibaba
-#    Cloud Model Studio / DashScope maxima.
-#  - Anthropic 1M-context beta ids (the ``[1m]`` suffix) — handled by a rule in
-#    :func:`_registry_context_window` rather than enumerated per base model.
-_CONTEXT_WINDOW_REGISTRY: dict[str, int] = {
-    "qwen3-coder-plus": 1_048_576,  # DashScope coding-plan default: 1M tokens
-    "qwen3-coder-flash": 1_048_576,  # served flash variant: 1M tokens
-    "qwen3-coder": 262_144,  # 480B open weights: 256K native (1M w/ YaRN)
-    "qwen-plus": 131_072,
-    "qwen-max": 131_072,
-    "qwen-turbo": 1_008_192,
-    "qwen-flash": 1_000_000,
-}
-
-# The Anthropic 1M-context beta encodes its window in the model id via a
-# trailing ``[1m]`` marker (e.g. ``claude-opus-4-8[1m]``). Neither litellm nor
-# the MLflow catalog keys on the bracketed form, so without this it resolves to
-# the 128K default — under-sizing both the context meter and the compaction /
-# overflow threshold by ~8x. The suffix *is* the window, so we read it directly
-# rather than stripping it (the base id may legitimately have a smaller window).
 _ANTHROPIC_1M_BETA_SUFFIX = "[1m]"
 _ANTHROPIC_1M_BETA_WINDOW = 1_000_000
 
 
-def _registry_context_window(model: str) -> int | None:
-    """Resolve a model's context window from Omnigent's authoritative registry.
-
-    Consulted BEFORE litellm and the MLflow catalog. Normalizes the id the way
-    model strings reach us — a provider prefix (``qwen/qwen3-coder``,
-    ``openrouter/qwen/qwen3-coder``) and an OpenRouter-style ``:tag`` suffix
-    (``qwen3-coder:free``) — down to the bare id, lowercased, with the ``[1m]``
-    beta marker preserved.
-
-    Resolution: an exact :data:`_CONTEXT_WINDOW_REGISTRY` entry, then the
-    Anthropic 1M-context beta rule (a trailing ``[1m]`` on a Claude id →
-    1,000,000). The rule is scoped to Claude ids so a custom/self-hosted model
-    that merely happens to end in ``[1m]`` isn't force-sized to 1M.
-
-    :param model: The model identifier (any namespacing).
-    :returns: The context window in tokens, or ``None`` when the model isn't in
-        our registry (caller falls back to litellm / the catalog / the default).
-    """
+def _encoded_context_window(model: str) -> int | None:
+    """Read a context size explicitly encoded in a provider model id."""
     bare = model.rsplit("/", 1)[-1].split(":", 1)[0].strip().lower()
-    if bare in _CONTEXT_WINDOW_REGISTRY:
-        return _CONTEXT_WINDOW_REGISTRY[bare]
-    # ``[1m]`` is an Anthropic-only beta convention, so gate on Claude ids
-    # (covers ``claude-*`` and ``databricks-claude-*``); other providers fall
-    # through to litellm/catalog rather than being forced to 1M.
     if "claude" in bare and bare.endswith(_ANTHROPIC_1M_BETA_SUFFIX):
         return _ANTHROPIC_1M_BETA_WINDOW
+    return None
+
+
+def _catalog_context_window(model: str) -> int | None:
+    """Return catalog context metadata when every matching entry agrees."""
+    windows = {
+        candidate.max_input_tokens
+        for candidate in find_catalog_models(model)
+        if candidate.max_input_tokens is not None
+    }
+    if len(windows) == 1:
+        return next(iter(windows))
     return None
 
 
@@ -132,159 +54,6 @@ _FALLBACK_CACHE_READ_INPUT_RATIO: float = 0.10
 _FALLBACK_CACHE_WRITE_INPUT_RATIO: float = 1.25
 
 
-def _infer_provider(bare: str) -> str | None:
-    """
-    Infer the MLflow provider name from a bare model identifier.
-
-    Checks ``_MODEL_PREFIX_TO_PROVIDER`` with longest-prefix-first
-    matching.
-
-    :param bare: Model name without provider prefix, e.g.
-        ``"databricks-gpt-5-5"`` or ``"gpt-4o"``.
-    :returns: Provider name (e.g. ``"databricks"``), or ``None``
-        when the prefix is not recognised.
-    """
-    for prefix, provider in sorted(
-        _MODEL_PREFIX_TO_PROVIDER.items(), key=lambda kv: len(kv[0]), reverse=True
-    ):
-        if bare.startswith(prefix):
-            return provider
-    return None
-
-
-def _download_mlflow_provider_catalog(provider: str) -> dict[str, object] | None:
-    """
-    Download the MLflow GitHub Release catalog JSON for *provider*.
-
-    Downloads ``_MLFLOW_CATALOG_URL.format(provider=provider)``,
-    following the GitHub redirect to the release-assets CDN. Returns
-    the parsed ``models`` dict (mapping model name to entry) on
-    success, ``None`` on any network or parse error. This is the raw
-    network call; callers should go through
-    :func:`_fetch_mlflow_provider_catalog` for the cached path.
-
-    :param provider: Provider name, e.g. ``"databricks"`` or
-        ``"openai"``.
-    :returns: Dict of model-name to catalog entry, or ``None`` on
-        failure.
-    """
-    import json
-    import urllib.request
-
-    url = _MLFLOW_CATALOG_URL.format(provider=provider)
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            data: dict[str, object] = json.loads(resp.read())
-        models = data.get("models")
-        return dict(models) if isinstance(models, dict) else None
-    except Exception:
-        return None
-
-
-def _fetch_mlflow_provider_catalog(provider: str) -> dict[str, object] | None:
-    """
-    Return the MLflow catalog for *provider*, cached process-wide.
-
-    Wraps :func:`_download_mlflow_provider_catalog` with a 1-hour TTL
-    cache so the per-request GitHub fetch (~490ms) is paid at most once
-    per provider per hour instead of on every ``GET /v1/sessions/{id}``
-    snapshot. A ``None`` result (network error / missing asset) is also
-    cached, so a transient outage doesn't make every subsequent request
-    re-pay the timeout for an hour — acceptable since the caller falls
-    back to the 128K default and the window is refreshed on TTL expiry.
-
-    :param provider: Provider name, e.g. ``"databricks"`` or
-        ``"openai"``.
-    :returns: Dict of model-name to catalog entry, or ``None`` on
-        failure.
-    """
-    with _catalog_cache_lock:
-        cached = _catalog_cache.get(provider, _CATALOG_MISS)
-        if cached is not _CATALOG_MISS:
-            return cached
-    # Network call outside the lock so a slow fetch for one provider
-    # doesn't block lookups for another.
-    result = _download_mlflow_provider_catalog(provider)
-    with _catalog_cache_lock:
-        _catalog_cache[provider] = result
-    return result
-
-
-def _fetch_context_window_from_mlflow(model: str) -> int | None:
-    """
-    Look up a model's context window via the MLflow GitHub Release
-    catalog.
-
-    Fetches the per-provider JSON file (one HTTP request per
-    provider) and reads ``context_window.max_input``. Strategy:
-
-    1. Infer the provider from the model name (explicit
-       ``provider/`` prefix or ``_MODEL_PREFIX_TO_PROVIDER`` table).
-    2. Fetch ``{provider}.json`` from the MLflow release asset CDN.
-    3. Exact name match in the ``models`` dict.
-    4. Family-prefix retry: strip the last hyphen component and
-       search the same provider catalog. Accepted only when **all**
-       prefix-matched entries share the same ``max_input``.
-
-    Times out after 5 seconds; any network or parse error returns
-    ``None``.
-
-    :param model: Model identifier, e.g. ``"databricks-gpt-5-5"``
-        or ``"openai/gpt-4o"``.
-    :returns: ``max_input + max_output`` from the catalog entry
-        in tokens, or ``None`` when the model cannot be resolved.
-    """
-    if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
-        return None
-
-    if "/" in model:
-        explicit_provider, bare = model.split("/", 1)
-        provider = explicit_provider
-    else:
-        bare = model
-        provider = _infer_provider(bare)
-
-    if provider is None:
-        return None
-
-    models = _fetch_mlflow_provider_catalog(provider)
-    if models is None:
-        return None
-
-    def _total(cw: object) -> int | None:
-        """Sum max_input + max_output from a context_window dict."""
-        if not isinstance(cw, dict):
-            return None
-        max_input = cw.get("max_input")
-        if max_input is None:
-            return None
-        return int(max_input) + int(cw.get("max_output") or 0)
-
-    entry = models.get(bare)
-    if entry is not None and isinstance(entry, dict):
-        val = _total(entry.get("context_window"))
-        if val is not None:
-            return val
-
-    if "-" in bare:
-        prefix = bare.rsplit("-", 1)[0]
-        matched = {
-            name: e
-            for name, e in models.items()
-            if name.startswith(prefix) and isinstance(e, dict)
-        }
-        if matched:
-            windows = {
-                _total(e.get("context_window"))
-                for e in matched.values()
-                if _total(e.get("context_window")) is not None
-            }
-            if len(windows) == 1:
-                return int(next(iter(windows)))  # type: ignore[arg-type]
-
-    return None
-
-
 def get_model_context_window(model: str) -> int:
     """
     Look up the model's context window size in tokens.
@@ -293,16 +62,12 @@ def get_model_context_window(model: str) -> int:
 
     1. ``AP_CONTEXT_WINDOW_OVERRIDE`` env var — overrides everything.
        Supports custom/self-hosted models and e2e compaction tests.
-    2. :func:`_registry_context_window` — Omnigent's own authoritative
-       registry (Qwen models, Anthropic ``[1m]`` beta). Supersedes the
-       upstream backends, which mis-size or omit these ids and collapse to
-       the 128K default offline.
-    3. ``litellm.get_model_info()`` — fast, local, no network. Also
+    2. :func:`_encoded_context_window` — explicit provider metadata carried
+       in the model id, currently Anthropic's ``[1m]`` beta marker.
+    3. Shared MLflow catalog metadata. This is the authoritative dynamic
+       source and reuses the onboarding/model-resolver cache.
+    4. ``litellm.get_model_info()`` — optional local metadata. Also
        tried with the ``databricks/`` prefix for Databricks models.
-    4. MLflow GitHub Release catalog — per-provider JSON fetched from
-       ``github.com/mlflow/mlflow/releases``. Covers models not yet
-       in litellm's bundled registry, with a family-prefix fallback
-       for newly released variants.
     5. ``_DEFAULT_CONTEXT_WINDOW`` (128 K) — conservative fallback.
 
     :param model: The model identifier, e.g. ``"openai/gpt-4o"`` or
@@ -312,17 +77,16 @@ def get_model_context_window(model: str) -> int:
     override = os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE")
     if override is not None:
         return int(override)
-    # Our registry supersedes the upstream backends: litellm and the MLflow
-    # catalog mis-size or omit ids we serve (the Anthropic ``[1m]`` beta resolves
-    # to 128K; Qwen models are absent), and offline both collapse to the 128K
-    # default. Consult ours first.
-    registered = _registry_context_window(model)
-    if registered is not None:
-        return registered
+    encoded = _encoded_context_window(model)
+    if encoded is not None:
+        return encoded
+    catalog_window = _catalog_context_window(model)
+    if catalog_window is not None:
+        return catalog_window
     try:
         import litellm
     except ImportError:
-        return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
+        return _DEFAULT_CONTEXT_WINDOW
     try:
         info = litellm.get_model_info(model)
         if info:
@@ -340,7 +104,7 @@ def get_model_context_window(model: str) -> int:
                     return int(limit)
         except Exception:
             pass
-    return _fetch_context_window_from_mlflow(model) or _DEFAULT_CONTEXT_WINDOW
+    return _DEFAULT_CONTEXT_WINDOW
 
 
 def resolve_effective_context_window(
@@ -421,9 +185,8 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
 
     Returns prices per token (not per million), including cache-read /
     cache-write rates when the catalog publishes them. Uses the same
-    provider-inference and catalog-fetch logic as
-    :func:`_fetch_context_window_from_mlflow`, with the same
-    family-prefix fallback for newly released model variants.
+    shared catalog lookup as :func:`get_model_context_window`, including the
+    same unambiguous family-prefix fallback for newly released variants.
 
     :param model: Model identifier, e.g. ``"anthropic/claude-sonnet-4-6"``
         or ``"databricks-gpt-5-5"``.
@@ -431,76 +194,31 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
         unavailable (network error, model not in catalog, or catalog
         entry lacks input/output pricing data).
     """
-    if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
-        return None
 
-    if "/" in model:
-        _explicit_provider, bare = model.split("/", 1)
-        provider = _explicit_provider
-    else:
-        bare = model
-        provider = _infer_provider(bare)
-
-    if provider is None:
-        return None
-
-    models = _fetch_mlflow_provider_catalog(provider)
-    if models is None:
-        return None
-
-    def _extract(entry: object) -> ModelPricing | None:
-        """Extract per-token pricing (incl. cache rates) from a catalog entry."""
-        if not isinstance(entry, dict):
+    def _extract(info: ModelInfo) -> ModelPricing | None:
+        """Convert shared per-million catalog prices to per-token values."""
+        if info.input_price is None or info.output_price is None:
             return None
-        pricing = entry.get("pricing")
-        if not isinstance(pricing, dict):
-            return None
-        input_ppm = pricing.get("input_per_million_tokens")
-        output_ppm = pricing.get("output_per_million_tokens")
-        if input_ppm is None or output_ppm is None:
-            return None
-        cache_read_ppm = pricing.get("cache_read_per_million_tokens")
-        cache_write_ppm = pricing.get("cache_write_per_million_tokens")
         return ModelPricing(
-            input_per_token=float(input_ppm) / 1_000_000,
-            output_per_token=float(output_ppm) / 1_000_000,
+            input_per_token=float(info.input_price) / 1_000_000,
+            output_per_token=float(info.output_price) / 1_000_000,
             cache_read_per_token=(
-                float(cache_read_ppm) / 1_000_000 if cache_read_ppm is not None else None
+                float(info.cache_read_price) / 1_000_000
+                if info.cache_read_price is not None
+                else None
             ),
             cache_write_per_token=(
-                float(cache_write_ppm) / 1_000_000 if cache_write_ppm is not None else None
+                float(info.cache_write_price) / 1_000_000
+                if info.cache_write_price is not None
+                else None
             ),
         )
 
-    entry = models.get(bare)
-    if entry is not None:
-        result = _extract(entry)
-        if result is not None:
-            return result
-
-    # Family-prefix fallback: strip last hyphen segment and look for
-    # entries that share the same pricing.
-    if "-" in bare:
-        prefix = bare.rsplit("-", 1)[0]
-        matched = [e for name, e in models.items() if name.startswith(prefix)]
-        prices = {_extract(e) for e in matched if _extract(e) is not None}
-        if len(prices) == 1:
-            return next(iter(prices))
-
-    # Databricks-gateway alias fallback. A model served through the
-    # Databricks gateway is reported as ``databricks-<base>`` (e.g.
-    # ``databricks-claude-opus-4-8``), but the Databricks provider catalog
-    # may not list every such alias even when the *underlying* provider
-    # catalog prices the base model (anthropic's ``claude-opus-4-8`` is
-    # priced; the databricks alias is not). Retry once with the de-prefixed
-    # base so the underlying provider's pricing applies. Only the known
-    # ``databricks-`` prefix is stripped, and the base never re-infers
-    # ``databricks`` (it has no such prefix), so this can't recurse.
-    if provider == "databricks" and bare.startswith("databricks-"):
-        base = bare[len("databricks-") :]
-        if base and base != bare:
-            return fetch_model_pricing(base)
-
+    prices = {
+        price for info in find_catalog_models(model) if (price := _extract(info)) is not None
+    }
+    if len(prices) == 1:
+        return next(iter(prices))
     return None
 
 

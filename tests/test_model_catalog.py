@@ -563,6 +563,12 @@ def test_databricks_listing_filters_to_chat_llms(
     assert by_id["system.ai.claude-sonnet-4-6"].family == "claude"
     assert by_id["system.ai.gpt-5-4"].family == "openai"
     assert by_id["system.ai.meta-llama-3-3-70b-instruct"].family == "other"
+    assert by_id["system.ai.claude-sonnet-4-6"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_CHAT}
+    )
+    assert by_id["system.ai.gpt-5-4"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_CHAT, ModelWireAPI.OPENAI_RESPONSES}
+    )
 
 
 def test_databricks_listing_skips_explicitly_non_ready_endpoints(
@@ -1268,30 +1274,21 @@ def test_resolve_catalog_default_preserves_provider_policy(
     assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
 
 
-@pytest.mark.parametrize(
-    ("provider", "family", "expected_model"),
-    [
-        ("anthropic", "claude", "claude-opus-4-8"),
-        ("openai", "openai", "gpt-5.5"),
-    ],
-)
-def test_resolve_catalog_default_preserves_provider_pin_when_catalog_lags(
+def test_resolve_catalog_default_preserves_provider_tier_policy(
     monkeypatch: pytest.MonkeyPatch,
-    provider: str,
-    family: str,
-    expected_model: str,
 ) -> None:
-    """Provider pins remain valid before the remote catalog learns their ids."""
+    """Default resolution retains broadly accessible provider tiers."""
     monkeypatch.setattr(
         "omnigent.onboarding.providers.get_chat_models",
         lambda _provider: [
-            ModelInfo(name=f"{family}-catalog-model", provider=provider, mode="chat")
+            ModelInfo(name="claude-opus-new", provider="anthropic", mode="chat"),
+            ModelInfo(name="claude-sonnet-stable", provider="anthropic", mode="chat"),
         ],
     )
 
-    resolution = resolve_catalog_model(provider, family=family)
+    resolution = resolve_catalog_model("anthropic", family="claude")
 
-    assert resolution.model_id == expected_model
+    assert resolution.model_id == "claude-sonnet-stable"
     assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
 
 

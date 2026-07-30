@@ -290,6 +290,67 @@ def test_build_pod_manifest_without_pvc_mounts_is_unchanged() -> None:
     ]
 
 
+def test_build_pod_manifest_secret_mounts_land_on_host_container_only() -> None:
+    """Each secret_mounts entry becomes a read-only secret volume mounted on host only."""
+    manifest = build_pod_manifest(
+        **_MANIFEST_KW,
+        secret_mounts=[
+            {"secret_name": "git-token", "mount_path": "/mnt/secrets/git"},
+            {"secret_name": "npm-token", "mount_path": "/mnt/secrets/npm"},
+        ],
+    )
+    spec = manifest["spec"]
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["secret-0"]["secret"] == {
+        "secretName": "git-token",
+        "optional": False,
+        "defaultMode": 0o440,
+    }
+    assert volumes["secret-1"]["secret"] == {
+        "secretName": "npm-token",
+        "optional": False,
+        "defaultMode": 0o440,
+    }
+    host_mounts = {m["name"]: m for m in spec["containers"][0]["volumeMounts"]}
+    assert host_mounts["secret-0"] == {
+        "name": "secret-0",
+        "mountPath": "/mnt/secrets/git",
+        "readOnly": True,
+    }
+    assert host_mounts["secret-1"] == {
+        "name": "secret-1",
+        "mountPath": "/mnt/secrets/npm",
+        "readOnly": True,
+    }
+    # Init container keeps only HOME — no credential exposure at clone time.
+    assert spec["initContainers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
+def test_build_pod_manifest_pvc_and_secret_mounts_coexist() -> None:
+    """PVC and Secret mounts get independent name spaces (pvc-N / secret-N) on the host."""
+    manifest = build_pod_manifest(
+        **_MANIFEST_KW,
+        pvc_mounts=[{"claim_name": "datasets", "mount_path": "/mnt/datasets", "read_only": True}],
+        secret_mounts=[{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}],
+    )
+    volume_names = {v["name"] for v in manifest["spec"]["volumes"]}
+    assert volume_names == {"home", "pvc-0", "secret-0"}
+    host_mount_names = {m["name"] for m in manifest["spec"]["containers"][0]["volumeMounts"]}
+    assert host_mount_names == {"home", "pvc-0", "secret-0"}
+
+
+def test_build_pod_manifest_without_secret_mounts_is_unchanged() -> None:
+    """No secret_mounts → the single home emptyDir, exactly as before."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert manifest["spec"]["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert manifest["spec"]["containers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
 def test_build_pod_manifest_is_restricted_and_least_privilege() -> None:
     """The Pod satisfies Pod Security 'restricted' and mounts no SA token."""
     manifest = build_pod_manifest(**_MANIFEST_KW)
@@ -541,6 +602,29 @@ def test_launch_host_threads_pvc_mounts_into_the_pod(fake_core: _FakeCore) -> No
     assert {
         "name": "pvc-0",
         "persistentVolumeClaim": {"claimName": "omnigent-datasets", "readOnly": True},
+    } in fake_core.created_pods[0]["spec"]["volumes"]
+
+
+def test_launch_host_threads_secret_mounts_into_the_pod(fake_core: _FakeCore) -> None:
+    """A launcher built with secret_mounts creates Pods carrying the secret volume."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        secret_mounts=[{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}],
+    )
+    launcher.start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert {
+        "name": "secret-0",
+        "secret": {"secretName": "git-token", "optional": False, "defaultMode": 0o440},
     } in fake_core.created_pods[0]["spec"]["volumes"]
 
 

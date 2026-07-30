@@ -48,7 +48,9 @@ function Probe({ id, path }: { id: string | undefined; path: string | null }) {
 }
 
 async function flushMicrotasks() {
-  await new Promise((r) => setTimeout(r, 10));
+  await new Promise((resolve) => {
+    setTimeout(resolve, 10);
+  });
 }
 
 type ChatStoreState = {

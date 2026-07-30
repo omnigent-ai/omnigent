@@ -2241,7 +2241,9 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         del resource_registry, publish_event
         created.append(session_id)
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _recording_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _recording_auto_create
+    )
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -2515,7 +2517,8 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
         created.append(session_id)
 
     monkeypatch.setattr(
-        "omnigent.runner.app._auto_create_antigravity_terminal", _recording_auto_create
+        "omnigent.runner.native.orchestration._auto_create_antigravity_terminal",
+        _recording_auto_create,
     )
 
     native_spec = AgentSpec(

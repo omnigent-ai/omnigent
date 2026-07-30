@@ -47,7 +47,7 @@ interface FakeEditor {
   getContribution: () => null;
   /** Test-only: set getValue() without firing onChange (mirrors a user keystroke
    *  landing in the buffer; the test fires onChange separately). */
-  __set: (v: string) => void;
+  setValueForTest: (v: string) => void;
 }
 
 function makeFakeEditor(initial: string): FakeEditor {
@@ -80,7 +80,7 @@ function makeFakeEditor(initial: string): FakeEditor {
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
     getContribution: () => null,
-    __set: (v) => {
+    setValueForTest: (v) => {
       value = v;
     },
   };
@@ -170,7 +170,7 @@ async function renderMounted(el: React.ReactElement) {
 
 // Drive a user edit: update the buffer, then fire the captured onChange.
 async function fireEdit(value: string) {
-  fakeEditor!.__set(value);
+  fakeEditor!.setValueForTest(value);
   await act(async () => {
     h.onChange?.(value, {});
   });

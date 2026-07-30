@@ -141,9 +141,23 @@ source. Provider-relative cost metadata orders candidates for the stable `fast`,
 cost is unknown. If discovery is unavailable, routing skips the override and the
 harness keeps the provider-resolved default instead of consulting a stale table.
 
-The remaining exact compatibility exclusions in smart routing are temporary
-wire-API workarounds. They stay isolated until catalog wire metadata can express
-the affected harness constraints without model-name checks.
+Smart routing retains the runner's normalized wire metadata when building the
+id-only candidate set expected by routing clients. Compatibility post-processing
+uses those catalog facts and treats missing metadata from older runners as
+unknown instead of inferring protocol support from model names.
+
+## Context Window Migration
+
+Context sizing and pricing now share the onboarding/model-resolver MLflow
+catalog cache. Stable family patterns locate a bounded provider catalog, while
+provider-qualified and vendor-namespaced ids route directly to their catalog
+source. Exact catalog metadata wins; family-prefix matches are accepted only
+when every candidate agrees on the requested field.
+
+The stale exact-id Qwen window table and duplicate catalog downloader are gone.
+An explicit Anthropic `[1m]` marker remains self-describing metadata, and an
+uncatalogued/offline model keeps the conservative 128K fallback rather than a
+release-specific guess.
 
 ## Kiro Picker Migration
 
@@ -152,3 +166,28 @@ bound runner and forwards the CLI's model ids, default, descriptions, context
 windows, and credit rates. The server caches the runner response through the
 same asynchronous picker path as Codex, so provider changes no longer require an
 Omnigent source update and snapshots do not block on the CLI process.
+## Ad-hoc CLI Defaults
+
+Minimal agent YAMLs that declare neither a harness nor a model now resolve the
+Databricks OpenAI-family default from the provider catalog during bundle
+materialization. `--model` and `OMNIGENT_MODEL` remain higher-precedence explicit
+choices. If discovery is unavailable, the CLI asks for one of those explicit
+values instead of silently baking a release-specific model into the bundle.
+
+## Onboarding Defaults
+
+Provider setup derives its suggested default from the live catalog after
+excluding specialty modalities. Stable family preferences choose broadly
+accessible Anthropic and OpenRouter tiers without naming a release. When the
+catalog is unavailable, onboarding accepts an explicit value instead of
+prefilling a source-controlled model pin.
+
+The same policy supplies the final runtime fallback for key, gateway, and local
+providers. Explicit agent and provider defaults still win; without either,
+runtime discovery fails with configuration guidance when no catalog is available.
+
+## Kimi Example Default
+
+The Kimi launcher example declares only the harness. With no explicit
+`--model` or session override, Omnigent omits `HARNESS_KIMI_MODEL` and lets the
+Kimi CLI use the default from its own provider configuration.

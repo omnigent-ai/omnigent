@@ -26,13 +26,12 @@ function IndentGuides({ depth }: { depth: number }) {
   if (depth <= 0) return null;
   return (
     <>
-      {Array.from({ length: depth }).map((_, i) => (
+      {Array.from({ length: depth }, (_, level) => indentFor(level) + GUIDE_OFFSET).map((left) => (
         <span
-          // biome-ignore lint/suspicious/noArrayIndexKey: fixed positional guides
-          key={i}
+          key={left}
           aria-hidden
           className="pointer-events-none absolute top-0 bottom-0 w-px bg-border"
-          style={{ left: `${indentFor(i) + GUIDE_OFFSET}px` }}
+          style={{ left: `${left}px` }}
         />
       ))}
     </>

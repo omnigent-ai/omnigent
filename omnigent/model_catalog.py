@@ -44,7 +44,13 @@ import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
-from omnigent.model_metadata import ModelCapability, ModelCostTier, ModelIntent, ModelMetadata
+from omnigent.model_metadata import (
+    ModelCapability,
+    ModelCostTier,
+    ModelIntent,
+    ModelMetadata,
+    ModelWireAPI,
+)
 from omnigent.model_override import model_family_mismatch
 from omnigent.model_resolver import (
     ModelResolution,
@@ -1149,15 +1155,33 @@ def _fetch_databricks_uc_listing(
         if not name:
             continue
         api_types = service.get("supported_api_types", [])
-        has_chat = any("chat" in t for t in api_types)
-        has_embed = any("embed" in t.lower() for t in api_types)
+        normalized_api_types = {
+            api_type.lower() for api_type in api_types if isinstance(api_type, str)
+        }
+        has_chat = any("chat" in api_type for api_type in normalized_api_types)
+        has_embed = any("embed" in api_type for api_type in normalized_api_types)
         if not has_chat or has_embed:
             continue
         from omnigent.pi_native_credentials import _unsupported_in_pi
 
         if _unsupported_in_pi(name.lower()):
             continue
-        models.append(ModelEntry(id=name, family=model_family_token(name)))
+        wire_apis: set[ModelWireAPI] = set()
+        if any("chat/completions" in api_type for api_type in normalized_api_types):
+            wire_apis.add(ModelWireAPI.OPENAI_CHAT)
+        if "openai/v1/responses" in normalized_api_types:
+            wire_apis.add(ModelWireAPI.OPENAI_RESPONSES)
+        if any(
+            "anthropic" in api_type and "messages" in api_type for api_type in normalized_api_types
+        ):
+            wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
+        models.append(
+            ModelEntry(
+                id=name,
+                family=model_family_token(name),
+                metadata=ModelMetadata(wire_apis=frozenset(wire_apis)),
+            )
+        )
     return ModelListing(
         source="gateway",
         verified=True,

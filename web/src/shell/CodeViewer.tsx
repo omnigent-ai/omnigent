@@ -12,6 +12,8 @@
 
 import { createPortal } from "react-dom";
 import {
+  Children,
+  isValidElement,
   lazy,
   Suspense,
   useCallback,
@@ -19,6 +21,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
   type RefObject,
   type UIEvent,
 } from "react";
@@ -40,6 +43,8 @@ import remarkEmoji from "remark-emoji";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
+import { mermaid } from "@streamdown/mermaid";
+import { Streamdown } from "streamdown";
 import { type Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -134,6 +139,18 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
 ];
 
+const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
+
+function MermaidPreview({ source }: { source: string }) {
+  return (
+    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
+      <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
+        {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
+      </Streamdown>
+    </div>
+  );
+}
+
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
 // GitHub honors explicit dimensions, so mirror them onto an inline style —
@@ -141,6 +158,16 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
 // after sanitize (React components render the already-sanitized tree), so it
 // adds no attack surface. Only literal integer pixel values are forwarded.
 const MARKDOWN_COMPONENTS: Components = {
+  pre({ children, ...props }) {
+    const child = Children.count(children) === 1 && isValidElement(children) ? children : null;
+    if (
+      isValidElement<{ className?: string; children?: ReactNode }>(child) &&
+      child.props.className?.split(/\s+/).includes("language-mermaid")
+    ) {
+      return <MermaidPreview source={String(child.props.children ?? "")} />;
+    }
+    return <pre {...props}>{children}</pre>;
+  },
   img({ node: _node, width, height, style, ...props }) {
     const px = (v: string | number | undefined) =>
       typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ? `${v}px` : undefined;

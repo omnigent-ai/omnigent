@@ -801,35 +801,33 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 onExit={exitSelectionMode}
               />
             ) : (
-              <>
-                <Button
-                  asChild
-                  variant="ghost"
-                  className={cn(
-                    "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
-                    SIDEBAR_HOVER_HIGHLIGHT,
-                    isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="inbox-button"
+              >
+                <Link to="/inbox" onClick={onNavClick}>
+                  <InboxIcon className="size-3.5 text-muted-foreground" />
+                  Inbox
+                  {inboxCount > 0 && (
+                    <span
+                      aria-label={
+                        inboxCount === 1
+                          ? "1 inbox item waiting"
+                          : `${inboxCount} inbox items waiting`
+                      }
+                      className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
+                    >
+                      {inboxCount}
+                    </span>
                   )}
-                  data-testid="inbox-button"
-                >
-                  <Link to="/inbox" onClick={onNavClick}>
-                    <InboxIcon className="size-3.5 text-muted-foreground" />
-                    Inbox
-                    {inboxCount > 0 && (
-                      <span
-                        aria-label={
-                          inboxCount === 1
-                            ? "1 inbox item waiting"
-                            : `${inboxCount} inbox items waiting`
-                        }
-                        className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
-                      >
-                        {inboxCount}
-                      </span>
-                    )}
-                  </Link>
-                </Button>
-              </>
+                </Link>
+              </Button>
             )}
           </div>
 
@@ -1717,67 +1715,16 @@ function ConversationList({
                     title="Projects"
                     collapsed={effectiveCollapsedSections.includes("Projects")}
                     onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                    headerAction={(() => {
-                      const allNames = sections.projectGroups.map((g) => g.name);
-                      // "New project" is always available (even when collapsed) so
-                      // the create-empty flow is reachable; the expand/revert control
-                      // is only meaningful when there are folders and the group is open.
-                      const showExpandControls =
-                        !effectiveCollapsedSections.includes("Projects") && allNames.length > 0;
-                      // Once every folder is open the only useful move is to undo it,
-                      // so the control flips to "revert" — which restores the set open
-                      // before "Expand all", or collapses everything when there's no
-                      // real last state (folders opened by hand). Otherwise it expands.
-                      const allExpanded =
-                        allNames.length > 0 && allNames.every((n) => expandedProjects.includes(n));
-                      return (
-                        // gap-0.5 between the two controls mirrors the row/folder
-                        // icon spacing, so every right-gutter pair lines up.
-                        <div className="flex items-center gap-0.5">
-                          {showExpandControls &&
-                            (allExpanded ? (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-xs"
-                                    aria-label="Collapse to previous"
-                                    data-testid="revert-projects"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      revertProjects();
-                                    }}
-                                  >
-                                    <Minimize2Icon className="size-3.5" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent side="bottom">Collapse to previous</TooltipContent>
-                              </Tooltip>
-                            ) : (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-xs"
-                                    aria-label="Expand all"
-                                    data-testid="expand-all-projects"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      expandAllProjects(allNames);
-                                    }}
-                                  >
-                                    <Maximize2Icon className="size-3.5" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent side="bottom">Expand all</TooltipContent>
-                              </Tooltip>
-                            ))}
-                          <NewProjectButton onCreated={expandProject} />
-                        </div>
-                      );
-                    })()}
+                    headerAction={
+                      <ProjectHeaderActions
+                        projectNames={sections.projectGroups.map((group) => group.name)}
+                        collapsed={effectiveCollapsedSections.includes("Projects")}
+                        expandedProjects={expandedProjects}
+                        onExpandAll={expandAllProjects}
+                        onRevert={revertProjects}
+                        onProjectCreated={expandProject}
+                      />
+                    }
                   >
                     {sections.projectGroups.map((group) => (
                       <ProjectFolder
@@ -2078,6 +2025,72 @@ function SectionHeader({
         )}
       </button>
     </h2>
+  );
+}
+
+function ProjectHeaderActions({
+  projectNames,
+  collapsed,
+  expandedProjects,
+  onExpandAll,
+  onRevert,
+  onProjectCreated,
+}: {
+  projectNames: string[];
+  collapsed: boolean;
+  expandedProjects: string[];
+  onExpandAll: (projectNames: string[]) => void;
+  onRevert: () => void;
+  onProjectCreated: (projectName: string) => void;
+}) {
+  const showExpandControls = !collapsed && projectNames.length > 0;
+  const allExpanded =
+    projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
+
+  return (
+    <div className="flex items-center gap-0.5">
+      {showExpandControls &&
+        (allExpanded ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Collapse to previous"
+                data-testid="revert-projects"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onRevert();
+                }}
+              >
+                <Minimize2Icon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Collapse to previous</TooltipContent>
+          </Tooltip>
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Expand all"
+                data-testid="expand-all-projects"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onExpandAll(projectNames);
+                }}
+              >
+                <Maximize2Icon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Expand all</TooltipContent>
+          </Tooltip>
+        ))}
+      <NewProjectButton onCreated={onProjectCreated} />
+    </div>
   );
 }
 
@@ -3263,7 +3276,12 @@ function ConversationRow({
           </DropdownMenu>
         </div>
       )}
-      <PermissionsModal sessionId={conversation.id} open={shareOpen} onOpenChange={setShareOpen} />
+      <PermissionsModal
+        sessionId={conversation.id}
+        open={shareOpen}
+        onOpenChange={setShareOpen}
+        canDelegateApprovals={isOwner}
+      />
       <Dialog
         open={deleteOpen}
         onOpenChange={(open) => {
@@ -3477,8 +3495,11 @@ function DeletingRow({
     );
   }
   return (
+    // Match the interactive row's box metrics (h-7, font-size, radius) so the
+    // swap only changes color/opacity — otherwise the row visibly grows and
+    // shifts the list while a delete is in flight.
     <div
-      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-sm text-muted-foreground opacity-70"
+      className="sidebar-compact-text flex h-7 w-full items-center gap-1.5 rounded-[var(--radius-otto-sm)] px-2 text-muted-foreground opacity-70"
       data-testid="conversation-deleting"
       aria-live="polite"
     >
@@ -3898,9 +3919,11 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }
 
   return (
-    // pl-1 + the input's px-1 line the text up with the row's px-2 title;
-    // py-1 around the size-7 buttons matches the 36px single-line row height.
-    <div className="flex items-center gap-1 rounded-md bg-muted py-1 pr-1 pl-1">
+    // Match the interactive row's box metrics (h-7, sidebar-compact-text) so
+    // entering edit mode doesn't grow the row or bump the font size. pl-1 + the
+    // input's px-1 line the text up with the row's px-2 title; the size-6
+    // buttons sit inside the 28px row height.
+    <div className="sidebar-compact-text flex h-7 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1">
       <input
         ref={inputRef}
         type="text"
@@ -3915,12 +3938,12 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
         data-testid="rename-conversation-input"
-        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-1 text-sm outline-none md:select-text"
+        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
       />
       <Button
         type="button"
         variant="ghost"
-        size="icon-sm"
+        size="icon-xs"
         aria-label="Save rename"
         onMouseDown={(e) => {
           // Prevent the input's blur from firing before the commit.
@@ -3933,7 +3956,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       <Button
         type="button"
         variant="ghost"
-        size="icon-sm"
+        size="icon-xs"
         aria-label="Cancel rename"
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => {

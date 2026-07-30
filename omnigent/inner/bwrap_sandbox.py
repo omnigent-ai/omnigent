@@ -69,7 +69,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from ._cwd_scan import scan_cwd_mask_entries
+from ._cwd_scan import MaskedEntry, MaskKind, scan_cwd_mask_entries
 from ._seccomp import (
     SCMP_CMP_EQ,
     SCMP_CMP_GE,
@@ -345,6 +345,12 @@ class BwrapSandboxBackend(SandboxBackend):
             else list(_DEFAULT_CWD_ALLOW_HIDDEN)
         )
 
+        mask_paths = (
+            [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]
+            if sandbox_spec.mask_paths
+            else None
+        )
+
         return SandboxPolicy(
             backend_type=self.type_name,
             active=True,
@@ -355,6 +361,8 @@ class BwrapSandboxBackend(SandboxBackend):
             cwd_allow_hidden=cwd_allow_hidden,
             cwd_hidden_scan_max_entries=sandbox_spec.cwd_hidden_scan_max_entries,
             cwd_hidden_scan_overflow=sandbox_spec.cwd_hidden_scan_overflow,
+            cwd_hidden_scan_recursive=sandbox_spec.cwd_hidden_scan_recursive,
+            mask_paths=mask_paths,
             env_passthrough=(
                 list(sandbox_spec.env_passthrough)
                 if sandbox_spec.env_passthrough is not None
@@ -1190,6 +1198,7 @@ def _dotfile_and_symlink_mask_args(
         safe_roots=safe_roots,
         max_entries=policy.cwd_hidden_scan_max_entries,
         overflow=policy.cwd_hidden_scan_overflow,
+        recursive=policy.cwd_hidden_scan_recursive,
         logger_name=__name__,
     )
     for entry in entries:
@@ -1207,6 +1216,7 @@ def _dotfile_and_symlink_mask_args(
                 safe_roots=safe_roots,
                 max_entries=policy.cwd_hidden_scan_max_entries,
                 overflow=policy.cwd_hidden_scan_overflow,
+                recursive=policy.cwd_hidden_scan_recursive,
                 logger_name=__name__,
                 scope_label="read_paths",
             )
@@ -1226,6 +1236,19 @@ def _dotfile_and_symlink_mask_args(
                 continue
             seen_mask_paths.add(key)
             entries.append(entry)
+    # Explicit operator-declared masks: hide these regardless of name
+    # or depth, on top of the dotfile walk. Kind is decided by a stat
+    # so a directory tmpfs-masks and a file /dev/null-masks; a missing
+    # path is dropped by the re-stat below. ``is_dir`` follows symlinks
+    # (unlike the walker's ``follow_symlinks=False``), so a symlink to a
+    # directory tmpfs-masks at the link location.
+    for mask_path in policy.mask_paths or []:
+        key = str(mask_path)
+        if key in seen_mask_paths:
+            continue
+        seen_mask_paths.add(key)
+        kind: MaskKind = "dir" if mask_path.is_dir() else "file"
+        entries.append(MaskedEntry(path=mask_path, kind=kind))
     args: list[str] = []
     for entry in entries:
         # Re-stat just before emitting: a mask overlays onto an EXISTING

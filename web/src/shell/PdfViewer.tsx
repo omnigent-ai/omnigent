@@ -39,12 +39,14 @@ import "./pdfViewer.css";
 // Point pdf.js at its worker. Vite imports the worker entry as a static asset so
 // the bundled SPA emits it as a hashed file without relying on the package
 // path resolving from `node_modules`.
+// oxlint-disable-next-line import/default -- Vite's `?url` import returns the asset URL.
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
 const SCALE_STEP = 0.25;
+const EMPTY_COMMENTS: Comment[] = [];
 
 interface FloatingAnchor {
   x: number;
@@ -91,9 +93,9 @@ function PdfCommentHighlights({
   return (
     <div className="pdf-comment-layer" aria-hidden>
       {highlights.map((h) =>
-        h.rects.map((rect, i) => (
+        h.rects.map((rect) => (
           <div
-            key={`${h.key}-${i}`}
+            key={`${h.key}-${rect.x}-${rect.y}-${rect.w}-${rect.h}`}
             className={cn("pdf-comment", h.active && "pdf-comment-active")}
             style={{
               left: `${rect.x * 100}%`,
@@ -115,7 +117,7 @@ function PdfCommentHighlights({
 export function PdfViewer({
   data,
   conversationId,
-  comments = [],
+  comments = EMPTY_COMMENTS,
   activeSelection = null,
   onSetActiveSelection,
 }: PdfViewerProps) {

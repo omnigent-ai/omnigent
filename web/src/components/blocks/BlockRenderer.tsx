@@ -292,6 +292,7 @@ const STREAMING_TAIL = 3;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
+  canApprove?: boolean;
 }
 
 type ToolRunFragment =
@@ -305,7 +306,7 @@ type ToolRunFragment =
       index: number;
     };
 
-export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
+export function BlockRenderer({ items, sessionStatus, canApprove = true }: BlockRendererProps) {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
@@ -358,11 +359,11 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
     }
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
-    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText));
+    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText, canApprove));
     previousRenderedItemWasText = item.kind === "text";
   }
 
-  return <>{rendered}</>;
+  return rendered;
 }
 
 /**
@@ -411,13 +412,13 @@ function renderToolRunFragment(
   return renderItem(fragment.tool, runStart + fragment.index, false);
 }
 
-const _ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
-const _SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
+const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
+const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
 
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (_ADVISE_MODELS_NAMES.has(item.execution.name) || _SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
   );
 }
 
@@ -454,6 +455,7 @@ function renderItem(
   index: number,
   isReasoningStreaming: boolean,
   followsText = false,
+  canApprove = true,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -479,7 +481,7 @@ function renderItem(
     case "tool":
       // Intelligent routing's fan-out sizing gets a structured plan card
       // instead of the generic name(json) row + raw-JSON expansion.
-      if (_ADVISE_MODELS_NAMES.has(item.execution.name)) {
+      if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
         return (
           <SmartRoutingCard
             key={key}
@@ -550,7 +552,7 @@ function renderItem(
         />
       );
     case "elicitation":
-      return <ElicitationCard key={key} item={item} />;
+      return <ElicitationCard key={key} item={item} canApprove={canApprove} />;
   }
 }
 

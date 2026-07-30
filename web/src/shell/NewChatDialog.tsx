@@ -68,6 +68,7 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { attachmentKey } from "@/lib/attachments";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
@@ -3246,7 +3247,7 @@ export function NewChatLandingScreen() {
               <div className="flex flex-wrap gap-1.5 px-4 pb-2">
                 {files.map((file, i) => (
                   <span
-                    key={i}
+                    key={attachmentKey(file)}
                     className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                   >
                     {file.type.startsWith("image/") ? (

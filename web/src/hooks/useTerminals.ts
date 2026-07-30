@@ -238,7 +238,7 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
 // first loads. We treat these as an empty list (the live SSE
 // ``session.resource.created`` event fills it in once the terminal lands)
 // instead of throwing, so React Query does not enter an error state.
-const _SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
+const SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
 
 /**
  * Fetch the current terminal resources for a conversation over HTTP.
@@ -265,14 +265,14 @@ const _SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
  * :param conversationId: Session/conversation identifier,
  *     e.g. ``"conv_abc123"``.
  * :returns: The mapped terminals, or an empty array when the runner is
- *     not yet reachable (see :data:`_SOFT_TERMINAL_LIST_STATUSES`).
+ *     not yet reachable (see :data:`SOFT_TERMINAL_LIST_STATUSES`).
  * :raises Error: On a non-soft HTTP error status.
  */
 export async function fetchTerminals(conversationId: string): Promise<TerminalInfo[]> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals?order=asc&limit=1000`,
   );
-  if (_SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return [];
+  if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return [];
   if (!res.ok) throw new Error(`terminals fetch failed: ${res.status} ${res.statusText}`);
   const json = (await res.json()) as { data?: unknown };
   const rows = Array.isArray(json.data) ? json.data : [];

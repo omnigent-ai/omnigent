@@ -41,7 +41,10 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.model_override import validate_model_override
-from omnigent.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native_coding_agents import (
+    native_coding_agent_for_harness,
+    native_coding_agent_for_terminal_name,
+)
 from omnigent.native_dispatch import resolve_hook
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -6416,8 +6419,10 @@ class PreLaunchResult:
 
     :param skip: When ``True``, do not auto-create (e.g. a sibling session's
         terminal is transferring in).
-    :param force_recreate: When ``True``, tear down an existing terminal and
-        recreate (e.g. claude rebuild after an in-place agent switch).
+    :param force_recreate: When ``True``, tear down the session's terminals
+        (``cleanup_conversation``, which is session-wide, not just this harness's
+        terminal) and recreate — e.g. claude rebuild after an in-place agent
+        switch. Mirrors the original claude arm's teardown scope.
     :param needs_terminal: When ``False``, skip auto-create because the session
         snapshot said a runner terminal is not needed (codex/antigravity).
     """
@@ -6547,10 +6552,12 @@ async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
 async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
     """Adapter: build the claude-native terminal from a launch context.
 
-    ``server_client`` is required by the builder; the launch dispatch only
-    reaches this adapter with a bound client.
+    ``server_client`` is required by the builder; the claude launch arm always
+    binds one. Raise explicitly (rather than ``assert``, which ``-O`` strips) so
+    a future caller that forgets gets a clear error instead of a ``None`` deref.
     """
-    assert ctx.server_client is not None  # guaranteed by the claude launch arm
+    if ctx.server_client is None:
+        raise ValueError("claude-native launch requires a bound server_client")
     return await _auto_create_claude_terminal(
         ctx.session_id,
         ctx.resource_registry,
@@ -6572,35 +6579,44 @@ async def _launch_native_terminal(
     ctx: NativeLaunchContext,
     *,
     ensure_locks: MutableMapping[str, asyncio.Lock],
-    pre_launch: PreLaunchResult | None = None,
+    pre_launch: Callable[[bool], Awaitable[PreLaunchResult]] | None = None,
     resolve_agent_spec: (Callable[[], Awaitable[AgentSpec | ResolvedSpec | None]] | None) = None,
+    build_context: Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None = None,
+    reraise: bool = False,
 ) -> bool | None:
     """Auto-create a native harness terminal through the provider seam.
 
     Replaces the per-harness ``if harness_name == "<x>-native"`` launch arms:
     resolves ``provider.auto_create_terminal`` from the registry and runs the
     shared lock / existence-check / pending-event / error-event mechanics every
-    arm shared. Harness-specific pre-call logic (claude rebuild+transfer,
-    codex/antigravity needs-checks) is computed by the caller and passed as
-    *pre_launch*.
+    arm shared.
 
-    ``agent_spec`` is resolved lazily via *resolve_agent_spec*, called inside the
-    create block only when a terminal is actually being created — matching the
-    original arms, which resolved the spec only on creation and with per-harness
-    error semantics (pi lets a resolution error surface as a terminal-start
-    error; cursor/opencode/kimi swallow ``OmnigentError`` in their resolver;
-    kiro/goose/hermes/qwen pass no resolver at all). The resolved spec replaces
-    ``ctx.agent_spec`` before the adapter runs.
+    The special arms' ``has_terminal``-dependent pre-call checks (claude rebuild
+    + transfer-inbound, codex/antigravity needs-terminal) run in *pre_launch*,
+    invoked inside the lock with the computed ``has_terminal`` so it sees the
+    same state the inline arms did. Context enrichment that must happen only on
+    create (claude's bundle_dir / agent_name / skills, codex's bundle_dir) runs
+    in *build_context*; the simpler uniform arms use *resolve_agent_spec* to fill
+    just ``agent_spec``. Both run inside the create block, so their work (and
+    error semantics) is skipped when a terminal already exists.
 
     :param harness_name: Harness id, e.g. ``"pi-native"``.
     :param ctx: Launch inputs; the resolved adapter reads the subset it needs.
     :param ensure_locks: Per-harness ``{session_id: Lock}`` map owned by the
         runner (kept there so session cleanup can pop the lock by name).
-    :param pre_launch: Optional pre-launch decision from a special arm.
+    :param pre_launch: Optional async callback ``(has_terminal) -> PreLaunchResult``
+        run inside the lock to decide skip / force_recreate / needs_terminal.
     :param resolve_agent_spec: Optional async callback that resolves the session
-        agent spec, invoked once inside the create block. Its exceptions are
-        surfaced as terminal-start errors (a resolver that wants to tolerate
-        ``OmnigentError`` must swallow it itself and return ``None``).
+        agent spec, invoked once inside the create block; the result replaces
+        ``ctx.agent_spec``. Its exceptions surface as terminal-start errors (a
+        resolver that tolerates ``OmnigentError`` must swallow it and return
+        ``None``). Mutually exclusive with *build_context*.
+    :param build_context: Optional async callback that returns the fully enriched
+        context, invoked once inside the create block (for arms that resolve more
+        than ``agent_spec``). Mutually exclusive with *resolve_agent_spec*.
+    :param reraise: When ``True``, a builder failure re-raises after publishing
+        the pending-off event instead of publishing a start-error event — used by
+        the turn-path opencode cold-boot, which converts failure to an HTTP 503.
     :returns: ``True`` when a terminal exists or was created, ``False`` when
         creation failed or was skipped, or ``None`` when *harness_name* is not a
         native harness with a launch adapter (caller handles it another way).
@@ -6611,7 +6627,6 @@ async def _launch_native_terminal(
     provider = native_provider_for_key(agent.key)
     if provider is None:
         return None
-    decision = pre_launch or PreLaunchResult()
 
     lock = ensure_locks.setdefault(ctx.session_id, asyncio.Lock())
     async with lock:
@@ -6620,6 +6635,7 @@ async def _launch_native_terminal(
             registry is not None
             and registry.get(ctx.session_id, agent.terminal_name, "main") is not None
         )
+        decision = await pre_launch(has_terminal) if pre_launch is not None else PreLaunchResult()
         if has_terminal and decision.force_recreate:
             if registry is not None:
                 await registry.cleanup_conversation(ctx.session_id)
@@ -6632,7 +6648,9 @@ async def _launch_native_terminal(
         adapter = resolve_hook(provider, "auto_create_terminal")
         _publish_terminal_pending(ctx.publish_event, ctx.session_id, True)
         try:
-            if resolve_agent_spec is not None:
+            if build_context is not None:
+                ctx = await build_context(ctx)
+            elif resolve_agent_spec is not None:
                 ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
             await adapter(ctx)
             return True
@@ -6642,6 +6660,8 @@ async def _launch_native_terminal(
                 agent.terminal_name,
                 ctx.session_id,
             )
+            if reraise:
+                raise
             _publish_native_terminal_start_error(
                 ctx.publish_event,
                 ctx.session_id,
@@ -6651,6 +6671,116 @@ async def _launch_native_terminal(
             return False
         finally:
             _publish_terminal_pending(ctx.publish_event, ctx.session_id, False)
+
+
+def _ensure_native_terminal_default_response(view: SessionResourceView) -> JSONResponse:
+    """Default 200 response for the ensure path: the terminal view as-is."""
+    return JSONResponse(status_code=200, content=session_resource_view_to_dict(view))
+
+
+async def _ensure_native_terminal(
+    terminal_name: str,
+    ctx: NativeLaunchContext,
+    *,
+    ensure_locks: MutableMapping[str, asyncio.Lock],
+    build_context: Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None = None,
+    is_owned: Callable[[SessionResourceRegistry, SessionResourceView], bool] | None = None,
+    conflict_message: str | None = None,
+    finalize: Callable[[SessionResourceView], JSONResponse] | None = None,
+) -> JSONResponse | None:
+    """Ensure a native harness terminal exists, returning its resource response.
+
+    The terminal-ensure (attach / reattach) sibling of
+    :func:`_launch_native_terminal`. Replaces the per-harness ``if terminal_name
+    == "<x>" and session_key == "main"`` arms in ``create_session_terminal``:
+    resolves ``provider.auto_create_terminal`` from the registry and runs the
+    shared lock / view-based existence-check / error-response mechanics every arm
+    shared.
+
+    Unlike the launch shell this is a *view-based* path — the existence check
+    returns the live :class:`SessionResourceView` (not a bool), the result is a
+    :class:`JSONResponse` (200 with the view, 500 on builder failure, 409 on an
+    ownership conflict), and it does NOT publish ``terminal_pending`` events.
+
+    The codex/antigravity ownership check (``is_owned``) and codex's one-shot
+    policy-notice wrap (``finalize``) run inside the lock, matching the inline
+    arms: codex's read-and-clear of the policy notice is only one-shot because
+    the per-session lock serializes concurrent ensures.
+
+    :param terminal_name: Short terminal name, e.g. ``"claude"`` (NOT
+        ``"claude-native"``).
+    :param ctx: Launch inputs; the resolved adapter reads the subset it needs.
+    :param ensure_locks: Per-harness ``{session_id: Lock}`` map owned by the
+        runner (the same map the launch shell uses).
+    :param build_context: Optional async callback returning the enriched context,
+        invoked once inside the create block (claude/codex/pi/opencode/etc. that
+        resolve an agent spec). Its exceptions surface as terminal-start errors.
+    :param is_owned: Optional predicate ``(registry, existing) -> bool`` deciding
+        whether an existing terminal is the runner-owned native TUI. When it
+        returns ``False`` the stale terminal is closed and replaced; a
+        close failure returns 409 with ``conflict_message``.
+    :param conflict_message: 409 detail used when a non-owned terminal cannot be
+        closed. Required when ``is_owned`` is set.
+    :param finalize: Optional ``(view) -> JSONResponse`` to build the success
+        response (codex attaches its one-shot policy notice); defaults to a plain
+        200 with the view.
+    :returns: A :class:`JSONResponse`, or ``None`` when *terminal_name* is not a
+        native harness with a launch adapter (caller falls through to the generic
+        terminal launch path).
+    """
+    agent = native_coding_agent_for_terminal_name(terminal_name)
+    if agent is None:
+        return None
+    provider = native_provider_for_key(agent.key)
+    if provider is None:
+        return None
+    respond = finalize or _ensure_native_terminal_default_response
+
+    terminal_id = terminal_resource_id(terminal_name, "main")
+    lock = ensure_locks.setdefault(ctx.session_id, asyncio.Lock())
+    async with lock:
+        existing = await ctx.resource_registry.get_terminal_resource(ctx.session_id, terminal_id)
+        if existing is not None:
+            if is_owned is None or is_owned(ctx.resource_registry, existing):
+                _logger.info(
+                    "%s terminal ensure returning existing resource: session=%s terminal_id=%s",
+                    agent.display_name,
+                    ctx.session_id,
+                    terminal_id,
+                )
+                return respond(existing)
+            _logger.info(
+                "Replacing non-native %s terminal %s for session %s",
+                terminal_name,
+                terminal_id,
+                ctx.session_id,
+            )
+            closed = await ctx.resource_registry.close_terminal(ctx.session_id, terminal_id)
+            if not closed:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": {
+                            "code": "terminal_conflict",
+                            "message": conflict_message
+                            or "Existing terminal could not be closed.",
+                        }
+                    },
+                )
+
+        adapter = resolve_hook(provider, "auto_create_terminal")
+        try:
+            if build_context is not None:
+                ctx = await build_context(ctx)
+            view = await adapter(ctx)
+        except Exception as exc:
+            _logger.exception(
+                "%s terminal ensure failed for session=%s",
+                agent.display_name,
+                ctx.session_id,
+            )
+            return _native_terminal_start_error_response(exc, agent.display_name)
+        return respond(view)
 
 
 async def _claude_native_session_wants_rebuild(

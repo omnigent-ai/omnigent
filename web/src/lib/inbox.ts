@@ -24,6 +24,8 @@ export interface InboxItem {
    * (sub-agent) prompt into its parent's snapshot.
    */
   resolveSessionId: string;
+  /** Whether the viewer may accept this session's privileged actions. */
+  canApprove: boolean;
   elicitation: ElicitationRequest;
 }
 
@@ -32,6 +34,8 @@ export interface InboxSource {
   row: Conversation;
   /** Raw `response.elicitation_request` event dicts from `Session.pendingElicitations`. */
   pendingElicitations: Array<Record<string, unknown>>;
+  /** Whether the snapshot viewer may accept privileged actions. */
+  canApprove?: boolean;
 }
 
 /**
@@ -47,7 +51,7 @@ export function collectInboxItems(sources: InboxSource[]): InboxItem[] {
   const items: InboxItem[] = [];
   const seen = new Set<string>();
   const newestFirst = [...sources].sort((a, b) => b.row.updated_at - a.row.updated_at);
-  for (const { row, pendingElicitations } of newestFirst) {
+  for (const { row, pendingElicitations, canApprove } of newestFirst) {
     for (const raw of pendingElicitations) {
       const evt = parseEvent("response.elicitation_request", raw);
       if (evt === null || evt.type !== "elicitation_request") continue;
@@ -56,6 +60,7 @@ export function collectInboxItems(sources: InboxSource[]): InboxItem[] {
       items.push({
         row,
         resolveSessionId: evt.targetSessionId ?? row.id,
+        canApprove: canApprove ?? true,
         elicitation: evt,
       });
     }
