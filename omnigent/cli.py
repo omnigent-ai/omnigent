@@ -3246,23 +3246,10 @@ def server(
         return
 
     if background:
-        # `omnigent server --background` replaces the removed `server start`
-        # subcommand: ensure (or reuse) the managed detached local server and
-        # return immediately instead of running uvicorn in-process.
-        startup = ensure_local_omnigent_server()
-        verb = (
-            "Started background server at"
-            if startup.spawned
-            else "Background server already running at"
-        )
-        click.echo(f"{verb} {startup.url}")
-        # Surface the exact log file so a detached server isn't a black box —
-        # `server --background` is otherwise the only signal it ever emits.
-        # Known for a spawned server and (via the log-path sidecar) for a
-        # reused one too; absent only for a foreground `omnigent server` whose
-        # logs stream to its own terminal.
-        if startup.log_path is not None:
-            click.echo(f"  log: {_display_path(startup.log_path)}")
+        # `omnigent server --background` is the canonical spelling for the
+        # detached server; the deprecated ``server start`` alias routes to the
+        # same helper so both spellings can never drift.
+        _run_background_server()
         return
 
     port_source = ctx.get_parameter_source("port")
@@ -3682,6 +3669,53 @@ def _stop_local_server_and_daemon(*, force: bool) -> bool:
     # running" while one was still listening on the default port).
     orphan_pid = stop_untracked_local_server()
     return was_running or orphan_pid is not None
+
+
+def _run_background_server() -> None:
+    """Ensure (or reuse) the managed detached local server and report it.
+
+    The shared body of ``omnigent server --background`` and its deprecated
+    ``omnigent server start`` alias: spawn the detached managed server (or
+    adopt a healthy one that is already up) and return immediately instead of
+    running uvicorn in-process.
+
+    :returns: None.
+    """
+    startup = ensure_local_omnigent_server()
+    verb = (
+        "Started background server at"
+        if startup.spawned
+        else "Background server already running at"
+    )
+    click.echo(f"{verb} {startup.url}")
+    # Surface the exact log file so a detached server isn't a black box —
+    # this is otherwise the only signal the detached path ever emits.
+    # Known for a spawned server and (via the log-path sidecar) for a
+    # reused one too; absent only for a foreground `omnigent server` whose
+    # logs stream to its own terminal.
+    if startup.log_path is not None:
+        click.echo(f"  log: {_display_path(startup.log_path)}")
+
+
+@server.command("start", hidden=True)
+def server_start() -> None:
+    """Deprecated alias for ``omnigent server --background``.
+
+    Removed in v0.7.0 by #3105 and restored here for compatibility: the
+    desktop app ships on its own update channel, so a client built before
+    v0.7.0 still shells out to ``omni server start`` and hard-failed with
+    ``No such command 'start'`` against a newer CLI (#3578). Hidden from
+    ``--help`` (the flag is the documented spelling) and warns on stderr so
+    interactive users migrate, while the desktop's stdout parsing — which
+    reads the URL line — keeps working unchanged.
+
+    :returns: None.
+    """
+    click.echo(
+        "omnigent: `server start` is deprecated; use `omnigent server --background`.",
+        err=True,
+    )
+    _run_background_server()
 
 
 @server.command("stop")
