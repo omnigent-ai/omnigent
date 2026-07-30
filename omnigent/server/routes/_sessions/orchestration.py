@@ -2170,6 +2170,13 @@ async def _wait_for_host_bound_runner_client(
     slow yields no verdict at all and the plain connect grace runs its
     normal course.
 
+    The extension is per-dispatch, so its cost is paid per in-flight message
+    rather than once per session. Messages that overlap against the same
+    wedged binding each wait the full budget, because none of them observes
+    the rotated ``runner_id`` until the first relaunch has completed and
+    written it. Sequential messages do not compound this: once that relaunch
+    rotates the binding, later dispatches address the new runner.
+
     :param session_id: Session/conversation identifier.
     :param runner_router: The ``RunnerRouter`` instance, or ``None``.
     :param tunnel_registry: The server's ``TunnelRegistry``, or ``None``.
