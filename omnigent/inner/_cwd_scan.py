@@ -507,28 +507,44 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def merge_scan_roots(cwd: Path, *root_lists: Sequence[Path] | None) -> list[Path]:
+def merge_scan_roots(
+    cwd: Path,
+    *root_lists: Sequence[Path] | None,
+    recursive: bool,
+) -> list[Path]:
     """
     Merge the extra roots a backend must mask-scan (beyond *cwd*) into
     one deduplicated, ancestor-first list.
 
     Every supplied list — e.g. ``read_paths`` then ``write_paths`` — is
-    folded together so a path granted by more than one lever, or nested
-    under another grant, is walked once rather than once per lever. A
-    root is dropped when it:
+    folded together so a path granted by more than one lever is walked
+    once, not once per lever. A root is always dropped when it is *cwd*
+    or lives under *cwd*: the caller scans *cwd* itself, so that subtree
+    is covered (this predates the ``write_paths`` extension).
 
-    - is *cwd* or lives under *cwd* (the caller's cwd walk already
-      covered it), or
-    - sits at-or-under a root already kept (a broader grant subsumes it).
+    Whether a *granted* root nested under ANOTHER kept grant is dropped
+    depends on *recursive* — and getting this wrong un-masks secrets:
+
+    - ``recursive=True``: a kept root's walk descends its whole subtree,
+      so a grant nested under it is redundant and dropped.
+    - ``recursive=False`` (the default; see
+      :attr:`~omnigent.inner.datamodel.OSEnvSandboxSpec.cwd_hidden_scan_recursive`):
+      each walk masks only a root's IMMEDIATE children, so a parent walk
+      never reaches ``parent/deep/nested/.env``. Dropping the nested
+      grant would leave its top-level dotfiles visible. In this mode we
+      therefore keep every distinct granted root and drop only EXACT
+      duplicates.
 
     Kept roots are returned outermost-first, so a parent is always
-    yielded before any descendant that would otherwise survive — which
-    is what lets the nested-root skip fire deterministically.
+    yielded before any descendant.
 
     :param cwd: The working directory the caller scans separately.
     :param root_lists: One or more lists of roots (``None`` entries and
         empty lists are ignored). Order between lists matters only for
         stability — the dedup result is the same set either way.
+    :param recursive: Whether the backend walks each root recursively.
+        Must match ``cwd_hidden_scan_recursive`` so the nested-grant
+        drop only fires when a parent walk actually covers the child.
     :returns: The roots to walk, deduplicated and ordered outermost-first.
     """
     # Resolve each distinct root exactly once (symlink-free) so the
@@ -545,20 +561,29 @@ def merge_scan_roots(cwd: Path, *root_lists: Sequence[Path] | None) -> list[Path
                 continue
             seen_input.add(key)
             resolved.append((_resolve_str(root), root))
-    # Lexicographic sort on the resolved string puts every root
-    # immediately ahead of its own descendants (``/a`` < ``/a/b`` <
-    # ``/ab``), so a single "cover" pointer is enough to drop nested
-    # grants: anything at-or-under the last kept root is subsumed.
+    # Sort so a parent is processed before its descendants; the
+    # ancestor check below then sees the parent already in ``kept_strs``.
     resolved.sort(key=lambda pair: pair[0])
     kept: list[Path] = []
-    cover: str | None = None
+    kept_strs: set[str] = set()
     for root_str, root in resolved:
         if _within_str(root_str, cwd_str):
             continue
-        if cover is not None and _within_str(root_str, cover):
+        if recursive:
+            # A recursive walk of a kept ancestor covers this root. Walk
+            # the parent chain against the kept set (not just the last
+            # kept root) so an interleaving sibling name — e.g. ``/a-b``
+            # sorting between ``/a`` and ``/a/b`` — cannot hide the true
+            # ancestor and leave a redundant walk.
+            if _path_has_ancestor(root_str, kept_strs):
+                continue
+        elif root_str in kept_strs:
+            # Top-level-only: keep every distinct grant (a parent walk
+            # would not reach a nested grant's children); drop only an
+            # exact duplicate, which a parent walk does cover.
             continue
         kept.append(root)
-        cover = root_str
+        kept_strs.add(root_str)
     return kept
 
 
@@ -582,3 +607,27 @@ def _within_str(path_str: str, root_str: str) -> bool:
     if path_str == root_str:
         return True
     return path_str.startswith(root_str.rstrip(os.sep) + os.sep)
+
+
+def _path_has_ancestor(path_str: str, roots: set[str]) -> bool:
+    """
+    Return whether *path_str* itself, or any of its parent directories,
+    is present in *roots* — a pure string walk up the path components.
+
+    Unlike a single-prefix compare against the most recent kept root,
+    this checks the whole ancestor chain, so an unrelated sibling that
+    happens to sort in between (e.g. ``/a-b`` between ``/a`` and
+    ``/a/b``) cannot mask a real ancestor (``/a``).
+
+    :param path_str: Candidate resolved path string.
+    :param roots: Set of resolved root strings to test ancestry against.
+    :returns: ``True`` when *path_str* is at-or-under any entry in *roots*.
+    """
+    current = path_str
+    while True:
+        if current in roots:
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent

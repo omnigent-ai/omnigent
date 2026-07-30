@@ -787,13 +787,14 @@ def test_unreadable_subdirectory_is_skipped_silently(tmp_path: Path) -> None:
         )
 
 
-def test_merge_scan_roots_dedupes_cwd_nested_and_duplicates(tmp_path: Path) -> None:
+def test_merge_scan_roots_recursive_drops_cwd_nested_and_duplicates(tmp_path: Path) -> None:
     """
-    ``merge_scan_roots`` folds the read + write grant lists into one
-    set of roots to walk beyond cwd: it drops roots at-or-under cwd,
-    drops a root nested under another kept root, dedupes exact repeats
-    (including a path granted both read and write), and returns the
-    survivors ancestor-first.
+    With ``recursive=True`` a kept root's walk descends its whole
+    subtree, so ``merge_scan_roots`` folds the read + write grant lists
+    into one set: it drops roots at-or-under cwd, drops a root nested
+    under another kept root, dedupes exact repeats (including a path
+    granted both read and write), and returns the survivors ancestor-
+    first.
     """
     cwd = tmp_path / "work"
     cwd.mkdir()
@@ -801,7 +802,7 @@ def test_merge_scan_roots_dedupes_cwd_nested_and_duplicates(tmp_path: Path) -> N
     a.mkdir()
     b = tmp_path / "b"
     b.mkdir()
-    nested = a / "child"  # under ``a`` → subsumed
+    nested = a / "child"  # under ``a`` → subsumed by the recursive walk of ``a``
     nested.mkdir()
     under_cwd = cwd / "sub"  # under cwd → covered by the cwd scan
     under_cwd.mkdir()
@@ -810,11 +811,42 @@ def test_merge_scan_roots_dedupes_cwd_nested_and_duplicates(tmp_path: Path) -> N
         cwd,
         [a, b, a, cwd],  # read grants: duplicate ``a`` and cwd itself
         [b, nested, under_cwd],  # write grants: dup ``b``, a nested + under-cwd root
+        recursive=True,
     )
 
     # Only the two distinct outside-cwd top roots survive, ancestor-
     # first (siblings ordered lexicographically).
     assert result == [a, b], result
+
+
+def test_merge_scan_roots_non_recursive_keeps_nested_grant(tmp_path: Path) -> None:
+    """
+    Regression guard for the top-level-only default: a granted root
+    nested under another grant MUST still be walked, because a
+    non-recursive walk of the parent only masks the parent's immediate
+    children and never reaches the nested grant's dotfiles. Only exact
+    duplicates and roots under cwd are dropped.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    a.mkdir()
+    nested = a / "deep" / "nested"  # granted separately, below a's first level
+    nested.mkdir(parents=True)
+    under_cwd = cwd / "sub"  # under cwd → still dropped (cwd is special)
+    under_cwd.mkdir()
+
+    result = merge_scan_roots(
+        cwd,
+        [a, a],  # duplicate ``a`` → deduped
+        [nested, under_cwd],
+        recursive=False,
+    )
+
+    # ``a`` and its nested grant both survive (nested is NOT subsumed in
+    # top-level-only mode); the under-cwd root is dropped; ordered
+    # ancestor-first.
+    assert result == [a, nested], result
 
 
 def test_merge_scan_roots_keeps_ancestor_of_cwd(tmp_path: Path) -> None:
@@ -828,6 +860,5 @@ def test_merge_scan_roots_keeps_ancestor_of_cwd(tmp_path: Path) -> None:
     cwd = parent / "work"
     cwd.mkdir()
 
-    result = merge_scan_roots(cwd, [parent], None)
-
-    assert result == [parent], result
+    assert merge_scan_roots(cwd, [parent], None, recursive=True) == [parent]
+    assert merge_scan_roots(cwd, [parent], None, recursive=False) == [parent]

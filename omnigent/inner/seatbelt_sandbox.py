@@ -1817,7 +1817,12 @@ def _scan_extra_roots_mask_entries(
     if not policy.read_roots and not policy.write_roots:
         return entries
     allow_hidden = policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else []
-    for root in merge_scan_roots(cwd, policy.read_roots, policy.write_roots):
+    for root in merge_scan_roots(
+        cwd,
+        policy.read_roots,
+        policy.write_roots,
+        recursive=policy.cwd_hidden_scan_recursive,
+    ):
         try:
             root_entries = scan_cwd_mask_entries(
                 root,

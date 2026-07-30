@@ -1235,6 +1235,41 @@ def test_read_write_overlap_scanned_once(tmp_path: Path) -> None:
     assert count == 1, f"Expected a single .env mask across overlapping grants, got {count}."
 
 
+def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` grant nested below a ``read_paths``
+    root must still have its top-level dotfiles masked in the default
+    (non-recursive) mode. A non-recursive walk of the parent only masks
+    the parent's immediate children, so the nested grant must be walked
+    in its own right — it must NOT be dropped as "subsumed".
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    (a / "deep" / "nested").mkdir(parents=True)
+    (a / ".env").write_text("SECRET_A")
+    (a / "deep" / "nested" / ".env").write_text("SECRET_NESTED")
+
+    backend = _make_backend()
+    policy = _make_policy(
+        cwd,
+        read_roots=[a.resolve(strict=False)],
+        write_roots=[(a / "deep" / "nested").resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    top_env = str(a.resolve(strict=False) / ".env")
+    nested_env = str((a / "deep" / "nested").resolve(strict=False) / ".env")
+    assert _has_pair(argv, "--bind-try", "/dev/null", top_env), (
+        "Top-level .env of the read_paths root must be masked."
+    )
+    assert _has_pair(argv, "--bind-try", "/dev/null", nested_env), (
+        "Nested write_paths grant's .env must be masked in non-recursive mode; "
+        "dropping the nested root as subsumed would leak it."
+    )
+
+
 def test_dotfile_masking_skips_target_that_vanished_after_scan(
     tmp_path: Path,
 ) -> None:

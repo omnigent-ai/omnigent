@@ -2296,6 +2296,41 @@ def test_read_write_overlap_masked_once(tmp_path: Path) -> None:
     )
 
 
+def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` grant nested below a ``read_paths``
+    root must still have its top-level dotfiles denied in the default
+    (non-recursive) mode. A non-recursive walk of the parent masks only
+    the parent's immediate children, so the nested grant must be walked
+    in its own right rather than dropped as "subsumed".
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    (a / "deep" / "nested").mkdir(parents=True)
+    (a / ".env").write_text("SECRET_A")
+    (a / "deep" / "nested" / ".env").write_text("SECRET_NESTED")
+
+    policy = _make_policy(
+        cwd,
+        read_roots=[a.resolve(strict=False)],
+        write_roots=[(a / "deep" / "nested").resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    top_env = f'(deny file-read* file-write* (literal "{a.resolve(strict=False) / ".env"}"))'
+    nested_env = (
+        "(deny file-read* file-write* (literal "
+        f'"{(a / "deep" / "nested").resolve(strict=False) / ".env"}"))'
+    )
+    assert top_env in profile, "Top-level .env of the read_paths root must be denied."
+    assert nested_env in profile, (
+        "Nested write_paths grant's .env must be denied in non-recursive mode; "
+        "dropping the nested root as subsumed would leak it."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Exec-chain symlink hops + launcher target visibility (bwrap parity)
 # ---------------------------------------------------------------------------

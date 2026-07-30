@@ -1211,7 +1211,12 @@ def _dotfile_and_symlink_mask_args(
     # grant lists into one deduplicated, ancestor-first set (dropping
     # roots under cwd and roots nested under another kept root) so an
     # overlapping or doubly-granted path is walked once, not per-lever.
-    for root in merge_scan_roots(cwd, policy.read_roots, policy.write_roots):
+    for root in merge_scan_roots(
+        cwd,
+        policy.read_roots,
+        policy.write_roots,
+        recursive=policy.cwd_hidden_scan_recursive,
+    ):
         try:
             extra = scan_cwd_mask_entries(
                 root,
