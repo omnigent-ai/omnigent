@@ -57,6 +57,7 @@ import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { initialWindowComplete } from "@/lib/sessionsApi";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
@@ -1456,8 +1457,7 @@ function MainAgentSurface({
   const terminalFirst = useTerminalFirst();
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
   // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
-  // mobile never runs its eager history backfill (up to 2000 items/open) for a
-  // rail the user can't see.
+  // mobile never mounts observers and history listeners for a rail it can't see.
   const isMobileViewport = useIsMobileViewport();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
@@ -1498,8 +1498,8 @@ function MainAgentSurface({
   // One rail tick per real user turn, paired with a preview of the reply that
   // followed. Walk bubbles in order: each non-system user bubble opens a turn,
   // and the first assistant text after it (before the next user bubble) is the
-  // preview. Same first-page window as the transcript, so a fresh load shows
-  // ≤20 ticks and older ones page in on scroll-up.
+  // preview. It mirrors the transcript's loaded window and grows lazily as
+  // older pages arrive.
   const turns = useMemo<Turn[]>(() => {
     const out: Turn[] = [];
     for (let i = 0; i < bubbles.length; i++) {
@@ -1708,7 +1708,9 @@ function MainAgentSurface({
               md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
               the message column so the ticks don't butt against the text; the
               rail is hidden on mobile, so the extra left padding is md-only. */}
+          {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
           <ConversationContent
+            scrollClassName="[overflow-anchor:none]"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
               CHAT_COLUMN_WIDTH,
@@ -1718,10 +1720,7 @@ function MainAgentSurface({
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <PreserveScrollDistanceOnResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
-            <HistoryAutoLoader
-              hasMoreHistory={hasMoreHistory}
-              loadingMoreHistory={loadingMoreHistory}
-            />
+            <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
             {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
               // Cold launch: a centered spinner instead of the "ready to
               // type" empty state (the create-then-send path uses the
@@ -1749,6 +1748,8 @@ function MainAgentSurface({
               )
             ) : (
               <>
+                {/* Older pages prepend here while their request is in flight. */}
+                {loadingMoreHistory && <HistoryLoadingIndicator />}
                 {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
                 ))}
@@ -1795,6 +1796,12 @@ function MainAgentSurface({
                 <McpStartupIndicator />
               </>
             )}
+            {/* Frames the initially loaded turn at the top of the viewport and
+                keeps the pane scrollable so older history stays reachable.
+                Always mounted — including for an empty new conversation — so
+                a fast first send cannot become the captured initial anchor.
+                Last child so it measures everything above it. */}
+            <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
           </ConversationContent>
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
@@ -1820,8 +1827,7 @@ function MainAgentSurface({
         {/* Left-edge minimap: one tick per turn, scrolls independently, pages
             in older history on scroll-up. Sibling of Conversation for the same
             reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
-            Desktop-only: not mounted on mobile so its eager backfill never
-            runs where the rail is hidden. */}
+            Desktop-only: not mounted on mobile where the rail is hidden. */}
         {!isMobileViewport && (
           <TurnRail
             turns={turns}
@@ -2104,100 +2110,239 @@ function PreserveScrollDistanceOnResize() {
   return null;
 }
 
-/**
- * Headless older-history loader. Pages older session items in two ways
- * with no visible control:
- *
- * 1. Near-top scroll trigger — fetches as the user scrolls toward the top.
- * 2. Viewport-fill guard — when the loaded window is too short to produce a
- *    scrollbar (so the scroll trigger can never fire), keeps paging until
- *    the content overflows or history runs out, keeping older messages
- *    reachable without a button.
- *
- * Must be rendered inside a `StickToBottom` tree to access `scrollRef`.
- *
- * @param hasMoreHistory - Whether older messages exist before the loaded window.
- * @param loadingMoreHistory - Whether an older-history page is currently loading.
- */
+function HistoryLoadingIndicator() {
+  return (
+    <div
+      role="status"
+      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm"
+    >
+      <Loader2Icon className="size-4 animate-spin" aria-hidden />
+      Loading earlier messages…
+    </div>
+  );
+}
+
+/** Builds the initial history window, then keeps loading near the top. */
+const HISTORY_LOAD_TOP_THRESHOLD_PX = 500;
+
 export function HistoryAutoLoader({
-  hasMoreHistory,
-  loadingMoreHistory,
+  scrollElement,
 }: {
-  hasMoreHistory: boolean;
-  loadingMoreHistory: boolean;
-}) {
+  scrollElement?: HTMLElement | null;
+} = {}) {
   // useStickToBottomContext exposes scrollRef (the actual scroll container
   // element) in the runtime context even though the public TS types only
   // declare isAtBottom and scrollToBottom. Cast to access it.
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
+  const historyGeneration = useChatStore((s) => s.historyGeneration);
+  const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
+  // A successful page updates this cursor in the same store transaction that
+  // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
+  // still changes when many fetched tool calls collapse into one visual row.
+  const oldestItemId = useChatStore((s) => s.oldestItemId);
+  const pagesFetchedRef = useRef(1);
+  const generationRef = useRef(historyGeneration);
+  const [scrollRevision, setScrollRevision] = useState(0);
+  const handledScrollRevisionRef = useRef(scrollRevision);
+  const oldestItemIdRef = useRef(oldestItemId);
+  const loadingMoreHistoryRef = useRef(loadingMoreHistory);
 
-  // Preserve scroll position when items are prepended after a scroll-up
-  // fetch. Snapshot scrollHeight before the call; restore the offset in a
-  // layout effect so the visible content doesn't jump.
+  // Preserve the latest user position across skeleton insertion/removal and
+  // the intervening prepend. Native overflow anchoring is disabled above so
+  // this correction is the single source of truth across browsers.
   const prevScrollHeightRef = useRef<number | null>(null);
-  const loadOlderPreservingOffset = useCallback(() => {
-    if (!hasMoreHistory || loadingMoreHistory) return;
-    const el = ctx.scrollRef?.current;
-    if (el) prevScrollHeightRef.current = el.scrollHeight;
-    void useChatStore.getState().loadMoreHistory();
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory]);
+  const prevScrollTopRef = useRef(0);
 
+  // Register before sibling layout effects can resize the transcript and make
+  // StickToBottom adjust scrollTop; otherwise that first scroll can be missed.
   useLayoutEffect(() => {
-    const el = ctx.scrollRef?.current;
-    // Wait until loadingMoreHistory is false — the prepend render that grows
-    // scrollHeight is the one to correct. Consuming the snapshot earlier
-    // would null the ref before the prepend lands, causing a scroll jump.
-    if (!el || prevScrollHeightRef.current === null || loadingMoreHistory) return;
-    const delta = el.scrollHeight - prevScrollHeightRef.current;
-    if (delta > 0) el.scrollTop += delta;
-    prevScrollHeightRef.current = null;
-  });
-
-  useEffect(() => {
-    const el = ctx.scrollRef?.current;
+    const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
     const handleScroll = () => {
-      if (el.scrollTop < 300 && hasMoreHistory && !loadingMoreHistory) {
-        loadOlderPreservingOffset();
-      }
+      prevScrollHeightRef.current = el.scrollHeight;
+      prevScrollTopRef.current = el.scrollTop;
+      setScrollRevision((revision) => revision + 1);
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, loadOlderPreservingOffset]);
+  }, [ctx.scrollRef, scrollElement]);
 
-  // Viewport-fill guard. When the loaded window is too short to overflow, page
-  // again so older history stays reachable without a scrollbar to scroll up.
-  // No offset snapshot here: with a short window the user sits at the bottom
-  // and use-stick-to-bottom keeps them pinned as older items prepend.
-  const maybeFillViewport = useCallback(() => {
-    const el = ctx.scrollRef?.current;
-    if (!el || !hasMoreHistory || loadingMoreHistory) return;
-    if (el.scrollHeight <= el.clientHeight) {
-      void useChatStore.getState().loadMoreHistory();
+  // This is the single paging effect. Fetches are driven by user scrolls or a
+  // changed oldest item, including a visually height-neutral prepend.
+  useLayoutEffect(() => {
+    const el = scrollElement ?? ctx.scrollRef?.current;
+    if (!el) return;
+
+    const generationChanged = generationRef.current !== historyGeneration;
+    const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
+    const loadingChanged =
+      !generationChanged && loadingMoreHistoryRef.current !== loadingMoreHistory;
+    const scrollPositionChanged =
+      !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
+    oldestItemIdRef.current = oldestItemId;
+    loadingMoreHistoryRef.current = loadingMoreHistory;
+    handledScrollRevisionRef.current = scrollRevision;
+
+    if (generationChanged) {
+      generationRef.current = historyGeneration;
+      pagesFetchedRef.current = 1;
+      prevScrollHeightRef.current = null;
     }
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory]);
 
-  // Re-check on mount and whenever a fetch settles (loadingMoreHistory flips
-  // back to false): if content still doesn't overflow, the callback pages again.
-  useEffect(() => {
-    maybeFillViewport();
-  }, [maybeFillViewport]);
+    const state = useChatStore.getState();
+    const userPromptCount = state.blocks.reduce(
+      (count, block) =>
+        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
+      0,
+    );
+    const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
-  // Re-check when the viewport grows (window resize, side panel close): a
-  // previously-scrollable window can stop overflowing, removing the scrollbar
-  // and stranding older history with nothing left to trigger a fetch.
-  useEffect(() => {
-    const el = ctx.scrollRef?.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => maybeFillViewport());
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [ctx.scrollRef, maybeFillViewport]);
+    if ((itemsChanged || loadingChanged) && prevScrollHeightRef.current !== null) {
+      const nextScrollTop = Math.max(
+        0,
+        el.scrollHeight - prevScrollHeightRef.current + prevScrollTopRef.current,
+      );
+      if (el.scrollTop !== nextScrollTop) el.scrollTop = nextScrollTop;
+    }
+    prevScrollHeightRef.current = el.scrollHeight;
+    prevScrollTopRef.current = el.scrollTop;
 
-  // No visible control — history loads purely on scroll-up / viewport fill.
+    if (
+      !state.oldestItemId ||
+      !state.hasMoreHistory ||
+      state.loadingMoreHistory ||
+      (!buildingInitialWindow &&
+        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX))
+    ) {
+      return;
+    }
+
+    if (buildingInitialWindow) pagesFetchedRef.current += 1;
+    void state.loadMoreHistory();
+  }, [
+    ctx.scrollRef,
+    historyGeneration,
+    loadingMoreHistory,
+    oldestItemId,
+    scrollElement,
+    scrollRevision,
+  ]);
+
+  // No visible control — history loads purely on scroll-up / the initial-window
+  // build above.
   return null;
+}
+
+/** Top inset for a pinned anchor: 16px beyond the fade's fully opaque edge. */
+const PINNED_ANCHOR_TOP_GAP_PX = 96;
+
+/**
+ * Trailing spacer that pins the initially loaded turn's anchor to the top of
+ * the viewport — the newest committed user prompt, or (on a page deep in a
+ * long tool chain with no prompt yet) the newest assistant text output. The
+ * anchor is captured once when the hydrated chat surface mounts. Live sends
+ * therefore consume the reserved space instead of becoming a new anchor and
+ * jumping to the top before the harness starts processing them.
+ *
+ * As a side effect it keeps the transcript taller than its scroll container
+ * whenever any content sits above the anchor, so older history stays reachable
+ * by scroll-up without a viewport-fill loop.
+ *
+ * Height = clientHeight − (anchor-top → content-bottom) − top gap, clamped to
+ * ≥ 0: a short reply leaves empty space below (anchor stays pinned at top);
+ * once the reply alone exceeds the viewport the spacer collapses to 0 and
+ * normal stick-to-bottom following resumes. The "content-bottom" edge is the
+ * spacer's own top, whose position is fixed by the content above it and so is
+ * independent of the height we set — the measurement can't feed back on itself.
+ */
+export function LatestTurnSpacer({
+  scrollElement,
+}: {
+  scrollElement?: HTMLElement | null;
+} = {}) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef: React.RefObject<HTMLElement>;
+  };
+  // Block changes remeasure the frozen anchor; streaming growth is covered by
+  // the ResizeObserver. The hydration gate remounts this component on a
+  // conversation switch, which captures that conversation's initial anchor.
+  const blockCount = useChatStore((s) => s.blocks.length);
+  const spacerRef = useRef<HTMLDivElement>(null);
+  // `undefined` means capture has not run; `null` is a completed capture with
+  // no suitable initial anchor (for example a brand-new empty conversation).
+  const initialAnchorRef = useRef<HTMLElement | null | undefined>(undefined);
+  const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
+  if (initialCommittedUserIdsRef.current === null) {
+    const ids = new Set<string>();
+    for (const block of useChatStore.getState().blocks) {
+      if (
+        block.type === "user_message" &&
+        !isSystemUserContent(block.content) &&
+        block.ctx.itemId !== null
+      ) {
+        ids.add(block.ctx.itemId);
+      }
+    }
+    initialCommittedUserIdsRef.current = ids;
+  }
+
+  const measure = useCallback(() => {
+    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
+    const spacerEl = spacerRef.current;
+    if (!scrollEl || !spacerEl) return;
+    if (initialAnchorRef.current === undefined) {
+      // Match DOM bubbles against committed blocks so an optimistic pending
+      // send visible during this first layout can never become the anchor.
+      const users = scrollEl.querySelectorAll<HTMLElement>(
+        '[data-role="user"][data-user-message-id]',
+      );
+      let initialUser: HTMLElement | null = null;
+      for (let index = users.length - 1; index >= 0; index -= 1) {
+        const candidate = users[index]!;
+        const itemId = candidate.dataset.userMessageId;
+        if (itemId !== undefined && initialCommittedUserIdsRef.current!.has(itemId)) {
+          initialUser = candidate;
+          break;
+        }
+      }
+      const texts = scrollEl.querySelectorAll<HTMLElement>(
+        '[data-testid="assistant-text-section"]',
+      );
+      initialAnchorRef.current = initialUser ?? texts[texts.length - 1] ?? null;
+    }
+    const anchor = initialAnchorRef.current;
+    if (!anchor) {
+      // Do not let the always-mounted sentinel become a zero-height flex item:
+      // the content column's gap would otherwise shift an empty-state layout.
+      spacerEl.style.display = "none";
+      return;
+    }
+    // rect diffs are scroll-invariant (both edges shift together), and the
+    // spacer's top is fixed by the content above it, so this is stable across
+    // the height we're about to set — it converges in one pass.
+    const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
+    const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
+    const current = Number.parseFloat(spacerEl.style.height) || 0;
+    if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
+  }, [ctx.scrollRef, scrollElement]);
+
+  useLayoutEffect(() => {
+    measure();
+  }, [measure, blockCount]);
+
+  useLayoutEffect(() => {
+    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
+    const contentEl = spacerRef.current?.parentElement;
+    if (!scrollEl || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(scrollEl); // viewport (clientHeight) changes
+    if (contentEl) observer.observe(contentEl); // streaming / reflow growth
+    return () => observer.disconnect();
+  }, [ctx.scrollRef, measure, scrollElement]);
+
+  return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
 }
 
 /**

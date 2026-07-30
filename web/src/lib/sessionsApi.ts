@@ -820,19 +820,20 @@ export async function fetchSessionItemsPage(
   return { items: [...page.data].reverse(), hasMore: page.has_more };
 }
 
-/**
- * Upper bound on pages `fetchInitialHistoryWindow` will fetch before
- * giving up on reaching the previous-user-message boundary. Caps a
- * pathological single turn (thousands of tool calls between two user
- * prompts) from fanning out into unbounded requests on open. When the
- * cap is hit we stop with `hasMore: true`, so the rest stays reachable
- * via scroll-up `loadMoreHistory` — not a silent truncation.
- */
-const MAX_INITIAL_PAGES = 8;
+/** Pages allowed while looking for the previous user-message boundary. */
+export const MAX_INITIAL_PAGES = 8;
 
 /** A real (non-meta) user prompt — the boundary the initial window snaps to. */
 function isUserPrompt(item: ConversationItem): boolean {
   return isMessageItem(item) && item.role === "user" && !item.is_meta;
+}
+
+/**
+ * The prompt boundary is complete after two real prompts or the page cap.
+ * The cap applies only to this semantic target, not viewport filling.
+ */
+export function initialWindowComplete(userPromptCount: number, pagesFetched: number): boolean {
+  return userPromptCount >= 2 || pagesFetched >= MAX_INITIAL_PAGES;
 }
 
 /**
@@ -861,14 +862,14 @@ export async function fetchInitialHistoryWindow(sessionId: string): Promise<Sess
   let hasMore = true;
   // Each page starts before the cursor returned by the prior page.
   /* oxlint-disable no-await-in-loop */
-  for (let pages = 0; pages < MAX_INITIAL_PAGES; pages++) {
+  for (let pagesFetched = 1; pagesFetched <= MAX_INITIAL_PAGES; pagesFetched += 1) {
     const cursor = items[0]?.id;
     const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
     items = [...page.items, ...items]; // prepend the older page
     hasMore = page.hasMore;
     if (!hasMore) break; // reached the start of the conversation
-    const userCount = items.filter(isUserPrompt).length;
-    if (items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2) break;
+    const userPromptCount = items.filter(isUserPrompt).length;
+    if (initialWindowComplete(userPromptCount, pagesFetched)) break;
     if (!items[0]?.id) break; // no cursor to page further; avoid a spin
   }
   /* oxlint-enable no-await-in-loop */
