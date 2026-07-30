@@ -656,6 +656,28 @@ def test_launch_host_times_out_with_reason(
         )
 
 
+def test_launch_host_times_out_using_configured_pod_ready_timeout(
+    fake_core: _FakeCore,
+) -> None:
+    """A configured pod_ready_timeout_s drives the wait deadline and its message."""
+    fake_core.read_default = _pod(phase="Pending")
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pod_ready_timeout_s=0,
+    )
+    with pytest.raises(click.ClickException, match="did not start within 0s"):
+        launcher.start_host(
+            "omnigent-pod-6",
+            token=_TOKEN,
+            host_id="host_6",
+            host_name="managed-6",
+            server_url="http://srv.example.com",
+        )
+
+
 def test_terminate_deletes_pod_and_secret(fake_core: _FakeCore) -> None:
     """Terminate deletes both the Pod and its token Secret."""
     _launcher().terminate("omnigent-pod-6")
