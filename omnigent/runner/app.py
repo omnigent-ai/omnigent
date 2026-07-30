@@ -114,6 +114,7 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
+from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -3612,45 +3613,6 @@ def create_runner_app(
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))
 
-    def _wake_parent_after_native_interrupt(conv_id: str) -> None:
-        delivery_ack = _mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent interrupted]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
-        ):
-            _logger.warning(
-                "Native interrupt: sub-agent delivery not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-
-    async def _handle_claude_native_interrupt(conv_id: str) -> Response:
-        from omnigent.claude_native_bridge import (
-            bridge_dir_for_bridge_id,
-            inject_interrupt,
-        )
-
-        bridge_id = await _claude_native_bridge_id_for_session(
-            server_client=server_client,
-            session_id=conv_id,
-        )
-        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        try:
-            await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "claude_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native interrupt"),
-                },
-            )
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
-
     async def _codex_native_bridge_state_for_session(
         conv_id: str,
         *,
@@ -3692,100 +3654,6 @@ def create_runner_app(
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
     )
-
-    async def _handle_codex_native_interrupt(conv_id: str) -> Response:
-        from omnigent.codex_native_app_server import client_for_transport
-        from omnigent.codex_native_bridge import (
-            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
-            bridge_dir_for_bridge_id,
-            cancel_pending_mcp_startup,
-            read_mcp_startup,
-        )
-
-        state = await _codex_native_bridge_state_for_session(conv_id, action="interrupt")
-        if state is None:
-            return Response(status_code=204)
-        labels = await _session_labels_for_runner_spawn(
-            server_client=server_client,
-            session_id=conv_id,
-        )
-        bridge_dir = bridge_dir_for_bridge_id(
-            labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
-        )
-        pending_mcp = cancel_pending_mcp_startup(bridge_dir)
-        if state.active_turn_id is None and not pending_mcp:
-            _logger.info(
-                "Codex-native interrupt skipped for %s: no active turn or MCP startup.",
-                conv_id,
-            )
-            return Response(status_code=204)
-        if pending_mcp:
-            _logger.info(
-                "Codex-native interrupt for %s cancels MCP startup: %s",
-                conv_id,
-                ", ".join(pending_mcp),
-            )
-            try:
-                await server_client.post(
-                    f"/v1/sessions/{conv_id}/events",
-                    json={
-                        "type": "external_mcp_startup",
-                        "data": {"servers": read_mcp_startup(bridge_dir)},
-                    },
-                    timeout=10.0,
-                )
-            except Exception:  # noqa: BLE001 - the bridge flip already took effect locally.
-                _logger.warning(
-                    "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
-                )
-
-        codex_client = client_for_transport(
-            state.socket_path,
-            client_name="omnigent-codex-native-runner",
-        )
-        try:
-            await codex_client.connect()
-            if pending_mcp:
-                try:
-                    await codex_client.request(
-                        "turn/interrupt",
-                        {"threadId": state.thread_id, "turnId": ""},
-                    )
-                except Exception:  # noqa: BLE001 - the local cancel already took effect.
-                    _logger.warning(
-                        "Codex-native MCP startup interrupt failed for session=%s thread=%s",
-                        conv_id,
-                        state.thread_id,
-                        exc_info=True,
-                    )
-            if state.active_turn_id is not None:
-                await codex_client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures to caller.
-            _logger.warning(
-                "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
-                conv_id,
-                state.thread_id,
-                state.active_turn_id,
-                exc_info=True,
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "codex_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="codex-native interrupt"),
-                },
-            )
-        finally:
-            with contextlib.suppress(Exception):
-                await codex_client.close()
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
 
     async def _handle_codex_native_settings_update(
         conv_id: str,
@@ -3951,30 +3819,6 @@ def create_runner_app(
                 await codex_client.close()
         return options
 
-    async def _handle_pi_native_interrupt(conv_id: str) -> Response:
-        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_interrupt
-
-        try:
-            await asyncio.to_thread(
-                enqueue_interrupt,
-                bridge_dir_for_session_id(conv_id),
-            )
-        except OSError as exc:
-            _logger.warning(
-                "Pi-native interrupt failed for session=%s",
-                conv_id,
-                exc_info=True,
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "pi_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="pi-native interrupt"),
-                },
-            )
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
-
     async def _handle_pi_native_model_change(
         conv_id: str,
         model: str | None,
@@ -4032,360 +3876,6 @@ def create_runner_app(
                 session_key=session_key,
                 publish_event=_publish_event,
             )
-
-    async def _handle_claude_native_stop(conv_id: str) -> Response:
-        from omnigent.claude_native_bridge import (
-            bridge_dir_for_bridge_id,
-            kill_session,
-        )
-
-        bridge_id = await _claude_native_bridge_id_for_session(
-            server_client=server_client,
-            session_id=conv_id,
-        )
-        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        try:
-            await asyncio.to_thread(kill_session, bridge_dir, timeout_s=1.0)
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "claude_native_stop_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native stop"),
-                },
-            )
-        await _teardown_session_terminals(conv_id)
-        _publish_event(
-            conv_id,
-            {"type": "session.status", "status": "idle"},
-        )
-        delivery_ack = _mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent stopped]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
-        ):
-            _logger.warning(
-                "Claude-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
-
-    async def _handle_cursor_native_interrupt(conv_id: str) -> Response:
-        from omnigent.cursor_native_bridge import bridge_dir_for_session_id, inject_interrupt
-
-        try:
-            await asyncio.to_thread(
-                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "cursor_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="cursor-native interrupt"),
-                },
-            )
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
-
-    async def _handle_cursor_native_stop(conv_id: str) -> Response:
-        from omnigent.cursor_native_bridge import bridge_dir_for_session_id, kill_session
-
-        try:
-            await asyncio.to_thread(
-                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "cursor_native_stop_failed",
-                    "detail": _client_safe_error_detail(exc, context="cursor-native stop"),
-                },
-            )
-        await _teardown_session_terminals(conv_id)
-        await _cancel_auto_forwarder_task(conv_id)
-        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        delivery_ack = _mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent stopped]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
-        ):
-            _logger.warning(
-                "Cursor-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
-
-    async def _handle_goose_native_interrupt(conv_id: str) -> Response:
-        from omnigent.goose_native_bridge import bridge_dir_for_session_id, inject_interrupt
-
-        try:
-            await asyncio.to_thread(
-                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "goose_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="goose-native interrupt"),
-                },
-            )
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
-
-    async def _handle_kiro_native_interrupt(conv_id: str) -> Response:
-        from omnigent.kiro_native_bridge import bridge_dir_for_session_id, inject_interrupt
-
-        try:
-            await asyncio.to_thread(
-                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "kiro_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="kiro-native interrupt"),
-                },
-            )
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
-
-    async def _handle_kimi_native_interrupt(conv_id: str) -> Response:
-        from omnigent.kimi_native_bridge import bridge_dir_for_session_id, inject_interrupt
-
-        try:
-            await asyncio.to_thread(
-                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "kimi_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="kimi-native interrupt"),
-                },
-            )
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
-
-    async def _handle_goose_native_stop(conv_id: str) -> Response:
-        from omnigent.goose_native_bridge import bridge_dir_for_session_id, kill_session
-
-        try:
-            await asyncio.to_thread(
-                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "goose_native_stop_failed",
-                    "detail": _client_safe_error_detail(exc, context="goose-native stop"),
-                },
-            )
-        await _teardown_session_terminals(conv_id)
-        await _cancel_auto_forwarder_task(conv_id)
-        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        delivery_ack = _mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent stopped]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
-        ):
-            _logger.warning(
-                "Goose-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
-
-    async def _handle_kiro_native_stop(conv_id: str) -> Response:
-        from omnigent.kiro_native_bridge import bridge_dir_for_session_id, kill_session
-
-        try:
-            await asyncio.to_thread(
-                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "kiro_native_stop_failed",
-                    "detail": _client_safe_error_detail(exc, context="kiro-native stop"),
-                },
-            )
-        await _teardown_session_terminals(conv_id)
-        await _cancel_auto_forwarder_task(conv_id)
-        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        delivery_ack = _mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent stopped]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
-        ):
-            _logger.warning(
-                "Kiro-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
-
-    async def _handle_kimi_native_stop(conv_id: str) -> Response:
-        from omnigent.kimi_native_bridge import bridge_dir_for_session_id, kill_session
-
-        try:
-            await asyncio.to_thread(
-                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "kimi_native_stop_failed",
-                    "detail": _client_safe_error_detail(exc, context="kimi-native stop"),
-                },
-            )
-        await _teardown_session_terminals(conv_id)
-        await _cancel_auto_forwarder_task(conv_id)
-        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        delivery_ack = _mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent stopped]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
-        ):
-            _logger.warning(
-                "Kimi-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
-
-    async def _handle_hermes_native_interrupt(conv_id: str) -> Response:
-        from omnigent.hermes_native_bridge import bridge_dir_for_session_id, inject_interrupt
-
-        try:
-            await asyncio.to_thread(
-                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "hermes_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="hermes-native interrupt"),
-                },
-            )
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
-
-    async def _handle_hermes_native_stop(conv_id: str) -> Response:
-        from omnigent.hermes_native_bridge import bridge_dir_for_session_id, kill_session
-
-        try:
-            await asyncio.to_thread(
-                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "hermes_native_stop_failed",
-                    "detail": _client_safe_error_detail(exc, context="hermes-native stop"),
-                },
-            )
-        await _teardown_session_terminals(conv_id)
-        await _cancel_auto_forwarder_task(conv_id)
-        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        delivery_ack = _mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent stopped]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
-        ):
-            _logger.warning(
-                "Hermes-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
-
-    async def _handle_qwen_native_interrupt(conv_id: str) -> Response:
-        from omnigent.qwen_native_bridge import bridge_dir_for_session_id, inject_interrupt
-
-        try:
-            await asyncio.to_thread(
-                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "qwen_native_interrupt_failed",
-                    "detail": _client_safe_error_detail(exc, context="qwen-native interrupt"),
-                },
-            )
-        _wake_parent_after_native_interrupt(conv_id)
-        return Response(status_code=204)
-
-    async def _handle_qwen_native_stop(conv_id: str) -> Response:
-        from omnigent.qwen_native_bridge import bridge_dir_for_session_id, kill_session
-
-        try:
-            await asyncio.to_thread(
-                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
-            )
-        except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "qwen_native_stop_failed",
-                    "detail": _client_safe_error_detail(exc, context="qwen-native stop"),
-                },
-            )
-        await _teardown_session_terminals(conv_id)
-        await _cancel_auto_forwarder_task(conv_id)
-        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        delivery_ack = _mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent stopped]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
-        ):
-            _logger.warning(
-                "qwen-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
 
     async def _handle_claude_native_effort_change(
         conv_id: str,
@@ -5264,6 +4754,17 @@ def create_runner_app(
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
         return ack
+
+    _native_interrupt_runner = NativeInterruptRunner(
+        server_client=server_client,
+        resource_registry=resource_registry,
+        publish_event=_publish_event,
+        mark_subagent_terminal_and_wake=_mark_subagent_terminal_and_wake,
+        session_sub_agent_names=_session_sub_agent_names,
+        codex_bridge_state_for_session=_codex_native_bridge_state_for_session,
+        client_safe_error_detail=_client_safe_error_detail,
+        logger=_logger,
+    )
 
     async def _ensure_comment_relay_started(
         session_id: str,
@@ -6445,24 +5946,9 @@ def create_runner_app(
 
         if body_type == "interrupt":
             _harness = _session_harness_name(conversation_id)
-            if _harness == "claude-native":
-                return await _handle_claude_native_interrupt(conversation_id)
-            if _harness == "codex-native":
-                return await _handle_codex_native_interrupt(conversation_id)
-            if _harness == "pi-native":
-                return await _handle_pi_native_interrupt(conversation_id)
-            if _harness == "cursor-native":
-                return await _handle_cursor_native_interrupt(conversation_id)
-            if _harness == "goose-native":
-                return await _handle_goose_native_interrupt(conversation_id)
-            if _harness == "kiro-native":
-                return await _handle_kiro_native_interrupt(conversation_id)
-            if _harness == "hermes-native":
-                return await _handle_hermes_native_interrupt(conversation_id)
-            if _harness == "qwen-native":
-                return await _handle_qwen_native_interrupt(conversation_id)
-            if _harness == "kimi-native":
-                return await _handle_kimi_native_interrupt(conversation_id)
+            _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
+            if _interrupt_resp is not None:
+                return _interrupt_resp
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 
@@ -6509,24 +5995,9 @@ def create_runner_app(
 
         if body_type == "stop_session":
             _harness = _session_harness_name(conversation_id)
-            if _harness == "claude-native":
-                return await _handle_claude_native_stop(conversation_id)
-            if _harness == "codex-native":
-                return await _handle_codex_native_interrupt(conversation_id)
-            if _harness == "pi-native":
-                return await _handle_pi_native_interrupt(conversation_id)
-            if _harness == "cursor-native":
-                return await _handle_cursor_native_stop(conversation_id)
-            if _harness == "goose-native":
-                return await _handle_goose_native_stop(conversation_id)
-            if _harness == "kiro-native":
-                return await _handle_kiro_native_stop(conversation_id)
-            if _harness == "hermes-native":
-                return await _handle_hermes_native_stop(conversation_id)
-            if _harness == "qwen-native":
-                return await _handle_qwen_native_stop(conversation_id)
-            if _harness == "kimi-native":
-                return await _handle_kimi_native_stop(conversation_id)
+            _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
+            if _stop_resp is not None:
+                return _stop_resp
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 
