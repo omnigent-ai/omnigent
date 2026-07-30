@@ -254,6 +254,13 @@ databricks = [
     # fresh install on Python 3.14 tries (and fails) to build it from source.
     "databricks-ai-bridge>=0.19",
 ]
+# WebSocket / HTTP load testing (dev/loadtest/). Locust drives the load; the
+# stdlib-free websocket-client opens the client-facing WS /v1/sessions/updates
+# sockets. Opt-in — only `locust -f dev/loadtest/...` users need it.
+loadtest = [
+    "locust>=2.30,<3",
+    "websocket-client>=1.7,<2",
+]
 dev = [
     "pytest>=7.0",
     # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
