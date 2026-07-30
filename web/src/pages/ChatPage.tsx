@@ -1708,7 +1708,9 @@ function MainAgentSurface({
               md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
               the message column so the ticks don't butt against the text; the
               rail is hidden on mobile, so the extra left padding is md-only. */}
+          {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
           <ConversationContent
+            scrollClassName="[overflow-anchor:none]"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
               CHAT_COLUMN_WIDTH,
@@ -2110,7 +2112,7 @@ function PreserveScrollDistanceOnResize() {
 function HistoryLoadingSkeleton() {
   return (
     <div role="status" aria-label="Loading earlier messages" className="flex flex-col gap-4 py-2">
-      <div aria-hidden className="flex flex-col gap-4 animate-pulse">
+      <div aria-hidden className="flex flex-col gap-6 animate-pulse">
         <Message from="assistant" className="max-w-3xl">
           <MessageContent className="w-full">
             <div className="h-3 w-3/4 rounded-full bg-muted" />
@@ -2145,6 +2147,7 @@ export function HistoryAutoLoader() {
     scrollRef: React.RefObject<HTMLElement>;
   };
   const historyGeneration = useChatStore((s) => s.historyGeneration);
+  const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
   // A successful page updates this cursor in the same store transaction that
   // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
   // still changes when many fetched tool calls collapse into one visual row.
@@ -2154,16 +2157,22 @@ export function HistoryAutoLoader() {
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
+  const loadingMoreHistoryRef = useRef(loadingMoreHistory);
 
-  // Preserve scroll position when items are prepended after a scroll-up
-  // fetch. The same layout effect that restores the offset decides whether
-  // the pane is still near enough to the top to queue another page.
+  // Preserve the latest user position across skeleton insertion/removal and
+  // the intervening prepend. Native overflow anchoring is disabled above so
+  // this correction is the single source of truth across browsers.
   const prevScrollHeightRef = useRef<number | null>(null);
+  const prevScrollTopRef = useRef(0);
 
   useEffect(() => {
     const el = ctx.scrollRef?.current;
     if (!el) return;
-    const handleScroll = () => setScrollRevision((revision) => revision + 1);
+    const handleScroll = () => {
+      prevScrollHeightRef.current = el.scrollHeight;
+      prevScrollTopRef.current = el.scrollTop;
+      setScrollRevision((revision) => revision + 1);
+    };
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
   }, [ctx.scrollRef]);
@@ -2176,9 +2185,12 @@ export function HistoryAutoLoader() {
 
     const generationChanged = generationRef.current !== historyGeneration;
     const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
+    const loadingChanged =
+      !generationChanged && loadingMoreHistoryRef.current !== loadingMoreHistory;
     const scrollPositionChanged =
       !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
     oldestItemIdRef.current = oldestItemId;
+    loadingMoreHistoryRef.current = loadingMoreHistory;
     handledScrollRevisionRef.current = scrollRevision;
 
     if (generationChanged) {
@@ -2195,11 +2207,15 @@ export function HistoryAutoLoader() {
     );
     const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
-    if (itemsChanged && prevScrollHeightRef.current !== null) {
-      const delta = el.scrollHeight - prevScrollHeightRef.current;
-      if (delta !== 0) el.scrollTop = Math.max(0, el.scrollTop + delta);
-      prevScrollHeightRef.current = null;
+    if ((itemsChanged || loadingChanged) && prevScrollHeightRef.current !== null) {
+      const nextScrollTop = Math.max(
+        0,
+        el.scrollHeight - prevScrollHeightRef.current + prevScrollTopRef.current,
+      );
+      if (el.scrollTop !== nextScrollTop) el.scrollTop = nextScrollTop;
     }
+    prevScrollHeightRef.current = el.scrollHeight;
+    prevScrollTopRef.current = el.scrollTop;
 
     if (
       !state.oldestItemId ||
@@ -2211,10 +2227,9 @@ export function HistoryAutoLoader() {
       return;
     }
 
-    prevScrollHeightRef.current = el.scrollHeight;
     if (buildingInitialWindow) pagesFetchedRef.current += 1;
     void state.loadMoreHistory();
-  }, [ctx.scrollRef, historyGeneration, oldestItemId, scrollRevision]);
+  }, [ctx.scrollRef, historyGeneration, loadingMoreHistory, oldestItemId, scrollRevision]);
 
   // No visible control — history loads purely on scroll-up / the initial-window
   // build above.

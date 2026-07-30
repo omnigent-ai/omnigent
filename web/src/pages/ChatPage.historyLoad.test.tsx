@@ -138,6 +138,39 @@ describe("HistoryAutoLoader", () => {
     expect(metrics.scrollTop).toBe(800);
   });
 
+  it("anchors the latest user position across skeleton insertion and removal", () => {
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 500, scrollHeight: 1000 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+    const loadMoreHistory = vi.fn(async () => {
+      // The loading skeleton prepends 100px before the request settles.
+      metrics.scrollHeight = 1100;
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
+
+    render(<HistoryAutoLoader />);
+    metrics.scrollTop = 499;
+    fireEvent.scroll(scrollRoot);
+    expect(metrics.scrollTop).toBe(599);
+
+    // Preserve a scroll made while loading, then replace the 100px skeleton
+    // with a page that leaves the content 400px taller overall.
+    metrics.scrollTop = 20;
+    fireEvent.scroll(scrollRoot);
+    metrics.scrollHeight = 1500;
+    act(() => {
+      useChatStore.setState({
+        hasMoreHistory: false,
+        loadingMoreHistory: false,
+        oldestItemId: "item_1",
+      });
+    });
+
+    expect(metrics.scrollTop).toBe(420);
+  });
+
   it("loads older history when the user scrolls near the top", () => {
     const loadMoreHistory = vi.fn(async () => {});
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
