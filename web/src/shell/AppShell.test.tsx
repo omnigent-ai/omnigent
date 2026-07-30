@@ -459,7 +459,12 @@ beforeEach(() => {
   // todo list from one test doesn't leak into the next.
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
-  useChatStore.setState({ todos: [], terminalPending: false, sessionStatus: "idle" });
+  useChatStore.setState({
+    todos: [],
+    terminalPending: false,
+    sessionStatus: "idle",
+    status: "idle",
+  });
 });
 
 afterEach(cleanup);
@@ -531,6 +536,22 @@ describe("AppShell header", () => {
     renderShell("/c/conv_terminal");
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
+  });
+
+  it("keeps the terminal-startup spinner when a send is relaunching a failed session", () => {
+    // A runner disconnect marks the session failed, and that status lingers
+    // until the relaunched runner pushes a fresh edge. A send in flight
+    // (local status "streaming") means the host is relaunching the runner
+    // right now, so the spinner must show through the relaunch window
+    // instead of leaving a silent gap until the runner is fully booted.
+    mockConversations([
+      { id: "conv_terminal", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useChatStore.setState({ terminalPending: true, sessionStatus: "failed", status: "streaming" });
+
+    renderShell("/c/conv_terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
   });
 });
 

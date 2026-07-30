@@ -96,6 +96,17 @@ describe("grantPermission", () => {
     });
   });
 
+  it("forwards delegated approval authority explicitly", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ user_id: "bob", conversation_id: "conv_abc", level: 2, can_approve: true }),
+    );
+
+    await grantPermission("conv_abc", "bob", 2, true);
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(init.body as string).can_approve).toBe(true);
+  });
+
   it.each([
     [1, "read"],
     [2, "edit"],

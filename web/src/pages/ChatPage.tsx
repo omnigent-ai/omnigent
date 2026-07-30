@@ -1076,6 +1076,7 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
+  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
@@ -1130,6 +1131,7 @@ export function ChatPage() {
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
+      canApprove={canApprove}
       readOnlyReason={readOnlyReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
@@ -1354,6 +1356,8 @@ interface MainAgentSurfaceProps {
   /** Whether a load-more fetch is currently in flight. */
   loadingMoreHistory: boolean;
   permissionLevel: number | null;
+  /** Whether this viewer may accept privileged actions. */
+  canApprove: boolean;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
   effortLevels: readonly string[];
@@ -1435,6 +1439,7 @@ function MainAgentSurface({
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
+  canApprove,
   readOnlyReason,
   effortLevels,
   showEffort,
@@ -1744,7 +1749,7 @@ function MainAgentSurface({
             ) : (
               <>
                 {streamBubbles.map((bubble) => (
-                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
+                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
                 ))}
                 {/* Pending elicitation cards, floated to the bottom of the
                     chat so an outstanding question stays in view (stick-to-
@@ -1763,7 +1768,7 @@ function MainAgentSurface({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
+                      <ElicitationCard item={item} canApprove={canApprove} />
                     </MessageContent>
                   </Message>
                 ))}
@@ -3020,7 +3025,7 @@ function CompactionLoadingIndicator() {
 // markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
 // the user-bubble markdown render tests.
 export const BubbleView = memo(
-  function BubbleView({ bubble }: { bubble: Bubble }) {
+  function BubbleView({ bubble, canApprove = true }: { bubble: Bubble; canApprove?: boolean }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator />;
@@ -3036,9 +3041,9 @@ export const BubbleView = memo(
         />
       );
     }
-    return <AssistantBubble bubble={bubble} />;
+    return <AssistantBubble bubble={bubble} canApprove={canApprove} />;
   },
-  (prev, next) => bubblesEqual(prev.bubble, next.bubble),
+  (prev, next) => prev.canApprove === next.canApprove && bubblesEqual(prev.bubble, next.bubble),
 );
 
 /**
@@ -3254,7 +3259,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   );
 }
 
-function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistant" }> }) {
+function AssistantBubble({
+  bubble,
+  canApprove,
+}: {
+  bubble: Extract<Bubble, { kind: "assistant" }>;
+  canApprove: boolean;
+}) {
   // The walker only emits an assistant bubble when at least one
   // assistant-side block exists, so `items` is non-empty here in the
   // common case. The "Working…" shimmer for the empty-items / streaming
@@ -3285,7 +3296,11 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
         className={isWide ? "max-w-full" : "max-w-3xl"}
       >
         <MessageContent className={isWide ? "w-full" : undefined}>
-          <BlockRenderer items={bubble.items} sessionStatus={sessionStatus} />
+          <BlockRenderer
+            items={bubble.items}
+            sessionStatus={sessionStatus}
+            canApprove={canApprove}
+          />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
           <p

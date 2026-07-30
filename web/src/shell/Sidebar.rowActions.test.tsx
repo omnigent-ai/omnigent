@@ -200,25 +200,34 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
 // server sharing policy via CapabilitiesProvider (default "loading" → on).
 function renderSidebar(activeId?: string, info?: ServerInfo) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
-  const tree = (
-    <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-          {activeId ? (
-            <Routes>
-              <Route path="/c/:conversationId" element={sidebar} />
-            </Routes>
-          ) : (
-            sidebar
-          )}
-        </MemoryRouter>
-      </TooltipProvider>
-    </QueryClientProvider>
-  );
-  // No explicit info → CapabilitiesContext default ("loading"), matching every
-  // pre-existing test (sharing treated as on).
-  return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
+  // Build a FRESH element tree per render: re-rendering the identical element
+  // reference lets React bail out without re-invoking the sidebar, which
+  // would swallow a `mockConversations` swap applied mid-test.
+  const makeUi = () => {
+    const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
+    const tree = (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+            {activeId ? (
+              <Routes>
+                <Route path="/c/:conversationId" element={sidebar} />
+              </Routes>
+            ) : (
+              sidebar
+            )}
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    // No explicit info → CapabilitiesContext default ("loading"), matching
+    // every pre-existing test (sharing treated as on).
+    return info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree;
+  };
+  const view = render(makeUi());
+  // Re-render so a test can apply a new `mockConversations` list mid-flight
+  // (e.g. simulating a reorder pushed between user clicks).
+  return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
 }
 
 beforeEach(() => {
@@ -453,6 +462,54 @@ describe("double-click to rename", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(mocks.rename.mutate).toHaveBeenCalledTimes(1);
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed" });
+  });
+
+  it("ignores a double-click whose first click landed on a different row", () => {
+    // A native double-click delivers click, click, dblclick to one element.
+    // If the list reorders between the two clicks (a session's updated_at
+    // bump pushes rows around under the cursor), the second click and the
+    // dblclick land on whichever row slid into place — which must NOT enter
+    // rename, or the user renames a session they never aimed at.
+    const convA: Conversation = {
+      ...CONV,
+      id: "conv_a",
+      title: "Session A",
+      updated_at: 1_700_000_200,
+    };
+    const convB: Conversation = {
+      ...CONV,
+      id: "conv_b",
+      title: "Session B",
+      updated_at: 1_700_000_100,
+    };
+    mockConversations([convA, convB]);
+    const view = renderSidebar();
+
+    // Click #1 of the user's double-click lands on session A (the top row).
+    fireEvent.click(screen.getByRole("link", { name: /Session A/ }));
+
+    // Before click #2, session B's updated_at bumps and the list reorders —
+    // B now occupies the screen position where A was.
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+
+    // Click #2 and the dblclick land on B, the row now under the cursor.
+    const rowB = screen.getByRole("link", { name: /Session B/ });
+    fireEvent.click(rowB);
+    fireEvent.dblClick(rowB);
+
+    // B saw only the second click, so it must not enter rename.
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(mocks.rename.mutate).not.toHaveBeenCalled();
+
+    // A clean double-click on B — both clicks on the row — still renames it.
+    fireEvent.click(rowB);
+    fireEvent.click(rowB);
+    fireEvent.dblClick(rowB);
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed B" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_b", title: "Renamed B" });
   });
 
   it("does not enter rename on double-click for a viewer-only row", () => {
@@ -697,6 +754,126 @@ describe("right-click context menu", () => {
     // inline rename input appears.
     fireEvent.click(screen.getByTestId("rename-conversation"));
     expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+  });
+
+  it("holds the list order under the pointer so a right-click rename hits the aimed row", () => {
+    // A right-click is a single event, so nothing can cross-check it like the
+    // double-click guard does — if the list reorders in the instant before
+    // the click lands, the row that slid under the cursor opens its (visually
+    // identical) menu and gets renamed. The fix is upstream: while the
+    // pointer is inside the list, every row's sort key is frozen so rows
+    // can't move under the cursor at all.
+    const convA: Conversation = {
+      ...CONV,
+      id: "conv_a",
+      title: "Session A",
+      updated_at: 1_700_000_200,
+    };
+    const convB: Conversation = {
+      ...CONV,
+      id: "conv_b",
+      title: "Session B",
+      updated_at: 1_700_000_100,
+    };
+    mockConversations([convA, convB]);
+    const view = renderSidebar();
+
+    // The pointer moves over the list, aiming at session A (the top row).
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
+
+    // Session B's updated_at bumps past A before the right-click lands.
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+
+    // The order holds: A is still the top row, exactly where the user aims.
+    const links = screen.getAllByRole("link", { name: /^Session/ });
+    expect(links[0]).toHaveAccessibleName(/Session A/);
+
+    // Right-click the top row and rename it — the PATCH targets session A.
+    fireEvent.contextMenu(links[0]);
+    fireEvent.click(screen.getByTestId("rename-conversation"));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed A" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });
+  });
+
+  it("keeps the order held while a rename edit is open even after the pointer leaves", () => {
+    // The pointer naturally drifts out of the sidebar while typing a new
+    // title. If that released the freeze, background updated_at churn would
+    // shuffle rows around the open input — and moving the input's DOM node
+    // blurs it, committing a half-typed title. An open rename edit must hold
+    // the order on its own; the snap-back happens once the edit ends.
+    const convA: Conversation = {
+      ...CONV,
+      id: "conv_a",
+      title: "Session A",
+      updated_at: 1_700_000_200,
+    };
+    const convB: Conversation = {
+      ...CONV,
+      id: "conv_b",
+      title: "Session B",
+      updated_at: 1_700_000_100,
+    };
+    mockConversations([convA, convB]);
+    const view = renderSidebar();
+
+    // Open the rename input on session A via right-click → Rename.
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
+    fireEvent.contextMenu(screen.getByRole("link", { name: /Session A/ }));
+    fireEvent.click(screen.getByTestId("rename-conversation"));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+
+    // The pointer leaves the list mid-edit; then session B's updated_at bumps.
+    fireEvent.mouseOut(screen.getByTestId("sidebar-conversation-list"), {
+      relatedTarget: document.body,
+    });
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+
+    // The edit row still holds the top slot (the edit input replaces A's link,
+    // so B — below it — must still be the only link, not the first row).
+    expect(screen.getByTestId("rename-conversation-input")).toBe(input);
+    const listEl = screen.getByTestId("sidebar-conversation-list");
+    const rowB = screen.getByRole("link", { name: /Session B/ });
+    expect(input.compareDocumentPosition(rowB) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(listEl).toContainElement(rowB);
+
+    // Committing the rename targets session A and releases the hold: the
+    // order snaps to reality (B first).
+    fireEvent.change(input, { target: { value: "Renamed A" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });
+    const after = screen.getAllByRole("link", { name: /^Session/ });
+    expect(after[0]).toHaveAccessibleName(/Session B/);
+  });
+
+  it("snaps the order back to reality when the pointer leaves the list", () => {
+    const convA: Conversation = {
+      ...CONV,
+      id: "conv_a",
+      title: "Session A",
+      updated_at: 1_700_000_200,
+    };
+    const convB: Conversation = {
+      ...CONV,
+      id: "conv_b",
+      title: "Session B",
+      updated_at: 1_700_000_100,
+    };
+    mockConversations([convA, convB]);
+    const view = renderSidebar();
+
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session A/);
+
+    fireEvent.mouseOut(screen.getByTestId("sidebar-conversation-list"), {
+      relatedTarget: document.body,
+    });
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session B/);
   });
 });
 

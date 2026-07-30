@@ -152,7 +152,6 @@ bound runner and forwards the CLI's model ids, default, descriptions, context
 windows, and credit rates. The server caches the runner response through the
 same asynchronous picker path as Codex, so provider changes no longer require an
 Omnigent source update and snapshots do not block on the CLI process.
-
 ## Ad-hoc CLI Defaults
 
 Minimal agent YAMLs that declare neither a harness nor a model now resolve the

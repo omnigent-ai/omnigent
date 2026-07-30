@@ -92,6 +92,11 @@ lint: _ensure-uv
 lint-all: _ensure-uv
     uv run pre-commit run --all-files
 
+[group('lint')]
+lint-ts:
+    pnpm install --frozen-lockfile --filter web
+    pnpm --filter web run lint
+
 # --- Lockfile maintenance ---
 
 [group('lint')]

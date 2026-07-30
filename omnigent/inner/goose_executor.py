@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -267,8 +268,7 @@ class GooseExecutor(Executor):
         """
         # This may be a restart after the previous subprocess died.
         self._reset_process_state()
-        env = os.environ.copy()
-        env.update(self._provider_env())
+        env = self._build_spawn_env()
         argv: list[str] = ["acp"]
         for builtin in self._builtins:
             argv.extend(["--with-builtin", builtin])
@@ -286,6 +286,24 @@ class GooseExecutor(Executor):
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
+
+    def _build_spawn_env(self) -> dict[str, str]:
+        """The env handed to the goose subprocess.
+
+        Deny-by-default: base + goose's own ``GOOSE_`` family + the spec's
+        ``env_passthrough``, then goose's provider/gateway overrides on top so
+        the intentionally-set values still win. Previously ``os.environ.copy()``
+        handed the goose CLI every host secret (#3445).
+
+        Kept as a named builder so the spawn-env canary can drive the real thing
+        rather than a hand-copied prefix list.
+        """
+        env = clean_agent_env(
+            allow_prefixes=("GOOSE_",),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
+        env.update(self._provider_env())
+        return env
 
     def _provider_env(self) -> dict[str, str]:
         """Build ``GOOSE_PROVIDER`` / ``GOOSE_MODEL`` overrides for the subprocess.

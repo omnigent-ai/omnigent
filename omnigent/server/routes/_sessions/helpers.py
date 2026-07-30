@@ -1000,6 +1000,20 @@ def _permission_level_from_grants(
     return None
 
 
+def _approval_access_from_grants(
+    user_id: str | None,
+    grants: list[SessionPermission],
+    is_admin: bool,
+) -> bool | None:
+    """Derive effective approval authority from pre-fetched grants."""
+    if user_id is None:
+        return None
+    if is_admin:
+        return True
+    user_grant = next((grant for grant in grants if grant.user_id == user_id), None)
+    return user_grant is not None and (user_grant.level >= LEVEL_OWNER or user_grant.can_approve)
+
+
 def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
     """
     Find the session owner from a pre-fetched list of grants.
@@ -8484,6 +8498,7 @@ __all__ = [
     "_announce_session_added",
     "_apply_liveness_to_items",
     "_apply_pending_policy_ask_writes",
+    "_approval_access_from_grants",
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",

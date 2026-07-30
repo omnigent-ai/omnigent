@@ -1871,6 +1871,101 @@ def approval_session(
                 respawned_runner.wait(timeout=5)
 
 
+# ---------------------------------------------------------------------------
+# Tool-run fold probe: an ``os_env`` agent whose mock LLM queue emits a
+# deterministic sys_os_shell("ls") → sys_os_read("README.md") tool sequence,
+# then a short text reply. Used to assert the chat view's collapsed tool-run
+# summary carries the semantic action label ("Listed 1 directory, read 1
+# file") rather than a generic step count. Same registration/bind contract
+# as :func:`approval_session`, minus the guardrails block (nothing gated).
+# ---------------------------------------------------------------------------
+
+_TOOL_FOLD_AGENT_NAME = "tool_fold_probe"
+_TOOL_FOLD_AGENT_YAML = """\
+spec_version: 1
+name: {name}
+prompt: |
+  You are a deterministic tool-run assistant. When the user asks you to
+  inspect the workspace, you MUST do exactly this and nothing else:
+
+  1. Call sys_os_shell with command set to exactly: ls
+  2. Call sys_os_read with path set to exactly: README.md
+  3. Reply with one short sentence.
+
+executor:
+  model: {model}
+  config:
+    harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+"""
+
+
+@pytest.fixture
+def tool_fold_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session whose turn runs a shell + read tool pair.
+
+    The mock queue is keyed by a per-fixture unique model name (same
+    isolation rationale as :func:`approval_session`): two tool-call
+    responses, then a text fallback for the wrap-up LLM call.
+
+    :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``. Send any turn to run the
+        deterministic ls → read → reply sequence.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    model = f"tool-fold-probe-{_uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ls",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "ls"}),
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "sys_os_read",
+                        "arguments": _json.dumps({"path": "README.md"}),
+                    }
+                ]
+            },
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(mock_llm_server_url, model, "Workspace inspected.")
+
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    yaml_text = _TOOL_FOLD_AGENT_YAML.format(name=_TOOL_FOLD_AGENT_NAME, model=model)
+    session_id = _create_bundled_session(live_server, runner_id, yaml_text)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
 @pytest.fixture(autouse=True)
 def _ui_defaults() -> None:
     """

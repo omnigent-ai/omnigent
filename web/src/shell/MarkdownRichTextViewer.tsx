@@ -30,6 +30,7 @@ import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
+import { useScrollRestore } from "./useScrollRestore";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
 import { MarkdownSearchBar } from "./MarkdownSearchBar";
@@ -243,6 +244,14 @@ function MarkdownRichTextViewerInner({
     [],
   );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // Persist/restore the editor's scroll position across unmount/remount and
+  // session switches. Content is present at mount (the parent gates on the
+  // file query), so the restore is ready immediately.
+  const handleScrollPersist = useScrollRestore(
+    scrollContainerRef,
+    conversationId && path ? `viewer-mdedit:${conversationId}:${path}` : null,
+    true,
+  );
   // Fall back to a local ref when the parent doesn't pass one (the toolbar
   // path always does; this keeps the bar usable in isolation/tests).
   const fallbackSearchInputRef = useRef<HTMLInputElement>(null);
@@ -463,6 +472,7 @@ function MarkdownRichTextViewerInner({
       )}
       <div
         ref={scrollContainerRef}
+        onScroll={handleScrollPersist}
         className="relative flex-1 overflow-auto px-8 py-6"
         // Link following. The Link extension runs with openOnClick:false so a
         // plain click in edit mode positions the cursor instead of navigating.

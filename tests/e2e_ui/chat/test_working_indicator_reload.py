@@ -218,7 +218,9 @@ def test_live_tool_output_updates_running_card(
             arguments='{"command": "pytest -q"}',
         )
 
-        trigger = page.locator('button[title^="shell"]').first
+        # toolTitle.ts formats `shell` calls as the bare command, so the
+        # trigger's tooltip is the command string, not "shell(...)".
+        trigger = page.locator('button[title="pytest -q"]').first
         expect(trigger).to_be_visible(timeout=10_000)
         expect(trigger.locator(".animate-spin")).to_be_visible(timeout=10_000)
 

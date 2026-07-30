@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 
@@ -68,7 +69,12 @@ def _parse_node_version(name: str) -> tuple[int, ...]:
         return ()
 
 
-def resolve_cli_binary(name: str, *, env_var: str | None = None) -> str | None:
+def resolve_cli_binary(
+    name: str,
+    *,
+    env_var: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> str | None:
     """Resolve a CLI binary that may live off the process ``PATH``.
 
     Checks an optional ``env_var`` override first (an explicit path or a name
@@ -81,12 +87,16 @@ def resolve_cli_binary(name: str, *, env_var: str | None = None) -> str | None:
     :param name: The binary name, e.g. ``"codex"`` or ``"claude"``.
     :param env_var: Optional env var holding an override path/name, e.g.
         ``"OMNIGENT_CODEX_PATH"``.
+    :param which: PATH-lookup hook, defaulting to :func:`shutil.which`. The
+        native harness resolvers thread their own test seam through here; the
+        fallback ladder always uses the real filesystem.
     :returns: An absolute path to the executable, or ``None``.
     """
+    which = shutil.which if which is None else which
     if env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
-            resolved = shutil.which(override)
+            resolved = which(override)
             if resolved:
                 return resolved
             if os.access(override, os.X_OK) and os.path.isfile(override):
@@ -100,7 +110,7 @@ def resolve_cli_binary(name: str, *, env_var: str | None = None) -> str | None:
                 override,
                 name,
             )
-    on_path = shutil.which(name)
+    on_path = which(name)
     if on_path is not None:
         return on_path
     for directory in _cli_fallback_dirs():

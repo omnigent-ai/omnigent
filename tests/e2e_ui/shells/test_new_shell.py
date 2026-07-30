@@ -39,6 +39,8 @@ independent session.
 from __future__ import annotations
 
 import re
+import time
+from pathlib import Path
 
 from playwright.sync_api import Page, expect
 
@@ -138,6 +140,71 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
     # "terminal session ended". A regression that drops user input or kills
     # the PTY on first keystroke would flip this out of ``connected``.
     expect(terminal_view).to_have_attribute("data-state", "connected")
+
+
+def test_shell_wheel_scroll_reaches_mouse_tracking_program(
+    page: Page, terminal_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Trackpad-sized wheel deltas reach a mouse-tracking TUI as SGR reports.
+
+    TUIs like Claude Code and OpenCode scroll their transcript via mouse
+    reports, so the browser terminal must translate wheel gestures into SGR
+    sequences. xterm's built-in conversion damps small pixel deltas to at
+    most ~1 report per gesture, which reads as "scrolling doesn't work" on
+    macOS trackpads; the custom wheel handler accumulates deltas and emits
+    one report per whole line. Pin that end-to-end: a program in the shell
+    enables mouse tracking and records its stdin to a file (absolute
+    ``tmp_path`` — the shell and this test share a host, sidestepping the
+    cwd/filesystem-API mismatch that made cwd-relative side-effects
+    fragile), then a ~80px gesture of 4px ticks must land >=3 wheel-up
+    reports. The damped path yields <=1, so this fails on a regression.
+    """
+    base_url, session_id = terminal_session
+    log = tmp_path / "wheel.log"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+
+    terminal_view = page.get_by_test_id("terminal-view").last
+    expect(terminal_view).to_be_visible(timeout=60_000)
+    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
+
+    # Become a minimal mouse-tracking "TUI": raw tty (so mouse bytes flow
+    # byte-by-byte, not line-buffered), any-motion tracking + SGR encoding
+    # (the mode set Claude Code and OpenCode use), stdin appended to a file.
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+    page.keyboard.type(f"stty raw -echo; printf '\\e[?1003h\\e[?1006h'; cat > '{log}'")
+    page.keyboard.press("Enter")
+    # Let the mode enables round-trip so the browser xterm starts forwarding.
+    page.wait_for_timeout(1_500)
+
+    # Slow two-finger scroll: 20 ticks of 4px over the terminal screen. With
+    # a ~17px cell this is ~4.7 lines -> >=3 SGR wheel-up reports from the
+    # accumulating handler; xterm's damped built-in emits at most 1.
+    screen = terminal_view.locator(".xterm-screen").first
+    box = screen.bounding_box()
+    assert box is not None, "xterm screen should have a bounding box"
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    for _ in range(20):
+        page.mouse.wheel(0, -4)
+        page.wait_for_timeout(25)
+
+    # The reports traverse browser -> WS -> tmux -> program asynchronously;
+    # poll the log rather than sleeping a fixed amount.
+    deadline = time.monotonic() + 15
+    reports = 0
+    while time.monotonic() < deadline:
+        reports = log.read_bytes().count(b"\x1b[<64") if log.exists() else 0
+        if reports >= 3:
+            break
+        page.wait_for_timeout(500)
+    assert reports >= 3, (
+        f"expected >=3 SGR wheel-up reports to reach the shell program, got {reports} "
+        f"(log: {log.read_bytes()[:200]!r})"
+        if log.exists()
+        else "wheel log never created"
+    )
 
 
 def test_workspace_rail_preserves_outer_top_inset(

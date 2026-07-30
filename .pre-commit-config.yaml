@@ -53,6 +53,13 @@ repos:
         # fights the tooling).
         exclude: ^(omnigent/server/static/web-ui/assets/|web/.*\.xcassets/|web/.*\.icon/)
 
+      - id: web-oxlint
+        name: web oxlint
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/oxlint && cd web && node_modules/.bin/oxlint .'
+        files: ^(web/.*\.[cm]?[jt]sx?|web/\.oxlintrc\.json|web/package\.json|pnpm-lock\.yaml)$
+        pass_filenames: false
+
       # Android Kotlin formatting + linting via ktlint (config:
       # web/android/.editorconfig). The wrapper no-ops when ktlint is absent,
       # so local machines without ktlint installed skip cleanly. CI installs

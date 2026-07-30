@@ -1,9 +1,10 @@
 name: Lint
 
-# Runs the project's pre-commit hooks (ruff, mypy, custom anti-pattern grep
-# hooks, etc.) on every non-draft PR and on push to main. Surfaces as the
-# `Pre-commit checks` check, a REQUIRED gate entry in merge-ready.yml. Draft PRs
-# are skipped; `ready_for_review` refires so the check doesn't strand pending.
+# Runs the project's pre-commit hooks (ruff, TypeScript lint, custom
+# anti-pattern grep hooks, etc.) on every non-draft PR and on push to main.
+# Surfaces as the `Pre-commit checks` check, a REQUIRED gate entry in
+# merge-ready.yml. Draft PRs are skipped; `ready_for_review` refires so the
+# check doesn't strand pending.
 
 on:
   pull_request:
@@ -83,7 +84,7 @@ jobs:
 
       - name: Install web dependencies
         # Pin the npm registry to the npmjs default; limit to the web package
-        # so the Electron package's large native devDependencies are not fetched.
+        # so Electron's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: pnpm install --frozen-lockfile --filter web
@@ -120,13 +121,8 @@ jobs:
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
 
-      - name: Run formatting, lint, and typing checks
+      - name: Run formatting and lint checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
-
-      # Type-checking is temporarily skipped in CI while the pnpm lockfile
-      # settles; `pnpm --filter web run type-check` still works locally.
-      # - name: Type-check web
-      #   run: pnpm --filter web run type-check
 
   # The four packages release in lockstep (identical versions + `==` sibling
   # pins). Assert agreement on every change so drift from a bad merge or
