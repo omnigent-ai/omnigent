@@ -35,21 +35,22 @@ python dev/loadtest/run.py \
 | Host | `--host-id` | Connected Omnigent host the load is scoped to. |
 | Load | `--users` / `--spawn-rate` / `--run-time` | Concurrency, ramp, duration. |
 | Auth | `--auth-token` | Bearer token (omit for a local single-user server). |
-| Mount prefix | `--mount-prefix` | Path the app is served under on a fronted deployment. Empty for a plain server; `/api/2.0/omnigent` for a managed Databricks (MAS) deployment. |
+| Mount prefix | `--mount-prefix` | Path the app is served under when it sits behind a reverse proxy at a sub-path. Empty for a plain server. |
 | Scenario | `--locustfile` | Which test to run (default: `ws_load_test.py`). |
 | UI | `--web` | Open Locust's web UI instead of a headless run. |
 
-### Against a managed Databricks deployment
+### Behind a reverse proxy (path prefix)
 
-The embedded server is mounted under `/api/2.0/omnigent` (the browser UI route
-`/omnigent` is SSO-gated and 303-redirects an API client to login — use the API
-mount, not that). Point `--server` at the workspace root and set the prefix:
+If the server is fronted by a reverse proxy that serves it under a sub-path
+rather than at the root, point `--server` at the proxy's base URL and pass the
+sub-path as `--mount-prefix` so the WebSocket URL resolves. Example for a
+server mounted under `/omnigent`:
 
 ```bash
 python dev/loadtest/run.py \
-    --server https://<workspace>.cloud.databricks.com \
-    --mount-prefix /api/2.0/omnigent \
-    --auth-token "$WORKSPACE_PAT" \
+    --server https://proxy.example.com \
+    --mount-prefix /omnigent \
+    --auth-token "$TOKEN" \
     --users 50 --spawn-rate 10 --run-time 60s
 ```
 

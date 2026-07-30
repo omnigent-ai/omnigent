@@ -95,9 +95,9 @@ def _ws_url(host: str, mount_prefix: str = "") -> str:
 
     :param host: The server base URL (Locust ``--host``), e.g.
         ``"http://localhost:8000"``; its scheme is swapped to the WS scheme.
-    :param mount_prefix: Path the Omnigent app is mounted under, e.g.
-        ``"/omnigent"`` or ``"/api/2.0/omnigent"`` on a fronted deployment.
-        Empty (default) for a plain server that serves the routes at root.
+    :param mount_prefix: Path the Omnigent app is served under when it sits
+        behind a reverse proxy at a sub-path, e.g. ``"/omnigent"``. Empty
+        (default) for a plain server that serves the routes at root.
     :returns: The full WebSocket URL for ``WS /v1/sessions/updates``.
     """
     base = host.rstrip("/")

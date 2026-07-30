@@ -29,21 +29,19 @@ Ask the user for these (use AskUserQuestion when several are unknown). Only
 | Spawn rate | `--spawn-rate` | 5 | Users started per second. |
 | Run time | `--run-time` | 60s | `30s` / `5m` / `1h`. |
 | Auth token | `--auth-token` | none | Bearer token for an authenticated deployment; omit for a local single-user server. **Never** print this or write it to a file. |
-| Mount prefix | `--mount-prefix` | none | Path the app is served under on a fronted deployment. Empty for a plain server; **`/api/2.0/omnigent`** for a managed Databricks (MAS) deployment. |
+| Mount prefix | `--mount-prefix` | none | Path the app is served under when it sits behind a reverse proxy at a sub-path (e.g. `/omnigent`). Empty for a plain server. |
 
 Scale guidance: start small on an unfamiliar target — `--users 10 --run-time
 30s` — to confirm connectivity and auth before ramping to 50–100+.
 
-### Managed Databricks deployment
+### Behind a reverse proxy (path prefix)
 
-The embedded server is mounted under `/api/2.0/omnigent`; the bare `/omnigent`
-route is the SSO-gated browser UI and will 303-redirect an API client to a login
-page (a symptom of the wrong prefix), so always use the API mount. Point
-`--server` at the workspace root, set `--mount-prefix /api/2.0/omnigent`, and use
-a workspace PAT / OAuth token. Sanity-check first with
-`curl -H "Authorization: Bearer $TOK" <server>/api/2.0/omnigent/v1/info` — a
-200 with a JSON body means the target + auth are good; a 303 to `/login.html`
-means wrong prefix or bad token. When sourcing a token from the shell env, pass
+If the server is fronted by a reverse proxy that serves it under a sub-path
+rather than at the root, point `--server` at the proxy's base URL and pass the
+sub-path as `--mount-prefix` (e.g. `--mount-prefix /omnigent`) so the WebSocket
+URL resolves. Sanity-check the target + auth first with a plain request, e.g.
+`curl -H "Authorization: Bearer $TOK" <server><prefix>/v1/info` — a 200 with a
+JSON body means both are good. When sourcing a token from the shell env, pass
 it as `--auth-token "$VAR"` and never echo the value.
 
 ## 2. Ensure the load-test deps are installed
@@ -66,8 +64,8 @@ omnigent server --port 8000 &
 until curl -sf http://localhost:8000/health >/dev/null; do sleep 0.5; done
 ```
 
-For a **remote/managed** deployment, do NOT start a server — just point
-`--server` at it and pass `--auth-token`.
+For a **remote** deployment, do NOT start a server — just point `--server` at
+it and pass `--auth-token`.
 
 ## 4. Run
 

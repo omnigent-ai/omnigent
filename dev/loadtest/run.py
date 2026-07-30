@@ -115,8 +115,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--mount-prefix",
         default="",
         help=(
-            "Path the Omnigent app is mounted under on a fronted deployment "
-            "(e.g. /omnigent or /api/2.0/omnigent). Empty for a plain server."
+            "Path the Omnigent app is served under when behind a reverse proxy "
+            "at a sub-path (e.g. /omnigent). Empty for a plain server."
         ),
     )
     parser.add_argument(
