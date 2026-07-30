@@ -661,9 +661,15 @@ interface McpFormState {
   description: string;
   url: string;
   /** Key-value pairs for HTTP headers. Values from existing servers are "[REDACTED]". */
-  headers: { key: string; value: string }[];
+  headers: { id: string; key: string; value: string }[];
   command: string;
   argsText: string;
+}
+
+let nextMcpHeaderId = 0;
+
+function mcpHeader(key = "", value = "") {
+  return { id: `mcp-header-${nextMcpHeaderId++}`, key, value };
 }
 
 const EMPTY_MCP_FORM: McpFormState = {
@@ -684,7 +690,7 @@ function mcpFormFromServer(server: McpServerSummary): McpFormState {
     transport: server.transport === "stdio" ? "stdio" : "http",
     description: server.description ?? "",
     url: server.url ?? "",
-    headers: Object.entries(server.headers ?? {}).map(([key, value]) => ({ key, value })),
+    headers: Object.entries(server.headers ?? {}).map(([key, value]) => mcpHeader(key, value)),
     command: server.command ?? "",
     argsText: (server.args ?? []).join("\n"),
   };
@@ -932,7 +938,7 @@ function McpServerManagerDialog({
                       onClick={() =>
                         setForm((prev) => ({
                           ...prev,
-                          headers: [...prev.headers, { key: "", value: "" }],
+                          headers: [...prev.headers, mcpHeader()],
                         }))
                       }
                       className="rounded p-0.5 hover:bg-muted"
@@ -942,7 +948,7 @@ function McpServerManagerDialog({
                     </button>
                   </div>
                   {form.headers.map((header, i) => (
-                    <div key={i} className="flex items-center gap-1">
+                    <div key={header.id} className="flex items-center gap-1">
                       <Input
                         value={header.key}
                         onChange={(e) =>

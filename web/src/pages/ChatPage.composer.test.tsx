@@ -1378,7 +1378,13 @@ describe("Composer reply-quote focus", () => {
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    rerender(<Composer {...composerProps({ replyQuotes: ["selected response text"] })} />);
+    rerender(
+      <Composer
+        {...composerProps({
+          replyQuotes: [{ id: "quote-1", text: "selected response text" }],
+        })}
+      />,
+    );
     expect(document.activeElement).toBe(ta);
   });
 
@@ -1386,13 +1392,20 @@ describe("Composer reply-quote focus", () => {
     // Removing a chip (the X button) shrinks the count — the effect only
     // fires when the count grows, so focus must stay put.
     const { rerender } = render(
-      <Composer {...composerProps({ replyQuotes: ["first", "second"] })} />,
+      <Composer
+        {...composerProps({
+          replyQuotes: [
+            { id: "quote-1", text: "first" },
+            { id: "quote-2", text: "second" },
+          ],
+        })}
+      />,
     );
     const ta = textarea();
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    rerender(<Composer {...composerProps({ replyQuotes: ["first"] })} />);
+    rerender(<Composer {...composerProps({ replyQuotes: [{ id: "quote-1", text: "first" }] })} />);
     expect(document.activeElement).not.toBe(ta);
   });
 });

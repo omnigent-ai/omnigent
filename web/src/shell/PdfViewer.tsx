@@ -92,9 +92,9 @@ function PdfCommentHighlights({
   return (
     <div className="pdf-comment-layer" aria-hidden>
       {highlights.map((h) =>
-        h.rects.map((rect, i) => (
+        h.rects.map((rect) => (
           <div
-            key={`${h.key}-${i}`}
+            key={`${h.key}-${rect.x}-${rect.y}-${rect.w}-${rect.h}`}
             className={cn("pdf-comment", h.active && "pdf-comment-active")}
             style={{
               left: `${rect.x * 100}%`,
