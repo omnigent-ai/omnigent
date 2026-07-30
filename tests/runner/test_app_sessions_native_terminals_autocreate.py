@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -49,7 +50,6 @@ from omnigent.runner.app import (
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
-    _refresh_claude_permission_hook_auth,
     _terminal_lookup_miss_log_state,
 )
 from omnigent.runner.resource_registry import (
@@ -69,47 +69,40 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
-@pytest.mark.asyncio
-async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
+def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The parent runner refreshes delegated hook auth in the bridge file."""
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    bridge_dir = prepare_bridge_dir("refresh-hook-auth", workspace=tmp_path)
-    claude_native_bridge.build_hook_settings(
-        bridge_dir,
-        ap_server_url="https://omnigent.example.com",
-        ap_auth_headers={"Authorization": "Bearer old-token"},
+    """read_relay_policy_config extracts relay URL, token, and session_id."""
+    from omnigent.native_policy_hook import read_relay_policy_config
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    relay_file = bridge_dir / "tool_relay.json"
+    relay_file.write_text(
+        '{"url": "http://127.0.0.1:9999", "token": "tok123", "session_id": "conv_abc"}'
     )
+    result = read_relay_policy_config(bridge_dir)
+    assert result == ("http://127.0.0.1:9999", "tok123", "conv_abc")
 
-    task = asyncio.create_task(
-        _refresh_claude_permission_hook_auth(
-            bridge_dir=bridge_dir,
-            server_url="https://omnigent.example.com",
-            auth_token_factory=lambda: "fresh-delegated-token",
-            refresh_interval_s=0.01,
-        )
-    )
-    try:
 
-        async def _wait_for_refresh() -> None:
-            while True:
-                config = read_permission_hook_config(bridge_dir)
-                if config.get("ap_auth_headers", {}).get("Authorization") == (
-                    "Bearer fresh-delegated-token"
-                ):
-                    return
-                await asyncio.sleep(0.01)
+def test_read_relay_policy_config_returns_none_when_missing(tmp_path: Path) -> None:
+    """read_relay_policy_config returns None when tool_relay.json absent."""
+    from omnigent.native_policy_hook import read_relay_policy_config
 
-        await asyncio.wait_for(_wait_for_refresh(), timeout=1.0)
-    finally:
-        task.cancel()
-        _ = await asyncio.gather(task, return_exceptions=True)
+    assert read_relay_policy_config(tmp_path) is None
 
-    config = read_permission_hook_config(bridge_dir)
-    assert config["ap_auth_headers"]["Authorization"] == "Bearer fresh-delegated-token"
+
+def test_read_relay_policy_config_returns_none_when_session_id_absent(
+    tmp_path: Path,
+) -> None:
+    """read_relay_policy_config returns None when session_id absent (relay not policy-capable)."""
+    from omnigent.native_policy_hook import read_relay_policy_config
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    relay_file = bridge_dir / "tool_relay.json"
+    relay_file.write_text('{"url": "http://127.0.0.1:9999", "token": "tok123"}')
+    assert read_relay_policy_config(bridge_dir) is None
 
 
 @pytest.mark.asyncio
@@ -1059,8 +1052,8 @@ async def _run_auto_create_cursor_terminal(
     monkeypatch: pytest.MonkeyPatch,
     agent_spec: AgentSpec | None,
     terminal_launch_args: list[str] | None,
-) -> Any:
-    """Drive ``_auto_create_cursor_terminal`` and return the captured launch spec.
+) -> dict[str, Any]:
+    """Drive ``_auto_create_cursor_terminal`` and return what it wired up.
 
     Stubs the cursor-agent binary lookup, the transcript forwarder, and the
     runner auth factory so the model-injection branch runs without a real
@@ -1068,6 +1061,10 @@ async def _run_auto_create_cursor_terminal(
     (workspace + ``terminal_launch_args``) is served from an in-memory
     ``httpx.MockTransport``, and a fake registry records the ``spec`` passed to
     ``launch_required_terminal`` so the test can assert on ``spec.args``.
+
+    :returns: ``{"spec": <launch spec>, "elicitation_kwargs": <kwargs>}``, the
+        latter captured from the elicitation supervisor the forwarder task
+        gathers (empty if that task never got to start it).
     """
     from omnigent.runner import _entry as _runner_entry
 
@@ -1084,11 +1081,25 @@ async def _run_auto_create_cursor_terminal(
         "omnigent.cursor_native_forwarder.supervise_cursor_forwarder",
         _no_op_forwarder,
     )
+    monkeypatch.setattr(
+        "omnigent.cursor_native_usage.supervise_cursor_usage_forwarder",
+        _no_op_forwarder,
+    )
     # The forwarder is stubbed, so the auth it would carry is never used — keep
     # the factory from reaching for ambient Databricks credentials in tests.
     monkeypatch.setattr(_runner_entry, "_make_auth_token_factory", lambda *a, **k: None)
 
-    captured: dict[str, Any] = {}
+    captured: dict[str, Any] = {"elicitation_kwargs": {}}
+    started = asyncio.Event()
+
+    async def _capture_elicitation_supervisor(**kwargs: Any) -> None:
+        captured["elicitation_kwargs"] = kwargs
+        started.set()
+
+    monkeypatch.setattr(
+        "omnigent.cursor_native_permissions.supervise_cursor_transcript_elicitations",
+        _capture_elicitation_supervisor,
+    )
 
     class _FakeResourceRegistry:
         """Captures the launched terminal spec; no real terminal registry."""
@@ -1130,9 +1141,13 @@ async def _run_auto_create_cursor_terminal(
             ensure_comment_relay=None,
             agent_spec=agent_spec,
         )
+        # The bridge supervisors are gathered in a background task, so give it
+        # a beat to record the kwargs the wiring derived.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(started.wait(), timeout=2.0)
     finally:
         await fake_client.aclose()
-    return captured["spec"]
+    return captured
 
 
 @pytest.mark.asyncio
@@ -1146,7 +1161,7 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
     session's ``executor.model`` (from ``--model`` or config.yaml ``model:``)
     must reach the TUI as ``--model <id>`` — the regression #933 fixes.
     """
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1154,6 +1169,7 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
         ),
         terminal_launch_args=None,
     )
+    spec = captured["spec"]
     assert spec.command == "cursor-agent"
     assert "--model" in spec.args
     assert spec.args[spec.args.index("--model") + 1] == "sonnet-4-thinking"
@@ -1178,7 +1194,7 @@ async def test_auto_create_cursor_terminal_user_model_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A user-pinned passthrough model wins; the spec model is not injected."""
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1186,6 +1202,7 @@ async def test_auto_create_cursor_terminal_user_model_wins(
         ),
         terminal_launch_args=passthrough,
     )
+    spec = captured["spec"]
     # Exactly the user's args survive — no second ``--model`` / spec model added.
     assert spec.args.count("--model") == passthrough.count("--model")
     assert "sonnet-4-thinking" not in spec.args
@@ -1207,7 +1224,7 @@ async def test_auto_create_cursor_terminal_omits_model_when_unusable(
     Gateway-routed ``databricks-*`` ids are not cursor-agent model ids, so they
     are dropped rather than passed through (which would error on launch).
     """
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1215,7 +1232,42 @@ async def test_auto_create_cursor_terminal_omits_model_when_unusable(
         ),
         terminal_launch_args=None,
     )
-    assert "--model" not in spec.args
+    assert "--model" not in captured["spec"].args
+
+
+@pytest.mark.parametrize(
+    ("terminal_launch_args", "expected"),
+    [
+        (None, False),
+        (["--auto-review"], False),
+        (["--yolo=false"], False),
+        (["--yolo"], True),
+        (["--force"], True),
+        (["-f"], True),
+    ],
+    ids=["none", "auto-review", "yolo-off", "yolo", "force", "short-force"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_wires_yolo_auto_accept(
+    terminal_launch_args: list[str] | None,
+    expected: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The elicitation supervisor's yolo stance is derived from the launch args.
+
+    This wiring is the only thing that turns the in-pane auto-accept on. It is
+    a single kwarg in a large auto-create function, so without this assertion a
+    rebase can drop it and leave the feature inert with the rest of the suite
+    green.
+    """
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=None,
+        terminal_launch_args=terminal_launch_args,
+    )
+    assert captured["elicitation_kwargs"]["auto_accept_approvals"] is expected
 
 
 @pytest.mark.parametrize(
@@ -2189,7 +2241,9 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         del resource_registry, publish_event
         created.append(session_id)
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _recording_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _recording_auto_create
+    )
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -2463,7 +2517,8 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
         created.append(session_id)
 
     monkeypatch.setattr(
-        "omnigent.runner.app._auto_create_antigravity_terminal", _recording_auto_create
+        "omnigent.runner.native.orchestration._auto_create_antigravity_terminal",
+        _recording_auto_create,
     )
 
     native_spec = AgentSpec(

@@ -15,6 +15,7 @@ import {
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
+import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceAllFiles: vi.fn(),
@@ -1241,5 +1242,148 @@ describe("FilesPanel sort control", () => {
       flatView: false,
     });
     expect(screen.getByRole("button", { name: /^Sort:/ })).toBeInTheDocument();
+  });
+});
+
+describe("FilesPanel scroll position persistence", () => {
+  function renderAndGetScrollSection(conversationId: string, files: WorkspaceFile[]) {
+    const result = renderPanel({ conversationId, files });
+    const section = result.container.querySelector("section");
+    if (!section) throw new Error("scroll section not found");
+    return { result, section };
+  }
+
+  it("restores the saved scroll position when returning to a conversation", () => {
+    const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));
+
+    // Scroll in conversation A, then leave it.
+    const a = renderAndGetScrollSection("conv_scroll_a", files);
+    a.section.scrollTop = 120;
+    fireEvent.scroll(a.section);
+    a.result.unmount();
+
+    // Conversation B starts at the top, unaffected by A's position.
+    const b = renderAndGetScrollSection("conv_scroll_b", files);
+    expect(b.section.scrollTop).toBe(0);
+    b.result.unmount();
+
+    // Returning to A restores its saved position.
+    const back = renderAndGetScrollSection("conv_scroll_a", files);
+    expect(back.section.scrollTop).toBe(120);
+  });
+
+  it("does not let the loading clamp overwrite the saved position", async () => {
+    const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));
+    const conversationId = "conv_scroll_clamp";
+
+    // Scroll in the conversation, then leave it.
+    const first = renderAndGetScrollSection(conversationId, files);
+    first.section.scrollTop = 120;
+    fireEvent.scroll(first.section);
+    first.result.unmount();
+
+    // Revisit while the queries are still disabled (environment pending):
+    // data is undefined — not "loading" — and the short placeholder content
+    // clamps scrollTop to 0, which fires a scroll event.
+    const pending = {
+      data: undefined,
+      error: null,
+      isError: false,
+      isLoading: false,
+    };
+    useAllFilesMock.mockReturnValue(pending as unknown as ReturnType<typeof useWorkspaceAllFiles>);
+    useChangedFilesMock.mockReturnValue(
+      pending as unknown as ReturnType<typeof useWorkspaceChangedFiles>,
+    );
+    useDirectoryMock.mockReturnValue(directoryResult());
+    useEnvironmentMock.mockReturnValue(environmentResult(null));
+    useSearchMock.mockReturnValue(searchResult());
+    // Fresh JSX per render — reusing the same element would let React bail
+    // out of the re-render without re-reading the updated hook mocks.
+    const panel = () => (
+      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                onFlatViewChange={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+    const view = render(panel());
+    const section = view.container.querySelector("section");
+    if (!section) throw new Error("scroll section not found");
+    section.scrollTop = 0;
+    fireEvent.scroll(section);
+
+    // Files arrive: the saved position survives the clamp and is restored.
+    useAllFilesMock.mockReturnValue(allFilesResult(files));
+    useChangedFilesMock.mockReturnValue(changedFilesResult([]));
+    view.rerender(panel());
+    expect(section.scrollTop).toBe(120);
+
+    // Let the restore's animation-frame loop settle (jsdom has no layout, so
+    // the target is never "reachable" — the loop runs until its time budget
+    // expires), then user scrolls are saved again.
+    const expired = performance.now() + SCROLL_RESTORE_BUDGET_MS + 1;
+    vi.spyOn(performance, "now").mockReturnValue(expired);
+    await act(() => new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))));
+    vi.mocked(performance.now).mockRestore();
+    section.scrollTop = 40;
+    fireEvent.scroll(section);
+    view.unmount();
+    const back = renderAndGetScrollSection(conversationId, files);
+    expect(back.section.scrollTop).toBe(40);
+  });
+});
+
+describe("FolderTree expanded state across conversation switches", () => {
+  function renderTree(conversationId: string, files: WorkspaceFile[]) {
+    useDirectoryMock.mockReturnValue(directoryResult());
+    const tree = (id: string) => (
+      <TooltipProvider>
+        <FolderTree
+          files={files}
+          isLoading={false}
+          isError={false}
+          error={null}
+          onFileSelect={vi.fn()}
+          conversationId={id}
+          showHidden={false}
+          changedFiles={[]}
+          sort="alpha"
+        />
+      </TooltipProvider>
+    );
+    const view = render(tree(conversationId));
+    return { view, tree };
+  }
+
+  it("re-syncs expanded folders when switching conversations without remounting", () => {
+    const files = [file("src/App.tsx"), file("README.md")];
+    const { view, tree } = renderTree("conv_tree_resync_a", files);
+
+    // Collapse src/ in conversation A (expanded by default).
+    expect(screen.getByText("App.tsx")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /src\// }));
+    expect(screen.queryByText("App.tsx")).toBeNull();
+
+    // Switch to conversation B in place: defaults apply, src/ is expanded.
+    view.rerender(tree("conv_tree_resync_b"));
+    expect(screen.getByText("App.tsx")).toBeDefined();
+
+    // Switch back to A in place: its collapsed state is restored.
+    view.rerender(tree("conv_tree_resync_a"));
+    expect(screen.queryByText("App.tsx")).toBeNull();
   });
 });

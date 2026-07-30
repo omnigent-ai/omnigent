@@ -78,6 +78,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.prompt import model_author_prefix
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
@@ -997,6 +998,20 @@ def _permission_level_from_grants(
     if public_grant is not None:
         return public_grant.level
     return None
+
+
+def _approval_access_from_grants(
+    user_id: str | None,
+    grants: list[SessionPermission],
+    is_admin: bool,
+) -> bool | None:
+    """Derive effective approval authority from pre-fetched grants."""
+    if user_id is None:
+        return None
+    if is_admin:
+        return True
+    user_grant = next((grant for grant in grants if grant.user_id == user_id), None)
+    return user_grant is not None and (user_grant.level >= LEVEL_OWNER or user_grant.can_approve)
 
 
 def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
@@ -2131,6 +2146,82 @@ async def _persist_external_codex_collaboration_mode_change(
     _publish_collaboration_mode(session_id, mode)
 
 
+async def _persist_external_codex_approval_mode_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Merge Codex's terminal-observed permission launch args."""
+    raw_args = body.data.get("terminal_launch_args")
+    if not isinstance(raw_args, list):
+        raise OmnigentError(
+            "external_codex_approval_mode_change requires data.terminal_launch_args list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        permission_args = _validate_terminal_launch_args(raw_args)
+        terminal_launch_args = _validate_terminal_launch_args(
+            _merge_codex_permission_launch_args(conv.terminal_launch_args, permission_args or [])
+        )
+    except ValueError as exc:
+        raise OmnigentError(
+            f"invalid terminal_launch_args: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    if conv.terminal_launch_args == terminal_launch_args:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        terminal_launch_args=terminal_launch_args,
+    )
+
+
+def _merge_codex_permission_launch_args(
+    existing_args: Sequence[str] | None,
+    permission_args: Sequence[str],
+) -> list[str]:
+    """Replace Codex permission arguments while preserving other launch args."""
+    config_keys = {
+        "approval_policy",
+        "approvals_reviewer",
+        "default_permissions",
+        "sandbox_mode",
+    }
+    value_options = {"--ask-for-approval", "-a", "--sandbox", "-s"}
+    merged: list[str] = []
+    args = list(existing_args or ())
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            index += 1
+            continue
+        if arg in value_options:
+            index += 2
+            continue
+        if arg.startswith(("--ask-for-approval=", "-a=", "--sandbox=", "-s=")):
+            index += 1
+            continue
+        if arg in {"--config", "-c"} and index + 1 < len(args):
+            key = args[index + 1].partition("=")[0].strip()
+            if key in config_keys:
+                index += 2
+                continue
+            merged.extend(args[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith(("--config=", "-c=")):
+            key = arg.split("=", 1)[1].partition("=")[0].strip()
+            if key in config_keys:
+                index += 1
+                continue
+        merged.append(arg)
+        index += 1
+    return [*merged, *permission_args]
+
+
 def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,
@@ -3052,6 +3143,27 @@ def _merge_pending_file_blocks(
         return item
     merged_data = item.data.model_copy(update={"content": [*file_blocks, *item.data.content]})
     return item.model_copy(update={"data": merged_data})
+
+
+def _strip_pending_author_prefix(
+    item: NewConversationItem,
+    pending_content: list[dict[str, Any]],
+    created_by: str | None,
+) -> NewConversationItem:
+    """Remove a runner-added author prefix from mirrored native text."""
+    if not isinstance(item.data, MessageData) or not created_by:
+        return item
+    original_text = _message_text(pending_content)
+    mirrored_text = _message_text(item.data.content)
+    prefix = model_author_prefix(created_by)
+    if original_text is None or mirrored_text != prefix + original_text:
+        return item
+    content = [dict(block) for block in item.data.content]
+    for block in content:
+        if block.get("type") == "input_text" and isinstance(block.get("text"), str):
+            block["text"] = block["text"][len(prefix) :]
+            break
+    return item.model_copy(update={"data": item.data.model_copy(update={"content": content})})
 
 
 def _message_text(content: list[dict[str, Any]]) -> str | None:
@@ -6421,9 +6533,18 @@ def _build_evaluation_context(
         text = data.get("text") or data.get("content") or str(data)
     else:
         text = str(data)
+    text_str = text if isinstance(text, str) else json.dumps(text)
+    # REQUEST content is the structured dict ({"user_content", "attachments"}) so
+    # every request reaches policies in one shape, whatever the entry point. This
+    # native/terminal path carries no uploads, so ``attachments`` is always empty;
+    # the web input gate (_evaluate_input_policy) is what populates it. RESPONSE
+    # stays a plain string — attachments are an input-only concern.
+    request_or_response_content: Any = (
+        {"user_content": text_str, "attachments": []} if phase == Phase.REQUEST else text_str
+    )
     return EvaluationContext(
         phase=phase,
-        content=text if isinstance(text, str) else json.dumps(text),
+        content=request_or_response_content,
         actor=actor,
         model=hook_model,
         harness=hook_harness,
@@ -7892,13 +8013,12 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import fetch_runner_models, infer_models
+    from omnigent.server.smart_routing import fetch_runner_models
 
     # Fetch live model catalog from the runner once; used below to populate
     # per-agent model lists when the caller omits explicit models.
     # Keys are worker names ("self", "claude_code", etc.) as returned by
-    # catalog_for_spec.  None when runner is unreachable — falls back to
-    # infer_models static table.
+    # catalog_for_spec. None when runner discovery is unavailable.
     _runner_catalog: dict[str, list[str]] | None = None
     if session_id is not None and runner_router is not None:
         _runner_client = await _get_runner_client(session_id, runner_router)
@@ -7973,12 +8093,10 @@ async def _handle_advise_models_mcp(
                 candidates = explicit_models
             else:
                 harness_key = _resolve_harness_for_worker(agent) or agent
-                # Prefer live runner catalog (worker name or harness key);
-                # fall back to static infer_models table.
+                # Prefer the worker name, then its normalized harness key.
                 candidates = (
                     (_runner_catalog or {}).get(agent)
                     or (_runner_catalog or {}).get(harness_key)
-                    or infer_models(harness_key)
                     or []
                 )
             if candidates:
@@ -8380,6 +8498,7 @@ __all__ = [
     "_announce_session_added",
     "_apply_liveness_to_items",
     "_apply_pending_policy_ask_writes",
+    "_approval_access_from_grants",
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
@@ -8462,6 +8581,7 @@ __all__ = [
     "_pending_elicitation_snapshot_for_session",
     "_permission_level_from_grants",
     "_persist_external_assistant_message",
+    "_persist_external_codex_approval_mode_change",
     "_persist_external_codex_collaboration_mode_change",
     "_persist_external_model_change",
     "_persist_external_model_options",
@@ -8547,6 +8667,7 @@ __all__ = [
     "_stop_session_via_runner",
     "_stored_file_to_resource",
     "_stream_live_events",
+    "_strip_pending_author_prefix",
     "_structured_ask_user_question",
     "_subagent_delivery_status",
     "_targeted_elicitation_event",

@@ -3,7 +3,7 @@
 # `e2e_matrix` and `integration_matrix`.
 #
 # We test `main` (the checked-out code = client + tests, always) against each
-# non-rc release tag AT OR ABOVE the backcompat floor (MIN_VERSION, default
+# final (non-prerelease) release tag AT OR ABOVE the backcompat floor (MIN_VERSION, default
 # 0.2.0 — the first release with the mock-LLM e2e infra; see below), on BOTH
 # axes — and ONLY those cells:
 #   (server=main,      runner=<release>)  — new server vs a previously-shipped runner
@@ -17,8 +17,9 @@
 #
 # Env in:
 #   VERSIONS    optional comma-separated override of the version set used for
-#               BOTH axes (e.g. "main,v0.2.0"). Empty = main + all non-rc tags.
-#               Blank entries are dropped and surrounding whitespace trimmed.
+#               BOTH axes (e.g. "main,v0.2.0"). Empty = main + all final
+#               (non-prerelease) tags. Blank entries are dropped and
+#               surrounding whitespace trimmed.
 #   NUM_SHARDS  e2e shard count per cell (default 4).
 # Out (GITHUB_OUTPUT):
 #   e2e_matrix={"include":[{"server":..,"runner":..,"shard_id":..,"num_shards":..}, ...]}
@@ -61,9 +62,12 @@ if [ -n "${VERSIONS:-}" ]; then
   IFS=',' read -ra raw <<<"$VERSIONS"
 else
   raw=("main")
-  # `[^a-z]rc[0-9]` so we drop vX.Y.ZrcN without over-excluding tags that merely
-  # contain the substring "rc" (e.g. a hypothetical "...march").
-  while IFS= read -r tag; do raw+=("$tag"); done < <(git tag --sort=-v:refname | grep -viE '(^|[^a-z])rc[0-9]')
+  # Drop pre-release tags (vX.Y.ZrcN / .devN / preN — same trio github-release.yml
+  # skips): they are snapshots of main, so main-vs-them is not a compat signal, and
+  # under the 256-job cap they would evict the oldest FINAL releases from coverage.
+  # `[^a-z]` guards against over-excluding tags that merely contain the substring
+  # (e.g. a hypothetical "...march"). An explicit VERSIONS override still accepts them.
+  while IFS= read -r tag; do raw+=("$tag"); done < <(git tag --sort=-v:refname | grep -viE '(^|[^a-z])(rc|dev|pre)[0-9]')
 fi
 
 # Trim whitespace, drop blanks, reject invalid tokens, drop below-floor releases.

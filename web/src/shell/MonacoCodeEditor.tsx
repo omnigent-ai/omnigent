@@ -42,6 +42,7 @@ import {
 } from "./monacoSetup";
 import type { monaco } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
+import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
 
 type EditorOptions = EditorProps["options"];
@@ -287,6 +288,12 @@ function MonacoCodeEditorInner({
   const flushRef = useRef(autoSave.flush);
   flushRef.current = autoSave.flush;
 
+  // Monaco scrolls internally, so its offset is cached per conversation + file
+  // rather than via the DOM scroll-restore hook. Held in a ref so the mount-time
+  // onDidScrollChange subscription always writes the current file's key.
+  const scrollKeyRef = useRef("");
+  scrollKeyRef.current = `viewer:${conversationId}:${path}`;
+
   const handleMount: OnMount = useCallback(
     (editor, monaco) => {
       editorInstanceRef.current = editor;
@@ -327,6 +334,13 @@ function MonacoCodeEditorInner({
         setDirty(false);
         if (viewState) ed.restoreViewState(viewState);
       };
+      // Reopening a file (or switching sessions and back) lands where the user
+      // left off, and further scrolling is cached under the current file's key.
+      attachEditorScrollRestore(
+        editor,
+        () => scrollKeyRef.current,
+        () => editorInstanceRef.current === editor,
+      );
       setMounted(true);
     },
     [setContentRef, setDirty, content],

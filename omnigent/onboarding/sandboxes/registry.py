@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from omnigent.onboarding.sandboxes.base import SandboxLauncher
+from omnigent.onboarding.sandboxes.base import SandboxLifecycle
 
 if TYPE_CHECKING:
     pass
@@ -298,10 +298,10 @@ def instantiate(
         raise SandboxRegistryError(
             f"could not load sandbox provider '{name}' from {meta.launcher_class!r}: {exc}"
         ) from exc
-    if not isinstance(launcher_cls, type) or not issubclass(launcher_cls, SandboxLauncher):
+    if not isinstance(launcher_cls, type) or not issubclass(launcher_cls, SandboxLifecycle):
         raise SandboxRegistryError(
             f"sandbox provider '{name}' resolved to {launcher_cls!r}, "
-            f"which is not a SandboxLauncher subclass"
+            f"which is not a SandboxLifecycle subclass"
         )
     if name == "lakebox" and workspace_host is not None:
         return launcher_cls(workspace_host=workspace_host)

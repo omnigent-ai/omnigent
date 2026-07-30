@@ -28,10 +28,12 @@ class _WakePost:
     :param url: The path the wake notice was POSTed to, e.g.
         ``"/v1/sessions/0349c7f62dcaa06b868e9c088c39f062/events"``.
     :param notice: The injected notice text pulled out of the request body.
+    :param created_by: Optional attribution actor sent with the wake notice.
     """
 
     url: str
     notice: str
+    created_by: str | None = None
 
 
 class _QueuedResponseServerClient:
@@ -69,7 +71,14 @@ class _QueuedResponseServerClient:
         :raises AssertionError: If more POSTs are made than responses queued.
         """
         notice = json["data"]["content"][0]["text"]
-        self.calls.append(_WakePost(url=url, notice=notice))
+        created_by = json.get("created_by")
+        self.calls.append(
+            _WakePost(
+                url=url,
+                notice=notice,
+                created_by=created_by if isinstance(created_by, str) else None,
+            )
+        )
         assert self._responses, (
             f"Wake POST made {len(self.calls)} call(s) but only "
             f"{len(self.calls) - 1} response(s) were queued — the retry "
@@ -138,6 +147,43 @@ async def test_wake_post_retries_transient_503_then_succeeds(
     assert len(_no_wake_backoff) == 1, (
         f"Expected one backoff before the single retry, got {_no_wake_backoff}."
     )
+
+
+async def test_wake_post_carries_dispatch_actor() -> None:
+    """A wake notice preserves the collaborator that dispatched the child."""
+    parent_id = "5a81ef19fce549929c8f9925c2ee034f"
+    client = _QueuedResponseServerClient([_wake_response(200, parent_id)])
+
+    delivered = await runner_app_mod._deliver_subagent_wake_post(
+        client,  # type: ignore[arg-type]
+        parent_id,
+        "[System: worker completed]",
+        created_by="bob@example.com",
+    )
+
+    assert delivered is True
+    assert len(client.calls) == 1
+    assert client.calls[0].created_by == "bob@example.com"
+
+
+async def test_wake_post_retries_without_actor_when_attribution_is_rejected() -> None:
+    """A stale collaborator grant cannot permanently drop a parent wake."""
+    parent_id = "32561551610d43b39dc4e394b78ea89d"
+    client = _QueuedResponseServerClient(
+        [_wake_response(403, parent_id), _wake_response(200, parent_id)]
+    )
+
+    delivered = await runner_app_mod._deliver_subagent_wake_post(
+        client,  # type: ignore[arg-type]
+        parent_id,
+        "[System: worker completed]",
+        created_by="bob@example.com",
+    )
+
+    assert delivered is True
+    assert len(client.calls) == 2
+    assert client.calls[0].created_by == "bob@example.com"
+    assert client.calls[1].created_by is None
 
 
 async def test_wake_post_persistent_503_returns_failure(
@@ -623,6 +669,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -666,7 +713,12 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         async def close(self) -> None:
             """:returns: None."""
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """
         No-op thread preload.
 
@@ -674,7 +726,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
-        del transport, loaded_thread_id
+        del transport, loaded_thread_id, terminal_launch_args
 
     runs: list[_ForwarderRun] = []
 

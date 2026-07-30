@@ -1378,7 +1378,13 @@ describe("Composer reply-quote focus", () => {
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    rerender(<Composer {...composerProps({ replyQuotes: ["selected response text"] })} />);
+    rerender(
+      <Composer
+        {...composerProps({
+          replyQuotes: [{ id: "quote-1", text: "selected response text" }],
+        })}
+      />,
+    );
     expect(document.activeElement).toBe(ta);
   });
 
@@ -1386,13 +1392,20 @@ describe("Composer reply-quote focus", () => {
     // Removing a chip (the X button) shrinks the count — the effect only
     // fires when the count grows, so focus must stay put.
     const { rerender } = render(
-      <Composer {...composerProps({ replyQuotes: ["first", "second"] })} />,
+      <Composer
+        {...composerProps({
+          replyQuotes: [
+            { id: "quote-1", text: "first" },
+            { id: "quote-2", text: "second" },
+          ],
+        })}
+      />,
     );
     const ta = textarea();
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    rerender(<Composer {...composerProps({ replyQuotes: ["first"] })} />);
+    rerender(<Composer {...composerProps({ replyQuotes: [{ id: "quote-1", text: "first" }] })} />);
     expect(document.activeElement).not.toBe(ta);
   });
 });
@@ -1673,6 +1686,27 @@ describe("Composer config gear", () => {
     expect(screen.getByTestId("composer-config-effort")).toBeTruthy();
   });
 
+  it("uses the Default sentinel when Kiro marks no catalog row as default", async () => {
+    const options = [
+      { id: "auto", displayName: "Automatic", isDefault: false },
+      { id: "provider-latest", displayName: "Latest", isDefault: false },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "kiro",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-model")).toHaveTextContent("Default");
+  });
+
   it("does not open the modal via bare /model when the gear is disabled (not live)", async () => {
     // Bare /model bumps the open nonce; on a non-live session the gear is
     // inert, so the nonce must NOT open a modal that can't apply a change.
@@ -1688,9 +1722,9 @@ describe("Composer config gear", () => {
         })}
       />,
     );
-    const textarea = document.querySelector("textarea") as HTMLTextAreaElement;
-    fireEvent.change(textarea, { target: { value: "/model" } });
-    fireEvent.keyDown(textarea, { key: "Enter", code: "Enter" });
+    const modelTextarea = document.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(modelTextarea, { target: { value: "/model" } });
+    fireEvent.keyDown(modelTextarea, { key: "Enter", code: "Enter" });
     // Give the nonce effect a tick; the modal must stay closed.
     await waitFor(() => expect(gear()).toHaveAttribute("aria-disabled", "true"));
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();

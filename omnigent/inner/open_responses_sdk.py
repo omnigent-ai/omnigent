@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import pydantic
 
+from omnigent import model_catalog
 from omnigent.llms.adapters._content import redact_inline_data_uris
 from omnigent.spec.types import RetryPolicy
 
@@ -534,7 +535,14 @@ class OpenResponsesExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
-        model = cfg.model or "gpt-5.3-codex"
+        model = cfg.model
+        if model is None:
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "openai",
+                family="openai",
+            )
+            model = resolution.model_id
         session_key = self._session_key(messages)
         state = self._get_or_create_session_state(session_key)
         state.interrupt_requested = False

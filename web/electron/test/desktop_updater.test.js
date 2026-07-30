@@ -253,17 +253,19 @@ describe("desktop_updater — dev feed gating", () => {
     const h = makeUpdater({ settings: { update_mode: "manual" } });
     h.updater.registerIpc();
 
-    for (const channel of [
-      "omnigent:update-check",
-      "omnigent:update-download",
-      "omnigent:update-install",
-      "omnigent:set-update-config",
-    ]) {
-      await assert.rejects(
-        h.ipcHandlers.get(channel)(h.event, { mode: "manual" }),
-        /unavailable in development/,
-      );
-    }
+    await Promise.all(
+      [
+        "omnigent:update-check",
+        "omnigent:update-download",
+        "omnigent:update-install",
+        "omnigent:set-update-config",
+      ].map((channel) =>
+        assert.rejects(
+          h.ipcHandlers.get(channel)(h.event, { mode: "manual" }),
+          /unavailable in development/,
+        ),
+      ),
+    );
     assert.equal(h.calls.showMessageBox.length, 0);
     assert.equal(h.calls.checkForUpdates ?? 0, 0);
     assert.equal(h.calls.downloadUpdate, 0);
@@ -284,12 +286,14 @@ describe("desktop_updater — IPC trust + consent", () => {
       ["omnigent:update-install", []],
       ["omnigent:set-update-config", [{ mode: "manual" }]],
     ];
-    for (const [channel, args] of cases) {
-      await assert.rejects(
-        Promise.resolve().then(() => h.ipcHandlers.get(channel)(h.event, ...args)),
-        /connected server page/,
-      );
-    }
+    await Promise.all(
+      cases.map(([channel, args]) =>
+        assert.rejects(
+          Promise.resolve().then(() => h.ipcHandlers.get(channel)(h.event, ...args)),
+          /connected server page/,
+        ),
+      ),
+    );
   });
 
   it("prompts and runs each privileged action when approved", async () => {

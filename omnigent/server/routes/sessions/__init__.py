@@ -508,6 +508,7 @@ def create_sessions_router(
         runner_exit_reports=runner_exit_reports,
         host_registry=host_registry,
         background_title_coordinator=background_title_coordinator,
+        runner_tunnel_tokens=runner_tunnel_tokens,
     )
 
     register_permissions_routes(

@@ -26,6 +26,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
@@ -127,9 +128,8 @@ def register_permissions_routes(
                     "cannot be shared on this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-        if (
-            _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
-            and body.level > LEVEL_READ
+        if _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY) and (
+            body.level > LEVEL_READ or body.can_approve is True
         ):
             raise OmnigentError(
                 "Sharing is limited to read-only access on this Omnigent server.",
@@ -166,9 +166,35 @@ def register_permissions_routes(
                 "Cannot modify owner permissions",
                 code=ErrorCode.FORBIDDEN,
             )
+        can_approve = (
+            existing.can_approve
+            if body.can_approve is None and existing is not None
+            else bool(body.can_approve)
+        )
+        if can_approve and body.level < LEVEL_EDIT:
+            raise OmnigentError(
+                "Approval delegation requires edit access",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if body.user_id == RESERVED_USER_PUBLIC and can_approve:
+            raise OmnigentError(
+                "Public access cannot approve privileged actions",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        approval_capability_changed = (
+            existing.can_approve if existing is not None else False
+        ) != can_approve
+        if approval_capability_changed:
+            await _require_access(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
         await asyncio.to_thread(permission_store.ensure_user, body.user_id)
         perm = await asyncio.to_thread(
-            permission_store.grant, body.user_id, session_id, body.level
+            permission_store.grant,
+            body.user_id,
+            session_id,
+            body.level,
+            can_approve=can_approve,
         )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
@@ -177,6 +203,7 @@ def register_permissions_routes(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
             level=perm.level,
+            can_approve=perm.can_approve,
         )
 
     @router.delete(
@@ -291,6 +318,7 @@ def register_permissions_routes(
                     user_id=g.user_id,
                     conversation_id=g.conversation_id,
                     level=g.level,
+                    can_approve=g.can_approve,
                 )
                 for g in grants
             ],

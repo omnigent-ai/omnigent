@@ -120,9 +120,12 @@ function sse(event: string, data: Record<string, unknown>): string {
 
 /** Let the async SSE-parse → reduce pipeline drain queued bytes. */
 async function drain(): Promise<void> {
+  // Timer turns must elapse in order to flush each queued stage.
+  /* oxlint-disable no-await-in-loop */
   for (let k = 0; k < 4; k += 1) {
     await new Promise<void>((r) => setTimeout(r, 0));
   }
+  /* oxlint-enable no-await-in-loop */
 }
 
 /**
@@ -247,6 +250,8 @@ export async function runStreamRenderBench(opts: {
   // Stream the text. Each delta carries a trailing space so the reducer
   // flushes a text_chunk on its 30-char threshold.
   let full = "";
+  // The benchmark drains each delta before sending the next one.
+  /* oxlint-disable no-await-in-loop */
   for (let n = 0; n < contentDeltas; n += 1) {
     const tok = `token${n} of streamed answer `;
     full += tok;
@@ -254,6 +259,7 @@ export async function runStreamRenderBench(opts: {
     await drain();
     if (manual && (n + 1) % blocksPerFrame === 0) manual.fire();
   }
+  /* oxlint-enable no-await-in-loop */
   if (manual) manual.fire(); // flush the partial trailing frame
 
   // Close the response.

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -293,11 +294,7 @@ class QwenExecutor(Executor):
         # derived from the initialize response, so it's stale too.
         self._initialized = False
         self._image_supported = False
-        env = os.environ.copy()
-        # Translate Omnigent's provider/gateway routing into the OpenAI-compatible
-        # env vars qwen reads (overriding any ambient values). No-op when no
-        # gateway is wired (the CLI's own ambient auth is used).
-        env.update(await self._resolve_gateway_env())
+        env = await self._build_spawn_env()
         # Resolve the path to spawn: the bare qwen binary, or a sandbox launcher
         # that confines the whole process tree when os_env requests it.
         launch_path = self._sandbox_launch_path(tuple(env.keys()))
@@ -366,6 +363,25 @@ class QwenExecutor(Executor):
         except (OSError, ImportError, NotImplementedError) as exc:
             logger.warning("Could not apply sandbox for qwen; running unsandboxed: %s", exc)
             return self._qwen_path
+
+    async def _build_spawn_env(self) -> dict[str, str]:
+        """The env handed to the qwen subprocess.
+
+        Deny-by-default: base + qwen's own ``QWEN_``/``OPENAI_``/``DASHSCOPE_``
+        families + the spec's ``env_passthrough``, then Omnigent's
+        provider/gateway routing on top so the intentionally-set values override
+        any ambient ones. Previously ``os.environ.copy()`` handed the qwen CLI
+        every host secret (#3445).
+
+        Kept as a named builder so the spawn-env canary can drive the real thing
+        rather than a hand-copied prefix list.
+        """
+        env = clean_agent_env(
+            allow_prefixes=("QWEN_", "OPENAI_", "DASHSCOPE_"),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
+        env.update(await self._resolve_gateway_env())
+        return env
 
     async def _resolve_gateway_env(self) -> dict[str, str]:
         """Build the OpenAI-compatible env qwen reads from the gateway config.

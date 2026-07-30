@@ -38,6 +38,10 @@ def _isolate_global_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     :param tmp_path: Temporary directory for the isolated config.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_catalog_default_model",
+        lambda provider_name, family, *, context: f"catalog-{provider_name}-{family}-default",
+    )
 
 
 def _make_spec(
@@ -225,7 +229,7 @@ def test_ucode_state_without_model_falls_back_to_databricks_default(
 
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
     # The verified routable gateway endpoint name, not the CLI's own default.
-    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-opus-4-8"
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "catalog-databricks-claude-default"
 
 
 def test_ucode_state_with_model_is_not_overridden_by_default(

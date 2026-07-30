@@ -568,11 +568,11 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             self.assertEqual(events[-1].response, "done")
             self.assertEqual(
                 _FakeRunner.last_calls[0]["agent"].model,
-                "databricks-gpt-5-5",
+                "catalog-databricks-openai-default",
             )
             self.assertEqual(
                 _FakeRunner.last_calls[0]["run_config"].kwargs["model"],
-                "databricks-gpt-5-5",
+                "catalog-databricks-openai-default",
             )
 
         _run(_t())

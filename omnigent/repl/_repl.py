@@ -4870,11 +4870,22 @@ def _build_model_readout_lines(
         PI_SURFACE,
         describe_active_credential,
         harness_family,
+        harness_owns_its_credential,
         load_providers,
         provider_families,
     )
 
     lines: list[str] = []
+    if harness and harness_owns_its_credential(harness):
+        # The external agent authenticates itself, so there is no Omnigent
+        # credential to name. An in-session override is still shown (it's
+        # real, and e.g. goose applies it as GOOSE_MODEL); whether it reaches
+        # the agent varies per ACP agent, so no claim is made either way.
+        model_label = model_override or "(the agent's own model)"
+        return [
+            f"Active:  {model_label}  ·  🤖 ACP agent (agent's own auth)",
+            "usage: /model <name> · /model default | off | reset to clear",
+        ]
     cred = describe_active_credential(config, harness, model_override=model_override)
     if cred is None:
         # Nothing resolves for this harness's surface — not in the explicit

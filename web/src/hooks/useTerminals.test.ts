@@ -164,14 +164,15 @@ describe("fetchTerminals", () => {
     ]);
   });
 
-  it("returns [] for a not-yet-reachable runner (404/409/502/503)", async () => {
-    // These are "no terminal yet", not errors: the live SSE event fills
-    // the rail once the runner binds, so the seed must not throw.
-    for (const status of [404, 409, 502, 503]) {
+  it.each([404, 409, 502, 503])(
+    "returns [] for a not-yet-reachable runner (%i)",
+    async (status) => {
+      // These are "no terminal yet", not errors: the live SSE event fills
+      // the rail once the runner binds, so the seed must not throw.
       fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: false, status }));
       expect(await fetchTerminals("conv_abc")).toEqual([]);
-    }
-  });
+    },
+  );
 
   it("throws on a hard error status so React Query can retry", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(null, { ok: false, status: 500 }));

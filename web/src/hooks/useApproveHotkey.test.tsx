@@ -50,6 +50,13 @@ describe("useApproveHotkey", () => {
     expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
   });
 
+  it("does not accept when the viewer lacks approval authority", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(false));
+    press();
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+
   it("accepts the most recent pending approval", () => {
     blocks = [
       { type: "elicitation", elicitationId: "old", status: "pending" },

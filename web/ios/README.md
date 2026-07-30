@@ -54,5 +54,5 @@ The conversation path never enters the saved server URL or recents (only the
 load URL carries it), so a later deep link resolves against a clean server
 identity. The scheme is registered via `CFBundleURLSchemes` in both Info plists;
 test from the simulator with `xcrun simctl openurl booted 'omnigent://...'`.
-The web UI must be rebuilt (`cd web && npm run build`) for the SPA's `onOpenPath`
+The web UI must be rebuilt (`pnpm --filter web run build`) for the SPA's `onOpenPath`
 subscriber to be present in the served bundle.

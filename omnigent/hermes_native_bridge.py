@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -403,6 +404,49 @@ def write_policy_hook_config(
     allowlist_path.write_text(json.dumps(allowlist_data, indent=2) + "\n")
 
     return hermes_home
+
+
+def inject_relay_into_policy_hook(
+    bridge_dir: Path,
+    relay_url: str,
+    relay_token: str,
+    server_url: str,
+    session_id: str,
+) -> bool:
+    """Atomically rewrite the policy hook wrapper to use relay credentials.
+
+    Called after the tool relay starts so subsequent hook subprocess
+    invocations authenticate via the relay's non-expiring local token
+    instead of a baked server bearer.
+
+    :returns: ``True`` when the wrapper existed and was rewritten.
+    """
+    hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
+    wrapper = hermes_home / "omnigent-policy-hook.sh"
+    if not wrapper.is_file():
+        return False
+
+    hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
+    from omnigent.native_policy_hook import _RELAY_TOKEN_ENV, _RELAY_URL_ENV
+
+    new_text = (
+        "#!/bin/sh\n"
+        f"export _OMNIGENT_SERVER_URL={shlex.quote(server_url)}\n"
+        f"export _OMNIGENT_SESSION_ID={shlex.quote(session_id)}\n"
+        f"export {_RELAY_URL_ENV}={shlex.quote(relay_url)}\n"
+        f"export {_RELAY_TOKEN_ENV}={shlex.quote(relay_token)}\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(hook_script_path)}\n"
+    )
+    fd, tmp_name = tempfile.mkstemp(prefix="omnigent-policy-hook.", dir=str(hermes_home))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(new_text)
+        os.chmod(tmp_name, 0o700)
+        os.replace(tmp_name, wrapper)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return True
 
 
 def _write_mcp_bridge_config(bridge_dir: Path) -> None:

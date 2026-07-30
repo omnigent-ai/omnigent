@@ -177,3 +177,34 @@ def test_terminal_attach_url_encodes_path_components_and_switches_scheme() -> No
         url == "wss://example.databricks.com/base/v1/sessions/conv%2Fa%20b"
         "/resources/terminals/terminal%2Fmain/attach"
     )
+
+
+def test_normalize_extra_args_prefers_extra_args() -> None:
+    assert native_terminal.normalize_extra_args(
+        extra_args=("--a",), legacy_args=None, legacy_param="pi_args"
+    ) == ("--a",)
+
+
+def test_normalize_extra_args_empty_when_neither_set() -> None:
+    assert (
+        native_terminal.normalize_extra_args(
+            extra_args=None, legacy_args=None, legacy_param="pi_args"
+        )
+        == ()
+    )
+
+
+def test_normalize_extra_args_legacy_alias_warns_and_is_used() -> None:
+    with pytest.warns(DeprecationWarning, match="pi_args"):
+        result = native_terminal.normalize_extra_args(
+            extra_args=None, legacy_args=("--legacy",), legacy_param="pi_args"
+        )
+    assert result == ("--legacy",)
+
+
+def test_normalize_extra_args_extra_args_wins_over_legacy_with_warning() -> None:
+    with pytest.warns(DeprecationWarning):
+        result = native_terminal.normalize_extra_args(
+            extra_args=("--new",), legacy_args=("--old",), legacy_param="pi_args"
+        )
+    assert result == ("--new",)

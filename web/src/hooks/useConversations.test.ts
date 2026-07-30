@@ -444,7 +444,14 @@ describe("useStopAndDeleteConversation cache eviction", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     } satisfies Session);
+    // The deleted session is also pinned. The Pinned section reads a sibling
+    // cache the ["conversations"] sweep skips, so delete must drop it here too.
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: [conversation({ id: "conv_x" }), conversation({ id: "conv_pinned_other" })],
+      filterHonored: true,
+    });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const rendered = renderHook(() => useStopAndDeleteConversation(), { wrapper });
@@ -495,6 +502,21 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The open-chat snapshot must go too so a later visit to /c/{id}
     // can't render the deleted session from cache.
     expect(queryClient.getQueryData(["session", "conv_x"])).toBeUndefined();
+  });
+
+  it("drops a deleted pinned session from the sibling pinned cache", async () => {
+    const { queryClient, rendered } = seedAndDelete();
+
+    rendered.result.current.mutate({ id: "conv_x" });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // The Pinned section renders from PINNED_CONVERSATIONS_KEY, a sibling of
+    // ["conversations"] that the delete sweep deliberately skips — so without
+    // an explicit patch the deleted row lingers in Pinned until a reload.
+    const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+    expect(pinned!.conversations.map((c) => c.id)).toEqual(["conv_pinned_other"]);
+    // The patch preserves the query's filterHonored flag.
+    expect(pinned!.filterHonored).toBe(true);
   });
 
   it("does not refetch the conversations list, but does refresh the project list", async () => {
@@ -554,6 +576,7 @@ describe("useRenameConversation cache patching", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     } satisfies Session);
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);

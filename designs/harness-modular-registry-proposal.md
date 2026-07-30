@@ -321,13 +321,18 @@ validator keeps rejecting community native metadata throughout Phase 1.
 | **1.2 Signature normalization** | Give `run_<x>_native` a uniform `extra_args` spelling with a back-compat `<x>_args` alias (one-release deprecation per CLAUDE.md — name the target release). Decide the `**extra` protocol for the four special-kwarg harnesses (claude/codex/antigravity/opencode). | 11 `omnigent/<x>_native.py`, `native_dispatch.py` | 1.1 | Low–Med (mechanical ×11) | 2–3d |
 | **1.3 Resume hubs** | Collapse `resume_dispatch._dispatch_wrapper` (10 arms) and the 6 `chat.py` `_run_<x>_native_resume_redirect` helpers into one `resolve(provider.run_native)(...)` path. Deletes the redirect helpers and normalizes the 10-vs-6 coverage gap. | `resume_dispatch.py`, `chat.py` | 1.1, 1.2 | Med | 2d |
 | **1.4 CLI subcommands** | Replace the 11 hand-written `@cli.command` funcs in `cli_native.py` with a loop over `native_agents()`, registering one Click command each; make `_reject_native_on_windows` a registry-driven guard. Wrinkle: per-command options (`--model`, `--command`) must come off provider/row metadata. | `cli_native.py`, `cli.py` | 1.1, 1.2 | Med | 2–3d |
-| **1.5 Runner launch + terminal-route** | The epicenter. Replace spawn-env (22 arms), launch (11 + 3 elif), and terminal-route (11) dispatch in `app.py` with `resolve(provider.auto_create_terminal / spawn_env_builder)(...)`. **Preserve the `_supervise_*_bridges` forward-cursor / restart / double-post invariants exactly.** Likely splits into 1.5a spawn-env and 1.5b launch+route. | `runner/app.py`, `runner/native/orchestration.py` | 1.1, 1.2 | **High** | 4–6d |
-| **1.6 Runner interrupt/stop** | Route interrupt/stop through `resolve(provider.interrupt_handler / stop_handler)`; fill the 9/7 coverage gaps so every native has both paths. | `runner/app.py` | 1.1 | Med | 2d |
+| **1.5a Runner spawn-env** | Collapse the spawn-env dispatch — **two** near-identical 11-arm blocks (`app.py` ~2720 and ~6236) — behind a uniform `build_spawn_env(session_id, *, server_client, labels)` provider hook. Absorbs the three shapes (bare / bridge-id-from-labels / hermes policy-hook write) behind that one signature. Self-contained; removes the duplication. The bounded first measurement of the runner. | `runner/app.py`, 11 `<x>_native_bridge.py` | 1.1, 1.2 | Med | 2–3d |
+| **1.5b Runner launch** | The epicenter. The launch arms (`app.py` ~2841–3316 + the ~6095 elif chain) do **not** share a signature — `_auto_create_<x>_terminal` has 11 divergent signatures (3 common params; claude carries 9 extras). Unify by passing a `NativeLaunchContext` dataclass to a uniform `provider.auto_create_terminal(ctx)` adapter, with explicit `pre_launch` hooks for the non-uniform arms (claude transfer-inbound + rebuild-on-switch, codex needs-terminal check, antigravity host-spawn + transfer, opencode cold-boot terminal-ensure on the turn path ~6329). **Preserve the `_supervise_*_bridges` forward-cursor / double-post invariants exactly.** | `runner/app.py`, `runner/native/orchestration.py` | 1.5a | **High** | 4–6d |
+| **1.5c Runner terminal-route** | Collapse the `terminal/attach` `ensure_native_terminal` dispatch (`app.py` ~7462–7908). 9/11 are a uniform check→create→return; codex + antigravity need an ownership-check + response-wrap hook (`_is_runner_owned_*`, `_codex_ensure_response_with_policy_notice`). Reuses 1.5b's context object. | `runner/app.py` | 1.5b | Med | 2d |
+| **1.6 Runner interrupt/stop** | Route interrupt/stop through the provider; fill the 9-interrupt / 7-stop coverage gaps so every native has both paths. **Not additive as first scoped:** every handler is a closure over app-scope state (`server_client`, `resource_registry`, `_publish_event`, the `_AUTO_FORWARDER_TASKS` / `_session_*` module dicts), so extracting to module-level provider functions requires threading those in as a dependency-injection context, not a plain move. | `runner/app.py`, `runner/native/orchestration.py` | 1.5b | Med–High | 3–4d |
 | **1.7 Seeding loop** | Replace the 26 `_ensure_default_<x>_agent` / `_build_<x>_native_bundle` touchpoints in `server/app.py` with a loop materializing via `provider.materialize_agent_spec`. **`builtin_agent_id` output must stay byte-identical** so redeploy doesn't orphan seeded agents — pin this with a test. | `server/app.py`, `db/utils.py` | 1.1 | Med | 2–3d |
-| **1.8 Derive enumerations** | Add a `fork_history: Literal["none","rebuild","preamble"]` axis to `HarnessCapabilities`; derive the §5 frozensets/dicts from `native_agents()` / capabilities (8 files, ~35 sets); delete the dead `_HARNESS_MODULES` literal. | `harness_capabilities.py`, `_omnigent_compat.py`, `harness_readiness.py`, `harness_install.py`, `model_override.py`, `model_catalog.py`, `_sessions/common.py`, `resource_registry.py`, `runtime/harnesses/__init__.py`, `tests/test_harness_capabilities.py` | 1.1 | Med | 2–3d |
+| **1.8 Derive enumerations** | Add a `fork_history: Literal["none","rebuild","preamble"]` axis to `HarnessCapabilities`; derive the §5 frozensets/dicts from `native_agents()` / capabilities (8 files, ~35 sets); delete the dead `_HARNESS_MODULES` literal. Also add optional `shell_tool_name` / `shell_tool_prompt` fields so the harness bench's tool-call probe can be driven off capabilities instead of its hardcoded `_NATIVE_TOOL_PROVOCATION` table (see "Harness bench compatibility" below). | `harness_capabilities.py`, `_omnigent_compat.py`, `harness_readiness.py`, `harness_install.py`, `model_override.py`, `model_catalog.py`, `_sessions/common.py`, `resource_registry.py`, `runtime/harnesses/__init__.py`, `tests/harness_bench/native_tui_driver.py`, `tests/test_harness_capabilities.py` | 1.1 | Med | 2–3d |
 
-After 1.1 + 1.2 land, PRs 1.3–1.8 touch mostly disjoint hubs and can proceed in
-parallel. **Phase 1 subtotal: ~17–25 engineer-days.**
+After 1.1 + 1.2 land, PRs 1.3, 1.4, 1.7, 1.8 touch mostly disjoint hubs and can
+proceed in parallel. The runner sub-stack (1.5a → 1.5b → 1.5c → 1.6) is serial —
+each reuses the prior's context object — and is the critical path.
+**Phase 1 subtotal: ~20–29 engineer-days** (revised up from ~17–25 after the
+runner exploration split 1.5 into 1.5a/b/c and re-scoped 1.6; see below).
 
 ### Phase 2 — Open to community packages
 
@@ -338,20 +343,103 @@ Only starts once Phase 1 has every built-in running *through* the seam.
 | **2.1 Validator flip** | Replace the hard reject in `_validate_community_contribution` with positive validation: every `native_agent.key` has a matching `native_provider.key`; provider import paths start with `COMMUNITY_MODULE_PREFIX`; identity values don't collide (`_native_agent_identity_values` already checks this); `run_native` + `auto_create_terminal` are non-empty. | `harness_plugins.py` | 1.1 | Low–Med | 1d |
 | **2.2 `/v1/harnesses` native rows** | Extend `harness_catalog()` to emit native-agent rows + capabilities (`agent_name`, `wrapper_label`, `fork_history`, icon/label field), so the web has a server source of truth. | `harness_plugins.py`, `server/routes/harnesses.py` | 1.8 | Low | 2d |
 | **2.3 Web off the endpoint** | Delete the `nativeCodingAgents.ts` literals + `HARNESS_ALIASES`, the `forkHarness.ts` sets (`NATIVE_REBUILD_HARNESSES` / `PREAMBLE_FORK_HARNESSES` now come from `fork_history`), the `AgentCard` icon switch, and the wrapper-label literals in `sessionStop.ts` / `sessionCapabilities.ts` / `codexPlanMode.ts` — all driven by `/v1/harnesses`. Needs a **demo (screenshots/recording)** per CLAUDE.md; likely splits into 2.3a fork/capabilities data-plumb and 2.3b icon/label rendering. | `web/src/lib/*`, `web/src/components/AgentCard.tsx` | 2.2 | Med–High (largest FE) | 4–6d |
-| **2.4 Docs + example plugin** | Extend `designs/harness-plugin-interface.md` § "Native TUI Harnesses" with the native checklist, and ship an example native plugin (`examples/` or a sibling `omnigent-foo-native`) proving the contract end to end. | `designs/harness-plugin-interface.md`, `examples/` | 2.1, 2.2 | Low–Med | 2–3d |
+| **2.4 Docs + example plugin** | Extend `designs/harness-plugin-interface.md` § "Native TUI Harnesses" with the native checklist, and ship an example native plugin (`examples/` or a sibling `omnigent-foo-native`) proving the contract end to end. **Acceptance criterion: the example plugin is benchable** — `python -m tests.harness_bench --harness <plugin> --live` runs green (selection + native-tui driver + provisioning), which is the honest end-to-end proof the contract holds. | `designs/harness-plugin-interface.md`, `examples/` | 2.1, 2.2 | Low–Med | 2–3d |
 
 **Phase 2 subtotal: ~9–12 engineer-days.**
 
+### Harness bench compatibility
+
+Does the harness bench (`tests/harness_bench/`, per
+`designs/harness-capabilities-bench-seam.md`) work with a community-contributed
+native plugin after this refactor? **Mostly yes, with no separate bench-migration
+PR — the bench's selection/driver layer is already registry-driven.** Verified
+against the current tree:
+
+- **Selection is already registry-driven.** `manifest.py` seeds
+  `OFFICIAL_PROFILES` from the 4 P0 SDK probes, then loops over
+  `harness_capabilities()` adding every harness whose `integration_mode is
+  NATIVE_TUI` (`_native_tui_harnesses()`), auto-generating a `BenchProfile` per
+  native via `_native_profile()`. Community harnesses also resolve through
+  `_registry_profile()` (`harness_modules()` / `harness_capabilities()`), and the
+  CLI accepts a `module:attr` `BenchProfile` reference. So a plugin declaring
+  `native_agents` + a `NATIVE_TUI` capability **enumerates and gets a profile with
+  zero bench edits**.
+- **The driver is already generic.** `transport.py`'s `driver_registry()` keys on
+  transport/integration-mode; a native profile auto-selects `NativeTuiDriver`,
+  which spawns a real server + runner and drives the vendor TUI through the
+  session API. No `if harness == "x"` in the driver path.
+- **Gap 1 — provisioning needs registry-driven seeding, which is PR 1.7.** The
+  native driver provisions a session against a pre-seeded `<harness>-ui` agent
+  (`native_tui_driver.py` → `_agent_id(vendor.agent_name)`). Today that agent
+  exists only because `server/app.py` hardcodes its seeding, so a community
+  plugin's agent isn't on the server and the run fails at provisioning. **PR 1.7
+  (registry-driven seeding loop) closes this for free** — no separate bench work.
+- **Gap 2 — tool-call probe metadata, folded into PR 1.8.** The tool/MCP probe
+  reads a hardcoded `_NATIVE_TOOL_PROVOCATION` table (the per-vendor "run this
+  shell tool" prompt); a plugin can't supply it, so those probes *skip*
+  (NOT_APPLICABLE — non-fatal; basic-turn / streaming / interrupt / reasoning
+  probes still run). The `shell_tool_name` / `shell_tool_prompt` capability fields
+  added in **1.8** let the bench read this off the registry instead.
+
+Net: **no new phase or standalone bench-migration PR.** Full provisioning falls
+out of 1.7; tool-call probes become plugin-drivable via a small 1.8 field; and
+2.4's example plugin carries a `--live` bench run as its acceptance criterion.
+
 ### Effort summary
 
-- **Phase 1** (internal seam): ~17–25 engineer-days.
-- **Phase 2** (community + web): ~9–12 engineer-days.
-- **Total: ~26–37 engineer-days** of focused work across ~12 PRs (splittable to
-  ~14 with 1.5 and 2.3 breaking in two). Folding in review cycles, CI, and
-  runner e2e validation, that is realistically **~2–3 calendar months** done
-  alongside other work. The critical path is 1.1 → 1.2 → 1.5 (runner) →
-  2.2 → 2.3 (web); the risk center is **PR 1.5**, where the `_supervise_*_bridges`
-  invariants live.
+- **Phase 1** (internal seam): ~20–29 engineer-days across 10 PRs (1.1–1.4,
+  1.5a/b/c, 1.6, 1.7, 1.8).
+- **Phase 2** (community + web): ~9–12 engineer-days across 4 PRs.
+- **Total: ~29–41 engineer-days** across ~14 PRs (2.3 may split further).
+  Folding in review cycles, CI, and runner e2e validation, that is realistically
+  **~2.5–3.5 calendar months** done alongside other work. The critical path is
+  1.1 → 1.2 → 1.5a → 1.5b → 1.5c → 1.6, then 2.2 → 2.3 (web); the risk center is
+  the **runner sub-stack (1.5b in particular)**, where the divergent
+  `_auto_create_*` signatures and the `_supervise_*_bridges` invariants live.
+
+### Calibration (updated 2026-07-27, after 1.1–1.3 landed + runner exploration)
+
+Grounding the estimates in built evidence rather than the original guesses:
+
+- **Additive/mechanical PRs come in under estimate.** 1.1 (provider model +
+  resolver) and 1.3 (resume-hub collapse, net −261 lines) each landed in ~½ day
+  of code vs. the 1–2d / 2d budgeted. 1.1 was cheap partly because the resolver
+  was ~90% pre-built (`load_object` already did dotted-path → callable). Expect
+  1.4, 2.1, 2.4 to likewise come in low.
+- **The real cost is test-shape churn, not the seam.** 1.3's core rewrite was
+  trivial; the time went into the tests that pin the exact call shape (kwarg
+  renames, a parametrized dispatch table, catching an over-reach where launch-
+  path expectations were flipped before their hub was migrated). This scales
+  with how many tests pin a hub — and the runner has the most (the ~19k-line
+  split native suite, #3149).
+- **The runner is bigger than the original single "1.5" line implied.** Reading
+  the code (not guessing) showed spawn-env, launch, and terminal-route each need
+  their own PR, `_auto_create_*` has 11 divergent signatures (so the seam needs
+  a `NativeLaunchContext`, not a uniform call), and interrupt/stop (1.6) closes
+  over app-scope state (needs DI, not a move). Hence 1.5 → 1.5a/b/c and 1.6
+  re-scoped upward.
+- **Net:** trim the additive PRs, **hold the runner sub-stack** until 1.5a is
+  measured. The back-loaded risk profile is confirmed, not softened, by the
+  three fast early PRs — 1.1–1.3 being fast is evidence the foundation is sound,
+  not that 1.5b will be. A 2-week compression of remaining Phase 1 is plausible
+  only if the runner sub-stack goes cleanly; that is the one unmeasured unknown.
+
+### Implementation progress
+
+Append-only ledger — one line per PR as it opens, updated to `landed` on merge.
+The plan tables above stay the stable target; this tracks what has actually
+shipped. **~14 PRs total** (Phase 1: 1.1–1.4, 1.5a/b/c, 1.6, 1.7, 1.8;
+Phase 2: 2.1–2.4).
+
+| PR | Status | Link |
+|---|---|---|
+| 1.1 Provider model + resolver | landed | #3239 |
+| 1.2 Signature normalization | landed | #3244 |
+| 1.3 Resume hubs | landed | #3314 |
+| 1.5a Runner spawn-env | landed | #3495 |
+| 1.5b-i Runner launch (scaffolding + 8 uniform arms) | landed | #3500 |
+| 1.5b-ii Runner launch (3 special arms + turn-path opencode) | landed | #3501 |
+| 1.5c Runner terminal-ensure (attach path) | in review | (this PR) |
 
 ## Risks and open questions
 
@@ -363,11 +451,18 @@ Only starts once Phase 1 has every built-in running *through* the seam.
   remaining risk shifts to Phase 1, where the dispatch that reaches these
   mirrors gets rewritten. Lean on the existing native e2e skills
   (`claude-native-ui:build-omnigent`, `pi-native-e2e-dev`, etc.).
-- **Signature uniformity.** Not every native launcher is trivially uniform
-  (opencode has a cold-boot app-server path, codex has WS JSON-RPC). The
-  provider may need an optional `transport`/`cold_boot` hook rather than
-  forcing one signature. Validate against the two hardest (codex, opencode)
-  before committing the protocol.
+- **Signature uniformity — confirmed non-uniform (runner exploration).** The
+  `run_<x>_native` *launchers* normalized cleanly (1.2). The *runner* builders
+  did not: `_auto_create_<x>_terminal` has 11 divergent signatures (3 common
+  params; claude carries 9 extras — `bundle_dir`, `skills_filter`,
+  `auth_token_factory`, `resolve_launch_config`, …), and the launch arms carry
+  irreducible per-harness pre-call work (claude transfer/rebuild, codex/
+  antigravity needs+transfer checks, opencode turn-path cold-boot). The seam
+  therefore passes a `NativeLaunchContext` dataclass to a uniform
+  `provider.auto_create_terminal(ctx)` adapter with explicit `pre_launch` hooks —
+  not a single uniform positional call. Interrupt/stop handlers close over
+  app-scope state and need a DI context, not a plain extraction. This is why 1.5
+  became 1.5a/b/c and 1.6 was re-scoped upward.
 - **Windows.** `_reject_native_on_windows` must keep firing for contributed
   natives — make it a registry-driven guard, not per-command.
 - **Import hygiene.** Providers hold *strings*; the resolver is the only place
@@ -380,11 +475,15 @@ Only starts once Phase 1 has every built-in running *through* the seam.
 
 ## Bottom line
 
-The data model is ready and Phase 0 (the file splits) has landed. The remaining
-work is untangling native orchestration from five `runner/app.py` chains and
-four other hubs into a `NativeHarnessProvider` behavior seam, then flipping the
-validator — sequenced as ~12 PRs (Phase 1: 1.1–1.8 core-only; Phase 2: 2.1–2.4
-community + web), ~26–37 engineer-days total. Start with the additive foundation
-(1.1 provider model + resolver), which unblocks everything; the risk center is
-1.5 (runner launch/terminal-route), where the `_supervise_*_bridges` invariants
-live.
+The data model is ready, Phase 0 (the file splits) has landed, and 1.1–1.3 are
+in review. The remaining work is untangling native orchestration from five
+`runner/app.py` chains and four other hubs into a `NativeHarnessProvider`
+behavior seam, then flipping the validator — sequenced as ~14 PRs (Phase 1:
+1.1–1.4, 1.5a/b/c, 1.6, 1.7, 1.8; Phase 2: 2.1–2.4), ~29–41 engineer-days total.
+The additive foundation (1.1) landed cheap and the additive/mechanical PRs are
+coming in under estimate; the estimate now lives almost entirely in the serial
+runner sub-stack (1.5a → 1.5b → 1.5c → 1.6), where the code — read, not guessed —
+shows divergent `_auto_create_*` signatures (needing a `NativeLaunchContext`),
+closure-bound interrupt/stop handlers (needing DI), and the `_supervise_*_bridges`
+invariants. Measure 1.5a (bounded spawn-env) before committing a runner
+timeline.

@@ -15,7 +15,7 @@ Dev tooling for Omnigent, in one binary with three surfaces:
 
 A per-repo dev **pod** supervisor, as a single long-running terminal UI. It
 replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
-`npm run dev`) with one process that:
+`pnpm run dev`) with one process that:
 
 - runs each checkout in an **isolated pod** — its own state dir, database,
   artifacts, logs, and auto-allocated ports — so multiple worktrees never
@@ -31,7 +31,7 @@ replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
 
 ## Build & run
 
-Requires the repo's usual dev prerequisites (`uv` for Python, `npm` for the
+Requires the repo's usual dev prerequisites (`uv` for Python, `pnpm` for the
 web UI) plus a Rust toolchain.
 
 ```bash
@@ -50,9 +50,9 @@ Run it from anywhere inside the checkout — it walks up to the repo root
 |---|---|---|
 | server | `uv run omnigent --log-to-stderr server --host 127.0.0.1 --port <p> --database-uri … --artifact-location …` | Waited on via `GET /health`. |
 | host   | `uv run omnigent --log-to-stderr host --server http://127.0.0.1:<p>` | Started once the server is healthy. |
-| vite   | `npm run dev -- --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
+| vite   | `pnpm run dev -- --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
 
-Before Vite starts (and on a manual Vite restart), omnidev runs `npm install`
+Before Vite starts (and on a manual Vite restart), omnidev runs `pnpm install`
 in `web/` when needed — `node_modules/` is missing, or `package.json` /
 `package-lock.json` is newer than it — so a fresh checkout or a new dependency
 doesn't make Vite fail its dependency scan. Output streams into the `vite` pane.
@@ -65,7 +65,7 @@ Only Omnigent's own state is isolated per pod — enough that concurrent pods
 never share a database, server pidfile, or `config.yaml` — via
 `OMNIGENT_DATA_DIR`, `OMNIGENT_DATABASE_URI`, `OMNIGENT_URL`, and
 `OMNIGENT_CONFIG_HOME`. Everything else (your real `HOME`, credentials, and
-uv/npm caches) is inherited, because the agents Omnigent runs need it. This is
+uv/pnpm caches) is inherited, because the agents Omnigent runs need it. This is
 deliberately lighter than the hermetic `scripts/backend-smoke.sh` sandbox,
 which repoints `HOME`/`XDG_*` to touch nothing real.
 
@@ -192,9 +192,9 @@ omnidev shell-hook  # print the daily-check snippet for your shell rc
 extras), `--repo <url>`. The choice is saved to
 `${XDG_CONFIG_HOME:-~/.config}/omnidev/install.toml` so `update` reuses it.
 
-Installing from git **builds the web UI from source**, so Node 22+/npm must be
+Installing from git **builds the web UI from source**, so Node 22+/pnpm must be
 on PATH (the PyPI wheel ships the UI prebuilt; the git install does not).
-`omnidev install` fails early with a clear message if `uv` or `npm` is missing.
+`omnidev install` fails early with a clear message if `uv` or `pnpm` is missing.
 
 ### Daily update check
 

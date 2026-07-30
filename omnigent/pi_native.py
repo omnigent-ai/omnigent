@@ -18,6 +18,7 @@ import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import PI_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -40,6 +41,9 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
 from omnigent.pi_native_bridge import bridge_dir_for_session_id
 
@@ -121,7 +125,7 @@ def resolve_pi_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_pi_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
             "Native Pi requires the 'pi' CLI on PATH. Install Pi, add it to PATH, "
@@ -198,7 +202,8 @@ def run_pi_native(
     *,
     server: str | None,
     session_id: str | None,
-    pi_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    pi_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -213,6 +218,9 @@ def run_pi_native(
         conversation URL after launch.
     :returns: None after the terminal attach session ends.
     """
+    pi_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=pi_args, legacy_param="pi_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(

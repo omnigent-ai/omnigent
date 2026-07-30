@@ -198,7 +198,7 @@ export function useSeedReadState(conversations: readonly ReadStateSeed[] | undef
  * between tests (the mirror is intentionally module-scoped, not React state).
  * Not used in production.
  */
-export function __resetReadStateForTests(): void {
+export function resetReadStateForTests(): void {
   for (const id of Object.keys(lastSeenMap)) delete lastSeenMap[id];
   explicitlyUnread.clear();
   seeded.clear();
