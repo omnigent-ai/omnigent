@@ -2142,7 +2142,7 @@ function InitialHistorySkeleton() {
 }
 
 /** Builds the initial history window, then keeps loading near the top. */
-const HISTORY_LOAD_TOP_THRESHOLD_PX = 300;
+const HISTORY_LOAD_TOP_THRESHOLD_PX = 500;
 
 export function HistoryAutoLoader() {
   // useStickToBottomContext exposes scrollRef (the actual scroll container

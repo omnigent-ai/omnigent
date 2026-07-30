@@ -122,7 +122,7 @@ describe("HistoryAutoLoader", () => {
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader />);
-    metrics.scrollTop = 299;
+    metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
     metrics.scrollTop = 0;
     fireEvent.scroll(scrollRoot);
@@ -192,7 +192,7 @@ describe("HistoryAutoLoader", () => {
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader />);
-    metrics.scrollTop = 299;
+    metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
 
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
@@ -209,7 +209,7 @@ describe("HistoryAutoLoader", () => {
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader />);
-    metrics.scrollTop = 299;
+    metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
