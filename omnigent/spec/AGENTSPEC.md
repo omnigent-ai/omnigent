@@ -26,13 +26,16 @@ my-agent/
 │   │   └── *.ts
 │   └── mcp/             MCP server declarations
 │       └── *.yaml
+├── extensions/          optional — UI extensions
+│   └── <extension-name>/
+│       └── manifest.json
 └── agents/              optional — sub-agent images (recursive)
     └── <agent-name>/
         ├── config.yaml
         └── ...
 ```
 
-Any files or directories not listed above are ignored by the parser.
+Any files or directories not listed above (including extensions/) are ignored by the parser.
 
 ---
 
