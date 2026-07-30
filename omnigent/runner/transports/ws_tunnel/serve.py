@@ -50,6 +50,7 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
 
@@ -653,6 +654,10 @@ async def _serve_tunnel_once(
     headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
+    # Verifying SSL context from a real CA bundle for wss:// — a bare default
+    # context loads zero roots on uv / python-build-standalone Pythons (no
+    # OpenSSL default cert path). Local runners use ws:// and pass ssl=None.
+    ssl_ctx = client_ssl_context() if tunnel_url.startswith("wss://") else None
     # A graceful-shutdown-capable tunnel needs a close timeout sized for a
     # real remote round-trip: completing the close handshake is what confirms
     # the server read our end-of-stream frames. A tunnel without a shutdown
@@ -669,6 +674,7 @@ async def _serve_tunnel_once(
         additional_headers=headers,
         close_timeout=close_timeout,
         max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        ssl=ssl_ctx,
         # Protocol keepalive aligned to the server's 90 s app-level budget (not the
         # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
         # Also the runner's only liveness probe for a silently-dead server.

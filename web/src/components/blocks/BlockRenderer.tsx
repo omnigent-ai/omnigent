@@ -292,6 +292,7 @@ const STREAMING_TAIL = 3;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
+  canApprove?: boolean;
 }
 
 type ToolRunFragment =
@@ -305,7 +306,7 @@ type ToolRunFragment =
       index: number;
     };
 
-export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
+export function BlockRenderer({ items, sessionStatus, canApprove = true }: BlockRendererProps) {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
@@ -358,7 +359,7 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
     }
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
-    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText));
+    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText, canApprove));
     previousRenderedItemWasText = item.kind === "text";
   }
 
@@ -454,6 +455,7 @@ function renderItem(
   index: number,
   isReasoningStreaming: boolean,
   followsText = false,
+  canApprove = true,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -550,7 +552,7 @@ function renderItem(
         />
       );
     case "elicitation":
-      return <ElicitationCard key={key} item={item} />;
+      return <ElicitationCard key={key} item={item} canApprove={canApprove} />;
   }
 }
 

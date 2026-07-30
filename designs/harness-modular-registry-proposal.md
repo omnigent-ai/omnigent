@@ -437,7 +437,8 @@ Phase 2: 2.1–2.4).
 | 1.2 Signature normalization | landed | #3244 |
 | 1.3 Resume hubs | landed | #3314 |
 | 1.5a Runner spawn-env | landed | #3495 |
-| 1.5b-i Runner launch (scaffolding + 8 uniform arms) | in review | (this PR) |
+| 1.5b-i Runner launch (scaffolding + 8 uniform arms) | in review | #3500 |
+| 1.5b-ii Runner launch (3 special arms + turn-path opencode) | in review | (this PR) |
 
 ## Risks and open questions
 

@@ -1485,8 +1485,8 @@ function FileViewerBody({
       </div>
       <Dialog
         open={pendingAction !== null}
-        onOpenChange={(open) => {
-          if (!open) setPendingAction(null);
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setPendingAction(null);
         }}
       >
         <DialogContent showCloseButton={false}>

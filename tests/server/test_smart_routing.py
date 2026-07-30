@@ -102,17 +102,27 @@ def _catalog_client() -> MagicMock:
         "self": _TEST_MODELS["claude-sdk"],
     }
     response = MagicMock()
-    response.json.return_value = {
-        "workers": {
-            worker: {
-                "source": "catalog",
-                "verified": True,
-                "models": [{"id": model} for model in models],
-                "note": "",
-            }
-            for worker, models in workers.items()
+    catalog_workers: dict[str, dict[str, Any]] = {}
+    for worker, models in workers.items():
+        entries: list[dict[str, Any]] = []
+        for model in models:
+            entry: dict[str, Any] = {"id": model}
+            if worker == "pi":
+                if "claude" in model:
+                    entry.update(family="claude", wire_apis=["openai-chat"])
+                elif "gpt" in model:
+                    entry.update(
+                        family="openai",
+                        wire_apis=["openai-chat", "openai-responses"],
+                    )
+            entries.append(entry)
+        catalog_workers[worker] = {
+            "source": "catalog",
+            "verified": True,
+            "models": entries,
+            "note": "",
         }
-    }
+    response.json.return_value = {"workers": catalog_workers}
     response.raise_for_status = MagicMock()
     client = MagicMock()
     client.get = AsyncMock(return_value=response)
@@ -1156,12 +1166,11 @@ async def test_route_session_harness_returns_none_for_empty_message() -> None:
 
 @pytest.mark.asyncio
 async def test_route_session_harness_sends_full_candidate_set_unfiltered() -> None:
-    """The candidate set sent to the router is NOT pruned of incompatible models.
+    """The candidate set sent to the router is not pruned before selection.
 
     The external task_v0 router enforces a required model set and 400s if any
-    required model is missing, so we must offer the full list (including
-    gpt-5.5/5.6 and Claude models under pi) and correct an incompatible verdict
-    afterward via the redirect, not by filtering candidates.
+    required model is missing, so compatibility metadata is applied to its
+    verdict rather than filtering the candidates sent to it.
     """
     pi_models: list[str] = []
 
@@ -1177,36 +1186,30 @@ async def test_route_session_harness_sends_full_candidate_set_unfiltered() -> No
         await route_session_harness(
             "hello", session_id="conv_123", runner_client=_catalog_client()
         )
-    # The excluded-on-pi models are still SENT (router requires the full set);
-    # incompatibility is handled post-verdict by the redirect.
+    # Every discovered Pi model is still sent to the router.
     assert "databricks-claude-haiku-4-5" in pi_models
     assert "databricks-gpt-5-5" in pi_models
 
 
 @pytest.mark.asyncio
-async def test_route_session_harness_redirects_incompatible_router_pick() -> None:
-    """A router that ignores our candidate set and picks pi+gpt-5.5 is redirected.
-
-    Some external routers return a (harness, model) pair we excluded. The
-    verdict post-processing must redirect gpt-5.5 off pi to codex.
-    """
-    # Router returns pi + gpt-5-5 (an excluded, incompatible pair).
+async def test_route_session_harness_keeps_responses_capable_model_on_pi() -> None:
+    """Pi can keep a model whose catalog advertises the Responses wire."""
     expected = RoutingResult(
-        model="databricks-gpt-5-5", rationale="picked despite exclusion", harness="pi"
+        model="databricks-gpt-5-5", rationale="responses-capable", harness="pi"
     )
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, error = await route_session_harness(
             "do something", session_id="conv_123", runner_client=_catalog_client()
         )
-    assert harness == "codex", f"gpt-5.5 on pi should redirect to codex, got {harness!r}"
+    assert harness == "pi"
     assert model == "databricks-gpt-5-5"
     assert error is None
 
 
 @pytest.mark.asyncio
 async def test_route_session_harness_redirects_claude_on_pi_to_claude_sdk() -> None:
-    """A router pick of a Claude model on pi is redirected to claude-sdk."""
+    """A Claude endpoint without Messages support is redirected off Pi."""
     expected = RoutingResult(model="databricks-claude-haiku-4-5", rationale="cheap", harness="pi")
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -1214,6 +1217,25 @@ async def test_route_session_harness_redirects_claude_on_pi_to_claude_sdk() -> N
             "quick q", session_id="conv_123", runner_client=_catalog_client()
         )
     assert harness == "claude-sdk", f"claude on pi should redirect to claude-sdk, got {harness!r}"
+    assert model == "databricks-claude-haiku-4-5"
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_keeps_unknown_pi_compatibility() -> None:
+    """Missing wire metadata from an older runner does not imply incompatibility."""
+    expected = RoutingResult(model="databricks-claude-haiku-4-5", rationale="cheap", harness="pi")
+    client = _catalog_client()
+    payload = client.get.return_value.json.return_value
+    payload["workers"]["pi"]["models"][0].pop("wire_apis")
+    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict, error = await route_session_harness(
+            "quick q", session_id="conv_123", runner_client=client
+        )
+
+    assert harness == "pi"
     assert model == "databricks-claude-haiku-4-5"
     assert error is None
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from omnigent.policies.schema import (
@@ -282,6 +283,181 @@ def detect_task_switch(
     return evaluate  # type: ignore[return-value]
 
 
+# ── detect_thrashing ─────────────────────────────────────────────────────────
+
+_THRASHING_HISTORY_KEY = "_thrashing_results"
+
+_ERROR_PREFIXES: tuple[str, ...] = (
+    "error:",
+    "error -",
+    "failed:",
+    "traceback (most recent call last)",
+    "exception:",
+    "fatal:",
+    "command failed",
+    "permission denied",
+    "no such file or directory",
+    "enoent:",
+    "eacces:",
+    "eperm:",
+)
+
+_ERROR_JSON_RE = re.compile(r'^\s*\{[^}]*"error"\s*:', re.DOTALL)
+
+
+def _looks_like_error(result: str) -> bool:
+    """Heuristically detect whether a tool result is an error.
+
+    Checks for common error prefixes (case-insensitive) and
+    JSON payloads with an ``"error"`` key.  Designed to be
+    over-inclusive rather than under-inclusive — a false positive
+    merely increments the error counter by one, which is harmless
+    below the threshold; a false negative lets a real error slip
+    past uncounted.
+
+    :param result: The ``event["data"]["result"]`` string from a
+        ``tool_result`` event.
+    :returns: ``True`` when the result looks like an error.
+    """
+    if not result:
+        return False
+    lower = result[:500].lower().lstrip()
+    if any(lower.startswith(p) for p in _ERROR_PREFIXES):
+        return True
+    if _ERROR_JSON_RE.match(result[:500]):
+        return True
+    return False
+
+
+def detect_thrashing(
+    *,
+    consecutive_threshold: int = 5,
+    window: int = 10,
+    window_error_rate: float = 0.8,
+    action: str = "ASK",
+) -> PolicyCallable:
+    """Factory: detect when an agent is failing repeatedly.
+
+    Fires on ``tool_result`` events.  Maintains a rolling window of
+    recent tool-result outcomes (error / success) in ``session_state``
+    and flags the agent when either:
+
+    - the last *consecutive_threshold* results are all errors, **or**
+    - the error rate within the last *window* results reaches or
+      exceeds *window_error_rate*.
+
+    On detection the policy returns *action* with a message telling
+    the user the agent appears stuck.  The window is **not** reset on
+    detection (unlike ``detect_task_switch``): the agent is likely to
+    keep failing, so the policy should keep firing until the user
+    intervenes or the agent recovers naturally (successful results
+    push old errors out of the window).
+
+    Error detection is heuristic — see :func:`_looks_like_error`.
+
+    :param consecutive_threshold: Number of consecutive errors before
+        the policy fires.  ``0`` disables the consecutive check.
+        Defaults to ``5``.
+    :param window: Rolling window size for the error-rate check.
+        Must be ``>= 2`` when *window_error_rate* is set.  Defaults
+        to ``10``.
+    :param window_error_rate: Fraction of errors within the last
+        *window* results that triggers the policy.  ``0.0`` disables
+        the rate check.  Defaults to ``0.8`` (80%).
+    :param action: Response when thrashing is detected — ``"ASK"``
+        (default) or ``"DENY"``.
+    :returns: A policy callable that fires on ``tool_result`` events.
+    """
+    normalised_action = action.upper() if isinstance(action, str) else "ASK"
+    if normalised_action not in {"DENY", "ASK"}:
+        _log.warning(
+            "detect_thrashing: unknown action %r — defaulting to ASK",
+            action,
+        )
+        normalised_action = "ASK"
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse | None:
+        """Track tool-result outcomes and flag sustained failure runs.
+
+        Reads ``session_state[_THRASHING_HISTORY_KEY]`` for the
+        rolling window and writes the updated window back via
+        ``state_updates``.  Each entry is ``1`` (error) or ``0``
+        (success).
+
+        :param event: Policy event dict.
+        :returns: *action* when thrashing is detected; ``None``
+            (abstain) for non-``tool_result`` events; ALLOW with
+            updated state otherwise.
+        """
+        if event.get("type") != "tool_result":
+            return None
+
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return None
+        result_str = data.get("result", "")
+        if not isinstance(result_str, str):
+            result_str = str(result_str)
+
+        is_error = 1 if _looks_like_error(result_str) else 0
+
+        state = event.get("session_state") or {}
+        raw_history = state.get(_THRASHING_HISTORY_KEY)
+        if isinstance(raw_history, list) and all(isinstance(v, int) for v in raw_history):
+            history: list[int] = raw_history
+        else:
+            history = []
+
+        effective_window = max(window, 1)
+        keep = max(effective_window, consecutive_threshold)
+        updated = [*history, is_error][-keep:]
+
+        state_update: PolicyResponse = {
+            "result": "ALLOW",
+            "state_updates": [
+                {
+                    "key": _THRASHING_HISTORY_KEY,
+                    "action": "set",
+                    "value": updated,
+                }
+            ],
+        }
+
+        # ── Consecutive check ──────────────────────────────────────
+        if consecutive_threshold > 0 and len(updated) >= consecutive_threshold:
+            tail = updated[-consecutive_threshold:]
+            if all(v == 1 for v in tail):
+                return {
+                    "result": normalised_action,
+                    "reason": (
+                        f"The agent has hit {consecutive_threshold} consecutive "
+                        f"tool errors. It may be stuck — review and redirect, "
+                        f"or start a fresh session."
+                    ),
+                    "state_updates": state_update["state_updates"],
+                }
+
+        # ── Window rate check ──────────────────────────────────────
+        if window_error_rate > 0.0 and len(updated) >= effective_window:
+            rate_window = updated[-effective_window:]
+            rate = sum(rate_window) / len(rate_window)
+            if rate >= window_error_rate:
+                pct = int(rate * 100)
+                return {
+                    "result": normalised_action,
+                    "reason": (
+                        f"The agent has a {pct}% error rate over the last "
+                        f"{effective_window} tool calls. It may be stuck — "
+                        f"review and redirect, or start a fresh session."
+                    ),
+                    "state_updates": state_update["state_updates"],
+                }
+
+        return state_update
+
+    return evaluate  # type: ignore[return-value]
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
@@ -334,6 +510,63 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                         "System prompt for the classifier. Must instruct the "
                         'model to return {"verdict": "CONTINUATION"|"TASK_SWITCH"}; '
                         "the output schema is enforced via structured output."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.context.detect_thrashing",
+        "kind": "factory",
+        "name": "Detect Agent Thrashing",
+        "description": (
+            "Detects when an agent is failing repeatedly by tracking tool-result "
+            "outcomes in a rolling window. Fires when consecutive errors exceed a "
+            "threshold or when the error rate within the window is too high. "
+            "Error detection is heuristic (common error prefixes and JSON error "
+            "payloads). No server LLM required."
+        ),
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "consecutive_threshold": {
+                    "type": "integer",
+                    "default": 5,
+                    "minimum": 0,
+                    "description": (
+                        "Number of consecutive tool errors before the policy "
+                        "fires. Set to 0 to disable the consecutive check. "
+                        "Defaults to 5."
+                    ),
+                },
+                "window": {
+                    "type": "integer",
+                    "default": 10,
+                    "minimum": 1,
+                    "description": (
+                        "Rolling window size for the error-rate check. Defaults to 10."
+                    ),
+                },
+                "window_error_rate": {
+                    "type": "number",
+                    "default": 0.8,
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": (
+                        "Fraction of errors within the window that triggers "
+                        "the policy (0.0–1.0). Set to 0 to disable the rate "
+                        "check. Defaults to 0.8 (80%)."
+                    ),
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["ASK", "DENY"],
+                    "default": "ASK",
+                    "description": (
+                        "Response when thrashing is detected. "
+                        "ASK escalates to the user (default); "
+                        "DENY blocks the next tool result outright."
                     ),
                 },
             },

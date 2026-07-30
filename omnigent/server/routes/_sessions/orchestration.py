@@ -539,6 +539,11 @@ def _build_session_list_item(
     # only); assert for the type checker without a runtime branch.
     assert conv.agent_id is not None
     level = _permission_level_from_grants(user_id, grants, user_is_admin)
+    can_approve = (
+        _approval_access_from_grants(user_id, grants, user_is_admin)
+        if permissions_enabled
+        else None
+    )
     owner = _owner_from_grants(grants) if permissions_enabled else None
     # Per-viewer read tracking, embedded so the client hydrates the unread
     # dots straight from the list (no separate fetch). Built per-user here —
@@ -559,6 +564,7 @@ def _build_session_list_item(
         host_id=conv.host_id,
         reasoning_effort=conv.reasoning_effort,
         permission_level=level,
+        can_approve=can_approve,
         owner=owner,
         external_session_id=conv.external_session_id,
         # The persisted row count is a CROSS-REPLICA mirror: the replica
@@ -644,6 +650,7 @@ def _build_session_response(
     items: list[ConversationItem],
     status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
+    can_approve: bool | None = None,
     background_task_count: int | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,
@@ -678,6 +685,8 @@ def _build_session_response(
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
+    :param can_approve: Whether the requesting user may accept
+        privileged actions, or ``None`` when permissions are disabled.
     :param runner_online: Session-scoped liveness for the bound
         runner/host, e.g. ``False`` for a dead tunneled runner.
         ``None`` when no lookup is wired.
@@ -765,6 +774,7 @@ def _build_session_response(
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
+        can_approve=can_approve,
         sub_agent_name=conv.sub_agent_name,
         kind=conv.kind,
         parent_session_id=conv.parent_conversation_id,
@@ -6364,6 +6374,7 @@ async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
     permission_level: int | None = None,
+    can_approve: bool | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     conversation: Conversation | None = None,
@@ -6388,6 +6399,8 @@ async def _get_session_snapshot(
         e.g. ``"conv_abc123"``.
     :param permission_level: The requesting user's numeric level
         on this session, or ``None`` when permissions are disabled.
+    :param can_approve: Whether the requesting user may accept
+        privileged actions, or ``None`` when permissions are disabled.
     :param agent_store: Optional agent store used to look up the
         bound agent's bundle location. ``None`` in legacy call sites
         that don't yet pass it.
@@ -6619,6 +6632,7 @@ async def _get_session_snapshot(
         items,
         status,
         permission_level,
+        can_approve,
         background_task_count=_session_background_task_count_cache.get(session_id),
         llm_model=llm_model,
         context_window=context_window,

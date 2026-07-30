@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from omnigent.model_metadata import ModelCostTier, ModelIntent
+from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
     import httpx  # used in type annotations only; runtime import is lazy in fetch_runner_models
@@ -70,22 +70,45 @@ class RoutingClient(Protocol):
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
-async def fetch_runner_models(
+@dataclass(frozen=True)
+class _RunnerModel:
+    """Model metadata retained from the runner catalog for routing decisions."""
+
+    id: str
+    family: str | None
+    cost_tier: str | None
+    wire_apis: frozenset[ModelWireAPI]
+
+
+def _catalog_wire_apis(raw: object) -> frozenset[ModelWireAPI]:
+    """Parse known wire values while ignoring older or future vocabulary."""
+    if not isinstance(raw, list):
+        return frozenset()
+    wire_apis: set[ModelWireAPI] = set()
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        try:
+            wire_apis.add(ModelWireAPI(value))
+        except ValueError:
+            continue
+    return frozenset(wire_apis)
+
+
+async def _fetch_runner_catalog(
     session_id: str,
     runner_client: httpx.AsyncClient,
-) -> dict[str, list[str]] | None:
+) -> dict[str, list[_RunnerModel]] | None:
     """Fetch live model availability from the runner's ``/v1/sessions/{id}/models`` endpoint.
 
-    Converts the ``sys_list_models``-shaped catalog into the harness →
-    model-id-list format expected by :class:`RoutingClient`. Models with
-    provider-relative cost metadata are ordered economy → standard → premium;
-    catalog order remains the deterministic tie-breaker.
+    Parses the ``sys_list_models``-shaped catalog while retaining compatibility
+    metadata. Models with provider-relative cost metadata are ordered economy →
+    standard → premium; catalog order remains the deterministic tie-breaker.
 
     :param session_id: Session/conversation identifier.
     :param runner_client: Async HTTP client pointed at the runner.
-    :returns: ``{harness: [model_id, ...]}`` ordered cheapest → most
-        powerful, or ``None`` when the endpoint is unavailable or the
-        response cannot be parsed.
+    :returns: Worker names mapped to ordered model metadata, or ``None`` when
+        the endpoint is unavailable or the response cannot be parsed.
     """
     import httpx as _httpx
 
@@ -103,7 +126,7 @@ async def fetch_runner_models(
     if not workers:
         return None
 
-    result: dict[str, list[str]] = {}
+    result: dict[str, list[_RunnerModel]] = {}
     for worker_name, row in workers.items():
         if not isinstance(row, dict):
             continue
@@ -115,22 +138,49 @@ async def fetch_runner_models(
             ModelCostTier.STANDARD.value: 1,
             ModelCostTier.PREMIUM.value: 2,
         }
-        indexed_models = [
-            (index, model)
-            for index, model in enumerate(models_raw)
-            if isinstance(model, dict) and isinstance(model.get("id"), str)
-        ]
+        indexed_models: list[tuple[int, _RunnerModel]] = []
+        for index, model in enumerate(models_raw):
+            if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+                continue
+            indexed_models.append(
+                (
+                    index,
+                    _RunnerModel(
+                        id=model["id"],
+                        family=model.get("family")
+                        if isinstance(model.get("family"), str)
+                        else None,
+                        cost_tier=(
+                            model.get("cost_tier")
+                            if isinstance(model.get("cost_tier"), str)
+                            else None
+                        ),
+                        wire_apis=_catalog_wire_apis(model.get("wire_apis")),
+                    ),
+                )
+            )
         ordered_models = sorted(
             indexed_models,
             key=lambda item: (
-                cost_order.get(item[1].get("cost_tier"), len(cost_order)),
+                cost_order.get(item[1].cost_tier, len(cost_order)),
                 item[0],
             ),
         )
-        ids = [model["id"] for _, model in ordered_models]
-        if ids:
-            result[worker_name] = ids
+        models = [model for _, model in ordered_models]
+        if models:
+            result[worker_name] = models
     return result or None
+
+
+async def fetch_runner_models(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> dict[str, list[str]] | None:
+    """Return the runner catalog in the id-only routing-client shape."""
+    catalog = await _fetch_runner_catalog(session_id, runner_client)
+    if catalog is None:
+        return None
+    return {worker: [model.id for model in models] for worker, models in catalog.items()}
 
 
 def _flatten_models(available_models: dict[str, list[str]]) -> list[str]:
@@ -585,63 +635,38 @@ _WORKER_NAME_TO_HARNESS: dict[str, str] = {
     "pi": "pi",
 }
 
-# Per-harness (harness, model) incompatibilities corrected AFTER the router
-# verdict. We do NOT prune these from the candidate set sent to the router —
-# the external task_v0 router enforces a required model set and 400s if any
-# required model is absent, so the full set must be offered. Instead, when the
-# router picks one of these pairs, _redirect_incompatible_pick moves it to a
-# harness that can actually run the model.
-#
-# The pi harness reaches Databricks two incompatible ways for these families:
-#   - Claude models ride pi's Anthropic Messages gateway, whose request path
-#     adds an ``eager_input_streaming`` field the serving endpoint rejects with
-#     a 400 when tools are present.
-#   - The gpt-5.5 / gpt-5.6 reasoning models ride pi's openai-completions path
-#     (``/chat/completions``); Databricks applies a default ``reasoning_effort``
-#     there and rejects tool calls with "Function tools with reasoning_effort
-#     are not supported for gpt-5.5 ... use /v1/responses or set reasoning_effort
-#     to 'none'." pi's provider can't send that override, so tool turns 400.
-# claude-sdk serves Claude and codex serves gpt-5.5+ (Responses API); the
-# gpt-5.4 family works on pi and is left alone.
-_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
-    "pi": (
-        "databricks-claude-haiku-4-5",
-        "databricks-gpt-5-5",
-        "databricks-gpt-5-5-pro",
-        "databricks-gpt-5-6-luna",
-        "databricks-gpt-5-6-terra",
-        "databricks-gpt-5-6-sol",
-    ),
-}
 
-
-def _redirect_incompatible_pick(harness: str | None, model: str) -> str | None:
+def _redirect_incompatible_pick(
+    harness: str | None,
+    model: str,
+    harness_catalog: dict[str, list[_RunnerModel]],
+) -> str | None:
     """Redirect a router verdict off a harness that can't serve *model*.
 
-    Some external routers ignore the candidate set we send and return a
-    ``(harness, model)`` pair we deliberately excluded (see
-    :data:`_HARNESS_EXCLUDED_MODELS`). Since we can't stop the router from
-    choosing it, redirect the pick to a harness that CAN serve the model:
-
-    - a Claude model on pi → ``claude-sdk``
-    - a gpt-5.5/5.6 reasoning model on pi → ``codex`` (Responses API)
+    Pi speaks Anthropic Messages for Claude-family models. When the runner
+    catalog explicitly reports that the selected endpoint does not accept that
+    wire, move the verdict to ``claude-sdk``. Unknown metadata from an older
+    runner is not treated as incompatible.
 
     :param harness: The router's chosen harness id (may be ``None``).
     :param model: The router's chosen model id.
+    :param harness_catalog: Catalog metadata keyed by normalized harness id.
     :returns: A replacement harness id, or the original *harness* when the
         pick is already compatible.
     """
-    if harness is None:
-        return None
-    excluded = _HARNESS_EXCLUDED_MODELS.get(harness, ())
-    if model not in excluded:
+    if harness != "pi":
         return harness
-    lower = model.lower()
-    if "claude" in lower:
+    entry = next(
+        (candidate for candidate in harness_catalog.get(harness, ()) if candidate.id == model),
+        None,
+    )
+    if (
+        entry is not None
+        and entry.family == "claude"
+        and entry.wire_apis
+        and ModelWireAPI.ANTHROPIC_MESSAGES not in entry.wire_apis
+    ):
         return "claude-sdk"
-    if "gpt" in lower:
-        return "codex"
-    # Unknown family on an excluding harness — leave as-is rather than guess.
     return harness
 
 
@@ -687,9 +712,9 @@ async def route_session_harness(
     # for a sub-agent) so the candidate set is the full spawnable-worker map,
     # independent of whether the routed session is top-level or a sub-agent.
     _catalog_sid = catalog_session_id or session_id
-    live_catalog: dict[str, list[str]] | None = None
+    live_catalog: dict[str, list[_RunnerModel]] | None = None
     if _catalog_sid and runner_client is not None:
-        live_catalog = await fetch_runner_models(_catalog_sid, runner_client)
+        live_catalog = await _fetch_runner_catalog(_catalog_sid, runner_client)
 
     # NOTE: we do NOT filter incompatible (harness, model) pairs out of the
     # candidate set here. The external router (task_v0) enforces a required
@@ -698,14 +723,16 @@ async def route_session_harness(
     # and correct an incompatible verdict afterward via
     # _redirect_incompatible_pick.
     harness_models: dict[str, list[str]] = {}
+    harness_catalog: dict[str, list[_RunnerModel]] = {}
     if live_catalog:
-        for worker_name, worker_models in live_catalog.items():
+        for worker_name, worker_catalog in live_catalog.items():
             harness = _WORKER_NAME_TO_HARNESS.get(worker_name)
             if harness is None or harness not in _AUTO_ROUTING_HARNESSES:
                 continue
-            if worker_models:
+            if worker_catalog:
                 # First worker wins for a given harness id (dedupe).
-                harness_models.setdefault(harness, worker_models)
+                harness_catalog.setdefault(harness, worker_catalog)
+                harness_models.setdefault(harness, [entry.id for entry in worker_catalog])
 
     if not harness_models:
         return None, None, None, "No discovered routable harnesses are available on this runner."
@@ -751,11 +778,9 @@ async def route_session_harness(
                 chosen_harness = h
                 break
 
-    # Redirect an incompatible (harness, model) pick the router may have
-    # returned despite our filtered candidate set (some external routers
-    # ignore it): a Claude model or gpt-5.5+ reasoning model on pi is
-    # redirected to claude-sdk / codex respectively.
-    _redirected = _redirect_incompatible_pick(chosen_harness, result.model)
+    # Redirect a catalog-proven wire mismatch after routing so the complete
+    # candidate set still reaches external routers that require it.
+    _redirected = _redirect_incompatible_pick(chosen_harness, result.model, harness_catalog)
     if _redirected != chosen_harness:
         _logger.info(
             "smart_routing: redirecting incompatible pick harness=%s model=%s -> harness=%s",

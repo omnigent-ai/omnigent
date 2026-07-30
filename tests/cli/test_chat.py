@@ -15,7 +15,6 @@ from omnigent_client import QueryResult
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
-    _DEFAULT_AD_HOC_MODEL,
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
     _SERVER_READY_INITIAL_POLL_SECONDS,
@@ -42,6 +41,7 @@ from omnigent.chat import (
 )
 from omnigent.cli import _build_resume_parts
 from omnigent.inner.databricks_executor import DatabricksCredentials
+from omnigent.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
 
@@ -1182,7 +1182,9 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
     ``runner_recover=None`` (no CLI-side restart).
     """
     agent_yaml = tmp_path / "hello.yaml"
-    agent_yaml.write_text("name: hello\nprompt: Say hi.\n")
+    agent_yaml.write_text(
+        "name: hello\nprompt: Say hi.\nexecutor:\n  model: databricks-gpt-test-model\n"
+    )
     captured: dict[str, object] = {}
 
     async def _fake_prepare(**kwargs: object) -> _DaemonChatSession:
@@ -1444,31 +1446,40 @@ def test_prepare_chat_session_via_daemon_fork_wins_over_resume(
 
 # ── OMNIGENT_MODEL env-var fallback ───────────────────
 #
-# These tests pin the env-var contract on the
-# ``omnigent/cli.py`` → ``run_chat`` direct path. Without
-# them, ``OMNIGENT_MODEL=foo`` was silently dropped on the
-# ``omnigent`` console-script default Omnigent path because
-# ``_apply_overrides_to_raw`` used the hardcoded
-# ``_DEFAULT_AD_HOC_MODEL`` instead of the env-var-aware
-# helper. See ``designs/RUN_OMNIGENT_REPL_PARITY.md``.
+# These tests pin explicit-environment and discovered-default precedence on
+# the ``omnigent/cli.py`` → ``run_chat`` path.
 
 
-def test_default_cli_model_returns_hardcoded_default_when_env_unset(
+def test_default_cli_model_resolves_catalog_when_env_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    With ``OMNIGENT_MODEL`` unset, the helper returns the
-    hardcoded ``_DEFAULT_AD_HOC_MODEL``.
-
-    What this proves: the existing default behavior (the model
-    that ships in the README example) is preserved when no env
-    var is set. If this fails, users running
-    ``omnigent run hello.yaml`` without setting the env var
-    would suddenly land on a different model than they did
-    before — silently breaking their workflows.
-    """
+    """An unconfigured ad-hoc run resolves its Databricks catalog default."""
     monkeypatch.delenv("OMNIGENT_MODEL", raising=False)
-    assert _default_cli_model() == _DEFAULT_AD_HOC_MODEL
+    calls: list[tuple[str, str | None]] = []
+
+    def _resolve(provider: str, *, family: str | None = None) -> SimpleNamespace:
+        calls.append((provider, family))
+        return SimpleNamespace(model_id="catalog-default")
+
+    monkeypatch.setattr(chat_module, "resolve_catalog_model", _resolve)
+
+    assert _default_cli_model() == "catalog-default"
+    assert calls == [("databricks", "openai")]
+
+
+def test_default_cli_model_fails_clearly_without_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable catalog directs users to explicit configuration."""
+    monkeypatch.delenv("OMNIGENT_MODEL", raising=False)
+
+    def _fail(*args: object, **kwargs: object) -> None:
+        raise ModelResolutionError("catalog unavailable")
+
+    monkeypatch.setattr(chat_module, "resolve_catalog_model", _fail)
+
+    with pytest.raises(click.ClickException, match="Pass --model, set OMNIGENT_MODEL"):
+        _default_cli_model()
 
 
 def test_default_cli_model_honors_omnigent_model_env_var(
@@ -1478,9 +1489,7 @@ def test_default_cli_model_honors_omnigent_model_env_var(
     With ``OMNIGENT_MODEL=foo`` set, the helper returns
     ``"foo"``.
 
-    What this proves: the env-var override fires. If the helper
-    returns ``_DEFAULT_AD_HOC_MODEL`` here, the env var was
-    silently dropped — exactly the regression this gap closed.
+    What this proves: the env-var override fires without consulting discovery.
     """
     monkeypatch.setenv("OMNIGENT_MODEL", "databricks-claude-sonnet-4-6")
     assert _default_cli_model() == "databricks-claude-sonnet-4-6"
@@ -1489,19 +1498,7 @@ def test_default_cli_model_honors_omnigent_model_env_var(
 def test_apply_overrides_uses_env_var_when_yaml_has_no_model_or_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A YAML that declares neither ``executor.model`` nor
-    ``executor.harness``, processed with empty overrides and
-    ``OMNIGENT_MODEL=foo`` set, lands with ``executor.model =
-    "foo"``.
-
-    What this proves: the env var traverses
-    ``_apply_overrides_to_raw`` to the executor block. If this
-    fails with the assertion showing ``databricks-gpt-5-4``
-    (the hardcoded default), the helper isn't being called —
-    line 756 of ``omnigent/chat.py`` reverted to the literal
-    ``_DEFAULT_AD_HOC_MODEL`` and the env var is dropped again.
-    """
+    """A harness-less YAML receives the explicit environment model."""
     monkeypatch.setenv("OMNIGENT_MODEL", "databricks-claude-sonnet-4-6")
     raw: dict[str, object] = {"name": "ad_hoc", "prompt": "hi"}
 
@@ -1515,12 +1512,33 @@ def test_apply_overrides_uses_env_var_when_yaml_has_no_model_or_harness(
     )
     assert executor.get("model") == "databricks-claude-sonnet-4-6", (
         f"Expected env-var override 'databricks-claude-sonnet-4-6' to "
-        f"land in executor.model; got {executor.get('model')!r}. If "
-        f"this is 'databricks-gpt-5-4' (the hardcoded default), line "
-        f"756 of omnigent/chat.py is back to the literal "
-        f"_DEFAULT_AD_HOC_MODEL and OMNIGENT_MODEL is silently dropped "
-        f"on the omnigent/cli.py → run_chat path."
+        f"land in executor.model; got {executor.get('model')!r}."
     )
+
+
+def test_apply_overrides_yaml_model_wins_over_env_and_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A YAML model remains authoritative over fallback sources."""
+    monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
+    monkeypatch.setattr(
+        chat_module,
+        "resolve_catalog_model",
+        lambda *args, **kwargs: pytest.fail(
+            f"catalog fallback called for explicit YAML model: {args=}, {kwargs=}"
+        ),
+    )
+    raw: dict[str, object] = {
+        "name": "configured",
+        "prompt": "hi",
+        "executor": {"model": "from-yaml"},
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides())
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["model"] == "from-yaml"
 
 
 def test_apply_overrides_explicit_model_wins_over_env_var(
@@ -1530,10 +1548,7 @@ def test_apply_overrides_explicit_model_wins_over_env_var(
     A ``--model`` override takes precedence over
     ``OMNIGENT_MODEL``.
 
-    What this proves: the precedence chain is
-    ``--model`` > ``executor.model`` in YAML > ``OMNIGENT_MODEL``
-    > ``_DEFAULT_AD_HOC_MODEL``. If this fails, the env var is
-    overriding an explicit CLI flag — surprising and broken.
+    What this proves: explicit CLI arguments remain the highest precedence.
     """
     monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
     raw: dict[str, object] = {"name": "ad_hoc", "prompt": "hi"}
@@ -1851,8 +1866,8 @@ def test_nested_config_harness_skips_ad_hoc_model_fallback(
     """
     A single-file spec that declares its harness under the bundle-style
     ``executor.config.harness`` (no flat ``harness:``, no ``model:``) must
-    NOT trigger the ``_DEFAULT_AD_HOC_MODEL`` fallback — this is the polly
-    shape (``examples/polly/config.yaml`` run as a file).
+    not trigger ad-hoc model resolution — this is the polly shape
+    (``examples/polly/config.yaml`` run as a file).
 
     Regression guard for the ``databricks-gpt-5-4`` injection: before
     ``_spec_declares_harness_or_model`` looked under ``config``, an unpinned

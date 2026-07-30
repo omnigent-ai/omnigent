@@ -1338,15 +1338,14 @@ async def test_resolve_url_cross_user_forbidden(
     auth_client: httpx.AsyncClient,
 ) -> None:
     """
-    A shared editor cannot reach the resolve endpoint when auth is
-    active.
+    A shared editor needs explicit approval delegation.
 
     Alice owns the session and grants Bob edit access. Bob's POST to
-    its resolve URL is rejected by the ``LEVEL_OWNER`` access gate
-    before any resolution runs. The
+    its resolve URL is initially rejected before any resolution runs. The
     unguessable elicitation id is a capability, but session-owner
-    access control is the outer fence — edit access must not authorize
-    tools that execute with Alice's credentials.
+    delegation is the outer fence — edit access alone must not authorize
+    tools that execute with Alice's credentials. Alice can then delegate
+    that authority explicitly.
     """
     agent = await create_test_agent(auth_client, user="alice@example.com")
     session_id = await _create_session(auth_client, agent["id"], user="alice@example.com")
@@ -1363,6 +1362,27 @@ async def test_resolve_url_cross_user_forbidden(
         headers={"X-Forwarded-Email": "bob@example.com"},
     )
     assert resp.status_code == 403, resp.text
+
+    decline = await auth_client.post(
+        f"/v1/sessions/{session_id}/elicitations/elicit_decline/resolve",
+        json={"action": "decline"},
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert decline.status_code == 202, decline.text
+
+    delegated = await auth_client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "bob@example.com", "level": LEVEL_EDIT, "can_approve": True},
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert delegated.status_code == 200, delegated.text
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/elicitations/elicit_whatever/resolve",
+        json={"action": "accept"},
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert resp.status_code == 202, resp.text
 
 
 # ── GET /sessions/{id}/elicitations/{eid} (approval page) ────

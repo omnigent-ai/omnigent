@@ -521,7 +521,7 @@ const elicitItem = (id: string, status: "pending" | "responded"): RenderItem => 
   response: status === "responded" ? { action: "accept" } : null,
 });
 const pendingIds = (items: RenderItem[]): string[] =>
-  items.map((it) => (it.kind === "elicitation" ? it.elicitationId : ""));
+  items.map((item) => (item.kind === "elicitation" ? item.elicitationId : ""));
 
 describe("collectPendingElicitations", () => {
   it("collects pending cards across bubbles in document order (newest last)", () => {
@@ -555,7 +555,7 @@ describe("stripPendingElicitations", () => {
     const bubbles = [assistantWith("a1", [elicitItem("e1", "pending"), textItem("t1")])];
     const stripped = stripPendingElicitations(bubbles);
     const a1 = stripped[0] as Extract<Bubble, { kind: "assistant" }>;
-    expect(a1.items.map((it) => it.kind)).toEqual(["text"]);
+    expect(a1.items.map((item) => item.kind)).toEqual(["text"]);
   });
 
   it("leaves answered cards inline", () => {

@@ -941,11 +941,11 @@ function hardenOauthPopup(child) {
  * (re-pointing an existing window) so the mount-aware join is in one place.
  *
  * @param {string} serverUrl A normalized server URL (origin or origin+mount).
- * @param {string} path An absolute in-app path beginning with ``/``.
+ * @param {string} routePath An absolute in-app path beginning with ``/``.
  * @returns {string}
  */
-function resolveServerPath(serverUrl, path) {
-  return serverUrl.replace(/\/+$/, "") + (path.startsWith("/") ? path : "/" + path);
+function resolveServerPath(serverUrl, routePath) {
+  return serverUrl.replace(/\/+$/, "") + (routePath.startsWith("/") ? routePath : "/" + routePath);
 }
 
 /**
@@ -957,13 +957,13 @@ function resolveServerPath(serverUrl, path) {
  *
  * @param {BrowserWindow} win
  * @param {string} serverUrl Clean server URL (origin or origin+mount).
- * @param {string} [path] Optional basename-less in-app path (e.g. ``/c/<id>``).
+ * @param {string} [routePath] Optional basename-less in-app path (e.g. ``/c/<id>``).
  * @returns {Promise<void>}
  */
-function loadServerUrl(win, serverUrl, path) {
+function loadServerUrl(win, serverUrl, routePath) {
   pinWindow(win, originOf(serverUrl));
   setWindowServerUrl(win, serverUrl);
-  return win.loadURL(path ? resolveServerPath(serverUrl, path) : serverUrl);
+  return win.loadURL(routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
 }
 
 /**
@@ -2563,13 +2563,13 @@ function focusAndRestore(win) {
  * defense-in-depth on top of that.
  *
  * @param {BrowserWindow | null | undefined} win
- * @param {string} path
+ * @param {string} routePath
  */
-function sendOpenPath(win, path) {
+function sendOpenPath(win, routePath) {
   if (!win || win.isDestroyed()) return;
-  console.log(`[omnigent] deep-link: send open-path ${path}`);
+  console.log(`[omnigent] deep-link: send open-path ${routePath}`);
   try {
-    win.webContents.send("omnigent:open-path", path);
+    win.webContents.send("omnigent:open-path", routePath);
   } catch {
     // Window torn down between the check and the send; ignore.
   }

@@ -149,6 +149,8 @@ interface ApprovalCardProps {
    * elicitation (edit tools take the ``allowAllEdits`` path instead).
    */
   rememberScope?: RememberScope | null;
+  /** Whether this viewer may accept the pending action. Rejection stays available. */
+  canApprove?: boolean;
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -173,6 +175,7 @@ export function ApprovalCard({
   codexCommand,
   allowAllEdits,
   rememberScope,
+  canApprove = true,
   onSubmit,
 }: ApprovalCardProps) {
   const submit: SubmitApprovalFn =
@@ -286,12 +289,12 @@ export function ApprovalCard({
     : undefined;
   const binaryButtons = (
     <div className="flex flex-wrap gap-2 pt-1">
-      <Button size="sm" onClick={() => submitBinary("accept")}>
+      <Button size="sm" onClick={() => submitBinary("accept")} disabled={!canApprove}>
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
       {allowAllEdits && (
-        <Button size="sm" variant="outline" onClick={submitAllowAllEdits}>
+        <Button size="sm" variant="outline" onClick={submitAllowAllEdits} disabled={!canApprove}>
           <CheckIcon className="mr-1 size-3.5" />
           Accept & allow all edits
         </Button>
@@ -301,6 +304,7 @@ export function ApprovalCard({
           size="sm"
           variant="outline"
           onClick={submitRemember}
+          disabled={!canApprove}
           title={rememberTitle}
           data-testid="approval-card-remember"
         >
@@ -316,7 +320,7 @@ export function ApprovalCard({
   );
   const codexCommandButtons = (
     <div className="flex flex-wrap items-center gap-2 pt-1" data-testid="codex-command-actions">
-      <Button size="sm" onClick={() => submitBinary("accept")}>
+      <Button size="sm" onClick={() => submitBinary("accept")} disabled={!canApprove}>
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
@@ -325,6 +329,7 @@ export function ApprovalCard({
           size="sm"
           variant="outline"
           onClick={() => submitExecPolicyAmendment(execPolicyAmendment)}
+          disabled={!canApprove}
         >
           <CheckIcon className="mr-1 size-3.5" />
           Approve and remember
@@ -483,6 +488,11 @@ export function ApprovalCard({
         )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
+        {!canApprove && (
+          <span className="text-xs text-muted-foreground" role="note">
+            Only the session owner or a delegated approver can approve. You can still reject.
+          </span>
+        )}
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>
@@ -491,6 +501,7 @@ export function ApprovalCard({
               onAcceptAuto={submitAllowAllEdits}
               onAccept={() => submitBinary("accept")}
               onReject={submitPlanRejection}
+              canApprove={canApprove}
             />
           </>
         ) : isAskUserQuestion ? (
@@ -498,6 +509,7 @@ export function ApprovalCard({
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
+            canSubmit={canApprove}
           />
         ) : isCodexCommandApproval ? (
           <>
@@ -539,6 +551,7 @@ export function ApprovalCard({
                     size="sm"
                     variant="outline"
                     onClick={() => submitOption(optLabel)}
+                    disabled={!canApprove}
                   >
                     {optLabel}
                   </Button>
@@ -564,9 +577,11 @@ export function ApprovalCard({
 export function ElicitationCard({
   item,
   onSubmit,
+  canApprove,
 }: {
   item: Extract<RenderItem, { kind: "elicitation" }>;
   onSubmit?: SubmitApprovalFn;
+  canApprove?: boolean;
 }) {
   return (
     <ApprovalCard
@@ -584,6 +599,7 @@ export function ElicitationCard({
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       rememberScope={item.rememberScope}
+      canApprove={canApprove}
       onSubmit={onSubmit}
     />
   );

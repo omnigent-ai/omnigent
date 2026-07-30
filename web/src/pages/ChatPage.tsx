@@ -62,7 +62,7 @@ import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
-import { validateAttachments } from "@/lib/attachments";
+import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
   isIOSShell,
@@ -1076,6 +1076,7 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
+  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
@@ -1130,6 +1131,7 @@ export function ChatPage() {
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
+      canApprove={canApprove}
       readOnlyReason={readOnlyReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
@@ -1354,6 +1356,8 @@ interface MainAgentSurfaceProps {
   /** Whether a load-more fetch is currently in flight. */
   loadingMoreHistory: boolean;
   permissionLevel: number | null;
+  /** Whether this viewer may accept privileged actions. */
+  canApprove: boolean;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
   effortLevels: readonly string[];
@@ -1435,6 +1439,7 @@ function MainAgentSurface({
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
+  canApprove,
   readOnlyReason,
   effortLevels,
   showEffort,
@@ -1560,7 +1565,8 @@ function MainAgentSurface({
   }, [nav]);
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
-  const [replyQuotes, setReplyQuotes] = useState<string[]>([]);
+  const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
+  const nextReplyQuoteId = useRef(0);
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1744,7 +1750,7 @@ function MainAgentSurface({
             ) : (
               <>
                 {streamBubbles.map((bubble) => (
-                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
+                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
                 ))}
                 {/* Pending elicitation cards, floated to the bottom of the
                     chat so an outstanding question stays in view (stick-to-
@@ -1763,7 +1769,7 @@ function MainAgentSurface({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
+                      <ElicitationCard item={item} canApprove={canApprove} />
                     </MessageContent>
                   </Message>
                 ))}
@@ -1828,7 +1834,12 @@ function MainAgentSurface({
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
         containerRef={conversationRef}
-        onReply={(text) => setReplyQuotes((prev) => [...prev, text])}
+        onReply={(text) =>
+          setReplyQuotes((prev) => [
+            ...prev,
+            { id: `reply-quote-${nextReplyQuoteId.current++}`, text },
+          ])
+        }
       />
 
       <Composer
@@ -3020,7 +3031,7 @@ function CompactionLoadingIndicator() {
 // markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
 // the user-bubble markdown render tests.
 export const BubbleView = memo(
-  function BubbleView({ bubble }: { bubble: Bubble }) {
+  function BubbleView({ bubble, canApprove = true }: { bubble: Bubble; canApprove?: boolean }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator />;
@@ -3036,9 +3047,9 @@ export const BubbleView = memo(
         />
       );
     }
-    return <AssistantBubble bubble={bubble} />;
+    return <AssistantBubble bubble={bubble} canApprove={canApprove} />;
   },
-  (prev, next) => bubblesEqual(prev.bubble, next.bubble),
+  (prev, next) => prev.canApprove === next.canApprove && bubblesEqual(prev.bubble, next.bubble),
 );
 
 /**
@@ -3166,11 +3177,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {/* Inline image previews */}
           {images.length > 0 && (
             <div className="mb-1.5 flex flex-wrap gap-2">
-              {images.map((img, i) =>
+              {images.map((img) =>
                 img.file_id.startsWith("pending:") ? (
                   // Upload in-flight — show a chip placeholder
                   <span
-                    key={i}
+                    key={img.file_id}
                     className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                   >
                     <ImageIcon className="size-3 shrink-0" />
@@ -3181,7 +3192,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 ) : (
                   // Uploaded — render the actual image
                   <SessionImage
-                    key={i}
+                    key={img.file_id}
                     path={
                       sessionId
                         ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
@@ -3197,9 +3208,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {/* Non-image file chips */}
           {fileChips.length > 0 && (
             <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {fileChips.map((att, i) => (
+              {fileChips.map((att) => (
                 <span
-                  key={i}
+                  key={att.file_id}
                   className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                 >
                   <FileTextIcon className="size-3 shrink-0" />
@@ -3254,7 +3265,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   );
 }
 
-function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistant" }> }) {
+function AssistantBubble({
+  bubble,
+  canApprove,
+}: {
+  bubble: Extract<Bubble, { kind: "assistant" }>;
+  canApprove: boolean;
+}) {
   // The walker only emits an assistant bubble when at least one
   // assistant-side block exists, so `items` is non-empty here in the
   // common case. The "Working…" shimmer for the empty-items / streaming
@@ -3285,7 +3302,11 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
         className={isWide ? "max-w-full" : "max-w-3xl"}
       >
         <MessageContent className={isWide ? "w-full" : undefined}>
-          <BlockRenderer items={bubble.items} sessionStatus={sessionStatus} />
+          <BlockRenderer
+            items={bubble.items}
+            sessionStatus={sessionStatus}
+            canApprove={canApprove}
+          />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
           <p
@@ -3325,6 +3346,11 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   );
 }
 
+interface ReplyQuote {
+  id: string;
+  text: string;
+}
+
 interface ComposerProps {
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. */
@@ -3355,7 +3381,7 @@ interface ComposerProps {
    */
   readOnlyReason: string | null;
   /** Quoted texts to prepend to the next message (one per "Reply ↵" click). */
-  replyQuotes: string[];
+  replyQuotes: ReplyQuote[];
   /** Removes the quote at the given index without submitting. */
   onRemoveQuote: (index: number) => void;
   /** Clears all quotes (called after submit). */
@@ -4471,8 +4497,8 @@ export function Composer({
     const quotePreamble =
       replyQuotes.length > 0
         ? replyQuotes
-            .map((q) =>
-              q
+            .map((quote) =>
+              quote.text
                 .split("\n")
                 .map((line) => `> ${line}`)
                 .join("\n"),
@@ -4728,10 +4754,10 @@ export function Composer({
         {replyQuotes.length > 0 && (
           <div className="flex flex-col gap-1.5 px-4 pt-3 pb-0">
             {replyQuotes.map((quote, i) => (
-              <div key={i} className="flex items-start gap-2">
+              <div key={quote.id} className="flex items-start gap-2">
                 <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-xs text-muted-foreground">
                   <span className="block truncate">
-                    {quote.length > 120 ? `${quote.slice(0, 120)}…` : quote}
+                    {quote.text.length > 120 ? `${quote.text.slice(0, 120)}…` : quote.text}
                   </span>
                 </div>
                 <button
@@ -4851,7 +4877,7 @@ export function Composer({
           <div className="flex flex-wrap gap-1.5 px-4 pb-2">
             {files.map((file, i) => (
               <span
-                key={i}
+                key={attachmentKey(file)}
                 className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
               >
                 {file.type.startsWith("image/") ? (

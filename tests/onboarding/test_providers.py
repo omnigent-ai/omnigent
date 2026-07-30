@@ -66,6 +66,20 @@ _FAKE_CATALOG: dict[str, dict] = {
             },
         }
     },
+    "openrouter": {
+        "models": {
+            "openai/gpt-6": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 128000, "max_output": 16384},
+            },
+            "moonshotai/kimi-k2.6": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 128000, "max_output": 16384},
+            },
+        }
+    },
     "gemini": {
         "models": {
             "gemini/gemini-2.5-flash": {
@@ -217,23 +231,13 @@ def test_extract_model_version_ignores_dates_sizes_and_unknown_families(
 # ── default_chat_model ─────────────────────────────────────
 
 
-def test_default_chat_model_anthropic_is_pinned_opus() -> None:
-    """The anthropic default is the explicit ``claude-opus-4-8`` pin.
-
-    The out-of-box Claude default is an explicit pin (it may be newer than
-    the bundled catalog), so a fresh user gets the intended current model.
-    A failure means the pin regressed to the dynamic catalog pick.
-    """
-    assert default_chat_model("anthropic") == "claude-opus-4-8"
+def test_default_chat_model_anthropic_prefers_accessible_tier() -> None:
+    """Anthropic selects the newest broadly accessible catalog tier."""
+    assert default_chat_model("anthropic") == "claude-sonnet-4-6"
 
 
-def test_default_chat_model_openai_is_pinned_gpt() -> None:
-    """The openai default is the explicit ``gpt-5.5`` pin (general-purpose).
-
-    The default must be a usable general-purpose ``gpt-*`` text model, never
-    a specialty (audio/realtime/…) variant. A failure means the pin
-    regressed.
-    """
+def test_default_chat_model_openai_uses_newest_general_model() -> None:
+    """OpenAI selects the newest non-specialty catalog model."""
     default = default_chat_model("openai")
     assert default == "gpt-5.5"
     assert default.startswith("gpt-")
@@ -241,25 +245,23 @@ def test_default_chat_model_openai_is_pinned_gpt() -> None:
         assert token not in default.lower()
 
 
-def test_default_chat_model_openrouter_is_pinned_oss() -> None:
-    """OpenRouter defaults to the pinned OSS model (not an OpenAI/Anthropic id).
-
-    OpenRouter routes OSS models, so its out-of-box default is an OSS model
-    (``moonshotai/kimi-k2.6``) — also the gateway add flow's OpenAI-surface
-    pre-fill. A failure means the OSS pin regressed.
-    """
+def test_default_chat_model_openrouter_prefers_kimi_family() -> None:
+    """OpenRouter prefers its broadly-served Kimi family over newer entries."""
     assert default_chat_model("openrouter") == "moonshotai/kimi-k2.6"
 
 
-def test_default_chat_model_dynamic_skips_specialty_variants() -> None:
-    """The dynamic rule (non-pinned providers) drops specialty modalities.
+def test_default_chat_model_openrouter_requires_kimi_family() -> None:
+    """OpenRouter does not silently fall back to a proprietary model."""
+    assert default_chat_model("openrouter", allowed_models={"openai/gpt-6"}) is None
 
-    Pinned providers short-circuit, so this exercises the catalog rule via
-    the internal helper on the openai catalog (whose newest-first top entry
-    is a specialty model): the dynamic pick must skip audio/realtime/etc.
-    and choose a general-purpose ``gpt-*``. Guards the fallback used for any
-    non-pinned provider.
-    """
+
+def test_default_chat_model_without_catalog_is_none() -> None:
+    """Offline onboarding asks for a model instead of using a source pin."""
+    assert default_chat_model("xai") is None
+
+
+def test_default_chat_model_dynamic_skips_specialty_variants() -> None:
+    """The catalog rule drops specialty modalities."""
     from omnigent.onboarding.providers import _SPECIALTY_MODEL_TOKENS
 
     general = [
