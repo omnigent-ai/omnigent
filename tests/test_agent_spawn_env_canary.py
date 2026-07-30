@@ -73,9 +73,10 @@ def _bare(cls, **attrs):
     """An executor carrying only the attributes its env builder reads.
 
     The constructors want a live config, an event loop and a spawned CLI. The
-    builders do not — they read ``_os_env`` and, for hermes, ``_hermes_home``.
+    builders do not need a live process; they read ``_os_env`` plus a small
+    number of executor-specific attributes supplied by the wrappers below.
     Bypassing ``__init__`` keeps the canary on the real method without dragging
-    in the rest of the executor.
+    in the rest of each executor.
     """
     obj = object.__new__(cls)
     obj._os_env = None
@@ -85,9 +86,12 @@ def _bare(cls, **attrs):
 
 
 def _acp_spawn_env():
-    from omnigent.inner.acp_executor import AcpExecutor
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 
-    return _bare(AcpExecutor)._build_spawn_env()
+    return _bare(
+        AcpExecutor,
+        _config=AcpAgentConfig(command="canary-acp"),
+    )._build_spawn_env()
 
 
 def _goose_spawn_env():
