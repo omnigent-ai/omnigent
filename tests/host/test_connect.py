@@ -99,6 +99,104 @@ async def test_handle_model_options_uses_host_claude_configuration(
     )
 
 
+async def test_handle_model_options_uses_codex_provider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Codex launch picker comes from the host's resolved provider catalog."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    def _fake_list_models_for_worker(spec: object, harness: str) -> ModelListing:
+        assert harness == "codex-native"
+        assert spec.executor.config["profile"] == "oss"
+        return ModelListing(
+            source="static",
+            verified=False,
+            models=(
+                ModelEntry(id="gpt-live-default", family="openai"),
+                ModelEntry(id="gpt-live-fast", family="openai"),
+            ),
+            note="test catalog",
+        )
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        _fake_list_models_for_worker,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model="gpt-live-fast",
+            profile="oss",
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[
+            {"id": "gpt-live-default", "displayName": "gpt-live-default"},
+            {"id": "gpt-live-fast", "displayName": "gpt-live-fast", "isDefault": True},
+        ],
+    )
+
+
+async def test_handle_model_options_does_not_invent_codex_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog entry is not a default unless Codex resolves it as one."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="static",
+            verified=False,
+            models=(ModelEntry(id="gpt-live", family="openai"),),
+            note="test catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [{"id": "gpt-live", "displayName": "gpt-live"}]
+
+
+async def test_handle_model_options_rejects_unsupported_harness() -> None:
+    """Only launch paths with host-resolved model catalogs are accepted."""
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="cursor-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="failed",
+        error="model options are unsupported for harness 'cursor-native'",
+    )
+
+
 def _make_host_process() -> HostProcess:
     """Create a HostProcess with a test identity.
 
