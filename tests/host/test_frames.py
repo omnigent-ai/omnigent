@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -293,12 +294,14 @@ def test_launch_runner_result_frame_failure_round_trip() -> None:
         request_id="req_001",
         status="failed",
         error="workspace path does not exist",
+        error_code=WORKSPACE_MISSING_ERROR_CODE,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerResultFrame)
     assert decoded.status == "failed"
     assert decoded.runner_id is None
     assert decoded.error == "workspace path does not exist"
+    assert decoded.error_code == WORKSPACE_MISSING_ERROR_CODE
 
 
 def test_hello_frame_configured_harnesses_round_trip() -> None:
