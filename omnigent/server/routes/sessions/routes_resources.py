@@ -38,6 +38,10 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.artifact_previews import (
+    ArtifactPreviewService,
+    ArtifactPreviewUnavailable,
+)
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
@@ -64,9 +68,12 @@ from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
 from omnigent.server.routes._sessions.orchestration import *
 from omnigent.server.schemas import (
+    ArtifactPreviewRequest,
+    ArtifactPreviewResponse,
     CopiedFile,
     CopyFilesRequest,
     CopyFilesResponse,
+    ManagedArtifactList,
     SessionResourceObject,
     SessionResourcePaginatedList,
 )
@@ -87,6 +94,7 @@ def register_resources_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     host_registry: HostRegistry | None = None,
+    artifact_preview_service: ArtifactPreviewService | None = None,
 ) -> None:
     """Register the resources routes on router."""
 
@@ -265,6 +273,43 @@ def register_resources_routes(
                 msg = "runner resource endpoint failed"
             raise HTTPException(status_code=502, detail=msg)
         return resp.json()
+
+    @router.post(
+        "/sessions/{session_id}/artifact-previews",
+        status_code=201,
+        response_model=ArtifactPreviewResponse,
+    )
+    async def create_artifact_preview(
+        session_id: str,
+        request: Request,
+        body: ArtifactPreviewRequest,
+    ) -> ArtifactPreviewResponse:
+        """Create a short-lived capability URL for an HTML artifact."""
+        await _validate_session(session_id, request, LEVEL_READ)
+        if artifact_preview_service is None:
+            raise HTTPException(status_code=503, detail="artifact previews unavailable")
+        try:
+            grant = await artifact_preview_service.create_grant(session_id, body.entry_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid artifact entry path") from exc
+        except ArtifactPreviewUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="artifact preview runner unavailable",
+            ) from exc
+        return ArtifactPreviewResponse(url=grant.url, expires_at=grant.expires_at)
+
+    @router.get("/sessions/{session_id}/artifacts", response_model=ManagedArtifactList)
+    async def list_managed_artifacts(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """List canonical HTML entries from the managed artifact root."""
+        await _validate_session(session_id, request, LEVEL_READ)
+        return await _proxy_get_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/artifacts",
+        )
 
     async def _fs_get_with_host_fallback(
         session_id: str,

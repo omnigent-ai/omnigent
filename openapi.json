@@ -165,6 +165,39 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "ArtifactPreviewRequest": {
+        "description": "Request a capability-scoped preview URL for one artifact entry.",
+        "properties": {
+          "entry_path": {
+            "title": "Entry Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_path"
+        ],
+        "title": "ArtifactPreviewRequest",
+        "type": "object"
+      },
+      "ArtifactPreviewResponse": {
+        "description": "Short-lived preview capability returned for an artifact entry.",
+        "properties": {
+          "expires_at": {
+            "title": "Expires At",
+            "type": "number"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "expires_at"
+        ],
+        "title": "ArtifactPreviewResponse",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Request body for the current-agent automatic rename endpoint.",
@@ -2033,6 +2066,66 @@
           "transport"
         ],
         "title": "MCPServerSummary",
+        "type": "object"
+      },
+      "ManagedArtifactList": {
+        "description": "List of canonical managed HTML artifact entries.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ManagedArtifactObject"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "ManagedArtifactList",
+        "type": "object"
+      },
+      "ManagedArtifactObject": {
+        "description": "Canonical HTML artifact entry discovered for one session.",
+        "properties": {
+          "bytes": {
+            "title": "Bytes",
+            "type": "integer"
+          },
+          "modified_at": {
+            "title": "Modified At",
+            "type": "number"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "type": {
+            "const": "file",
+            "default": "file",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "name",
+          "bytes",
+          "modified_at"
+        ],
+        "title": "ManagedArtifactObject",
         "type": "object"
       },
       "McpServerStartup": {
@@ -9202,6 +9295,102 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/artifact-previews": {
+      "post": {
+        "description": "Create a short-lived capability URL for an HTML artifact.",
+        "operationId": "create_artifact_preview_v1_sessions__session_id__artifact_previews_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Artifact Preview",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/artifacts": {
+      "get": {
+        "description": "List canonical HTML entries from the managed artifact root.",
+        "operationId": "list_managed_artifacts_v1_sessions__session_id__artifacts_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedArtifactList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Managed Artifacts",
+        "tags": [
+          "sessions"
         ]
       }
     },

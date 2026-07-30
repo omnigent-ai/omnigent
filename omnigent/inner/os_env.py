@@ -22,6 +22,7 @@ from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import (
+    ARTIFACT_DIR_ENV_VAR,
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
 )
@@ -132,6 +133,10 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     # way CLAUDE_CODE / CODEX are visible in their agents' shells. Set on
     # the runner via runner.identity.OMNIGENT_SESSION_ENV_VAR.
     OMNIGENT_SESSION_ENV_VAR,
+    # Session-scoped managed output directory for design artifacts. This is
+    # a non-secret path and must reach sandboxed shell/file tools so agents
+    # can write outputs without touching the project workspace.
+    ARTIFACT_DIR_ENV_VAR,
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
     *WINDOWS_ENV_PASSTHROUGH,

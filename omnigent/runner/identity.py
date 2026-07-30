@@ -18,6 +18,7 @@ RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # imports working there and let callers skip adopt signaling.
 RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
+ARTIFACT_DIR_ENV_VAR = "OMNIGENT_ARTIFACT_DIR"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 # A host-launched runner uses this bearer for its initial server connection,
 # then falls back to its own refreshable auth when the bearer is rejected.

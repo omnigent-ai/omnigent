@@ -1785,6 +1785,50 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert captured["create_app_kwargs"]["runner_tunnel_tokens"] == frozenset(
         {"test-tunnel-token-abc"}
     )
+    assert captured["create_app_kwargs"]["artifact_preview_origin"] == (
+        "http://preview.localhost:9999"
+    )
+
+
+def test_server_command_uses_fallback_port_for_artifact_preview_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A canonical server's preview origin follows its resolved fallback port."""
+    import uvicorn.server
+
+    captured: dict[str, Any] = {}
+
+    from omnigent.server import app as app_module
+
+    original_create_app = app_module.create_app
+
+    def _spy_create_app(**kwargs: Any) -> Any:
+        captured["create_app_kwargs"] = kwargs
+        return original_create_app(**kwargs)
+
+    def _fake_server_run(self: Any) -> None:
+        captured["uvicorn_port"] = self.config.port
+
+    monkeypatch.setattr(app_module, "create_app", _spy_create_app)
+    monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    from omnigent.host import local_server as local_server_module
+
+    monkeypatch.setattr(local_server_module, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(local_server_module, "pick_local_port", lambda _preferred: 45555)
+    monkeypatch.setattr(local_server_module, "register_local_server", lambda _port: None)
+    monkeypatch.setattr(local_server_module, "clear_local_server_record", lambda: None)
+
+    result = CliRunner().invoke(cli, ["server", "--no-open"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["uvicorn_port"] == 45555
+    assert captured["create_app_kwargs"]["artifact_preview_origin"] == (
+        "http://preview.localhost:45555"
+    )
 
 
 def test_server_with_explicit_db_does_not_reuse_canonical_server(

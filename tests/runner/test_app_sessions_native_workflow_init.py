@@ -1917,7 +1917,9 @@ async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
 
     assert execute_resp.status_code == 200
     assert execute_resp.json() == {"result": {"output": "called jira__search_issues"}}
-    assert mcp_manager.call_tool_invocations == [("jira__search_issues", {"query": "asyncio"})]
+    assert mcp_manager.call_tool_invocations == [
+        ("jira__search_issues", {"query": "asyncio"}, "6a09e2c1b63301fc6be99bb645418905")
+    ]
 
 
 @pytest.mark.asyncio

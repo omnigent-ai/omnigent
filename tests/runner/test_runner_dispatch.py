@@ -1916,6 +1916,78 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_os_env_tools_route_artifact_paths_to_managed_storage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Virtual ``artifacts/`` paths stay out of the project workspace."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    write = await _execute_os_env_tool(
+        "sys_os_write",
+        {"path": "artifacts/revenue/index.html", "content": "<h1>Draft</h1>"},
+        agent_spec=spec,
+        conversation_id="conv_managed_artifact",
+    )
+    assert json.loads(write)["created"] is True
+
+    edit = await _execute_os_env_tool(
+        "sys_os_edit",
+        {
+            "path": "artifacts/revenue/index.html",
+            "oldText": "Draft",
+            "newText": "Revenue",
+        },
+        agent_spec=spec,
+        conversation_id="conv_managed_artifact",
+    )
+    assert json.loads(edit)["replacements"] == 1
+
+    delete = await _execute_os_env_tool(
+        "sys_os_edit",
+        {
+            "path": "artifacts/revenue/index.html",
+            "oldText": "Revenue",
+            "newText": "",
+        },
+        agent_spec=spec,
+        conversation_id="conv_managed_artifact",
+    )
+    assert json.loads(delete)["replacements"] == 1
+
+    read = await _execute_os_env_tool(
+        "sys_os_read",
+        {"path": "artifacts/revenue/index.html"},
+        agent_spec=spec,
+        conversation_id="conv_managed_artifact",
+    )
+    assert json.loads(read)["content"] == "<h1></h1>"
+    assert (
+        tmp_path
+        / "data"
+        / "artifacts"
+        / "sessions"
+        / "conv_managed_artifact"
+        / "revenue"
+        / "index.html"
+    ).read_text() == "<h1></h1>"
+    assert not (workspace / "artifacts").exists()
+
+
+@pytest.mark.asyncio
 async def test_runner_os_env_placeholder_cwd_uses_cli_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
