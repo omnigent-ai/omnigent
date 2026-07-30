@@ -64,9 +64,11 @@ describe("HistoryAutoLoader", () => {
     stickContext.scrollRef.current = null;
     useChatStore.setState({
       blocks: [userBlock("user_1"), userBlock("user_2")],
+      conversationId: "session-1",
       hasMoreHistory: false,
       loadingMoreHistory: false,
       loadingInitialWindow: false,
+      oldestItemId: "item_2",
       historyGeneration: 0,
     });
   });
@@ -78,108 +80,207 @@ describe("HistoryAutoLoader", () => {
   });
 
   it("renders no visible control", () => {
-    const { container } = render(
-      <HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />,
-    );
+    const { container } = render(<HistoryAutoLoader />);
 
     expect(container).toBeEmptyDOMElement();
   });
 
   it("preserves the visible scroll offset after a scroll-up prepend", () => {
-    const loadMoreHistory = vi.fn(async () => {});
-    useChatStore.setState({ loadMoreHistory });
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
-    const metrics = { scrollTop: 24, scrollHeight: 100 };
+    const metrics = { scrollTop: 500, scrollHeight: 100 };
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    const { rerender } = render(
-      <HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />,
-    );
+    render(<HistoryAutoLoader />);
     // Scroll near the top to trigger an older-history fetch.
+    metrics.scrollTop = 24;
     fireEvent.scroll(scrollRoot);
-    rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
     metrics.scrollHeight = 180;
-    rerender(<HistoryAutoLoader hasMoreHistory={false} loadingMoreHistory={false} />);
+    act(() => {
+      useChatStore.setState({
+        hasMoreHistory: false,
+        loadingMoreHistory: false,
+        oldestItemId: "item_1",
+      });
+    });
 
     expect(metrics.scrollTop).toBe(104);
   });
 
-  it("loads older history when the user scrolls near the top", () => {
-    const loadMoreHistory = vi.fn(async () => {});
-    useChatStore.setState({ loadMoreHistory });
+  it("preserves the offset after the user scrolls again during the request", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 299, scrollHeight: 100 });
+    const metrics = { scrollTop: 500, scrollHeight: 1000 };
+    setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    render(<HistoryAutoLoader />);
+    metrics.scrollTop = 299;
+    fireEvent.scroll(scrollRoot);
+    metrics.scrollTop = 0;
+    fireEvent.scroll(scrollRoot);
+
+    metrics.scrollHeight = 1800;
+    act(() => {
+      useChatStore.setState({
+        hasMoreHistory: false,
+        loadingMoreHistory: false,
+        oldestItemId: "item_1",
+      });
+    });
+
+    expect(metrics.scrollTop).toBe(800);
+  });
+
+  it("excludes the disappearing skeleton from the restored offset", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      loadingInitialWindow: true,
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    const skeleton = document.createElement("div");
+    skeleton.dataset.initialHistorySkeleton = "";
+    vi.spyOn(skeleton, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      right: 0,
+      bottom: 80,
+      left: 0,
+      width: 0,
+      height: 80,
+      toJSON: () => ({}),
+    });
+    scrollRoot.append(skeleton);
+    const metrics = { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    metrics.scrollHeight = 1300;
+    act(() => {
+      useChatStore.setState({
+        blocks: [userBlock("previous"), userBlock("latest")],
+        hasMoreHistory: false,
+        loadingMoreHistory: false,
+        oldestItemId: "item_1",
+      });
+    });
+
+    expect(metrics.scrollTop).toBe(720);
+    expect(useChatStore.getState().loadingInitialWindow).toBe(false);
+  });
+
+  it("loads older history when the user scrolls near the top", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 500, scrollHeight: 100 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    metrics.scrollTop = 299;
     fireEvent.scroll(scrollRoot);
 
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
   it("keeps loading after reaching the top during an in-flight fetch", () => {
-    const loadMoreHistory = vi.fn(async () => {});
-    useChatStore.setState({ loadMoreHistory });
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
-    const metrics = { scrollTop: 299, scrollHeight: 1000 };
+    const metrics = { scrollTop: 500, scrollHeight: 1000 };
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
-    const view = render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    render(<HistoryAutoLoader />);
+    metrics.scrollTop = 299;
     fireEvent.scroll(scrollRoot);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
-    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
     metrics.scrollTop = 0;
     fireEvent.scroll(scrollRoot);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
-    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    // Tool-heavy pages can collapse without changing scrollHeight. The paging
+    // cursor still changes, so completing the request must queue another page.
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_1" });
+    });
     expect(loadMoreHistory).toHaveBeenCalledTimes(2);
   });
 
   it("loads to the second real user prompt even when the viewport already scrolls", async () => {
-    const loadMoreHistory = vi.fn(async () => {});
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
     useChatStore.setState({
       blocks: [userBlock("latest"), userBlock("system", "[System: task completed]")],
+      hasMoreHistory: true,
       loadMoreHistory,
     });
     const scrollRoot = document.createElement("div");
     setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
-    const view = render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    render(<HistoryAutoLoader />);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
     expect(useChatStore.getState().loadingInitialWindow).toBe(true);
 
-    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
     act(() => {
-      useChatStore.setState({ blocks: [userBlock("previous"), userBlock("latest")] });
+      useChatStore.setState({
+        blocks: [userBlock("previous"), userBlock("latest")],
+        loadingMoreHistory: false,
+        oldestItemId: "item_1",
+      });
     });
-    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
 
     await waitFor(() => expect(useChatStore.getState().loadingInitialWindow).toBe(false));
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
   it("caps the prompt search at the page cap", async () => {
-    const loadMoreHistory = vi.fn(async () => {});
-    useChatStore.setState({ blocks: [userBlock("latest")], loadMoreHistory });
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      loadMoreHistory,
+    });
 
     const scrollRoot = document.createElement("div");
     setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
-    const view = render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    render(<HistoryAutoLoader />);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
     // The newest page counts as page one. Settle older pages without finding a
     // second prompt; the semantic search must stop at the cap — reachability is
     // no longer this loop's job (the spacer keeps the pane scrollable).
     for (let page = 2; page <= MAX_INITIAL_PAGES; page++) {
-      view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
-      view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+      act(() => {
+        useChatStore.setState({
+          loadingMoreHistory: false,
+          oldestItemId: `item_${page + 1}`,
+        });
+      });
     }
 
     await waitFor(() => expect(useChatStore.getState().loadingInitialWindow).toBe(false));
@@ -187,16 +288,44 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(MAX_INITIAL_PAGES - 1);
   });
 
+  it("clears the initial skeleton when a request fails without changing items", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    expect(useChatStore.getState().loadingInitialWindow).toBe(true);
+
+    act(() => {
+      useChatStore.setState({ hasMoreHistory: false, loadingMoreHistory: false });
+    });
+
+    expect(useChatStore.getState().loadingInitialWindow).toBe(false);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
   it("does not page a short window for viewport fill (the spacer handles reachability)", () => {
     const loadMoreHistory = vi.fn(async () => {});
     // Two prompts already loaded → prompt boundary met. A window too short to
     // scroll must NOT trigger a fetch: the spacer keeps it reachable instead.
-    useChatStore.setState({ blocks: [userBlock("user_1"), userBlock("user_2")], loadMoreHistory });
+    useChatStore.setState({
+      blocks: [userBlock("user_1"), userBlock("user_2")],
+      hasMoreHistory: true,
+      loadMoreHistory,
+    });
     const scrollRoot = document.createElement("div");
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 100, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    render(<HistoryAutoLoader />);
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
@@ -208,7 +337,7 @@ describe("HistoryAutoLoader", () => {
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 100, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader hasMoreHistory={false} loadingMoreHistory={false} />);
+    render(<HistoryAutoLoader />);
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
@@ -291,24 +420,24 @@ describe("LatestTurnSpacer", () => {
   }
 
   it("pads a short reply so the anchor prompt pins to the top", () => {
-    // anchor→end = 100px content, viewport 500 → spacer = 500 − 100 − 88 = 312.
+    // anchor→end = 100px content, viewport 500 → spacer = 500 − 100 − 96 = 304.
     expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 100, anchor: "user" })).toBe(
-      312,
+      304,
     );
   });
 
   it("collapses to zero once the reply alone exceeds the viewport", () => {
     // Reply taller than the viewport (spacer top far below the anchor):
-    // 500 − 900 − 88 < 0, clamped to 0.
+    // 500 − 900 − 96 < 0, clamped to 0.
     expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 900, anchor: "user" })).toBe(
       0,
     );
   });
 
   it("anchors to the last assistant text when no user prompt is present", () => {
-    // 500 − 50 − 88 = 362.
+    // 500 − 50 − 96 = 354.
     expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 50, anchor: "text" })).toBe(
-      362,
+      354,
     );
   });
 

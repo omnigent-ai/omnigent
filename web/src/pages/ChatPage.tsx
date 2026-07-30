@@ -1720,10 +1720,7 @@ function MainAgentSurface({
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <PreserveScrollDistanceOnResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
-            <HistoryAutoLoader
-              hasMoreHistory={hasMoreHistory}
-              loadingMoreHistory={loadingMoreHistory}
-            />
+            <HistoryAutoLoader />
             {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
               // Cold launch: a centered spinner instead of the "ready to
               // type" empty state (the create-then-send path uses the
@@ -1752,12 +1749,7 @@ function MainAgentSurface({
             ) : (
               <>
                 {/* The newest page renders first; older initial pages arrive here. */}
-                {loadingInitialWindow && (
-                  <div className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm">
-                    <Loader2Icon className="size-4 animate-spin" aria-hidden />
-                    Loading earlier messages…
-                  </div>
-                )}
+                {loadingInitialWindow && <InitialHistorySkeleton />}
                 {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
                 ))}
@@ -2117,19 +2109,42 @@ function PreserveScrollDistanceOnResize() {
   return null;
 }
 
-/**
- * Builds the initial history window after first paint, then keeps loading while
- * the transcript remains near its top.
- */
+function InitialHistorySkeleton() {
+  return (
+    <div
+      role="status"
+      aria-label="Loading earlier messages"
+      data-initial-history-skeleton
+      className="flex flex-col gap-4 py-2"
+    >
+      <div aria-hidden className="flex flex-col gap-4 animate-pulse">
+        <Message from="assistant" className="max-w-3xl">
+          <MessageContent className="w-full">
+            <div className="h-3 w-3/4 rounded-full bg-muted" />
+            <div className="h-3 w-1/2 rounded-full bg-muted" />
+          </MessageContent>
+        </Message>
+        <Message from="user" className="max-w-3xl">
+          <MessageContent className="w-2/3">
+            <div className="h-3 w-full rounded-full bg-muted-foreground/15" />
+            <div className="h-3 w-2/3 rounded-full bg-muted-foreground/15" />
+          </MessageContent>
+        </Message>
+        <Message from="assistant" className="max-w-3xl">
+          <MessageContent className="w-full">
+            <div className="h-3 w-2/3 rounded-full bg-muted" />
+            <div className="h-3 w-5/12 rounded-full bg-muted" />
+          </MessageContent>
+        </Message>
+      </div>
+    </div>
+  );
+}
+
+/** Builds the initial history window, then keeps loading near the top. */
 const HISTORY_LOAD_TOP_THRESHOLD_PX = 300;
 
-export function HistoryAutoLoader({
-  hasMoreHistory,
-  loadingMoreHistory,
-}: {
-  hasMoreHistory: boolean;
-  loadingMoreHistory: boolean;
-}) {
+export function HistoryAutoLoader() {
   // useStickToBottomContext exposes scrollRef (the actual scroll container
   // element) in the runtime context even though the public TS types only
   // declare isAtBottom and scrollToBottom. Cast to access it.
@@ -2137,94 +2152,96 @@ export function HistoryAutoLoader({
     scrollRef: React.RefObject<HTMLElement>;
   };
   const historyGeneration = useChatStore((s) => s.historyGeneration);
-  const userPromptCount = useChatStore((s) =>
-    s.blocks.reduce(
-      (count, block) =>
-        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
-      0,
-    ),
-  );
+  // A successful page updates this cursor in the same store transaction that
+  // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
+  // still changes when many fetched tool calls collapse into one visual row.
+  const oldestItemId = useChatStore((s) => s.oldestItemId);
+  // This only terminates the initial skeleton when a request exhausts history
+  // or fails without advancing the cursor; it never initiates a page by itself.
+  const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const pagesFetchedRef = useRef(1);
-  const [isNearHistoryTop, setIsNearHistoryTop] = useState(false);
-
-  useEffect(() => {
-    pagesFetchedRef.current = 1;
-    setIsNearHistoryTop(false);
-    useChatStore.setState({ loadingInitialWindow: false });
-  }, [historyGeneration]);
+  const generationRef = useRef(historyGeneration);
+  const [scrollRevision, setScrollRevision] = useState(0);
+  const handledScrollRevisionRef = useRef(scrollRevision);
+  const oldestItemIdRef = useRef(oldestItemId);
 
   // Preserve scroll position when items are prepended after a scroll-up
-  // fetch. Snapshot scrollHeight before the call; restore the offset in a
-  // layout effect so the visible content doesn't jump.
+  // fetch. The same layout effect that restores the offset decides whether
+  // the pane is still near enough to the top to queue another page.
   const prevScrollHeightRef = useRef<number | null>(null);
-  const loadOlderPreservingOffset = useCallback(() => {
-    if (!hasMoreHistory || loadingMoreHistory || useChatStore.getState().loadingMoreHistory) return;
-    const el = ctx.scrollRef?.current;
-    if (el) prevScrollHeightRef.current = el.scrollHeight;
-    if (!initialWindowComplete(userPromptCount, pagesFetchedRef.current)) {
-      pagesFetchedRef.current += 1;
-      useChatStore.setState({ loadingInitialWindow: true });
-    }
-    void useChatStore.getState().loadMoreHistory();
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, userPromptCount]);
-
-  useLayoutEffect(() => {
-    const el = ctx.scrollRef?.current;
-    // Wait until loadingMoreHistory is false — the prepend render that grows
-    // scrollHeight is the one to correct. Consuming the snapshot earlier
-    // would null the ref before the prepend lands, causing a scroll jump.
-    if (!el || prevScrollHeightRef.current === null || loadingMoreHistory) return;
-    const delta = el.scrollHeight - prevScrollHeightRef.current;
-    if (delta > 0) el.scrollTop += delta;
-    prevScrollHeightRef.current = null;
-  });
 
   useEffect(() => {
     const el = ctx.scrollRef?.current;
     if (!el) return;
-    const handleScroll = () => setIsNearHistoryTop(el.scrollTop < HISTORY_LOAD_TOP_THRESHOLD_PX);
+    const handleScroll = () => setScrollRevision((revision) => revision + 1);
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
   }, [ctx.scrollRef]);
 
-  // Keep paging while the pane remains near the top. This re-runs when an
-  // in-flight request settles, so arriving at the top during that request does
-  // not require another scroll gesture to fetch the following page.
-  useEffect(() => {
+  // This is the single paging effect. Fetches are driven by user scrolls or a
+  // changed oldest item, including a visually height-neutral prepend.
+  useLayoutEffect(() => {
     const el = ctx.scrollRef?.current;
-    if (!isNearHistoryTop || !el || el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX) return;
-    loadOlderPreservingOffset();
-  }, [ctx.scrollRef, isNearHistoryTop, loadOlderPreservingOffset]);
+    if (!el) return;
 
-  // Page older history until the previous-prompt boundary is reached (or the
-  // page cap trips). Reachability is no longer this loop's concern: the
-  // <LatestTurnSpacer> keeps the transcript taller than its viewport whenever
-  // content sits above the anchor, so scroll-up stays available even when the
-  // loaded turns collapse too short to overflow on their own — no viewport-fill
-  // fetch loop needed.
-  const maybeBuildInitialWindow = useCallback(() => {
-    if (loadingMoreHistory || useChatStore.getState().loadingMoreHistory) return;
-    if (!hasMoreHistory || initialWindowComplete(userPromptCount, pagesFetchedRef.current)) {
-      useChatStore.setState({ loadingInitialWindow: false });
+    const generationChanged = generationRef.current !== historyGeneration;
+    const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
+    const scrollPositionChanged =
+      !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
+    oldestItemIdRef.current = oldestItemId;
+    handledScrollRevisionRef.current = scrollRevision;
+
+    if (generationChanged) {
+      generationRef.current = historyGeneration;
+      pagesFetchedRef.current = 1;
+      prevScrollHeightRef.current = null;
+    }
+
+    const state = useChatStore.getState();
+    const userPromptCount = state.blocks.reduce(
+      (count, block) =>
+        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
+      0,
+    );
+    const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
+    const showInitialSkeleton = buildingInitialWindow && state.hasMoreHistory;
+
+    if (itemsChanged && prevScrollHeightRef.current !== null) {
+      let delta = el.scrollHeight - prevScrollHeightRef.current;
+      if (state.loadingInitialWindow && !showInitialSkeleton) {
+        const skeleton = el.querySelector<HTMLElement>("[data-initial-history-skeleton]");
+        delta -= skeleton?.getBoundingClientRect().height ?? 0;
+      }
+      if (delta !== 0) el.scrollTop = Math.max(0, el.scrollTop + delta);
+      prevScrollHeightRef.current = null;
+    }
+
+    if (state.loadingInitialWindow !== showInitialSkeleton) {
+      useChatStore.setState({ loadingInitialWindow: showInitialSkeleton });
+    }
+
+    if (
+      !state.oldestItemId ||
+      !state.hasMoreHistory ||
+      state.loadingMoreHistory ||
+      (!buildingInitialWindow &&
+        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX))
+    ) {
       return;
     }
-    pagesFetchedRef.current += 1;
-    useChatStore.setState({ loadingInitialWindow: true });
-    void useChatStore.getState().loadMoreHistory();
-  }, [hasMoreHistory, loadingMoreHistory, userPromptCount]);
 
-  // Re-check after every prepend so the next page loads once state settles.
-  useEffect(() => {
-    maybeBuildInitialWindow();
-  }, [maybeBuildInitialWindow]);
+    prevScrollHeightRef.current = el.scrollHeight;
+    if (buildingInitialWindow) pagesFetchedRef.current += 1;
+    void state.loadMoreHistory();
+  }, [ctx.scrollRef, hasMoreHistory, historyGeneration, oldestItemId, scrollRevision]);
 
   // No visible control — history loads purely on scroll-up / the initial-window
   // build above.
   return null;
 }
 
-/** Top inset for a pinned anchor: 8px beyond the fade's fully opaque edge. */
-const PINNED_ANCHOR_TOP_GAP_PX = 88;
+/** Top inset for a pinned anchor: 16px beyond the fade's fully opaque edge. */
+const PINNED_ANCHOR_TOP_GAP_PX = 96;
 
 /**
  * Trailing spacer that pins the latest turn's anchor to the top of the
