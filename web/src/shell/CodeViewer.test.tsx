@@ -309,7 +309,11 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(screen.getByTestId("mermaid-preview")).toBeDefined();
     expect(container.querySelector("pre > code.language-mermaid")).toBeNull();
     await waitFor(() =>
-      expect(container.querySelector("[data-testid='mermaid-preview'] svg")).not.toBeNull(),
+      expect(
+        container.querySelector(
+          "[data-testid='mermaid-preview'] [data-streamdown='mermaid-block']",
+        ),
+      ).not.toBeNull(),
     );
   });
 

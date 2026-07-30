@@ -81,7 +81,10 @@ def test_mermaid_fence_renders_as_preview_diagram(
 
     mermaid_preview = file_viewer.get_by_test_id("mermaid-preview")
     expect(mermaid_preview).to_be_visible(timeout=10_000)
-    expect(mermaid_preview.locator("svg")).to_be_visible(timeout=10_000)
+    diagram = mermaid_preview.locator(
+        '[data-streamdown="mermaid-block"] svg[role~="graphics-document"]'
+    )
+    expect(diagram).to_be_visible(timeout=10_000)
     expect(file_viewer.locator("pre > code.language-mermaid")).to_have_count(0)
 
     js_code = file_viewer.locator("pre > code.language-js")
