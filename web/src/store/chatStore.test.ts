@@ -1276,7 +1276,7 @@ describe("chatStore — switchTo", () => {
     // The window is healthy: a fresh scroll-up still pages correctly.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...itemsA.slice(0, SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      ...itemsA.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
   });
@@ -1303,13 +1303,13 @@ describe("chatStore — switchTo", () => {
     // kept across the rebind — without itemId dedupe each would render twice.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      items.slice(SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      items.slice(SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     // The cursor advanced through the overlap, so the oldest page loads next.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      items.map((it) => it.id),
+      items.map((item) => item.id),
     );
   });
 
@@ -1353,7 +1353,7 @@ describe("chatStore — switchTo", () => {
     // Scroll-up still works: the older page actually fetches and prepends.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
   });
@@ -1553,7 +1553,7 @@ describe("chatStore — switchTo", () => {
       .getState()
       .blocks.map((b) => b.ctx.itemId)
       .filter((iid): iid is string => Boolean(iid));
-    const seededIds = items.map((it) => it.id);
+    const seededIds = items.map((item) => item.id);
     const suffix = seededIds.slice(seededIds.length - loadedIds.length);
     expect(loadedIds).toEqual(suffix);
     expect(loadedIds.length).toBeGreaterThan(2 * SESSION_HISTORY_PAGE_SIZE);
@@ -6992,8 +6992,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // newest page covers only the last 20, so pre-fix the 25 oldest gap
     // items would sit in a hole no code path could ever fetch.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
-      ...windowItems.map((it) => it.id),
-      ...gap.map((it) => it.id),
+      ...windowItems.map((item) => item.id),
+      ...gap.map((item) => item.id),
     ]);
     // Backfill is not a re-hydrate: the scroll-up cursor is untouched.
     expect(state.oldestItemId).toBe(windowItems[0]!.id);
@@ -7036,7 +7036,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // The window was replaced wholesale with the newest page, exactly as a
     // cold bind would load it — not left with a mid-transcript hole.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
     // The cursor was rewound to the fresh window's top, so everything older
     // (the rest of the gap included) is reachable again by paging up.
@@ -7045,7 +7045,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     const last = sinks[1]!;
@@ -7160,7 +7160,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await useChatStore.getState().loadMoreHistory();
     const fresh = useChatStore.getState();
     expect(fresh.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     // The stale page resolves: the conversation id matches again, so only
@@ -7173,7 +7173,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // re-hydrate fallback, which rewound the scroll-up cursor to the
     // window top and bumped the generation (voiding future legit pages).
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
     expect(state.oldestItemId).toBe(gap.at(-2 * SESSION_HISTORY_PAGE_SIZE)!.id);
     expect(state.historyGeneration).toBe(fresh.historyGeneration);
@@ -7183,7 +7183,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // this would still show only 40 items.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-3 * SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      gap.slice(-3 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
     );
 
     // Unpark the orphaned pump so the awaited loop can exit.
@@ -7261,7 +7261,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // The fresh fetch returns ITEMS only — dropping these blocks would lose
     // the pending ApprovalCard (and the failure reason) with no way back.
     expect(state.blocks.map((b) => b.ctx.itemId ?? b.type)).toEqual([
-      ...gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+      ...gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
       "elicitation",
       "error",
     ]);

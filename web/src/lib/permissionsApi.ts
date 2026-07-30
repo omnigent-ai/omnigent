@@ -146,8 +146,8 @@ export async function grantPermission(
     },
   );
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
+    const responseBody = await res.json().catch(() => ({}));
+    throw new Error(responseBody?.error?.message ?? `${res.status} ${res.statusText}`);
   }
   return (await res.json()) as Permission;
 }

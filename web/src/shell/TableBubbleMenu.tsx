@@ -97,7 +97,9 @@ export function moveColumnToIndex(
     const row = node.child(r);
     if (fromCol < 0 || fromCol >= row.childCount) return row;
     if (toCol < 0 || toCol >= row.childCount) return row;
-    const cells = Array.from({ length: row.childCount }, (_, c) => row.child(c));
+    const cells = Array.from({ length: row.childCount }, (__, columnIndex) =>
+      row.child(columnIndex),
+    );
     const [cell] = cells.splice(fromCol, 1);
     cells.splice(toCol, 0, cell);
     return row.type.create(row.attrs, Fragment.fromArray(cells));

@@ -1600,8 +1600,8 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
           sessionId={sessionId}
           mcpDirty={mcpDirty}
           onMcpDirtyChange={setMcpDirty}
-          onSubdialogOpenChange={(open) => {
-            subdialogOpenRef.current = open;
+          onSubdialogOpenChange={(isOpen) => {
+            subdialogOpenRef.current = isOpen;
           }}
         />
       </PopoverContent>

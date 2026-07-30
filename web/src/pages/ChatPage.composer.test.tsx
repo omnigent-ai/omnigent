@@ -1709,9 +1709,9 @@ describe("Composer config gear", () => {
         })}
       />,
     );
-    const textarea = document.querySelector("textarea") as HTMLTextAreaElement;
-    fireEvent.change(textarea, { target: { value: "/model" } });
-    fireEvent.keyDown(textarea, { key: "Enter", code: "Enter" });
+    const modelTextarea = document.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(modelTextarea, { target: { value: "/model" } });
+    fireEvent.keyDown(modelTextarea, { key: "Enter", code: "Enter" });
     // Give the nonce effect a tick; the modal must stay closed.
     await waitFor(() => expect(gear()).toHaveAttribute("aria-disabled", "true"));
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
