@@ -175,6 +175,23 @@ class EvaluationContext:
         label state via ``event["context"]["labels"]``. ``None`` means
         "not populated" (runner-local gate, test contexts) — policies
         must treat that the same as an empty mapping.
+    :param conversation_id: The conversation this evaluation belongs
+        to, e.g. ``"conv_abc123"``. Injected by the engine (it owns the
+        id) so policies can key session-scoped state or telemetry
+        without a side channel — callers leave it ``None``. Surfaced as
+        ``event["context"]["conversation_id"]``. ``None`` means "engine
+        never populated it" (runner-local gate, test contexts).
+    :param root_conversation_id: The root of this conversation's spawn
+        tree. Equal to ``conversation_id`` for a top-level session;
+        differs exactly when the conversation is a sub-agent child.
+        Injected by the engine alongside ``conversation_id``. Surfaced
+        as ``event["context"]["root_conversation_id"]``.
+    :param sub_agent_name: The dispatched sub-agent's name (the
+        conversation row's ``sub_agent_name``), e.g. ``"researcher"``;
+        ``None`` for top-level sessions. Injected by the engine so
+        policies can tell child evaluations apart without label
+        conventions. Surfaced as
+        ``event["context"]["sub_agent_name"]``.
     :param llm_client: An :class:`~omnigent.policies.types.PolicyLLMClient`
         instance configured with the server-level LLM credentials.
         Available to function policy callables via
@@ -196,6 +213,9 @@ class EvaluationContext:
     model: str | None = None
     harness: str | None = None
     labels: dict[str, str] | None = None
+    conversation_id: str | None = None
+    root_conversation_id: str | None = None
+    sub_agent_name: str | None = None
     llm_client: Any = None  # PolicyLLMClient | None — Any to avoid import cycle
 
 

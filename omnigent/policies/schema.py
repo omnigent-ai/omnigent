@@ -158,6 +158,18 @@ class EventContext(TypedDict, total=False):
         labels, e.g. ``{"cost_control.plan": "{...}"}``. Populated by
         the server-side engine; empty on paths that don't carry labels
         (the runner-local gate). Read via ``event["context"]["labels"]``.
+    :param conversation_id: The conversation under evaluation, e.g.
+        ``"conv_abc123"``. Populated by the server-side engine; ``None``
+        on paths that don't carry it (the runner-local gate). Read via
+        ``event["context"]["conversation_id"]``.
+    :param root_conversation_id: The root of the conversation's spawn
+        tree — equal to ``conversation_id`` for top-level sessions,
+        different exactly for sub-agent children. Read via
+        ``event["context"]["root_conversation_id"]``.
+    :param sub_agent_name: The dispatched sub-agent's name for child
+        conversations (``None`` for top-level sessions), e.g.
+        ``"researcher"``. Read via
+        ``event["context"]["sub_agent_name"]``.
     """
 
     actor: ActorContext
@@ -170,6 +182,11 @@ class EventContext(TypedDict, total=False):
     model: str | None
     harness: str | None
     labels: dict[str, str]
+    # Conversation identity — ``None`` (carried, not absent) on paths
+    # that never populated it (runner-local gate, test contexts).
+    conversation_id: str | None
+    root_conversation_id: str | None
+    sub_agent_name: str | None
 
 
 class PolicyEvent(TypedDict, total=False):
