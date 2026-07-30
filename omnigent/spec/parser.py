@@ -1656,6 +1656,16 @@ _BROKER_FIELD_ENV_DENYLIST = frozenset(
     }
 )
 
+# A tool name becomes a shim filename and is interpolated into the shim's
+# double-quoted bash ``exec`` line (see ``credential_broker._write_shims``), so
+# restrict it to a safe executable basename: no path separators, no shell
+# metacharacters ($ ` " space), no leading dash/dot (which would spoof a flag or
+# a dotfile / ``..``).
+_BROKER_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# An explicit binary is exec'd (never shell-interpreted) so path separators are
+# fine, but reject anything that isn't a plain path to keep it defensible.
+_BROKER_BINARY_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
 
 class _CredentialBrokerFieldModel(BaseModel):
     """Pydantic boundary model for one ``credential_broker.groups[*][n]`` field."""
@@ -1719,6 +1729,13 @@ class _CredentialBrokerToolModel(BaseModel):
     credentials: list[str]
     binary: str | None = None
 
+    @field_validator("binary")
+    @classmethod
+    def _binary_ok(cls, value: str | None) -> str | None:
+        if value is not None and not _BROKER_BINARY_RE.match(value):
+            raise ValueError("binary must be a plain executable name or path")
+        return value
+
 
 class _CredentialBrokerModel(BaseModel):
     """Pydantic boundary model for the ``credential_broker`` block."""
@@ -1728,12 +1745,18 @@ class _CredentialBrokerModel(BaseModel):
     load: list[_CredentialBrokerLoadModel] = Field(default_factory=list)
     groups: dict[str, list[_CredentialBrokerFieldModel]] = Field(default_factory=dict)
     tools: dict[str, _CredentialBrokerToolModel] = Field(default_factory=dict)
+    allow_terminal: bool = False
 
     @model_validator(mode="after")
     def _check_refs(self) -> _CredentialBrokerModel:
         if not self.tools:
             raise ValueError("credential_broker must declare at least one tool")
         for tname, tool in self.tools.items():
+            if not _BROKER_TOOL_NAME_RE.match(tname):
+                raise ValueError(
+                    f"credential_broker tool name {tname!r} must be a safe executable name "
+                    "(alphanumeric plus . _ -, no path separators)"
+                )
             if not tool.credentials:
                 raise ValueError(f"credential_broker tool {tname!r} must list at least one group")
             for c in tool.credentials:
@@ -1783,6 +1806,7 @@ def _parse_credential_broker(raw: object) -> CredentialBrokerSpec | None:
             t: CredentialBrokerTool(credentials=list(v.credentials), binary=v.binary)
             for t, v in model.tools.items()
         },
+        allow_terminal=model.allow_terminal,
     )
 
 

@@ -100,3 +100,48 @@ def test_parse_broker_unknown_key_rejected():
     }
     with pytest.raises(OmnigentError):
         _parse_os_env_sandbox(raw)
+
+
+@pytest.mark.parametrize("bad", ["../evil", "a/b", 'x";rm -rf', "$(id)", "-rf", ".hidden"])
+def test_parse_broker_unsafe_tool_name_rejected(bad):
+    raw = {
+        "type": "linux_bwrap",
+        "allow_network": True,
+        "credential_broker": {
+            "groups": {"g": [{"env": "PGHOST"}]},
+            "tools": {bad: {"credentials": ["g"]}},
+        },
+    }
+    with pytest.raises(OmnigentError, match="safe executable name"):
+        _parse_os_env_sandbox(raw)
+
+
+def test_parse_broker_unsafe_binary_rejected():
+    raw = {
+        "type": "linux_bwrap",
+        "allow_network": True,
+        "credential_broker": {
+            "groups": {"g": [{"env": "PGHOST"}]},
+            "tools": {"psql": {"credentials": ["g"], "binary": "/usr/bin/psql; rm -rf /"}},
+        },
+    }
+    with pytest.raises(OmnigentError, match="plain executable name or path"):
+        _parse_os_env_sandbox(raw)
+
+
+def test_parse_broker_allow_terminal_opt_in():
+    raw = {
+        "type": "linux_bwrap",
+        "allow_network": True,
+        "credential_broker": _broker(allow_terminal=True),
+    }
+    spec = _parse_os_env_sandbox(raw)
+    assert spec.credential_broker is not None
+    assert spec.credential_broker.allow_terminal is True
+
+
+def test_parse_broker_allow_terminal_defaults_false():
+    raw = {"type": "linux_bwrap", "allow_network": True, "credential_broker": _broker()}
+    spec = _parse_os_env_sandbox(raw)
+    assert spec.credential_broker is not None
+    assert spec.credential_broker.allow_terminal is False

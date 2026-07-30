@@ -1075,13 +1075,14 @@ class McpServerConnection:
         if not groups:
             return {}
         if self.credential_broker is None:
-            _logger.warning(
-                "MCP server %r declares credential_groups %s but the agent has no "
-                "os_env.sandbox.credential_broker; ignoring.",
-                self.config.name,
-                groups,
+            # Fail closed: the server asked for brokered creds and the mechanism
+            # is absent. Launching anyway would run it against the ambient parent
+            # env — exactly what the broker exists to prevent — so refuse instead
+            # of silently degrading. Same posture as the unknown-group case below.
+            raise RuntimeError(
+                f"MCP server {self.config.name!r} declares credential_groups {groups} but the "
+                "agent has no os_env.sandbox.credential_broker to resolve them"
             )
-            return {}
         from omnigent.inner.credential_broker import _load_store, _resolve_tool_env
         from omnigent.inner.datamodel import CredentialBrokerSpec as _Spec
         from omnigent.inner.datamodel import CredentialBrokerTool as _Tool

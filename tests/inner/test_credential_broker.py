@@ -141,6 +141,31 @@ def test_server_token_and_unknown_tool(short_tmp):
         srv.stop()
 
 
+def test_server_survives_stalled_client(short_tmp):
+    """A peer that connects and never finishes its request (no newline) must
+    not block subsequent legitimate requests — the pre-token DoS Polly flagged.
+    """
+    srv = _BrokerServer(
+        spec=_spec(),
+        store={"PGHOST": "h"},
+        parent_env={},
+        command_env={},
+        socket_path=short_tmp / "b.sock",
+        auth_token="T",
+    )
+    srv.start()
+    staller = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        staller.connect(str(srv.socket_path))
+        staller.sendall(b'{"tool":"psql"')  # partial request, deliberately no newline
+        # Off the stalled worker, a well-formed request still returns promptly.
+        ok = _ask(srv.socket_path, {"tool": "psql", "token": "T"})
+        assert ok["env"]["PGHOST"] == "h"
+    finally:
+        staller.close()
+        srv.stop()
+
+
 # --- Task 10: runtime ------------------------------------------------------
 
 

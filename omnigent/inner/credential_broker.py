@@ -1,10 +1,21 @@
 """Parent-side broker for non-HTTP credentialed tools.
 
 Real secrets are resolved in the trusted parent — loaded once at session start
-(the "unlock"), or per-call via a fallback source — and reach a single tool
-invocation over an ``AF_UNIX`` socket in the helper's bound scratch dir,
-authenticated by a per-handle token. Nothing credential-shaped sits in the
-agent's ambient environment. Values are never logged.
+(the "unlock"), or per-call via a fallback source — and reach a tool invocation
+over an ``AF_UNIX`` socket in the helper's bound scratch dir, keyed to a
+per-handle token. The value is injected into the tool's process, never placed on
+argv, and never logged.
+
+Security boundary (be honest about what the token can and can't enforce): the
+shim runs *as* the untrusted agent, so nothing can authenticate "the shim but
+not the agent." A token-holding agent can open the socket itself and read the
+raw resolved value for any mapped tool — the token gates *who may ask*, not
+*what they learn*. So this does NOT guarantee a secret never enters the agent's
+reach; it keeps credentials out of static config and out of the tool's *ambient*
+environment. Reserve the ``load:`` store for non-secret connection config
+(hosts, db names, usernames); put real secrets only behind ``fallback: command``
+sources that mint short-lived, audience-scoped tokens, so what an agent can pull
+off the socket is ephemeral by construction.
 
 See ``docs/superpowers/plans/2026-06-26-non-http-credential-broker.md``.
 """
@@ -87,7 +98,17 @@ def _resolve_tool_env(
             if val is None and field.fallback is not None:
                 try:
                     val = _resolve_secret(field.fallback, parent_env=command_env)
-                except ValueError:
+                except ValueError as exc:
+                    # Surface the cause (field name + error; never the resolved
+                    # value, which is stdout and absent from these messages) so
+                    # a failing fallback isn't silently skipped for an optional
+                    # field or masked behind a generic error for a required one.
+                    logger.warning(
+                        "credential_broker: fallback for field %s (tool %r) failed: %s",
+                        field.env,
+                        tool_name,
+                        exc,
+                    )
                     val = None
             if val is None:
                 if field.optional:
@@ -122,13 +143,28 @@ def _write_shims(tool_names: list[str], shim_dir: Path, *, socket_path: Path) ->
     return shim_dir
 
 
-def _recv_line(conn: socket.socket) -> str:
+# A well-formed request is ~80 bytes ({"tool","token"}); cap far above that so a
+# client that never sends a newline can't stream unbounded data into memory.
+_MAX_REQUEST_BYTES = 65536
+# Per-connection read/write deadline. The listener's ``settimeout`` does NOT
+# propagate to accepted sockets, so a peer that connects and never sends a
+# newline would otherwise block its worker forever. Resolution (a ``command``
+# fallback) runs between recv and send and is not bounded by this.
+_RECV_TIMEOUT_SECONDS = 5.0
+# Ceiling on concurrently-served connections. A single tool launch uses one;
+# this bounds a same-uid flood so it can't exhaust threads/memory.
+_MAX_INFLIGHT_CONNECTIONS = 32
+
+
+def _recv_line(conn: socket.socket, *, max_bytes: int = _MAX_REQUEST_BYTES) -> str:
     buf = b""
     while not buf.endswith(b"\n"):
-        chunk = conn.recv(65536)
+        chunk = conn.recv(4096)
         if not chunk:
             break
         buf += chunk
+        if len(buf) > max_bytes:
+            raise ValueError("request exceeds maximum size")
     return buf.decode("utf-8")
 
 
@@ -176,6 +212,9 @@ class _BrokerServer:
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._running = False
+        self._inflight = threading.BoundedSemaphore(_MAX_INFLIGHT_CONNECTIONS)
+        self._workers: set[threading.Thread] = set()
+        self._workers_lock = threading.Lock()
 
     def start(self) -> None:
         old_umask = os.umask(0o077)
@@ -203,8 +242,28 @@ class _BrokerServer:
                 continue
             except OSError:
                 break
+            # Deadline the accepted socket (the listener's timeout does not
+            # propagate) so a stalled peer can't wedge its worker.
+            conn.settimeout(_RECV_TIMEOUT_SECONDS)
+            if not self._inflight.acquire(blocking=False):
+                # Shed load rather than let a same-uid flood exhaust threads.
+                # A legit client (one connection per tool launch) never hits this.
+                with contextlib.suppress(OSError):
+                    conn.close()
+                continue
+            worker = threading.Thread(target=self._serve_conn, args=(conn,), daemon=True)
+            with self._workers_lock:
+                self._workers.add(worker)
+            worker.start()
+
+    def _serve_conn(self, conn: socket.socket) -> None:
+        try:
             with conn:
                 self._handle(conn)
+        finally:
+            self._inflight.release()
+            with self._workers_lock:
+                self._workers.discard(threading.current_thread())
 
     def _handle(self, conn: socket.socket) -> None:
         try:
@@ -231,7 +290,8 @@ class _BrokerServer:
             conn.sendall((json.dumps({"env": env, "binary": binary}) + "\n").encode("utf-8"))
         except Exception as exc:  # noqa: BLE001 — never leak a value-bearing message into the sandbox
             logger.warning("credential_broker: resolution failed: %s", exc)
-            conn.sendall(b'{"error":"resolution failed"}\n')
+            with contextlib.suppress(OSError):
+                conn.sendall(b'{"error":"resolution failed"}\n')
 
     def stop(self) -> None:
         self._running = False
@@ -240,6 +300,10 @@ class _BrokerServer:
                 self._sock.close()
         if self._thread is not None:
             self._thread.join(timeout=2)
+        with self._workers_lock:
+            workers = list(self._workers)
+        for w in workers:
+            w.join(timeout=2)
         with contextlib.suppress(OSError):
             self.socket_path.unlink()
 

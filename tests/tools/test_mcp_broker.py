@@ -53,9 +53,11 @@ def test_resolve_broker_env_empty_without_groups():
     assert _conn([], _broker())._resolve_broker_env() == {}
 
 
-def test_resolve_broker_env_skips_when_no_broker():
-    # credential_groups set but agent has no broker -> warn + ignore (not crash).
-    assert _conn(["pg"], None)._resolve_broker_env() == {}
+def test_resolve_broker_env_fails_closed_when_no_broker():
+    # credential_groups set but agent has no broker -> refuse (fail closed), so
+    # the server never silently launches against the ambient parent env.
+    with pytest.raises(RuntimeError, match="has no os_env"):
+        _conn(["pg"], None)._resolve_broker_env()
 
 
 def test_resolve_broker_env_unknown_group_raises():

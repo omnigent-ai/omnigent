@@ -1390,16 +1390,28 @@ class TerminalInstance:
         out-of-band channel for the per-handle token — the same constraint that
         makes the terminal egress proxy ``require_auth=False`` (see
         :meth:`_bootstrap_egress_proxy`). The token is delivered via the
-        terminal env, which a same-UID ``ps -E`` reader can lift; on the
-        terminal path the broker socket's cross-agent protection therefore
-        reduces to uid-gating. Prefer the os_env shell surface, or one agent per
-        UID, where strict cross-agent isolation is required.
+        terminal env, which a same-UID ``ps eww`` / ``/proc/<pid>/environ``
+        reader can lift; on the terminal path the broker socket's cross-agent
+        protection therefore reduces to uid-gating. That residual must be
+        opted into explicitly: this method refuses to start the broker unless
+        ``credential_broker.allow_terminal`` is set, so a deployment can't
+        silently rely on a guarantee the terminal path doesn't provide. Prefer
+        the os_env shell surface where strict cross-agent isolation is required.
 
         :param sandbox: Active sandbox policy with ``credential_broker`` set.
         :param env: Mutable env dict passed to the tmux subprocess.
         :returns: Updated policy with the broker scratch dir in ``write_roots``.
+        :raises RuntimeError: If ``credential_broker.allow_terminal`` is not set.
         """
         assert sandbox.credential_broker is not None, "caller checked credential_broker"
+        if not sandbox.credential_broker.allow_terminal:
+            raise RuntimeError(
+                "credential_broker is enabled on a terminal, where the per-handle token "
+                "travels via process env and is readable by any same-uid process, reducing "
+                "cross-agent isolation to uid-gating. Set credential_broker.allow_terminal: "
+                "true to accept this in a single-agent-per-uid deployment, or use the os_env "
+                "shell surface (which has a private token channel) for strict isolation."
+            )
         self._broker_tmpdir = create_private_tmpdir()
         # Add to write_roots BEFORE encoding the policy into the launcher so
         # bwrap/seatbelt bind the broker socket + shim dir into the namespace.

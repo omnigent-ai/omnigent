@@ -565,13 +565,25 @@ class CredentialBrokerSpec:
 
     Real secrets stay in the parent. A shim on the helper ``PATH`` fetches a
     tool's credentials over an ``AF_UNIX`` socket and execs the real tool with
-    them, so nothing credential-shaped sits in the agent's ambient env.
+    them, keeping credentials out of static config and out of the tool's ambient
+    env. The token gates who may ask, not what they learn, so reserve ``load:``
+    for non-secret config and put real secrets behind ephemeral ``fallback:
+    command`` sources (see the module docstring in ``inner/credential_broker``).
     Requires ``allow_network: true`` and is incompatible with ``egress_rules``.
+
+    :param allow_terminal: Opt-in for the terminal (tmux) surface, where the
+        per-handle token is delivered via process env (no out-of-band FD) and is
+        readable by any same-uid process (``ps eww`` / ``/proc/<pid>/environ``),
+        so cross-agent isolation degrades to uid-gating. Left ``False`` (the
+        default), the terminal path refuses to start the broker; set it ``True``
+        only in single-agent-per-uid deployments that accept that residual. Does
+        not affect the os_env shell surface, which has a private token channel.
     """
 
     load: list[CredentialBrokerLoadSource] = field(default_factory=list)
     groups: dict[str, CredentialBrokerGroup] = field(default_factory=dict)
     tools: dict[str, CredentialBrokerTool] = field(default_factory=dict)
+    allow_terminal: bool = False
 
 
 @dataclass
