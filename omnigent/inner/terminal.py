@@ -1421,7 +1421,7 @@ class TerminalInstance:
         command_env = build_helper_env(os.environ, sandbox)
         self._broker_runtime = prepare_credential_broker_runtime(
             sandbox.credential_broker,
-            parent_env=dict(os.environ),
+            parent_env=os.environ.copy(),
             command_env=command_env,
             scratch_dir=self._broker_tmpdir,
         )

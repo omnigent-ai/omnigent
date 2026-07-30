@@ -537,7 +537,7 @@ async def test_cred_reaches_tool_cwd_outside_repo(tmp_path):
                     self._broker_runtime.stop(); self._broker_runtime = None
                 from .credential_broker import prepare_credential_broker_runtime
                 self._broker_runtime = prepare_credential_broker_runtime(
-                    sandbox.credential_broker, parent_env=dict(os.environ),
+                    sandbox.credential_broker, parent_env=os.environ.copy(),
                     command_env=dict(env), scratch_dir=self._tmpdir)
                 if self._broker_runtime is not None:
                     env["PATH"] = f"{self._broker_runtime.shim_dir}{os.pathsep}{env['PATH']}"
@@ -563,7 +563,7 @@ async def test_cred_reaches_tool_cwd_outside_repo(tmp_path):
                 self._broker_dir = create_private_tmpdir()
                 command_env = build_helper_env(os.environ, sandbox_for_launcher)  # filtered, NOT dict(env)
                 self._broker_runtime = prepare_credential_broker_runtime(
-                    sandbox_for_launcher.credential_broker, parent_env=dict(os.environ),
+                    sandbox_for_launcher.credential_broker, parent_env=os.environ.copy(),
                     command_env=command_env, scratch_dir=self._broker_dir)
                 if self._broker_runtime is not None:
                     sandbox_for_launcher = with_additional_write_roots(sandbox_for_launcher, [self._broker_dir])
@@ -597,8 +597,8 @@ MCP servers spawn **unsandboxed in the parent** (`mcp.py:979`) → no socket, no
             from omnigent.inner.datamodel import CredentialBrokerSpec, CredentialBrokerTool
             synthetic = CredentialBrokerSpec(load=self._broker_spec.load, groups=self._broker_spec.groups,
                 tools={"__mcp__": CredentialBrokerTool(credentials=list(self.config.credential_groups))})
-            store = _load_store(synthetic.load, parent_env=dict(os.environ))
-            broker_env = _resolve_tool_env(synthetic, "__mcp__", store, command_env=dict(os.environ))
+            store = _load_store(synthetic.load, parent_env=os.environ.copy())
+            broker_env = _resolve_tool_env(synthetic, "__mcp__", store, command_env=os.environ.copy())
         env = strip_runner_auth_secrets(os.environ) | self.config.env | broker_env
 ```
 - [ ] Test: MCP env carries resolved creds when groups set; unchanged otherwise. · **Commit** `feat(mcp): resolve broker credential groups into server env`

@@ -494,7 +494,7 @@ class _HelperProcessClient:
                     self._broker_runtime = None
                 self._broker_runtime = prepare_credential_broker_runtime(
                     sandbox.credential_broker,
-                    parent_env=dict(os.environ),
+                    parent_env=os.environ.copy(),
                     command_env=dict(env),
                     scratch_dir=self._tmpdir,
                 )

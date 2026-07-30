@@ -1098,7 +1098,7 @@ class McpServerConnection:
             groups=self.credential_broker.groups,
             tools={"__mcp__": _Tool(credentials=groups)},
         )
-        store = _load_store(synthetic.load, parent_env=dict(os.environ))
+        store = _load_store(synthetic.load, parent_env=os.environ.copy())
         return _resolve_tool_env(
             synthetic, "__mcp__", store, command_env=strip_runner_auth_secrets(os.environ)
         )
