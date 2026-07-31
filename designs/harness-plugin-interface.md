@@ -166,11 +166,18 @@ For a non-native harness:
 
 ## Native TUI Harnesses
 
-Community native terminal harnesses are not supported by this interface yet.
-Core native harnesses still use internal registry metadata, but the runner,
-chat-resume, CLI-command, interrupt/stop, and built-in agent seeding paths are
-not pluggable. Community plugins that set `native_harnesses` or `native_agents`
-are rejected at load time until those lifecycle hooks are wired end to end.
+Community native terminal harnesses **are** supported: the runner, chat-resume,
+interrupt/stop, spawn-env, and built-in agent-seeding paths all dispatch through
+the `NativeHarnessProvider` seam, so a plugin that ships `native_agents` +
+`native_providers` is accepted at load time (validated for internal consistency
+and identity collisions — see `_validate_native_contribution`). A contribution
+must pair each `NativeCodingAgent` with a `NativeHarnessProvider` keyed by the
+same `key`, declare the agent's harness id in `valid_harnesses`, supply the
+required provider hooks (`run_native`, `auto_create_terminal`), and keep every
+provider import path under `COMMUNITY_MODULE_PREFIX`.
+
+A full step-by-step native-plugin checklist and a benchable example plugin ship
+with the plugin-interface docs update (workstream PR 2.4).
 
 ## Import Rules
 
