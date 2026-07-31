@@ -647,19 +647,28 @@ function setupLandingMocks() {
     data: undefined,
   } as unknown as ReturnType<typeof useHostWorktrees>);
   mockHosts([host("online")]);
-  useHostModelOptionsMock.mockReturnValue({
-    data: [
-      { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
-      {
-        id: "sonnet",
-        model: "system.ai.claude-sonnet-4-6[1m]",
-        displayName: "Sonnet 4.6",
-      },
-      { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
-    ],
-    isLoading: false,
-    isError: false,
-  } as unknown as ReturnType<typeof useHostModelOptions>);
+  useHostModelOptionsMock.mockImplementation(
+    (_hostId, harness) =>
+      ({
+        data:
+          harness === "codex-native"
+            ? [
+                { id: "databricks-gpt-5-5", displayName: "GPT-5.5", isDefault: true },
+                { id: "databricks-gpt-5-6", displayName: "GPT-5.6" },
+              ]
+            : [
+                { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
+                {
+                  id: "sonnet",
+                  model: "system.ai.claude-sonnet-4-6[1m]",
+                  displayName: "Sonnet 4.6",
+                },
+                { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
+              ],
+        isLoading: false,
+        isError: false,
+      }) as unknown as ReturnType<typeof useHostModelOptions>,
+  );
   mockAgents([
     {
       id: "a1",
@@ -1068,10 +1077,51 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     // Open Codex's (a2) config modal — it carries the approval-mode select.
     openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
     openSelect("new-chat-landing-config-approval");
     expect(screen.getByText("Full access")).toBeTruthy();
     expect(screen.getByText("Read only")).toBeTruthy();
+  });
+
+  it("sends the selected Codex launch model without changing Claude's remembered model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+
+    openAgentConfig("a2");
+    openSelect("new-chat-landing-config-model");
+    expect(screen.getAllByText("Default (databricks-gpt-5-5)").length).toBeGreaterThan(0);
+    expect(screen.getByText("databricks-gpt-5-6")).toBeTruthy();
+    fireEvent.click(screen.getByText("databricks-gpt-5-6"));
+    saveConfig();
+
+    // The Codex model is remembered under codex-native only; Claude Code's
+    // picker should reopen on its own Default instead of inheriting the GPT id.
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Default");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).not.toContain(
+      "databricks-gpt-5-6",
+    );
+    saveConfig();
+
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "databricks-gpt-5-6",
+    );
+    saveConfig();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.model_override).toBe("databricks-gpt-5-6");
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
   });
 
   it("arms codex full bypass via the Approval dropdown and shows the warning banner", () => {
