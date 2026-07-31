@@ -152,8 +152,7 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
         return (
             f"harness {canon!r} is Gemini-native and cannot run Claude/GPT or "
             f"Databricks-gateway models; got {model!r}. Use a Gemini id "
-            "(e.g. 'gemini-3.5-flash'), or the claude_code / codex / pi worker "
-            "for those families."
+            "or the claude_code / codex / pi worker for those families."
         )
     return None
 

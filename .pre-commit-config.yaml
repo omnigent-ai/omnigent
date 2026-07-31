@@ -41,7 +41,8 @@ repos:
         language: system
         entry: .venv/bin/python dev/lint/lint_no_hardcoded_models.py
         pass_filenames: false
-        files: ^((omnigent|scripts|examples|\.github|dev/lint)/.*\.(py|ya?ml|json|toml|sh)|dev/lint/hardcoded_model_allowlist\.txt)$
+        files: \.(py|ya?ml|json|toml|sh)$
+        exclude: (^|/)tests/|^openapi\.json$
 
       - id: web-prettier
         name: web prettier
@@ -52,6 +53,13 @@ repos:
         # and Apple Icon Composer `.icon` bundles (machine-formatted; prettier
         # fights the tooling).
         exclude: ^(omnigent/server/static/web-ui/assets/|web/.*\.xcassets/|web/.*\.icon/)
+
+      - id: web-oxlint
+        name: web oxlint
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/oxlint && cd web && node_modules/.bin/oxlint --deny-warnings .'
+        files: ^(web/.*\.[cm]?[jt]sx?|web/\.oxlintrc\.json|web/package\.json|pnpm-lock\.yaml)$
+        pass_filenames: false
 
       # Android Kotlin formatting + linting via ktlint (config:
       # web/android/.editorconfig). The wrapper no-ops when ktlint is absent,

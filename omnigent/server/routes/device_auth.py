@@ -730,7 +730,10 @@ def _consent_html(
     self-contained (no JS framework) so it works regardless of the
     server's front-end build.
     """
-    esc = lambda s: html.escape(str(s or ""))  # noqa: E731
+
+    def esc(value: object) -> str:
+        return html.escape(str(value or ""))
+
     # Requesting client's identifier, defaulting to a neutral label when it
     # didn't identify itself.
     app_name = esc(client_id) if client_id else "An application"

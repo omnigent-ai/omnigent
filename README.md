@@ -414,6 +414,11 @@ and they're in. Signup is invite-only.
   omnigent run --fork <session_id>
   ```
 
+Shared sessions identify model-visible messages with `[account]:` labels by
+default. Set `OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED=0` to hide those
+labels. This does not change stored authors, UI avatars, or who may approve or
+run privileged actions.
+
 > [!TIP]
 > Want your team to sign in with the logins they already have (**Google,
 > GitHub, Okta, Microsoft**)? Set `OMNIGENT_OIDC_ISSUER` plus a client ID

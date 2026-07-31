@@ -39,7 +39,7 @@ function focusOwnsHotkey(): boolean {
  * @param enabled  Pass `false` to disable the hotkey (e.g. embedded mode, where
  *   ⌘K belongs to the host page). Defaults to enabled.
  */
-export function useCommandPaletteHotkey(onToggle: () => void, enabled: boolean = true): void {
+export function useCommandPaletteHotkey(onToggle: () => void, enabled = true): void {
   // Held in a ref so the bound handler always calls the latest closure without
   // re-registering on every render.
   const latest = useRef(onToggle);

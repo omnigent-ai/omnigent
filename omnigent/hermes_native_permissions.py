@@ -36,10 +36,17 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 import httpx
 
 from omnigent.hermes_native_bridge import capture_hermes_pane, send_hermes_pane_keys
+
+
+class _PendingApproval(TypedDict):
+    elicitation_id: str
+    task: asyncio.Task[None]
+
 
 _logger = logging.getLogger(__name__)
 
@@ -169,7 +176,7 @@ async def supervise_hermes_approval_mirror(
     :param auth: Optional httpx auth for the runner's requests.
     :param poll_interval_s: Pane poll cadence in seconds.
     """
-    active: dict[str, object] | None = None
+    active: _PendingApproval | None = None
     episode = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     async with httpx.AsyncClient(

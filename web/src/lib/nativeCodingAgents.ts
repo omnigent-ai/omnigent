@@ -157,13 +157,13 @@ export const NATIVE_CODING_AGENTS = [
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
-const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_AGENT_NAME = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.agentName, agent]),
 );
-const BY_HARNESS: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_HARNESS = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.harness, agent]),
 );
-const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_WRAPPER = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
 );
 

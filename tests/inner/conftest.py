@@ -13,11 +13,23 @@ import os
 import pathlib
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
 from tests import _model_pools
+
+
+@pytest.fixture(autouse=True)
+def _stub_executor_catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep executor unit tests deterministic without catalog network access."""
+
+    def _resolve(provider_name: str, *, family: str, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(model_id=f"catalog-{provider_name}-{family}-default")
+
+    monkeypatch.setattr("omnigent.model_catalog.resolve_catalog_model", _resolve)
+
 
 # Diagnostic: dump every thread's stack every 90s. The dispatcher's
 # stderr lands in the workflow log directly, but xdist workers route

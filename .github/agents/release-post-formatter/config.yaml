@@ -83,6 +83,23 @@ prompt: |
   Full Changelog: <copy the exact `Full Changelog:` line from the input, verbatim>
   <!-- /RELEASE_POST -->
 
+  Then, AFTER the closing `<!-- /RELEASE_POST -->` marker, emit a machine-readable
+  map of which PRs back each feature section you wrote, so the workflow can build
+  a per-feature demo-video reference table for the reviewer. Emit it between its
+  own markers, as a JSON array in the SAME ORDER as your numbered sections — one
+  object per section, `title` matching the section's title text exactly (without
+  the `N. ` prefix), `pr_refs` the numbers from the `(#123, #456)` refs on the
+  release-body bullets you folded into that feature (integers, no `#`). Include
+  ONLY features you wrote up; omit bullets/PRs you dropped. This block is metadata,
+  NOT part of the post — never put PR numbers back into the RELEASE_POST prose.
+
+  <!-- RELEASE_POST_PRS -->
+  [
+    {"title": "<Feature 1 title>", "pr_refs": [123, 456]},
+    {"title": "<Feature 2 title>", "pr_refs": [789]}
+  ]
+  <!-- /RELEASE_POST_PRS -->
+
   ## The MLflow 3.14.0 style (match this)
   - CURATE, don't mirror. Pick only the ~4-6 OUTSTANDING, headline features and
     give each its own numbered section. DROP minor features, small tweaks, and
@@ -113,7 +130,9 @@ prompt: |
   placeholder immediately under EACH feature heading:
     `![TODO: add a demo screenshot or GIF for "<feature title>"](TODO)`
   Use the literal token `TODO` so a reviewer can grep for it. Never fabricate a
-  real-looking image path.
+  real-looking image path. (The workflow adds a table of the release's feature
+  PRs and their existing demo videos to the PR description, so a reviewer can drop
+  an already-recorded clip into these placeholders — you do not reference it.)
 
   ## Docs links (link to the most specific real page/section, or omit the line)
   The "## Available docs pages and sections" input lists every real docs URL and

@@ -65,6 +65,9 @@ from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._auth_helpers import (
+    require_approval_access as _require_approval_access,
+)
+from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
@@ -568,10 +571,19 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
-            # Approval authorizes a tool to run with the session owner's
-            # execution identity, so shared editors may not resolve it.
-            await _require_access(
-                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            # Accepting authorizes a tool to run with the session owner's
+            # execution identity, so authority must be explicitly delegated.
+            # Editors may still decline/cancel to stop an unsafe or unwanted
+            # action; the route-level edit gate above already authorizes that.
+            if body.data.get("action") not in {"decline", "cancel"}:
+                await _require_approval_access(
+                    user_id, session_id, permission_store, conversation_store
+                )
+            _logger.info(
+                "approval verdict submitted: session=%s actor=%s action=%s",
+                session_id,
+                user_id,
+                body.data.get("action"),
             )
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
@@ -1258,12 +1270,22 @@ def register_events_routes(
             # forwarded into a TUI whose forwarder isn't attached, the
             # round-trip never mirrors back, and the optimistic bubble
             # sticks with no reply (host-restart bug).
+            #
+            # suppress_recovery_turn=True: the server already persisted the
+            # message to DB before calling session-init, so the runner's
+            # history load would see the pending message and start a
+            # recovery turn.  The subsequent forward would then arrive to
+            # an active turn, be buffered, and be processed a second time
+            # once the recovery turn finishes.  Telling the runner to skip
+            # recovery-turn detection here ensures the server's forward is
+            # the sole trigger for the turn.
             native_terminal_ready = await _ensure_runner_session_initialized(
                 session_id,
                 conv,
                 runner_client,
                 conversation_store,
                 initializer=getattr(request.app.state, "runner_session_initializer", None),
+                suppress_recovery_turn=True,
             )
         await _ensure_runner_relay_ready(
             session_id,
@@ -1327,6 +1349,7 @@ def register_events_routes(
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
             created_by=created_by,
+            author_attribution_required=(access.level is not None and access.level < LEVEL_OWNER),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
         )

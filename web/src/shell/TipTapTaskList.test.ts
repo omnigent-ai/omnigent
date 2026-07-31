@@ -18,7 +18,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
 import { TaskItem, TaskList } from "@tiptap/extension-list";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 
 let editor: Editor | null = null;
 let host: HTMLElement | null = null;

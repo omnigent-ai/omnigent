@@ -561,6 +561,8 @@ class SqlSessionPermission(OmnigentBase):
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage. Each level subsumes the
         ones below it (comparison is ``>=``).
+    :param can_approve: Owner-controlled authority to resolve privileged
+        action approvals for this session.
     """
 
     __tablename__ = "session_permissions"
@@ -582,6 +584,12 @@ class SqlSessionPermission(OmnigentBase):
         primary_key=True,
     )
     level: Mapped[int] = mapped_column(Integer, nullable=False)
+    can_approve: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=false(),
+        default=False,
+    )
 
     __table_args__ = (
         CheckConstraint("level IN (1, 2, 3, 4)", name="ck_session_permissions_level"),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+
 from sqlalchemy import and_, asc, desc, or_, select
 from sqlalchemy.exc import IntegrityError
 
@@ -231,7 +233,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 has_more=has_more,
             )
 
-    def get_names(self, agent_ids: list[str]) -> dict[str, str]:
+    def get_names(self, agent_ids: builtins.list[str]) -> dict[str, str]:
         """
         Batch-fetch agent names for a list of IDs.
 

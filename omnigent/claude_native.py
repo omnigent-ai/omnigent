@@ -47,6 +47,7 @@ import yaml
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
+from omnigent import model_catalog
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
@@ -90,6 +91,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.model_fallbacks import static_model_fallback
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -109,6 +111,7 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -134,6 +137,7 @@ _BEDROCK_AUTH_COMMAND_TIMEOUT_S = 15.0
 _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
+_CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 # Claude Code's agent view (the session list opened by `claude agents`, the
 # left-arrow shortcut on an empty prompt, or /background) lets the user hop to
@@ -373,7 +377,26 @@ def resolve_claude_native_model_selection(
             return provider_fallback
         if claude_config.model:
             return claude_config.model
-    return "claude-sonnet-5"
+    fallback = static_model_fallback(SUBSCRIPTION_KIND, "claude")
+    if fallback is None:
+        raise ValueError("Claude subscription fallback has no routable Sonnet model")
+    exact_match = next(
+        (
+            model_id
+            for model_id in fallback.model_ids
+            if _claude_model_display_name("sonnet", model_id) == _UCODE_CLAUDE_CUSTOM_TIER_LABEL
+        ),
+        None,
+    )
+    if exact_match is not None:
+        return exact_match
+    family_match = next(
+        (model_id for model_id in fallback.model_ids if "claude-sonnet-" in model_id.lower()),
+        None,
+    )
+    if family_match is None:
+        raise ValueError("Claude subscription fallback has no routable Sonnet model")
+    return family_match
 
 
 def _claude_model_display_name(tier: str, model_id: str) -> str:
@@ -1614,10 +1637,7 @@ def _ucode_config_for_profile(
     if not profile:
         return None
 
-    from omnigent.onboarding.databricks_config import (
-        DATABRICKS_CLAUDE_DEFAULT_MODEL,
-        get_workspace_url_for_profile,
-    )
+    from omnigent.onboarding.databricks_config import get_workspace_url_for_profile
     from omnigent.onboarding.ucode_state import read_ucode_state
 
     workspace_url = get_workspace_url_for_profile(profile)
@@ -1685,11 +1705,8 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
+        _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
     }
-    # Don't disable betas when gateway-aware mode (CLAUDE_CODE_USE_GATEWAY=1)
-    # is selected: that mode keeps tool search on so MCP schemas load on demand.
-    if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1":
-        env[_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV] = "1"
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
     # names.  Without this Claude Code normalises the picked model to a
@@ -1739,7 +1756,9 @@ def _ucode_config_for_profile(
     return ClaudeNativeUcodeConfig(
         env=env,
         api_key_helper=agent_state.auth_command,
-        model=default_model or configured_default or DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        model=default_model
+        or configured_default
+        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
     )
 
 
@@ -1884,8 +1903,7 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
         _logger.warning(
             "native-claude: bedrock provider %r sets no models.default — Claude Code "
             "will choose its own default model, which is usually not enabled on a "
-            "Bedrock account. Set models.default to a Bedrock inference-profile id "
-            "(e.g. us.anthropic.claude-opus-4-5-20251101-v1:0).",
+            "Bedrock account. Set models.default to a Bedrock inference-profile id.",
             entry.name,
         )
     _logger.info(
@@ -4752,23 +4770,31 @@ def _websocket_connect(attach_url: str, *, headers: dict[str, str]) -> Any:
     import websockets
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
     # guard (CSWSH protection) allows the handshake — this attach client
     # is not a browser. Set on a copy so the caller's dict (which also
     # carries auth headers and may be reused) is not mutated here.
     handshake_headers = {**headers, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+    # A remote (https) workspace yields a wss:// attach URL; build a verifying
+    # SSL context from a real CA bundle so verification works on interpreters
+    # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
+    # library default — no TLS). See omnigent/tls.py and issue #1730.
+    ssl_ctx = client_ssl_context() if attach_url.startswith("wss://") else None
     try:
         return websockets.connect(
             attach_url,
             additional_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
+            ssl=ssl_ctx,
         )
     except TypeError:
         return websockets.connect(
             attach_url,
             extra_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
+            ssl=ssl_ctx,
         )
 
 

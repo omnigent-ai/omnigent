@@ -243,8 +243,12 @@ async def test_session_items_expose_per_actor_attribution(
 class _CaptureRunnerClient:
     """Stub runner client that accepts the forwarded event POST."""
 
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+
     async def post(self, path: str, *, json: dict[str, Any], **_: Any) -> Any:
         """Return a fake 202 so persist-before-forward completes."""
+        self.posts.append((path, json))
 
         class _Resp:
             status_code = 202
@@ -277,8 +281,10 @@ async def test_post_event_records_authenticated_poster(
     """
     from omnigent.server.routes import sessions as sessions_mod
 
+    runner_client = _CaptureRunnerClient()
+
     async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
-        return _CaptureRunnerClient()
+        return runner_client
 
     monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
     monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
@@ -301,6 +307,10 @@ async def test_post_event_records_authenticated_poster(
     items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
     [persisted] = items.data
     assert persisted.created_by == "alice@example.com"
+    [(path, forwarded)] = runner_client.posts
+    assert path == f"/v1/sessions/{session_id}/events"
+    assert forwarded["created_by"] == "alice@example.com"
+    assert forwarded["author_attribution_required"] is True
 
 
 @pytest.mark.asyncio

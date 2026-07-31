@@ -26,7 +26,10 @@ import { ComposerMicButton } from "./ComposerMicButton";
 // Controllable DictationSession stand-in for the server-mode tests. The
 // factory reads the mutable spies at call time, so each test installs its
 // own behavior in beforeEach.
-type SessionStub = { stop: () => Promise<string>; cancel: () => void };
+interface SessionStub {
+  stop: () => Promise<string>;
+  cancel: () => void;
+}
 let sessionStartMock: Mock<(events: DictationSessionEvents) => Promise<SessionStub>>;
 let sessionStopMock: Mock<() => Promise<string>>;
 let sessionCancelMock: Mock<() => void>;
@@ -275,6 +278,11 @@ const DICTATION_INFO: ServerInfo = {
   dictation_available: true,
 };
 
+const NO_DICTATION_INFO: ServerInfo = {
+  ...DICTATION_INFO,
+  dictation_available: false,
+};
+
 function renderServerMode(
   props: Partial<React.ComponentProps<typeof ComposerMicButton>> = {},
   info: ServerInfo = DICTATION_INFO,
@@ -303,7 +311,7 @@ describe("ComposerMicButton (server dictation)", () => {
   });
 
   it("renders nothing when neither Web Speech nor the server can help", () => {
-    const { container } = renderServerMode({}, { ...DICTATION_INFO, dictation_available: false });
+    const { container } = renderServerMode({}, NO_DICTATION_INFO);
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -435,7 +443,7 @@ describe("ComposerMicButton (server dictation)", () => {
 
   it("keeps the plain error path when the server offers no dictation", async () => {
     render(
-      <CapabilitiesContext.Provider value={{ ...DICTATION_INFO, dictation_available: false }}>
+      <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
         <ComposerMicButton onTranscript={vi.fn()} />
       </CapabilitiesContext.Provider>,
     );

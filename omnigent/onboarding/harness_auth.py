@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Literal, NamedTuple
+from collections.abc import Callable
+from typing import Literal, NamedTuple, Protocol
 
 from omnigent.onboarding.configure_models import (
     build_gateway_provider_entry,
@@ -62,7 +63,16 @@ class StoreCredentialResult(NamedTuple):
     reason: str | None
 
 
-def _config_writer():  # type: ignore[no-untyped-def]
+class _ConfigSaver(Protocol):
+    def __call__(
+        self,
+        settings: dict[str, object],
+        *,
+        deep_merge_providers: bool,
+    ) -> None: ...
+
+
+def _config_writer() -> tuple[Callable[[], dict[str, object]], _ConfigSaver]:
     """Return a ``(load, save)`` pair for the global config on this host.
 
     Isolated so the daemon writes to the same ``~/.omnigent/config.yaml`` the
@@ -95,7 +105,12 @@ def _config_writer():  # type: ignore[no-untyped-def]
     return _load, _save
 
 
-def _pin_defaults_after_write(name: str, family: str, load, save) -> None:  # type: ignore[no-untyped-def]
+def _pin_defaults_after_write(
+    name: str,
+    family: str,
+    load: Callable[[], dict[str, object]],
+    save: _ConfigSaver,
+) -> None:
     """Point the right defaults at a just-written provider entry *name*.
 
     Two pins, each only when nothing already claims the slot (so we never
@@ -124,7 +139,7 @@ def _pin_defaults_after_write(name: str, family: str, load, save) -> None:  # ty
         set_default_provider,
     )
 
-    def _pin(scope: str, resolved) -> None:  # type: ignore[no-untyped-def]
+    def _pin(scope: str, resolved: object | None) -> None:
         if resolved is not None:
             return
         block = load().get("providers")

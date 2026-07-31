@@ -94,6 +94,7 @@ describe("createSession", () => {
       pendingElicitations: [],
       pendingInputs: [],
       permissionLevel: null,
+      canApprove: null,
       parentSessionId: null,
       subAgentName: null,
       kind: "default",
@@ -641,6 +642,20 @@ describe("getSession", () => {
     expect(session.permissionLevel).toBe(4);
   });
 
+  it("maps can_approve from the wire to canApprove", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+        can_approve: false,
+      }),
+    );
+    const session = await getSession("conv_abc");
+    expect(session.canApprove).toBe(false);
+  });
+
   it("treats a missing permission_level as null", async () => {
     // The server omits the field when permissions are disabled.
     // ``sessionFromWire`` must default to null so callers can lean on
@@ -803,7 +818,7 @@ describe("fetchInitialHistoryWindow", () => {
       content: [{ type: "output_text", text: id }],
     };
   }
-  function pageBody(dataNewestFirst: Array<{ id: string }>, hasMore: boolean): Response {
+  function pageBody(dataNewestFirst: { id: string }[], hasMore: boolean): Response {
     return mockJsonResponse({
       object: "list",
       data: dataNewestFirst,

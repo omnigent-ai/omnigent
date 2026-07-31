@@ -16,20 +16,22 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .databricks_executor import (
     _databricks_gateway_host,
@@ -98,14 +100,6 @@ _TURN_COMPLETED_DRAIN_SECONDS = 1.0
 _CODEX_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
 _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
-_OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
-# Databricks-specific default model for the Databricks-profile-derivation
-# gateway path (no gateway base URL supplied directly). The neutral
-# generic-provider gateway path never uses this — it requires the Omnigent producer
-# to resolve a concrete model. Used only when constructing the codex config
-# from ~/.databrickscfg credentials with no spec/override model.
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
-
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
@@ -134,7 +128,7 @@ _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
 
-def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any] | None:
+def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, object] | None:
     """Map a ``thread/tokenUsage/updated`` payload's ``last`` breakdown
     onto the wire shape that :class:`TurnComplete` consumes.
 
@@ -167,7 +161,7 @@ def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any]
     input_total = int(last.get("inputTokens") or 0)
     # Clamp so a malformed cached > total never makes input_tokens negative.
     cached = min(int(last.get("cachedInputTokens") or 0), input_total)
-    usage: dict[str, Any] = {
+    usage: dict[str, object] = {
         "input_tokens": input_total - cached,  # non-cached portion
         "output_tokens": int(last.get("outputTokens") or 0),
         "total_tokens": int(last.get("totalTokens") or 0),
@@ -357,83 +351,57 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
-    """
-    Indirection point for ``asyncio.create_subprocess_exec``.
+_ProcessPath: TypeAlias = str | bytes | os.PathLike[str] | os.PathLike[bytes]
 
-    Exists so tests can stub the subprocess creation without
-    patching ``asyncio.create_subprocess_exec`` globally (patching
-    ``omnigent.inner.codex_executor.asyncio.create_subprocess_exec``
-    walks the dotted path into the real ``asyncio`` module
-    singleton and leaks the mock into every other test in the
-    process).
 
-    :param args: Positional argv components forwarded to
-        ``asyncio.create_subprocess_exec``.
-    :param kwargs: Keyword args (``stdin``, ``stdout``, ``stderr``,
-        ``env``, ``cwd``, ...) forwarded as-is.
-    :returns: The spawned subprocess handle.
-    """
-    return await asyncio.create_subprocess_exec(*args, **kwargs)
+async def _create_subprocess_exec(
+    program: _ProcessPath,
+    *args: _ProcessPath,
+    stdin: int | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    env: Mapping[str, str] | Mapping[bytes, bytes] | None = None,
+    cwd: _ProcessPath | None = None,
+    start_new_session: bool = False,
+    creationflags: int = 0,
+) -> asyncio.subprocess.Process:
+    """Start a subprocess through the module-local test seam."""
+    return await asyncio.create_subprocess_exec(
+        program,
+        *args,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        env=env,
+        cwd=cwd,
+        start_new_session=start_new_session,
+        creationflags=creationflags,
+    )
 
 
 def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
 
-    Uses a prefix allowlist so only known-safe categories pass through
-    (proxy settings, locale, OpenAI retry knobs, etc.). Keys in
-    :data:`_CODEX_ENV_DENY_EXACT` are excluded even when their prefix
-    matches; ``OPENAI_API_KEY`` is stripped so the codex CLI falls
-    back to subscription auth (``auth.json``) rather than a developer
-    API key that would charge separately.
+    Thin wrapper over :func:`omnigent.inner.agent_env.clean_agent_env`; the
+    families below are codex's own on top of the shared safe base. Keys in
+    :data:`_CODEX_ENV_DENY_EXACT` are excluded even when their prefix matches;
+    ``OPENAI_API_KEY`` is stripped so the codex CLI falls back to subscription
+    auth (``auth.json``) rather than a developer API key that would charge
+    separately.
 
     :returns: Filtered environment dict.
     """
-    env: dict[str, str] = {}
-    allow_prefixes = (
-        "OPENAI_",
-        "HTTP_",
-        "HTTPS_",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "SSL_",
-        "REQUESTS_",
-        "CODEX_HOME",
-        "XDG_",
-        "LANG",
-        "LC_",
+    return clean_agent_env(
+        allow_prefixes=("OPENAI_", "REQUESTS_", "CODEX_HOME"),
+        allow_exact=(
+            "PYTHONUTF8",
+            "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
+            "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+        ),
+        deny_exact=_CODEX_ENV_DENY_EXACT,
+        extra_allowed=extra_allow,
     )
-    allow_exact = {
-        "HOME",
-        "PATH",
-        "TERM",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "PYTHONUTF8",
-        "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
-        "DATABRICKS_CODEX_TOKEN",  # env_key referenced by ~/.codex/config.toml's DB provider
-        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
-    } | set(extra_allow)
-    for key, value in os.environ.items():
-        if key in _CODEX_ENV_DENY_EXACT:
-            continue
-        if key in allow_exact or key.startswith(allow_prefixes):
-            env[key] = value
-    return env
-
-
-def _declared_passthrough(os_env: OSEnvSpec | None) -> tuple[str, ...]:
-    """Env-var names an agent declared for tool passthrough.
-
-    Lives on ``os_env.sandbox.env_passthrough`` (an
-    :class:`OSEnvSandboxSpec` field), not on ``OSEnvSpec`` directly.
-    Returns an empty tuple when any link in that chain is absent.
-    """
-    if os_env is not None and os_env.sandbox is not None and os_env.sandbox.env_passthrough:
-        return tuple(os_env.sandbox.env_passthrough)
-    return ()
 
 
 def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
@@ -755,7 +723,7 @@ def _populate_codex_home_config(
             "true",
             "yes",
         }
-    symlink_files = _CODEX_HOME_SYMLINK_FILES
+    symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
     for filename in symlink_files:
@@ -1074,7 +1042,7 @@ def _session_key(messages: list[Message]) -> str:
 
 def _extract_latest_user_content(
     messages: list[Message],
-) -> str | list[dict[str, Any]]:
+) -> str | list[CodexParams]:
     """
     Extract the latest user message content.
 
@@ -1101,7 +1069,7 @@ def _extract_latest_user_content(
 
 def _build_initial_prompt(
     messages: list[Message],
-) -> str | list[dict[str, Any]]:
+) -> str | list[CodexParams]:
     """
     Build the initial prompt for a fresh Codex thread.
 
@@ -1133,9 +1101,7 @@ def _build_initial_prompt(
     return "\n".join(lines)
 
 
-def _prompt_for_turn(
-    messages: list[Message], *, is_new_thread: bool
-) -> str | list[dict[str, Any]]:
+def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:
     """
     Choose the prompt payload for a Codex turn.
 
@@ -1155,8 +1121,8 @@ def _prompt_for_turn(
 
 
 def _to_codex_input_items(
-    blocks: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    blocks: list[CodexParams],
+) -> list[CodexParams]:
     """
     Convert Responses API content blocks to Codex app-server
     ``turn/start`` input items.
@@ -1170,7 +1136,7 @@ def _to_codex_input_items(
         ``input_text``, ``input_image``, ``input_file``).
     :returns: Codex input item dicts.
     """
-    items: list[dict[str, Any]] = []
+    items: list[CodexParams] = []
     for block in blocks:
         block_type = block.get("type")
         if block_type in ("input_text", "output_text", "text"):
@@ -1360,7 +1326,7 @@ class _CodexAppServerSession:
         # turn breakdown, mapped to the wire shape. Consumed (and cleared)
         # on the next ``turn/completed`` so each TurnComplete carries the
         # usage for the turn that just finished.
-        self._last_turn_usage: dict[str, int] | None = None
+        self._last_turn_usage: dict[str, object] | None = None
 
     async def start(self) -> None:
         if self._started:
@@ -2339,7 +2305,7 @@ class CodexExecutor(Executor):
                 f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
             )
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
+        self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
@@ -2398,9 +2364,13 @@ class CodexExecutor(Executor):
                     if gateway_auth_command is not None
                     else _databricks_codex_auth_command(host, databricks_profile)
                 )
-                # Databricks-profile path: a Databricks default is legitimate.
+                # Databricks-profile path: select a gateway endpoint from the
+                # catalog when no caller supplied one.
                 self._gateway_uses_databricks_profile = True
-                effective_model = model or _DATABRICKS_CODEX_DEFAULT_MODEL
+                effective_model = (
+                    model
+                    or model_catalog.resolve_catalog_model("databricks", family="openai").model_id
+                )
             else:
                 if base_url_override is None:
                     raise OSError(
@@ -2547,20 +2517,17 @@ class CodexExecutor(Executor):
         cfg = config or ExecutorConfig()
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
-        # cfg.model (per-request /model override) wins over the spec
-        # default (HARNESS_CODEX_MODEL → self._model_override). The final
-        # fallback is the Databricks default only on the Databricks-profile
-        # gateway path; the neutral gateway path (and the built-in path) never
-        # select a ``databricks-*`` model.
-        model = (
-            cfg.model
-            or self._model_override
-            or (
-                _DATABRICKS_CODEX_DEFAULT_MODEL
-                if self._gateway_uses_databricks_profile
-                else _OPENAI_CODEX_DEFAULT_MODEL
+        # cfg.model (per-request /model override) wins over the spec default.
+        # An unresolved default comes from the active provider catalog.
+        model = cfg.model or self._model_override
+        if model is None:
+            provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                provider_name,
+                family="openai",
             )
-        )
+            model = resolution.model_id
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )

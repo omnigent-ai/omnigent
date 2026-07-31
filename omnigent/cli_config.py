@@ -40,7 +40,7 @@ from omnigent.onboarding.ucode_setup import (
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
     from omnigent.onboarding.ambient import DetectedProvider
-    from omnigent.onboarding.openclaw_config import OpenClawDiscovery
+    from omnigent.onboarding.openclaw_config import OpenClawDiscovery, SourceKind
     from omnigent.onboarding.provider_config import ProviderEntry
 
 # _INTERNAL_BETA_DEFAULT_SERVER (internal Databricks Apps host) moved to
@@ -53,22 +53,26 @@ if TYPE_CHECKING:
 _CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT"}
 
 
-def _load_global_config(*a, **k):  # type: ignore[no-untyped-def]
+def _load_global_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     import omnigent.cli as _cli
 
-    return _cli._load_global_config(*a, **k)
+    return _cli._load_global_config()
 
 
-def _save_global_config(*a, **k):  # type: ignore[no-untyped-def]
+def _save_global_config(  # type: ignore[explicit-any]
+    settings: collections.abc.Mapping[str, Any],
+    unset_keys: tuple[str, ...] = (),
+    deep_merge_keys: tuple[str, ...] = (),
+) -> None:
     import omnigent.cli as _cli
 
-    return _cli._save_global_config(*a, **k)
+    _cli._save_global_config(settings, unset_keys, deep_merge_keys)
 
 
-def _load_effective_config(*a, **k):  # type: ignore[no-untyped-def]
+def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     import omnigent.cli as _cli
 
-    return _cli._load_effective_config(*a, **k)
+    return _cli._load_effective_config()
 
 
 # Node version hint shared by the preflight problem messages and surfaced
@@ -173,7 +177,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     import signal
     import tempfile
 
-    from omnigent.onboarding.internal_beta import DEFAULT_PROFILES
+    import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
     from omnigent.onboarding.setup import CONFLICTING_ENV_VARS
 
     original_cfg = Path.home() / ".databrickscfg"
@@ -199,7 +203,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     if original_cfg.exists():
         orig_cfg.read(original_cfg)
     cfg = configparser.ConfigParser()
-    for spec in DEFAULT_PROFILES:
+    for spec in internal_beta.DEFAULT_PROFILES:
         if orig_cfg.has_section(spec.name):
             cfg[spec.name] = dict(orig_cfg[spec.name])
 
@@ -241,7 +245,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         orig_cfg = configparser.ConfigParser()
         if original_cfg.exists():
             orig_cfg.read(original_cfg)
-        for spec in DEFAULT_PROFILES:
+        for spec in internal_beta.DEFAULT_PROFILES:
             if tmp_cfg.has_section(spec.name):
                 orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
         write_tmp = original_cfg.with_suffix(".tmp")
@@ -728,8 +732,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # releases (e.g. a brand-new claude-sonnet-4-6 won't be listed yet), so
         # a fixed picker would block the user from a model they can actually
         # use. Pre-fill the canonical default and let the user type ANY model
-        # id. Blank → the default (or no pin when unknown). Always persisting
-        # a pin keeps a later re-add from silently dropping ``models.default``.
+        # id. Blank accepts a known catalog default; without one, the prompt
+        # requires an explicit model id.
         from omnigent.onboarding.providers import default_chat_model
 
         catalog_default = default_chat_model(provider)
@@ -860,9 +864,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             wire_api = RESPONSES_WIRE_API if wire_choice == 0 else CHAT_WIRE_API
         # Default model per served surface. A gateway has NO catalog default,
         # so without a pin routing would fall back to a vendor model the
-        # gateway can't serve. The OpenAI surface pre-fills a broadly-served
-        # OSS default (moonshotai/kimi-k2.6, via the openrouter pin); the
-        # user can type any gateway model id.
+        # gateway can't serve. The OpenAI surface pre-fills the catalog's
+        # preferred Kimi-family model; if none is advertised, the user must
+        # type a gateway model id explicitly.
         from omnigent.onboarding.providers import default_chat_model
 
         models: dict[str, str] = {}
@@ -905,8 +909,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # usually not enabled on a Bedrock account, so pin an explicit id.
         default_model = (
             prompt_text(
-                "Default model (Bedrock inference-profile id, e.g. "
-                "us.anthropic.claude-opus-4-5-20251101-v1:0)"
+                "Default model (Bedrock inference-profile id or ARN; e.g. "
+                "us.vendor.model-family-YYYYMMDD-v1:0)"
             ).strip()
             or None
         )
@@ -1671,9 +1675,10 @@ def _manage_cursor_harness() -> None:
         from omnigent._platform import resolve_cli_binary
 
         cli_installed = harness_cli_installed(CURSOR_KEY)
+        install_spec = harness_install_spec(CURSOR_KEY)
         if cli_installed:
             cli_status = "logged in" if harness_cli_logged_in(CURSOR_KEY) else "needs login"
-        elif resolve_cli_binary(harness_install_spec(CURSOR_KEY).binary) is not None:
+        elif install_spec is not None and resolve_cli_binary(install_spec.binary) is not None:
             cli_status = "needs upgrade"
         else:
             cli_status = "not installed"
@@ -2258,7 +2263,8 @@ def _choose_openclaw_source() -> OpenClawDiscovery | None:
 
     detected: list[OpenClawDiscovery] = []
     options: list[str] = []
-    for source, path in zip(("acpx", "openclaw"), default_config_paths(), strict=True):
+    sources: tuple[SourceKind, SourceKind] = ("acpx", "openclaw")
+    for source, path in zip(sources, default_config_paths(), strict=True):
         try:
             exists = path.exists()
         except OSError:
@@ -3832,12 +3838,12 @@ def _run_configure_harnesses_interactive() -> None:
         selectable: list[bool] = []
         row_target: list[str | None] = []
         descriptions: list[str] = []
-        for target, name, status_text, kind, desc in harness_rows:
+        for row_key, name, status_text, kind, desc in harness_rows:
             status_text = _truncate_cells(status_text, max_status_width)
             glyph, color = status_styles[kind]
             options.append(f"{name.ljust(name_col)}[{color}]{glyph} {escape(status_text)}[/]")
             selectable.append(True)
-            row_target.append(target)
+            row_target.append(row_key)
             descriptions.append(desc)
         options.append("Quit")
         selectable.append(True)
@@ -3853,32 +3859,32 @@ def _run_configure_harnesses_interactive() -> None:
         )
         if idx < 0:  # Esc / q — exit
             return
-        target = row_target[idx]
-        if target == CURSOR_KEY:
+        selected_target = row_target[idx]
+        if selected_target == CURSOR_KEY:
             _manage_cursor_harness()
-        elif target == COPILOT_KEY:
+        elif selected_target == COPILOT_KEY:
             _manage_copilot_harness()
-        elif target in families:
-            _manage_harness_providers(target)
-        elif target == _ANTIGRAVITY:
+        elif selected_target in families:
+            _manage_harness_providers(selected_target)
+        elif selected_target == _ANTIGRAVITY:
             _manage_antigravity_harness()
-        elif target == _QWEN:
+        elif selected_target == _QWEN:
             _manage_qwen_harness()
-        elif target == _OPENCODE:
+        elif selected_target == _OPENCODE:
             _manage_opencode_harness()
-        elif target == _GOOSE:
+        elif selected_target == _GOOSE:
             _manage_goose_harness()
-        elif target == _ACP_IMPORT:
+        elif selected_target == _ACP_IMPORT:
             _import_openclaw_agents()
-        elif target == _ACP_ADD:
+        elif selected_target == _ACP_ADD:
             _add_acp_agent()
-        elif isinstance(target, str) and target.startswith(_ACP_AGENT_PREFIX):
-            _manage_acp_agent(target[len(_ACP_AGENT_PREFIX) :])
-        elif target == _HERMES:
+        elif isinstance(selected_target, str) and selected_target.startswith(_ACP_AGENT_PREFIX):
+            _manage_acp_agent(selected_target[len(_ACP_AGENT_PREFIX) :])
+        elif selected_target == _HERMES:
             _manage_hermes_harness()
-        elif target == _KIRO:
+        elif selected_target == _KIRO:
             _manage_kiro_harness()
-        elif target == _KIMI:
+        elif selected_target == _KIMI:
             _manage_kimi_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return

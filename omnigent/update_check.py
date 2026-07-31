@@ -409,13 +409,14 @@ def _index_from_uv_config() -> str:
         indexes = data.get("index")
         if isinstance(indexes, list):
             for entry in indexes:
+                url = entry.get("url") if isinstance(entry, dict) else None
                 if (
                     isinstance(entry, dict)
                     and entry.get("default") is True
-                    and isinstance(entry.get("url"), str)
-                    and entry["url"].strip()
+                    and isinstance(url, str)
+                    and url.strip()
                 ):
-                    return entry["url"].strip().rstrip("/")
+                    return url.strip().rstrip("/")
     return ""
 
 

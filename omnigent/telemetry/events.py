@@ -80,3 +80,51 @@ class SessionDeletedEvent:
     input_tokens: int | None
     output_tokens: int | None
     total_cost_usd: float | None
+
+
+@dataclass
+class PolicyRegisteredEvent:
+    """Fired when a policy is created via the API.
+
+    Covers both session-level (``POST /v1/sessions/{id}/policies``) and
+    admin-level (``POST /v1/policies``) creation.
+
+    :param installation_id: Server-side installation ID.
+    :param handler: Registered handler path (e.g.
+        ``"omnigent.policies.blast_radius"``) or HTTPS endpoint URL for
+        ``type="url"`` policies.
+    :param policy_type: Handler type: ``"python"`` or ``"url"``.
+    :param scope: ``"session"`` for per-session policies, ``"admin"`` for
+        server-wide default policies.
+    :param session_id: Owning session identifier for scope ``"session"``;
+        ``None`` for admin policies.
+    :param anon_user_id: First 16 hex chars of ``sha256("<installation_id>:<user_id>")``.
+    """
+
+    installation_id: str | None
+    handler: str
+    policy_type: str
+    scope: str
+    session_id: str | None
+    anon_user_id: str | None
+
+
+@dataclass
+class PolicyDeletedEvent:
+    """Fired when a policy is deleted via the API.
+
+    Covers both session-level (``DELETE /v1/sessions/{id}/policies/{pid}``)
+    and admin-level (``DELETE /v1/policies/{pid}``) deletion.
+
+    :param installation_id: Server-side installation ID.
+    :param scope: ``"session"`` for per-session policies, ``"admin"`` for
+        server-wide default policies.
+    :param session_id: Owning session identifier for scope ``"session"``;
+        ``None`` for admin policies.
+    :param anon_user_id: First 16 hex chars of ``sha256("<installation_id>:<user_id>")``.
+    """
+
+    installation_id: str | None
+    scope: str
+    session_id: str | None
+    anon_user_id: str | None
