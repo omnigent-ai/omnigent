@@ -174,6 +174,7 @@ def prompt_policy(
                         ],
                     },
                 ],
+                text=_CLASSIFIER_SCHEMA,
             )
             raw_text = _extract_response_text(response)
             if not raw_text:
