@@ -1344,13 +1344,12 @@ def _account_verification_rejected(socket_path: str, tmux_target: str) -> bool:
     A verified submit only proves the draft left the composer, which is also true
     when agy swallows the turn during its startup eligibility check (see
     :data:`_AGY_VERIFYING_MARKER`). Distinguishes the two by watching for a
-    running turn first: a started turn clears the notice, so the running-turn
-    marker WINS over notice text still rendered from a prior attempt — otherwise
-    a stale notice would re-deliver an accepted turn as a duplicate.
+    running turn first, then requiring both the notice and the idle footer before
+    retrying. The idle check prevents a stale notice from duplicating an accepted
+    turn when agy's running footer is renamed or truncated.
 
-    Fails open (returns ``False``) when neither signal appears within
-    :data:`_VERIFY_PROBE_TIMEOUT_S`, so a future agy that renames its running
-    footer keeps delivering instead of retrying a turn that already landed.
+    Fails open (returns ``False``) unless rejection is explicit within
+    :data:`_VERIFY_PROBE_TIMEOUT_S`.
 
     :param socket_path: tmux server socket path.
     :param tmux_target: tmux pane target.
@@ -1363,7 +1362,7 @@ def _account_verification_rejected(socket_path: str, tmux_target: str) -> bool:
         if _AGY_ACTIVE_MARKER in pane:
             return False
         if time.monotonic() >= deadline:
-            return _AGY_VERIFYING_MARKER in pane.lower()
+            return _AGY_VERIFYING_MARKER in pane.lower() and _AGY_IDLE_MARKER in pane
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 

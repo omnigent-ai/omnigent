@@ -1235,6 +1235,45 @@ def test_inject_user_message_via_tui_does_not_redeliver_an_accepted_turn(
     assert pastes["n"] == 1, "a running turn must not be re-delivered"
 
 
+def test_inject_user_message_via_tui_ignores_stale_notice_with_changed_active_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A renamed active footer still prevents a stale-notice duplicate."""
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 0.2)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+    pastes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Reject once, then accept while the stale notice remains visible."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            pastes["n"] += 1
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = (
+                _VERIFYING_PANE
+                if pastes["n"] == 1
+                else _VERIFYING_PANE.replace(
+                    "? for shortcuts", "(generating response, press the cancel key to stop)"
+                )
+            )
+        return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert pastes["n"] == 2, "the accepted retry must not be delivered again"
+
+
 # ---------------------------------------------------------------------------
 # Composer-region detection robustness (#1598 review follow-ups)
 # ---------------------------------------------------------------------------
