@@ -157,9 +157,9 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
         # Imported here (not at module top) because the lakebox module
         # may be absent from a distribution; the availability check above
         # guarantees it exists in this one.
-        from omnigent.onboarding.sandboxes.lakebox import LakeboxLauncher
+        import omnigent.onboarding.sandboxes.lakebox as lakebox  # type: ignore[import-not-found]
 
-        return LakeboxLauncher(workspace_host=workspace_host)
+        return lakebox.LakeboxLauncher(workspace_host=workspace_host)
     module_name, _, class_name = target.partition(":")
     module = importlib.import_module(module_name)
     launcher_cls: type[SandboxLauncher] = getattr(module, class_name)

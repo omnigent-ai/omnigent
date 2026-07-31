@@ -8429,7 +8429,7 @@ def setup(internal_beta: bool) -> None:
         # build. Fail loud with a clear message instead of an ImportError deep
         # in the onboarding flow when someone passes --internal-beta there.
         try:
-            import omnigent.onboarding.internal_beta  # noqa: F401
+            import omnigent.onboarding.internal_beta  # type: ignore[import-not-found]  # noqa: F401
         except ImportError:
             raise click.ClickException(
                 "Databricks internal-beta setup is not available in this build. "
@@ -8453,7 +8453,9 @@ def setup(internal_beta: bool) -> None:
         # bootstrap so a fresh machine sees every gap at once.
         _warn_missing_harness_dependencies()
         from omnigent.onboarding.internal_beta import _INTERNAL_BETA_DEFAULT_SERVER
-        from omnigent.onboarding.sandboxes.lakebox import install_demo_databricks_cli
+        from omnigent.onboarding.sandboxes.lakebox import (  # type: ignore[import-not-found]
+            install_demo_databricks_cli,
+        )
         from omnigent.onboarding.setup import run_onboarding
 
         # Install the demo `databricks` CLI (with the `lakebox`

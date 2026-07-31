@@ -1293,7 +1293,7 @@ def _classify_anthropic_exception(exception: BaseException) -> str | None:
         recognize.
     """
     try:
-        import anthropic
+        import anthropic  # type: ignore[import-not-found]
     except ImportError:
         return None
 
