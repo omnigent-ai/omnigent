@@ -647,6 +647,7 @@ class _ShellOp:
     branches: frozenset[str]
     branch_targeted: bool
     detail: str
+    tag_push: bool = False
 
 
 def _repo_from_tokens(tokens: list[str]) -> str | None:
@@ -711,8 +712,12 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
         positionals = [t for t in args if not t.startswith("-")]
         repo = _repo_from_tokens(args)
         branches: set[str] = set()
+        tag_push = any(t in ("--tags", "--follow-tags") for t in args)
         for refspec in positionals[1:]:
             dest = refspec.split(":", 1)[1] if ":" in refspec else refspec
+            if dest.startswith("refs/tags/"):
+                tag_push = True
+                continue
             branch = _normalize_branch(dest)
             if branch:
                 branches.add(branch)
@@ -722,6 +727,7 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
             branches=frozenset(branches),
             branch_targeted=True,
             detail="git push",
+            tag_push=tag_push,
         )
     return None
 
@@ -866,6 +872,7 @@ def github_policy(
     read_repos: list[str] | None = None,
     write_repos: list[str] | None = None,
     write_branches: list[str] | None = None,
+    deny_tag_push: bool = True,
     mcp_tool_prefixes: list[str] | None = None,
     shell_tools: list[str] | None = None,
     deny_reason: str = "GitHub operation blocked by policy.",
@@ -883,6 +890,11 @@ def github_policy(
     :param write_branches: Branches writable within an allowed repo, e.g.
         ``["main", "develop"]``. ``None`` / empty means branches are not
         restricted (any branch on an allowed repo is writable).
+    :param deny_tag_push: When ``True`` (default), pushing tags to remotes via
+        ``git push --tags``, ``git push --follow-tags``, or explicit
+        ``refs/tags/`` refspecs is denied. Tags are immutable references that
+        downstream CI/CD and release tooling depend on; an agent pushing a tag
+        can trigger releases, deployments, or break semver expectations.
     :param mcp_tool_prefixes: GitHub MCP server name-prefixes to strip when
         canonicalizing MCP tool names. ``None`` uses the standard
         ``mcp__github__`` / ``github__``.
@@ -1058,6 +1070,11 @@ def github_policy(
                 ),
             )
         if op.kind == "write":
+            if deny_tag_push and op.tag_push:
+                return _deny(
+                    f"{deny_reason} Pushing tags is blocked by policy "
+                    f"(deny_tag_push is enabled)."
+                )
             return _gate_write(
                 {op.repo} if op.repo else set(),
                 set(op.branches),
@@ -1158,6 +1175,13 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Branches writable within an allowed repo. Empty = any branch.",
+                },
+                "deny_tag_push": {
+                    "type": "boolean",
+                    "description": "Block pushing tags to remotes (--tags, --follow-tags, "
+                    "refs/tags/ refspecs). Tags are immutable references that downstream "
+                    "CI/CD depends on.",
+                    "default": True,
                 },
                 "mcp_tool_prefixes": {
                     "type": "array",
