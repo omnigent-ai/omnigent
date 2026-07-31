@@ -471,11 +471,11 @@ export interface ChatState {
    * `session.todos` SSE events. Empty array for non-claude-native
    * sessions or before the first poll tick from the forwarder.
    */
-  todos: Array<{
+  todos: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
   /**
    * Skills the bound agent can invoke (bundled + host-discovered).
    * Populated from the session snapshot on bind; empty array
@@ -2508,11 +2508,11 @@ async function bindStream(
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
-        todos: (session.todos ?? []) as Array<{
+        todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
           activeForm: string;
-        }>,
+        }[],
       };
     });
     racedNativeModelOptions.delete(id);

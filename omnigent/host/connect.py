@@ -819,6 +819,10 @@ class HostProcess:
             # acceptable, since the leak this guards against accrues over hours,
             # not a two-minute worst case.
             return 0
+        if not hasattr(os, "WNOHANG"):
+            # Windows: no child reparenting to a subreaper and no ``WNOHANG`` /
+            # ``waitpid(-1, ...)`` — nothing to reap and the calls would raise.
+            return 0
         if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
             return self._reap_orphans_waitid()
         return self._reap_orphans_waitpid()

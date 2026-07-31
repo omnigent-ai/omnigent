@@ -176,10 +176,10 @@ let client: QueryClient;
 const fetchMock = vi.fn();
 let sessionSnapshots: Map<string, ConversationItem[]>;
 let sessionItems: Map<string, ConversationItem[]>;
-let sessionPendingElicitations: Map<string, Array<Record<string, unknown>>>;
+let sessionPendingElicitations: Map<string, Record<string, unknown>[]>;
 let sessionPendingInputs: Map<
   string,
-  Array<{ pending_id: string; content: unknown[]; created_by?: string }>
+  { pending_id: string; content: unknown[]; created_by?: string }[]
 >;
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
@@ -410,13 +410,13 @@ function seedSessionItems(id: string, items: ConversationItem[] = []): void {
   sessionItems.set(id, items);
 }
 
-function seedPendingElicitations(id: string, events: Array<Record<string, unknown>>): void {
+function seedPendingElicitations(id: string, events: Record<string, unknown>[]): void {
   sessionPendingElicitations.set(id, events);
 }
 
 function seedPendingInputs(
   id: string,
-  inputs: Array<{ pending_id: string; content: unknown[]; created_by?: string }>,
+  inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
 }
@@ -1561,7 +1561,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // Control /events resolution: each POST returns a deferred promise so the
     // test can hold the first one open and observe whether the next fires.
     const eventBodies: string[] = [];
-    const resolvers: Array<() => void> = [];
+    const resolvers: (() => void)[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url === "/v1/sessions/conv_x/events" && init?.method === "POST") {
@@ -3580,7 +3580,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
      */
     function seedSnapshotSkills(
       seedId: string,
-      skills: Array<{ name: string; description: string }>,
+      skills: { name: string; description: string }[],
     ): void {
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
@@ -5149,7 +5149,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     model_override?: string | null;
     cost_control_mode_override?: "on" | "off" | null;
     parent_session_id?: string | null;
-    model_options?: Array<Record<string, unknown>>;
+    model_options?: Record<string, unknown>[];
   }
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
@@ -5176,7 +5176,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     });
   }
 
-  function patchCallsFor(id: string): Array<Record<string, unknown>> {
+  function patchCallsFor(id: string): Record<string, unknown>[] {
     return fetchMock.mock.calls
       .filter(([u, init]) => {
         const url = typeof u === "string" ? u : u.toString();
@@ -7077,7 +7077,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   }
 
   /** The `live:<messageId>` provisional preview blocks currently rendered. */
-  function livePreviews(): Array<Extract<AnyBlock, { type: "text_done" }>> {
+  function livePreviews(): Extract<AnyBlock, { type: "text_done" }>[] {
     return useChatStore
       .getState()
       .blocks.filter(
@@ -8629,7 +8629,7 @@ describe("chatStore — client-side message queue", () => {
 
 describe("chatStore — background cross-session flush", () => {
   /** /events POSTs the flush fired, as (conversationId, text) pairs. */
-  const eventPosts = (): Array<{ id: string; text: string }> =>
+  const eventPosts = (): { id: string; text: string }[] =>
     fetchMock.mock.calls
       .filter(
         ([u, init]) =>

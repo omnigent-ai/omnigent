@@ -183,7 +183,12 @@ def detect_task_switch(
             return None
 
         state = event.get("session_state") or {}
-        history: list[str] = state.get(_TASK_SWITCH_HISTORY_KEY) or []
+        raw_history = state.get(_TASK_SWITCH_HISTORY_KEY)
+        history = (
+            [item for item in raw_history if isinstance(item, str)]
+            if isinstance(raw_history, list)
+            else []
+        )
 
         # Slide the window: append new message, keep last history_window entries.
         updated_history = [*history, new_message[:500]][-history_window:]

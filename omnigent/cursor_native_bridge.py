@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import click
+
 from omnigent._platform import stable_user_id
 
 #: Env var carrying the bridge dir into the harness executor process.
@@ -773,7 +775,7 @@ def inject_model_command(
                 for option in _live_cursor_model_options()
                 if option.get("id") == model
             )
-        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        except (click.ClickException, OSError, subprocess.SubprocessError, ValueError) as exc:
             raise RuntimeError("cursor-native could not verify the live model catalog") from exc
         except StopIteration as exc:
             raise RuntimeError(

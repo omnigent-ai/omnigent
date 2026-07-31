@@ -533,7 +533,10 @@ def cost_budget(
             crossed = max((t for t in thresholds if cost >= t), default=None)
             if crossed is not None:
                 state = event.get("session_state") or {}
-                approved_up_to = float(state.get(_ASK_APPROVED_KEY, 0.0) or 0.0)
+                approved_value = state.get(_ASK_APPROVED_KEY, 0.0)
+                approved_up_to = (
+                    float(approved_value) if isinstance(approved_value, int | float | str) else 0.0
+                )
                 if crossed > approved_up_to:
                     limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd is not None else ""
                     return {
@@ -855,7 +858,10 @@ def subagent_cost_budget(
             crossed = max((t for t in thresholds if cost >= t), default=None)
             if crossed is not None:
                 state = event.get("session_state") or {}
-                approved_up_to = float(state.get(_SUBAGENT_ASK_APPROVED_KEY, 0.0) or 0.0)
+                approved_value = state.get(_SUBAGENT_ASK_APPROVED_KEY, 0.0)
+                approved_up_to = (
+                    float(approved_value) if isinstance(approved_value, int | float | str) else 0.0
+                )
                 if crossed > approved_up_to:
                     limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd else ""
                     return {

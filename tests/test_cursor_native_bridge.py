@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import click
 import pytest
 
 from omnigent import cursor_native_bridge
@@ -214,6 +215,21 @@ class TestInjectModelGate:
         assert ["-t", _TARGET, "-l", "/model gpt-5.2"] in tails  # the filter command
         assert ["-t", _TARGET, "Enter"] in tails  # selection committed
         assert ["-t", _TARGET, "Escape"] not in tails  # no dismiss on a real match
+
+    def test_missing_cli_catalog_raises_clean_runtime_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cold switch without cursor-agent degrades through the runner's handled error path."""
+
+        def _missing_cli() -> list[dict[str, object]]:
+            raise click.ClickException("cursor-agent missing")
+
+        monkeypatch.setattr(cursor_native_bridge, "_live_cursor_model_options", _missing_cli)
+
+        with pytest.raises(RuntimeError, match="could not verify the live model catalog") as error:
+            cursor_native_bridge.inject_model_command(tmp_path, model="gpt-5.2")
+
+        assert isinstance(error.value.__cause__, click.ClickException)
 
     def test_raises_without_enter_on_no_match(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

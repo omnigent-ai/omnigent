@@ -21,13 +21,13 @@ import {
 } from "./TerminalView";
 
 const terminalSessionMock = vi.hoisted(() => ({
-  instances: [] as Array<{
+  instances: [] as {
     url: string;
     nativeSelection: boolean;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
-  }>,
+  }[],
 }));
 
 vi.mock("./TerminalSession", async (importOriginal) => ({
