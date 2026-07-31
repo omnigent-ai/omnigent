@@ -114,16 +114,17 @@ locust -f dev/loadtest/ws_load_test.py \
 #### Run against a remote deployment (bearer auth)
 
 ```bash
-locust -f dev/loadtest/ws_load_test.py \
+AUTH_TOKEN="$TOKEN" locust -f dev/loadtest/ws_load_test.py \
     --host https://my-omnigent.example.com \
-    --headless -u 50 -r 5 -t 5m \
-    -e AUTH_TOKEN "$TOKEN"
+    --headless -u 50 -r 5 -t 5m
 ```
 
 Drop `--headless` to open Locust's web UI and drive users interactively.
 
-Flags: `-u` users (N concurrent sockets), `-r` spawn rate/s, `-t` run time,
-`-e KEY VALUE` env.
+Flags: `-u` users (N concurrent sockets), `-r` spawn rate/s, `-t` run time.
+The scenario reads `AUTH_TOKEN` / `SESSION_IDS` / `WS_READ_TIMEOUT` / `HOST_ID` /
+`MOUNT_PREFIX` from the environment (set them before `locust`, as above);
+`run.py` sets them for you from its flags.
 
 ### Environment variables
 

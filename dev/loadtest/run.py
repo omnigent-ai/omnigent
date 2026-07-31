@@ -258,8 +258,12 @@ def _read_stats(stats_csv: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
-def _fmt_ms(raw: str) -> str:
-    """Format a locust millisecond field to one decimal, or ``"-"`` if blank.
+def _fmt_num(raw: str) -> str:
+    """Format a numeric CSV cell to one decimal, or ``"-"`` if blank.
+
+    Used for both millisecond latency fields and the requests/s rate in the
+    summary table (any single-decimal numeric column), so it is named for the
+    formatting, not a unit.
 
     :param raw: Raw CSV cell, e.g. ``"14.508"`` or ``""``.
     :returns: A compact display string, e.g. ``"14.5"``.
@@ -300,9 +304,14 @@ def _write_summary(
     lines.append(f"- **Outcome:** {outcome}")
     lines.append("")
 
+    # Locust's CSV includes an "Aggregated" row that is already the sum of the
+    # per-request-type rows — so sum only the non-Aggregated rows (else the
+    # headline count double-counts everything).
     total_reqs = 0
     total_fails = 0
     for row in rows:
+        if row.get("Name") == "Aggregated":
+            continue
         try:
             total_reqs += int(row.get("Request Count", "0") or "0")
             total_fails += int(row.get("Failure Count", "0") or "0")
@@ -322,12 +331,12 @@ def _write_summary(
                 name=row.get("Name", "?"),
                 n=row.get("Request Count", "-"),
                 fails=row.get("Failure Count", "-"),
-                avg=_fmt_ms(row.get("Average Response Time", "")),
-                med=_fmt_ms(row.get("Median Response Time", "")),
-                p95=_fmt_ms(row.get("95%", "")),
-                p99=_fmt_ms(row.get("99%", "")),
-                mx=_fmt_ms(row.get("Max Response Time", "")),
-                rps=_fmt_ms(row.get("Requests/s", "")),
+                avg=_fmt_num(row.get("Average Response Time", "")),
+                med=_fmt_num(row.get("Median Response Time", "")),
+                p95=_fmt_num(row.get("95%", "")),
+                p99=_fmt_num(row.get("99%", "")),
+                mx=_fmt_num(row.get("Max Response Time", "")),
+                rps=_fmt_num(row.get("Requests/s", "")),
             )
         )
     lines.append("")
@@ -384,11 +393,19 @@ def main() -> int:
     """Parse inputs, run locust, and write the result set."""
     args = _build_parser().parse_args()
 
-    if importlib.util.find_spec("locust") is None:
+    # The default scenario needs both locust and websocket-client (module
+    # ``websocket``); check both up front so a partial install fails here with
+    # an actionable message rather than deep inside the locustfile at runtime.
+    missing = [
+        pkg
+        for pkg, mod in (("locust", "locust"), ("websocket-client", "websocket"))
+        if importlib.util.find_spec(mod) is None
+    ]
+    if missing:
         sys.exit(
-            f"locust is not importable under {sys.executable} — install the extra: "
-            "pip install -e '.[loadtest]' (or: uv sync --extra loadtest), and run "
-            "run.py with that same interpreter."
+            f"{', '.join(missing)} not importable under {sys.executable} — install "
+            "the extra: pip install -e '.[loadtest]' (or: uv sync --extra loadtest), "
+            "and run run.py with that same interpreter."
         )
     if not Path(args.locustfile).is_file():
         sys.exit(f"locustfile not found: {args.locustfile}")

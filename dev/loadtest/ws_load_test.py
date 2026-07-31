@@ -22,7 +22,7 @@ Protocol (JSON text frames), from the server's ``session_updates`` handler
   when idle.
 
 Auth: a local single-user server needs none. Against an authenticated
-deployment, pass a bearer token via ``-e AUTH_TOKEN`` (sent as
+deployment, set the ``AUTH_TOKEN`` environment variable (sent as
 ``Authorization: Bearer <token>`` on the handshake). The first-party sentinel
 ``Origin: omnigent://internal`` is always sent so the server's cross-origin
 WebSocket (CSWSH) guard accepts a non-browser client regardless of mode.
@@ -46,10 +46,9 @@ Run against a local server (no auth):
 
 Against a remote deployment (bearer auth):
 
-    locust -f dev/loadtest/ws_load_test.py \
+    AUTH_TOKEN="$TOKEN" locust -f dev/loadtest/ws_load_test.py \
         --host https://my-omnigent.example.com \
-        --headless -u 50 -r 5 -t 5m \
-        -e AUTH_TOKEN "$TOKEN"
+        --headless -u 50 -r 5 -t 5m
 
 Drop ``--headless`` to open Locust's web UI and drive users interactively.
 """
@@ -95,6 +94,8 @@ def _ws_url(host: str, mount_prefix: str = "") -> str:
 
     :param host: The server base URL (Locust ``--host``), e.g.
         ``"http://localhost:8000"``; its scheme is swapped to the WS scheme.
+        A schemeless host (e.g. ``"localhost:8000"``, which Locust accepts) is
+        treated as ``ws://``.
     :param mount_prefix: Path the Omnigent app is served under when it sits
         behind a reverse proxy at a sub-path, e.g. ``"/omnigent"``. Empty
         (default) for a plain server that serves the routes at root.
@@ -105,8 +106,30 @@ def _ws_url(host: str, mount_prefix: str = "") -> str:
         base = "wss://" + base[len("https://") :]
     elif base.startswith("http://"):
         base = "ws://" + base[len("http://") :]
+    elif not base.startswith(("ws://", "wss://")):
+        # Schemeless host (Locust accepts a bare "host:port"): default to ws://
+        # rather than emit an invalid URL that fails obscurely at connect time.
+        base = "ws://" + base
     prefix = "/" + mount_prefix.strip("/") if mount_prefix.strip("/") else ""
     return f"{base}{prefix}{SESSION_UPDATES_PATH}"
+
+
+def _read_timeout_from_env() -> float:
+    """Resolve ``WS_READ_TIMEOUT`` (seconds), falling back on a bad value.
+
+    A malformed value (non-numeric / stray whitespace) should not crash the
+    user in ``on_start`` before it can record a sample — fall back to the
+    default instead.
+
+    :returns: The per-recv timeout in seconds.
+    """
+    raw = os.getenv("WS_READ_TIMEOUT", "").strip()
+    if not raw:
+        return DEFAULT_WS_READ_TIMEOUT_S
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_WS_READ_TIMEOUT_S
 
 
 class SessionUpdatesUser(User):
@@ -134,7 +157,7 @@ class SessionUpdatesUser(User):
         # "/omnigent"); empty for a plain server serving routes at root.
         mount_prefix = os.getenv("MOUNT_PREFIX", "").strip()
         self.ws_url = _ws_url(self.host, mount_prefix)
-        self.read_timeout = float(os.getenv("WS_READ_TIMEOUT", str(DEFAULT_WS_READ_TIMEOUT_S)))
+        self.read_timeout = _read_timeout_from_env()
         raw_ids = os.getenv("SESSION_IDS", "").strip()
         # Default: empty watch-set — a valid, dependency-free probe. The server
         # returns an empty snapshot, then heartbeats.
@@ -159,21 +182,25 @@ class SessionUpdatesUser(User):
         """
         start = time.monotonic()
         try:
-            ws = websocket.create_connection(
+            # Assign self.ws as soon as the socket exists, BEFORE the
+            # send/settimeout/recv steps that can throw — so _close() in the
+            # except can always reach it. Otherwise a post-create failure would
+            # leak the open socket (self.ws still None) and skew load results
+            # under repeated connect failures.
+            self.ws = websocket.create_connection(
                 self.ws_url,
                 timeout=CONNECT_TIMEOUT_S,
                 header=self.headers,
                 origin=INTERNAL_ORIGIN,
                 enable_multithread=True,
             )
-            ws.send(json.dumps({"type": "watch", "session_ids": self.session_ids}))
-            ws.settimeout(self.read_timeout)
-            self._read_until_snapshot(ws)
+            self.ws.send(json.dumps({"type": "watch", "session_ids": self.session_ids}))
+            self.ws.settimeout(self.read_timeout)
+            self._read_until_snapshot(self.ws)
         except Exception as exc:  # noqa: BLE001 — any failure is a failed connect sample
             self._fire("connect", start, exc=exc)
             self._close()
             return
-        self.ws = ws
         self._fire("connect", start)
 
     def _close(self) -> None:
@@ -195,11 +222,17 @@ class SessionUpdatesUser(User):
             within the socket's read timeout.
         """
         deadline = time.monotonic() + self.read_timeout
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise websocket.WebSocketTimeoutException("no snapshot within read timeout")
+            # Cap each recv to the time left, so a frame (e.g. a heartbeat)
+            # arriving near the deadline can't make the next recv block for
+            # another full read_timeout past it.
+            ws.settimeout(remaining)
             frame = ws.recv()
             if self._frame_type(frame) == "snapshot":
                 return
-        raise websocket.WebSocketTimeoutException("no snapshot within read timeout")
 
     @staticmethod
     def _frame_type(frame: object) -> str | None:
