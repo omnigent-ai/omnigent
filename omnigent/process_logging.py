@@ -10,7 +10,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TextIO
 
 from omnigent._platform import IS_POSIX
 
@@ -217,7 +217,7 @@ def _process_log_file_from_env() -> Path | None:
     return Path(value).expanduser() if value else None
 
 
-def _terminal_stream() -> object | None:
+def _terminal_stream() -> TextIO | None:
     fd_value = os.environ.get(LOG_TTY_FD_ENV_VAR)
     if fd_value and IS_POSIX:
         try:
