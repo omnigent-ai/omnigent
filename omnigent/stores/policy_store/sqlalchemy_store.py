@@ -210,14 +210,15 @@ class SqlAlchemyPolicyStore(PolicyStore):
             session.flush()
             return _to_entity(row)
 
-    def delete(self, policy_id: str, session_id: str) -> bool:
-        """Delete a policy. Idempotent: returns ``False`` if not found."""
+    def delete(self, policy_id: str, session_id: str) -> Policy | None:
+        """Delete a policy. Idempotent: returns ``None`` if not found."""
         with self._session() as session:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
             if row is None or row.session_id != normalize_uuid(session_id):
-                return False
+                return None
+            entity = _to_entity(row)
             session.delete(row)
-            return True
+            return entity
 
     # ── Default (server-wide) policy methods ─────────────────────
 
@@ -348,11 +349,12 @@ class SqlAlchemyPolicyStore(PolicyStore):
             session.flush()
             return _to_entity(row)
 
-    def delete_default(self, policy_id: str) -> bool:
-        """Delete a default policy. Idempotent."""
+    def delete_default(self, policy_id: str) -> Policy | None:
+        """Delete a default policy. Idempotent: returns ``None`` if not found."""
         with self._session() as session:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
             if row is None or row.scope != encode_policy_scope("default"):
-                return False
+                return None
+            entity = _to_entity(row)
             session.delete(row)
-            return True
+            return entity

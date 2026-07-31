@@ -383,10 +383,9 @@ def create_default_policies_router(
             privileges.
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
-        _existing = store.get_default(policy_id)
-        store.delete_default(policy_id)
+        _deleted = store.delete_default(policy_id)
         invalidate_default_policy_specs_cache()
-        if _existing is not None:
+        if _deleted is not None:
             try:
                 import hashlib as _hashlib
 
@@ -398,7 +397,7 @@ def create_default_policies_router(
                 _tel_emit(
                     _TelPolicyDeletedEvent(
                         installation_id=_srv_id,
-                        handler=_existing.handler,
+                        handler=_deleted.handler,
                         scope="admin",
                         session_id=None,
                         anon_user_id=_anon,

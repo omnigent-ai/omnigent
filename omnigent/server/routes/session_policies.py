@@ -401,10 +401,9 @@ def create_session_policies_router(
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
-        _existing = store.get(policy_id, session_id)
-        store.delete(policy_id, session_id)
+        _deleted = store.delete(policy_id, session_id)
         invalidate_session_policy_specs_cache(session_id)
-        if _existing is not None:
+        if _deleted is not None:
             try:
                 import hashlib as _hashlib
 
@@ -416,7 +415,7 @@ def create_session_policies_router(
                 _tel_emit(
                     _TelPolicyDeletedEvent(
                         installation_id=_srv_id,
-                        handler=_existing.handler,
+                        handler=_deleted.handler,
                         scope="session",
                         session_id=session_id,
                         anon_user_id=_anon,
