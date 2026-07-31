@@ -441,6 +441,12 @@ export function AppShell() {
     () => inventoryTerminals(terminals, terminalFirst),
     [terminals, terminalFirst],
   );
+  // Whether the agent's spec declares shell access (a ``terminals:`` block).
+  // The desktop rail's Shells TAB shows only once a shell exists (creation is
+  // via the tab-strip "+" menu), but the MOBILE Shells drawer — which has no
+  // "+" menu — must be reachable at zero shells so its "+ New shell" row is the
+  // create entry point. So mobile gates on declared access too.
+  const agentSupportsShells = (boundAgent?.terminals ?? []).length > 0;
   // The "root" session for the Subagents tab. The rail renders the whole
   // spawn tree from the top-level session, so when the user is inside a
   // descendant we walk the parent chain to the top via ``useRootSessionId``
@@ -1391,7 +1397,12 @@ export function AppShell() {
                     shellsPanelOpen,
                     todosPanelOpen,
                     hideTerminalsTab,
-                    showShellsTab: railTabsAvailable.terminals,
+                    // Mobile: reachable when a shell exists OR the agent
+                    // declares shell access (so the drawer's "+ New shell" row
+                    // can create the first one). Desktop rail tab stays gated
+                    // on an existing shell (railTabsAvailable.terminals).
+                    showShellsTab:
+                      !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
                     terminalsLength: railTerminals.length,
                     todosSupported,
                     todosCompleted,
@@ -1540,6 +1551,9 @@ export function AppShell() {
                   <InlineTerminalsSection
                     conversationId={conversationId}
                     onExpand={openTerminalsPanel}
+                    // Mobile has no tab strip "+" menu, so the drawer carries
+                    // the "+ New shell" create row.
+                    showNewShell
                   />
                 </MobilePanelDrawer>
               )}

@@ -1,12 +1,14 @@
 // Shells tab content for the right-side rail: the session's shells as
 // rows. Clicking a shell row hands it to `onExpand`, which opens the
-// shell as a rail tab. Creating a new shell is done from the tab strip's
-// "+" menu (see NewTabMenu), not from here. The rail stays a lightweight
-// index.
+// shell as a rail tab. On desktop, creating a new shell is done from the
+// tab strip's "+" menu (see NewTabMenu), so no create affordance shows
+// here. On mobile (no tab strip) the drawer passes ``showNewShell`` to
+// surface a leading "+ New shell" row as the create entry point.
 
 import { TerminalIcon } from "lucide-react";
 import { useMemo } from "react";
 import { inventoryTerminals, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
+import { NewTerminalButton } from "./NewTerminalButton";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -15,9 +17,17 @@ interface InlineTerminalsSectionProps {
   conversationId: string;
   /** Open a shell in the main view, keyed by its terminal tab key. */
   onExpand: (terminalKey: string) => void;
+  /** Show a leading "+ New shell" create row. Off by default — the desktop
+   *  rail creates shells from the tab strip's "+" menu. Set on mobile, where
+   *  there's no tab strip, so the drawer stays a usable create entry point. */
+  showNewShell?: boolean;
 }
 
-export function InlineTerminalsSection({ conversationId, onExpand }: InlineTerminalsSectionProps) {
+export function InlineTerminalsSection({
+  conversationId,
+  onExpand,
+  showNewShell = false,
+}: InlineTerminalsSectionProps) {
   const { terminals: allTerminals } = useTerminals(conversationId);
   // Inventory view: the agent's own terminal (SDK REPL / native vendor
   // pane) backs the pill's Terminal view and must not appear as a
@@ -31,10 +41,14 @@ export function InlineTerminalsSection({ conversationId, onExpand }: InlineTermi
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-      {/* Plain top-aligned list of the session's shells. New shells are
-          created from the tab strip's "+" menu, not here — so an empty list
-          shows nothing (the "+" is the entry point). */}
+      {/* Plain top-aligned list of the session's shells. A leading
+          "+ New shell" row (mobile only, gated inside NewTerminalButton on the
+          agent's terminal access) keeps the create entry point reachable where
+          there's no tab strip "+" menu. */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto py-1">
+        {showNewShell && (
+          <NewTerminalButton conversationId={conversationId} onCreated={onExpand} variant="row" />
+        )}
         {terminals.map((t) => (
           <button
             key={terminalTabKey(t)}

@@ -2679,16 +2679,19 @@ describe("Mobile session menu", () => {
     expect(screen.getByRole("menuitem", { name: /Shells/i })).toBeInTheDocument();
   });
 
-  it("shows the Shells entry on mobile once a shell exists", () => {
-    // Mobile mirrors the desktop rail's Shells gate: the entry shows only when
-    // a real (non-REPL) shell exists to list — creation is via the "+" menu.
+  it("shows the Shells entry on mobile at zero shells when the agent declares shell access", () => {
+    // Mobile has no tab-strip "+" menu, so the drawer is the create entry point:
+    // its Shells entry shows before any shell exists (declared access), unlike
+    // the desktop rail tab which gates on an existing shell. Here the only
+    // terminal is the embedded REPL (excluded from the inventory), so there's
+    // no shell yet — the entry must still appear.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([{ id: "conv_sdk", permission_level: null }]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_zsh_s1", name: "zsh", session: "s1", running: true }],
+      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
       isLoading: false,
       error: null,
     });
