@@ -2331,6 +2331,48 @@ def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
     )
 
 
+def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
+    """
+    Regression: a framework write root added via
+    ``with_additional_write_roots`` (the per-helper scratch tmpdir) is
+    excluded from the dotfile scan, so the egress ``.egress.sock`` in it
+    gets NO deny rule. Denying that socket cut off the relay endpoint and
+    reset every egress connection. A genuine user write root is still
+    scanned.
+    """
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    scratch = tmp_path / "scratch"  # framework runtime dir
+    scratch.mkdir()
+    (scratch / ".egress.sock").write_text("")  # dotfile the sandbox needs
+    user_root = tmp_path / "shared"  # real user write grant
+    user_root.mkdir()
+    (user_root / ".env").write_text("SECRET=1")
+
+    policy = _make_policy(
+        cwd,
+        write_roots=[user_root.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    # Mirror the real launch: the parent folds the scratch tmpdir in as a
+    # framework write root just before building the profile.
+    policy = with_additional_write_roots(policy, [scratch])
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    sock = scratch.resolve(strict=False) / ".egress.sock"
+    sock_deny = f'(deny file-read* file-write* (literal "{sock}"))'
+    assert sock_deny not in profile, (
+        "The framework scratch tmpdir must be excluded from the dotfile scan; "
+        "denying .egress.sock breaks the egress relay."
+    )
+    user_env = (
+        f'(deny file-read* file-write* (literal "{user_root.resolve(strict=False) / ".env"}"))'
+    )
+    assert user_env in profile, "A genuine user write root must still have its dotfiles denied."
+
+
 # ---------------------------------------------------------------------------
 # Exec-chain symlink hops + launcher target visibility (bwrap parity)
 # ---------------------------------------------------------------------------

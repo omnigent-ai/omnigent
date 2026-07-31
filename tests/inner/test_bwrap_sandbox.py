@@ -1270,6 +1270,50 @@ def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
     )
 
 
+def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
+    """
+    Regression: a framework write root added via
+    ``with_additional_write_roots`` (the per-helper scratch tmpdir) is
+    excluded from the dotfile scan, so the egress ``.egress.sock`` living
+    in it is NOT masked. Masking that socket ``--bind-try /dev/null``'d
+    the relay endpoint and reset every egress connection (the inner-rest
+    ``test_egress_e2e`` failures). A genuine user write root is still
+    scanned.
+    """
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    scratch = tmp_path / "scratch"  # framework runtime dir
+    scratch.mkdir()
+    (scratch / ".egress.sock").write_text("")  # dotfile the sandbox needs
+    user_root = tmp_path / "shared"  # real user write grant
+    user_root.mkdir()
+    (user_root / ".env").write_text("SECRET=1")
+
+    backend = _make_backend()
+    policy = _make_policy(
+        cwd,
+        write_roots=[user_root.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    # Mirror the real launch: the parent folds the scratch tmpdir in as a
+    # framework write root just before building the argv.
+    policy = with_additional_write_roots(policy, [scratch])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    sock = str(scratch.resolve(strict=False) / ".egress.sock")
+    assert not _has_pair(argv, "--bind-try", "/dev/null", sock), (
+        "The framework scratch tmpdir must be excluded from the dotfile scan; "
+        "masking .egress.sock breaks the egress relay."
+    )
+    # The real user write grant is still scanned and masked.
+    user_env = str(user_root.resolve(strict=False) / ".env")
+    assert _has_pair(argv, "--bind-try", "/dev/null", user_env), (
+        "A genuine user write root must still have its dotfiles masked."
+    )
+
+
 def test_dotfile_masking_skips_target_that_vanished_after_scan(
     tmp_path: Path,
 ) -> None:

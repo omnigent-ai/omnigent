@@ -1822,6 +1822,7 @@ def _scan_extra_roots_mask_entries(
         policy.read_roots,
         policy.write_roots,
         recursive=policy.cwd_hidden_scan_recursive,
+        skip_roots=policy.mask_scan_skip_roots,
     ):
         try:
             root_entries = scan_cwd_mask_entries(

@@ -862,3 +862,31 @@ def test_merge_scan_roots_keeps_ancestor_of_cwd(tmp_path: Path) -> None:
 
     assert merge_scan_roots(cwd, [parent], None, recursive=True) == [parent]
     assert merge_scan_roots(cwd, [parent], None, recursive=False) == [parent]
+
+
+def test_merge_scan_roots_skips_framework_roots(tmp_path: Path) -> None:
+    """
+    Framework scratch / runtime write roots passed via ``skip_roots`` are
+    dropped from the scan — along with anything nested under them — so the
+    dotfile mask never hides the sandbox's own machinery (e.g. the egress
+    ``.egress.sock`` that lives in the scratch tmpdir). A genuine user
+    grant that merely sits beside a skip root is still walked.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    scratch = tmp_path / "scratch"  # framework write root (holds .egress.sock)
+    scratch.mkdir()
+    nested_in_scratch = scratch / "inner"
+    nested_in_scratch.mkdir()
+    user_grant = tmp_path / "grant"  # real user write/read root — must survive
+    user_grant.mkdir()
+
+    result = merge_scan_roots(
+        cwd,
+        [user_grant],
+        [scratch, nested_in_scratch, user_grant],
+        recursive=False,
+        skip_roots=[scratch],
+    )
+
+    assert result == [user_grant], result

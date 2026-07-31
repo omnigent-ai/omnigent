@@ -511,6 +511,7 @@ def merge_scan_roots(
     cwd: Path,
     *root_lists: Sequence[Path] | None,
     recursive: bool,
+    skip_roots: Sequence[Path] | None = None,
 ) -> list[Path]:
     """
     Merge the extra roots a backend must mask-scan (beyond *cwd*) into
@@ -521,6 +522,15 @@ def merge_scan_roots(
     once, not once per lever. A root is always dropped when it is *cwd*
     or lives under *cwd*: the caller scans *cwd* itself, so that subtree
     is covered (this predates the ``write_paths`` extension).
+
+    A root is also dropped when it is at or under any *skip_roots* entry.
+    ``skip_roots`` carries the framework's own scratch / runtime write
+    roots (see
+    :attr:`~omnigent.inner.sandbox.SandboxPolicy.mask_scan_skip_roots`):
+    they hold sandbox scaffolding — the egress ``.egress.sock``, CA
+    bundle, credential-proxy files — not pre-existing user secrets, so
+    scanning them is pointless and masking their dotfiles breaks the
+    sandbox's own machinery.
 
     Whether a *granted* root nested under ANOTHER kept grant is dropped
     depends on *recursive* — and getting this wrong un-masks secrets:
@@ -545,6 +555,8 @@ def merge_scan_roots(
     :param recursive: Whether the backend walks each root recursively.
         Must match ``cwd_hidden_scan_recursive`` so the nested-grant
         drop only fires when a parent walk actually covers the child.
+    :param skip_roots: Framework write roots to exclude entirely. A
+        candidate at or under any of these is dropped from the scan.
     :returns: The roots to walk, deduplicated and ordered outermost-first.
     """
     # Resolve each distinct root exactly once (symlink-free) so the
@@ -552,6 +564,7 @@ def merge_scan_roots(
     # would re-``resolve`` O(n^2) times and stall on the big grant lists
     # the profile-size guard tests deliberately feed in.
     cwd_str = _resolve_str(cwd)
+    skip_strs = {_resolve_str(root) for root in skip_roots or []}
     seen_input: set[str] = set()
     resolved: list[tuple[str, Path]] = []
     for roots in root_lists:
@@ -568,6 +581,11 @@ def merge_scan_roots(
     kept_strs: set[str] = set()
     for root_str, root in resolved:
         if _within_str(root_str, cwd_str):
+            continue
+        # Drop framework scratch / runtime roots and anything nested
+        # under them — masking their dotfiles (e.g. ``.egress.sock``)
+        # would break the sandbox's own machinery.
+        if skip_strs and _path_has_ancestor(root_str, skip_strs):
             continue
         if recursive:
             # A recursive walk of a kept ancestor covers this root. Walk

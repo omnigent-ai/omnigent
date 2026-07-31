@@ -279,6 +279,34 @@ def test_sandbox_policy_round_trips_mask_and_recursive_fields() -> None:
     assert baseline.mask_paths is None
 
 
+def test_with_additional_write_roots_records_mask_scan_skip_roots() -> None:
+    """A framework write root added post-resolve is excluded from the
+    dotfile mask scan.
+
+    The per-helper scratch tmpdir (holding the egress ``.egress.sock``,
+    CA bundle, credential-proxy files) is folded into ``write_roots`` via
+    :func:`with_additional_write_roots`. It must also land in
+    ``mask_scan_skip_roots`` so the scan never masks ``.egress.sock`` and
+    breaks the egress relay. The source policy stays untouched (builders
+    are chained off a shared base).
+    """
+    from pathlib import Path
+
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    policy = _noop_policy()
+    scratch = Path("/tmp/omnigent-helper-ab12")
+
+    augmented = with_additional_write_roots(policy, [scratch])
+
+    resolved = scratch.resolve(strict=False)
+    assert resolved in augmented.write_roots
+    assert augmented.mask_scan_skip_roots == [resolved]
+    # Source policy not mutated.
+    assert policy.mask_scan_skip_roots is None
+    assert augmented is not policy
+
+
 def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:
     """``with_denied_unix_sockets`` resolves + de-duplicates the socket
     paths and never mutates the input policy.
