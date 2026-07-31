@@ -818,6 +818,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             image=_parse_provider_image(raw, "openshell"),
             env=_parse_provider_env(raw, "openshell"),
             cluster=_parse_provider_string(raw, "openshell", "cluster"),
+            workspace=_parse_provider_string(raw, "openshell", "workspace"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     elif provider == "kubernetes":
@@ -1483,6 +1484,7 @@ def _openshell_launcher_factory(
     image: str | None,
     env: list[str] | None,
     cluster: str | None,
+    workspace: str | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: openshell`` path.
@@ -1496,6 +1498,9 @@ def _openshell_launcher_factory(
     :param cluster: OpenShell gateway name to connect to, or ``None`` to
         use the active gateway (``$OPENSHELL_GATEWAY`` /
         ``~/.config/openshell/active_gateway``).
+    :param workspace: OpenShell workspace for sandbox lifecycle, or
+        ``None`` to resolve from ``$OMNIGENT_OPENSHELL_WORKSPACE``
+        then ``"default"``.
     :returns: A factory producing parameterized OpenShell launchers.
     """
 
@@ -1503,7 +1508,7 @@ def _openshell_launcher_factory(
         """Construct the OpenShell launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
 
-        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster)
+        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster, workspace=workspace)
 
     return _build
 

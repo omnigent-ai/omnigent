@@ -1,3 +1,6 @@
+import type * as ReactRouterDomModule from "react-router-dom";
+import type * as WorkspacePickerModule from "./WorkspacePicker";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -19,7 +22,7 @@ import { checkHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("react-router-dom")>();
+  const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
 });
 vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
@@ -39,7 +42,7 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 // directory being prefilled from the source, so the real picker never opens —
 // stub it anyway to keep its filesystem fetch out of the test.
 vi.mock("./WorkspacePicker", async (importActual) => ({
-  ...(await importActual<typeof import("./WorkspacePicker")>()),
+  ...(await importActual<typeof WorkspacePickerModule>()),
   WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
     <button type="button" data-testid="mock-pick-workspace" onClick={() => onSelect("/picked")}>
       pick

@@ -32,6 +32,10 @@ The remaining pins fall into a few buckets:
 - When a supported file or the baseline changes, `.pre-commit-config.yaml` runs
   the hook across the full tracked lint surface so both new pins and stale
   allowlist counts fail.
+- Unavoidable static aliases pass only when Python AST analysis proves they are
+  confined to complete `StaticModelFallback` records in
+  `omnigent/model_fallbacks.py`, including non-empty owner, provenance, and
+  discovery-gap metadata.
 - New hardcoded ids fail unless the allowlist count is intentionally updated,
   while removing a pin requires lowering or deleting its baseline entry.
 
@@ -159,6 +163,22 @@ An explicit Anthropic `[1m]` marker remains self-describing metadata, and an
 uncatalogued/offline model keeps the conservative 128K fallback rather than a
 release-specific guess.
 
+## Pi Wire Routing
+
+Pi gateway configuration consumes the same normalized Unity Catalog model
+service metadata. Databricks GPT models use the Responses or Chat surface the
+catalog advertises, while generic OpenAI-compatible providers honor their
+configured wire. If Databricks discovery is unavailable, an unknown GPT uses
+Responses rather than a release-specific completions allowlist.
+
+## Pi Picker Migration
+
+Inner Pi sessions populate their model registry from live Unity Catalog model
+services instead of a release-specific Databricks list. MLflow metadata adds
+context and output limits when available. If discovery is unavailable, the
+resolved run model is still registered so launch does not depend on picker
+enumeration; no stale alternatives are offered.
+
 ## Kiro Picker Migration
 
 The Kiro Web picker now runs `kiro-cli chat --list-models --format json` on the
@@ -185,6 +205,33 @@ prefilling a source-controlled model pin.
 The same policy supplies the final runtime fallback for key, gateway, and local
 providers. Explicit agent and provider defaults still win; without either,
 runtime discovery fails with configuration guidance when no catalog is available.
+
+## Persistent Catalog Resilience
+
+The shared MLflow catalog boundary persists one validated last-known-good file
+per provider in the platform user-cache directory. A cache is fresh for one
+hour; if live retrieval fails, a validated entry remains usable for up to seven
+days and logs its source and age. Atomic replacement prevents concurrent
+processes from exposing partial JSON.
+
+Cache files record their own schema version, the upstream catalog schema,
+source URL, and fetch time. Corrupt, incompatible, wrong-source, or over-age
+entries are ignored. `OMNIGENT_DISABLE_CATALOG_LOOKUP=1` bypasses in-memory,
+disk, and network lookup so tests cannot inherit developer-machine state.
+
+## Configuration Help Text
+
+Setup prompts, routing policy schemas, and spawn-tool descriptions explain the
+expected provider-configured model value without embedding release-specific ids.
+Runtime help may use synthetic examples to show identifier shape; concrete
+release ids belong in tests or provider-owned documentation.
+
+## Static Fallback Ownership
+
+The remaining Claude and Codex aliases live only in
+`omnigent/model_fallbacks.py`. Each fallback records its adapter owner, catalog
+provenance, and the discovery gap that prevents a live listing. `sys_list_models`
+surfaces those fields whenever it returns an unverified static catalog.
 
 ## Kimi Example Default
 

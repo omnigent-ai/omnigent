@@ -83,11 +83,7 @@ import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
-import {
-  terminalInfoFromResource,
-  terminalsQueryKey,
-  type TerminalInfo,
-} from "@/hooks/useTerminals";
+import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
   ContentBlock,
   ModelUsage,
@@ -475,11 +471,11 @@ export interface ChatState {
    * `session.todos` SSE events. Empty array for non-claude-native
    * sessions or before the first poll tick from the forwarder.
    */
-  todos: Array<{
+  todos: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
   /**
    * Skills the bound agent can invoke (bundled + host-discovered).
    * Populated from the session snapshot on bind; empty array
@@ -1552,7 +1548,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // that window and nothing more. Pruned to non-empty so the map
       // doesn't accrete stale keys; a restored bubble is reconciled
       // against the server snapshot in bindStream.
-      const pendingByConversation = { ...s.pendingByConversation };
+      let pendingByConversation = { ...s.pendingByConversation };
       if (s.conversationId !== null) {
         // Stash only THIS client's own UNSETTLED bubbles — client temp
         // ids (`pend_<n>`, set by send) whose POST hasn't returned.
@@ -1577,7 +1573,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             committedTexts: committedUserTextsOf(s.blocks),
           };
         } else {
-          delete pendingByConversation[s.conversationId];
+          const { [s.conversationId]: _removedStash, ...remainingStashes } = pendingByConversation;
+          pendingByConversation = remainingStashes;
         }
       }
       return {
@@ -2461,10 +2458,14 @@ async function bindStream(
       const prunedStash = hydratePending
         ? (() => {
             const own = snapshotPending.filter((p) => p.tempId.startsWith("pend_"));
-            const next = { ...state.pendingByConversation };
-            if (own.length > 0) next[id] = { messages: own, committedTexts: committedUserTexts };
-            else delete next[id];
-            return next;
+            if (own.length > 0) {
+              return {
+                ...state.pendingByConversation,
+                [id]: { messages: own, committedTexts: committedUserTexts },
+              };
+            }
+            const { [id]: _removedStash, ...remainingStashes } = state.pendingByConversation;
+            return remainingStashes;
           })()
         : state.pendingByConversation;
       const syntheticError: ErrorBlock | null =
@@ -2507,11 +2508,11 @@ async function bindStream(
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
-        todos: (session.todos ?? []) as Array<{
+        todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
           activeForm: string;
-        }>,
+        }[],
       };
     });
     racedNativeModelOptions.delete(id);
@@ -3973,10 +3974,9 @@ function removeFromPendingStash(
   const entry = stash[conversationId];
   if (!entry || !entry.messages.some((p) => p.tempId === tempId)) return stash;
   const messages = entry.messages.filter((p) => p.tempId !== tempId);
-  const next = { ...stash };
-  if (messages.length > 0) next[conversationId] = { ...entry, messages };
-  else delete next[conversationId];
-  return next;
+  if (messages.length > 0) return { ...stash, [conversationId]: { ...entry, messages } };
+  const { [conversationId]: _removedStash, ...remainingStashes } = stash;
+  return remainingStashes;
 }
 
 /**
@@ -4498,8 +4498,8 @@ export function handleSessionEvent(event: StreamEvent): void {
         // user bubble would otherwise spin forever. Drop the superseded
         // conversation's pending bubbles (live view + the navigate-back
         // stash) since the turn is over; resuming starts a fresh one.
-        const pendingByConversation = { ...s.pendingByConversation };
-        delete pendingByConversation[event.conversationId];
+        const { [event.conversationId]: _removedStash, ...pendingByConversation } =
+          s.pendingByConversation;
         return {
           redirectToConversationId: event.targetConversationId,
           pendingUserMessages: [],

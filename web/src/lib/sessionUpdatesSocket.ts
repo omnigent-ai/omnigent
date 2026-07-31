@@ -102,7 +102,10 @@ class SessionUpdatesSocket {
     this.ws = null;
     if (ws) {
       // Drop handlers first so the close doesn't schedule a reconnect.
-      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
       ws.close();
     }
     this.setConnected(false);

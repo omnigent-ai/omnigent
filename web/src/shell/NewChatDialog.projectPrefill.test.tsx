@@ -1,3 +1,6 @@
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
@@ -60,12 +63,12 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // The project list + config are the unit under test's inputs — stub the hooks
 // so each case controls them without HTTP-layer plumbing.
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: vi.fn(),
   useProjectConfig: vi.fn(),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({}),
   // Stub so the setup dialog's hook doesn't fire its own /v1/harnesses fetch
   // (which would skew the create-flow call-count assertions here).

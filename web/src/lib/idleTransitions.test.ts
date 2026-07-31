@@ -244,7 +244,7 @@ describe("computeUnreadBadgeIds", () => {
   it("passes each session's id, updated_at, and status to the predicate", () => {
     // The hook wires isConversationUnseen here; wrong arguments would make
     // the localStorage lookup miss and the badge silently read 0.
-    const calls: Array<{ id: string; updatedAt: number; status: string | undefined }> = [];
+    const calls: { id: string; updatedAt: number; status: string | undefined }[] = [];
     computeUnreadBadgeIds(
       [convB("a", { updatedAt: 42, status: "failed" })],
       undefined,

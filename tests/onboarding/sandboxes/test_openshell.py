@@ -16,6 +16,7 @@ from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
 from omnigent.onboarding.sandboxes.openshell import (
     HOST_IMAGE_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
+    WORKSPACE_ENV_VAR,
     OpenShellSandboxLauncher,
     _OpenShellClient,
 )
@@ -367,6 +368,7 @@ class _SDKState:
     stream_exit_code: int = 0
     last_workdir: str | None = None
     last_env: dict[str, str] | None = None
+    created_workspace: str | None = None
 
 
 @pytest.fixture
@@ -404,15 +406,18 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
                 raise _SandboxError("no active gateway configured")
             return cls()
 
-        def create(self, *, spec: Any) -> _SandboxRef:
+        def create(self, *, workspace: str, spec: Any) -> _SandboxRef:
             state.created_spec = spec
+            state.created_workspace = workspace
             return _SandboxRef(id="id-1", name="petname-new")
 
-        def wait_ready(self, name: str, *, timeout_seconds: int | None = None) -> _SandboxRef:
+        def wait_ready(
+            self, name: str, *, workspace: str, timeout_seconds: int | None = None
+        ) -> _SandboxRef:
             state.waited = (name, timeout_seconds)
             return _SandboxRef(id="id-1", name=name)
 
-        def get(self, name: str) -> _SandboxRef:
+        def get(self, name: str, *, workspace: str) -> _SandboxRef:
             state.got.append(name)
             return _SandboxRef(id=f"id-for-{name}", name=name)
 
@@ -447,7 +452,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
                 yield _FakeExecChunk(stream=stream, data=data)
             yield _FakeExecResult(exit_code=state.stream_exit_code)
 
-        def delete(self, name: str) -> None:
+        def delete(self, name: str, *, workspace: str) -> None:
             state.deleted.append(name)
             if state.delete_not_found:
                 raise _NotFound(_StatusCode.NOT_FOUND)
@@ -504,7 +509,16 @@ def test_client_create_sandbox(sdk: _SDKState) -> None:
     assert name == "petname-new"
     assert sdk.created_spec.template.image == "ghcr.io/x/host:1"
     assert sdk.created_spec.environment == {"A": "1"}
+    assert sdk.created_workspace == "default"
     assert sdk.waited == ("petname-new", 300)
+
+
+def test_client_create_sandbox_custom_workspace(sdk: _SDKState) -> None:
+    """A custom workspace reaches the SDK create call."""
+    client = _OpenShellClient(workspace="team-beta")
+    client.create_sandbox(image="img", env={})
+
+    assert sdk.created_workspace == "team-beta"
 
 
 def test_client_execute_maps_name_to_id(sdk: _SDKState) -> None:
@@ -569,6 +583,28 @@ def test_client_connect_error_raises(sdk: _SDKState) -> None:
     sdk.connect_error = True
     with pytest.raises(click.ClickException, match="OpenShell gateway"):
         _OpenShellClient()
+
+
+def test_launcher_workspace_from_env(sdk: _SDKState, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Workspace resolves from ``OMNIGENT_OPENSHELL_WORKSPACE`` when not explicit."""
+    monkeypatch.setenv(WORKSPACE_ENV_VAR, "team-alpha")
+    launcher = OpenShellSandboxLauncher()
+    assert launcher._workspace == "team-alpha"
+
+
+def test_launcher_workspace_defaults_to_default(
+    sdk: _SDKState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without explicit workspace or env var, workspace is ``"default"``."""
+    monkeypatch.delenv(WORKSPACE_ENV_VAR, raising=False)
+    launcher = OpenShellSandboxLauncher()
+    assert launcher._workspace == "default"
+
+
+def test_launcher_workspace_explicit(sdk: _SDKState) -> None:
+    """An explicit workspace kwarg takes precedence over the env var."""
+    launcher = OpenShellSandboxLauncher(workspace="my-ws")
+    assert launcher._workspace == "my-ws"
 
 
 def test_client_run_foreground_streams_and_returns_exit(

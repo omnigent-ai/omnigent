@@ -1215,7 +1215,13 @@ describe("useBulkArchiveConversations", () => {
     rendered.result.current.mutate({ ids: ["conv_a", "conv_b"], archived: true });
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
 
-    expect((rendered.result.current.error as any).failed).toEqual(["conv_b"]);
+    expect(rendered.result.current.error).toBeInstanceOf(Error);
+    expect(rendered.result.current.error).toMatchObject({
+      message: "Failed to archive 1 of 2 conversations",
+      failed: ["conv_b"],
+      succeeded: [],
+      total: 2,
+    });
   });
 });
 
@@ -1272,6 +1278,13 @@ describe("useBulkDeleteConversations", () => {
     expect(ids).not.toContain("conv_a");
     expect(ids).toContain("conv_b");
     expect(ids).toContain("conv_keep");
+    expect(rendered.result.current.error).toBeInstanceOf(Error);
+    expect(rendered.result.current.error).toMatchObject({
+      message: "Failed to delete 1 of 2 conversations",
+      failed: ["conv_b"],
+      succeeded: ["conv_a"],
+      total: 2,
+    });
   });
 });
 
@@ -1314,9 +1327,13 @@ describe("useBulkStopSessions", () => {
     rendered.result.current.mutate(["conv_a", "conv_b"]);
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
 
-    const err = rendered.result.current.error as any;
-    expect(err.succeeded).toEqual(["conv_a"]);
-    expect(err.failed).toEqual(["conv_b"]);
+    expect(rendered.result.current.error).toBeInstanceOf(Error);
+    expect(rendered.result.current.error).toMatchObject({
+      message: "Failed to stop 1 of 2 conversations",
+      failed: ["conv_b"],
+      succeeded: ["conv_a"],
+      total: 2,
+    });
   });
 });
 
@@ -1675,13 +1692,12 @@ describe("useDeleteProject", () => {
     result.current.mutate({ id: "p_1", name: "Sprint 42" });
     await waitFor(() => expect(result.current.isError).toBe(true));
 
-    const err = result.current.error as unknown as {
-      failed: string[];
-      succeeded: string[];
-      total: number;
-    };
-    expect(err.failed).toEqual(["conv_b"]);
-    expect(err.succeeded).toEqual(["conv_a"]);
-    expect(err.total).toBe(2);
+    expect(result.current.error).toBeInstanceOf(Error);
+    expect(result.current.error).toMatchObject({
+      message: "Failed to archive and unfile 1 of 2 conversations",
+      failed: ["conv_b"],
+      succeeded: ["conv_a"],
+      total: 2,
+    });
   });
 });

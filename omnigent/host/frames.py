@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TypeAlias
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
@@ -32,6 +32,8 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # by the daemon (producer), server (maps it to
 # ``ErrorCode.HARNESS_NOT_CONFIGURED``), and tests.
 HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
+
+_JsonObject: TypeAlias = dict[str, object]
 
 
 class HostFrameKind(str, Enum):
@@ -539,7 +541,7 @@ class HostListWorktreesResultFrame:
 
     request_id: str
     status: str
-    worktrees: list[dict[str, Any]] | None = None
+    worktrees: list[_JsonObject] | None = None
     error: str | None = None
 
 
@@ -762,7 +764,7 @@ class HostFsRequestFrame:
     op: str
     workspace: str
     session_id: str
-    params: dict[str, Any] = field(default_factory=dict)
+    params: _JsonObject = field(default_factory=dict)
 
 
 @dataclass
@@ -783,7 +785,7 @@ class HostFsResultFrame:
 
     request_id: str
     status: str
-    payload: dict[str, Any] | None = None
+    payload: _JsonObject | None = None
     error_status: int | None = None
     error_code: str | None = None
     error: str | None = None
@@ -803,7 +805,7 @@ class HostModelOptionsResultFrame:
 
     request_id: str
     status: str
-    models: list[dict[str, Any]] = field(default_factory=list)
+    models: list[_JsonObject] = field(default_factory=list)
     error: str | None = None
 
 
@@ -829,6 +831,12 @@ HostFrame = (
     | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostInstallHarnessFrame
+    | HostInstallHarnessResultFrame
+    | HostStoreSecretFrame
+    | HostStoreSecretResultFrame
+    | HostDetectCredentialsFrame
+    | HostDetectCredentialsResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
     | HostModelOptionsFrame
@@ -839,7 +847,7 @@ HostFrame = (
 # ── Encode / decode ──────────────────────────────────────
 
 
-def _encode_payload(payload: dict[str, Any]) -> str:
+def _encode_payload(payload: _JsonObject) -> str:
     """Serialize a frame payload, injecting the active trace context.
 
     Centralized so every host frame carries a W3C ``traceparent`` (and
@@ -859,7 +867,9 @@ def _encode_payload(payload: dict[str, Any]) -> str:
     # content capture) before injecting propagation keys, so the span
     # shows exactly what this side sent.
     telemetry.record_message_payload(payload)
-    telemetry.inject_trace_context(payload)
+    trace_context: dict[str, str] = {}
+    telemetry.inject_trace_context(trace_context)
+    payload.update(trace_context)
     return json.dumps(payload)
 
 
@@ -1194,7 +1204,7 @@ def decode_host_frame(text: str) -> HostFrame:
     return _decode_known_host_frame(kind, msg)
 
 
-def _parse_frame_object(text: str) -> dict[str, Any]:
+def _parse_frame_object(text: str) -> _JsonObject:
     """Parse a JSON frame object.
 
     :param text: Raw JSON frame text.
@@ -1210,7 +1220,7 @@ def _parse_frame_object(text: str) -> dict[str, Any]:
     return msg
 
 
-def _parse_host_frame_kind(msg: dict[str, Any]) -> HostFrameKind:
+def _parse_host_frame_kind(msg: _JsonObject) -> HostFrameKind:
     """Parse the host frame kind discriminator.
 
     :param msg: Decoded frame object.
@@ -1228,7 +1238,7 @@ def _parse_host_frame_kind(msg: dict[str, Any]) -> HostFrameKind:
 
 def _decode_known_host_frame(
     kind: HostFrameKind,
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostFrame:
     """Decode a host frame with a validated kind.
 
@@ -1303,7 +1313,7 @@ def _decode_known_host_frame(
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
-def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
+def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
     """Decode a host hello frame.
 
     :param msg: Decoded frame object.
@@ -1320,12 +1330,14 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
     )
 
 
-def _decode_harness_readiness(msg: dict[str, Any]) -> HostHarnessReadinessFrame:
+def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     """Decode a live harness-readiness refresh frame."""
+    raw = msg.get("configured_harnesses")
+    if not isinstance(raw, dict):
+        raise ValueError("harness readiness frame requires a configured_harnesses object")
     configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
     if configured_harnesses is None:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
-    raw = msg["configured_harnesses"]
     if len(configured_harnesses) != len(raw):
         raise ValueError("harness readiness frame contains an unsupported availability state")
     if not configured_harnesses:
@@ -1333,7 +1345,7 @@ def _decode_harness_readiness(msg: dict[str, Any]) -> HostHarnessReadinessFrame:
     return HostHarnessReadinessFrame(configured_harnesses=configured_harnesses)
 
 
-def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
+def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     """Decode a launch-runner frame.
 
     :param msg: Decoded frame object.
@@ -1349,7 +1361,7 @@ def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
 
 
 def _decode_launch_runner_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostLaunchRunnerResultFrame:
     """Decode a launch-runner-result frame.
 
@@ -1365,7 +1377,7 @@ def _decode_launch_runner_result(
     )
 
 
-def _decode_stop_runner(msg: dict[str, Any]) -> HostStopRunnerFrame:
+def _decode_stop_runner(msg: _JsonObject) -> HostStopRunnerFrame:
     """Decode a stop-runner frame.
 
     :param msg: Decoded frame object.
@@ -1378,7 +1390,7 @@ def _decode_stop_runner(msg: dict[str, Any]) -> HostStopRunnerFrame:
 
 
 def _decode_stop_runner_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostStopRunnerResultFrame:
     """Decode a stop-runner-result frame.
 
@@ -1392,7 +1404,7 @@ def _decode_stop_runner_result(
     )
 
 
-def _decode_runner_exited(msg: dict[str, Any]) -> HostRunnerExitedFrame:
+def _decode_runner_exited(msg: _JsonObject) -> HostRunnerExitedFrame:
     """Decode a host.runner_exited report frame.
 
     :param msg: Decoded frame object.
@@ -1404,7 +1416,7 @@ def _decode_runner_exited(msg: dict[str, Any]) -> HostRunnerExitedFrame:
     )
 
 
-def _decode_runner_status(msg: dict[str, Any]) -> HostRunnerStatusFrame:
+def _decode_runner_status(msg: _JsonObject) -> HostRunnerStatusFrame:
     """Decode a host.runner_status request frame.
 
     :param msg: Decoded frame object.
@@ -1417,7 +1429,7 @@ def _decode_runner_status(msg: dict[str, Any]) -> HostRunnerStatusFrame:
 
 
 def _decode_runner_status_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostRunnerStatusResultFrame:
     """Decode a host.runner_status_result frame.
 
@@ -1430,7 +1442,7 @@ def _decode_runner_status_result(
     )
 
 
-def _decode_stat(msg: dict[str, Any]) -> HostStatFrame:
+def _decode_stat(msg: _JsonObject) -> HostStatFrame:
     """Decode a host.stat request frame.
 
     :param msg: Decoded frame object.
@@ -1442,7 +1454,7 @@ def _decode_stat(msg: dict[str, Any]) -> HostStatFrame:
     )
 
 
-def _decode_stat_result(msg: dict[str, Any]) -> HostStatResultFrame:
+def _decode_stat_result(msg: _JsonObject) -> HostStatResultFrame:
     """Decode a host.stat_result frame.
 
     :param msg: Decoded frame object.
@@ -1458,7 +1470,7 @@ def _decode_stat_result(msg: dict[str, Any]) -> HostStatResultFrame:
     )
 
 
-def _decode_list_dir(msg: dict[str, Any]) -> HostListDirFrame:
+def _decode_list_dir(msg: _JsonObject) -> HostListDirFrame:
     """Decode a host.list_dir request frame.
 
     :param msg: Decoded frame object.
@@ -1476,7 +1488,7 @@ def _decode_list_dir(msg: dict[str, Any]) -> HostListDirFrame:
     )
 
 
-def _decode_list_dir_result(msg: dict[str, Any]) -> HostListDirResultFrame:
+def _decode_list_dir_result(msg: _JsonObject) -> HostListDirResultFrame:
     """Decode a host.list_dir_result frame.
 
     :param msg: Decoded frame object.
@@ -1502,7 +1514,7 @@ def _decode_list_dir_result(msg: dict[str, Any]) -> HostListDirResultFrame:
     )
 
 
-def _decode_list_dir_entry(msg: dict[str, Any]) -> HostListDirEntry:
+def _decode_list_dir_entry(msg: _JsonObject) -> HostListDirEntry:
     """Decode a single entry in a host.list_dir_result.
 
     :param msg: Decoded entry object.
@@ -1525,7 +1537,7 @@ def _decode_list_dir_entry(msg: dict[str, Any]) -> HostListDirEntry:
     )
 
 
-def _decode_create_worktree(msg: dict[str, Any]) -> HostCreateWorktreeFrame:
+def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
     """Decode a host.create_worktree request frame.
 
     :param msg: Decoded frame object.
@@ -1540,7 +1552,7 @@ def _decode_create_worktree(msg: dict[str, Any]) -> HostCreateWorktreeFrame:
 
 
 def _decode_create_worktree_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostCreateWorktreeResultFrame:
     """Decode a host.create_worktree_result frame.
 
@@ -1556,7 +1568,7 @@ def _decode_create_worktree_result(
     )
 
 
-def _decode_remove_worktree(msg: dict[str, Any]) -> HostRemoveWorktreeFrame:
+def _decode_remove_worktree(msg: _JsonObject) -> HostRemoveWorktreeFrame:
     """Decode a host.remove_worktree request frame.
 
     :param msg: Decoded frame object.
@@ -1574,7 +1586,7 @@ def _decode_remove_worktree(msg: dict[str, Any]) -> HostRemoveWorktreeFrame:
 
 
 def _decode_remove_worktree_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostRemoveWorktreeResultFrame:
     """Decode a host.remove_worktree_result frame.
 
@@ -1588,7 +1600,7 @@ def _decode_remove_worktree_result(
     )
 
 
-def _decode_list_worktrees(msg: dict[str, Any]) -> HostListWorktreesFrame:
+def _decode_list_worktrees(msg: _JsonObject) -> HostListWorktreesFrame:
     """Decode a host.list_worktrees request frame.
 
     :param msg: Decoded frame object.
@@ -1601,7 +1613,7 @@ def _decode_list_worktrees(msg: dict[str, Any]) -> HostListWorktreesFrame:
 
 
 def _decode_list_worktrees_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostListWorktreesResultFrame:
     """Decode a host.list_worktrees_result frame.
 
@@ -1623,7 +1635,7 @@ def _decode_list_worktrees_result(
     )
 
 
-def _decode_create_dir(msg: dict[str, Any]) -> HostCreateDirFrame:
+def _decode_create_dir(msg: _JsonObject) -> HostCreateDirFrame:
     """Decode a host.create_dir request frame.
 
     :param msg: Decoded frame object.
@@ -1635,7 +1647,7 @@ def _decode_create_dir(msg: dict[str, Any]) -> HostCreateDirFrame:
     )
 
 
-def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
+def _decode_create_dir_result(msg: _JsonObject) -> HostCreateDirResultFrame:
     """Decode a host.create_dir_result frame.
 
     :param msg: Decoded frame object.
@@ -1649,7 +1661,7 @@ def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
     )
 
 
-def _decode_install_harness(msg: dict[str, Any]) -> HostInstallHarnessFrame:
+def _decode_install_harness(msg: _JsonObject) -> HostInstallHarnessFrame:
     """Decode a host.install_harness request frame.
 
     :param msg: Decoded frame object.
@@ -1661,7 +1673,7 @@ def _decode_install_harness(msg: dict[str, Any]) -> HostInstallHarnessFrame:
     )
 
 
-def _decode_install_harness_result(msg: dict[str, Any]) -> HostInstallHarnessResultFrame:
+def _decode_install_harness_result(msg: _JsonObject) -> HostInstallHarnessResultFrame:
     """Decode a host.install_harness_result frame.
 
     :param msg: Decoded frame object.
@@ -1675,7 +1687,7 @@ def _decode_install_harness_result(msg: dict[str, Any]) -> HostInstallHarnessRes
     )
 
 
-def _decode_store_secret(msg: dict[str, Any]) -> HostStoreSecretFrame:
+def _decode_store_secret(msg: _JsonObject) -> HostStoreSecretFrame:
     """Decode a host.store_secret request frame.
 
     :param msg: Decoded frame object.
@@ -1693,7 +1705,7 @@ def _decode_store_secret(msg: dict[str, Any]) -> HostStoreSecretFrame:
     )
 
 
-def _decode_store_secret_result(msg: dict[str, Any]) -> HostStoreSecretResultFrame:
+def _decode_store_secret_result(msg: _JsonObject) -> HostStoreSecretResultFrame:
     """Decode a host.store_secret_result frame.
 
     :param msg: Decoded frame object.
@@ -1707,7 +1719,7 @@ def _decode_store_secret_result(msg: dict[str, Any]) -> HostStoreSecretResultFra
     )
 
 
-def _decode_detect_credentials_result(msg: dict[str, Any]) -> HostDetectCredentialsResultFrame:
+def _decode_detect_credentials_result(msg: _JsonObject) -> HostDetectCredentialsResultFrame:
     """Decode a host.detect_credentials_result frame.
 
     Coerces each credential entry to a ``{family, source, env_var}`` dict of
@@ -1741,7 +1753,7 @@ def _decode_detect_credentials_result(msg: dict[str, Any]) -> HostDetectCredenti
     )
 
 
-def _decode_fs_request(msg: dict[str, Any]) -> HostFsRequestFrame:
+def _decode_fs_request(msg: _JsonObject) -> HostFsRequestFrame:
     """Decode a host.fs_request request frame.
 
     :param msg: Decoded frame object.
@@ -1759,7 +1771,7 @@ def _decode_fs_request(msg: dict[str, Any]) -> HostFsRequestFrame:
     )
 
 
-def _decode_fs_result(msg: dict[str, Any]) -> HostFsResultFrame:
+def _decode_fs_result(msg: _JsonObject) -> HostFsResultFrame:
     """Decode a host.fs_result frame.
 
     :param msg: Decoded frame object.
@@ -1783,7 +1795,7 @@ def _decode_fs_result(msg: dict[str, Any]) -> HostFsResultFrame:
     )
 
 
-def _decode_model_options(msg: dict[str, Any]) -> HostModelOptionsFrame:
+def _decode_model_options(msg: _JsonObject) -> HostModelOptionsFrame:
     """Decode a host.model_options request frame."""
     return HostModelOptionsFrame(
         request_id=_required_str(msg, "request_id"),
@@ -1791,7 +1803,7 @@ def _decode_model_options(msg: dict[str, Any]) -> HostModelOptionsFrame:
     )
 
 
-def _decode_model_options_result(msg: dict[str, Any]) -> HostModelOptionsResultFrame:
+def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFrame:
     """Decode a host.model_options_result frame."""
     models = msg.get("models", [])
     if not isinstance(models, list) or not all(isinstance(model, dict) for model in models):
@@ -1807,7 +1819,7 @@ def _decode_model_options_result(msg: dict[str, Any]) -> HostModelOptionsResultF
 # ── Field validators ─────────────────────────────────────
 
 
-def _required_str(msg: dict[str, Any], key: str) -> str:
+def _required_str(msg: _JsonObject, key: str) -> str:
     """Return a required string field.
 
     :param msg: Decoded frame object.
@@ -1821,7 +1833,7 @@ def _required_str(msg: dict[str, Any], key: str) -> str:
     return val
 
 
-def _required_int(msg: dict[str, Any], key: str) -> int:
+def _required_int(msg: _JsonObject, key: str) -> int:
     """Return a required integer field.
 
     :param msg: Decoded frame object.
@@ -1835,7 +1847,7 @@ def _required_int(msg: dict[str, Any], key: str) -> int:
     return val
 
 
-def _required_bool(msg: dict[str, Any], key: str) -> bool:
+def _required_bool(msg: _JsonObject, key: str) -> bool:
     """Return a required boolean field.
 
     :param msg: Decoded frame object.
@@ -1849,7 +1861,7 @@ def _required_bool(msg: dict[str, Any], key: str) -> bool:
     return val
 
 
-def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
+def _optional_str_list(msg: _JsonObject, key: str) -> list[str]:
     """Return an optional list of strings.
 
     :param msg: Decoded frame object.
@@ -1864,7 +1876,7 @@ def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
 
 
 def _optional_str_availability_map(
-    msg: dict[str, Any], key: str
+    msg: _JsonObject, key: str
 ) -> dict[str, HarnessAvailability] | None:
     """Return an optional string→availability mapping field.
 
@@ -1884,7 +1896,7 @@ def _optional_str_availability_map(
     return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
-def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:
+def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
     """Return an optional nullable string field.
 
     :param msg: Decoded frame object.

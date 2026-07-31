@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NodeTypes, NodeProps, Node } from "@xyflow/react";
-import { ReactFlow, Background, Position, Handle } from "@xyflow/react";
+import { ReactFlow, Background, Position, Handle, useReactFlow } from "@xyflow/react";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
+import { ZoomInIcon, ZoomOutIcon, Maximize2Icon } from "lucide-react";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { cn } from "@/lib/utils";
@@ -86,6 +87,40 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         className="!bg-muted-foreground/40 !w-1.5 !h-1.5 !border-0"
       />
     </>
+  );
+}
+
+function ZoomControls() {
+  const { zoomIn, zoomOut, fitView } = useReactFlow();
+  const btnClass =
+    "flex items-center justify-center size-7 rounded-md border bg-card text-muted-foreground shadow-sm hover:bg-accent hover:text-accent-foreground transition-colors";
+  return (
+    <div className="absolute bottom-3 right-3 z-10 flex flex-col gap-1">
+      <button
+        type="button"
+        className={btnClass}
+        onClick={() => zoomIn({ duration: 200 })}
+        aria-label="Zoom in"
+      >
+        <ZoomInIcon className="size-4" />
+      </button>
+      <button
+        type="button"
+        className={btnClass}
+        onClick={() => zoomOut({ duration: 200 })}
+        aria-label="Zoom out"
+      >
+        <ZoomOutIcon className="size-4" />
+      </button>
+      <button
+        type="button"
+        className={btnClass}
+        onClick={() => fitView({ duration: 200, padding: 0.3 })}
+        aria-label="Fit view"
+      >
+        <Maximize2Icon className="size-4" />
+      </button>
+    </div>
   );
 }
 
@@ -209,10 +244,11 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
           nodesConnectable={false}
           elementsSelectable={false}
           proOptions={{ hideAttribution: true }}
-          minZoom={0.3}
-          maxZoom={1.5}
+          minZoom={0.1}
+          maxZoom={3}
         >
           <Background bgColor="var(--card)" />
+          <ZoomControls />
         </ReactFlow>
       </div>
       {rootChildren.map((child) => (

@@ -624,8 +624,11 @@ def read_bridge_state(bridge_dir: Path) -> OpenCodeNativeBridgeState | None:
     session_id = raw.get("session_id")
     server_base_url = raw.get("server_base_url")
     opencode_session_id = raw.get("opencode_session_id")
-    required = (session_id, server_base_url, opencode_session_id)
-    if not all(isinstance(value, str) and value for value in required):
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not isinstance(server_base_url, str) or not server_base_url:
+        return None
+    if not isinstance(opencode_session_id, str) or not opencode_session_id:
         return None
 
     def _opt_str(key: str) -> str | None:
