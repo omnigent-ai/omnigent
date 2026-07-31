@@ -48,7 +48,7 @@ import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
   fileContentToBlob,
-  useFileContent,
+  type useFileContent,
 } from "@/hooks/useFileContent";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";

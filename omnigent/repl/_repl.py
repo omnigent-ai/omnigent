@@ -2309,7 +2309,7 @@ class _SessionsChatReplAdapter:
                 self._pending_local_skill_slash_commands.remove(command_key)
             self._is_streaming = False
 
-    async def cancel(self):
+    async def cancel(self) -> None:
         """
         Interrupt the running turn (if any).
 

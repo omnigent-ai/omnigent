@@ -11,12 +11,14 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TypeVar, cast
 
 _INLINE_BASE64_DATA_URI = re.compile(
     r"data:([^;,\s]*)(?:;[^;,\r\n]*)*;base64,[ \t]?([A-Za-z0-9+/=_-]+)",
     re.IGNORECASE,
 )
+
+_Value = TypeVar("_Value")
 
 
 @dataclass
@@ -62,9 +64,9 @@ def parse_data_uri(uri: str) -> DataUriParts | None:
 
 
 def redact_inline_data_uris(
-    value: Any,  # type: ignore[explicit-any]
+    value: _Value,
     marker: Callable[[str, int], str],
-) -> Any:  # type: ignore[explicit-any]
+) -> _Value:
     """Recursively replace inline base64 data URIs with compact markers.
 
     Dict keys and all non-data-URI values are preserved. String values may
@@ -77,12 +79,18 @@ def redact_inline_data_uris(
     :returns: A copy with inline base64 payloads redacted.
     """
     if isinstance(value, str):
-        return _INLINE_BASE64_DATA_URI.sub(
-            lambda match: marker(match.group(1), len(match.group(2))),
-            value,
+        return cast(
+            _Value,
+            _INLINE_BASE64_DATA_URI.sub(
+                lambda match: marker(match.group(1), len(match.group(2))),
+                value,
+            ),
         )
     if isinstance(value, list):
-        return [redact_inline_data_uris(item, marker) for item in value]
+        return cast(_Value, [redact_inline_data_uris(item, marker) for item in value])
     if isinstance(value, dict):
-        return {key: redact_inline_data_uris(item, marker) for key, item in value.items()}
+        return cast(
+            _Value,
+            {key: redact_inline_data_uris(item, marker) for key, item in value.items()},
+        )
     return value

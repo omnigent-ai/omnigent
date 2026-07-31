@@ -1,11 +1,11 @@
 const IME_PROCESSING_KEY_CODE = 229;
 
-type ImeKeyboardEvent = {
+interface ImeKeyboardEvent {
   nativeEvent: {
     isComposing?: boolean;
     keyCode?: number;
   };
-};
+}
 
 export function isImeCompositionKeyEvent(event: ImeKeyboardEvent, isComposing = false): boolean {
   return (

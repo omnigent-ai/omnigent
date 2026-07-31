@@ -103,7 +103,8 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
         if event.get("type") != "tool_call":
             return _ALLOW
         state = event.get("session_state") or {}
-        count = int(state.get("_policy_tool_call_count", 0))
+        count_value = state.get("_policy_tool_call_count", 0)
+        count = int(count_value) if isinstance(count_value, int | float | str) else 0
         if count >= limit:
             return {
                 "result": "DENY",
@@ -175,7 +176,12 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
         h = _args_hash(tool_name, arguments)
 
         state = event.get("session_state") or {}
-        recent: list[str] = list(state.get(_LOOP_STATE_KEY) or [])
+        recent_value = state.get(_LOOP_STATE_KEY)
+        recent = (
+            [item for item in recent_value if isinstance(item, str)]
+            if isinstance(recent_value, list)
+            else []
+        )
 
         recent.append(h)
         # Trim to sliding window.

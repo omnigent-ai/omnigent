@@ -26,7 +26,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import TypeAlias
 
 import click
 import httpx
@@ -67,6 +67,8 @@ _logger = logging.getLogger(__name__)
 # ``wrapper_agent_name`` and the web native registry).
 _AGENT_NAME = "opencode-native-ui"
 
+_JsonObject: TypeAlias = dict[str, object]
+
 
 def _materialize_opencode_agent_spec(
     tmpdir: Path,
@@ -84,7 +86,7 @@ def _materialize_opencode_agent_spec(
     executor: dict[str, str] = {"harness": "opencode-native"}
     if model is not None:
         executor["model"] = model
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "OpenCode is running in the session terminal. Web UI messages are "
@@ -365,7 +367,7 @@ async def _create_opencode_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first opencode-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -387,7 +389,7 @@ async def _create_opencode_session(
     return new_session_id
 
 
-async def _fetch_opencode_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_opencode_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:
@@ -521,13 +523,16 @@ def _prompt_opencode_resume_workspace_action(
         f"  {_RESUME_ACTION_SWITCH:<6} - Switch working directory to {recorded_path}", err=True
     )
     click.echo(f"  {_RESUME_ACTION_CANCEL:<6} - Cancel resume", err=True)
-    return click.prompt(
+    action = click.prompt(
         "Resume action",
         type=click.Choice([_RESUME_ACTION_SWITCH, _RESUME_ACTION_CANCEL]),
         default=_RESUME_ACTION_SWITCH,
         show_choices=True,
         err=True,
     )
+    if not isinstance(action, str):
+        raise click.ClickException("Resume action must be a string.")
+    return action
 
 
 async def _find_running_opencode_terminal(

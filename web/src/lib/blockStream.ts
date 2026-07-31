@@ -268,7 +268,7 @@ function* closeText(state: ReducerState, itemId: string | null = null): Generato
   state.fullText = "";
 }
 
-function outputTextFromMessageContent(content: Array<Record<string, unknown>>): string {
+function outputTextFromMessageContent(content: Record<string, unknown>[]): string {
   let text = "";
   for (const block of content) {
     if (block.type !== "output_text") continue;

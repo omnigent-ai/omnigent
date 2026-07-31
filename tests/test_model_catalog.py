@@ -37,6 +37,8 @@ from omnigent.model_metadata import (
     ModelCostTier,
     ModelIntent,
     ModelMetadata,
+    ModelReasoningMetadata,
+    ModelReasoningMode,
     ModelWireAPI,
 )
 from omnigent.model_resolver import ModelResolutionError, ModelResolutionSource
@@ -762,7 +764,29 @@ def test_anthropic_api_listing_uses_api_key_headers(
             200,
             json={
                 "data": [
-                    {"type": "model", "id": "claude-opus-4-8", "display_name": "Claude Opus 4.8"},
+                    {
+                        "type": "model",
+                        "id": "claude-opus-4-8",
+                        "display_name": "Claude Opus 4.8",
+                        "max_input_tokens": 1_000_000,
+                        "capabilities": {
+                            "thinking": {
+                                "supported": True,
+                                "types": {
+                                    "enabled": {"supported": False},
+                                    "adaptive": {"supported": True},
+                                },
+                            },
+                            "effort": {
+                                "supported": True,
+                                "low": {"supported": True},
+                                "medium": {"supported": True},
+                                "high": {"supported": True},
+                                "xhigh": {"supported": True},
+                                "max": {"supported": True},
+                            },
+                        },
+                    },
                     {
                         "type": "model",
                         "id": "claude-sonnet-4-6",
@@ -784,6 +808,11 @@ def test_anthropic_api_listing_uses_api_key_headers(
     assert requests_seen[0].headers["anthropic-version"] == "2023-06-01"
     assert listing.source == "anthropic-api"
     assert [m.id for m in listing.models] == ["claude-opus-4-8", "claude-sonnet-4-6"]
+    opus = listing.models[0]
+    assert opus.context_window == 1_000_000
+    assert opus.metadata.supports(ModelCapability.REASONING) is True
+    assert opus.metadata.reasoning is not None
+    assert opus.metadata.reasoning.modes == frozenset({ModelReasoningMode.ADAPTIVE})
 
 
 def test_subscription_listing_is_static_and_unverified(
@@ -868,7 +897,6 @@ def test_static_model_fallbacks_document_ownership(
     assert fallback.owner
     assert fallback.provenance
     assert fallback.discovery_gap
-
 
 def test_cursor_listing_uses_live_cli_base_models(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1228,6 +1256,10 @@ def test_catalog_payload_serializes_normalized_model_metadata() -> None:
                     context_window=200_000,
                     cost_tier=ModelCostTier.STANDARD,
                     wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+                    reasoning=ModelReasoningMetadata(
+                        modes=frozenset({ModelReasoningMode.ADAPTIVE}),
+                        efforts=frozenset({"low", "high"}),
+                    ),
                 ),
             ),
         ),
@@ -1244,6 +1276,7 @@ def test_catalog_payload_serializes_normalized_model_metadata() -> None:
             "capabilities": {"tool-use": True, "vision": False},
             "cost_tier": "standard",
             "wire_apis": ["openai-responses"],
+            "reasoning": {"modes": ["adaptive"], "efforts": ["high", "low"]},
         }
     ]
 

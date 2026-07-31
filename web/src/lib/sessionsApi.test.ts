@@ -818,7 +818,7 @@ describe("fetchInitialHistoryWindow", () => {
       content: [{ type: "output_text", text: id }],
     };
   }
-  function pageBody(dataNewestFirst: Array<{ id: string }>, hasMore: boolean): Response {
+  function pageBody(dataNewestFirst: { id: string }[], hasMore: boolean): Response {
     return mockJsonResponse({
       object: "list",
       data: dataNewestFirst,
