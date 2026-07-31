@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, cast
 from urllib import error, request
 
 from omnigent._platform import stable_user_id
+from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
@@ -63,6 +64,9 @@ if TYPE_CHECKING:
 
 from omnigent.inner.bundle_skills import claude_native_skill_args
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.hook_scripts.subagent_router import (
+    AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
+)
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
 from omnigent.tools.base import Tool, ToolContext
@@ -308,11 +312,17 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     if target.is_relative_to(acp_root):
         return _absolute_syntactic_path(acp_root.parent.parent)
 
+    # The subagent router's per-session dirs sit beside the native bridges
+    # ($TMPDIR/omnigent-<uid>/subagent-router), so trust the same parent.
+    router_root = _absolute_syntactic_path(subagent_router_bridge_root())
+    if target.is_relative_to(router_root):
+        return _absolute_syntactic_path(router_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
         f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s}, {acp_root!s})"
+        f"{kiro_root!s}, {acp_root!s}, {router_root!s})"
     )
 
 
@@ -748,6 +758,31 @@ def _ensure_secure_dir(target: Path) -> None:
             os.chmod(ancestor, 0o700)
 
 
+def ensure_secure_dir(target: Path) -> None:
+    """Public alias for :func:`_ensure_secure_dir`.
+
+    The subagent router (``omnigent.runner.subagent_routing``) writes a
+    bearer-token advertisement under its own uid-scoped temp root and needs
+    the same ancestor hardening the bridges use.
+
+    :param target: Directory path to ensure, e.g. a router advertisement dir.
+    :raises RuntimeError: If validation fails for any ancestor.
+    """
+    _ensure_secure_dir(target)
+
+
+def subagent_router_bridge_root() -> Path:
+    """Root for the subagent router's own advertisement directories.
+
+    Shares the uid-scoped temp parent with claude-native
+    (``$TMPDIR/omnigent-<uid>/subagent-router``) so per-session router dirs
+    pass the :func:`_trusted_parent_for_bridge_dir` secure-root check.
+
+    :returns: The subagent-router root directory (not created here).
+    """
+    return _BRIDGE_ROOT_PARENT / "subagent-router"
+
+
 def acp_mcp_bridge_root() -> Path:
     """Bridge root for the headless ACP harnesses' Omnigent-MCP relay.
 
@@ -833,6 +868,7 @@ def prepare_bridge_dir(
     bridge_id: str | None = None,
     workspace: Path,
     launch_model: str | None = None,
+    launch_env: Mapping[str, str] | None = None,
 ) -> Path:
     """
     Create or refresh the bridge directory for a native Claude session.
@@ -847,6 +883,11 @@ def prepare_bridge_dir(
         forwarder can re-inject it when Claude Code's ``/model``
         normalizes the name to one the gateway rejects.  ``None`` when
         no ucode profile is active.
+    :param launch_env: Launch environment for the terminal. Its model
+        vocabulary keys (``ANTHROPIC_DEFAULT_*_MODEL`` /
+        ``ANTHROPIC_CUSTOM_MODEL_OPTION``) are persisted so runner-side
+        callers — which don't share the terminal's env — can translate a
+        routed model id into a ``/model`` argument the CLI accepts.
     :returns: Bridge directory path.
     """
     resolved_bridge_id = bridge_id or conversation_id
@@ -866,6 +907,13 @@ def prepare_bridge_dir(
     }
     if launch_model is not None:
         payload["launch_model"] = launch_model
+    model_env = {
+        key: launch_env[key]
+        for key in MODEL_VOCABULARY_ENV_VARS
+        if launch_env is not None and launch_env.get(key)
+    }
+    if model_env:
+        payload["model_env"] = model_env
     _write_json_file(bridge_dir / _CONFIG_FILE, payload)
     # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
     # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
@@ -1037,6 +1085,28 @@ def read_launch_model(bridge_dir: Path) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def read_model_env(bridge_dir: Path) -> dict[str, str]:
+    """
+    Read the launch env keys defining this session's model vocabulary.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: ``{env var: model id}`` for the pinned aliases and custom
+        model option; empty when the session predates the record or ran
+        without a ucode profile.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    if not isinstance(config, dict):
+        return {}
+    model_env = config.get("model_env")
+    if not isinstance(model_env, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in model_env.items()
+        if isinstance(key, str) and isinstance(value, str) and value
+    }
+
+
 def read_bridge_id(bridge_dir: Path) -> str | None:
     """
     Read the opaque bridge id from bridge config.
@@ -1146,6 +1216,7 @@ def build_hook_settings(
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
     launch_effort: str | None = None,
+    subagent_router_dir: Path | None = None,
 ) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
@@ -1174,6 +1245,10 @@ def build_hook_settings(
         for the same re-exec hardening.
     :param launch_effort: Effective launch effort from ``--effort``.
         Mirrored into ``effortLevel`` for restart/re-exec parity.
+    :param subagent_router_dir: Directory where the runner advertises its
+        ``route-subagent`` endpoint (``subagent_router.json``). When set,
+        a ``PreToolUse`` hook routes native subagent spawns; ``None``
+        leaves spawns unrouted.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -1358,6 +1433,34 @@ def build_hook_settings(
         # server-side. Covers both web-UI-injected and direct-terminal
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
+    if subagent_router_dir is not None:
+        # Route natively spawned subagents (the Task/Agent tool) through
+        # the runner's route-subagent endpoint. Settings-level hooks also
+        # apply to nested spawns, so a routed subagent's own spawns are
+        # routed too. The script fails open — an unreachable endpoint
+        # emits no output and the spawn proceeds unchanged.
+        router_command_parts = [
+            python,
+            "-I",
+            "-m",
+            "omnigent.inner.hook_scripts.claude_router_hook",
+            "--bridge-dir",
+            str(bridge_dir),
+            "--router-dir",
+            str(subagent_router_dir),
+        ]
+        router_hook: _JsonObject = {
+            "type": "command",
+            "command": shlex.join(router_command_parts),
+            # Outermost hop of the routing timeout budget documented in
+            # ``omnigent.runner.subagent_routing``: it must exceed the hook
+            # script's own 30s request timeout so the script's fail-open
+            # branch can actually run before Claude kills it.
+            "timeout": 40,
+        }
+        hooks.setdefault("PreToolUse", []).append(
+            {"matcher": CLAUDE_SUBAGENT_TOOL_MATCHER, "hooks": [router_hook]}
+        )
     settings: _JsonObject = {"hooks": hooks}
     if launch_model:
         settings["model"] = launch_model
@@ -1422,6 +1525,7 @@ def augment_claude_args(
     skills_filter: str | list[str] = "all",
     append_system_prompt: str | None = None,
     allowed_tools: tuple[str, ...] = (),
+    subagent_router_dir: Path | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1461,6 +1565,10 @@ def augment_claude_args(
         append through Claude Code's native ``--append-system-prompt`` flag.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
+    :param subagent_router_dir: Directory advertising the runner's
+        ``route-subagent`` endpoint, threaded to
+        :func:`build_hook_settings` so native ``Task`` spawns are routed.
+        ``None`` leaves them unrouted.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -1473,6 +1581,7 @@ def augment_claude_args(
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_effort=_arg_value(claude_args, "--effort"),
+        subagent_router_dir=subagent_router_dir,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
