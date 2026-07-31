@@ -31,6 +31,7 @@ from omnigent.entities import (
     ErrorData,
     MessageData,
     NewConversationItem,
+    ResourceEventData,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -4427,6 +4428,7 @@ async def _relay_runner_stream(
                     # clients.
                     resource_item = _resource_event_item_from_sse(session_id, event)
                     if resource_item is not None:
+                        resource_data = resource_item.data
                         await _relay_persist(
                             conversation_store,
                             session_id,
@@ -4439,8 +4441,9 @@ async def _relay_runner_stream(
                         # between launch and clear). Only fire on a real
                         # state change to avoid redundant stream traffic.
                         if (
-                            resource_item.data.event_type == "session.resource.created"
-                            and resource_item.data.resource_type == "terminal"
+                            isinstance(resource_data, ResourceEventData)
+                            and resource_data.event_type == "session.resource.created"
+                            and resource_data.resource_type == "terminal"
                             and _session_terminal_pending_cache.get(session_id, False)
                         ):
                             _publish_terminal_pending(session_id, False)
