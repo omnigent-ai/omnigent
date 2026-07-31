@@ -203,7 +203,7 @@ def prompt_policy(
             "reason": fixed_reason or llm_reason or "Denied by prompt policy.",
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 def _make_nonce() -> str:

@@ -238,7 +238,7 @@ def deny_trivial_to_expensive_model(
 
         return None
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── intent_based_authorization ───────────────────────────────────────────────────────────────
@@ -464,7 +464,7 @@ def intent_based_authorization() -> PolicyCallable:
 
         return None  # unrecognised verdict — fail open
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
