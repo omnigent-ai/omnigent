@@ -142,6 +142,92 @@ jobs:
           # fallback if the formatter agent is unavailable or fails.
           cp /tmp/release_body.md /tmp/site_body.md
 
+      # Build a reviewer reference table of the release's FEATURE PRs and whether
+      # each already ships a demo video, so a human filling the `TODO` demo
+      # placeholders can reuse an existing recording instead of re-recording. This
+      # is independent of the LLM reflow (useful for the raw-body fallback too), so
+      # it runs unconditionally; a failure leaves the table empty (best effort).
+      - name: Build demo-video reference table
+        id: demotable
+        continue-on-error: true
+        working-directory: omnigent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPO: ${{ env.SOURCE_REPO }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import json, os, pathlib, re, subprocess
+          repo = os.environ["SOURCE_REPO"]
+          body = pathlib.Path("/tmp/release_body.md").read_text(encoding="utf-8", errors="replace")
+
+          # Walk the curated body, tracking the current `## <section>`, and collect
+          # the PR refs from each bullet's trailing `(#123, #456)`. Only FEATURE
+          # sections matter — the release post drops bug fixes, so does this table.
+          FEATURE = {"major new features", "breaking changes"}
+          ref_re = re.compile(r"#(\d+)")
+          sections, current, seen = [], None, set()
+          for ln in body.splitlines():
+              h = re.match(r"##\s+(.*\S)", ln)
+              if h:
+                  name = h.group(1).strip()
+                  current = (name, []) if name.lower() in FEATURE else None
+                  if current:
+                      sections.append(current)
+                  continue
+              if current and ln.lstrip().startswith(("-", "*")):
+                  for n in ref_re.findall(ln):
+                      pr = int(n)
+                      if pr not in seen:
+                          seen.add(pr)
+                          current[1].append(pr)
+
+          # Same demo-VIDEO detection as feature-blog.yml: GitHub uploaded-asset
+          # links, bare video URLs, and <video> tags. Images are NOT counted — the
+          # placeholder asks for a recording (a screenshot is a weaker fallback).
+          video_re = re.compile(
+              r"https?://github\.com/user-attachments/assets/[0-9a-f-]+"
+              r"|https?://github\.com/[^/\s)]+/[^/\s)]+/assets/\d+/[0-9a-f-]+"
+              r"|https?://[^\s)]+\.(?:mp4|mov|webm|m4v)\b"
+              r"|<video\b",
+              re.IGNORECASE)
+          def _cell(t):
+              return (t or "").replace("|", "\\|").replace("\n", " ").strip()
+
+          meta_cache = {}
+          def _meta(pr):
+              if pr in meta_cache:
+                  return meta_cache[pr]
+              m = {"title": "", "url": f"https://github.com/{repo}/pull/{pr}", "video": False}
+              try:
+                  d = json.loads(subprocess.run(
+                      ["gh", "pr", "view", str(pr), "--repo", repo,
+                       "--json", "title,body,url"],
+                      capture_output=True, text=True, timeout=60).stdout or "{}")
+                  m["title"] = _cell(d.get("title", ""))
+                  m["url"] = d.get("url") or m["url"]
+                  m["video"] = bool(video_re.search(d.get("body") or ""))
+              except Exception as e:
+                  print(f"::notice::Could not read metadata for PR #{pr}: {e}")
+              meta_cache[pr] = m
+              return m
+
+          out = []
+          for name, prs in sections:
+              if not prs:
+                  continue
+              out += [f"### {name}", "", "| PR | Title | Demo video? |",
+                      "| --- | --- | --- |"]
+              for pr in prs:
+                  m = _meta(pr)
+                  cell = f"[✅ video]({m['url']})" if m["video"] else "—"
+                  out.append(f"| [#{pr}]({m['url']}) | {m['title']} | {cell} |")
+              out.append("")
+          pathlib.Path("/tmp/demo_table.md").write_text("\n".join(out).rstrip() + ("\n" if out else ""))
+          print(f"Built demo table for {len(seen)} feature PR(s) across "
+                f"{sum(1 for _, prs in sections if prs)} section(s).")
+          PYEOF
+
       # --- AI reflow (primary; degrades to the raw release body) ---
       # The GitHub Release itself is untouched — this rewrites its body into the
       # website's narrative, prose-driven post for the site page ONLY.
@@ -305,6 +391,10 @@ jobs:
             echo '```markdown'; cat /tmp/site_body.md; echo '```'
             echo "### Rendered \`app/releases/${VERSION}/page.mdx\`"
             echo '```mdx'; cat /tmp/site_page/page.mdx; echo '```'
+            if [ -s /tmp/demo_table.md ]; then
+              echo "### Source PRs — demo videos (for the \`TODO\` demo placeholders)"
+              cat /tmp/demo_table.md
+            fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
           echo "Dry-run: no token minted, no PR opened."
 
@@ -354,6 +444,11 @@ jobs:
             exit 0
           fi
           body="$(printf 'Publishes the **%s** release post at `/releases/%s` — the curated GitHub Release notes reformatted into the site'"'"'s narrative, prose-driven style.\n\nGenerated by omnigent `.github/workflows/publish-changelog.yml`. Edit the GitHub Release, not this file.' "$TAG" "$VERSION")"
+          # Append the demo-video reference table: which feature PRs already ship a
+          # recording a reviewer can drop into the post'"'"'s `TODO` demo placeholders.
+          if [ -s /tmp/demo_table.md ]; then
+            body="$(printf '%s\n\n### Source PRs — demo videos\nCheck a ✅ PR for a recording to replace a `TODO` demo placeholder in the post.\n\n%s' "$body" "$(cat /tmp/demo_table.md)")"
+          fi
           gh pr create \
             --repo "$SITE_REPO" \
             --base main \
@@ -435,5 +530,6 @@ jobs:
             /tmp/format-stderr.log
             /tmp/format_out.txt
             /tmp/site_body.md
+            /tmp/demo_table.md
           retention-days: 7
           if-no-files-found: ignore

@@ -113,7 +113,9 @@ prompt: |
   placeholder immediately under EACH feature heading:
     `![TODO: add a demo screenshot or GIF for "<feature title>"](TODO)`
   Use the literal token `TODO` so a reviewer can grep for it. Never fabricate a
-  real-looking image path.
+  real-looking image path. (The workflow adds a table of the release's feature
+  PRs and their existing demo videos to the PR description, so a reviewer can drop
+  an already-recorded clip into these placeholders — you do not reference it.)
 
   ## Docs links (link to the most specific real page/section, or omit the line)
   The "## Available docs pages and sections" input lists every real docs URL and
