@@ -377,13 +377,13 @@ function renderShell(path: string, info?: ServerInfo) {
 }
 
 function mockConversations(
-  convs: Array<{
+  convs: {
     id: string;
     permission_level: number | null;
     labels?: Record<string, string>;
     host_id?: string | null;
     runner_id?: string | null;
-  }>,
+  }[],
 ) {
   useConvMock.mockReturnValue({
     data: {

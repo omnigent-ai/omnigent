@@ -194,6 +194,13 @@ The same policy supplies the final runtime fallback for key, gateway, and local
 providers. Explicit agent and provider defaults still win; without either,
 runtime discovery fails with configuration guidance when no catalog is available.
 
+## Static Fallback Ownership
+
+The remaining Claude and Codex aliases live only in
+`omnigent/model_fallbacks.py`. Each fallback records its adapter owner, catalog
+provenance, and the discovery gap that prevents a live listing. `sys_list_models`
+surfaces those fields whenever it returns an unverified static catalog.
+
 ## Kimi Example Default
 
 The Kimi launcher example declares only the harness. With no explicit

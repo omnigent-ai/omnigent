@@ -379,7 +379,8 @@ def intent_based_authorization() -> PolicyCallable:
             return None
 
         state = event.get("session_state") or {}
-        intent: str = state.get(_INTENT_KEY, "")
+        intent_value = state.get(_INTENT_KEY, "")
+        intent = intent_value if isinstance(intent_value, str) else ""
         if not intent:
             return None  # no intent captured yet — fail open
 

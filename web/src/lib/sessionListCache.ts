@@ -313,9 +313,7 @@ export function removeIdsFromPages(
  *   skipped.
  * @returns Deduplicated conversation ids.
  */
-export function collectConversationIds(
-  datas: Array<ConversationsInfiniteData | undefined>,
-): string[] {
+export function collectConversationIds(datas: (ConversationsInfiniteData | undefined)[]): string[] {
   const ids = new Set<string>();
   for (const data of datas) {
     if (!data) continue;

@@ -412,9 +412,9 @@ class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   readyState = 0;
   binaryType = "blob";
-  sent: Array<string | Uint8Array> = [];
+  sent: (string | Uint8Array)[] = [];
   closed = false;
-  private listeners: Record<string, Array<(ev: unknown) => void>> = {};
+  private listeners: Record<string, ((ev: unknown) => void)[]> = {};
   url: string;
 
   constructor(url: string) {

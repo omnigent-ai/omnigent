@@ -249,7 +249,7 @@ describe("activityDotClassName (shared list/graph palette)", () => {
   // color the dot from the same ``activityDotClassName``, so the rendered dot
   // is identical in both views.
   it("classifies list and graph identically for each status", () => {
-    const cases: Array<{ child: ChildSessionInfo; expected: string }> = [
+    const cases: { child: ChildSessionInfo; expected: string }[] = [
       {
         child: childInfo({ id: "launching", current_task_status: "launching" }),
         expected: "bg-session-active/70",

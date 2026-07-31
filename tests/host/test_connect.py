@@ -1227,6 +1227,25 @@ def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> N
     assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
 
 
+def test_reap_orphans_is_noop_without_wnohang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows (no ``os.WNOHANG``) the reaper is a clean no-op, not a crash.
+
+    Windows has no child reparenting to a subreaper and no
+    ``waitpid(-1, WNOHANG)``; touching ``os.WNOHANG`` there raises
+    ``AttributeError``. The final drain runs unguarded in ``run``'s
+    ``finally``, so an unguarded sweep would crash shutdown. Simulate the
+    platform by deleting ``os.WNOHANG`` and assert a quiet ``0``.
+    """
+    import os
+
+    monkeypatch.delattr(os, "WNOHANG", raising=False)
+
+    host = _make_host_process()
+    assert host._reap_orphans_once() == 0
+
+
 def test_install_child_subreaper_is_safe_to_call() -> None:
     """``_install_child_subreaper`` never raises and reports a bool.
 

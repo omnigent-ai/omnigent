@@ -20,7 +20,7 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.orm import QueryableAttribute, Session, aliased
+from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -1768,17 +1768,40 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._conv_session() as session:
             is_asc = order == "asc"
             sort_fn = asc if is_asc else desc
-            stmt = select(SqlConversationItem).where(
-                SqlConversationItem.workspace_id == current_workspace_id(),
-                SqlConversationItem.conversation_id == conversation_id,
+            # Load only the columns _to_item reads. search_text is a wide Text
+            # column (roughly mirrors the message body) that this read path never
+            # touches; on Postgres it is TOAST-ed, so omitting it skips a detoast
+            # and roughly halves the bytes pulled per row on a chatty conversation.
+            stmt = (
+                select(SqlConversationItem)
+                .options(
+                    load_only(
+                        SqlConversationItem.id,
+                        SqlConversationItem.type,
+                        SqlConversationItem.status,
+                        SqlConversationItem.response_id,
+                        SqlConversationItem.created_at,
+                        SqlConversationItem.data,
+                        SqlConversationItem.created_by,
+                    )
+                )
+                .where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                )
             )
             if type is not None:
                 stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
             if after:
+                # Scope the cursor lookup to conversation_id so it lands on the
+                # (workspace_id, conversation_id, id) primary key as a point
+                # lookup. Without it, (workspace_id, id) leads no index and the
+                # subquery degrades to a workspace-wide scan every paginated page.
                 sub = (
                     select(SqlConversationItem.position)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
                         SqlConversationItem.id == after,
                     )
                     .scalar_subquery()
@@ -1794,6 +1817,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     select(SqlConversationItem.position)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
                         SqlConversationItem.id == before,
                     )
                     .scalar_subquery()

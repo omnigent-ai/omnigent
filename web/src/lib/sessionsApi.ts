@@ -166,18 +166,18 @@ interface SessionResponseWire {
    * SSE event the chat would have received live — same fields the
    * `sse.ts` parser already handles.
    */
-  pending_elicitations?: Array<Record<string, unknown>>;
+  pending_elicitations?: Record<string, unknown>[];
   /**
    * Un-consumed web-composer user messages on native-terminal sessions
    * at snapshot time, each ``{pending_id, content}``. Replayed so a
    * client that posted then navigated away / rebound re-hydrates the
    * optimistic bubble. Empty for non-native sessions.
    */
-  pending_inputs?: Array<{
+  pending_inputs?: {
     pending_id: string;
     content: MessageContentBlock[];
     created_by?: string;
-  }>;
+  }[];
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
@@ -201,11 +201,11 @@ interface SessionResponseWire {
    */
   sub_agent_name?: string | null;
   kind?: "default" | "sub_agent" | null;
-  todos?: Array<{
+  todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
   /**
    * Skills the bound agent can invoke — bundled + host-discovered
    * (subject to the spec's ``skills_filter``). Just name + one-line
