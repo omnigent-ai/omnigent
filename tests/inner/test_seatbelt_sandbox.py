@@ -75,6 +75,8 @@ def _make_policy(
     read_roots: list[Path] | None = None,
     egress_relay_port: int | None = None,
     egress_socket_path: str | None = None,
+    cwd_hidden_scan_recursive: bool | None = None,
+    mask_paths: list[Path] | None = None,
 ) -> SandboxPolicy:
     """
     Build a :class:`SandboxPolicy` directly without going through the
@@ -98,20 +100,30 @@ def _make_policy(
         Unix-socket allow rules.
     :param egress_socket_path: Filesystem path of the parent-side
         Unix socket the relay forwards to.
+    :param cwd_hidden_scan_recursive: Override for the recursive-walk
+        flag; ``None`` keeps the dataclass default (``False``,
+        top-level only).
+    :param mask_paths: Explicit absolute paths to mask; ``None`` keeps
+        the dataclass default (no explicit masks).
     :returns: A populated :class:`SandboxPolicy`.
     """
     del cwd
-    return SandboxPolicy(
-        backend_type="darwin_seatbelt",
-        active=True,
-        read_roots=read_roots,
-        write_roots=write_roots if write_roots is not None else [],
-        write_files=[],
-        allow_network=allow_network,
-        cwd_allow_hidden=allow_hidden,
-        egress_relay_port=egress_relay_port,
-        egress_socket_path=egress_socket_path,
-    )
+    kwargs: dict[str, object] = {
+        "backend_type": "darwin_seatbelt",
+        "active": True,
+        "read_roots": read_roots,
+        "write_roots": write_roots if write_roots is not None else [],
+        "write_files": [],
+        "allow_network": allow_network,
+        "cwd_allow_hidden": allow_hidden,
+        "egress_relay_port": egress_relay_port,
+        "egress_socket_path": egress_socket_path,
+    }
+    if cwd_hidden_scan_recursive is not None:
+        kwargs["cwd_hidden_scan_recursive"] = cwd_hidden_scan_recursive
+    if mask_paths is not None:
+        kwargs["mask_paths"] = mask_paths
+    return SandboxPolicy(**kwargs)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +767,73 @@ def test_profile_dotfile_mask_uses_deny_rules(tmp_path: Path) -> None:
         "intended profile order is cwd-allow first, deny mask "
         "after, even though SBPL deny-wins doesn't depend on order."
     )
+
+
+def test_profile_dotfile_mask_non_recursive_default(tmp_path: Path) -> None:
+    """
+    With the production default (``cwd_hidden_scan_recursive=False``)
+    the SBPL profile denies top-level dotfiles but does NOT emit a
+    deny for a dotfile nested below the top level.
+    """
+    (tmp_path / ".env").write_text("TOP=1")
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=1")
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"])
+    profile = _build_profile(policy, cwd)
+
+    top_deny = f'(deny file-read* file-write* (literal "{cwd / ".env"}"))'
+    nested_deny = f'(deny file-read* file-write* (literal "{cwd / "services" / "api" / ".env"}"))'
+    assert top_deny in profile, "Top-level .env must still be denied in non-recursive mode."
+    assert nested_deny not in profile, (
+        "Non-recursive default must not descend into subdirectories; "
+        "nested .env must stay visible."
+    )
+
+
+def test_profile_dotfile_mask_recursive_opt_in(tmp_path: Path) -> None:
+    """
+    Opting into ``cwd_hidden_scan_recursive=True`` restores the deep
+    walk: a nested dotfile gets its own literal deny.
+    """
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=1")
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"], cwd_hidden_scan_recursive=True)
+    profile = _build_profile(policy, cwd)
+
+    nested_deny = f'(deny file-read* file-write* (literal "{cwd / "services" / "api" / ".env"}"))'
+    assert nested_deny in profile, "Recursive opt-in should deny the nested .env."
+
+
+def test_profile_mask_paths_denies_explicit_file_and_dir(tmp_path: Path) -> None:
+    """
+    Explicit ``mask_paths`` entries produce denies regardless of name
+    or depth: a plain file gets a ``(literal ...)`` deny and a
+    directory gets a ``(subpath ...)`` deny.
+    """
+    secret_file = tmp_path / "config" / "production.key"
+    secret_file.parent.mkdir(parents=True)
+    secret_file.write_text("KEY")
+    secret_dir = tmp_path / "private"
+    secret_dir.mkdir()
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(
+        tmp_path,
+        allow_hidden=[".venv"],
+        mask_paths=[secret_file.resolve(strict=False), secret_dir.resolve(strict=False)],
+    )
+    profile = _build_profile(policy, cwd)
+
+    file_deny = f'(deny file-read* file-write* (literal "{secret_file.resolve(strict=False)}"))'
+    dir_deny = f'(deny file-read* file-write* (subpath "{secret_dir.resolve(strict=False)}"))'
+    assert file_deny in profile, "Explicit mask_paths file must get a literal deny."
+    assert dir_deny in profile, "Explicit mask_paths directory must get a subpath deny."
 
 
 # ---------------------------------------------------------------------------

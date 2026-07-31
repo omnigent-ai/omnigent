@@ -15,10 +15,11 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeAlias, cast
 
 import tomlkit
 import websockets
+from websockets.asyncio.client import ClientConnection
 
 from omnigent import model_catalog
 
@@ -50,8 +51,9 @@ from omnigent.inner.databricks_executor import _databricks_gateway_host
 
 _logger = logging.getLogger(__name__)
 
-CodexMessage = dict[str, Any]
-CodexParams = dict[str, Any]
+_JsonObject: TypeAlias = dict[str, object]
+CodexMessage: TypeAlias = _JsonObject
+CodexParams: TypeAlias = _JsonObject
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -93,6 +95,20 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 # Below this the flag is unknown and codex exits immediately with an error,
 # so we skip it and fall back to the old behaviour (trust prompt may appear).
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
+
+
+def _string_object_dict(value: object) -> _JsonObject | None:
+    """Return *value* as a string-keyed object mapping when valid."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("_JsonObject", value)
+
+
+def _object_list(value: object) -> list[object] | None:
+    """Return *value* as an object list when valid."""
+    if not isinstance(value, list):
+        return None
+    return cast("list[object]", value)
 
 
 def _format_codex_version(version: tuple[int, int, int] | None) -> str:
@@ -366,7 +382,7 @@ class CodexAppServerClient:
         self._socket_path = socket_path
         self._ws_url = ws_url
         self._client_name = client_name
-        self._ws: Any | None = None
+        self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
         self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
@@ -515,13 +531,28 @@ class CodexAppServerClient:
         async for raw in self._ws:
             if not isinstance(raw, str):
                 continue
-            message = json.loads(raw)
+            decoded: object = json.loads(raw)
+            message = _string_object_dict(decoded)
+            if message is None:
+                _logger.warning("Ignoring non-object Codex app-server message")
+                continue
             if (
                 "id" in message
                 and "method" not in message
                 and ("result" in message or "error" in message)
             ):
-                future = self._pending_requests.pop(int(message["id"]), None)
+                raw_id = message["id"]
+                request_id: int | None = None
+                if isinstance(raw_id, int):
+                    request_id = raw_id
+                elif isinstance(raw_id, str):
+                    with contextlib.suppress(ValueError):
+                        request_id = int(raw_id)
+                future = (
+                    self._pending_requests.pop(request_id, None)
+                    if request_id is not None
+                    else None
+                )
                 if future is not None and not future.done():
                     future.set_result(message)
                 continue
@@ -920,9 +951,7 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
     )
 
 
-def _codex_policy_hooks_settings(
-    bridge_dir: Path, python_executable: str | None
-) -> dict[str, Any]:
+def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
     """
     Build the ``hooks.json`` payload registering the policy hook.
 
@@ -953,7 +982,7 @@ def _codex_policy_hooks_settings(
     }
 
 
-def _merge_user_hooks(policy_payload: dict[str, Any], user_hooks_path: Path) -> dict[str, Any]:
+def _merge_user_hooks(policy_payload: _JsonObject, user_hooks_path: Path) -> _JsonObject:
     """
     Merge user-declared hooks into the policy hooks payload.
 
@@ -973,21 +1002,28 @@ def _merge_user_hooks(policy_payload: dict[str, Any], user_hooks_path: Path) -> 
         because the user's hooks file is malformed).
     """
     try:
-        user_data = json.loads(user_hooks_path.read_text(encoding="utf-8"))
+        decoded: object = json.loads(user_hooks_path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return policy_payload
-    user_hooks: dict[str, Any] = user_data.get("hooks", {}) if isinstance(user_data, dict) else {}
+    user_data = _string_object_dict(decoded)
+    user_hooks = _string_object_dict(user_data.get("hooks")) if user_data is not None else None
     if not user_hooks:
         return policy_payload
-    merged: dict[str, Any] = dict(policy_payload)
-    merged["hooks"] = dict(policy_payload["hooks"])
+    policy_hooks = _string_object_dict(policy_payload.get("hooks"))
+    if policy_hooks is None:
+        return policy_payload
+    merged: _JsonObject = dict(policy_payload)
+    merged_hooks: _JsonObject = dict(policy_hooks)
+    merged["hooks"] = merged_hooks
     for event, entries in user_hooks.items():
-        if not isinstance(entries, list):
+        user_entries = _object_list(entries)
+        if user_entries is None:
             continue
-        if event in merged["hooks"]:
-            merged["hooks"][event] = list(merged["hooks"][event]) + entries
+        existing_entries = _object_list(merged_hooks.get(event))
+        if existing_entries is not None:
+            merged_hooks[event] = existing_entries + user_entries
         else:
-            merged["hooks"][event] = entries
+            merged_hooks[event] = user_entries
     return merged
 
 
@@ -1025,7 +1061,7 @@ def _write_codex_policy_hooks_file(
             os.unlink(tmp_name)
 
 
-def _our_policy_hooks_from_list(listed: dict[str, Any], cwd: str) -> list[dict[str, Any]]:
+def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObject]:
     """
     Extract *our* policy hooks for *cwd* from a ``hooks/list`` response.
 
@@ -1040,20 +1076,24 @@ def _our_policy_hooks_from_list(listed: dict[str, Any], cwd: str) -> list[dict[s
     :returns: The matching Omnigent hook metadata dicts (possibly
         empty), each with ``key``, ``currentHash``, ``trustStatus``.
     """
-    result = listed.get("result", listed)
-    data = result.get("data", []) if isinstance(result, dict) else []
-    for entry in data:
-        if isinstance(entry, dict) and entry.get("cwd") == cwd:
-            hooks = entry.get("hooks", [])
+    result = _string_object_dict(listed.get("result"))
+    if result is None:
+        result = listed
+    data = _object_list(result.get("data")) or []
+    for raw_entry in data:
+        entry = _string_object_dict(raw_entry)
+        if entry is not None and entry.get("cwd") == cwd:
+            hooks = _object_list(entry.get("hooks")) or []
             return [
-                h
-                for h in hooks
-                if isinstance(h, dict) and _POLICY_HOOK_MODULE in str(h.get("command", ""))
+                hook
+                for raw_hook in hooks
+                if (hook := _string_object_dict(raw_hook)) is not None
+                and _POLICY_HOOK_MODULE in str(hook.get("command", ""))
             ]
     return []
 
 
-def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
+def _hooks_list_diagnostics(listed: _JsonObject, cwd: str) -> str:
     """
     Summarize a ``hooks/list`` response for a discovery-failure error.
 
@@ -1076,10 +1116,12 @@ def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
         ``"hooks/list returned no hooks (codex loaded none — likely an "
         "invalid per-session config.toml)"``.
     """
-    result = listed.get("result", listed)
-    data = result.get("data", []) if isinstance(result, dict) else []
-    entries = [e for e in data if isinstance(e, dict)]
-    if not entries or all(not e.get("hooks") for e in entries):
+    result = _string_object_dict(listed.get("result"))
+    if result is None:
+        result = listed
+    data = _object_list(result.get("data")) or []
+    entries = [entry for raw in data if (entry := _string_object_dict(raw)) is not None]
+    if not entries or all(not (_object_list(entry.get("hooks")) or []) for entry in entries):
         return (
             "hooks/list returned no hooks (codex loaded none — likely an "
             "invalid per-session config.toml, so codex fell back to defaults)"
@@ -1087,18 +1129,19 @@ def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
     matched_cwd = any(e.get("cwd") == cwd for e in entries)
     parts: list[str] = []
     for entry in entries:
-        hooks = entry.get("hooks", []) or []
+        hooks = _object_list(entry.get("hooks")) or []
         ours = sum(
             1
-            for h in hooks
-            if isinstance(h, dict) and _POLICY_HOOK_MODULE in str(h.get("command", ""))
+            for raw_hook in hooks
+            if (hook := _string_object_dict(raw_hook)) is not None
+            and _POLICY_HOOK_MODULE in str(hook.get("command", ""))
         )
         parts.append(f"cwd={entry.get('cwd')!r}: {len(hooks)} hook(s), {ours} ours")
     prefix = "" if matched_cwd else f"no entry matched queried cwd {cwd!r}; "
     return f"hooks/list returned [{prefix}{'; '.join(parts)}]"
 
 
-def _untrusted_hook_detail(hooks: list[dict[str, Any]]) -> str:
+def _untrusted_hook_detail(hooks: Sequence[_JsonObject]) -> str:
     """
     Render untrusted hook metadata for a trust-failure error.
 
@@ -1358,7 +1401,10 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     prefix = "model_provider="
     for override in launch.config_overrides:
         if override.startswith(prefix):
-            return json.loads(override.removeprefix(prefix))
+            decoded: object = json.loads(override.removeprefix(prefix))
+            if not isinstance(decoded, str):
+                raise ValueError("model_provider override must decode to a string")
+            return decoded
     if launch.profile is not None:
         return "omnigent_databricks"
     return "openai"

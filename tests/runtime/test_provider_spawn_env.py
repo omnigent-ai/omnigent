@@ -148,7 +148,13 @@ def _make_spec(
     )
 
 
-def _key_family(base_url: str, api_key: str, default_model: str) -> dict[str, object]:
+def _key_family(
+    base_url: str,
+    api_key: str,
+    default_model: str,
+    *,
+    wire_api: str | None = None,
+) -> dict[str, object]:
     """
     Build a single provider-family config block (inline static key).
 
@@ -158,11 +164,14 @@ def _key_family(base_url: str, api_key: str, default_model: str) -> dict[str, ob
     :param default_model: The family's ``models.default``, e.g. ``"gpt-4o"``.
     :returns: A family mapping ready to nest under a provider entry.
     """
-    return {
+    family: dict[str, object] = {
         "base_url": base_url,
         "api_key": api_key,
         "models": {"default": default_model},
     }
+    if wire_api is not None:
+        family["wire_api"] = wire_api
+    return family
 
 
 def _anthropic_default_config() -> dict[str, object]:
@@ -492,6 +501,23 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_GATEWAY_HOST"] == "https://anthropic.example.com"
     assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
+
+
+def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:
+    """Pi routes a generic OpenAI provider using configured wire metadata."""
+    config = _openai_default_config()
+    provider = config["providers"]["vendor-openai"]
+    provider["openai"] = _key_family(
+        "https://openai.example.com/v1",
+        "sk-oai-secret",
+        "gpt-default-model",
+        wire_api="responses",
+    )
+    _write_config(config_home, config)
+
+    env = _build_pi_spawn_env(_make_spec(harness="pi"), workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] == "responses"
 
 
 # ── Named ProviderAuth selection ───────────────────────────────────────────

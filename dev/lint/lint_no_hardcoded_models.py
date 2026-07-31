@@ -1,9 +1,10 @@
-"""Flag new hardcoded LLM model ids outside tests.
+"""Flag new hardcoded LLM model ids outside tests and owned fallbacks.
 
 The codebase still has a curated baseline of model pins that predate this
 check. This hook requires every path/model count to exactly match
 ``dev/lint/hardcoded_model_allowlist.txt`` so new pins fail and removed pins
-must ratchet the baseline down.
+must ratchet the baseline down. Unavoidable static aliases are accepted only
+inside complete ``StaticModelFallback`` records in the central fallback module.
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ SKIP_PARTS = {
     "tests",
 }
 ALLOWLIST_PATH = Path("dev/lint/hardcoded_model_allowlist.txt")
+OWNED_FALLBACK_PATH = Path("omnigent/model_fallbacks.py")
+FALLBACK_METADATA_FIELDS = frozenset({"owner", "provenance", "discovery_gap"})
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,82 @@ def _extract_models(text: str) -> list[str]:
     return [match.group(0) for match in MODEL_ID_RE.finditer(text)]
 
 
+def _literal_string_nodes(node: ast.expr) -> tuple[ast.Constant, ...] | None:
+    """Return string literal elements when *node* is a literal sequence."""
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return None
+    literals: list[ast.Constant] = []
+    for element in node.elts:
+        if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+            return None
+        literals.append(element)
+    return tuple(literals)
+
+
+def _fallback_keywords(node: ast.Call) -> dict[str, ast.expr] | None:
+    """Return complete owned-fallback keywords for a direct constructor call."""
+    if not isinstance(node.func, ast.Name) or node.func.id != "StaticModelFallback":
+        return None
+    keywords = {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg is not None}
+    if "model_ids" not in keywords:
+        return None
+    for field in FALLBACK_METADATA_FIELDS:
+        value = keywords.get(field)
+        if (
+            not isinstance(value, ast.Constant)
+            or not isinstance(value.value, str)
+            or not value.value.strip()
+        ):
+            return None
+    return keywords
+
+
+def _owned_fallback_model_literals(tree: ast.Module) -> set[ast.Constant]:
+    """Return model literals confined to complete central fallback records."""
+    fallback_model_values: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and (keywords := _fallback_keywords(node)) is not None:
+            fallback_model_values.append(keywords["model_ids"])
+
+    exempt: set[ast.Constant] = set()
+    for value in fallback_model_values:
+        if (literals := _literal_string_nodes(value)) is not None:
+            exempt.update(literals)
+
+    # Only module-level tuples qualify; nested or conditional aliases fail closed.
+    assignments: dict[str, tuple[ast.Constant, ...] | None] = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+            if isinstance(target, ast.Name):
+                literals = _literal_string_nodes(statement.value)
+                assignments[target.id] = literals if target.id not in assignments else None
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            literals = (
+                _literal_string_nodes(statement.value) if statement.value is not None else None
+            )
+            assignments[statement.target.id] = (
+                literals if statement.target.id not in assignments else None
+            )
+
+    valid_named_uses = {
+        value
+        for value in fallback_model_values
+        if isinstance(value, ast.Name) and isinstance(value.ctx, ast.Load)
+    }
+    for name, literals in assignments.items():
+        if literals is None:
+            continue
+        loads = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name
+        ]
+        if loads and all(load in valid_named_uses for load in loads):
+            exempt.update(literals)
+    return exempt
+
+
 def _scan_python(path: Path) -> list[Hit]:
     """Scan Python syntax-aware string literals in model contexts."""
     try:
@@ -134,9 +213,16 @@ def _scan_python(path: Path) -> list[Hit]:
         return []
 
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    exempt = (
+        _owned_fallback_model_literals(tree)
+        if _repo_relative(path) == OWNED_FALLBACK_PATH.as_posix()
+        else set()
+    )
     hits: list[Hit] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        if node in exempt:
             continue
         if not _is_model_context(node, parents):
             continue
@@ -261,9 +347,10 @@ def main() -> int:
             "lower or remove the baseline entry\n"
         )
     sys.stdout.write(
-        "\nAvoid adding hardcoded model names outside tests. If this is an intentional "
-        "temporary pin, document why and update dev/lint/hardcoded_model_allowlist.txt "
-        "with the smallest path/model count.\n"
+        "\nAvoid adding hardcoded model names outside tests. Unavoidable static aliases "
+        "belong in complete StaticModelFallback records in omnigent/model_fallbacks.py. "
+        "If this is an intentional temporary pin, document why and update "
+        "dev/lint/hardcoded_model_allowlist.txt with the smallest path/model count.\n"
     )
     return 1
 

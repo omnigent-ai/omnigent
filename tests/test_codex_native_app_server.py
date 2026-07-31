@@ -19,6 +19,8 @@ from omnigent.codex_native_app_server import (
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexNativeAppServer,
     _codex_policy_hooks_settings,
+    _hooks_list_diagnostics,
+    _our_policy_hooks_from_list,
     _sync_codex_developer_instructions,
     build_codex_native_server,
     trust_native_policy_hooks,
@@ -133,6 +135,17 @@ def _hook(key: str, command: str, trust: str, current_hash: str = "sha256:h") ->
         "trustStatus": trust,
         "currentHash": current_hash,
     }
+
+
+def test_hooks_list_empty_result_does_not_fall_back_to_envelope() -> None:
+    """A valid empty result remains authoritative over envelope metadata."""
+    listed = {
+        "result": {},
+        "data": [{"cwd": _CWD, "hooks": [_hook("k1", _OUR_COMMAND, "trusted")]}],
+    }
+
+    assert _our_policy_hooks_from_list(listed, _CWD) == []
+    assert "returned no hooks" in _hooks_list_diagnostics(listed, _CWD)
 
 
 @dataclass

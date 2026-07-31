@@ -19,9 +19,10 @@ import {
   useCreateMcpServer,
   useDeleteMcpServer,
   useUpdateMcpServer,
+  type Agent,
+  type McpServerSummary,
   type UpsertMcpServerInput,
 } from "@/hooks/useAgents";
-import type { Agent, McpServerSummary } from "@/hooks/useAgents";
 import type { ModelUsage } from "@/lib/types";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -180,7 +181,7 @@ function formatTokenCount(tokens: number): string {
  * Token buckets shown per model in the ``usage_by_model`` section, mapping
  * the ``ModelUsage`` field to its row label. Cost is rendered separately.
  */
-const MODEL_TOKEN_ROWS: ReadonlyArray<{ key: keyof ModelUsage; label: string }> = [
+const MODEL_TOKEN_ROWS: readonly { key: keyof ModelUsage; label: string }[] = [
   { key: "inputTokens", label: "Input" },
   { key: "outputTokens", label: "Output" },
   { key: "cacheReadInputTokens", label: "Cache read" },

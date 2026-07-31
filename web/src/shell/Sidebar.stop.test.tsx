@@ -5,6 +5,8 @@
 // confirms through a dialog before firing the stop mutation. See
 // ConversationRow in Sidebar.tsx.
 
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -54,7 +56,7 @@ vi.mock("@/hooks/useConversations", () => ({
 }));
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionRunnerOnline: (id: string | undefined) => mocks.runnerOnline(id),
 }));
 

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from sqlalchemy import delete, exists, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
@@ -90,6 +94,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 "level": level,
                 "can_approve": can_approve,
             }
+            stmt: Insert
             if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlSessionPermission)
@@ -126,12 +131,15 @@ class SqlAlchemyPermissionStore(PermissionStore):
     def revoke(self, user_id: str, conversation_id: str) -> bool:
         """Remove a permission grant. See base class for contract."""
         with self._session() as session:
-            result = session.execute(
-                delete(SqlSessionPermission).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == user_id,
-                    SqlSessionPermission.conversation_id == conversation_id,
-                )
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                    )
+                ),
             )
             return result.rowcount > 0
 
@@ -293,6 +301,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         with self._session() as session:
             dialect = self._engine.dialect.name
             values = {"id": user_id, "is_admin": is_admin}
+            stmt: Insert
             if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlUser)

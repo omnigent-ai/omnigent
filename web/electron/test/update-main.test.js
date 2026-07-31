@@ -196,7 +196,9 @@ function loadMainHarness({
 }
 
 async function flushPromises() {
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => {
+    setImmediate(resolve);
+  });
 }
 
 function plain(value) {
@@ -444,7 +446,9 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.appQuit, 1); // still no re-issued quit
     assert.equal(harness.calls.appExit, 0); // fallback not fired yet
 
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
     assert.equal(harness.calls.appExit, 1); // fallback forced the exit
     assert.equal(harness.calls.appQuit, 1); // never re-issued
   });
@@ -470,7 +474,9 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.appQuit, 0); // shutdown hung, no re-issued quit
     assert.equal(harness.calls.appExit, 0); // cap not fired yet
 
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
     assert.equal(harness.calls.appExit, 1); // cap forced the exit
     assert.equal(harness.calls.appQuit, 0); // never re-issued
   });

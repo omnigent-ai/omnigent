@@ -3241,7 +3241,9 @@ def test_clean_codex_env_deny_wins_over_extra_allow(monkeypatch):
 
 
 def test_declared_passthrough_reads_sandbox_env_passthrough():
-    from omnigent.inner.codex_executor import _declared_passthrough
+    # Codex consumes the shared helper in agent_env rather than keeping its own
+    # copy; this still covers the codex spawn path's source of extra_allowed.
+    from omnigent.inner.agent_env import declared_passthrough as _declared_passthrough
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     # env_passthrough lives on os_env.sandbox, not os_env directly

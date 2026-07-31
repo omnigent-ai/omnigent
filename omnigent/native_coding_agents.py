@@ -7,6 +7,17 @@ from typing import Any
 from omnigent._platform import installed_interactive_shells
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import (
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+    CURSOR_NATIVE_CODING_AGENT,
+    GOOSE_NATIVE_CODING_AGENT,
+    HERMES_NATIVE_CODING_AGENT,
+    KIMI_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
+    OPENCODE_NATIVE_CODING_AGENT,
+    PI_NATIVE_CODING_AGENT,
+    QWEN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
 from omnigent.harness_plugins import (
@@ -19,6 +30,23 @@ _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}
 _BY_HARNESS = {agent.harness: agent for agent in NATIVE_CODING_AGENTS}
 _BY_WRAPPER_LABEL = {agent.wrapper_label: agent for agent in NATIVE_CODING_AGENTS}
 _BY_TERMINAL_NAME = {agent.terminal_name: agent for agent in NATIVE_CODING_AGENTS}
+
+# Canonical built-in ``*-native-ui`` agent names, one per tier-1 native harness.
+# Each is the registry row's ``agent_name`` — a named single-source-of-truth
+# handle so seeding and tests reference the built-in by symbol, not a magic
+# string literal. (The startup seeder loops NATIVE_CODING_AGENTS; these give
+# callers that need one specific built-in a stable name.)
+CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
+CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
+PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
+OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
+CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
+KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
+GOOSE_NATIVE_AGENT_NAME = GOOSE_NATIVE_CODING_AGENT.agent_name
+HERMES_NATIVE_AGENT_NAME = HERMES_NATIVE_CODING_AGENT.agent_name
+ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
+QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
+KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 
 
 def native_coding_agent_for_agent_name(name: str | None) -> NativeCodingAgent | None:
