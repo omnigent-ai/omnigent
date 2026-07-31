@@ -6492,14 +6492,12 @@ async def _get_session_snapshot(
         runner_client = get_runner_client()
 
     if refresh_state:
-        # Re-discover runner-backed overlays. Drop the model catalog only
-        # when a live runner can serve the re-fetch immediately; with no
-        # runner bound the cached catalog is all there is — keep serving it
-        # (stale) so a reload of an asleep session doesn't blank the picker.
+        # Re-discover runner-backed overlays while continuing to serve the
+        # previous model catalog until the asynchronous refresh replaces it.
         _invalidate_runner_backed_snapshot_state(
             session_id,
             cancel_inflight=False,
-            drop_model_options=runner_client is not None,
+            drop_model_options=False,
         )
 
     status = _session_status_from_cache(session_id)

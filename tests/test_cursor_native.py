@@ -166,8 +166,10 @@ _CURSOR_MODELS_OUTPUT = """Available models
 auto - Auto (default)
 gpt-5.3-codex-low - Codex 5.3 Low
 gpt-5.3-codex-high-fast - Codex 5.3 High Fast
+gpt-5.1-high - GPT-5.1 High
 claude-4.6-opus-high - Opus 4.6 1M
 claude-4.6-opus-high-thinking - Opus 4.6 1M Thinking
+claude-4-sonnet-thinking - Sonnet 4 Thinking
 composer-2.5 - Composer 2.5 (current)
 """
 
@@ -185,6 +187,12 @@ def test_parse_cursor_cli_model_options_normalizes_base_ids() -> None:
             "isCurrent": False,
         },
         {
+            "id": "gpt-5.1",
+            "displayName": "GPT-5.1",
+            "isDefault": False,
+            "isCurrent": False,
+        },
+        {
             "id": "claude-opus-4-6",
             "displayName": "Opus 4.6",
             "isDefault": False,
@@ -197,6 +205,16 @@ def test_parse_cursor_cli_model_options_normalizes_base_ids() -> None:
             "isCurrent": False,
         },
     ]
+
+
+def test_parse_cursor_cli_model_options_logs_unmapped_claude_ids(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reversed Claude ids that cannot round-trip never reach the picker."""
+    models = cursor_native.parse_cursor_cli_model_options(_CURSOR_MODELS_OUTPUT)
+
+    assert all(model["id"] != "claude-4-sonnet" for model in models)
+    assert "Skipping non-injectable Cursor model id 'claude-4-sonnet'" in caplog.text
 
 
 def test_parse_cursor_cli_model_options_rejects_empty_catalog() -> None:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -58,6 +59,8 @@ from omnigent.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native_terminal import url_component
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_CURSOR_COMMAND = "cursor-agent"
 _CURSOR_PATH_ENV = "OMNIGENT_CURSOR_PATH"
@@ -210,6 +213,7 @@ _CURSOR_VARIANT_SUFFIX_RE = re.compile(
 _CURSOR_DOTTED_CLAUDE_RE = re.compile(
     r"^claude-(?P<major>\d+)\.(?P<minor>\d+)-(?P<family>[a-z][a-z0-9-]*)$"
 )
+_CURSOR_UNMAPPED_CLAUDE_RE = re.compile(r"^claude-\d+(?:\.\d+)?-[a-z][a-z0-9-]*$")
 _CURSOR_DISPLAY_SUFFIXES = frozenset(
     {"1m", "none", "low", "medium", "high", "max", "thinking", "extra", "fast"}
 )
@@ -240,6 +244,9 @@ def parse_cursor_cli_model_options(output: str) -> list[dict[str, Any]]:
         if match is None:
             continue
         model_id = _cursor_base_model_id(match.group("id"))
+        if _CURSOR_UNMAPPED_CLAUDE_RE.fullmatch(model_id):
+            _logger.warning("Skipping non-injectable Cursor model id %r", model_id)
+            continue
         display_name = _cursor_base_display_name(match.group("name")) or model_id
         tags = {tag.strip().lower() for tag in (match.group("tags") or "").split(",")}
         option = options_by_id.setdefault(
