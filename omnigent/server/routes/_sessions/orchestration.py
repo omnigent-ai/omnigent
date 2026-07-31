@@ -8,6 +8,7 @@ imported by the router in ``sessions.py``."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 import time
@@ -3991,7 +3992,49 @@ async def _persist_session_event(
     return item_id
 
 
-def _native_turn_catalog(session_id: str, conv: Conversation) -> list[str] | None:
+async def _refresh_stale_native_model_options(
+    session_id: str,
+    runner_client: httpx.AsyncClient | None,
+) -> None:
+    """
+    Replace a pre-launch claude catalog with the runner's launch-exact one.
+
+    The cache can hold a catalog resolved from the session's *host* before
+    the terminal existed (``_load_model_options_from_host``), whose family
+    aliases carry the workspace default rather than this session's routed
+    pin. Such an entry is marked in ``_model_options_stale``; serving it to
+    turn routing offers a vocabulary the pane does not have. Once a runner
+    is bound its ``claude-model-options`` endpoint reports the pinned
+    aliases, so await that fetch before reading the cache. Leaves the stale
+    entry in place when there is no runner or the fetch fails — a stale
+    vocabulary still beats none.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param runner_client: HTTP client pointed at the bound runner, or
+        ``None`` when no runner is bound.
+    """
+    if runner_client is None or session_id not in _model_options_stale:
+        return
+    inflight = _model_options_inflight.get(session_id)
+    if inflight is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.shield(inflight)
+        return
+    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
+    task = asyncio.create_task(
+        _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+    )
+    _model_options_inflight[session_id] = task
+    task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
+    with contextlib.suppress(Exception):
+        await asyncio.shield(task)
+
+
+async def _native_turn_catalog(
+    session_id: str,
+    conv: Conversation,
+    runner_client: httpx.AsyncClient | None = None,
+) -> list[str] | None:
     """
     Return the models a native session's terminal can switch onto.
 
@@ -4003,12 +4046,16 @@ def _native_turn_catalog(session_id: str, conv: Conversation) -> list[str] | Non
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param conv: Conversation row, read for the wrapper label.
+    :param runner_client: HTTP client pointed at the bound runner, used to
+        replace a stale pre-launch catalog with the launch-exact one.
+        ``None`` serves whatever is cached.
     :returns: Model ids, or ``None`` when the session is not a native
         terminal with a known vocabulary (the caller keeps its own
         candidate resolution).
     """
     if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
         return None
+    await _refresh_stale_native_model_options(session_id, runner_client)
     options = _model_options_cache.get(session_id)
     if not options:
         return None
@@ -4447,7 +4494,7 @@ async def _forward_event_to_runner(
                     _user_text,
                     session_id=session_id,
                     runner_client=runner_client,
-                    catalog=_native_turn_catalog(session_id, conv),
+                    catalog=await _native_turn_catalog(session_id, conv, runner_client),
                 )
                 if _routed_model is not None:
                     # Whether the session can actually be switched onto the
@@ -4784,7 +4831,7 @@ async def _dispatch_session_event_to_runner_impl(
                     _user_text,
                     session_id=session_id,
                     runner_client=_native_runner_client,
-                    catalog=_native_turn_catalog(session_id, conv),
+                    catalog=await _native_turn_catalog(session_id, conv, _native_runner_client),
                 )
                 if _native_routed_model is not None:
                     # A pane that already took a routed turn can only be moved

@@ -69,6 +69,7 @@ def _restore_runtime_globals() -> Iterator[None]:
     for name, value in saved.items():
         setattr(_globals, name, value)
 
+
 CLAUDE_MODEL = "databricks-claude-opus-4-8"
 GPT_MODEL = "databricks-gpt-5-5"
 ROUTING_MESSAGE = "refactor the auth module and add tests"
@@ -518,7 +519,7 @@ def _native_conv(session_id: str) -> Any:  # type: ignore[explicit-any]
     )
 
 
-def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
+async def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
     """The picker rows bound both what a turn may pick and what it may claim."""
     from omnigent.server.routes._sessions.orchestration import (
         _model_options_cache,
@@ -533,7 +534,7 @@ def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
         {"id": "sonnet_5", "model": "databricks-claude-opus-4-8"},
     ]
     try:
-        assert _native_turn_catalog("conv_vocab", conv) == [
+        assert await _native_turn_catalog("conv_vocab", conv) == [
             "databricks-claude-opus-5",
             "databricks-claude-opus-4-8",
         ]
@@ -560,19 +561,99 @@ def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
     # A picker row with no ``model`` still names its vocabulary through ``id``.
     _model_options_cache["conv_rowkey"] = [{"id": "opus"}]
     try:
-        assert _native_turn_catalog("conv_rowkey", _native_conv("conv_rowkey")) == ["opus"]
+        assert await _native_turn_catalog("conv_rowkey", _native_conv("conv_rowkey")) == ["opus"]
     finally:
         _model_options_cache.pop("conv_rowkey", None)
 
     # Not a claude-native session, and a native one with no rows cached: both
     # leave the caller's own resolution and claim untouched.
     plain = SimpleNamespace(id="conv_plain", labels={})
-    assert _native_turn_catalog("conv_plain", plain) is None
-    assert _native_turn_catalog("conv_vocab", conv) is None
+    assert await _native_turn_catalog("conv_plain", plain) is None
+    assert await _native_turn_catalog("conv_vocab", conv) is None
     assert (
         _routed_turn_model_spelling("conv_vocab", conv, "databricks-gpt-5-5")
         == "databricks-gpt-5-5"
     )
+
+
+async def test_turn_catalog_refetches_a_stale_pre_launch_catalog() -> None:
+    """A pre-launch host catalog never bounds a turn once a runner is bound."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _model_options_stale,
+        _native_turn_catalog,
+        _routed_turn_model_spelling,
+    )
+
+    session_id = "conv_stale"
+    conv = _native_conv(session_id)
+    # Hydrated from the host BEFORE launch: the opus alias carries the
+    # workspace default, not this session's routed pin.
+    _model_options_cache[session_id] = [{"id": "opus", "model": "databricks-claude-opus-5"}]
+    _model_options_stale.add(session_id)
+    requested: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        # What the runner reports post-launch: the launch config pinned the
+        # routed arm onto the opus alias.
+        return httpx.Response(
+            200, json={"models": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner.invalid"
+    )
+    try:
+        assert await _native_turn_catalog(session_id, conv, runner_client) == [
+            "databricks-claude-opus-4-8"
+        ]
+        assert requested == [f"/v1/sessions/{session_id}/claude-model-options"]
+        assert session_id not in _model_options_stale
+        # The same refreshed vocabulary now spells the pick for the apply.
+        assert (
+            _routed_turn_model_spelling(session_id, conv, "databricks-claude-opus-4-8") == "opus"
+        )
+        # A fresh entry is served without a second fetch.
+        assert await _native_turn_catalog(session_id, conv, runner_client) == [
+            "databricks-claude-opus-4-8"
+        ]
+        assert len(requested) == 1
+    finally:
+        await runner_client.aclose()
+        _model_options_cache.pop(session_id, None)
+        _model_options_stale.discard(session_id)
+
+
+async def test_turn_catalog_keeps_a_stale_catalog_when_the_refetch_fails() -> None:
+    """A stale vocabulary still bounds the turn when the runner cannot answer."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _model_options_stale,
+        _native_turn_catalog,
+    )
+
+    session_id = "conv_stale_fail"
+    conv = _native_conv(session_id)
+    _model_options_cache[session_id] = [{"id": "opus", "model": "databricks-claude-opus-5"}]
+    _model_options_stale.add(session_id)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("runner gone")
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner.invalid"
+    )
+    try:
+        assert await _native_turn_catalog(session_id, conv, runner_client) == [
+            "databricks-claude-opus-5"
+        ]
+        # No runner bound at all: the cache is served untouched.
+        assert await _native_turn_catalog(session_id, conv, None) == ["databricks-claude-opus-5"]
+    finally:
+        await runner_client.aclose()
+        _model_options_cache.pop(session_id, None)
+        _model_options_stale.discard(session_id)
 
 
 async def test_routing_authorizes_host_ownership_before_touching_the_host() -> None:
