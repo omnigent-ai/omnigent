@@ -595,9 +595,12 @@ def _decision_from_result(
     model = result.model
     rationale = getattr(result, "rationale", "") or ""
     # Only report a raw pick that actually differs from the resolved model, so
-    # the telemetry field means "the router asked for something else".
+    # the telemetry field means "the router asked for something else". A
+    # prefix-only spelling difference is the same arm, not a substitution.
+    from omnigent.server.smart_routing import _bare_id
+
     raw = _opt_str(getattr(result, "raw_model", None))
-    raw_model = raw if raw and raw != model else None
+    raw_model = raw if raw and _bare_id(raw) != _bare_id(model) else None
     offered = {m for models in candidates.values() for m in models}
     if offered and model not in offered:
         # Never let an unoffered pick through: "didn't spawn" beats "wrong model".
