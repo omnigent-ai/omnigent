@@ -31,7 +31,7 @@ from omnigent.version import VERSION
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from omnigent.runner.app import ResolvedSpec
+    from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
@@ -512,11 +512,11 @@ def _make_auth_token_factory(
     # credential at rest and no fixed session-length cap.
     if _allow_delegated_mint and resolved_server_url:
         try:
-            binding_token = _runner_tunnel_binding_token_from_env()
+            fallback_binding_token = _runner_tunnel_binding_token_from_env()
         except RuntimeError:
-            binding_token = None
-        if binding_token is not None:
-            return _make_managed_mint_factory(resolved_server_url, binding_token)
+            fallback_binding_token = None
+        if fallback_binding_token is not None:
+            return _make_managed_mint_factory(resolved_server_url, fallback_binding_token)
     return None
 
 
@@ -913,7 +913,7 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404.
     """
-    from omnigent.runner.app import ResolvedSpec
+    from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
     if session_id is None:
