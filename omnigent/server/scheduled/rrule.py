@@ -56,9 +56,11 @@ class RRuleValidationError(ValueError):
 
 
 class _ParsedRRule(Protocol):
-    def after(self, dt: datetime, inc: bool = False) -> datetime | None: ...
+    def after(self, dt: datetime, inc: bool = False) -> datetime | None:
+        raise NotImplementedError
 
-    def __iter__(self) -> Iterator[datetime]: ...
+    def __iter__(self) -> Iterator[datetime]:
+        raise NotImplementedError
 
 
 def _anchor_dtstart(after: datetime, tz: ZoneInfo) -> datetime:
