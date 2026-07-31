@@ -909,8 +909,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # usually not enabled on a Bedrock account, so pin an explicit id.
         default_model = (
             prompt_text(
-                "Default model (Bedrock inference-profile id or ARN; "
-                "format: us.<provider>.<model>-<release>-v<n>:<revision>)"
+                "Default model (Bedrock inference-profile id or ARN; e.g. "
+                "us.vendor.model-family-YYYYMMDD-v1:0)"
             ).strip()
             or None
         )

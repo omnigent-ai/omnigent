@@ -116,8 +116,9 @@ def deny_trivial_to_expensive_model(
     classification failures all pass through (fail open).
 
     :param expensive_models: Provider-configured model ids that should
-        not be used for trivial tasks. Required — the operator must
-        explicitly list the models to gate.
+        not be used for trivial tasks, e.g. ``["provider/model-id",
+        "provider-local-model-id"]``. Required — the operator must explicitly
+        list the models to gate.
     :param classification_prompt: System instructions for the
         classifier LLM call. The model is constrained to respond
         with structured JSON
@@ -485,7 +486,10 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                 "expensive_models": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": ("Provider-configured model ids to gate for trivial tasks."),
+                    "description": (
+                        "Provider-configured model ids to gate for trivial tasks, "
+                        "e.g. ['provider/model-id', 'provider-local-model-id']."
+                    ),
                 },
                 "classification_prompt": {
                     "type": "string",

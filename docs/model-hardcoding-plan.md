@@ -202,8 +202,8 @@ runtime discovery fails with configuration guidance when no catalog is available
 
 Setup prompts, routing policy schemas, and spawn-tool descriptions explain the
 expected provider-configured model value without embedding release-specific ids.
-Concrete examples belong in tests or provider-owned documentation so runtime
-help does not recommend stale models.
+Runtime help may use synthetic examples to show identifier shape; concrete
+release ids belong in tests or provider-owned documentation.
 
 ## Static Fallback Ownership
 

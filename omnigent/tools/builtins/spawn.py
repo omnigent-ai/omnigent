@@ -926,8 +926,9 @@ class SysSessionCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "Optional provider-configured model id for "
-                                "the child session. Sets the harness model "
-                                "at session creation; omit to use the "
+                                "the child session, e.g. 'provider/model-id' "
+                                "or 'provider-local-model-id'. Sets the harness "
+                                "model at session creation; omit to use the "
                                 "agent's default."
                             ),
                         },
