@@ -34,9 +34,15 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from typing import Any
 
 _logger = logging.getLogger(__name__)
+
+# Executable-resolution seam for the stale-override fallback. Module-level so
+# tests can pin it and precedence assertions don't depend on what happens to
+# be installed on the machine running them.
+_which = shutil.which
 
 # The release in which the legacy ``HARNESS_<NAME>_PATH`` read is removed.
 # Deprecated in v0.6.0; two versions of back-compat, then removal.
@@ -277,6 +283,11 @@ def resolve_harness_command(
     3. config ``harness.<canonical>.command`` (when *cfg* is provided).
     4. *default* — the harness's built-in executable name.
 
+    An env- or config-layer override that no longer resolves to an
+    executable is skipped with a warning when *default* does resolve
+    (see :func:`_fallback_if_stale`); the explicit flag is never
+    second-guessed.
+
     :param harness: A harness id (canonical or alias), e.g.
         ``"claude-native"`` or ``"codex"``.
     :param default: Built-in fallback executable, e.g. ``"claude"``.
@@ -296,14 +307,51 @@ def resolve_harness_command(
     # be shadowed by a config ``harness.<id>.command``.
     env_value = resolve_harness_path(canonical)
     if env_value:
-        return env_value
+        return _fallback_if_stale(env_value, default, "env", canonical)
     if cfg is not None:
         _, overrides = resolve_harness_config(cfg)
         entry = overrides.get(canonical)
         if entry is not None:
             command = entry.get(_OVERRIDE_KEY_COMMAND)
             if isinstance(command, str) and command.strip():
-                return command.strip()
+                return _fallback_if_stale(command.strip(), default, "config", canonical)
+    return default
+
+
+def _fallback_if_stale(command: str, default: str, source: str, canonical: str) -> str:
+    """Return *command*, or *default* when *command* is a stale override.
+
+    A stored override can outlive the binary it names — e.g. a
+    ``harness.claude-native.command`` pinned to a versioned install path
+    (``…/claude/versions/2.1.216``) that the next reinstall deleted.
+    Launching would then die in preflight even though the built-in
+    default still works, so in keeping with this module's warn+skip
+    philosophy the stale override is skipped with a warning instead of
+    taking the launch down with it.
+
+    The fallback fires only when *command* does not resolve to an
+    executable while *default* does. When neither resolves, *command*
+    is kept so the launch error names the operator's configured value,
+    and the explicit ``--command`` flag never reaches this path — a
+    per-invocation choice should fail loudly, not be second-guessed.
+
+    :param command: The override value from the env or config layer.
+    :param default: The harness's built-in executable name.
+    :param source: Layer that supplied the override, for the log line.
+    :param canonical: Canonical harness id, for the log line.
+    :returns: *command*, or *default* when the override is stale.
+    """
+    if _which(command) is not None or _which(default) is None:
+        return command
+    _logger.warning(
+        "Ignoring stale %s command override %r for harness %r: it does not "
+        "resolve to an executable, but the default %r does. Update or remove "
+        "the override.",
+        source,
+        command,
+        canonical,
+        default,
+    )
     return default
 
 
