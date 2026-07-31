@@ -6210,6 +6210,156 @@ async def _pre_session_model_catalog(
     return {harness: models for harness, models in zip(harnesses, results, strict=True) if models}
 
 
+async def _routing_host_for_create(
+    body: SessionCreateRequest,
+    request: Request,
+    user_id: str | None,
+) -> Host | None:
+    """Resolve the create's target host for routing, authorizing ownership first.
+
+    Routing reads the host's harness readiness and pushes model-options frames
+    over its live connection, so a foreign ``host_id`` must be rejected before
+    anything is read from the host or landed in its owner's connection.
+
+    :param body: The create request; ``host_id`` selects the host.
+    :param request: Used to reach the app's host store.
+    :param user_id: Authenticated caller, or ``None`` when auth is disabled.
+    :returns: The owned host, or ``None`` when the create names none.
+    :raises HTTPException: 404 if ``host_id`` is unknown, 403 if it belongs
+        to another user.
+    """
+    from omnigent.server.routes._host_launch import resolve_host_owner
+
+    host_store = getattr(request.app.state, "host_store", None)
+    if host_store is None or body.host_id is None:
+        return None
+    return await asyncio.to_thread(
+        resolve_host_owner,
+        user_id=user_id,
+        host_id=body.host_id,
+        host_store=host_store,
+    )
+
+
+def _create_resolved_harness(
+    agent: Agent,
+    harness_override: str | None,
+    agent_cache: AgentCache | None,
+) -> str | None:
+    """Resolve the harness a create will run on, before any row exists.
+
+    :param agent: The bound agent row.
+    :param harness_override: The request's raw ``harness_override``, if any.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: The canonical harness id, or ``None`` when it cannot be resolved.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    native_agent = native_coding_agent_for_agent_name(agent.name)
+    if native_agent is not None:
+        return native_agent.harness
+    if harness_override:
+        return canonicalize_harness(harness_override) or harness_override
+    if agent_cache is None:
+        return None
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+        # An unloadable spec just means "harness unknown"; the create's own
+        # validation reports it.
+        _logger.debug("create-time routing: agent %r failed to load", agent.name, exc_info=True)
+        return None
+    return canonicalize_harness(_spec_harness(loaded.spec)) or None
+
+
+def _fixed_native_routing_harness(
+    body: SessionCreateRequest,
+    agent: Agent,
+    agent_cache: AgentCache | None,
+) -> str | None:
+    """The native harness whose model a create must route now, if any.
+
+    A native terminal launches with the session row and its turns originate in
+    the TUI, so the server never sees the first message pre-inference: a session
+    pinned to claude-native / codex-native has to route its MODEL during the
+    create or not at all. Everything else routes later — an SDK harness on its
+    first turn through the server, the ``"auto"`` path on its own create branch.
+
+    :param body: The validated create request.
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: ``"claude-native"`` / ``"codex-native"`` when create-time model
+        routing applies, else ``None``.
+    """
+    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+
+    if body.cost_control_mode_override != "on":
+        return None
+    if not (body.smart_routing_message or "").strip():
+        return None
+    # The auto path routes harness AND model on its own branch; a child or
+    # sub-agent session is routed by the spawn/turn paths, which know the
+    # parent's family. Neither may take this branch.
+    if body.harness_override == "auto":
+        return None
+    if body.parent_session_id is not None or body.sub_agent_name is not None:
+        return None
+    # A client-pinned model wins over the router, exactly as it does per turn.
+    if body.model_override is not None:
+        return None
+    harness = _create_resolved_harness(agent, body.harness_override, agent_cache)
+    return harness if harness in AUTO_NATIVE_ROUTING_HARNESSES else None
+
+
+async def _resolve_fixed_native_model_routing(
+    body: SessionCreateRequest,
+    request: Request,
+    user_id: str | None,
+    harness: str,
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    """Route the model for a create already pinned to one native harness.
+
+    Candidates come from the host's pre-launch catalog for that single harness
+    (:func:`_pre_session_model_catalog`) — no runner exists yet — and the pick is
+    constrained to the session's own harness, so routing can only change the
+    model. Fails open: an unavailable router or a pick this harness cannot run
+    yields no model and a rationale for the routing card.
+
+    :param body: The create request; ``smart_routing_message`` carries the
+        routing text and ``host_id`` selects whose CLI catalog is read.
+    :param request: Used to reach the app's host store and host registry.
+    :param user_id: Authenticated caller, or ``None`` when auth is disabled.
+    :param harness: The session's native harness, e.g. ``"claude-native"``.
+    :returns: ``(model, verdict, error)``; ``model`` and ``verdict`` are
+        ``None`` when nothing should be pinned, and ``error`` then explains why.
+    :raises HTTPException: 404 if ``host_id`` is unknown, 403 if it belongs
+        to another user.
+    """
+    from omnigent.server.smart_routing import models_in_family, route_session_harness
+
+    host = await _routing_host_for_create(body, request, user_id)
+    _harness, model, verdict, error = await route_session_harness(
+        body.smart_routing_message or "",
+        harness_candidates=(harness,),
+        catalog=await _pre_session_model_catalog(request, host, (harness,)),
+    )
+    if model is None or verdict is None:
+        return None, None, error or "Routing unavailable; using the harness default model."
+    if not models_in_family(harness, [model]):
+        # With one harness on offer the seam has nothing to redirect an
+        # out-of-family pick onto, and it resolves to the only candidate. The
+        # launch would pass a ``--model`` this CLI cannot run, so leave the
+        # session on its default and say so on the card.
+        return (
+            None,
+            None,
+            f"Not applied: this {harness} session cannot run {model}.",
+        )
+    return model, verdict, None
+
+
 async def _resolve_native_smart_routing(
     body: SessionCreateRequest,
     request: Request,
@@ -6245,24 +6395,9 @@ async def _resolve_native_smart_routing(
     :raises HTTPException: 404 if ``host_id`` is unknown, 403 if it belongs
         to another user.
     """
-    from omnigent.server.routes._host_launch import resolve_host_owner
     from omnigent.server.smart_routing import route_session_harness
 
-    # Authorize host ownership FIRST: this reads the host's harness readiness
-    # and pushes model-options frames over its live connection, so a foreign
-    # host_id would otherwise leak CLI/catalog presence and land frames in
-    # another user's connection.
-    host_store = getattr(request.app.state, "host_store", None)
-    host = (
-        await asyncio.to_thread(
-            resolve_host_owner,
-            user_id=user_id,
-            host_id=body.host_id,
-            host_store=host_store,
-        )
-        if host_store is not None and body.host_id is not None
-        else None
-    )
+    host = await _routing_host_for_create(body, request, user_id)
     installed = _installed_native_harnesses(host)
     if not installed:
         return None, None, None, "No native CLI is installed on this host."
@@ -6385,6 +6520,28 @@ async def _create_session_from_existing_agent(
             conversation_store=conversation_store,
         )
 
+    # Fixed native harness + Smart Routing on: the harness is the caller's own
+    # choice, so only the MODEL is routed — and it has to happen here, since the
+    # terminal launches with the row and its turns originate in the TUI (the
+    # server never sees the first message pre-inference). Fails open: no pin, a
+    # decision card with the reason, and the CLI's default model.
+    _fixed_native_harness = (
+        None
+        if _native_smart_routing
+        else await asyncio.to_thread(_fixed_native_routing_harness, body, agent, agent_cache)
+    )
+    _fixed_routed_model: str | None = None
+    _fixed_routing_verdict: dict[str, Any] | None = None
+    _fixed_routing_error: str | None = None
+    if _fixed_native_harness is not None:
+        (
+            _fixed_routed_model,
+            _fixed_routing_verdict,
+            _fixed_routing_error,
+        ) = await _resolve_fixed_native_model_routing(
+            body, request, user_id, _fixed_native_harness
+        )
+
     # Authorize parent_session_id before inheriting anything.
     # The caller must own or have READ access to the parent session;
     # otherwise a forged parent link lets them inherit runner
@@ -6417,8 +6574,13 @@ async def _create_session_from_existing_agent(
     # before any row or worktree exists.
     model_override, reasoning_effort = validate_session_model_metadata(
         # Native Smart Routing bakes the routed model into the terminal launch;
-        # the client sends none of its own on that path.
-        model_override=_native_routed_model if _native_smart_routing else body.model_override,
+        # the client sends none of its own on that path. A fixed-harness routed
+        # create does the same, and only ever ran because the client sent none.
+        model_override=(
+            _native_routed_model
+            if _native_smart_routing
+            else _fixed_routed_model or body.model_override
+        ),
         reasoning_effort=body.reasoning_effort,
     )
 
@@ -6743,6 +6905,29 @@ async def _create_session_from_existing_agent(
                 "unavailable",
                 {"rationale": _native_routing_error, "applied": False},
                 scope="session",
+            )
+    elif _fixed_native_harness is not None:
+        # Same card for a create that routed only the model. The decision label
+        # records what pinned the row's model, the way a routed turn does.
+        if _fixed_routed_model is not None and _fixed_routing_verdict is not None:
+            _fixed_decision_id = await _emit_server_routing_decision(
+                conv.id,
+                conversation_store,
+                _fixed_routed_model,
+                _fixed_routing_verdict,
+                scope="session",
+                harness=_fixed_native_harness,
+            )
+            await _stamp_routing_decision_label(conv.id, conversation_store, _fixed_decision_id)
+            conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id) or conv
+        elif _fixed_routing_error is not None:
+            await _emit_server_routing_decision(
+                conv.id,
+                conversation_store,
+                "unavailable",
+                {"rationale": _fixed_routing_error, "applied": False},
+                scope="session",
+                harness=_fixed_native_harness,
             )
 
     # Emit session.created exactly once at creation time.

@@ -6,6 +6,11 @@ the first message as ``smart_routing_message``. A native terminal launches with
 the session row, so the harness is decided during the create — not on the first
 message event the way the bundle-agent auto path does — and the session is
 rebound to the wrapper the router picked.
+
+A create pinned to one native harness (the CLI's ``omni claude --smart-routing``,
+or the web UI picking a harness with routing on) routes on the same seam for the
+same reason, but only the MODEL: its turns originate in the TUI, so the server
+never sees the first message pre-inference and the turn gate would never fire.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ import httpx
 import pytest
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, ROUTING_DECISION_LABEL_KEY
 from omnigent.server.routes._sessions.orchestration import (
     _installed_native_harnesses,
     _pre_session_model_catalog,
@@ -132,6 +137,222 @@ async def _create_smart_routing_session(
         return await client.post("/v1/sessions", json=body)
 
 
+async def _create_fixed_harness_session(
+    client: httpx.AsyncClient,
+    agent_id: str,
+    routing_client: FakeRoutingClient | None,
+    **extra: Any,  # type: ignore[explicit-any]
+) -> httpx.Response:
+    """POST a Smart Routing create for a session pinned to one harness.
+
+    The CLI's ``omni claude --smart-routing`` shape: a fixed harness (the native
+    wrapper agent, no ``harness_override``) plus routing on and the prompt as
+    ``smart_routing_message``.
+
+    :param client: Test HTTP client.
+    :param agent_id: Agent to bind.
+    :param routing_client: Stub router, or ``None`` to leave routing unconfigured.
+    :param extra: Extra create-body fields, merged last.
+    :returns: The raw create response.
+    """
+    body: dict[str, Any] = {
+        "agent_id": agent_id,
+        "cost_control_mode_override": "on",
+        "smart_routing_message": ROUTING_MESSAGE,
+        **extra,
+    }
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        return await client.post("/v1/sessions", json=body)
+
+
+def _routing_decision_items(db_uri: str, session_id: str) -> list[dict[str, Any]]:
+    """The session's ``routing_decision`` item payloads, oldest first.
+
+    :param db_uri: Database URI for a direct store handle.
+    :param session_id: Session whose transcript to read.
+    :returns: The ``data`` dict of each routing_decision item.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    items = store.list_items(session_id, type="routing_decision").data
+    return [cast("dict[str, Any]", item.data.model_dump()) for item in items]
+
+
+@pytest.mark.parametrize(
+    ("harness", "picked_model"),
+    [
+        ("claude-native", CLAUDE_MODEL),
+        ("codex-native", GPT_MODEL),
+    ],
+)
+async def test_fixed_native_harness_create_routes_the_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+    picked_model: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=picked_model, rationale="sized task"))
+    created = await _create_fixed_harness_session(client, wrappers[harness], routing_client)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    # Only the session's own harness is on the menu: routing may change the
+    # model, never the harness the caller asked for.
+    assert list(routing_client.offered[0]) == [harness]
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    # The wrapper launches with ``--model <routed>``, and the label records what
+    # pinned it.
+    assert conv.model_override == picked_model
+    assert conv.agent_id == wrappers[harness]
+    assert conv.harness_override is None
+    decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    assert decision_id is not None
+    # A fixed harness is not auto: subagents stay in this session's family.
+    assert AUTO_HARNESS_LABEL_KEY not in conv.labels
+
+    decisions = _routing_decision_items(db_uri, session_id)
+    assert len(decisions) == 1
+    assert decisions[0]["model"] == picked_model
+    assert decisions[0]["applied"] is True
+    assert decisions[0]["scope"] == "session"
+    assert decisions[0]["harness"] == harness
+    assert decisions[0]["decision_id"] == decision_id
+
+    # The create response and the snapshot both carry the model the CLI launches
+    # with. (``harness`` is read off the bound agent's SPEC, which these seeded
+    # wrappers share with a generic test bundle, so it is not asserted here.)
+    assert created.json()["model_override"] == picked_model
+    snapshot = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["model_override"] == picked_model
+    # The launch harness is reported as ``harness`` on both (there is no
+    # ``harness_override`` field on the snapshot — a native session stores none).
+    assert "harness_override" not in snapshot.json()
+    assert created.json()["harness"] == snapshot.json()["harness"]
+
+
+async def test_fixed_harness_create_does_not_pin_an_unrunnable_pick(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    # A gpt pick for a Claude terminal: the harness is not negotiable here, so
+    # nothing is pinned and the card says so.
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    created = await _create_fixed_harness_session(
+        client, wrappers["claude-native"], routing_client
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.model_override is None
+    assert ROUTING_DECISION_LABEL_KEY not in conv.labels
+
+    decisions = _routing_decision_items(db_uri, session_id)
+    assert len(decisions) == 1
+    assert decisions[0]["applied"] is False
+    assert GPT_MODEL in decisions[0]["rationale"]
+
+
+async def test_fixed_harness_create_fails_open_when_the_router_is_down(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    created = await _create_fixed_harness_session(client, wrappers["codex-native"], None)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    # The session still opens a terminal, on the CLI's own default model.
+    assert conv.model_override is None
+    assert ROUTING_DECISION_LABEL_KEY not in conv.labels
+
+    decisions = _routing_decision_items(db_uri, session_id)
+    assert len(decisions) == 1
+    assert decisions[0]["applied"] is False
+    assert "not configured" in decisions[0]["rationale"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        # Routing off: the create is a plain fixed-harness create.
+        {"cost_control_mode_override": "off"},
+        # No routing text — nothing to size the task with.
+        {"smart_routing_message": None},
+        {"smart_routing_message": "   "},
+        # A client-pinned model wins over the router, as it does per turn.
+        {"model_override": CLAUDE_MODEL},
+    ],
+)
+async def test_fixed_harness_create_routes_only_when_asked(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    extra: dict[str, Any],
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    created = await _create_fixed_harness_session(
+        client, wrappers["claude-native"], routing_client, **extra
+    )
+    assert created.status_code == 201, created.text
+    assert routing_client.offered == []
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    assert conv.model_override == extra.get("model_override")
+    assert _routing_decision_items(db_uri, created.json()["id"]) == []
+
+
+async def test_sdk_harness_create_still_routes_on_its_first_turn(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    # An SDK harness's first message reaches the server before inference, so the
+    # turn gate routes it; a create-time pin would only disable that gate.
+    agent = await create_test_agent(client, name="fixed-harness-sdk-agent")
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    created = await _create_fixed_harness_session(client, agent["id"], routing_client)
+    assert created.status_code == 201, created.text
+    assert routing_client.offered == []
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    assert conv.model_override is None
+    assert _routing_decision_items(db_uri, created.json()["id"]) == []
+
+
+async def test_child_session_create_is_not_routed_at_create_time(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    parent = await client.post("/v1/sessions", json={"agent_id": wrappers["claude-native"]})
+    assert parent.status_code == 201, parent.text
+
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    created = await _create_fixed_harness_session(
+        client,
+        wrappers["claude-native"],
+        routing_client,
+        parent_session_id=parent.json()["id"],
+    )
+    assert created.status_code == 201, created.text
+    # A child is routed by the spawn / turn paths, which know the parent's
+    # family and its own routing state.
+    assert routing_client.offered == []
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    assert conv.model_override is None
+
+
 @pytest.mark.parametrize(
     ("picked_model", "expected_harness"),
     [
@@ -160,6 +381,12 @@ async def test_create_binds_the_wrapper_the_router_picked(
     assert conv.harness_override is None
     # The auto marker is what keeps subagents cross-harness-eligible.
     assert conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+    # What a client reads back to launch the TUI: the routed model plus the
+    # bound wrapper. The row keeps no ``harness_override`` on this path, so
+    # ``harness`` (resolved from the bound wrapper) is the harness field.
+    assert created.json()["model_override"] == picked_model
+    assert created.json()["agent_id"] == wrappers[expected_harness]
+    assert "harness_override" not in created.json()
 
 
 async def test_router_is_offered_both_native_families(
