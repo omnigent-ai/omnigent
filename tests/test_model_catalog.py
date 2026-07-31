@@ -872,6 +872,7 @@ def test_cli_config_listing_is_static_and_unverified(
         "gpt-5-6-sol",
         "gpt-5-6-luna",
         "gpt-5-6-terra",
+        "gpt-5-5",
     ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.

@@ -37,7 +37,7 @@ import os
 import subprocess
 import threading
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Literal, TypeAlias, cast
 
 import click
 import httpx
@@ -74,6 +74,7 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
 if TYPE_CHECKING:
     from omnigent.onboarding.providers import ModelInfo
+    from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger(__name__)
 
@@ -97,9 +98,20 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
 
+_ProviderHarness: TypeAlias = Literal[
+    "claude-sdk",
+    "codex",
+    "pi",
+    "openai-agents-sdk",
+    "antigravity",
+    "kimi",
+    "qwen",
+]
+_JsonObject: TypeAlias = dict[str, object]
+
 # Harness spellings -> the workflow harness whose provider resolution they
 # share; natives resolve via their SDK sibling (the resolve_native_* rule).
-_PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
+_PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     "claude-sdk": "claude-sdk",
     "claude_sdk": "claude-sdk",
     "claude": "claude-sdk",
@@ -445,7 +457,7 @@ def _catalog_cost_tiers(models: list[ModelInfo]) -> dict[int, ModelCostTier]:
     return tiers
 
 
-def spec_harness(spec: Any) -> str | None:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def spec_harness(spec: object) -> str | None:
     """Resolve the declared harness for a (sub-)agent spec.
 
     Mirrors the runner's harness derivation
@@ -467,7 +479,7 @@ def spec_harness(spec: Any) -> str | None:  # type: ignore[explicit-any]  # stru
     return executor_type if isinstance(executor_type, str) and executor_type else None
 
 
-def resolve_model_provider(spec: Any, harness: str | None) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def resolve_model_provider(spec: object, harness: str | None) -> ResolvedModelProvider:
     """Resolve the model provider a worker's launch path would use.
 
     Total by contract: callers (the dispatch gate and ``sys_list_models``)
@@ -494,7 +506,7 @@ def resolve_model_provider(spec: Any, harness: str | None) -> ResolvedModelProvi
         )
 
 
-def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> ResolvedModelProvider:
     """Resolve the provider, propagating failures to the catch-all wrapper.
 
     Step 1 reuses :func:`~omnigent.runtime.workflow._resolve_provider_for_build`
@@ -523,13 +535,16 @@ def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedMo
             detail=f"harness {harness or 'unknown'!r} has no model-provider resolution",
         )
 
-    entry = _resolve_provider_for_build(spec, harness_type=harness_type)  # type: ignore[arg-type]  # AgentHarnessType narrowed by the map above
+    agent_spec = cast("AgentSpec", spec)
+    entry = _resolve_provider_for_build(agent_spec, harness_type=harness_type)
     if entry is not None:
         return _provider_from_entry(entry, harness_type)
-    return _provider_from_legacy_auth(spec, harness_type)
+    return _provider_from_legacy_auth(agent_spec, harness_type)
 
 
-def _provider_from_legacy_auth(spec: Any, harness_type: str) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _provider_from_legacy_auth(
+    spec: AgentSpec, harness_type: _ProviderHarness
+) -> ResolvedModelProvider:
     """Mirror the per-harness legacy fallthrough of ``_build_*_spawn_env``.
 
     The builders diverge: claude-sdk consumes spec/global ``auth:``
@@ -555,7 +570,7 @@ def _provider_from_legacy_auth(spec: Any, harness_type: str) -> ResolvedModelPro
     return _legacy_profile_only_provider(spec, harness_type)
 
 
-def _databricks_prefix_provider(spec: Any) -> ResolvedModelProvider | None:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _databricks_prefix_provider(spec: AgentSpec) -> ResolvedModelProvider | None:
     """Map a ``databricks-*`` spec model to the runner-env-profile gateway.
 
     Mirrors the builders' shared model-prefix heuristic; the native
@@ -575,7 +590,7 @@ def _databricks_prefix_provider(spec: Any) -> ResolvedModelProvider | None:  # t
     return None
 
 
-def _legacy_claude_sdk_provider(spec: Any) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _legacy_claude_sdk_provider(spec: AgentSpec) -> ResolvedModelProvider:
     """Mirror ``_build_claude_sdk_spawn_env``'s legacy auth branch.
 
     Spec ``auth:`` (databricks / api_key) → legacy profile
@@ -617,7 +632,7 @@ def _legacy_claude_sdk_provider(spec: Any) -> ResolvedModelProvider:  # type: ig
     return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
 
 
-def _legacy_openai_agents_provider(spec: Any) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _legacy_openai_agents_provider(spec: AgentSpec) -> ResolvedModelProvider:
     """Mirror ``_build_openai_agents_sdk_spawn_env``'s legacy auth branch.
 
     Spec ``auth:`` (api_key with its base_url / databricks) → global
@@ -659,7 +674,9 @@ def _legacy_openai_agents_provider(spec: Any) -> ResolvedModelProvider:  # type:
     return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
 
 
-def _legacy_profile_only_provider(spec: Any, harness_type: str) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _legacy_profile_only_provider(
+    spec: AgentSpec, harness_type: _ProviderHarness
+) -> ResolvedModelProvider:
     """Mirror the codex / pi builders' legacy branch (profile + prefix only).
 
     ``_build_codex_spawn_env`` / ``_build_pi_spawn_env`` never read
@@ -751,7 +768,7 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
 
 
 def list_models_for_worker(
-    spec: Any,  # type: ignore[explicit-any]  # structural spec stubs in tests
+    spec: object,
     harness: str | None,
     *,
     transport: httpx.BaseTransport | None = None,
@@ -780,7 +797,7 @@ def list_models_for_worker(
     if use_uc and provider.kind == DATABRICKS_KIND:
         uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:
-            cached = _listing_cache.get(uc_key)
+            cached = cast(ModelListing | None, _listing_cache.get(uc_key))
         if cached is not None:
             listing = cached
         else:
@@ -802,10 +819,10 @@ def list_models_for_worker(
 
 
 def catalog_for_spec(
-    spec: Any,  # type: ignore[explicit-any]  # structural spec stubs in tests
+    spec: object,
     *,
     transport: httpx.BaseTransport | None = None,
-) -> dict[str, dict[str, Any]]:  # type: ignore[explicit-any]  # JSON-shaped tool payload
+) -> dict[str, _JsonObject]:
     """Build the full ``sys_list_models`` payload for an agent spec.
 
     One row per declared sub-agent, keyed by sub-agent name, plus a
@@ -819,7 +836,7 @@ def catalog_for_spec(
     :returns: Mapping of worker name → row dict with ``source`` /
         ``verified`` / ``models`` / ``note`` keys.
     """
-    rows: dict[str, dict[str, Any]] = {}  # type: ignore[explicit-any]  # JSON-shaped tool payload
+    rows: dict[str, _JsonObject] = {}
     for sub in getattr(spec, "sub_agents", None) or []:
         name = getattr(sub, "name", None)
         if not isinstance(name, str) or not name:
@@ -830,10 +847,10 @@ def catalog_for_spec(
 
 
 def _worker_row(
-    spec: Any,  # type: ignore[explicit-any]  # structural spec stubs in tests
+    spec: object,
     *,
     transport: httpx.BaseTransport | None,
-) -> dict[str, Any]:  # type: ignore[explicit-any]  # JSON-shaped tool payload
+) -> _JsonObject:
     """Build one worker's catalog row, never raising.
 
     :param spec: The worker's (sub-)agent spec.
@@ -855,16 +872,16 @@ def _worker_row(
     return _listing_payload(listing)
 
 
-def _listing_payload(listing: ModelListing) -> dict[str, Any]:  # type: ignore[explicit-any]  # JSON-shaped tool payload
+def _listing_payload(listing: ModelListing) -> _JsonObject:
     """Serialize a :class:`ModelListing` into the tool's JSON row shape.
 
     :param listing: The listing to serialize.
     :returns: Row dict; ``context_window`` and ``static_fallback`` appear only
         when known.
     """
-    models: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON-shaped tool payload
+    models: list[_JsonObject] = []
     for entry in listing.models:
-        row: dict[str, Any] = {"id": entry.id, "family": entry.family}  # type: ignore[explicit-any]
+        row: _JsonObject = {"id": entry.id, "family": entry.family}
         metadata = entry.metadata
         if metadata.context_window is not None:
             row["context_window"] = metadata.context_window
@@ -888,7 +905,7 @@ def _listing_payload(listing: ModelListing) -> dict[str, Any]:  # type: ignore[e
                 "efforts": sorted(metadata.reasoning.efforts),
             }
         models.append(row)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "source": listing.source,
         "verified": listing.verified,
         "models": models,
@@ -968,7 +985,7 @@ def _listing_for_provider(
 
     cache_key = _listing_cache_key(provider)
     with _listing_cache_lock:
-        cached = _listing_cache.get(cache_key)
+        cached = cast(ModelListing | None, _listing_cache.get(cache_key))
     if cached is not None:
         return cached
     try:
