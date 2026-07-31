@@ -6287,6 +6287,64 @@ async def _drain_inbox(
     return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
 
 
+async def _evaluate_async_tool_call_policy(
+    tool_name: str,
+    tool_args: str,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> bool:
+    """
+    Evaluate PHASE_TOOL_CALL policy for an out-of-turn background dispatch.
+
+    Calls the AP server's policy-evaluate endpoint directly (no SSE
+    round-trip, since the originating turn has already ended).
+
+    ``arguments`` is sent as a dict (not a JSON string) so the server's policy
+    context builder and argument-aware built-in policies (e.g. safety rules
+    that inspect ``arguments.command``) see the same structure every in-turn
+    evaluation path delivers.
+
+    An ASK verdict parks the gate server-side (up to the policy's
+    ``ask_timeout``) and blocks the background task until resolved or timed
+    out — ``sys_cancel_async`` cannot interrupt a parked evaluation.
+
+    :returns: ``True`` when the tool may proceed; ``False`` to DENY.
+    """
+    evaluation_id = f"poleval_async_{uuid.uuid4().hex[:12]}"
+    phase = "PHASE_TOOL_CALL"
+    try:
+        try:
+            arguments_dict: dict[str, Any] = json.loads(tool_args)
+            if not isinstance(arguments_dict, dict):
+                arguments_dict = {}
+        except (json.JSONDecodeError, ValueError):
+            arguments_dict = {}
+        resp = await server_client.post(
+            f"/v1/sessions/{conversation_id}/policies/evaluate",
+            json={
+                "event": {"type": phase, "data": {"name": tool_name, "arguments": arguments_dict}}
+            },
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            result = resp.json()
+            action = result.get("result", "POLICY_ACTION_DENY")
+            return action == "POLICY_ACTION_ALLOW" or action == "POLICY_ACTION_UNSPECIFIED"
+        _logger.warning(
+            "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
+            resp.status_code,
+            evaluation_id,
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
+            evaluation_id,
+            exc_info=True,
+        )
+    return False
+
+
 def _spawn_async_tool(
     args: dict[str, Any],
     *,
@@ -6349,6 +6407,29 @@ def _spawn_async_tool(
         :returns: The tool output string.
         """
         try:
+            # Evaluate PHASE_TOOL_CALL policy before executing. The originating
+            # turn has already ended, so we call the AP server directly instead
+            # of going through the SSE round-trip. ASK is treated as DENY —
+            # there is no active turn to surface an approval prompt.
+            if server_client is not None and conversation_id is not None:
+                allowed = await _evaluate_async_tool_call_policy(
+                    target_tool,
+                    target_args,
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                )
+                if not allowed:
+                    result = "[Result suppressed by policy: PHASE_TOOL_CALL denied]"
+                    session_inbox.put_nowait(
+                        {
+                            "handle_id": handle_id,
+                            "tool_name": target_tool,
+                            "status": "failed",
+                            "output": result,
+                        }
+                    )
+                    return result
+
             # Race the tool execution against the cancel event.
             exec_coro = execute_tool(
                 tool_name=target_tool,

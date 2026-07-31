@@ -154,6 +154,32 @@ from omnigent.tools.builtins.load_skill import (
 _logger = logging.getLogger(__name__)
 
 
+def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
+    """
+    Log that a sub-agent name did not resolve to a declared child spec.
+
+    Every spec-swap site is guarded by ``if sub_spec is not None`` with no
+    ``else`` and falls back to the already-resolved PARENT spec — so a
+    renamed/removed sub-agent or stale session metadata silently boots the
+    child as a parent clone (parent prompt, tools, harness, workdir). The
+    create route now rejects an undeclared name up front, but stale rows
+    and post-create bundle edits can still reach these sites; a loud log
+    makes the fallback diagnosable instead of invisible.
+
+    :param session_id: The session whose turn is resolving the spec.
+    :param sub_agent_name: The name that failed to resolve in the parent
+        spec tree.
+    """
+    _logger.warning(
+        "Sub-agent %r for session %s did not resolve in the parent spec; "
+        "falling back to the parent spec (child runs with the parent's "
+        "prompt, tools and harness). Likely a renamed/removed sub-agent or "
+        "stale session metadata.",
+        sub_agent_name,
+        session_id,
+    )
+
+
 def __getattr__(name: str) -> Any:
     """Preserve private native-helper imports during the package move."""
     return getattr(_native, name)
@@ -2550,6 +2576,8 @@ def create_runner_app(
                         if _resolved_spec_workdir(spec_entry) is not None
                         else spec
                     )
+                else:
+                    _warn_unresolved_sub_agent(session_id, _sa_name_assign)
             harness_name = spec.executor.config.get("harness") or spec.executor.type
             harness_name = canonicalize_harness(harness_name) or harness_name
 
@@ -3777,7 +3805,10 @@ def create_runner_app(
         )
 
     async def _codex_native_model_options(conv_id: str) -> list[dict[str, Any]]:
-        from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.codex_native_app_server import (
+            client_for_transport,
+            list_codex_model_options,
+        )
 
         state = await _codex_native_bridge_state_for_session(
             conv_id,
@@ -3791,35 +3822,12 @@ def create_runner_app(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
-        options: list[dict[str, Any]] = []
         try:
             await codex_client.connect()
-            cursor: str | None = None
-            while True:
-                params: dict[str, Any] = {"includeHidden": False}
-                if cursor is not None:
-                    params["cursor"] = cursor
-                response = await codex_client.request("model/list", params)
-                result = response.get("result")
-                if not isinstance(result, dict):
-                    raise ValueError("Codex model/list result must be an object")
-                data = result.get("data")
-                if not isinstance(data, list):
-                    raise ValueError("Codex model/list data must be a list")
-                for raw_model in data:
-                    if not isinstance(raw_model, dict):
-                        raise ValueError("Codex model/list item must be an object")
-                    options.append(raw_model)
-                next_cursor = result.get("nextCursor")
-                if next_cursor is None:
-                    break
-                if not isinstance(next_cursor, str) or not next_cursor:
-                    raise ValueError("Codex model/list nextCursor must be a string or null")
-                cursor = next_cursor
+            return await list_codex_model_options(codex_client)
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        return options
 
     async def _handle_pi_native_model_change(
         conv_id: str,
@@ -4963,6 +4971,8 @@ def create_runner_app(
                     if cached_spec_workdir is not None
                     else cached_spec
                 )
+            else:
+                _warn_unresolved_sub_agent(conv, _sa_name)
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
         if cached_spec is not None:
@@ -7342,6 +7352,8 @@ def create_runner_app(
                             if workdir is not None
                             else sub_spec
                         )
+                    else:
+                        _warn_unresolved_sub_agent(session_id, sub_agent_name)
             _session_spec_cache[session_id] = spec_entry
             return spec_entry
 
@@ -8514,6 +8526,8 @@ async def _resolve_harness_config(
                 sub_spec = _find_spec_by_name(spec, sub_agent_name)
                 if sub_spec is not None:
                     spec = sub_spec
+                else:
+                    _warn_unresolved_sub_agent(session_id, sub_agent_name)
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(

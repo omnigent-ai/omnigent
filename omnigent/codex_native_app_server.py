@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import uuid
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING, TypeAlias, cast
 
 import tomlkit
 import websockets
+from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
 
 from omnigent import model_catalog
@@ -57,6 +59,7 @@ CodexParams: TypeAlias = _JsonObject
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
+_MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
@@ -557,6 +560,159 @@ class CodexAppServerClient:
                     future.set_result(message)
                 continue
             await self._events.put(message)
+
+
+async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
+    """Read every visible model from an initialized Codex app-server client.
+
+    :param client: Connected Codex app-server client.
+    :returns: Raw ``model/list`` rows in Codex preference order.
+    :raises ValueError: When Codex returns a malformed response.
+    """
+    options: list[_JsonObject] = []
+    cursor: str | None = None
+    while True:
+        params: CodexParams = {"includeHidden": False}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = await client.request("model/list", params)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise ValueError("Codex model/list result must be an object")
+        data = result.get("data")
+        if not isinstance(data, list):
+            raise ValueError("Codex model/list data must be a list")
+        for raw_model in data:
+            if not isinstance(raw_model, dict):
+                raise ValueError("Codex model/list item must be an object")
+            options.append(raw_model)
+        next_cursor = result.get("nextCursor")
+        if next_cursor is None:
+            return options
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise ValueError("Codex model/list nextCursor must be a string or null")
+        cursor = next_cursor
+
+
+_model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(
+    maxsize=8,
+    ttl=_MODEL_DISCOVERY_CACHE_SECONDS,
+)
+
+
+async def discover_codex_model_options(*, codex_path: str | None = None) -> list[_JsonObject]:
+    """Query the installed Codex CLI's credential-free compatibility catalog.
+
+    Starts a short-lived app-server with an empty private ``CODEX_HOME`` and
+    no provider overrides. The resulting ``model/list`` is Codex's own curated
+    compatibility set; callers can intersect it with a provider's live
+    availability without exposing provider credentials to the subprocess.
+
+    :param codex_path: Optional Codex executable override.
+    :returns: Raw visible ``model/list`` rows in Codex preference order.
+    :raises ImportError: When the Codex CLI is unavailable.
+    :raises RuntimeError: When the discovery app-server exits before connecting.
+    :raises TimeoutError: When the discovery app-server does not become ready.
+    """
+    resolved_codex = codex_path or _find_codex_cli()
+    if not resolved_codex:
+        raise ImportError("Native Codex model discovery requires the 'codex' CLI on PATH.")
+    cached = _model_discovery_cache.get(resolved_codex)
+    if cached is not None:
+        return [dict(option) for option in cached]
+
+    with tempfile.TemporaryDirectory(prefix="omnigent-codex-model-discovery-") as raw_dir:
+        root = Path(raw_dir)
+        codex_home = root / "codex-home"
+        codex_home.mkdir(mode=0o700)
+        port = _allocate_loopback_port()
+        listen_url = f"ws://127.0.0.1:{port}"
+        env = _clean_codex_env()
+        for name in tuple(env):
+            if name.startswith("OPENAI_") or name in {
+                "DATABRICKS_BEARER",
+                "DATABRICKS_CODEX_TOKEN",
+            }:
+                env.pop(name)
+        env["CODEX_HOME"] = str(codex_home)
+        process = await _start_codex_model_discovery_process(
+            codex_path=resolved_codex,
+            listen_url=listen_url,
+            env=env,
+            cwd=root,
+        )
+        client: CodexAppServerClient | None = None
+        try:
+            await _wait_for_discovery_listener(process, port)
+            client = CodexAppServerClient(
+                ws_url=listen_url,
+                client_name="omnigent-codex-model-discovery",
+            )
+            await client.connect()
+            options = await list_codex_model_options(client)
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.close()
+            _proc.terminate_tree(process)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except TimeoutError:
+                _proc.kill_tree(process)
+                await process.wait()
+
+    _model_discovery_cache[resolved_codex] = tuple(dict(option) for option in options)
+    return options
+
+
+async def _start_codex_model_discovery_process(
+    *,
+    codex_path: str,
+    listen_url: str,
+    env: dict[str, str],
+    cwd: Path,
+) -> asyncio.subprocess.Process:
+    """Start the isolated Codex process used only for model discovery."""
+    return await asyncio.create_subprocess_exec(
+        codex_path,
+        "app-server",
+        "--listen",
+        listen_url,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=env,
+        cwd=str(cwd),
+        **_proc.spawn_kwargs(),
+    )
+
+
+def _allocate_loopback_port() -> int:
+    """Return an ephemeral TCP port on loopback for model discovery."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+async def _wait_for_discovery_listener(
+    process: asyncio.subprocess.Process,
+    port: int,
+) -> None:
+    """Wait until a discovery app-server accepts loopback connections."""
+    deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
+    while asyncio.get_running_loop().time() < deadline:
+        if process.returncode is not None:
+            raise RuntimeError(f"Codex model discovery exited early ({process.returncode})")
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+            continue
+        writer.close()
+        await writer.wait_closed()
+        del reader
+        return
+    raise TimeoutError("Timed out waiting for Codex model discovery app-server")
 
 
 @dataclass

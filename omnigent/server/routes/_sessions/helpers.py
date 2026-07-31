@@ -7293,6 +7293,58 @@ def _resolve_subagent_spec(
     return _find_spec_by_name(parent_spec, sub_agent_name)
 
 
+def _require_declared_subagent(
+    *,
+    agent: Agent,
+    sub_agent_name: str,
+    agent_cache: AgentCache | None,
+) -> None:
+    """
+    Reject a ``sub_agent_name`` the parent's spec does not declare.
+
+    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and every
+    downstream site that swaps in the resolved child spec is guarded by
+    ``if ... is not None`` with no ``else`` — so a name that resolves to
+    nothing leaves the parent's spec, workdir, harness and instructions in
+    place and the child silently boots as a full clone of the parent
+    (runaway recursion for an orchestrator). This gate fails the create
+    loud instead, mirroring normal dispatch (``tool_dispatch`` rejects an
+    undeclared ``agent``) and the ``AGENTSPEC.md`` contract that unlisted
+    names are rejected.
+
+    Only rejects when the bundle loads AND the name is positively absent:
+    a load failure or absent cache cannot prove the negative, so it is
+    left to fail-loud downstream rather than blocking a create we cannot
+    adjudicate here.
+
+    :param agent: The parent agent row whose bundle declares the
+        sub-agents.
+    :param sub_agent_name: The requested sub-agent name to validate.
+    :param agent_cache: Cache for loading the parsed parent bundle.
+        ``None`` skips the check (cannot resolve the tree).
+    :raises OmnigentError: 404 ``NOT_FOUND`` when the bundle loads and
+        declares no sub-agent named ``sub_agent_name``.
+    """
+    if agent_cache is None:
+        return
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    try:
+        parent_spec = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        ).spec
+    except Exception:  # noqa: BLE001
+        # Can't load the bundle -> can't prove the name is undeclared.
+        # Leave it to the runner's fail-loud resolution rather than
+        # rejecting a create we cannot adjudicate.
+        return
+    if _find_spec_by_name(parent_spec, sub_agent_name) is None:
+        raise OmnigentError(
+            f"Sub-agent not declared in parent spec: {sub_agent_name!r}",
+            code=ErrorCode.NOT_FOUND,
+        )
+
+
 def _spec_harness(spec: AgentSpec) -> str:
     """
     Return the canonical harness identifier for a resolved spec.
@@ -8723,6 +8775,7 @@ __all__ = [
     "_replace_text_in_message_body",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",
+    "_require_declared_subagent",
     "_require_external_status_forward",
     "_require_host_conn_for_worktree",
     "_reset_runner_resources_after_switch",

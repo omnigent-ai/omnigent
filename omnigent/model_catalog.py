@@ -242,6 +242,16 @@ class ResolvedModelProvider:
     detail: str = ""
 
 
+def is_direct_openai_provider(provider: ResolvedModelProvider) -> bool:
+    """Return whether *provider* targets OpenAI's canonical models API."""
+    if provider.family != OPENAI_FAMILY or not provider.base_url:
+        return False
+    from omnigent.onboarding.configure_models import default_base_url_for_family
+
+    canonical = default_base_url_for_family(OPENAI_FAMILY)
+    return _models_url(provider.base_url).lower() == _models_url(canonical).lower()
+
+
 # Unfiltered listings keyed by provider identity. TTLCache is not thread-safe
 # and enumeration runs via asyncio.to_thread, so accesses lock; the HTTP fetch
 # stays outside it (duplicate fetches are benign, corruption is not).

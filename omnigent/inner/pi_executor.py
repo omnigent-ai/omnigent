@@ -45,7 +45,7 @@ import tempfile
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, TypeAlias
+from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent import model_catalog
@@ -130,6 +130,34 @@ NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
 # Plain JSON value — recursive union used by ``_check_blocked`` to walk
 # parsed Pi tool-result payloads.
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+_JsonObject: TypeAlias = dict[str, object]
+
+
+class _PiProviderConfig(TypedDict):
+    baseUrl: str
+    apiKey: str
+    api: str
+    models: list[_JsonObject]
+    authHeader: NotRequired[bool]
+    compat: NotRequired[_JsonObject]
+
+
+class _PiModelsConfig(TypedDict):
+    providers: dict[str, _PiProviderConfig]
+
+
+class _PiMessageUsage(TypedDict):
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cache_read_input_tokens: int
+    cache_creation_input_tokens: int
+    model: str | None
+
+
+class _PiTurnUsage(_PiMessageUsage):
+    context_tokens: int
+
 
 # ---------------------------------------------------------------------------
 # TCP tool server — serves Omnigent tools to the Pi extension
@@ -646,9 +674,8 @@ def _build_models_json(
     catalog_models: Sequence[model_catalog.ModelEntry] = (),
     model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
     openai_wire_api: str | None = None,
-) -> dict[str, Any]:  # type: ignore[explicit-any]
+) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
-    # the schema is owned by the Pi CLI and not worth a TypedDict tree here.
     """Build a Pi ``models.json`` with protocol-specific gateway providers.
 
     Each provider targets a different API gateway path and wire format so
@@ -705,13 +732,13 @@ def _build_models_json(
         codex_gateway_url = openai_base_url
         mlflow_gateway_url = openai_base_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
-    _openai_responses_compat: dict[str, Any] = {  # type: ignore[explicit-any]
+    _openai_responses_compat: _JsonObject = {
         "supportsDeveloperRole": False,
         "supportsStore": False,
         "supportsStrictMode": False,
         "supportsReasoningEffort": False,
     }
-    provider_models: dict[str, list[dict[str, Any]]] = {  # type: ignore[explicit-any]
+    provider_models: dict[str, list[_JsonObject]] = {
         "databricks-openai": [],
         "databricks": [],
         "databricks-anthropic": [],
@@ -728,7 +755,7 @@ def _build_models_json(
         if model is not None and model.lower() in _databricks_model_aliases(model_id):
             registered_model = replace(catalog_model, id=model)
         provider_models[provider_name].append(_pi_model_json_entry(registered_model))
-    config: dict[str, Any] = {  # type: ignore[explicit-any]  # Pi-owned schema, see note above
+    config: _PiModelsConfig = {
         "providers": {
             # Models advertising Responses support use the AI Gateway's Codex
             # surface, including tool-result chaining on subsequent turns.
@@ -811,7 +838,7 @@ def _build_models_json(
             # provider-side 400 on image turns — a deliberate trade (loud error
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
-            entry: dict[str, Any] = {"id": model, "input": ["text", "image"]}  # type: ignore[explicit-any]
+            entry: _JsonObject = {"id": model, "input": ["text", "image"]}
             if _pi_model_is_reasoning(model):
                 entry["reasoning"] = True
             provider["models"] = [*provider["models"], entry]
@@ -834,9 +861,9 @@ def _pi_model_is_reasoning(model: str) -> bool:
     return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
 
 
-def _pi_model_json_entry(model: model_catalog.ModelEntry) -> dict[str, Any]:  # type: ignore[explicit-any]
+def _pi_model_json_entry(model: model_catalog.ModelEntry) -> _JsonObject:
     """Translate normalized catalog metadata into Pi's model schema."""
-    entry: dict[str, Any] = {"id": model.id, "input": ["text", "image"]}  # type: ignore[explicit-any]
+    entry: _JsonObject = {"id": model.id, "input": ["text", "image"]}
     if model.metadata.context_window is not None:
         entry["contextWindow"] = model.metadata.context_window
     if model.metadata.max_output_tokens is not None:
@@ -1261,7 +1288,7 @@ def _extract_text(msg: Message) -> str:
 
 def _extract_latest_user_content(
     messages: list[Message],
-) -> str | list[dict[str, Any]]:
+) -> str | list[_JsonObject]:
     """
     Extract the latest user message content.
 
@@ -1280,12 +1307,12 @@ def _extract_latest_user_content(
             if isinstance(content, str):
                 return content
             if isinstance(content, list):
-                return content
+                return cast(list[_JsonObject], content)
             return str(content)
     return ""
 
 
-def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]]]:
+def _split_pi_prompt(blocks: list[_JsonObject]) -> tuple[str, list[dict[str, str]]]:
     """Split content blocks into Pi's prompt ``message`` text and ``images``.
 
     Pi's RPC ``prompt`` command carries text in ``message`` and images in a
@@ -1363,9 +1390,7 @@ def _split_pi_prompt(blocks: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
     return "\n".join(text_parts), images
 
 
-def _build_pi_prompt(
-    messages: list[Message], *, is_first_turn: bool
-) -> str | list[dict[str, Any]]:
+def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | list[_JsonObject]:
     """
     Build the prompt to send to Pi.
 
@@ -1544,7 +1569,7 @@ def _resolve_pi_skill_args(
 def _extract_pi_turn_usage(
     message: object,
     fallback_model: str | None,
-) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+) -> _PiMessageUsage | None:
     """Map a Pi assistant message's ``usage`` object onto the wire shape
     that :class:`TurnComplete` consumes, so pi sub-agent cost is priced
     the same way as ``claude-sdk`` and ``codex`` turns.
@@ -1584,9 +1609,9 @@ def _extract_pi_turn_usage(
 
 
 def _aggregate_pi_turn_usage(
-    message_usages: list[dict[str, Any]],  # type: ignore[explicit-any]
+    message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
-) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+) -> _PiTurnUsage | None:
     """Aggregate per-message Pi usage into one turn-level usage dict.
 
     A single Omnigent turn drives Pi's full agent loop, which may make
@@ -1957,7 +1982,10 @@ class PiExecutor(Executor):
                 "databricks",
                 family="claude",
             )
-            return resolution.model_id
+            model_id = resolution.model_id
+            if not isinstance(model_id, str):
+                raise TypeError("Databricks model resolution returned a non-string model id")
+            return model_id
         return model
 
     def _generic_openai_wire_api(self) -> str | None:
@@ -2315,7 +2343,7 @@ class PiExecutor(Executor):
         else:
             message = prompt
         cmd_id = f"turn_{id(messages)}"
-        command: dict[str, Any] = {"type": "prompt", "message": message, "id": cmd_id}
+        command: CodexEvent = {"type": "prompt", "message": message, "id": cmd_id}
         if images:
             command["images"] = images
         try:
@@ -2332,7 +2360,7 @@ class PiExecutor(Executor):
         # fallback). Summed into a turn-level usage dict at completion so a
         # multi-step (tool-loop) turn bills for every call, not just the
         # last. Empty when pi reports no usage — cost tracking is skipped.
-        message_usages: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        message_usages: list[_PiMessageUsage] = []
         # Error reported by a ``message_end`` (stopReason=error); surfaced at
         # ``agent_end`` so the terminal event is consumed off the RPC stream.
         pending_error: str | None = None
@@ -2353,7 +2381,10 @@ class PiExecutor(Executor):
                 else:
                     turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                     _notify_usage_from_dict(model=model, usage=turn_usage)
-                    yield TurnComplete(response=response_text, usage=turn_usage)
+                    yield TurnComplete(
+                        response=response_text,
+                        usage=dict(turn_usage) if turn_usage is not None else None,
+                    )
                 return
 
             try:
@@ -2509,7 +2540,10 @@ class PiExecutor(Executor):
                             break
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                 _notify_usage_from_dict(model=model, usage=turn_usage)
-                yield TurnComplete(response=response_text, usage=turn_usage)
+                yield TurnComplete(
+                    response=response_text,
+                    usage=dict(turn_usage) if turn_usage is not None else None,
+                )
                 return
 
             # message_end carries one completed assistant message, whose

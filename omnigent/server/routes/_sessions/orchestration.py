@@ -5342,6 +5342,19 @@ async def _create_session_from_existing_agent(
             conversation_store,
         )
 
+    # Reject an undeclared sub-agent before persisting the row. Downstream
+    # spec swaps are all guarded by ``if ... is not None`` with no
+    # ``else``, so a name the parent's spec never declares would leave the
+    # parent spec/workdir/harness/instructions in place and boot the child
+    # as a parent clone. Fail loud here instead.
+    if body.sub_agent_name:
+        await asyncio.to_thread(
+            _require_declared_subagent,
+            agent=agent,
+            sub_agent_name=body.sub_agent_name,
+            agent_cache=agent_cache,
+        )
+
     # The persisted override reaches a native CLI as a ``--model`` argv
     # element at terminal launch, so reject shell-/flag-shaped values
     # before any row or worktree exists.

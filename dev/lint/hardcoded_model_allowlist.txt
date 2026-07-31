@@ -17,8 +17,3 @@
 .github/workflows/polly-review.yml databricks-gpt-5-5 1
 .github/workflows/security-triage.yml databricks-claude-sonnet-4-6 1
 .github/workflows/vscode-release-pr.yml databricks-claude-sonnet-4-6 1
-omnigent/cli_config.py claude-opus-4-5-20251101-v1:0 1
-omnigent/policies/builtins/routing.py databricks-claude-opus-4-6 1
-omnigent/policies/builtins/routing.py o3 1
-omnigent/tools/builtins/spawn.py databricks-claude-opus-4-8 1
-omnigent/tools/builtins/spawn.py system.ai.glm-5-2 1
