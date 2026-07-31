@@ -15,6 +15,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.native_coding_agents import (
+    ANTIGRAVITY_NATIVE_AGENT_NAME,
+    QWEN_NATIVE_AGENT_NAME,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -619,9 +623,9 @@ def test_ensure_default_native_agents_seeds_qwen_card(seed_stores: _SeedStores) 
         seed_stores.agent_cache,
     )
 
-    seeded = seed_stores.agent_store.get_by_name("qwen-native-ui")
+    seeded = seed_stores.agent_store.get_by_name(QWEN_NATIVE_AGENT_NAME)
     assert seeded is not None, "qwen-native-ui was not registered"
-    assert seeded.name == "qwen-native-ui"
+    assert seeded.name == QWEN_NATIVE_AGENT_NAME
     # The bundle must be retrievable, not just referenced.
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
@@ -691,7 +695,7 @@ def test_ensure_default_native_agents_is_idempotent(seed_stores: _SeedStores) ->
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
-    first = seed_stores.agent_store.get_by_name("qwen-native-ui")
+    first = seed_stores.agent_store.get_by_name(QWEN_NATIVE_AGENT_NAME)
     assert first is not None
     server_app._ensure_default_native_agents(
         seed_stores.agent_store,
@@ -699,7 +703,7 @@ def test_ensure_default_native_agents_is_idempotent(seed_stores: _SeedStores) ->
         seed_stores.agent_cache,
     )
     page = seed_stores.agent_store.list(limit=100)
-    qwen_rows = [a for a in page.data if a.name == "qwen-native-ui"]
+    qwen_rows = [a for a in page.data if a.name == QWEN_NATIVE_AGENT_NAME]
     assert len(qwen_rows) == 1
     assert qwen_rows[0].id == first.id
     assert qwen_rows[0].version == first.version == 1
@@ -741,9 +745,9 @@ def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -
         seed_stores.agent_cache,
     )
 
-    seeded = seed_stores.agent_store.get_by_name("antigravity-native-ui")
+    seeded = seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME)
     assert seeded is not None, "antigravity-native-ui was not registered"
-    assert seeded.name == "antigravity-native-ui"
+    assert seeded.name == ANTIGRAVITY_NATIVE_AGENT_NAME
     # Built-ins are session-scope NULL so ``GET /v1/agents`` (which filters on
     # ``session_id IS NULL``) returns them to the picker.
     assert seeded.session_id is None
@@ -769,7 +773,7 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
         seed_stores.agent_cache,
     )
 
-    assert seed_stores.agent_store.get_by_name("antigravity-native-ui") is not None
+    assert seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
 
 
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:
