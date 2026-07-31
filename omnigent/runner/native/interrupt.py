@@ -11,11 +11,13 @@ Mirrors :class:`omnigent.runner.codex.goal.CodexGoalRunner`: app-scope state
 injected at construction so the class stays out of the already-large app module
 while preserving the exact behavior of the original closures.
 
-The nine uniform interrupt harnesses and seven uniform stop harnesses differ
+The seven uniform interrupt harnesses and six uniform stop harnesses differ
 only by bridge module, control-function name, and error label; they collapse to
 two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 :data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution) and codex
-interrupt (MCP-startup + app-server ``turn/interrupt``) keep dedicated methods.
+interrupt (MCP-startup + app-server ``turn/interrupt``) keep dedicated methods
+(so nine interrupt handlers total); claude stop is likewise special-cased and
+codex/pi alias stop to their interrupt handler (so seven stop handlers total).
 
 Coverage note: antigravity-native and opencode-native have no handler here and
 :meth:`interrupt` / :meth:`stop` return ``None`` for them, so the caller falls
@@ -111,7 +113,7 @@ class _UniformStop:
     display_name: str
 
 
-# The nine uniform interrupt harnesses (claude/codex are special-cased). pi uses
+# The seven uniform interrupt harnesses (claude/codex are special-cased). pi uses
 # enqueue_interrupt + OSError and no timeout; the rest inject_interrupt +
 # RuntimeError + timeout_s.
 _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
@@ -174,7 +176,7 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
     ),
 }
 
-# The seven uniform stop harnesses (claude has a special stop; codex/pi have no
+# The six uniform stop harnesses (claude has a special stop; codex/pi have no
 # distinct stop — they route to interrupt, handled in ``stop``).
 _UNIFORM_STOP: dict[str, _UniformStop] = {
     "cursor": _UniformStop(
