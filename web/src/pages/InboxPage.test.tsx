@@ -11,8 +11,6 @@
 // component that just exposes an Accept button wired to its `onSubmit`, which
 // lets us drive the approve/rollback path without the real card's internals.
 
-import type * as UseConversationsModule from "@/hooks/useConversations";
-
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -49,7 +47,7 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
 }));
 
 vi.mock("@/hooks/useConversations", async (importActual) => ({
-  ...(await importActual<typeof UseConversationsModule>()),
+  ...(await importActual<typeof conversationsHook>()),
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
