@@ -734,6 +734,7 @@ def run_claude_native(
     extra_args: tuple[str, ...] | None = None,
     claude_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
+    prompt: str | None = None,
     command: str = _DEFAULT_CLAUDE_COMMAND,
     use_claude_config: bool = False,
     auto_open_conversation: bool = False,
@@ -753,6 +754,11 @@ def run_claude_native(
     :param resume_picker: ``True`` runs the claude-native picker
         once the server is reachable; ``False`` keeps the existing
         ``session_id``-or-fresh-session behavior.
+    :param prompt: Optional first prompt for the TUI, e.g.
+        ``"review the last commit"``. Delivered as Claude Code's
+        positional prompt argument, so a multi-line prompt survives
+        intact (one argv entry — never a tmux paste). ``None`` starts
+        the TUI empty.
     :param command: Executable to run in the terminal resource,
         e.g. ``"claude"``. Kept off the public CLI surface so v0
         always exposes Claude Code, while tests can supply a fake
@@ -782,6 +788,11 @@ def run_claude_native(
     _preflight_local_tools(resolved_command)
     startup_profiler.mark("local tools ready")
     sanitized_args = _strip_resume_from_claude_args(claude_args)
+    # Claude Code takes the initial prompt as a positional argument, so it
+    # rides along with the launch args (persisted for the runner on the remote
+    # path). One argv entry keeps newlines and quotes intact.
+    if prompt and prompt.strip():
+        sanitized_args = (*sanitized_args, prompt)
     startup_profiler.mark("claude args normalized")
     # Resolve the launch config across all offerings: a configured provider
     # (configure harnesses), the Databricks ucode profile, or Claude's own
