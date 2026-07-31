@@ -3,7 +3,7 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
-import { type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

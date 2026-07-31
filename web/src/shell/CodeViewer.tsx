@@ -44,7 +44,7 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import { mermaid } from "@streamdown/mermaid";
 import { Streamdown } from "streamdown";
-import { type Comment } from "@/hooks/useComments";
+import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
   fileContentToBlob,

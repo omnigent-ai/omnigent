@@ -18,12 +18,12 @@ import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { MessageSquarePlusIcon, MinusIcon, PlusIcon } from "lucide-react";
 import { fileContentToBlob, type FileContentResponse } from "@/hooks/useFileContent";
-import { type Comment } from "@/hooks/useComments";
+import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
-import { type ActiveSelection } from "./codeViewerHelpers";
+import type { ActiveSelection } from "./codeViewerHelpers";
 import {
   commentsMatchOffsets,
   decodePdfAnchor,
