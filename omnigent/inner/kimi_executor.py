@@ -595,8 +595,8 @@ class KimiExecutor(Executor):
 
 
 async def _create_subprocess_exec(
-    *args: Any,  # type: ignore[explicit-any]
-    **kwargs: Any,  # type: ignore[explicit-any]
+    *args: Any,
+    **kwargs: Any,
 ) -> asyncio.subprocess.Process:
     """Indirection point so tests can stub subprocess creation.
 
