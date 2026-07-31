@@ -176,8 +176,61 @@ same `key`, declare the agent's harness id in `valid_harnesses`, supply the
 required provider hooks (`run_native`, `auto_create_terminal`), and keep every
 provider import path under `COMMUNITY_MODULE_PREFIX`.
 
-A full step-by-step native-plugin checklist and a benchable example plugin ship
-with the plugin-interface docs update (workstream PR 2.4).
+### Native provider hooks
+
+`NativeHarnessProvider` (keyed by the same `key` as its `NativeCodingAgent`)
+carries dotted import-path strings for the lifecycle hooks the runner resolves
+lazily at dispatch time:
+
+`run_native` (required)
+: CLI + resume launch entry point, `run_<key>_native(*, server, session_id,
+extra_args=..., resume_picker=..., auto_open_conversation=...)`. Called by the
+resume dispatch.
+
+`auto_create_terminal` (required)
+: Runner terminal builder `async (NativeLaunchContext) -> SessionResourceView`.
+Runs on the runner (may import the runner stack — it is imported at dispatch
+time, not during entry-point discovery).
+
+`spawn_env_builder` (optional)
+: `(agent_spec) -> dict[str, str]` env vars injected into the harness spawn.
+
+`materialize_agent_spec` (optional)
+: `(tmpdir: Path) -> Path` writing the built-in `<key>-native-ui` wrapper spec,
+so the server's seeding loop registers a picker-ready agent.
+
+`interrupt_handler` / `stop_handler` (optional)
+: Currently runner-internal; leave unset — a native harness without them falls
+through to the in-process turn cancel.
+
+### Minimal Native Harness Checklist
+
+- Create the package under the reserved `omnigent.community.harness.<key>.*`
+  namespace and add the `omnigent.community.harness` entry point.
+- `get_contribution()` returns `native_agents=(NativeCodingAgent(...),)` +
+  `native_providers=(NativeHarnessProvider(...),)`, both keyed `<key>`, plus
+  `valid_harnesses={"<key>-native"}`, `harness_modules`, and (optionally) an
+  `aliases={"native-<key>": "<key>-native"}` reversed spelling.
+- Declare `capabilities[<key>-native]` including the `fork_history` axis (drives
+  fork/switch history gating) and, if the harness bench should probe it,
+  `shell_tool_name` / `shell_tool_prompt`.
+- Keep every provider import path under `omnigent.community.harness.<key>.*`.
+- Implement the hook modules (the runner imports them lazily): `run_<key>_native`,
+  the `auto_create_terminal` adapter, and the `create_app()` subprocess harness.
+
+### Example plugin
+
+`examples/omnigent-echo-native/` is the reference native contribution —
+`echo-native`. It is a real, installable, registry-loadable package: its
+`get_contribution()` passes the community validator, its hooks resolve, and it
+surfaces on `GET /v1/harnesses`. The vendor-integration internals (live TUI
+bridge, transcript forwarder) are documented stubs marked `TODO(real-harness)`
+that point at the built-in `pi_native` / `claude_native` implementations; the
+package proves the *contract wiring* end to end (see
+`tests/test_example_echo_native_plugin.py`). Making the example fully
+`--live` benchable (`python -m tests.harness_bench --harness echo-native
+--live`) requires implementing those stubs against a real vendor CLI and is the
+remaining follow-up.
 
 ## Import Rules
 
