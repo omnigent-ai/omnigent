@@ -6,7 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from omnigent.harness_plugins import harness_catalog, harness_setup_steps_by_spelling
+from omnigent.harness_plugins import (
+    harness_catalog,
+    harness_setup_steps_by_spelling,
+    native_agent_catalog,
+)
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 
@@ -23,10 +27,14 @@ def create_harnesses_router(*, auth_provider: AuthProvider | None = None) -> API
         # declare — native wrappers (``codex-native``) and installable ids that
         # aren't picker rows (``opencode``/``qwen``) — so the setup dialog can
         # resolve steps by the harness it actually holds without the picker
-        # list gaining non-pickable rows.
+        # list gaining non-pickable rows. ``native_agents`` carries the native
+        # coding-agent identity + capability rows (built-in and community) so
+        # the web can drive native recognition / fork-history / capability
+        # gating off the server instead of hardcoded literals (PR 2.2 → 2.3).
         return {
             "data": harness_catalog(),
             "setup_steps": harness_setup_steps_by_spelling(),
+            "native_agents": native_agent_catalog(),
         }
 
     return router

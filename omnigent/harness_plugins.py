@@ -1133,6 +1133,48 @@ def harness_catalog() -> list[dict[str, Any]]:
     return rows
 
 
+def native_agent_catalog() -> list[dict[str, Any]]:
+    """Return JSON-serializable native-agent rows for ``GET /v1/harnesses``.
+
+    Built-in *and* community native agents (after PR 2.1 accepts them). Each row
+    is the native agent's stable identity (``key`` / ``agent_name`` / ``harness``
+    / ``wrapper_label`` / ``terminal_name`` / ``display_name`` /
+    ``subagent_wrapper_label``) plus its harness ``capabilities`` and the
+    ``fork_history`` axis, so the web can drive native-agent recognition,
+    fork-history gating, and capability gating off the server instead of the
+    hardcoded ``web/src/lib/nativeCodingAgents.ts`` literals (PR 2.3).
+
+    Only fields with an unambiguous server source are emitted. The web literal
+    additionally carries UI-presentation fields (``iconKind``, ``sortRank``, a
+    marketing ``displayName`` like "Claude Code" vs the row's "Claude", and a
+    picker-capability list) that have no clean registry source today; whether to
+    add those to ``NativeCodingAgent`` is deferred to the PR 2.3 review (see the
+    workstream doc) rather than expanding the frozen wire shape here.
+
+    :returns: One row per native coding agent, ordered by ``key`` for stability.
+    """
+    capabilities = harness_capabilities()
+    rows: list[dict[str, Any]] = []
+    for agent in sorted(native_agents(), key=lambda a: a.key):
+        capability = capabilities.get(agent.harness)
+        rows.append(
+            {
+                "key": agent.key,
+                "agent_name": agent.agent_name,
+                "harness": agent.harness,
+                "wrapper_label": agent.wrapper_label,
+                "terminal_name": agent.terminal_name,
+                "display_name": agent.display_name,
+                "subagent_wrapper_label": agent.subagent_wrapper_label,
+                "fork_history": (
+                    capability.fork_history.value if capability is not None else None
+                ),
+                "capabilities": capability.as_dict() if capability is not None else None,
+            }
+        )
+    return rows
+
+
 def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, Any]]]:
     """Map every harness spelling to its ordered UI setup steps.
 
