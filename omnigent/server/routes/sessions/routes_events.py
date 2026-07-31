@@ -1270,12 +1270,22 @@ def register_events_routes(
             # forwarded into a TUI whose forwarder isn't attached, the
             # round-trip never mirrors back, and the optimistic bubble
             # sticks with no reply (host-restart bug).
+            #
+            # suppress_recovery_turn=True: the server already persisted the
+            # message to DB before calling session-init, so the runner's
+            # history load would see the pending message and start a
+            # recovery turn.  The subsequent forward would then arrive to
+            # an active turn, be buffered, and be processed a second time
+            # once the recovery turn finishes.  Telling the runner to skip
+            # recovery-turn detection here ensures the server's forward is
+            # the sole trigger for the turn.
             native_terminal_ready = await _ensure_runner_session_initialized(
                 session_id,
                 conv,
                 runner_client,
                 conversation_store,
                 initializer=getattr(request.app.state, "runner_session_initializer", None),
+                suppress_recovery_turn=True,
             )
         await _ensure_runner_relay_ready(
             session_id,

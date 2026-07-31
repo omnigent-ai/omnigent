@@ -2839,6 +2839,8 @@ async def _ensure_runner_session_initialized(
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     initializer: RunnerSessionInitializer | None = None,
+    *,
+    suppress_recovery_turn: bool = False,
 ) -> bool:
     """
     Drive — and wait for — the runner's session-init handshake.
@@ -2878,6 +2880,15 @@ async def _ensure_runner_session_initialized(
         *session_id* (its tunnel is up).
     :param conversation_store: Store used to clear persisted disconnect
         error labels once the handshake proves the runner recovered.
+    :param suppress_recovery_turn: When ``True``, ask the runner not to
+        start a crash-recovery turn during ``create_session``.  Must be
+        set whenever the caller will forward a message immediately after
+        this call: the server persists the message to DB before calling
+        session-init, so the runner's history load would otherwise see
+        the pending message and start a recovery turn — the subsequent
+        forward then arrives to an active turn, is buffered, and is
+        processed a second time once the (redundant) recovery turn
+        finishes.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -2887,6 +2898,7 @@ async def _ensure_runner_session_initialized(
                 conv,
                 runner_client,
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+                suppress_recovery_turn=suppress_recovery_turn,
             )
         else:
             from omnigent.version import VERSION
@@ -2896,6 +2908,7 @@ async def _ensure_runner_session_initialized(
                 json=build_runner_session_init_payload(
                     conv,
                     server_version=VERSION,
+                    suppress_recovery_turn=suppress_recovery_turn,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
