@@ -197,14 +197,18 @@ class TestInjectModelGate:
         monkeypatch.setattr(
             cursor_native_bridge,
             "_live_cursor_model_options",
-            lambda: [{"id": "gpt-5.2", "displayName": "GPT-5.2"}],
+            lambda: pytest.fail("cached display name must avoid a second CLI listing"),
         )
         captured = _install_fake_tmux(
             monkeypatch, pane_captures=[f'{_IDLE}\nModels matching "gpt-5.2"\n →  GPT-5.2   High']
         )
         monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
 
-        cursor_native_bridge.inject_model_command(bridge_dir, model="gpt-5.2")
+        cursor_native_bridge.inject_model_command(
+            bridge_dir,
+            model="gpt-5.2",
+            expected_display_name="GPT-5.2",
+        )
 
         tails = _send_keys_calls(captured)
         assert ["-t", _TARGET, "-l", "/model gpt-5.2"] in tails  # the filter command
@@ -282,6 +286,24 @@ class TestInjectModelGate:
         tails = _send_keys_calls(captured)
         assert ["-t", _TARGET, "Enter"] not in tails
         assert ["-t", _TARGET, "Escape"] in tails
+
+
+@pytest.mark.parametrize(
+    ("row", "display_name", "expected"),
+    [
+        ("Provider Model", "Provider Model", True),
+        ("Provider Model   High", "Provider Model", True),
+        ("Provider Modelish High", "Provider Model", False),
+        ("Other Provider Model", "Provider Model", False),
+    ],
+)
+def test_picker_row_matches_complete_display_label(
+    row: str,
+    display_name: str,
+    expected: bool,
+) -> None:
+    """Variant suffixes are allowed, but longer-name prefixes are not."""
+    assert cursor_native_bridge._picker_row_matches_display(row, display_name) is expected
 
 
 class TestHooksConfig:

@@ -739,6 +739,7 @@ def inject_model_command(
     bridge_dir: Path,
     *,
     model: str,
+    expected_display_name: str | None = None,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
     """Switch the live Cursor model by driving the TUI ``/model`` picker.
@@ -754,6 +755,8 @@ def inject_model_command(
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
     :param model: cursor-agent base model id, e.g. ``"gpt-5.2"`` (derived from
         ``cursor-agent models`` by stripping effort variants).
+    :param expected_display_name: Display name from the already-fetched live
+        picker catalog. ``None`` refreshes the catalog before switching.
     :param timeout_s: Per-readiness-gate timeout.
     :raises RuntimeError: If the tmux target is never advertised, the TUI has
         exited, a tmux command fails, or the picker reports no match for *model*
@@ -763,16 +766,19 @@ def inject_model_command(
     model = model.strip()
     if not model:
         raise RuntimeError("cursor-native model switch requires a non-empty model id")
-    try:
-        expected_display_name = next(
-            option["displayName"]
-            for option in _live_cursor_model_options()
-            if option.get("id") == model
-        )
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        raise RuntimeError("cursor-native could not verify the live model catalog") from exc
-    except StopIteration as exc:
-        raise RuntimeError(f"cursor model {model!r} is not available in the live catalog") from exc
+    if expected_display_name is None:
+        try:
+            expected_display_name = next(
+                option["displayName"]
+                for option in _live_cursor_model_options()
+                if option.get("id") == model
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise RuntimeError("cursor-native could not verify the live model catalog") from exc
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"cursor model {model!r} is not available in the live catalog"
+            ) from exc
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
@@ -819,7 +825,7 @@ def inject_model_command(
     if (
         _PICKER_MATCH_MARKER not in settled_pane
         or highlighted_row is None
-        or expected_display_name.casefold() not in highlighted_row.casefold()
+        or not _picker_row_matches_display(highlighted_row, expected_display_name)
     ):
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
         _clear_composer(socket_path, tmux_target)
@@ -844,6 +850,15 @@ def _picker_highlighted_row(pane: str) -> str | None:
         if stripped.startswith("→"):
             return stripped.removeprefix("→").strip()
     return None
+
+
+def _picker_row_matches_display(row: str, display_name: str) -> bool:
+    """Match a base display name without accepting a longer-name prefix."""
+    normalized_row = " ".join(row.casefold().split())
+    normalized_display = " ".join(display_name.casefold().split())
+    return normalized_row == normalized_display or normalized_row.startswith(
+        f"{normalized_display} "
+    )
 
 
 def _wait_for_pane_settle(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
