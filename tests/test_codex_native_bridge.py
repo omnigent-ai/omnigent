@@ -350,6 +350,20 @@ def test_read_mcp_startup_ignores_malformed_entries(bridge_dir: Path) -> None:
     assert read_mcp_startup(bridge_dir) == {"ok": {"status": "ready", "error": None}}
 
 
+def test_clear_bridge_state_removes_the_routing_canary(bridge_dir: Path) -> None:
+    # A canary from a previous launch would otherwise vouch for this launch's
+    # hooks, masking a fail-open for the whole session.
+    from omnigent.inner.codex_executor import codex_router_canary_fired
+    from omnigent.inner.hook_scripts.codex_router_hook import CANARY_FILENAME
+
+    (bridge_dir / CANARY_FILENAME).write_text('{"session_id": "conv_old"}\n')
+    assert codex_router_canary_fired(bridge_dir) is True
+
+    clear_bridge_state(bridge_dir)
+
+    assert codex_router_canary_fired(bridge_dir) is False
+
+
 def test_clear_bridge_state_removes_mcp_startup(bridge_dir: Path) -> None:
     """
     ``clear_bridge_state`` drops the MCP startup map with the other

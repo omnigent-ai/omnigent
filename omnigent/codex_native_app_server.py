@@ -932,6 +932,13 @@ class CodexNativeAppServer:
             self._stderr_loop(),
             name="codex-native-app-server-stderr",
         )
+        # Ordering invariant: hooks.json is written before the spawn above,
+        # and the trust handshake must complete before the first turn — codex
+        # resolves trust when it dispatches a hook, so trust landing after the
+        # spawn is fine, but a turn started before it runs unhooked. The
+        # handshake cannot precede the spawn (``hooks/list`` is an app-server
+        # RPC), so callers must not launch the TUI or dispatch a turn until
+        # ``start()`` returns.
         # Readiness failure (the app-server never came up) is fatal and
         # tears down the subprocess so it is not orphaned. Policy-hook
         # trust, by contrast, is best-effort: a trust failure degrades the

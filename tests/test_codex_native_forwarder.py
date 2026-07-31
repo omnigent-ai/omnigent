@@ -2563,6 +2563,106 @@ class _EmptyStreamCodexClient:
         self.closed = True
 
 
+class _ScriptedCodexClient(_EmptyStreamCodexClient):
+    """App-server client replaying a fixed notification script."""
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self._events = events
+
+    async def iter_events(self):  # type: ignore[no-untyped-def]
+        for event in self._events:
+            yield event
+
+
+async def _turn_gate_after(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, events: list[dict[str, Any]]
+) -> bool:
+    """Replay *events* through the forwarder and report the turn gate state."""
+    captured: dict[str, asyncio.Event] = {}
+
+    async def _fake_watch(
+        client: Any,  # type: ignore[explicit-any]
+        session_id: str,
+        bridge_dir: Path,
+        *,
+        interval_s: float = 30.0,
+        turn_observed: asyncio.Event | None = None,
+    ) -> None:
+        del client, session_id, bridge_dir, interval_s
+        assert turn_observed is not None
+        captured["gate"] = turn_observed
+        await turn_observed.wait()
+
+    monkeypatch.setattr(fwd, "_watch_subagent_routing_enforcement", _fake_watch)
+    await fwd.supervise_forwarder(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id="conv_gate",
+        bridge_dir=tmp_path,
+        app_server_url=str(tmp_path / "app-server.sock"),
+        thread_id="thread_gate",
+        client=_ScriptedCodexClient(events),  # type: ignore[arg-type]
+    )
+    return captured["gate"].is_set()
+
+
+async def test_mcp_startup_activity_does_not_release_the_enforcement_watcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Thread activation without a turn must keep the canary check parked.
+
+    Codex activates the thread (and emits items) while booting its MCP
+    servers, but dispatches ``SessionStart`` only when a turn begins, so
+    releasing the watcher here flagged ``subagent_routing_unenforced`` on
+    sessions that had simply not been asked anything yet.
+    """
+    released = await _turn_gate_after(
+        monkeypatch,
+        tmp_path,
+        [
+            {
+                "method": "thread/status/changed",
+                "params": {"threadId": "thread_gate", "status": {"type": "active"}},
+            },
+            {"method": "item/started", "params": {"threadId": "thread_gate"}},
+            {
+                "method": "thread/status/changed",
+                "params": {"threadId": "thread_gate", "status": {"type": "idle"}},
+            },
+        ],
+    )
+
+    assert released is False
+
+
+async def test_turn_start_releases_the_enforcement_watcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real turn releases the canary check — that is when SessionStart runs."""
+    released = await _turn_gate_after(
+        monkeypatch,
+        tmp_path,
+        [{"method": "turn/started", "params": {"threadId": "thread_gate"}}],
+    )
+
+    assert released is True
+
+
+def test_event_indicates_turn_started_only_for_turn_events() -> None:
+    assert fwd._event_indicates_turn_started({"method": "turn/started"}) is True
+    assert fwd._event_indicates_turn_started({"method": "turn/completed"}) is True
+    assert fwd._event_indicates_turn_started({"method": "item/started"}) is False
+    assert (
+        fwd._event_indicates_turn_started(
+            {"method": "thread/status/changed", "params": {"status": {"type": "active"}}}
+        )
+        is False
+    )
+    assert fwd._event_indicates_turn_started({}) is False
+
+
 async def test_enforcement_watcher_does_not_leak_on_a_session_without_turns(
     tmp_path: Path,
 ) -> None:

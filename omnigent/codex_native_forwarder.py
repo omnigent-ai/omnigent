@@ -1849,8 +1849,12 @@ async def supervise_forwarder(
                     # waiting forever on an idle fresh thread.
                     if not thread_active.is_set() and _event_indicates_thread_active(event):
                         thread_active.set()
-                        # Same signal releases the routing-enforcement watcher:
-                        # the canary can only exist once a turn has begun.
+                    # The routing-enforcement watcher needs a stricter signal:
+                    # codex dispatches SessionStart when a turn begins, so only
+                    # a turn-start event proves the canary should exist by now.
+                    # Thread-active alone also covers the MCP startup round,
+                    # which activates the thread without running a turn.
+                    if not turn_observed.is_set() and _event_indicates_turn_started(event):
                         turn_observed.set()
                     await _handle_event(
                         ap_client,
@@ -2208,6 +2212,23 @@ def _event_indicates_thread_active(event: CodexMessage) -> bool:
         status = params.get("status") if isinstance(params, dict) else None
         return isinstance(status, dict) and status.get("type") == "active"
     return False
+
+
+def _event_indicates_turn_started(event: CodexMessage) -> bool:
+    """
+    Return whether a notification proves a turn has actually begun.
+
+    Codex dispatches ``SessionStart`` (the routing canary) when a thread's
+    first *turn* starts. ``thread/status/changed → active`` and ``item/*``
+    are weaker: the MCP startup round activates a thread and emits items
+    without any turn, so using them to release the routing-enforcement
+    watcher flags a session that has simply not been asked anything yet.
+
+    :param event: A Codex JSON-RPC notification envelope.
+    :returns: ``True`` for a ``turn/*`` notification.
+    """
+    method = event.get("method")
+    return isinstance(method, str) and method.startswith("turn/")
 
 
 def _is_thread_not_ready_error(exc: Exception) -> bool:
@@ -5889,14 +5910,16 @@ async def _watch_subagent_routing_enforcement(
     Codex dispatches ``SessionStart`` when a thread's *first turn* begins,
     not at ``thread/start``, so checking before then would flag every idle
     session. *turn_observed* holds the first check until the forwarder has
-    seen the thread go active.
+    seen a ``turn/*`` event — thread activity alone also covers the MCP
+    startup round, which runs no turn and so dispatches no ``SessionStart``.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id.
     :param bridge_dir: Native Codex bridge directory.
     :param interval_s: Seconds between checks.
     :param turn_observed: Set by the forwarder on the thread's first
-        activity. ``None`` checks immediately (tests / resumed sessions).
+        turn-start event. ``None`` checks immediately (tests / resumed
+        sessions).
     :returns: None. Runs until cancelled.
     """
     armed = subagent_routing_armed(bridge_dir)
