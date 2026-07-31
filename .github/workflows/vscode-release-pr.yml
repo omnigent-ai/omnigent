@@ -178,6 +178,10 @@ jobs:
             echo "::warning::No LLM credentials — keeping the CHANGELOG placeholder."
             exit 0
           fi
+          if [ -z "${DRAFTER_MODEL:-}" ]; then
+            echo "::warning::Repository variable OMNIGENT_CI_FAST_ANTHROPIC_MODEL is empty — keeping the CHANGELOG placeholder."
+            exit 0
+          fi
           echo "::add-mask::${LLM_API_KEY}"
           python3 - "$VERSION" <<'PY'
           import json, os, re, pathlib, sys, urllib.request

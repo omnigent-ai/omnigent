@@ -89,6 +89,10 @@ jobs:
             echo "::notice::No LLM credentials; reviewer ranking skipped (load-balanced fallback)."
             exit 0
           fi
+          if [ -z "${ROUTER_MODEL:-}" ]; then
+            echo "::warning::Repository variable OMNIGENT_CI_FAST_ANTHROPIC_MODEL is empty; reviewer ranking skipped (load-balanced fallback)."
+            exit 0
+          fi
           # Skip maintainer-authored PRs: the assign step (auto-assign-reviewer.js)
           # no-ops on them, so ranking them would spend a gateway call whose result
           # is discarded. Mirror that step's author-is-maintainer guard here

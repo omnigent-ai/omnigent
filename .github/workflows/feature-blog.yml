@@ -541,7 +541,9 @@ jobs:
           m = re.match(r"(https?://[^/]+)", gw)
           if not m:
               raise SystemExit(f"cannot parse gateway host from {gw!r}")
-          model = os.environ["IMAGE_MODEL"]
+          model = os.environ.get("IMAGE_MODEL", "").strip()
+          if not model:
+              raise SystemExit("repository variable OMNIGENT_CI_IMAGE_MODEL is empty")
           url = f"{m.group(1)}/serving-endpoints/{model}/invocations"
           style = (" Flat vector illustration, dark navy tech background with subtle "
                    "circuit lines, teal and pink accents, 16:9 wide, no text, no words, "
