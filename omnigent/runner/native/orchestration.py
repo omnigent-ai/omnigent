@@ -21,7 +21,7 @@ import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from omnigent.opencode_native_app_server import OpenCodeNativeServer
     from omnigent.opencode_native_client import OpenCodeClient, OpenCodeSession
     from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
+    from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.spec.types import MCPServerConfig
 
 import click
@@ -467,6 +468,76 @@ class _KiroNativeLaunchConfig:
     terminal_launch_args: list[str] | None
     external_session_id: str | None
     model_override: str | None = None
+
+
+class _NativeRouterLaunch(NamedTuple):
+    """What a native launch site needs back from the router start.
+
+    :param advertised_dir: Directory to point the harness's hooks at, or
+        ``None`` when no endpoint is running.
+    :param router: The handle to hand back to
+        :func:`_shutdown_session_router_async`, so a delayed teardown from
+        this launch cannot close a router a re-create has since installed.
+    """
+
+    advertised_dir: Path | None
+    router: SubagentRouter | None
+
+
+def _start_subagent_router_for_native_session(
+    session_id: str,
+    *,
+    bridge_dir: Path,
+    harness: str,
+    server_client: httpx.AsyncClient | None,
+) -> _NativeRouterLaunch:
+    """Start the subagent-routing endpoint for a native session.
+
+    Native harnesses enforce routing through hooks configured at terminal
+    launch, so the endpoint has to be live (and advertised in the bridge
+    dir the hooks read) before the CLI starts. Installed for every
+    session, routed or not: the server re-reads the session's
+    subagent-routing setting on each spawn, so a session that starts
+    unrouted can still be toggled on mid-flight.
+
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Session bridge directory the hooks discover.
+    :param harness: Harness the router is being installed for; logged on
+        failure.
+    :param server_client: Runner→server client the relay forwards on.
+    :returns: The advertisement directory to point hooks at (``None`` when
+        the endpoint could not start) paired with the router handle.
+    """
+    from omnigent.runner.subagent_routing import ensure_session_router_quietly
+
+    router = ensure_session_router_quietly(
+        session_id,
+        bridge_dir=bridge_dir,
+        server_client=server_client,
+        harness=harness,
+    )
+    return _NativeRouterLaunch(bridge_dir if router is not None else None, router)
+
+
+async def _shutdown_session_router_async(
+    session_id: str, router: SubagentRouter | None = None
+) -> None:
+    """Tear down a session's subagent-routing endpoint off the event loop.
+
+    ``shutdown_session_router`` joins the router's serving thread, so
+    calling it inline would block the loop for up to the shutdown poll
+    interval. A session with no router is a no-op.
+
+    :param session_id: Session/conversation identifier.
+    :param router: Handle this launch started. Passing it scopes the
+        teardown to that router, so a forwarder whose ``finally`` runs
+        after a terminal re-create does not close the new session's live
+        endpoint.
+    :returns: None.
+    """
+    from omnigent.runner.subagent_routing import shutdown_session_router
+
+    await asyncio.to_thread(shutdown_session_router, session_id, router)
 
 
 def _required_runner_env(name: str) -> str:
@@ -3750,6 +3821,19 @@ async def _auto_create_codex_terminal(
         # workspace in the session-private config instead of blocking forever.
         trust_project=True,
     )
+    # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
+    # app-server reads the endpoint out of its own process env at start, and
+    # the server decides per spawn whether to route.
+    _codex_router_dir, _codex_router = _start_subagent_router_for_native_session(
+        session_id,
+        bridge_dir=bridge_dir,
+        harness="codex-native",
+        server_client=server_client,
+    )
+    if _codex_router_dir is not None:
+        from omnigent.runner.subagent_routing import router_env
+
+        app_server.env.update(router_env(session_id, _codex_router_dir, harness="codex-native"))
     app_server.listen_url = codex_ws_url
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
@@ -3836,11 +3920,19 @@ async def _auto_create_codex_terminal(
                     # Omnigent provisions the private CODEX_HOME and vets
                     # hook sources itself; skip the interactive trust prompt
                     # that headless sub-agents can never answer.
-                    # Gated on version: the flag was added in 0.140.0; on
-                    # older binaries it causes an immediate exit error.
+                    #
+                    # Requires a *positively parsed* version, unlike the
+                    # hooks-file gate in ``codex_native_app_server``, which
+                    # treats an unknown version as supported. The two differ
+                    # because their failure modes do: an unsupported hooks
+                    # file is ignored by codex and caught downstream at the
+                    # trust check, whereas an unknown CLI flag aborts argv
+                    # parsing — so a transient ``codex --version`` hiccup on a
+                    # pre-0.131 codex would turn a recoverable trust prompt
+                    # into a dead terminal.
                     bypass_hook_trust=(
-                        app_server.codex_cli_version is None
-                        or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+                        app_server.codex_cli_version is not None
+                        and app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
                     ),
                 ),
                 env=codex_terminal_env(app_server),
@@ -3885,6 +3977,7 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
+                subagent_router=_codex_router,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -3892,6 +3985,7 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
+                subagent_router=_codex_router,
             )
         ),
         name=f"codex-forwarder-{session_id}",
@@ -3921,6 +4015,7 @@ async def _codex_discover_thread_and_forward(
     codex_home: Path,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    subagent_router: SubagentRouter | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -3945,6 +4040,9 @@ async def _codex_discover_thread_and_forward(
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param subagent_router: Router this terminal launch started, torn down
+        in the ``finally``. Passed so a late teardown cannot close the
+        endpoint a re-created terminal has since installed.
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
@@ -4063,6 +4161,7 @@ async def _codex_discover_thread_and_forward(
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()
+        await _shutdown_session_router_async(session_id, subagent_router)
 
 
 async def _codex_forward_known_thread(
@@ -4071,6 +4170,7 @@ async def _codex_forward_known_thread(
     bridge_dir: Path,
     codex_ws_url: str,
     thread_id: str,
+    subagent_router: SubagentRouter | None = None,
 ) -> None:
     """
     Forward a runner-owned Codex terminal that resumes an existing thread.
@@ -4081,6 +4181,9 @@ async def _codex_forward_known_thread(
         ``"ws://127.0.0.1:9876"``.
     :param thread_id: Existing Codex app-server thread id, e.g.
         ``"thread_abc123"``.
+    :param subagent_router: Router this terminal launch started, torn down
+        in the ``finally``. Passed so a late teardown cannot close the
+        endpoint a re-created terminal has since installed.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -4109,6 +4212,7 @@ async def _codex_forward_known_thread(
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()
+        await _shutdown_session_router_async(session_id, subagent_router)
 
 
 async def _run_antigravity_reader(
@@ -5419,12 +5523,14 @@ class _ClaudeSessionLaunchMetadata:
     external_session_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
+    routing_enabled: bool = False
 
 
 def _claude_launch_metadata_from_envelope(
     session_init: RunnerSessionInitEnvelope,
 ) -> _ClaudeSessionLaunchMetadata:
     """Project Claude launch metadata without server callbacks."""
+    from omnigent.runner.subagent_routing import routing_enabled
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -5433,6 +5539,7 @@ def _claude_launch_metadata_from_envelope(
     snapshot = session_init.snapshot
     fork_source = snapshot.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
     return _ClaudeSessionLaunchMetadata(
+        routing_enabled=routing_enabled(snapshot.cost_control_mode_override),
         reasoning_effort=snapshot.reasoning_effort,
         model_override=snapshot.model_override,
         terminal_launch_args=snapshot.terminal_launch_args,
@@ -5449,6 +5556,7 @@ async def _load_legacy_claude_launch_metadata(
     session_id: str,
 ) -> _ClaudeSessionLaunchMetadata:
     """Fetch Claude launch metadata for servers predating the init envelope."""
+    from omnigent.runner.subagent_routing import routing_enabled
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -5476,7 +5584,11 @@ async def _load_legacy_claude_launch_metadata(
     labels = snapshot.get("labels")
     labels = labels if isinstance(labels, dict) else {}
     fork_source = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+    cost_control_mode = snapshot.get("cost_control_mode_override")
     metadata = _ClaudeSessionLaunchMetadata(
+        routing_enabled=routing_enabled(
+            cost_control_mode if isinstance(cost_control_mode, str) else None
+        ),
         reasoning_effort=effort if isinstance(effort, str) and effort else None,
         model_override=(
             model_override if isinstance(model_override, str) and model_override else None
@@ -5712,6 +5824,8 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.claude_native import (
         build_native_claude_terminal_env,
+        claude_config_with_launch_model_pinned,
+        claude_config_with_routed_arms_pinned,
         resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
@@ -5927,23 +6041,35 @@ async def _auto_create_claude_terminal(
             "and that the secret resolves in this process.",
             exc_info=True,
         )
-    if record_launch_config is not None:
-        record_launch_config(session_id, claude_config)
-    _logger.info(
-        "Claude terminal provider config resolved: session=%s configured=%s "
-        "env_keys=%s api_key_helper_set=%s model_set=%s",
-        session_id,
-        claude_config is not None,
-        sorted(claude_config.env) if claude_config is not None else [],
-        bool(claude_config.api_key_helper) if claude_config is not None else False,
-        bool(claude_config.model) if claude_config is not None else False,
-    )
+    # A routed session's turn-1 ``/model`` can only reach ids this launch env
+    # spells, so point the family aliases at the router's frozen arms before the
+    # launch model is derived from them.
+    if launch_metadata.routing_enabled:
+        from omnigent.server.smart_routing import task_v1_claude_arms
 
+        claude_config = claude_config_with_routed_arms_pinned(claude_config, task_v1_claude_arms())
     launch_model = resolve_claude_native_model_selection(
         session_model_override
         or _claude_native_model_from_spec(agent_spec)
         or (claude_config.model if claude_config is not None else None),
         claude_config,
+    )
+    # Give an exact launch model (a Smart Routing pick is resolved before the
+    # terminal exists) a spelling of its own in the picker, so a later
+    # ``/model`` can return to it instead of stepping onto whatever the family
+    # alias points at. Recorded below, so the picker and the launch agree.
+    claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
+    if record_launch_config is not None:
+        record_launch_config(session_id, claude_config)
+    _logger.info(
+        "Claude terminal provider config resolved: session=%s configured=%s "
+        "env_keys=%s api_key_helper_set=%s model_set=%s launch_model=%s",
+        session_id,
+        claude_config is not None,
+        sorted(claude_config.env) if claude_config is not None else [],
+        bool(claude_config.api_key_helper) if claude_config is not None else False,
+        bool(claude_config.model) if claude_config is not None else False,
+        launch_model,
     )
     base_claude_args = _build_claude_native_base_args(
         reasoning_effort=session_effort,
@@ -5964,6 +6090,15 @@ async def _auto_create_claude_terminal(
     # has the spec resolver) expose a bundle's ``skills/`` to Claude Code
     # via ``--plugin-dir`` — the CLI mirror of the SDK plugin wiring.
     # ``api_key_helper`` (ucode) registers Claude's gateway token command.
+    # Gate natively spawned subagents (the Task/Agent tool): start the loopback
+    # endpoint in the bridge dir the PreToolUse hook already discovers. Always
+    # installed — the server decides per spawn whether to route.
+    subagent_router_dir, _subagent_router = _start_subagent_router_for_native_session(
+        session_id,
+        bridge_dir=bridge_dir,
+        harness="claude-native",
+        server_client=server_client,
+    )
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -5973,6 +6108,7 @@ async def _auto_create_claude_terminal(
         agent_name=agent_name,
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        subagent_router_dir=subagent_router_dir,
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
@@ -6116,15 +6252,18 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native_forwarder import supervise_forwarder
 
     async def _supervise_bridge() -> None:
-        await supervise_forwarder(
-            base_url=server_url,
-            headers=_runner_headers,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            start_at_end=resume_external_session_id is not None,
-            auth=_runner_auth,
-        )
+        try:
+            await supervise_forwarder(
+                base_url=server_url,
+                headers=_runner_headers,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=resume_external_session_id is not None,
+                auth=_runner_auth,
+            )
+        finally:
+            await _shutdown_session_router_async(session_id, _subagent_router)
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),
