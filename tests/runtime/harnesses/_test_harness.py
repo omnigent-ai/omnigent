@@ -78,17 +78,9 @@ def create_app() -> FastAPI:
         return {"pid": os.getpid()}
 
     @app.get("/conversation-id")
-    async def conversation_id(request: Request) -> dict[str, str]:
-        """
-        Echo back the conversation id the runner stashed on
-        ``app.state.conversation_id``.
-
-        :param request: FastAPI's request handle, used to reach
-            ``request.app.state.conversation_id``.
-        :returns: ``{"conversation_id": <str>}`` proving the
-            runner CLI plumbing wired the value through.
-        """
-        return {"conversation_id": request.app.state.conversation_id}
+    async def conversation_id(request: Request) -> dict[str, str | None]:
+        """Echo back the conversation id from app.state (None in shared-runner mode)."""
+        return {"conversation_id": getattr(request.app.state, "conversation_id", None)}
 
     @app.get("/env/{name}")
     async def env_var(name: str) -> dict[str, str | None]:

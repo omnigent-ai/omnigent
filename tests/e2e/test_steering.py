@@ -83,8 +83,8 @@ def test_steering_acknowledged(
     the active task and reflected in the final output.
     """
 
-    reset_mock_llm(mock_llm_server_url)
     agent_name, model = _mock_agent(http_client, mock_llm_server_url)
+    reset_mock_llm(mock_llm_server_url, key=model)
     configure_mock_llm(
         mock_llm_server_url,
         [
@@ -139,7 +139,7 @@ def test_steering_with_tool_items(
     fix: tool items must not advance ``last_seen`` past the steer.
     """
     model = f"mock-ws-{uuid.uuid4().hex[:6]}"
-    reset_mock_llm(mock_llm_server_url)
+    reset_mock_llm(mock_llm_server_url, key=model)
     agent_name = register_inline_agent(
         http_client,
         name=f"ws-{uuid.uuid4().hex[:6]}",
@@ -217,8 +217,8 @@ def test_steering_after_completed_starts_new_turn(
     not a steer.
     """
 
-    reset_mock_llm(mock_llm_server_url)
     agent_name, model = _mock_agent(http_client, mock_llm_server_url)
+    reset_mock_llm(mock_llm_server_url, key=model)
     configure_mock_llm(
         mock_llm_server_url,
         [{"text": "Hello!"}, {"text": "The answer is 4."}],
@@ -264,8 +264,8 @@ def test_steering_during_multi_tool_iterations(
     agent makes multiple sequential sys_read_inbox calls.
     """
 
-    reset_mock_llm(mock_llm_server_url)
     agent_name, model = _mock_agent(http_client, mock_llm_server_url)
+    reset_mock_llm(mock_llm_server_url, key=model)
     # 1. sys_read_inbox → blocks on inbox
     # 2. (steer arrives, inbox returns) → sys_read_inbox again
     # 3. Final text with PINEAPPLE

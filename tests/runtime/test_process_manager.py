@@ -33,69 +33,55 @@ class _AliveProc:
 
 
 @pytest.mark.asyncio
-async def test_get_client_respawns_only_when_model_changes(
+async def test_get_client_isolates_per_env_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``get_client`` respawns iff a concrete different model is requested.
+    """``get_client`` spawns one subprocess per unique spawn-env fingerprint.
 
-    Drives a single conversation through a sequence of model requests and
-    asserts the spawn count tracks exactly the model *transitions* (same
-    model → cache hit, no spawn; changed model → respawn; no model env →
-    keep the running process). A failure means either ``/model`` wouldn't
-    take effect (missing respawn) or every turn needlessly respawns
-    (over-eager respawn that would churn the harness + drop its warm state).
+    Conversations with the same harness AND the same env share a subprocess.
+    Different envs (including different models) get separate subprocesses so
+    per-spec isolation is preserved — the model and other env vars are baked
+    into the executor at construction time and cannot be changed per-turn.
 
     :param monkeypatch: Pytest monkeypatch fixture used to mock the
         subprocess-spawn boundary.
     """
     pm = HarnessProcessManager()
-    # Bypass start(): these tests mock the spawn boundary, so no instance
-    # dir / orphan sweep / real subprocess is needed.
     pm._started = True
 
     spawns: list[str | None] = []
-    closes: list[str | None] = []
 
     async def _fake_spawn(conv: str, harness: str, env: dict[str, str] | None) -> _SubprocessEntry:
-        """Record the spawned model and return a live fake entry."""
         model = (env or {}).get(_model_env_key(harness))
         spawns.append(model)
         return _SubprocessEntry(
-            process=_AliveProc(),  # type: ignore[arg-type]  # stand-in process
+            process=_AliveProc(),  # type: ignore[arg-type]
             client=httpx.AsyncClient(),
             endpoint=_HarnessEndpoint(socket_path=Path("/tmp/fake.sock")),
             harness=harness,
-            model=model,
         )
 
     async def _fake_close(entry: _SubprocessEntry) -> None:
-        """Record the closed entry's model and release its client."""
-        closes.append(entry.model)
         await entry.client.aclose()
 
     monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
     monkeypatch.setattr(pm, "_close_entry", _fake_close)
 
     conv, harness = "conv_x", "claude-sdk"
-    key = _model_env_key(harness)  # HARNESS_CLAUDE_SDK_MODEL
+    key = _model_env_key(harness)
 
-    await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})  # spawn opus
-    await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})  # same → cache hit
-    await pm.get_client(conv, harness, env={key: "claude-sonnet-4-6"})  # changed → respawn
-    await pm.get_client(conv, harness, env=None)  # no model env → keep running process
-    await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})  # changed back → respawn
+    await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})
+    await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})  # same env → reuse
+    await pm.get_client("conv_y", harness, env={key: "claude-opus-4-6"})  # same env → reuse
+    await pm.get_client(
+        "conv_z", harness, env={key: "claude-sonnet-4-6"}
+    )  # diff model → new spawn
 
-    # Exactly three spawns, tracking the model transitions opus→sonnet→opus.
-    # If the respawn-on-change were missing this would be ["claude-opus-4-6"]
-    # (everything served by the first cached process).
-    assert spawns == ["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-6"], spawns
-    # Each respawn closed the prior process first (opus, then sonnet); the
-    # cache-hit and the env=None turn close nothing.
-    assert closes == ["claude-opus-4-6", "claude-sonnet-4-6"], closes
+    # Two spawns: one per unique env fingerprint.
+    assert spawns == ["claude-opus-4-6", "claude-sonnet-4-6"], spawns
 
-    final = pm._entries.get(conv)
-    if final is not None:
-        await final.client.aclose()
+    for entry in pm._entries.values():
+        await entry.client.aclose()
 
 
 def test_build_harness_spawn_env_strips_binding_token_with_overrides(

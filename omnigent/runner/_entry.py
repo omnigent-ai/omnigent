@@ -1268,16 +1268,81 @@ async def _run_tunnel_from_env() -> None:
 
     # Set when the launcher adopts this runner (tmux detach); makes the
     # parent-death killer stand down so the runner outlives the CLI.
+    # Prepare the pending-tokens directory so the host can drop new binding
+    # tokens here and signal us via RUNNER_ADD_SESSION_SIGNAL to pick them up.
+    from omnigent.runner.identity import (
+        get_disk_stable_runner_id,
+        pending_tokens_dir,
+        token_bound_runner_id,
+    )
+
+    # Always key the pending-tokens dir on the on-disk stable runner id,
+    # not runner_id (which is the token-bound tunnel id from RUNNER_ID_ENV_VAR).
+    # The host also uses the disk stable id when writing tokens, so both sides
+    # agree on the directory path regardless of which binding token was used.
+    _pending_tokens_dir = pending_tokens_dir(get_disk_stable_runner_id())
+    _pending_tokens_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    # Set (instead of stop_event) on an idle-reaper shutdown so the tunnel
+    # drains its session streams and closes cleanly — the server then sees an
+    # end-of-stream, not an abrupt drop that renders a scary error banner.
+    tunnel_shutdown_event = asyncio.Event()
+
+    # All active tunnel tasks (one per binding token). The primary task uses
+    # the runner's own binding_token; additional tasks are added when the host
+    # signals RUNNER_ADD_SESSION_SIGNAL with new tokens in the pending dir.
+    _extra_tunnel_tasks: set[asyncio.Task[None]] = set()
+
+    def _spawn_extra_tunnels() -> None:
+        """Scan pending-tokens dir and start a tunnel task per token found."""
+        try:
+            token_files = list(_pending_tokens_dir.iterdir())
+        except OSError:
+            return
+        for token_file in token_files:
+            try:
+                # Token is stored as file content, not filename, so it is
+                # not exposed by directory listing on multi-user hosts.
+                token = token_file.read_text().strip()
+            except OSError:
+                continue
+            # Validate token contains only safe chars before using it.
+            _SAFE_TOKEN_CHARS = frozenset(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+            )
+            if not token or not all(c in _SAFE_TOKEN_CHARS for c in token):
+                _logger.warning(
+                    "skipping suspicious pending-token content in: %r", token_file.name
+                )
+                continue
+            extra_runner_id = token_bound_runner_id(token)
+            _logger.info("adopting new session tunnel: %s", extra_runner_id)
+            extra_task = asyncio.create_task(
+                serve_tunnel(
+                    cast("_ASGIApp", app),
+                    server_url=server_url,
+                    runner_id=extra_runner_id,
+                    runner_version=_RUNNER_VERSION,
+                    tunnel_token=token,
+                    auth_token_factory=auth_token_factory,
+                    on_activity=_mark_activity,
+                    shutdown_event=tunnel_shutdown_event,
+                    on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
+                ),
+                name=f"runner-ws-tunnel:{extra_runner_id}",
+            )
+            extra_task.add_done_callback(_extra_tunnel_tasks.discard)
+            _extra_tunnel_tasks.add(extra_task)
+            with contextlib.suppress(OSError):
+                token_file.unlink(missing_ok=True)
+
     adopted_event = threading.Event()
     _install_signal_handlers(
         stop_event,
         adopted_event=adopted_event,
         record_reason=_record_exit_reason,
+        add_session_callback=_spawn_extra_tunnels,
     )
-    # Set (instead of stop_event) on an idle-reaper shutdown so the tunnel
-    # drains its session streams and closes cleanly — the server then sees an
-    # end-of-stream, not an abrupt drop that renders a scary error banner.
-    tunnel_shutdown_event = asyncio.Event()
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -1380,6 +1445,10 @@ async def _run_tunnel_from_env() -> None:
             await stop_task
         with contextlib.suppress(asyncio.CancelledError):
             await tunnel_task
+        for extra in list(_extra_tunnel_tasks):
+            extra.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await extra
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
@@ -1390,6 +1459,7 @@ def _install_signal_handlers(
     stop_event: asyncio.Event,
     adopted_event: threading.Event | None = None,
     record_reason: Callable[[str], None] | None = None,
+    add_session_callback: Callable[[], None] | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -1421,10 +1491,15 @@ def _install_signal_handlers(
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
-        if RUNNER_ADOPT_SIGNAL is None:
-            return
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+        if RUNNER_ADOPT_SIGNAL is not None:
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+    if add_session_callback is not None:
+        from omnigent.runner.identity import RUNNER_ADD_SESSION_SIGNAL
+
+        if RUNNER_ADD_SESSION_SIGNAL is not None:
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(RUNNER_ADD_SESSION_SIGNAL, add_session_callback)
 
 
 def _install_crash_logging() -> None:

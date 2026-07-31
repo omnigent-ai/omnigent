@@ -113,7 +113,7 @@ def _set_pdeathsig() -> None:
         pass
 
 
-def _load_harness_app(harness: str, module_path: str, conversation_id: str) -> FastAPI:
+def _load_harness_app(harness: str, module_path: str) -> FastAPI:
     """
     Import the harness module and instantiate its app.
 
@@ -123,9 +123,6 @@ def _load_harness_app(harness: str, module_path: str, conversation_id: str) -> F
     :param module_path: Fully-qualified Python module to import,
         e.g. ``"omnigent.inner.claude_sdk_harness"``. Must
         export ``create_app() -> FastAPI``.
-    :param conversation_id: AP-allocated conversation identifier
-        for the subprocess to scope its in-memory state by, e.g.
-        ``"conv_abc123"``. Stashed on ``app.state.conversation_id``.
     :returns: The harness's :class:`FastAPI` app, ready to serve.
     :raises SystemExit: If the module fails to import or doesn't
         export ``create_app``. Both are operator-fixable
@@ -153,10 +150,6 @@ def _load_harness_app(harness: str, module_path: str, conversation_id: str) -> F
         raise SystemExit(2)
 
     app: FastAPI = create_app()
-    # Stash on app.state so individual route handlers can read the
-    # conversation id without re-parsing CLI args. Layer 1 / 2 / 3
-    # state containers (per §Harness in-memory state) key off this.
-    app.state.conversation_id = conversation_id
     app.state.harness = harness
     # S1 (security): the per-spawn bearer token the parent (process_manager)
     # presents on every ``/v1`` request, delivered via the private spawn env
@@ -329,11 +322,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--conversation-id",
-        required=True,
-        help="AP-allocated conversation id (e.g. 'conv_abc123').",
-    )
-    parser.add_argument(
         "--parent-pid",
         type=int,
         default=None,
@@ -396,7 +384,7 @@ def main(argv: list[str] | None = None) -> None:
     except Exception:
         pass  # tracing init failed; continue without tracing
 
-    app = _load_harness_app(args.harness, args.module, args.conversation_id)
+    app = _load_harness_app(args.harness, args.module)
     if args.parent_pid is not None:
         _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)

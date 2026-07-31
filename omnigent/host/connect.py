@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
@@ -95,12 +96,15 @@ from omnigent.process_logging import (
     process_log_dir,
 )
 from omnigent.runner.identity import (
+    RUNNER_ADD_SESSION_SIGNAL,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
+    get_stable_runner_id,
+    pending_tokens_dir,
     token_bound_runner_id,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -667,10 +671,15 @@ class _RunnerHandle:
         ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
         Read back for diagnostics when the runner dies before
         connecting its tunnel.
+    :param workspace: Canonical workspace path the process was spawned
+        with. Used to gate runner reuse — sessions with different
+        workspaces must not share a runner (the workspace is baked into
+        the subprocess env and drives filesystem root resolution).
     """
 
     proc: subprocess.Popen[bytes]
     log_path: Path
+    workspace: Path | None = None
 
 
 class HostProcess:
@@ -1128,6 +1137,77 @@ class HostProcess:
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
+
+        # If a runner process is already alive for this host, signal it to
+        # adopt the new session's binding token instead of spawning a new
+        # subprocess. The runner opens an extra tunnel connection for the new
+        # token_bound_runner_id, so the server sees a normal runner connect.
+        # This is backward compatible: the server and runner protocol are
+        # unchanged; we just reuse one process for multiple tunnel connections.
+        stable_id = get_stable_runner_id()
+        existing_handle = self._runners.get(stable_id)
+        # Only reuse the runner when the workspace matches — the runner's
+        # OMNIGENT_RUNNER_WORKSPACE env var is frozen at spawn time and
+        # drives filesystem-root resolution, so a different workspace must
+        # get a fresh process.
+        workspace_matches = (
+            existing_handle is not None
+            and existing_handle.workspace is not None
+            and existing_handle.workspace == workspace
+        )
+        if (
+            existing_handle is not None
+            and existing_handle.proc.poll() is None
+            and RUNNER_ADD_SESSION_SIGNAL is not None
+            and workspace_matches
+        ):
+            try:
+                token_dir = pending_tokens_dir(stable_id)
+                # Create directory with restricted permissions (0o700) so
+                # the token files are not world-readable on multi-user hosts.
+                token_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                # Use a random filename (not the token) to avoid leaking the
+                # secret via directory listing. Token content is written with
+                # restricted permissions (0o600).
+                token_filename = secrets.token_hex(8)
+                token_file = token_dir / token_filename
+                token_file.write_text(frame.binding_token)
+                token_file.chmod(0o600)
+                existing_handle.proc.send_signal(RUNNER_ADD_SESSION_SIGNAL)
+                # Wait for the runner to pick up the token (it deletes the
+                # file after starting the extra tunnel task). This prevents
+                # the server from trying to use the new runner_id before
+                # the tunnel WebSocket has connected. Poll briefly; fall
+                # through to spawn if the runner doesn't respond in time.
+                _TOKEN_PICKUP_TIMEOUT_S = 5.0
+                _TOKEN_POLL_INTERVAL_S = 0.05
+                waited = 0.0
+                while token_file.exists() and waited < _TOKEN_PICKUP_TIMEOUT_S:
+                    await asyncio.sleep(_TOKEN_POLL_INTERVAL_S)
+                    waited += _TOKEN_POLL_INTERVAL_S
+                if token_file.exists():
+                    # Runner didn't pick up the token — fall through to spawn.
+                    token_file.unlink(missing_ok=True)
+                    raise OSError("runner did not pick up session token in time")
+                _logger.info(
+                    "Reusing runner %s (pid=%d) for new session %s",
+                    stable_id,
+                    existing_handle.proc.pid,
+                    frame.session_id or runner_id,
+                )
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="launched",
+                    runner_id=runner_id,
+                )
+            except OSError as exc:
+                _logger.warning(
+                    "Failed to signal existing runner %s; spawning new process: %s",
+                    stable_id,
+                    exc,
+                )
+                # Fall through to normal spawn path.
+
         initial_auth_token = await asyncio.to_thread(
             self._current_auth_token,
             initialize=False,
@@ -1193,7 +1273,11 @@ class HostProcess:
                 error=_runner_exit_error(proc.returncode, log_path),
             )
 
-        self._runners[runner_id] = _RunnerHandle(proc=proc, log_path=log_path)
+        handle = _RunnerHandle(proc=proc, log_path=log_path, workspace=workspace)
+        self._runners[runner_id] = handle
+        # Also register under the stable host runner_id so subsequent sessions
+        # find this process and reuse it via the add-session signal path.
+        self._runners[stable_id] = handle
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
@@ -1237,6 +1321,11 @@ class HostProcess:
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
+        # Also remove the stable_id alias that was registered alongside this
+        # runner at launch time so stale entries don't persist after stop.
+        stable_id = get_stable_runner_id()
+        if self._runners.get(stable_id) is handle:
+            self._runners.pop(stable_id, None)
         if handle.proc.poll() is None:
             handle.proc.terminate()
             try:

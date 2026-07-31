@@ -415,17 +415,32 @@ def configure_mock_llm(
     resp.raise_for_status()
 
 
-def reset_mock_llm(mock_llm_server_url: str | None) -> None:
+def reset_mock_llm(
+    mock_llm_server_url: str | None,
+    key: str | None = None,
+) -> None:
     """
-    Clear all regular keyed queues, captured requests, and gates.
+    Clear regular keyed queues, captured requests, and gates.
+
+    When *key* is provided only that queue is cleared — safe for use
+    in tests that run concurrently (xdist workers). Without *key* all
+    queues are cleared (original behaviour, legacy call sites).
 
     Fallbacks set via :func:`set_fallback_mock_llm` are preserved.
 
     :param mock_llm_server_url: Mock server URL or ``None``.
+    :param key: Queue key to reset, or ``None`` to reset all.
     """
     if mock_llm_server_url is None:
         return
-    resp = httpx.post(f"{mock_llm_server_url}/mock/reset", timeout=5.0)
+    payload: dict[str, Any] = {}
+    if key is not None:
+        payload["key"] = key
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/reset",
+        json=payload if payload else None,
+        timeout=5.0,
+    )
     resp.raise_for_status()
 
 

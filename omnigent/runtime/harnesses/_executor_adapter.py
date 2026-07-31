@@ -2,12 +2,12 @@
 Shared adapter that wraps any inner :class:`Executor` instance as
 a :class:`HarnessApp` subclass.
 
-The four per-harness wraps (claude-sdk, codex, pi,
-openai-agents-sdk) all use this adapter — they only differ in the
+The per-harness wraps (claude-sdk, codex, pi, openai-agents-sdk,
+claude-native, etc.) all use this adapter — they only differ in the
 inner ``Executor`` they construct. The adapter handles:
 
-- Per-conversation lazy executor construction (Layer 1 state on
-  the adapter instance).
+- Per-conversation lazy executor construction (Layer 1 state stored
+  in ``_sessions``, a dict keyed by conversation_id).
 - Per-turn translation of Omnigent :class:`CreateResponseRequest` →
   inner :class:`Message` list + :class:`ExecutorConfig`.
 - Per-turn translation of inner :class:`ExecutorEvent`s →
@@ -19,7 +19,11 @@ inner ``Executor`` they construct. The adapter handles:
   action_required path).
 - Cancellation propagation (POST /cancel → ctx.cancelled →
   inner ``Executor.interrupt_session``).
-- Per-conversation cleanup on shutdown.
+- Per-conversation cleanup on session close and adapter shutdown.
+
+A single adapter instance now serves multiple conversations: one
+``_SessionState`` entry per conversation_id, created lazily on the
+first turn and removed by ``close_session``.
 
 V1 limitations (documented in §Autonomous decisions):
 
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import secrets
@@ -139,6 +144,33 @@ def _strip_mcp_tool_prefix(name: str) -> str:
     return name
 
 
+@dataclasses.dataclass
+class _SessionState:
+    """Per-conversation state hosted inside a shared :class:`ExecutorAdapter`."""
+
+    # Stable key passed to executor.close_session / interrupt_session.
+    session_key: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex)
+    # Lazily-constructed inner executor, reused across turns.
+    executor: Executor | None = None
+    # Per-turn pointer to the active TurnContext, rebound at the top of
+    # run_turn and cleared in its finally. The stable _tool_executor /
+    # _elicitation_handler / _policy_evaluator bridges installed on the
+    # executor read from this slot at call time so they always dispatch
+    # into the current turn's ctx, not a stale one.
+    current_ctx: TurnContext | None = None
+    current_agent: str | None = None
+    # FIFO queue of inner-SDK tool-use ids for MCP call-id correlation.
+    # See the comment on _pending_mcp_call_ids in the old single-session
+    # __init__ for the full rationale.
+    pending_mcp_call_ids: deque = dataclasses.field(default_factory=deque)
+    # Per-session tracing context, created lazily on the first traced turn.
+    tracing_ctx: TracingContext | None = None
+    # Call ids round-tripped through _stable_tool_executor this turn;
+    # ToolCallComplete events carrying these ids are suppressed to avoid
+    # duplicate output cards.
+    dispatched_call_ids: set = dataclasses.field(default_factory=set)
+
+
 class ExecutorAdapter(HarnessApp):
     """
     :class:`HarnessApp` subclass that drives any inner
@@ -146,15 +178,15 @@ class ExecutorAdapter(HarnessApp):
 
     The per-harness wrap supplies an ``executor_factory`` —
     a zero-arg callable that constructs the inner executor. The
-    adapter calls it lazily on the first turn (so heavyweight
-    constructors like :class:`ClaudeSDKExecutor`'s eager
-    Databricks credential resolution don't fire at FastAPI
+    adapter calls it lazily on the first turn for each conversation
+    (so heavyweight constructors like :class:`ClaudeSDKExecutor`'s
+    eager Databricks credential resolution don't fire at FastAPI
     boot, only when a real conversation starts).
 
-    The factory's return value is cached as Layer 1 state on the
-    adapter instance — reused across turns for the conversation's
-    lifetime. ``shutdown()`` calls ``executor.close()`` on
-    teardown.
+    A single adapter instance now serves multiple conversations.
+    Per-conversation state is stored in ``_sessions``
+    (a dict keyed by conversation_id), created lazily on the
+    first turn and removed by :meth:`close_session`.
 
     :param executor_factory: Zero-arg callable returning a fresh
         :class:`Executor`. Tests pass a ``lambda:
@@ -162,13 +194,6 @@ class ExecutorAdapter(HarnessApp):
         constructs the real per-harness Executor with config
         appropriate to the spec, e.g. ``lambda:
         ClaudeSDKExecutor(databricks=True, databricks_profile="<your-profile>")``.
-    :param session_key: Stable identifier the inner executor uses
-        to scope per-session state (clients, subprocesses). The
-        adapter passes this to ``executor.close_session()`` and
-        ``executor.interrupt_session()``. Defaults to a uuid hex
-        — production wraps may want to set it from the
-        ``conversation_id`` once the runner exposes it on
-        ``app.state``.
     """
 
     def __init__(
@@ -179,83 +204,110 @@ class ExecutorAdapter(HarnessApp):
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
-        self._session_key = session_key or uuid.uuid4().hex
         # Human-readable harness name used in elicitation card messages,
         # e.g. "Claude" → "Claude wants to call **Bash**" or
         # "Cursor" → "Cursor wants to use **Bash**".
         self._harness_label = harness_label
-        # Layer 1: lazily-constructed inner executor, reused
-        # across turns for the conversation's lifetime.
-        self._executor: Executor | None = None
-        # Per-turn pointer to the active :class:`TurnContext`,
-        # rebound at the top of each :meth:`run_turn` and cleared
-        # in its finally. The stable ``_tool_executor`` bridge
-        # (installed once on first use) reads from this slot so
-        # the MCP handlers cached inside ``ClaudeSDKClient`` —
-        # which closure-capture whatever ``_tool_executor`` was
-        # set on the FIRST turn — always dispatch into the
-        # CURRENT turn's ctx. Without this, turn N>1's tool calls
-        # park a Future inside turn 1's already-dead ctx and the
-        # SDK hangs forever waiting for a result that nobody can
-        # deliver.
-        self._current_ctx: TurnContext | None = None
-        self._current_agent: str | None = None
-        # FIFO queue of inner-SDK tool-use ids, one entry per
-        # ToolCallRequest the executor parses. Populated by
-        # :meth:`_translate_event` whenever ``event.metadata``
-        # carries a ``call_id`` (the inner Claude SDK / OpenAI
-        # Agents SDK / Codex / Pi executors all stamp it for
-        # bridged tools). Drained by :meth:`_stable_tool_executor`
-        # so each :func:`_bridge_one_dispatch` call reuses the
-        # SAME ``call_id`` the observed function_call event
-        # already carried — that's what lets the Omnigent REPL dedupe
-        # the inline observed render with the post-stream
-        # action_required render. Without this correlation, the
-        # two events have different uuids, the SDK client sees
-        # them as separate tool calls, and the REPL renders
-        # ``⏵ tool_name`` twice plus an empty result panel for
-        # the orphan call (the 2026-04-29 user-reported
-        # duplicate-render + empty-box regression for
-        # openai-agents — same shape as the 2026-04-28 claude-
-        # sdk regression resolved for MCP-prefixed
-        # tools). See commit 989bfde for the prior
-        # suppress-observed mitigation that introduced the
-        # end-of-turn ordering regression this queue resolves.
-        self._pending_mcp_call_ids: deque[str] = deque()
-        # Per-session tracing context. Created lazily on the first
-        # turn when tracing is enabled; reused across turns so the
-        # span parent chain stays rooted on the session's executor.
-        self._tracing_ctx: TracingContext | None = None
-        # Call ids actually round-tripped through :meth:`_stable_tool_executor`
-        # -> ``ctx.dispatch_tool`` this turn. ``dispatch_tool`` emits the paired
-        # function_call_output itself, so a ToolCallComplete carrying one of
-        # these ids must be SUPPRESSED in :meth:`_translate_event` to avoid a
-        # duplicate output card. Completions whose id is NOT here come from
-        # tools the inner SDK ran entirely internally (e.g. the antigravity
-        # executor, which has no ``_stable_tool_executor`` dispatch) — those are
-        # the ONLY output source and MUST be emitted. Reset per turn alongside
-        # ``_pending_mcp_call_ids``.
-        self._dispatched_call_ids: set[str] = set()
+        # Per-conversation state, keyed by conversation_id.
+        # Legacy callers that pass session_key at construction time (tests,
+        # direct create_app() usage without a runner) get a single synthetic
+        # entry under that key so existing call sites keep working.
+        self._sessions: dict[str, _SessionState] = {}
+        if session_key is not None:
+            # Compatibility shim: single-session callers that supply an
+            # explicit session_key (e.g. unit tests) get that key wired
+            # as the only session so _ensure_session(session_key) below
+            # finds it without needing app.state.conversation_id.
+            self._sessions[session_key] = _SessionState(session_key=session_key)
+        # Kept for backward compatibility with external callers that read
+        # adapter._session_key directly (tests). Points at the first session
+        # or a fresh uuid when no session_key is provided.
+        self._session_key = session_key or uuid.uuid4().hex
+
+    def _ensure_session(self, conversation_id: str) -> _SessionState:
+        """Return the existing session state for *conversation_id*, creating it lazily."""
+        if conversation_id not in self._sessions:
+            self._sessions[conversation_id] = _SessionState()
+        return self._sessions[conversation_id]
+
+    # ── Backward-compatibility shims ─────────────────────────────────────
+    # Tests and legacy callers that manipulate single-session state directly
+    # (adapter._current_ctx = ctx, adapter._pending_mcp_call_ids, etc.) route
+    # through these properties into the default session keyed by _session_key.
+
+    @property
+    def _default_sess(self) -> _SessionState:
+        return self._ensure_session(self._session_key)
+
+    @property
+    def _executor(self) -> Executor | None:
+        return self._default_sess.executor
+
+    @_executor.setter
+    def _executor(self, value: Executor | None) -> None:
+        self._default_sess.executor = value
+
+    @property
+    def _current_ctx(self) -> TurnContext | None:
+        return self._default_sess.current_ctx
+
+    @_current_ctx.setter
+    def _current_ctx(self, value: TurnContext | None) -> None:
+        self._default_sess.current_ctx = value
+
+    @property
+    def _current_agent(self) -> str | None:
+        return self._default_sess.current_agent
+
+    @_current_agent.setter
+    def _current_agent(self, value: str | None) -> None:
+        self._default_sess.current_agent = value
+
+    @property
+    def _pending_mcp_call_ids(self) -> deque:
+        return self._default_sess.pending_mcp_call_ids
+
+    @property
+    def _dispatched_call_ids(self) -> set:
+        return self._default_sess.dispatched_call_ids
+
+    # Stable bridge shims — delegate to the default session so tests
+    # that call adapter._stable_tool_executor(...) still work.
+    async def _stable_tool_executor(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return await self._make_tool_executor(self._default_sess)(tool_name, args)
+
+    async def _stable_elicitation_handler(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> bool:
+        return await self._make_elicitation_handler(self._default_sess)(tool_name, tool_input)
+
+    async def _stable_policy_evaluator(
+        self, phase: str, data: dict[str, Any]
+    ) -> PolicyVerdictPayload:
+        return await self._make_policy_evaluator(self._default_sess)(phase, data)
+
+    async def _watch_injections_compat(self, ctx: TurnContext, executor: Executor) -> None:
+        """Backward-compat wrapper for tests that call _watch_injections without sess."""
+        await self._watch_injections(ctx, executor, self._default_sess)
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """
         Drive the inner executor and translate its events.
 
-        Lazily constructs the inner executor on the first call.
-        Subsequent calls reuse the cached instance. Wires a
-        per-turn ``_tool_executor`` callback so the inner SDK
+        Lazily constructs the inner executor on the first call for a
+        conversation. Subsequent calls reuse the cached instance.
+        Wires a per-turn ``_tool_executor`` callback so the inner SDK
         can round-trip spec-declared tools through Omnigent via the
         scaffold's ``dispatch_tool`` (action_required) path.
-        The hook is reset to ``None`` after the turn so cross-
-        turn references can't accidentally fire stale dispatch
-        contexts.
 
         :param request: Decoded :class:`CreateResponseRequest`
             synthesized by the harness scaffold for this turn.
         :param ctx: Per-turn :class:`TurnContext` from the
             scaffold.
         """
-        executor = self._ensure_executor()
+        conversation_id = ctx.conversation_id or self._session_key
+        sess = self._ensure_session(conversation_id)
+        executor = self._ensure_executor(sess)
         messages = _translate_input_to_messages(request.input)
         # Stamp every message with the adapter's session_key so
         # the inner :class:`ClaudeSDKExecutor` keys its cached
@@ -263,14 +315,14 @@ class ExecutorAdapter(HarnessApp):
         # executor's :meth:`_session_key` falls back to
         # ``"default"`` (no ``session_id`` on any message), and
         # subsequent :meth:`Executor.enqueue_session_message`
-        # calls — which use ``self._session_key`` from this
+        # calls — which use ``sess.session_key`` from this
         # adapter — return ``False`` because the cached client
         # is under a DIFFERENT key. Symptom (the user reported
         # this): mid-turn steering arrives in the harness, the
         # adapter forwards to enqueue_session_message, but the
         # SDK never sees the new prompt and Claude keeps going.
         for message in messages:
-            message["session_id"] = self._session_key
+            message["session_id"] = sess.session_key
         extra: dict[str, Any] = {}
         if request.reasoning is not None:
             effort = request.reasoning.get("effort")
@@ -287,35 +339,21 @@ class ExecutorAdapter(HarnessApp):
         system_prompt = request.instructions or ""
         # Install the stable bridge ONCE on the executor. The SDK
         # caches its client on first turn and the MCP handlers
-        # closure-capture ``self._tool_executor`` then. A fresh
-        # bridge per turn would leave those handlers pointing at
-        # a turn-1 closure forever — every later tool call would
-        # dispatch into a dead ctx and the SDK would hang.
-        # Rebind ``_current_ctx`` / ``_current_agent`` per turn
-        # instead; the stable bridge reads from those slots at
-        # call time. ``_tool_executor`` is harness-specific (not
-        # declared on the inner :class:`Executor` ABC), so the
-        # attribute set is best-effort — executors that don't
-        # read it ignore the value, executors that DO read it
-        # (Claude SDK) honor the round-trip protocol.
+        # closure-capture the bridge then. A fresh bridge per turn
+        # would leave those handlers pointing at a turn-1 closure
+        # forever — every later tool call would dispatch into a dead
+        # ctx and the SDK would hang.
+        # Each bridge is a closure over ``sess`` so it reads from
+        # the correct session's current_ctx / current_agent at call
+        # time even when multiple sessions share this adapter.
         if getattr(executor, "_tool_executor", None) is None:  # type: ignore[attr-defined]
-            executor._tool_executor = self._stable_tool_executor  # type: ignore[attr-defined]
-        # Install the elicitation handler once on first use, same
-        # stable-reference pattern as ``_tool_executor``. The SDK's
-        # ``can_use_tool`` callback is constructed per-turn inside
-        # ClaudeSDKExecutor.run_turn() from this attribute, so the
-        # closure always reads ``_current_ctx`` at call time.
+            executor._tool_executor = self._make_tool_executor(sess)  # type: ignore[attr-defined]
         if getattr(executor, "_elicitation_handler", None) is None:  # type: ignore[attr-defined]
-            executor._elicitation_handler = self._stable_elicitation_handler  # type: ignore[attr-defined]
-        # Install the policy evaluator bridge once on first use, same
-        # stable-reference pattern as ``_tool_executor``. The inner
-        # executor calls this before/after each LLM call to evaluate
-        # LLM_REQUEST / LLM_RESPONSE policies via a round-trip to the
-        # Omnigent server (routed through the runner).
+            executor._elicitation_handler = self._make_elicitation_handler(sess)  # type: ignore[attr-defined]
         if getattr(executor, "_policy_evaluator", None) is None:  # type: ignore[attr-defined]
-            executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
-        self._current_ctx = ctx
-        self._current_agent = request.model
+            executor._policy_evaluator = self._make_policy_evaluator(sess)  # type: ignore[attr-defined]
+        sess.current_ctx = ctx
+        sess.current_agent = request.model
         # Reset the MCP call-id queue at turn start. A prior turn
         # that errored mid-stream (e.g. cancelled while a tool_use
         # block had been parsed but its MCP-handler hadn't fired
@@ -324,53 +362,29 @@ class ExecutorAdapter(HarnessApp):
         # MCP dispatches with stale observed events from the
         # previous turn. Clearing makes each turn's correlation
         # window self-contained.
-        self._pending_mcp_call_ids.clear()
-        self._dispatched_call_ids.clear()
+        sess.pending_mcp_call_ids.clear()
+        sess.dispatched_call_ids.clear()
 
         # --- Tracing setup ------------------------------------------------
-        # Create a TracingContext per turn when tracing is enabled.
-        # The trace_context_for_response wrapper derives the W3C
-        # trace ID from the response_id so operators can look up
-        # traces by response ID without a mapping table.
         tracing = is_tracing_enabled()
         from omnigent.runtime.telemetry import current_session_id, session_scope
 
-        # Prefer the conversation id the request hook already bound
-        # (authoritative, from the /sessions/<conv>/events path); fall back to
-        # the adapter session key, which can be a random uuid for harnesses
-        # built without one.
-        turn_session_id = current_session_id() or self._session_key
-        if tracing and self._tracing_ctx is None:
-            self._tracing_ctx = TracingContext(session_id=turn_session_id)
-        tctx = self._tracing_ctx if tracing else None
+        turn_session_id = current_session_id() or sess.session_key
+        if tracing and sess.tracing_ctx is None:
+            sess.tracing_ctx = TracingContext(session_id=turn_session_id)
+        tctx = sess.tracing_ctx if tracing else None
         agent_span = None
-        # Active tool span for correlating ToolCallRequest → ToolCallComplete.
         _active_tool_span = None
         _active_tool_parent = None
 
         user_message = _extract_last_user_message(request.input)
         # --- End tracing setup --------------------------------------------
 
-        # Watcher for mid-turn steering injections. The scaffold
-        # routes incoming steering events with
-        # ``previous_response_id == ctx.response_id`` onto
-        # ``ctx.next_injection`` (see _push_injection in the
-        # scaffold). The watcher converts each injection into an
-        # :meth:`Executor.enqueue_session_message` call so the
-        # inner SDK delivers the new user message into its
-        # in-flight session — without this hook, AP-forwarded
-        # steering would queue forever and the LLM would never
-        # see it.
         injection_watcher = asyncio.create_task(
-            self._watch_injections(ctx, executor),
+            self._watch_injections(ctx, executor, sess),
             name=f"executor-adapter-injection-watch:{ctx.response_id}",
         )
         try:
-            # Wrap the executor loop in the trace context so all
-            # MLflow spans share the response-derived trace ID.
-            # The context manager is built outside the `with` so we
-            # can fall back to nullcontext if the response_id format
-            # doesn't match (e.g. 24-char hex vs expected 32).
             trace_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
             if tctx:
                 try:
@@ -379,10 +393,6 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            # Bind the session for the whole turn so every span the harness
-            # creates (agent/LLM/tool, the native tmux inject, DB/httpx child
-            # spans) is tagged with session.id by the span processor — no
-            # per-harness code. (session_scope imported above with current_session_id.)
             with session_scope(turn_session_id), trace_cm:
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
@@ -405,9 +415,8 @@ class ExecutorAdapter(HarnessApp):
                             record_cancellation(agent_span)
                             tctx.end_agent_span(agent_span, response=None)
                             agent_span = None
-                        await executor.interrupt_session(self._session_key)
+                        await executor.interrupt_session(sess.session_key)
                         return
-                    # --- Tracing: emit spans per event ---
                     if tctx is not None:
                         if isinstance(event, ToolCallRequest):
                             _active_tool_parent = tctx._current_span
@@ -431,11 +440,8 @@ class ExecutorAdapter(HarnessApp):
                             if event.usage is not None:
                                 from omnigent.runtime.telemetry import record_llm_usage
 
-                                # Record usage on the agent span for
-                                # aggregate visibility.
                                 record_llm_usage(agent_span, event.usage)
-                    # --- End tracing ---
-                    self._translate_event(event, ctx)
+                    self._translate_event(event, ctx, sess)
                     if isinstance(event, TurnComplete):
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(agent_span, response=response_text)
@@ -459,12 +465,6 @@ class ExecutorAdapter(HarnessApp):
                             agent_span = None
                         raise RuntimeError(f"inner executor error: {event.message}")
         except ElicitationDeclinedError:
-            # Fallback for executors that propagate the exception directly
-            # (non-SDK / non-spawned-task paths). SDK-based executors use
-            # ctx.cancelled.set() from _stable_elicitation_handler instead,
-            # because the SDK wraps its control-request callbacks in their
-            # own tasks and would swallow a raised exception before it
-            # reached this handler. Either way the turn ends as cancelled.
             _logger.info(
                 "elicitation explicitly declined for response %s — aborting turn",
                 ctx.response_id,
@@ -475,33 +475,17 @@ class ExecutorAdapter(HarnessApp):
                 record_cancellation(agent_span)
                 tctx.end_agent_span(agent_span, response=None)
             ctx.cancelled.set()
-            # Interrupt the inner executor session so the in-flight
-            # generation stops immediately, same as the normal
-            # cancellation path.
-            if self._executor is not None:
-                await self._executor.interrupt_session(self._session_key)
+            if sess.executor is not None:
+                await sess.executor.interrupt_session(sess.session_key)
         except BaseException:
-            # End agent span on unhandled exceptions so it's not
-            # left open (which would leak on the OTel provider).
             if tctx is not None and agent_span is not None:
                 tctx.end_agent_span(agent_span, response=None, error="unhandled exception")
                 agent_span = None
             raise
         finally:
-            # Stop the injection watcher and let it drain so a
-            # late ``next_injection`` doesn't fire after we've
-            # moved on. ``injection_watcher`` is a long-poll
-            # against an ``asyncio.Queue.get`` — cancelling is
-            # the only way to break it.
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await injection_watcher
-            # Flush the OTel provider and finalize the trace status
-            # on the MLflow server. Without the flush, the
-            # BatchSpanProcessor may not have exported the final
-            # spans. Without the PATCH, the OTLP-ingested trace
-            # stays "In progress" because the server has no
-            # signal that all spans have arrived.
             if tctx is not None:
                 try:
                     from opentelemetry import trace as otel_trace
@@ -511,89 +495,59 @@ class ExecutorAdapter(HarnessApp):
                         provider.force_flush(timeout_millis=5000)
                 except Exception:
                     pass
-            # Clear the per-turn pointers so a stray late callback
-            # (e.g. one fired after the SDK's stream closed) sees
-            # ``None`` and returns an explicit error rather than
-            # silently dispatching into the just-finished ctx.
-            self._current_ctx = None
-            self._current_agent = None
+            sess.current_ctx = None
+            sess.current_agent = None
 
-    async def _handle_interrupt_event(self) -> Response:
+    async def _handle_interrupt_event(self, conversation_id: str | None = None) -> Response:
         """Cancel the turn AND drop the inner executor session.
 
-        The base handler sets ``ctx.cancelled`` (terminal event becomes
-        ``response.cancelled``) and clears the inject target. But the live
-        client — dropping which is what actually stops the in-flight
-        generation and forces the next turn to rebuild fresh — was only
-        dropped by the run loop's between-events ``interrupt_session`` call,
-        which is skipped when the turn is blocked awaiting the first token or
-        torn down via HTTP disconnect. The next turn then reuses the client
-        and flushes the abandoned generation: the post-cancel stream dump +
-        the off-by-one. Drop it here, synchronously on the interrupt.
-
-        :returns: The base handler's 204 response.
-        :raises OmnigentError: 404 (from the base handler) when no turn is
-            in flight.
+        Only interrupts the session for *conversation_id*. In legacy
+        single-conversation mode (``None``) all sessions are interrupted.
         """
-        response = await super()._handle_interrupt_event()
-        # ``self._executor`` is set once a turn has run; an interrupt only
-        # reaches here when one is in flight, so it is non-None in practice.
-        # interrupt_session is best-effort and idempotent (a no-op if the run
-        # loop already dropped the session), so call it bare like that path.
-        if self._executor is not None:
-            await self._executor.interrupt_session(self._session_key)
+        response = await super()._handle_interrupt_event(conversation_id)
+        # Only interrupt the executor(s) for the target conversation so
+        # co-tenant conversations are not affected.
+        target_sessions = (
+            [self._sessions[conversation_id]]
+            if conversation_id is not None and conversation_id in self._sessions
+            else list(self._sessions.values())
+        )
+        for sess in target_sessions:
+            if sess.executor is not None:
+                await sess.executor.interrupt_session(sess.session_key)
         return response
 
-    async def _watch_injections(self, ctx: TurnContext, executor: Executor) -> None:
+    async def _watch_injections(
+        self, ctx: TurnContext, executor: Executor, sess: _SessionState | None = None
+    ) -> None:
         """
         Loop forwarding ``ctx.next_injection`` to the inner SDK.
 
-        Polls :meth:`TurnContext.next_injection` (a queue
-        backed by the scaffold's ``_push_injection``) and
-        translates each :class:`CreateResponseRequest` into an
-        :meth:`Executor.enqueue_session_message` call so the
-        inner SDK delivers the new user message into its
-        in-flight session. Loops until cancelled by the
-        :meth:`run_turn` finally block.
-
-        Best-effort throughout — a failed injection logs and
-        continues; a malformed request body (missing user
-        text) is skipped; the watcher never raises out of the
-        loop body. Errors that escape would teardown the watch
-        task and surface as a confusing test/test-env failure
-        in the parent run_turn.
-
         :param ctx: The active turn's context.
         :param executor: The inner executor to inject into.
-            Must implement ``enqueue_session_message`` for the
-            forwarding to actually deliver — executors that
-            don't (legacy harnesses) silently no-op.
+        :param sess: The session state for this conversation. Falls back
+            to the default session when ``None`` (backward compat).
         """
+        if sess is None:
+            sess = self._default_sess
         while True:
             try:
                 injection = await ctx.next_injection(timeout=None)
             except asyncio.CancelledError:
                 return
             if injection is None:
-                # ``next_injection(None)`` blocks forever on the
-                # queue, so a None return here means the queue
-                # protocol changed or the scaffold pushed a
-                # sentinel. Defensive — bail rather than spin.
                 return
             text = _extract_user_text(injection.input)
             if not text:
-                # Empty / malformed input — skip rather than
-                # call the SDK with garbage.
                 _logger.warning(
                     "skipping in-band injection with no text payload: %r",
                     injection.input,
                 )
                 continue
             if ctx.cancelled.is_set():
-                # Turn interrupted — don't deliver into the dying session.
                 return
             try:
-                accepted = await executor.enqueue_session_message(self._session_key, text)
+                accepted = await executor.enqueue_session_message(sess.session_key, text)
             except Exception:
                 _logger.exception(
                     "inner executor.enqueue_session_message failed; in-band injection lost"
@@ -606,13 +560,6 @@ class ExecutorAdapter(HarnessApp):
                     "not see the steered message until the next turn"
                 )
                 continue
-            # The executor consumed this injection into the running turn.
-            # Echo the runner's correlation id back as an
-            # ``injection.consumed`` marker so the runner drops the
-            # buffered copy and does not re-deliver it as a continuation
-            # turn (RUNNER_MESSAGE_INGEST.md Part B). Only meaningful when
-            # the runner stamped an injection_id; fresh-turn injections and
-            # legacy callers leave it unset.
             injection_id = getattr(injection, "injection_id", None)
             if injection_id:
                 ctx.emit(
@@ -622,212 +569,101 @@ class ExecutorAdapter(HarnessApp):
                     )
                 )
 
-    async def _stable_tool_executor(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-    ) -> dict[str, Any]:
-        """
-        Cached bridge the inner SDK keeps over the lifetime of
-        the executor instance.
+    def _make_tool_executor(self, sess: _SessionState) -> Callable[..., Any]:
+        """Return a per-session tool-executor bridge closed over *sess*."""
 
-        Reads :attr:`_current_ctx` and :attr:`_current_agent` at
-        call time so the dispatch always lands in the active
-        turn's :class:`TurnContext`. If neither is set (a
-        stale callback fired after the turn ended, or the SDK
-        called the executor without a wrapping ``run_turn``),
-        returns a clear error payload — letting the call park
-        on a dead ctx would just hang the SDK indefinitely.
-
-        For MCP-prefixed tools, drains the next ``tool_use_id``
-        from :attr:`_pending_mcp_call_ids` and passes it to
-        :func:`_bridge_one_dispatch` so the dispatch's
-        action_required event shares a ``call_id`` with the
-        inline observed event already emitted by
-        :meth:`_translate_event`. The deque is FIFO and the
-        inner SDK invokes MCP-server handlers in the same
-        order it parsed the corresponding tool_use blocks, so
-        positional pop is correct.
-
-        :param tool_name: Tool name from the LLM's call. Carries
-            the MCP prefix for SDK-registered tools (e.g.
-            ``"mcp__omnigent__sys_terminal_launch"``).
-        :param args: Decoded argument dict.
-        :returns: A dict suitable as the MCP tool result.
-        """
-        ctx = self._current_ctx
-        agent = self._current_agent
-        if ctx is None or agent is None:
-            _logger.warning(
-                "tool callback fired with no active turn context (tool=%s); returning error",
-                tool_name,
+        async def _tool_executor(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+            ctx = sess.current_ctx
+            agent = sess.current_agent
+            if ctx is None or agent is None:
+                _logger.warning(
+                    "tool callback fired with no active turn context (tool=%s); returning error",
+                    tool_name,
+                )
+                return {"error": "no active turn context for tool dispatch"}
+            correlated_call_id: str | None = None
+            if sess.pending_mcp_call_ids:
+                correlated_call_id = sess.pending_mcp_call_ids.popleft()
+            dispatch_call_id = correlated_call_id or f"call_{uuid.uuid4().hex[:12]}"
+            sess.dispatched_call_ids.add(dispatch_call_id)
+            return await _bridge_one_dispatch(
+                ctx, agent, tool_name, args, call_id=dispatch_call_id
             )
-            return {"error": "no active turn context for tool dispatch"}
-        # Pop the matching ``tool_use_id`` for MCP tools so the
-        # dispatch reuses the observed event's call_id. Non-MCP
-        # tools and out-of-order edge cases (queue empty when an
-        # MCP tool fires) fall through to a freshly-allocated id
-        # in :func:`_bridge_one_dispatch` — that loses the dedup
-        # but doesn't break the dispatch protocol.
-        # ``_stable_tool_executor`` IS the SDK's MCP-server tool
-        # callback — only invoked for MCP-routed tools. The
-        # callback receives the BARE tool name (the MCP wrapper
-        # strips the ``mcp__omnigent__`` prefix before
-        # dispatching), so a ``startswith("mcp__")`` guard here
-        # would always be False and the queue would never pop.
-        # Pop whenever there's a queued id; non-MCP paths don't
-        # populate the queue, so this can't accidentally drain
-        # an unrelated id.
-        correlated_call_id: str | None = None
-        if self._pending_mcp_call_ids:
-            correlated_call_id = self._pending_mcp_call_ids.popleft()
-        # Allocate the dispatch id here (rather than letting
-        # _bridge_one_dispatch default it) so we can record EXACTLY which id was
-        # round-tripped. _translate_event suppresses the inner
-        # ToolCallComplete for these ids — dispatch_tool already emits their
-        # function_call_output — while letting internally-run SDK tool
-        # completions (not in this set) through as the sole output source.
-        dispatch_call_id = correlated_call_id or f"call_{uuid.uuid4().hex[:12]}"
-        self._dispatched_call_ids.add(dispatch_call_id)
-        return await _bridge_one_dispatch(
-            ctx,
-            agent,
-            tool_name,
-            args,
-            call_id=dispatch_call_id,
-        )
 
-    async def _stable_elicitation_handler(
-        self,
-        tool_name: str,
-        tool_input: dict[str, Any],
-    ) -> bool:
-        """
-        Cached bridge the inner SDK keeps over the executor's lifetime.
+        return _tool_executor
 
-        Called by :class:`omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor`
-        via ``options.can_use_tool`` when the Claude CLI requests
-        permission before executing a tool and ``permission_mode`` is not
-        ``"bypassPermissions"``. Reads :attr:`_current_ctx` at call time
-        so the elicitation always lands in the active turn's context —
-        same rebind-per-turn pattern as :meth:`_stable_tool_executor`.
+    def _make_elicitation_handler(self, sess: _SessionState) -> Callable[..., Any]:
+        """Return a per-session elicitation bridge closed over *sess*."""
 
-        If no turn context is active (callback fired after the turn ended
-        or before a turn starts), returns ``False`` to deny by default
-        rather than granting unreviewed permission.
-
-        :param tool_name: Tool name the agent wants to call, e.g. ``"Bash"``.
-        :param tool_input: Arguments dict for the tool call,
-            e.g. ``{"command": "ls -la"}``.
-        :returns: ``True`` when the user approves the tool call;
-            ``False`` when they deny it.
-        """
-        ctx = self._current_ctx
-        if ctx is None:
-            # Elicitation callback fired with no active turn — this is a
-            # code-level invariant violation (run_turn clears _current_ctx
-            # in its finally block; a callback should never arrive after
-            # that). Deny by default: fail safe rather than grant permission
-            # that was never reviewed.
-            _logger.error(
-                "elicitation callback fired with no active turn context "
-                "(tool=%s); denying by default",
-                tool_name,
+        async def _elicitation_handler(tool_name: str, tool_input: dict[str, Any]) -> bool:
+            ctx = sess.current_ctx
+            if ctx is None:
+                _logger.error(
+                    "elicitation callback fired with no active turn context "
+                    "(tool=%s); denying by default",
+                    tool_name,
+                )
+                return False
+            elicitation_id = f"elicit_{secrets.token_hex(16)}"
+            try:
+                preview = json.dumps(tool_input, ensure_ascii=False)
+            except (TypeError, ValueError):
+                preview = repr(tool_input)
+            preview = preview[:300]
+            label = self._harness_label
+            policy_name = f"{label.lower()}_sdk_permission"
+            params = ElicitationRequestParams(
+                mode="form",
+                message=f"{label} wants to use **{tool_name}**",
+                requestedSchema=None,
+                url=None,
+                phase="tool_call",
+                policy_name=policy_name,
+                content_preview=f"{tool_name}({preview})",
             )
-            return False
+            result = await ctx.elicit(elicitation_id, params)
+            if result.action == "decline":
+                ctx.cancelled.set()
+            return result.action == "accept"
 
-        elicitation_id = f"elicit_{secrets.token_hex(16)}"
-        # Build a concise preview: truncate long args so the UI widget
-        # stays readable. 300 chars matches AP's policy-engine preview.
-        try:
-            preview = json.dumps(tool_input, ensure_ascii=False)
-        except (TypeError, ValueError):
-            preview = repr(tool_input)
-        preview = preview[:300]
+        return _elicitation_handler
 
-        label = self._harness_label
-        policy_name = f"{label.lower()}_sdk_permission"
-        params = ElicitationRequestParams(
-            mode="form",
-            message=f"{label} wants to use **{tool_name}**",
-            requestedSchema=None,
-            url=None,
-            phase="tool_call",
-            policy_name=policy_name,
-            content_preview=f"{tool_name}({preview})",
-        )
-        result = await ctx.elicit(elicitation_id, params)
-        if result.action == "decline":
-            # The SDK invokes this callback from a spawned control-request
-            # task whose try/except would swallow a raised exception before
-            # it could reach run_turn's except block. Signal the cancellation
-            # via ctx.cancelled instead — the run_turn event loop checks this
-            # flag between events and takes the existing interrupt path.
-            ctx.cancelled.set()
-        return result.action == "accept"
+    def _make_policy_evaluator(self, sess: _SessionState) -> Callable[..., Any]:
+        """Return a per-session policy-evaluator bridge closed over *sess*."""
 
-    async def _stable_policy_evaluator(
-        self,
-        phase: str,
-        data: dict[str, Any],
-    ) -> PolicyVerdictPayload:
-        """
-        Cached bridge the inner executor keeps over its lifetime.
+        async def _policy_evaluator(phase: str, data: dict[str, Any]) -> PolicyVerdictPayload:
+            ctx = sess.current_ctx
+            if ctx is None:
+                fail_closed = phase in FAIL_CLOSED_PHASES
+                action = "POLICY_ACTION_DENY" if fail_closed else "POLICY_ACTION_ALLOW"
+                _logger.warning(
+                    "policy evaluator fired with no active turn context (phase=%s); "
+                    "returning %s by default",
+                    phase,
+                    "DENY" if fail_closed else "ALLOW",
+                )
+                return PolicyVerdictPayload(
+                    action=action,
+                    reason=(
+                        f"No active turn context; failing closed for {phase}."
+                        if fail_closed
+                        else None
+                    ),
+                )
+            evaluation_id = f"poleval_{secrets.token_hex(16)}"
+            return await ctx.evaluate_policy(evaluation_id, phase, data)
 
-        Called by the inner executor before (``PHASE_LLM_REQUEST``)
-        and after (``PHASE_LLM_RESPONSE``) each LLM call. Routes
-        the evaluation through the scaffold's
-        :meth:`TurnContext.evaluate_policy` round-trip, which emits
-        a ``policy_evaluation.requested`` SSE event and parks on a
-        Future until the runner delivers the verdict.
+        return _policy_evaluator
 
-        The round-trip has a timeout (see ``_POLICY_EVAL_TIMEOUT_S``
-        in ``_scaffold.py``) so a stalled verdict defaults to ALLOW
-        instead of hanging the executor.
+    def _ensure_executor(self, sess: _SessionState) -> Executor:
+        """Construct the inner executor for *sess* on first use; return cached instance."""
+        if sess.executor is None:
+            sess.executor = self._executor_factory()
+        return sess.executor
 
-        :param phase: Proto-style phase string, e.g.
-            ``"PHASE_LLM_REQUEST"`` or ``"PHASE_LLM_RESPONSE"``.
-        :param data: Event data dict for the policy engine.
-        :returns: The policy verdict from the Omnigent server.
-        """
-        ctx = self._current_ctx
-        if ctx is None:
-            # Orphaned callback after a turn-context desync (#1026). Blanket
-            # ALLOW here silently bypasses guardrails: for a PHASE_TOOL_CALL this
-            # adapter is the only enforcement point (the call is never re-checked
-            # server-side), so an unevaluable verdict must fail closed. Mirror
-            # the runner's phase-aware default in _evaluate_policy_via_omnigent —
-            # tool calls DENY; advisory LLM phases and the post-execution result
-            # phase ALLOW so a transient desync never needlessly wedges them.
-            fail_closed = phase in FAIL_CLOSED_PHASES
-            action = "POLICY_ACTION_DENY" if fail_closed else "POLICY_ACTION_ALLOW"
-            _logger.warning(
-                "policy evaluator fired with no active turn context (phase=%s); "
-                "returning %s by default",
-                phase,
-                "DENY" if fail_closed else "ALLOW",
-            )
-            return PolicyVerdictPayload(
-                action=action,
-                reason=(
-                    f"No active turn context; failing closed for {phase}." if fail_closed else None
-                ),
-            )
-        evaluation_id = f"poleval_{secrets.token_hex(16)}"
-        return await ctx.evaluate_policy(evaluation_id, phase, data)
-
-    def _ensure_executor(self) -> Executor:
-        """
-        Construct the inner executor on first use; return cached
-        instance thereafter.
-
-        :returns: The per-conversation inner :class:`Executor`.
-        """
-        if self._executor is None:
-            self._executor = self._executor_factory()
-        return self._executor
-
-    def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
+    def _translate_event(
+        self, event: ExecutorEvent, ctx: TurnContext, sess: _SessionState | None = None
+    ) -> None:
         """
         Translate one inner :class:`ExecutorEvent` into Omnigent SSE
         events emitted via ``ctx.emit``.
@@ -842,7 +678,11 @@ class ExecutorAdapter(HarnessApp):
         :param event: The inner executor event to translate.
         :param ctx: The per-turn context; events are pushed onto
             its queue.
+        :param sess: The session state for this conversation. When
+            ``None`` (direct test calls), falls back to the default session.
         """
+        if sess is None:
+            sess = self._default_sess
         if isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
@@ -917,7 +757,7 @@ class ExecutorAdapter(HarnessApp):
             # event, and the REPL renders the call twice plus an
             # empty result panel for the orphan call.
             if tool_use_id is not None:
-                self._pending_mcp_call_ids.append(tool_use_id)
+                sess.pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
             bare_name = _strip_mcp_tool_prefix(event.name)
             ctx.emit(
@@ -979,7 +819,7 @@ class ExecutorAdapter(HarnessApp):
             #      ``_current_ctx is not None`` rule swallowed these) must not leak
             #      an empty-id output. Internal-tool executors (antigravity) stamp a
             #      real positional id, so their legitimate completions still emit.
-            if not call_id or call_id in self._dispatched_call_ids:
+            if not call_id or call_id in sess.dispatched_call_ids:
                 return
             item: dict[str, Any] = {
                 "id": f"fco_{uuid.uuid4().hex[:12]}",
@@ -1101,21 +941,33 @@ class ExecutorAdapter(HarnessApp):
         # AP's retry allowlist won't match.
         return super()._build_error_detail(exception)
 
+    async def close_session(self, conversation_id: str) -> None:
+        """Close and remove the session state for *conversation_id*.
+
+        Called when a conversation terminates so its executor and
+        in-memory state are freed without shutting down the shared runner.
+        """
+        sess = self._sessions.pop(conversation_id, None)
+        if sess is not None and sess.executor is not None:
+            await sess.executor.close_session(sess.session_key)
+            await sess.executor.close()
+            sess.executor = None
+
     async def on_shutdown(self) -> None:
         """
-        Release the inner executor's resources on subprocess
-        shutdown.
+        Release all sessions' executor resources on subprocess shutdown.
 
         Overrides :meth:`HarnessApp.on_shutdown`; called from
-        the scaffold's lifespan teardown path. Closes the
-        executor's session and the executor itself so child
-        processes (e.g. ``claude --output-format``) are reaped
-        rather than orphaned.
+        the scaffold's lifespan teardown path. Closes every session's
+        executor so child processes (e.g. ``claude --output-format``)
+        are reaped rather than orphaned.
         """
-        if self._executor is not None:
-            await self._executor.close_session(self._session_key)
-            await self._executor.close()
-            self._executor = None
+        for sess in list(self._sessions.values()):
+            if sess.executor is not None:
+                await sess.executor.close_session(sess.session_key)
+                await sess.executor.close()
+                sess.executor = None
+        self._sessions.clear()
 
 
 def _classify_openai_exception(exception: BaseException) -> str | None:

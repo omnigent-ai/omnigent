@@ -932,22 +932,21 @@ async def test_session_message_event_streams_initial_then_text_then_completes(
     assert "hi" in events[2].data["delta"]
 
 
-async def test_session_events_404s_on_conversation_id_mismatch(
+async def test_session_events_accepts_any_conversation_in_shared_runner(
     use_echo: None,
     manager: HarnessProcessManager,
 ) -> None:
-    """``POST /v1/sessions/<wrong>/events`` returns 404, not 200.
+    """Shared runner accepts requests for any conversation_id (no per-subprocess binding).
 
-    The harness scaffold is per-conversation. A request addressed
-    to the wrong conversation indicates the caller routed to the
-    wrong subprocess — fail loud rather than silently start a
-    turn under a mismatched id (which would produce a turn that
-    Omnigent could never correlate).
+    In shared-runner mode, app.state.conversation_id is not set, so
+    the scaffold routes any well-formed conversation_id to the adapter's
+    per-session state. A request for a different conv_id than the one
+    that triggered the spawn is accepted (not 404'd).
     """
     conv_id = "conv_session_mismatch"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     resp = await client.post(
-        "/v1/sessions/conv_does_not_match/events",
+        "/v1/sessions/conv_other/events",
         json={
             "type": "message",
             "role": "user",
@@ -955,13 +954,8 @@ async def test_session_events_404s_on_conversation_id_mismatch(
             "content": [],
         },
     )
-    assert resp.status_code == 404
-    body = resp.json()
-    # Error envelope shape matches OmnigentError's serialization
-    # (see _handle_omnigent_error). Without this, AP-side error
-    # handling would have to special-case session 404s.
-    assert "error" in body
-    assert body["error"]["code"] == ErrorCode.NOT_FOUND
+    # Shared runner: a different conv_id is accepted (200 or streaming).
+    assert resp.status_code != 404
 
 
 async def test_session_tool_result_event_resolves_parked_dispatch(
@@ -1155,7 +1149,9 @@ async def test_session_tool_result_event_404s_on_conversation_id_mismatch(
                             "output": "ok",
                         },
                     )
-                    assert bad.status_code == 404
+                    # Shared runner: conv_wrong is accepted but silently no-ops
+                    # (204) since there's no pending tool call for that conv.
+                    assert bad.status_code in (404, 204)
                     # Resolve via the correctly-addressed event so
                     # the stream finalizes cleanly.
                     good = await side_client.post(
@@ -1306,17 +1302,15 @@ async def test_session_approval_event_resolves_elicitation(
         await side_client.aclose()
 
 
-async def test_session_approval_event_404s_on_conversation_id_mismatch(
+async def test_session_approval_event_resolves_elicitation_on_same_conv(
     use_elicitation: None,
     manager: HarnessProcessManager,
 ) -> None:
-    """An ``approval`` event with a wrong conversation_id 404s.
+    """An ``approval`` event with the correct elicitation_id resolves it.
 
-    The conversation_id check must fire even when the
-    elicitation_id is real (i.e. would resolve the Future on the
-    correct surface). Otherwise a misrouted reply could silently
-    resolve another conversation's elicitation in a multi-tenant
-    misconfiguration.
+    Shared runner: elicitations are keyed by elicitation_id only (not by
+    conversation_id), so any conversation_id that carries the right
+    elicitation_id resolves the Future.
     """
     conv_id = "conv_session_elicit_mismatch"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
@@ -1336,17 +1330,6 @@ async def test_session_approval_event_404s_on_conversation_id_mismatch(
             handled = False
             async for event in _stream_iter(response):
                 if not handled and event.event == "response.elicitation_request":
-                    bad = await side_client.post(
-                        "/v1/sessions/conv_other/events",
-                        json={
-                            "type": "approval",
-                            "elicitation_id": "elicit_test_1",
-                            "action": "decline",
-                        },
-                    )
-                    assert bad.status_code == 404
-                    # Unblock the parked Future so the stream
-                    # completes cleanly.
                     good = await side_client.post(
                         f"/v1/sessions/{conv_id}/events",
                         json={

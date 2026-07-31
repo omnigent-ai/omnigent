@@ -387,10 +387,15 @@ class TurnContext:
         response_id: str,
         event_queue: asyncio.Queue[HarnessStreamEvent | None],
         cancelled: asyncio.Event,
+        conversation_id: str | None = None,
     ) -> None:
         self.response_id = response_id
         self._event_queue = event_queue
         self.cancelled = cancelled
+        # The conversation this turn belongs to. Set by the scaffold when
+        # serving a shared (multi-conversation) runner so run_turn
+        # implementations can key per-session state by conversation_id.
+        self.conversation_id: str | None = conversation_id
         # Layer 3 per-tool-dispatch state: ``call_id`` →
         # Future[ToolResult-output-string]. Populated by
         # ``dispatch_tool``; resolved by the ``tool_result``
@@ -769,8 +774,11 @@ class HarnessApp:
         # (before async teardown). Used by sessions-native
         # injection: a message arriving while this is set is
         # steering, not a new turn.
-        self._active_turn_ctx: TurnContext | None = None
-        # Lock for ``_in_flight`` / ``_active_turn_ctx`` mutations —
+        # Per-conversation active turn pointer. Keyed by conversation_id so
+        # concurrent conversations in a shared runner don't overwrite each
+        # other's active turn. None-keyed entry covers legacy single-conv mode.
+        self._active_turn_ctxs: dict[str | None, TurnContext] = {}
+        # Lock for ``_in_flight`` / ``_active_turn_ctxs`` mutations —
         # route handlers run concurrently in FastAPI's event loop.
         self._lock = asyncio.Lock()
         # Set by graceful-shutdown signal handlers; checked by the
@@ -788,6 +796,18 @@ class HarnessApp:
         :class:`ExecutorAdapter`) override this to close inner
         executor resources, SDK sessions, and child processes
         that would otherwise leak on process exit.
+
+        The base implementation is a no-op.
+        """
+
+    async def close_session(self, conversation_id: str) -> None:
+        """
+        Subclass hook to release per-conversation resources.
+
+        Called by ``_post_session_close`` when the process manager
+        signals that a conversation has terminated. Subclasses
+        (e.g. :class:`ExecutorAdapter`) override this to free
+        the executor and in-memory state for that conversation.
 
         The base implementation is a no-op.
         """
@@ -1008,6 +1028,12 @@ class HarnessApp:
             # heterogeneous return type.
             response_model=None,
         )
+        router.add_api_route(
+            "/sessions/{conversation_id}/close",
+            self._post_session_close,
+            methods=["POST"],
+            response_model=None,
+        )
         return router
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
@@ -1041,17 +1067,34 @@ class HarnessApp:
         """
         bound = getattr(request.app.state, "conversation_id", None)
         if bound is None:
-            raise OmnigentError(
-                "harness scaffold has no conversation_id bound on app.state — "
-                "the runner must set app.state.conversation_id before serving",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
+            # Shared runner: no single conversation_id is bound on app.state;
+            # the adapter routes per-conversation state internally. Accept any
+            # well-formed id.
+            return
         if bound != conversation_id:
             raise OmnigentError(
                 f"conversation {conversation_id!r} not served by this harness "
                 f"(bound to {bound!r})",
                 code=ErrorCode.NOT_FOUND,
             )
+
+    async def _post_session_close(
+        self,
+        conversation_id: str,
+        request: Request,
+    ) -> Response:
+        """
+        Handle ``POST /v1/sessions/{conversation_id}/close``.
+
+        Called by the process manager when a conversation terminates to
+        release per-conversation resources from a shared runner subprocess
+        without killing the subprocess itself.
+        """
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        await self.close_session(conversation_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _post_session_event(
         self,
@@ -1107,17 +1150,17 @@ class HarnessApp:
             return denied
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
-            return await self._start_or_inject_turn(body.to_create_request())
+            return await self._start_or_inject_turn(body.to_create_request(), conversation_id)
         if isinstance(body, InterruptEvent):
-            return await self._handle_interrupt_event()
+            return await self._handle_interrupt_event(conversation_id)
         if isinstance(body, ToolResultEvent):
-            return await self._handle_tool_result_event(body)
+            return await self._handle_tool_result_event(body, conversation_id)
         if isinstance(body, ApprovalEvent):
             return await self._resolve_elicitation(
-                body.elicitation_id, body.to_elicitation_result()
+                body.elicitation_id, body.to_elicitation_result(), conversation_id
             )
         if isinstance(body, PolicyVerdictEvent):
-            return await self._handle_policy_verdict_event(body)
+            return await self._handle_policy_verdict_event(body, conversation_id)
         # Pydantic's discriminated-union validator should reject
         # unknown variants before we reach this branch; if it ever
         # falls through, fail loud rather than silently no-op.
@@ -1126,63 +1169,78 @@ class HarnessApp:
             code=ErrorCode.INVALID_INPUT,
         )
 
-    async def _handle_interrupt_event(self) -> Response:
+    async def _handle_interrupt_event(self, conversation_id: str | None = None) -> Response:
         """
-        Apply an :class:`InterruptEvent` to the in-flight turn.
+        Apply an :class:`InterruptEvent` to the in-flight turn for
+        *conversation_id*.
 
-        The harness has at most one in-flight turn per conversation
-        in practice, but the registry is a dict so this iterates
-        defensively. If no turn is in flight, 404s — fail loud
-        rather than silently no-op so a stray interrupt arriving
-        after a turn ended surfaces as an obvious operator error.
+        In shared-runner mode only the turns belonging to the target
+        conversation are cancelled; other conversations' turns are
+        unaffected. When *conversation_id* is ``None`` (single-conversation
+        legacy mode) all in-flight turns are cancelled as before.
 
+        :param conversation_id: The conversation to interrupt, or ``None``
+            to interrupt all (legacy single-conversation mode).
         :returns: 204 on success.
-        :raises OmnigentError: 404 if no turn is in flight.
+        :raises OmnigentError: 404 if no turn is in flight for this
+            conversation.
         """
-        if not self._in_flight:
+        target_ctxs = [
+            ctx
+            for ctx in self._in_flight.values()
+            if conversation_id is None or ctx.conversation_id == conversation_id
+        ]
+        if not target_ctxs:
             raise OmnigentError(
                 "no in-flight turn to interrupt",
                 code=ErrorCode.NOT_FOUND,
             )
-        for ctx in self._in_flight.values():
+        for ctx in target_ctxs:
             ctx.cancelled.set()
             ctx._cancel_pending()
-        # Drop the cancelled turn as the inject target so the next message
-        # starts a fresh turn (rebuilds with the marker), not into the dying one
-        # — otherwise it resumes the abandoned turn and the agent runs one behind.
         async with self._lock:
-            self._active_turn_ctx = None
+            if conversation_id is None:
+                self._active_turn_ctxs.clear()
+            else:
+                self._active_turn_ctxs.pop(conversation_id, None)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    async def _handle_tool_result_event(self, body: ToolResultEvent) -> Response:
+    async def _handle_tool_result_event(
+        self, body: ToolResultEvent, conversation_id: str | None = None
+    ) -> Response:
         """
         Apply a :class:`ToolResultEvent` to whichever in-flight
         turn has a matching parked tool-call Future.
 
+        In shared-runner mode only turns belonging to *conversation_id*
+        are searched; ``None`` searches all turns (legacy).
+
         Loose-by-default semantics — stale ``call_id`` entries
-        silently no-op. Benign races (turn cancelled mid-event,
-        Future already resolved on a different path) MUST NOT
-        surface as hard failures upstream; the streaming response
-        is the source of truth for whether the result actually
-        landed.
+        silently no-op.
 
         :param body: The decoded :class:`ToolResultEvent`.
+        :param conversation_id: Target conversation, or ``None``.
         :returns: 204 No Content.
         """
         for ctx in self._in_flight.values():
+            if conversation_id is not None and ctx.conversation_id != conversation_id:
+                continue
             if ctx._complete_tool(body.call_id, body.output):
                 break
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    async def _handle_policy_verdict_event(self, body: PolicyVerdictEvent) -> Response:
+    async def _handle_policy_verdict_event(
+        self, body: PolicyVerdictEvent, conversation_id: str | None = None
+    ) -> Response:
         """
         Apply a :class:`PolicyVerdictEvent` to whichever in-flight
         turn has a matching parked policy-evaluation Future.
 
-        Loose semantics — stale ``evaluation_id`` entries silently
-        no-op, same as :meth:`_handle_tool_result_event`.
+        In shared-runner mode only turns belonging to *conversation_id*
+        are searched; ``None`` searches all turns (legacy).
 
         :param body: The decoded :class:`PolicyVerdictEvent`.
+        :param conversation_id: Target conversation, or ``None``.
         :returns: 204 No Content.
         """
         verdict = PolicyVerdictPayload(
@@ -1191,12 +1249,14 @@ class HarnessApp:
             data=body.data,
         )
         for ctx in self._in_flight.values():
+            if conversation_id is not None and ctx.conversation_id != conversation_id:
+                continue
             if ctx._complete_policy_evaluation(body.evaluation_id, verdict):
                 break
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
-        self, request: CreateResponseRequest
+        self, request: CreateResponseRequest, conversation_id: str | None = None
     ) -> StreamingResponse | Response:
         """
         Start a new turn or inject into the in-flight one.
@@ -1230,16 +1290,15 @@ class HarnessApp:
 
         async with self._lock:
             # Sessions-native steering: no previous_response_id on
-            # the wire, but a turn is actively streaming. Inject.
-            # Serialized under _lock so two concurrent requests
-            # can't both pass the guard before either sets
-            # _active_turn_ctx.
+            # the wire, but a turn is actively streaming. Inject only
+            # into the active turn for this conversation.
+            active_ctx = self._active_turn_ctxs.get(conversation_id)
             if (
                 request.previous_response_id is None
-                and self._active_turn_ctx is not None
-                and not self._active_turn_ctx.cancelled.is_set()
+                and active_ctx is not None
+                and not active_ctx.cancelled.is_set()
             ):
-                self._active_turn_ctx._push_injection(request)
+                active_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
 
             if self._shutting_down.is_set():
@@ -1255,9 +1314,10 @@ class HarnessApp:
                 response_id=response_id,
                 event_queue=event_queue,
                 cancelled=cancelled,
+                conversation_id=conversation_id,
             )
             self._in_flight[response_id] = ctx
-            self._active_turn_ctx = ctx
+            self._active_turn_ctxs[conversation_id] = ctx
 
         return StreamingResponse(
             self._stream_turn(request, ctx),
@@ -1337,12 +1397,11 @@ class HarnessApp:
                 ctx, model=request.model, run_task=run_task, sequence=sequence
             )
             # Clear before yielding the terminal event so the next
-            # request (continuation turn) sees _active_turn_ctx as
-            # None and starts a new turn instead of injecting into
-            # this completed one.
+            # request (continuation turn) sees no active ctx for this
+            # conversation and starts a new turn instead of injecting.
             async with self._lock:
-                if self._active_turn_ctx is ctx:
-                    self._active_turn_ctx = None
+                if self._active_turn_ctxs.get(ctx.conversation_id) is ctx:
+                    self._active_turn_ctxs.pop(ctx.conversation_id, None)
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
@@ -1429,8 +1488,8 @@ class HarnessApp:
                 await run_task
         async with self._lock:
             self._in_flight.pop(ctx.response_id, None)
-            if self._active_turn_ctx is ctx:
-                self._active_turn_ctx = None
+            if self._active_turn_ctxs.get(ctx.conversation_id) is ctx:
+                self._active_turn_ctxs.pop(ctx.conversation_id, None)
 
     async def _guarded_run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """
@@ -1666,6 +1725,7 @@ class HarnessApp:
         self,
         elicitation_id: str,
         body: ElicitationResult,
+        conversation_id: str | None = None,
     ) -> Response:
         """
         Resolve a parked elicitation Future from an
@@ -1683,6 +1743,8 @@ class HarnessApp:
             matches the id (across all in-flight turns).
         """
         for ctx in self._in_flight.values():
+            if conversation_id is not None and ctx.conversation_id != conversation_id:
+                continue
             if ctx._complete_elicitation(elicitation_id, body):
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
         raise OmnigentError(
