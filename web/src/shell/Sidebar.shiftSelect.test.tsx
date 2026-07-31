@@ -230,6 +230,42 @@ describe("Sidebar shift-click selection", () => {
     });
   });
 
+  it("selects sessions within projects (not the flat list) from the Projects kebab", async () => {
+    // Project "Alpha" has 3 sessions; the flat list has 2 unfiled chats.
+    projectsMock.push("Alpha");
+    const sessions = [
+      conv("p1", { labels: { omni_project: "Alpha" } }),
+      conv("p2", { labels: { omni_project: "Alpha" } }),
+      conv("p3", { labels: { omni_project: "Alpha" } }),
+      conv("c1"),
+      conv("c2"),
+    ];
+    mockConversations(sessions);
+    // Selection mode preserves the current expansion; seed Alpha expanded so
+    // its sessions are visible (the kebab no longer auto-expands folders).
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    renderSidebar();
+
+    // Enter selection mode via the Projects header kebab → project scope.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+
+    // Shift-select across the project sessions: p1 anchor → p3 selects p1..p3.
+    fireEvent.click(await screen.findByRole("link", { name: "p1" }));
+    fireEvent.click(screen.getByRole("link", { name: "p3" }), { shiftKey: true });
+    await waitFor(() => {
+      expect(screen.getByText("3 selected")).toBeInTheDocument();
+    });
+
+    // A flat-list chat is NOT selectable in project scope: clicking it does not
+    // grow the selection (it has no checkbox and its link stays a navigation).
+    fireEvent.click(screen.getByRole("link", { name: "c1" }), { shiftKey: true });
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
+  });
+
   it("normal click after shift-select sets a new anchor", async () => {
     const sessions = [conv("s1"), conv("s2"), conv("s3"), conv("s4")];
     mockConversations(sessions);
@@ -248,41 +284,6 @@ describe("Sidebar shift-click selection", () => {
 
     // Normal click on s4 (sets new anchor, toggles s4 on)
     fireEvent.click(screen.getByRole("link", { name: "s4" }));
-
-    await waitFor(() => {
-      expect(screen.getByText("3 selected")).toBeInTheDocument();
-    });
-  });
-
-  it("shift-select within a project uses the folder's own rendered IDs, not the global list", async () => {
-    // Seed a project with sessions that differ from the global list:
-    // the global list has p1,p2 but the folder's own query returns p1,p2,p3.
-    projectsMock.push("Alpha");
-    const sessions = [
-      conv("p1", { labels: { omni_project: "Alpha" } }),
-      conv("p2", { labels: { omni_project: "Alpha" } }),
-      conv("c1"),
-    ];
-    mockConversations(sessions);
-    // The folder's useProjectSessions returns an extra session (p3)
-    // that isn't in the global paginated window.
-    projectSessionsMock.current["Alpha"] = [
-      conv("p1", { labels: { omni_project: "Alpha" } }),
-      conv("p2", { labels: { omni_project: "Alpha" } }),
-      conv("p3", { labels: { omni_project: "Alpha" } }),
-    ];
-    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
-
-    renderSidebar();
-
-    const selectBtn = screen.getByRole("button", { name: /select/i });
-    fireEvent.click(selectBtn);
-
-    // Click p1 (anchor) then shift-click p3 — the range should include
-    // p1, p2, p3 (all from the folder's own query, including p3 which
-    // isn't in the global list).
-    fireEvent.click(screen.getByRole("link", { name: "p1" }));
-    fireEvent.click(screen.getByRole("link", { name: "p3" }), { shiftKey: true });
 
     await waitFor(() => {
       expect(screen.getByText("3 selected")).toBeInTheDocument();
