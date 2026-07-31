@@ -27,6 +27,7 @@ from omnigent.model_catalog import (
     catalog_for_spec,
     catalog_model_entries,
     list_models_for_worker,
+    model_family_token,
     resolve_catalog_model,
     resolve_model_provider,
     spec_harness,
@@ -675,6 +676,85 @@ def test_family_filter_per_harness(
     assert {m.id for m in listing.models} == expected_ids
 
 
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("databricks-claude-opus-4-8", "claude"),
+        ("claude-sonnet-5", "claude"),
+        ("databricks-gpt-5-5", "openai"),
+        ("gpt-5.1-codex", "openai"),
+        # GLM / Kimi are codex-runnable, so they carry the codex-compatible
+        # token — a candidate filter keyed on it must not strip them.
+        ("glm-5-2", "openai"),
+        ("databricks-glm-5-2", "openai"),
+        ("system.ai.glm-5-2", "openai"),
+        ("kimi-k2", "openai"),
+        ("databricks-kimi-k2-6", "openai"),
+        ("system.ai.kimi-k2-instruct", "openai"),
+        ("kimi-for-coding", "openai"),
+        ("databricks-meta-llama-3.3-70b-instruct", "other"),
+        ("gemini-3.5-flash", "other"),
+        # Segment matching, not substring: an unrelated endpoint name that
+        # happens to contain the letters is not the GLM family.
+        ("glmqlfit-eval", "other"),
+    ],
+)
+def test_model_family_token_tags_codex_compatible_families(model_id: str, expected: str) -> None:
+    """The family token names the harness family that can serve the id.
+
+    :param model_id: Model id under test.
+    :param expected: The family token it must carry.
+    """
+    assert model_family_token(model_id) == expected
+
+
+def test_codex_worker_listing_keeps_glm_and_kimi_endpoints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A codex worker's list keeps the GLM/Kimi endpoints it can serve.
+
+    The workspace serves these over the same Responses wire codex speaks,
+    so filtering them out would hide runnable models from the router while
+    the dispatch gate would have accepted them.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
+    _stub_workspace_creds(monkeypatch)
+    page = {
+        "endpoints": [
+            {
+                "name": name,
+                "creator": "system",
+                "task": "llm/v1/chat",
+                "state": {"ready": "READY"},
+            }
+            for name in (
+                "databricks-gpt-5-5",
+                "databricks-glm-5-2",
+                "databricks-kimi-k2-6",
+                "databricks-claude-sonnet-4-6",
+                "databricks-meta-llama-3-3-70b-instruct",
+            )
+        ]
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Serve the serving-endpoints page for the codex worker."""
+        return httpx.Response(200, json=page)
+
+    listing = list_models_for_worker(
+        _worker_spec("codex-native"), "codex-native", transport=httpx.MockTransport(_handler)
+    )
+
+    assert {m.id for m in listing.models} == {
+        "databricks-gpt-5-5",
+        "databricks-glm-5-2",
+        "databricks-kimi-k2-6",
+    }
+
+
 def test_openai_compatible_listing_maps_ids_and_context_window(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -730,9 +810,13 @@ def test_openai_compatible_listing_maps_ids_and_context_window(
     assert requests_seen[0].headers["authorization"] == "Bearer sk-or-test"
     assert listing.source == "openai-compatible"
     assert listing.verified is True
-    # codex-native keeps only the GPT-family id; the provider-reported
-    # context window rides along.
-    assert [(m.id, m.context_window) for m in listing.models] == [("openai/gpt-5.4", 400000)]
+    # codex-native keeps the codex-compatible ids (GPT plus the Kimi family
+    # it serves over the same wire); the provider-reported context window
+    # rides along.
+    assert [(m.id, m.context_window) for m in listing.models] == [
+        ("openai/gpt-5.4", 400000),
+        ("moonshotai/kimi-k2.6", 262144),
+    ]
 
 
 def test_anthropic_api_listing_uses_api_key_headers(

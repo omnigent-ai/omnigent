@@ -14,11 +14,14 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping, Sequence
+
     import httpx  # used in type annotations only; runtime import is lazy in fetch_runner_models
     from databricks.sdk.config import Config
 
@@ -27,6 +30,141 @@ _logger = logging.getLogger(__name__)
 # Custom-method path (Google API convention) appended to the external
 # router's base URL, e.g. ``<base_url>/routes:select``.
 ROUTES_SELECT_PATH = "routes:select"
+
+# ── Model lists per harness family ──────────────────────────────────────────
+#
+# Ordered cheapest → most powerful within each family. Live per-session catalogs
+# win wherever one is in reach (:func:`fetch_runner_models`); this table is the
+# fallback, so a stale entry pushes a router pick through the substitution path.
+
+MODEL_LISTS: dict[str, list[str]] = {
+    "claude": [
+        "databricks-claude-haiku-4-5",
+        "databricks-claude-sonnet-4-6",
+        "databricks-claude-sonnet-5",
+        "databricks-claude-opus-4-8",
+    ],
+    "gpt": [
+        "databricks-gpt-5-4-nano",
+        "databricks-gpt-5-4-mini",
+        "databricks-gpt-5-4",
+        "databricks-gpt-5-5",
+    ],
+    # pi is multi-model: Claude and GPT both available.
+    "pi": [
+        "databricks-gpt-5-4-nano",
+        "databricks-claude-haiku-4-5",
+        "databricks-gpt-5-4-mini",
+        "databricks-claude-sonnet-4-6",
+        "databricks-claude-sonnet-5",
+        "databricks-gpt-5-4",
+        "databricks-gpt-5-5",
+        "databricks-claude-opus-4-8",
+    ],
+}
+
+# The router's own current arms, offered as candidates so a routed arm resolves
+# to its own endpoint instead of substituting down a generation (a routed
+# gpt-5-6-sol landing on gpt-5-5). Kept out of the curated ordering above,
+# which is a cost/capability spread the arms do not belong to.
+_CURRENT_GENERATION_MODELS: dict[str, tuple[str, ...]] = {
+    "gpt": (
+        "databricks-gpt-5-6-luna",
+        "databricks-gpt-5-6-sol",
+    ),
+}
+
+_HARNESS_FAMILY: dict[str, str] = {
+    "claude-sdk": "claude",
+    "claude_sdk": "claude",
+    "claude-native": "claude",
+    "pi": "pi",
+    "codex": "gpt",
+    "codex-native": "gpt",
+    "openai-agents": "gpt",
+    "openai-agents-sdk": "gpt",
+    "agents_sdk": "gpt",
+}
+
+
+def infer_models(harness: str | None) -> list[str] | None:
+    """Return available models for *harness*, or ``None`` if unroutable.
+
+    The curated ordering plus the current generation's endpoints
+    (:data:`_CURRENT_GENERATION_MODELS`), so a routed current arm resolves to
+    its own endpoint rather than substituting down a generation.
+    """
+    if harness is None:
+        return None
+    family = _HARNESS_FAMILY.get(harness)
+    if family is None:
+        return None
+    curated = MODEL_LISTS.get(family)
+    if curated is None:
+        return None
+    return [*curated, *_CURRENT_GENERATION_MODELS.get(family, ())]
+
+
+def models_in_family(harness: str | None, models: Iterable[str]) -> list[str]:
+    """Keep only the models *harness*'s family can actually run.
+
+    :param harness: Harness id, e.g. ``"codex-native"``. Unknown or
+        multi-model harnesses (and the unresolved ``"auto"`` sentinel)
+        impose no constraint.
+    :param models: Candidate model ids, cheapest first.
+    :returns: The servable subset, order preserved.
+    """
+    from omnigent.runner.subagent_routing import harness_family, model_in_family
+
+    family = harness_family(harness)
+    if family is None:
+        return list(models)
+    return [model for model in models if model_in_family(family, model)]
+
+
+def catalog_models_for_harness(
+    catalog: Mapping[str, list[str]] | None,
+    harness: str,
+    *,
+    allow_self: bool = False,
+) -> list[str] | None:
+    """Pull *harness*'s models out of a live runner catalog.
+
+    Catalog rows are keyed by WORKER name (sub-agent names plus ``"self"``),
+    not harness id, so match a harness id first, then a worker whose harness
+    shares the family, then — only for the session's own harness — the
+    ``"self"`` row.
+
+    :param catalog: :func:`fetch_runner_models` result, or ``None``.
+    :param harness: Harness id whose models are wanted, e.g.
+        ``"claude-native"``.
+    :param allow_self: ``True`` when *harness* is the catalog session's own
+        harness, so its ``"self"`` row applies.
+    :returns: Servable model ids, or ``None`` when the catalog has no row
+        for this harness.
+    """
+    if not catalog:
+        return None
+    own = catalog.get(harness)
+    if own:
+        return list(own)
+    family = _HARNESS_FAMILY.get(harness)
+    for worker, worker_models in catalog.items():
+        if not worker_models:
+            continue
+        worker_harness = _WORKER_NAME_TO_HARNESS.get(worker)
+        if worker_harness is None:
+            continue
+        if worker_harness == harness or (
+            family is not None and _HARNESS_FAMILY.get(worker_harness) == family
+        ):
+            return list(worker_models)
+    if allow_self:
+        own_models = catalog.get("self")
+        if own_models:
+            return list(own_models)
+    return None
+
 
 # ── RoutingClient protocol ──────────────────────────────────────────────────
 
@@ -40,15 +178,25 @@ class RoutingResult:
     :param harness: The harness the judge selected, e.g. ``"claude-sdk"``.
         ``None`` when the routing client does not distinguish harnesses (e.g.
         single-harness calls or custom implementations that omit it).
+    :param raw_model: The router's pick in its own vocabulary, before it was
+        resolved to a servable catalog id (they differ when the router names an
+        arm this workspace has no endpoint for). ``None`` when the two are the
+        same or the client does not distinguish them.
     """
 
     model: str
     rationale: str
     harness: str | None = None
+    raw_model: str | None = None
 
 
 class RoutingClient(Protocol):
-    """Protocol for pluggable model routing implementations."""
+    """Protocol for pluggable model routing implementations.
+
+    An implementation may also expose a ``last_error`` string with the reason
+    its most recent :meth:`route` returned ``None``; callers read it through
+    :func:`routing_last_error`, which tolerates its absence.
+    """
 
     async def route(
         self,
@@ -274,6 +422,8 @@ class LLMRoutingClient:
 
     def __init__(self, llm_client: Any) -> None:
         self._llm = llm_client
+        # Reason the most recent route() returned None; see RoutingClient.
+        self.last_error: str | None = None
 
     async def route(
         self,
@@ -282,7 +432,12 @@ class LLMRoutingClient:
     ) -> RoutingResult | None:
         flat = _flatten_models(available_models)
         rubric = _build_rubric(available_models)
-        _logger.info("LLMRoutingClient: available_models=%s", dict(available_models))
+        _logger.info(
+            "LLMRoutingClient: available_models=%s prompt_chars=%d",
+            dict(available_models),
+            len(message),
+        )
+        self.last_error = None
         try:
             response = await self._llm.create(
                 instructions=rubric,
@@ -302,15 +457,19 @@ class LLMRoutingClient:
                 },
             )
             text = response.output[0].content[0].text
-            _logger.info("LLMRoutingClient: raw response: %s", text[:500])
+            # The verdict can echo prompt text in its rationale, so keep it off
+            # INFO; the chosen model is logged by the caller either way.
+            _logger.debug("LLMRoutingClient: raw response: %s", text[:500])
             verdict = json.loads(text)
-        except Exception:  # noqa: BLE001  # fail-open
+        except Exception as exc:  # noqa: BLE001  # fail-open
             _logger.warning("LLMRoutingClient: judge call failed", exc_info=True)
+            self.last_error = f"routing judge call failed: {exc}"
             return None
 
         model = verdict.get("model")
         rationale = verdict.get("rationale", "")
         if not model or not isinstance(model, str):
+            self.last_error = "routing judge returned no model"
             return None
 
         # Clamp hallucinated models to the cheapest available.
@@ -323,6 +482,7 @@ class LLMRoutingClient:
                 )
                 model = flat[0]
             else:
+                self.last_error = "no candidate models were available"
                 return None
 
         # Resolve the harness: use the judge's pick only when it is both a
@@ -397,15 +557,640 @@ def _router_error_detail(body: str) -> str:
     return text[:300]
 
 
+# ── Route-options seam ──────────────────────────────────────────────────────
+#
+# Every assumption about the router's wire contract lives here: the arms it
+# expects to be offered, how a pick maps back to a servable catalog id, and
+# which harness can run it. Callers never see router vocabulary.
+
+DEFAULT_ROUTER_NAME = "task_v1"
+
+# Catalog ids carry these prefixes; the router keys ids bare. A deployment with
+# different ones sets ``routing.model_prefix``. Kept in sync with
+# ``claude_model_vocabulary._CATALOG_PREFIXES``, which the hook path uses
+# because it cannot read server config.
+MODEL_ID_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
+
+
+def strip_catalog_prefix(model: str, prefixes: Sequence[str]) -> str:
+    """Strip the first matching *prefixes* entry from a catalog model id.
+
+    A prefix configured without its trailing separator (``system.ai``) leaves
+    one behind, so a single leading separator is dropped too.
+
+    :param model: A catalog model id, e.g. ``"system.ai.claude-opus-5"``.
+    :param prefixes: Prefixes to try, in order.
+    :returns: The id with the prefix removed.
+    """
+    for prefix in prefixes:
+        if prefix and model.startswith(prefix):
+            rest = model[len(prefix) :]
+            return rest[1:] if rest[:1] in ".-_" else rest
+    return model
+
+
+# task_v1 infers a scenario from WHICH model families appear in route_options
+# and then requires that scenario's full arm menu (extra models are tolerated
+# and ignored); a partial menu is rejected. Menu ids need not be servable in
+# the workspace — the router requires them anyway and may select them.
+_TASK_V1_CLAUDE_ARMS: tuple[str, ...] = ("claude-opus-4-8", "claude-sonnet-5")
+_TASK_V1_CODEX_ARMS: tuple[str, ...] = ("glm-5-2", "gpt-5-6-sol", "gpt-5-6-luna")
+
+# Scenario → the full arm menu task_v1 requires when that scenario is inferred.
+TASK_V1_MENUS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "cc": _TASK_V1_CLAUDE_ARMS,
+        "codex": _TASK_V1_CODEX_ARMS,
+        "both": _TASK_V1_CLAUDE_ARMS + _TASK_V1_CODEX_ARMS,
+    }
+)
+
+# What to run when the workspace serves no endpoint for a picked arm (or when
+# the session's harness bars it), in preference order — the arm itself first,
+# so a workspace that does serve it applies it exactly. Bare ids; the first
+# entry the candidate set serves wins.
+_ARM_SUBSTITUTES: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "gpt-5-6-sol": ("gpt-5-6-sol", "gpt-5-5", "gpt-5-4", "gpt-5-3-codex", "gpt-5-2"),
+        "gpt-5-6-luna": (
+            "gpt-5-6-luna",
+            "gpt-5-4-mini",
+            "gpt-5-mini",
+            "gpt-5-1-codex-mini",
+            "gpt-5-4",
+        ),
+        "glm-5-2": ("glm-5-2", "gpt-5-6-sol", "gpt-5-5", "gpt-5-4", "gpt-5-3-codex"),
+        "claude-opus-4-8": (
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ),
+        "claude-sonnet-5": (
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+        ),
+    }
+)
+
+
+def task_v1_claude_arms() -> tuple[str, ...]:
+    """Return the frozen Claude-family arms task_v1 may select.
+
+    Read by the claude-native launch path, which pins Claude Code's family
+    aliases to these arms so the first turn's ``/model`` can reach whatever
+    the router picks. One definition, so the pins can't drift from the menu.
+
+    :returns: Bare arm ids, e.g. ``("claude-opus-4-8", "claude-sonnet-5")``.
+    """
+    return _TASK_V1_CLAUDE_ARMS
+
+
+@dataclass(frozen=True)
+class RoutingSettings:
+    """Deployment routing knobs, parsed from the server ``routing:`` block.
+
+    Hung on :attr:`~omnigent.runtime.caps.RuntimeCaps.routing_settings` so
+    every consumer reads one value object instead of re-parsing config.
+
+    :param router_name: Router strategy to invoke, e.g. ``"task_v1"``.
+    :param selection_model: Model the router should use for its own
+        extraction call, sent as ``route_selector.config.model``. ``None``
+        leaves the router's frozen default in place.
+    :param model_prefixes: Prefixes this deployment's catalog attaches to
+        model ids that the router keys bare; see :data:`MODEL_ID_PREFIXES`.
+    """
+
+    router_name: str = DEFAULT_ROUTER_NAME
+    selection_model: str | None = None
+    model_prefixes: tuple[str, ...] = MODEL_ID_PREFIXES
+
+
+@dataclass(frozen=True)
+class RouteOptionSpec:
+    """One candidate destination to offer the router, in router vocabulary."""
+
+    model: str
+    harness: str | None = None
+
+
+@dataclass(frozen=True)
+class RoutePick:
+    """The router's raw selection, exactly as it came off the wire."""
+
+    model: str
+    harness: str | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedRoute:
+    """A router pick translated into something this deployment can run.
+
+    :param model: Servable catalog id to apply.
+    :param harness: Harness derived from the picked arm's family.
+    :param raw_model: The router's pick verbatim, kept for the decision
+        payload so the UI can show what the router actually said.
+    """
+
+    model: str
+    harness: str | None
+    raw_model: str
+
+
+# Harness family that serves several vendors and so never wins family matching
+# outright — only used when no single-vendor harness fits.
+_MULTI_MODEL_FAMILY = "pi"
+
+# (harness, model) pairs the harness's own gateway 400s on: under pi, Claude
+# models on its ``eager_input_streaming`` field and gpt-5.5/5.6 reasoning models
+# on its openai-completions default ``reasoning_effort``. See
+# designs/LIVE_MODEL_STATE.md.
+_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
+    "pi": (
+        "databricks-claude-haiku-4-5",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+        "databricks-gpt-5-6-luna",
+        "databricks-gpt-5-6-terra",
+        "databricks-gpt-5-6-sol",
+    ),
+}
+
+
+def _configured_prefixes(prefixes: Sequence[str] | None) -> Sequence[str]:
+    """Resolve which catalog prefixes to compare ids with.
+
+    ``None`` reads this deployment's own :class:`RoutingSettings`, so a
+    workspace whose catalog uses other prefixes still compares ids correctly.
+    """
+    return tuple(routing_settings().model_prefixes) if prefixes is None else prefixes
+
+
+def _bare_id(model: str, prefixes: Sequence[str] | None = None) -> str:
+    """Strip a catalog prefix so ids compare across vocabularies.
+
+    Comparison spelling only, never a model id to send anywhere: dots read as
+    dashes (a picker's ``gpt-5.6-sol`` is the router's ``gpt-5-6-sol``) and case
+    is folded.
+    """
+    bare = strip_catalog_prefix(model, _configured_prefixes(prefixes))
+    return bare.replace(".", "-").lower()
+
+
+def _model_family(model: str) -> str:
+    """Tag *model* with the harness family that can serve it.
+
+    Defers to the shared token rule so this file, the dispatch gate, and
+    subagent candidate filtering never disagree about a family; the
+    ``"openai"`` token there is this file's ``"gpt"`` family.
+    """
+    from omnigent.model_catalog import model_family_token
+
+    bare = _bare_id(model).lower()
+    token = model_family_token(bare)
+    return "gpt" if token == "openai" else token
+
+
+def _cost_position(
+    model: str,
+    candidates: Sequence[str],
+    prefixes: Sequence[str] | None,
+) -> int | None:
+    """Where *model* sits in the cost-ordered *candidates*.
+
+    Exact when the candidates serve the pick (a barred-but-servable model);
+    otherwise read off the curated family ordering and counted back onto the
+    candidate list. ``None`` when neither knows the id.
+    """
+    bare = _bare_id(model, prefixes)
+    bares = [_bare_id(candidate, prefixes) for candidate in candidates]
+    if bare in bares:
+        return bares.index(bare)
+    family = _model_family(model)
+    order = [
+        _bare_id(m, prefixes)
+        for m in (*MODEL_LISTS.get(family, ()), *_CURRENT_GENERATION_MODELS.get(family, ()))
+    ]
+    if bare not in order:
+        return None
+    cheaper = set(order[: order.index(bare)])
+    return sum(1 for candidate in bares if candidate in cheaper)
+
+
+def substitute_model(
+    model: str,
+    candidates: Sequence[str],
+    *,
+    prefixes: Sequence[str] | None = None,
+    barred: Sequence[str] = (),
+) -> str | None:
+    """Find something in *candidates* to run in place of *model*.
+
+    Walks *model*'s :data:`_ARM_SUBSTITUTES` chain first; when it names none of
+    the candidates, takes the same-family candidate nearest the pick's own cost
+    position, resolving ties toward the cheaper end — a barred cheap pick must
+    never escalate to the flagship.
+
+    :param model: The router's pick, in either vocabulary.
+    :param candidates: Servable model ids, cheapest first.
+    :param prefixes: Catalog prefixes to strip before comparing ids; ``None``
+        uses this deployment's configured ones.
+    :param barred: Bare ids to skip, e.g. models the harness's gateway 400s on.
+    :returns: A servable candidate id, or ``None`` when nothing fits.
+    """
+    local: dict[str, str] = {}
+    for candidate in candidates:
+        local.setdefault(_bare_id(candidate, prefixes), candidate)
+    skip = {_bare_id(m, prefixes) for m in barred}
+    for substitute in _ARM_SUBSTITUTES.get(_bare_id(model, prefixes), ()):
+        if substitute in skip:
+            continue
+        if substitute in local:
+            return local[substitute]
+    family = _model_family(model)
+    ranked = [
+        (index, candidate)
+        for index, candidate in enumerate(candidates)
+        if _model_family(candidate) == family and _bare_id(candidate, prefixes) not in skip
+    ]
+    if not ranked:
+        return None
+    target = _cost_position(model, candidates, prefixes)
+    if target is None:
+        # Nothing places the pick on the cost curve; stay at the cheap end.
+        return ranked[0][1]
+    return min(ranked, key=lambda entry: (abs(entry[0] - target), entry[0]))[1]
+
+
+def natural_harness_for_model(
+    model: str,
+    catalog: Mapping[str, Sequence[str]],
+    *,
+    harnesses: Sequence[str] = (),
+    prefixes: Sequence[str] | None = None,
+) -> str | None:
+    """Choose which offered harness *model* belongs to, bars ignored.
+
+    Prefers a harness whose catalog row serves the model, then one of the
+    model's own family, then the multi-model harness, then whatever is first
+    on offer.
+
+    :param model: The picked model id, in either vocabulary.
+    :param catalog: Harness → servable model ids.
+    :param harnesses: Harnesses on offer, used when *catalog* is empty.
+    :param prefixes: Catalog prefixes to strip before comparing ids.
+    :returns: A harness id from the offer, or ``None`` when nothing was offered.
+    """
+    order = list(catalog) or list(harnesses)
+    bare = _bare_id(model, prefixes)
+    serving = [
+        h for h in order if any(_bare_id(m, prefixes) == bare for m in catalog.get(h, ()) or ())
+    ]
+    candidates = serving or order
+    family = _model_family(model)
+    chosen = next((h for h in candidates if _HARNESS_FAMILY.get(h) == family), None)
+    if chosen is None:
+        chosen = next(
+            (h for h in candidates if _HARNESS_FAMILY.get(h) == _MULTI_MODEL_FAMILY), None
+        )
+    if chosen is None:
+        chosen = candidates[0] if candidates else None
+    return chosen
+
+
+def harness_for_model(
+    model: str,
+    catalog: Mapping[str, Sequence[str]],
+    *,
+    harnesses: Sequence[str] = (),
+    prefixes: Sequence[str] | None = None,
+) -> str | None:
+    """Choose the offered harness that can actually run *model*.
+
+    :func:`natural_harness_for_model`, then :func:`_redirect_incompatible_pick`
+    so a harness whose gateway bars the model never wins.
+
+    :returns: A harness id from the offer, or ``None`` when nothing was offered
+        or no offered harness can run the model.
+    """
+    order = list(catalog) or list(harnesses)
+    chosen = natural_harness_for_model(model, catalog, harnesses=harnesses, prefixes=prefixes)
+    return _redirect_incompatible_pick(chosen, model, harnesses=order, prefixes=prefixes)
+
+
+def harness_bars_model(
+    harness: str | None,
+    model: str,
+    *,
+    prefixes: Sequence[str] | None = None,
+) -> bool:
+    """Report whether *harness*'s gateway rejects *model*.
+
+    See :data:`_HARNESS_EXCLUDED_MODELS`.
+    """
+    barred = {_bare_id(m, prefixes) for m in _HARNESS_EXCLUDED_MODELS.get(harness or "", ())}
+    return _bare_id(model, prefixes) in barred
+
+
+def _redirect_incompatible_pick(
+    harness: str | None,
+    model: str,
+    *,
+    harnesses: Sequence[str] = (),
+    prefixes: Sequence[str] | None = None,
+) -> str | None:
+    """Redirect a verdict off a harness that can't serve *model*.
+
+    A Claude model on pi moves to ``claude-sdk``; a gpt-5.5/5.6 reasoning model
+    on pi moves to ``codex`` (Responses API) — but only when that harness was
+    itself on offer, so a child restricted to one family can never escape it.
+
+    :param harness: The chosen harness id (may be ``None``).
+    :param model: The chosen model id, in either vocabulary.
+    :param harnesses: The harnesses on offer; a replacement outside them is
+        declined. Empty means nothing is known to be on offer, so any needed
+        redirect declines.
+    :param prefixes: Catalog prefixes to strip before comparing ids.
+    :returns: *harness* when it already serves the model, a replacement from
+        *harnesses*, or ``None`` when no offered harness can run the model.
+    """
+    if harness is None:
+        return None
+    if not harness_bars_model(harness, model, prefixes=prefixes):
+        return harness
+    family = _model_family(model)
+    replacement = {"claude": "claude-sdk", "gpt": "codex"}.get(family)
+    if replacement is not None and replacement in harnesses:
+        return replacement
+    return None
+
+
+class TaskV1RouteOptionSource:
+    """Route-options source for the ``task_v1`` generation of the router.
+
+    Offers the scenario menu the router demands (injecting arms the workspace
+    has no endpoint for), ignores the echoed harness tag — passthrough and
+    untrusted — and maps a pick back to a servable catalog id.
+    """
+
+    def __init__(
+        self,
+        *,
+        router_name: str = DEFAULT_ROUTER_NAME,
+        model_prefixes: Sequence[str] = MODEL_ID_PREFIXES,
+    ) -> None:
+        """
+        :param router_name: Router strategy name. Only ``task_v1`` demands an
+            arm menu; another version is offered exactly the caller's catalog.
+        :param model_prefixes: Catalog prefixes to strip on the way out and
+            restore on the way back; see :data:`MODEL_ID_PREFIXES`.
+        """
+        self._router_name = router_name
+        self._model_prefixes = tuple(model_prefixes)
+
+    def to_router_id(self, model: str) -> str:
+        """Strip the first matching configured prefix from a catalog id."""
+        return strip_catalog_prefix(model, self._model_prefixes)
+
+    def build_route_options(
+        self,
+        harnesses: Sequence[str],
+        catalog: dict[str, list[str]],
+    ) -> list[RouteOptionSpec]:
+        """Offer the catalog plus whatever arms the router's menu requires.
+
+        :param harnesses: Harnesses the decision may land on; picks the
+            scenario (codex-only, claude-only, or mixed).
+        :param catalog: Harness → servable model ids.
+        :returns: Candidate options in router vocabulary, catalog first.
+        """
+        # Keyed on the comparison spelling so a catalog's ``gpt-5.6-luna`` and the
+        # menu's ``gpt-5-6-luna`` are one option, not two; the arm's own spelling
+        # wins the collision because the router matches its menu byte-exactly.
+        offered: dict[str, RouteOptionSpec] = {}
+        for harness, models in catalog.items():
+            for model in models:
+                router_id = self.to_router_id(model)
+                offered.setdefault(
+                    _bare_id(router_id, self._model_prefixes),
+                    RouteOptionSpec(model=router_id, harness=harness),
+                )
+        for arm in self.menu(harnesses or list(catalog)):
+            key = _bare_id(arm, self._model_prefixes)
+            existing = offered.get(key)
+            offered[key] = RouteOptionSpec(
+                model=arm,
+                harness=existing.harness
+                if existing is not None
+                else self._tag_harness(arm, harnesses, catalog),
+            )
+        return list(offered.values())
+
+    def resolve_selection(
+        self,
+        pick: RoutePick,
+        harnesses: Sequence[str],
+        catalog: dict[str, list[str]],
+    ) -> ResolvedRoute | None:
+        """Translate *pick* into a servable (harness, model) pair.
+
+        :param pick: The router's selection as received; its ``harness`` is
+            ignored because the router echoes the tag verbatim without ever
+            reading it. An id that already carries a catalog prefix is mapped
+            back to router vocabulary first, so re-resolving an id this seam
+            already resolved is a no-op rather than a miss.
+        :param harnesses: Harnesses the decision may land on.
+        :param catalog: Harness → servable model ids.
+        :returns: A :class:`ResolvedRoute`, or ``None`` when the pick was
+            never offered or nothing servable is close enough.
+        """
+        raw = self.to_router_id((pick.model or "").strip())
+        if not raw:
+            return None
+        harness = harness_for_model(
+            raw, catalog, harnesses=harnesses, prefixes=self._model_prefixes
+        )
+        if harness is None:
+            # No offered harness runs the pick itself: keep the harness it would
+            # have landed on (a child must not leave its family) and swap the
+            # model for one that harness's gateway accepts.
+            return self._substitute_within_harness(raw, harnesses, catalog)
+        local = self._local_id(raw, harness, catalog)
+        if local is None:
+            # Only an arm we injected may be substituted; anything else is a
+            # model the router was never offered.
+            if not self._is_menu_arm(raw, harnesses, catalog):
+                return None
+            pool = catalog.get(harness or "") or [m for models in catalog.values() for m in models]
+            local = substitute_model(raw, pool, prefixes=self._model_prefixes)
+        if local is None:
+            return None
+        return ResolvedRoute(model=local, harness=harness, raw_model=raw)
+
+    def _is_menu_arm(
+        self,
+        router_id: str,
+        harnesses: Sequence[str],
+        catalog: dict[str, list[str]],
+    ) -> bool:
+        """Report whether *router_id* is an arm this seam injected."""
+        key = _bare_id(router_id, self._model_prefixes)
+        return any(
+            _bare_id(arm, self._model_prefixes) == key
+            for arm in self.menu(harnesses or list(catalog))
+        )
+
+    def _substitute_within_harness(
+        self,
+        router_id: str,
+        harnesses: Sequence[str],
+        catalog: dict[str, list[str]],
+    ) -> ResolvedRoute | None:
+        """Resolve a pick every offered harness bars, without changing harness."""
+        harness = natural_harness_for_model(
+            router_id, catalog, harnesses=harnesses, prefixes=self._model_prefixes
+        )
+        if harness is None:
+            return None
+        pool = catalog.get(harness) or [m for models in catalog.values() for m in models]
+        local = substitute_model(
+            router_id,
+            pool,
+            prefixes=self._model_prefixes,
+            barred=_HARNESS_EXCLUDED_MODELS.get(harness, ()),
+        )
+        if local is None:
+            return None
+        return ResolvedRoute(model=local, harness=harness, raw_model=router_id)
+
+    def menu(self, harnesses: Iterable[str]) -> tuple[str, ...]:
+        """Return the arm menu the router requires for *harnesses*."""
+        if self._router_name != DEFAULT_ROUTER_NAME:
+            return ()
+        return TASK_V1_MENUS.get(self._scenario(harnesses), ())
+
+    def _scenario(self, harnesses: Iterable[str]) -> str:
+        """Map a harness set to a router scenario key."""
+        families = {_HARNESS_FAMILY.get(h) for h in harnesses}
+        if families == {"claude"}:
+            return "cc"
+        if families == {"gpt"}:
+            return "codex"
+        return "both"
+
+    def _tag_harness(
+        self,
+        arm: str,
+        harnesses: Sequence[str],
+        catalog: dict[str, list[str]],
+    ) -> str | None:
+        """Pick a plausible harness tag for an injected arm.
+
+        The tag is decoration — no router reads it — so a family match is
+        enough, falling back to the first harness on offer.
+        """
+        order = list(catalog) or list(harnesses)
+        family = _model_family(arm)
+        match = next((h for h in order if _HARNESS_FAMILY.get(h) == family), None)
+        if match is not None:
+            return match
+        return order[0] if order else None
+
+    def _local_id(
+        self,
+        router_id: str,
+        harness: str | None,
+        catalog: dict[str, list[str]],
+    ) -> str | None:
+        """Restore the exact catalog id behind a router id, if it is servable.
+
+        Matched on the comparison spelling, so a catalog row the picker spells
+        with dots still answers for the arm's dashed id.
+        """
+        key = _bare_id(router_id, self._model_prefixes)
+
+        def _matches(model: str) -> bool:
+            return _bare_id(self.to_router_id(model), self._model_prefixes) == key
+
+        own = catalog.get(harness or "", [])
+        exact = next((m for m in own if _matches(m)), None)
+        if exact is not None:
+            return exact
+        for models in catalog.values():
+            for model in models:
+                if _matches(model):
+                    return model
+        return None
+
+
+def routing_settings(caps: Any = None) -> RoutingSettings:  # type: ignore[explicit-any]
+    """Read this deployment's :class:`RoutingSettings`, defaulted.
+
+    The single accessor for routing knobs: every consumer reads the value
+    object off the caps instead of re-parsing config.
+
+    :param caps: A :class:`~omnigent.runtime.caps.RuntimeCaps` (or structural
+        equivalent) to read from. ``None`` reads the process-global caps.
+    :returns: The configured settings, or all-defaults when none are set.
+    """
+    if caps is None:
+        try:
+            from omnigent.runtime._globals import _caps
+        except ImportError:
+            return RoutingSettings()
+        caps = _caps
+    settings = getattr(caps, "routing_settings", None) if caps is not None else None
+    return settings if isinstance(settings, RoutingSettings) else RoutingSettings()
+
+
+def routing_last_error(client: Any) -> str | None:  # type: ignore[explicit-any]
+    """Read the reason *client*'s last :meth:`route` call returned ``None``.
+
+    Defensive: a custom :class:`RoutingClient` may predate the protocol's
+    ``last_error`` field, and an empty string is no reason at all.
+
+    :param client: A routing client, or ``None``.
+    :returns: The non-empty reason string, or ``None``.
+    """
+    detail = getattr(client, "last_error", None)
+    return detail if isinstance(detail, str) and detail else None
+
+
+def route_option_source(
+    settings: RoutingSettings | None = None,
+    *,
+    model_prefixes: Sequence[str] = (),
+) -> TaskV1RouteOptionSource:
+    """Build the route-options source for this deployment.
+
+    :param settings: Routing settings; read off the runtime caps when omitted.
+    :param model_prefixes: Catalog prefixes the router does not expect;
+        defaults to the settings' own ``model_prefixes`` when empty.
+    :returns: The configured source.
+    """
+    resolved = settings or routing_settings()
+    return TaskV1RouteOptionSource(
+        router_name=resolved.router_name,
+        model_prefixes=tuple(model_prefixes) or resolved.model_prefixes,
+    )
+
+
 class ExternalRoutingClient:
     """Routing client backed by an external ``routes:select`` service.
 
-    Calls an external routing service (the Databricks AI-Gateway router,
-    or any endpoint speaking the ``omnigent.api.routing.v1`` proto)
+    Calls an external routing service (the Databricks AI-Gateway ``task_v1``
+    router, or any endpoint speaking the ``omnigent.api.routing.v1`` proto)
     instead of running a local judge. The candidate models come from
     ``available_models`` (the same live catalog the built-in judge sees),
-    so no catalog plumbing changes. A failure or empty selection returns
-    ``None`` so the turn proceeds on the agent's default model.
+    so no catalog plumbing changes. This client is the one authority on
+    resolving a pick: it returns both the servable ``model`` and the router's
+    own ``raw_model``, and callers apply them as-is. A failure or empty
+    selection returns ``None`` so the turn proceeds on the agent's default
+    model.
     """
 
     def __init__(
@@ -415,14 +1200,15 @@ class ExternalRoutingClient:
         router_name: str,
         auth: httpx.Auth | None = None,
         databricks_profile: str | None = None,
-        model_prefixes: list[str] | None = None,
+        model_prefixes: Sequence[str] | None = None,
         request_timeout: float = 20.0,
+        selection_model: str | None = None,
     ) -> None:
         """
         :param base_url: Routing service base, e.g.
             ``"https://host/ai-gateway/routing/v1"``.
             ``/routes:select`` is appended.
-        :param router_name: Router strategy name, e.g. ``"task_v0"``.
+        :param router_name: Router strategy name, e.g. ``"task_v1"``.
         :param auth: Optional static httpx auth (e.g. a bearer built from an
             explicit ``api_key``). ``None`` for an unauthenticated endpoint or
             when *databricks_profile* supplies per-call OAuth instead.
@@ -431,18 +1217,15 @@ class ExternalRoutingClient:
             call via the databricks-sdk ``Config`` — which refreshes OAuth
             tokens transparently, so a long-lived server never sends a stale
             token (the 401 an at-startup captured token hits after ~1h).
-        :param model_prefixes: Optional prefixes this deployment's catalog
-            attaches to model ids that the router does NOT expect. The
-            first matching prefix is stripped from ids sent to the router
-            and restored on its answer via the (harness, bare-id) -> local
-            map. Examples: ``"databricks-"`` when serving-endpoint names are
-            ``databricks-claude-opus-4-8`` but the router keys on
-            ``claude-opus-4-8``; ``"system.ai."`` for Unity Catalog
-            foundation-model ids like ``system.ai.claude-opus-4-8``. Empty
-            or omitted (default) sends catalog ids verbatim — no provider
-            assumed.
+        :param model_prefixes: Prefixes this deployment's catalog attaches to
+            model ids the router keys bare, stripped on the way out and
+            restored on its answer. ``None`` uses :data:`MODEL_ID_PREFIXES`.
         :param request_timeout: Per-call timeout in seconds; routing
             runs once per turn so a slow router can't stall forever.
+        :param selection_model: Model the router should use for its own
+            extraction call, sent as ``route_selector.config.model`` so a
+            deployment can pin one it has query access to. ``None`` omits
+            ``config`` entirely and leaves the router's frozen default.
         """
         self._url = base_url.rstrip("/") + "/" + ROUTES_SELECT_PATH
         self._router_name = router_name
@@ -451,11 +1234,19 @@ class ExternalRoutingClient:
         # Cached SDK Config for the profile (created lazily), reused across
         # calls; its authenticate() refreshes the OAuth token as needed.
         self._sdk_config: Config | None = None
-        self._model_prefixes = model_prefixes or []
+        self._model_prefixes = (
+            list(MODEL_ID_PREFIXES) if model_prefixes is None else list(model_prefixes)
+        )
         self._request_timeout = request_timeout
+        self._selection_model = selection_model or None
+        # All router-contract knowledge (arm menus, harness derivation,
+        # unservable-pick substitution) lives behind this seam.
+        self._source = TaskV1RouteOptionSource(
+            router_name=router_name, model_prefixes=self._model_prefixes
+        )
         # Human-readable reason the most recent route() returned None, for the
         # caller to surface in the UI (a bare None hides the actual cause, e.g.
-        # a 401 or the task_v0 required-model-set error). Set on every failure
+        # a 401 or the router's required-model-set error). Set on every failure
         # path, cleared on success.
         self.last_error: str | None = None
 
@@ -488,16 +1279,6 @@ class ExternalRoutingClient:
             return None
         return _bearer_auth(token)
 
-    def _to_router_id(self, model: str) -> str:
-        """Strip the first matching ``model_prefixes`` entry for the router.
-
-        A no-op when no configured prefix matches *model* (or none is set).
-        """
-        for prefix in self._model_prefixes:
-            if prefix and model.startswith(prefix):
-                return model[len(prefix) :]
-        return model
-
     async def route(
         self,
         message: str,
@@ -508,29 +1289,39 @@ class ExternalRoutingClient:
 
         from omnigent.api.routing.v1 import routing_pb2 as pb
 
-        # Send router-vocabulary ids (model_prefixes stripped) and keep a
-        # (harness, router-id) -> local-id map to recover the exact catalog id
-        # from the answer. Harness is part of the key because one bare id can
-        # be served under different harnesses (Databricks-authed PI vs a Codex
-        # subscription) that must map back to distinct local ids.
-        options: list[pb.RouteOption] = []
-        router_to_local: dict[tuple[str, str], str] = {}
-        for harness, models in available_models.items():
-            for model in models:
-                router_id = self._to_router_id(model)
-                router_to_local[(harness, router_id)] = model
-                options.append(pb.RouteOption(model=router_id, harness=harness))
-        if not options:
+        # The seam turns the catalog into router vocabulary and injects
+        # whatever arms the router's scenario menu demands.
+        harnesses = list(available_models)
+        specs = self._source.build_route_options(harnesses, available_models)
+        if not specs:
             return None
+        options = [pb.RouteOption(model=s.model, harness=s.harness) for s in specs]
+        selector = pb.RouteSelector(router_name=self._router_name)
+        if self._selection_model:
+            # The router makes its own extraction call; ``config.model`` pins
+            # the model it uses so a deployment can name one it can query.
+            json_format.ParseDict({"model": self._selection_model}, selector.config)
         request = pb.SelectRouteRequest(
             route_options=options,
             task=pb.Task(prompt=message[:4000]),
-            route_selector=pb.RouteSelector(router_name=self._router_name),
+            route_selector=selector,
         )
         # snake_case wire format — the router uses the proto field names.
         body = json_format.MessageToDict(request, preserving_proto_field_name=True)
-        _logger.info("ExternalRoutingClient: available_models=%s", dict(available_models))
-        _logger.info("ExternalRoutingClient: POST %s body=%s", self._url, body)
+        _logger.info(
+            "ExternalRoutingClient: POST %s router=%s options=%s prompt_chars=%d",
+            self._url,
+            self._router_name,
+            [s.model for s in specs],
+            len(message),
+        )
+        # The body carries the user's prompt, so it stays at DEBUG and the
+        # prompt itself is replaced with its length.
+        if _logger.isEnabledFor(logging.DEBUG):
+            _logger.debug(
+                "ExternalRoutingClient: request body=%s",
+                {**body, "task": {"prompt": f"<{len(message)} chars>"}},
+            )
         # Resolve auth per call (SDK token refresh is a blocking HTTP call, so
         # run it off the event loop) — keeps a long-lived server from sending a
         # token that has expired since startup.
@@ -553,8 +1344,8 @@ class ExternalRoutingClient:
             return None
         if resp.status_code >= 400:
             # Log the response body — the gateway puts the actual reason there
-            # (e.g. task_v0's required-model-set error), which the bare status
-            # code from raise_for_status() omits.
+            # (e.g. the required-model-set error), which the bare status code
+            # from raise_for_status() omits.
             _logger.warning(
                 "ExternalRoutingClient: routes:select returned %s: %s",
                 resp.status_code,
@@ -580,55 +1371,53 @@ class ExternalRoutingClient:
         if not selected.model:
             self.last_error = "router returned an empty model"
             return None
-        # Map the router's pick back to the local catalog id, rejecting an
-        # out-of-set model (falls back to an id-only match when the router
-        # omits the harness).
-        local_model = router_to_local.get((selected.harness, selected.model))
-        if local_model is None:
-            local_model = next(
-                (
-                    local
-                    for (_harness, router_id), local in router_to_local.items()
-                    if router_id == selected.model
-                ),
-                None,
-            )
-        if local_model is None:
+        resolved = self._source.resolve_selection(
+            RoutePick(model=selected.model, harness=selected.harness or None),
+            harnesses,
+            available_models,
+        )
+        if resolved is None:
             _logger.warning(
                 "ExternalRoutingClient: router returned model %r (harness %r) "
-                "not in the candidate set; ignoring",
+                "with nothing servable behind it; ignoring",
                 selected.model,
                 selected.harness,
             )
-            self.last_error = f"router picked model {selected.model!r} outside the candidate set"
+            self.last_error = f"router picked model {selected.model!r}, which nothing here serves"
             return None
+        if resolved.model != resolved.raw_model:
+            _logger.info(
+                "ExternalRoutingClient: router pick %r is not servable here; using %r",
+                resolved.raw_model,
+                resolved.model,
+            )
         return RoutingResult(
-            model=local_model,
+            model=resolved.model,
             rationale=out.rationale,
-            harness=selected.harness or None,
+            harness=resolved.harness,
+            raw_model=resolved.raw_model,
         )
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-# SDK harnesses offered as candidates when the user picks "auto" harness.
-# Native harnesses are excluded: they require CLI binaries that may not be
-# installed, and they bake the model at terminal launch rather than per-turn.
-#
-# Order matters: it is the insertion order of the candidate set sent to the
-# router AND the tiebreak order when a model is served by multiple harnesses
-# (both the external router's id-only fallback and our own model-ownership
-# fallback pick the FIRST harness owning the model). codex precedes pi so GPT
-# models default to codex — which uses the Responses API and handles gpt-5.5+
-# reasoning models with tools, whereas pi's openai-completions path 400s on
-# them. claude-sdk owns Claude models; pi is the last-resort multi-model home.
+# SDK harnesses offered as candidates when the user picks "auto" harness; native
+# ones need a CLI binary that may not be installed. Order is the tiebreak when
+# several serve the pick: codex precedes pi so GPT models take the Responses
+# API, which pi's completions path 400s on for gpt-5.5+ reasoning models.
 _AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "codex", "pi")
 
-# The live runner catalog (fetch_runner_models) keys rows by WORKER name — the
-# sub-agent names declared in the parent spec (e.g. "claude_code") plus "self"
-# for the session's own harness — NOT by harness id. Map the common worker
-# names back to their harness id so a child session's catalog still yields
-# routable candidates. Unknown worker names are ignored.
+# Native terminal harnesses offered when Smart Routing is the top-level harness.
+# Both families are on the menu, so the pick maps onto the matching native
+# wrapper agent (claude-native-ui / codex-native-ui). The caller narrows them to
+# the host's installed CLIs and resolves their models pre-launch.
+AUTO_NATIVE_ROUTING_HARNESSES: tuple[str, ...] = ("claude-native", "codex-native")
+
+# The live runner catalog keys rows by WORKER name — the sub-agent names declared
+# in the parent spec (e.g. "claude_code") plus "self" for the session's own
+# harness — NOT by harness id. Map the common worker names back so a child
+# session's catalog still yields routable candidates; unknown worker names fall
+# through to the static infer_models table.
 _WORKER_NAME_TO_HARNESS: dict[str, str] = {
     "claude_code": "claude-sdk",
     "claude-sdk": "claude-sdk",
@@ -637,23 +1426,27 @@ _WORKER_NAME_TO_HARNESS: dict[str, str] = {
 }
 
 
-def _redirect_incompatible_pick(
+def _redirect_wire_incompatible_pick(
     harness: str | None,
     model: str,
-    harness_catalog: dict[str, list[_RunnerModel]],
+    harness_catalog: Mapping[str, Sequence[_RunnerModel]],
+    *,
+    harnesses: Sequence[str] = (),
 ) -> str | None:
-    """Redirect a router verdict off a harness that can't serve *model*.
+    """Redirect a verdict off a harness the catalog proves cannot serve *model*.
 
-    Pi speaks Anthropic Messages for Claude-family models. When the runner
-    catalog explicitly reports that the selected endpoint does not accept that
-    wire, move the verdict to ``claude-sdk``. Unknown metadata from an older
-    runner is not treated as incompatible.
+    The catalog-driven companion to :func:`_redirect_incompatible_pick`, which
+    only knows the statically-barred pairs. Pi speaks Anthropic Messages for
+    Claude-family models, so an endpoint the catalog reports as not accepting
+    that wire moves to ``claude-sdk``. Unknown metadata from an older runner is
+    not treated as incompatible.
 
-    :param harness: The router's chosen harness id (may be ``None``).
-    :param model: The router's chosen model id.
+    :param harness: The chosen harness id (may be ``None``).
+    :param model: The chosen model id.
     :param harness_catalog: Catalog metadata keyed by normalized harness id.
-    :returns: A replacement harness id, or the original *harness* when the
-        pick is already compatible.
+    :param harnesses: The harnesses on offer; a replacement outside them is
+        declined so a family-restricted child cannot escape its family.
+    :returns: A replacement harness id, or *harness* when the pick already fits.
     """
     if harness != "pi":
         return harness
@@ -666,6 +1459,7 @@ def _redirect_incompatible_pick(
         and entry.family == "claude"
         and entry.wire_apis
         and ModelWireAPI.ANTHROPIC_MESSAGES not in entry.wire_apis
+        and (not harnesses or "claude-sdk" in harnesses)
     ):
         return "claude-sdk"
     return harness
@@ -677,6 +1471,9 @@ async def route_session_harness(
     session_id: str | None = None,
     catalog_session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
+    allowed_family: str | None = None,
+    harness_candidates: Sequence[str] | None = None,
+    catalog: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -693,6 +1490,19 @@ async def route_session_harness(
         ``"self"`` row and would force the static fallback. Defaults to
         *session_id* when unset.
     :param runner_client: HTTP client pointed at the runner (optional).
+    :param allowed_family: Restrict candidates to this harness family
+        (:func:`omnigent.runner.subagent_routing.harness_family`), e.g.
+        ``"gpt"`` for a child of a codex session. ``None`` offers every
+        auto-routing harness — only sessions in auto-harness mode.
+    :param harness_candidates: Replace the default SDK candidate set with an
+        explicit one, e.g. :data:`AUTO_NATIVE_ROUTING_HARNESSES` for a session
+        that must land on a native terminal. Callers narrow it to what the host
+        can actually run; an empty sequence yields the standard "no routable
+        harnesses" error. ``None`` uses :data:`_AUTO_ROUTING_HARNESSES`.
+    :param catalog: Harness → model ids resolved without a runner, e.g. the
+        host's pre-launch model options during a session create. Used when no
+        live runner catalog is in reach; the static table then only tops up the
+        candidates it could not answer for.
     :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
         ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
         and ``error`` carries a human-readable reason shown in the UI.
@@ -702,10 +1512,10 @@ async def route_session_harness(
     try:
         from omnigent.runtime._globals import _caps
     except ImportError:
-        return None, None, None, "Intelligent routing is not available."
+        return None, None, None, "Smart routing is not available."
 
     if _caps is None or _caps.routing_client is None:
-        return None, None, None, "Intelligent routing is not configured on this server."
+        return None, None, None, "Smart routing is not configured on this server."
 
     # Fetch the live catalog. Its rows are keyed by worker name (sub-agent
     # names + "self"), so normalize those to harness ids before matching
@@ -717,26 +1527,53 @@ async def route_session_harness(
     if _catalog_sid and runner_client is not None:
         live_catalog = await _fetch_runner_catalog(_catalog_sid, runner_client)
 
-    # NOTE: we do NOT filter incompatible (harness, model) pairs out of the
-    # candidate set here. The external router (task_v0) enforces a required
-    # model set and 400s if any required model is missing, so dropping e.g.
-    # gpt-5-6-luna would break the whole request. Instead we send the full set
-    # and correct an incompatible verdict afterward via
-    # _redirect_incompatible_pick.
+    # Incompatible (harness, model) pairs stay on the menu — the router 400s on a
+    # partial one — and are corrected post-verdict. Only an auto-harness session
+    # may leave its family: a child is offered its parent's family alone.
+    candidate_harnesses = tuple(
+        h
+        for h in (
+            _AUTO_ROUTING_HARNESSES if harness_candidates is None else tuple(harness_candidates)
+        )
+        if allowed_family is None or _HARNESS_FAMILY.get(h) == allowed_family
+    )
     harness_models: dict[str, list[str]] = {}
     harness_catalog: dict[str, list[_RunnerModel]] = {}
     if live_catalog:
         for worker_name, worker_catalog in live_catalog.items():
             harness = _WORKER_NAME_TO_HARNESS.get(worker_name)
-            if harness is None or harness not in _AUTO_ROUTING_HARNESSES:
+            if harness is None or harness not in candidate_harnesses:
                 continue
-            if worker_catalog:
-                # First worker wins for a given harness id (dedupe).
+            in_family = models_in_family(harness, [entry.id for entry in worker_catalog])
+            if in_family:
+                # First worker wins for a given harness id (dedupe). The catalog
+                # rows are kept alongside the ids so the post-verdict wire check
+                # can read the endpoint's advertised protocols.
                 harness_catalog.setdefault(harness, worker_catalog)
-                harness_models.setdefault(harness, [entry.id for entry in worker_catalog])
+                harness_models.setdefault(harness, in_family)
+
+    # No runner to ask (a create routes before the session exists): take the
+    # caller's pre-session catalog, family-filtered like the live one.
+    if not harness_models and catalog:
+        for h in candidate_harnesses:
+            in_family = models_in_family(h, catalog.get(h) or ())
+            if in_family:
+                harness_models[h] = in_family
+
+    # Fall back to the static table when neither catalog produced routable
+    # candidates (e.g. a child session whose catalog only lists "self" under an
+    # unrecognized worker name, or the runner was unreachable), and to top up
+    # candidates a pre-session catalog could not answer for.
+    if not harness_models or (catalog and len(harness_models) < len(candidate_harnesses)):
+        for h in candidate_harnesses:
+            if h in harness_models:
+                continue
+            models = infer_models(h)
+            if models:
+                harness_models[h] = models
 
     if not harness_models:
-        return None, None, None, "No discovered routable harnesses are available on this runner."
+        return None, None, None, "No routable harnesses are available on this runner."
 
     try:
         result = await _caps.routing_client.route(user_message, harness_models)
@@ -747,7 +1584,7 @@ async def route_session_harness(
     if result is None:
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
         # gateway's message) when it exposes one; otherwise a generic note.
-        detail = getattr(_caps.routing_client, "last_error", None)
+        detail = routing_last_error(_caps.routing_client)
         reason = (
             f"Routing unavailable: {detail}"
             if detail
@@ -755,68 +1592,87 @@ async def route_session_harness(
         )
         return None, None, None, reason
 
-    # Use the router's harness pick only when it names one of our candidates
-    # AND the chosen model is in that harness's list (avoids mismatches).
-    if result.harness in harness_models and result.model in harness_models[result.harness]:
-        chosen_harness = result.harness
-    else:
-        if result.harness and result.harness not in harness_models:
-            _logger.debug(
-                "smart_routing: router harness %r not in candidate set; "
-                "falling back to model-ownership lookup",
-                result.harness,
-            )
-        elif result.harness and result.model not in harness_models.get(result.harness, []):
-            _logger.debug(
-                "smart_routing: router harness %r does not own model %r; "
-                "falling back to model-ownership lookup",
-                result.harness,
-                result.model,
-            )
-        chosen_harness = None
-        for h, models in harness_models.items():
-            if result.model in models:
-                chosen_harness = h
-                break
+    # The client owns resolution: it already mapped the router's pick onto a
+    # servable id (reporting the pick itself as ``raw_model``). Re-resolving
+    # here would second-guess it with a different prefix list and downgrade the
+    # pick, so only the harness is filled in when the client named none.
+    prefixes = routing_settings().model_prefixes
+    chosen_model = result.model
+    raw_model = result.raw_model
+    offered = tuple(harness_models)
+    chosen_harness = (
+        _redirect_incompatible_pick(
+            result.harness, chosen_model, harnesses=offered, prefixes=prefixes
+        )
+        if result.harness
+        else harness_for_model(chosen_model, harness_models, prefixes=prefixes)
+    )
+    if chosen_harness is None and result.harness in harness_models:
+        # Every offered harness bars the pick, and the family the caller allowed
+        # is not negotiable — swap the model instead of the harness.
+        substitute = substitute_model(
+            raw_model or chosen_model,
+            harness_models[result.harness],
+            prefixes=prefixes,
+            barred=_HARNESS_EXCLUDED_MODELS.get(result.harness, ()),
+        )
+        if substitute is not None:
+            raw_model = raw_model or chosen_model
+            chosen_harness, chosen_model = result.harness, substitute
+    if chosen_harness is None:
+        return None, None, None, f"No available harness can run {chosen_model}."
 
-    # Redirect a catalog-proven wire mismatch after routing so the complete
-    # candidate set still reaches external routers that require it.
-    _redirected = _redirect_incompatible_pick(chosen_harness, result.model, harness_catalog)
+    # Then the catalog's own wire metadata, which knows endpoints the static bar
+    # list cannot. Applied post-verdict so the complete candidate set still
+    # reaches external routers that require it.
+    _redirected = _redirect_wire_incompatible_pick(
+        chosen_harness, chosen_model, harness_catalog, harnesses=offered
+    )
     if _redirected != chosen_harness:
         _logger.info(
-            "smart_routing: redirecting incompatible pick harness=%s model=%s -> harness=%s",
+            "smart_routing: redirecting wire-incompatible pick harness=%s model=%s -> harness=%s",
             chosen_harness,
-            result.model,
+            chosen_model,
             _redirected,
         )
         chosen_harness = _redirected
 
+    # The UI shows what the router said, not only what we could run — but only
+    # when they are genuinely different models, not the same one spelled bare.
+    verdict: dict[str, Any] = {"model": chosen_model, "rationale": result.rationale}
+    if raw_model and _bare_id(raw_model, prefixes) != _bare_id(chosen_model, prefixes):
+        verdict["raw_model"] = raw_model
+
     _logger.info(
-        "smart_routing: auto-harness harness=%s model=%s rationale=%s",
+        "smart_routing: auto-harness harness=%s model=%s",
         chosen_harness,
-        result.model,
-        result.rationale,
+        chosen_model,
     )
-    return (
-        chosen_harness,
-        result.model,
-        {"model": result.model, "rationale": result.rationale},
-        None,
-    )
+    # The rationale paraphrases the user's prompt, so it stays off INFO.
+    _logger.debug("smart_routing: auto-harness rationale=%s", result.rationale)
+    return chosen_harness, chosen_model, verdict, None
 
 
 async def route_turn(
-    _harness: str | None,
+    harness: str | None,
     user_message: str,
     *,
     session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
+    catalog: Sequence[str] | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Pick the best model for a turn via :attr:`RuntimeCaps.routing_client`.
 
-    Fetches live model availability from the runner's
-    ``/v1/sessions/{id}/models`` endpoint. Routing is skipped when discovery
-    is unavailable so the harness can use its provider-resolved default.
+    When *session_id* and *runner_client* are provided, fetches live model
+    availability from the runner's ``/v1/sessions/{id}/models`` endpoint.
+    Falls back to the static :func:`infer_models` lookup table if the runner
+    is unreachable or returns no data.
+
+    :param catalog: The models this session can actually be switched onto,
+        when the caller knows them exactly - a native terminal's own picker
+        vocabulary. Authoritative: its gateway serves more models than the
+        running CLI can be switched to, and offering those routes the turn
+        onto a model the switch would silently drop.
     """
     try:
         from omnigent.runtime._globals import _caps
@@ -824,27 +1680,97 @@ async def route_turn(
         return None, None
 
     if _caps is None or _caps.routing_client is None:
+        _logger.info(
+            "smart_routing: route_turn skipped for session=%s: no routing client configured",
+            session_id,
+        )
         return None, None
 
-    # Prefer live runner catalog — but only the "self" worker entry.
-    # The catalog includes sub-agent workers (claude_code, pi, codex…);
-    # for brain-turn routing we only want the models this session's own
-    # harness can run, not the sub-agents' model lists.
+    _logger.info("smart_routing: routing turn session=%s harness=%s", session_id, harness)
+    # Prefer the live runner catalog, but only its "self" row — the sub-agent
+    # workers' models are not this session's. Key the map by harness id, not the
+    # "self" label, so the seam infers the right single-harness scenario.
     available: dict[str, list[str]] | None = None
-    if session_id and runner_client is not None:
-        catalog = await fetch_runner_models(session_id, runner_client)
-        if catalog and "self" in catalog:
-            available = {"self": catalog["self"]}
+    if catalog:
+        in_vocabulary = models_in_family(harness, catalog)
+        if in_vocabulary:
+            available = {harness or "self": in_vocabulary}
+    if available is None and session_id and runner_client is not None:
+        runner_catalog = await fetch_runner_models(session_id, runner_client)
+        if runner_catalog and "self" in runner_catalog:
+            # A native terminal's own catalog can list models from other
+            # families (its gateway serves them all); offering those would
+            # route the session onto a model its harness cannot run.
+            in_family = models_in_family(harness, runner_catalog["self"])
+            if in_family:
+                available = {harness or "self": in_family}
     if not available:
-        return None, None
+        models = infer_models(harness)
+        if models is None:
+            _logger.info(
+                "smart_routing: route_turn skipped for session=%s: "
+                "no candidate models for harness=%s",
+                session_id,
+                harness,
+            )
+            return None, None
+        available = {harness or "": models}
+
+    prefixes = routing_settings().model_prefixes
+    # A turn cannot change the harness, so a model its gateway bars is not a
+    # candidate at all. The seam still injects whatever arms the router's menu
+    # requires, so dropping these rows never makes that menu partial.
+    if _HARNESS_EXCLUDED_MODELS.get(harness or ""):
+        available = {
+            name: runnable
+            for name, models in available.items()
+            if (
+                runnable := [
+                    m for m in models if not harness_bars_model(harness, m, prefixes=prefixes)
+                ]
+            )
+        }
+        if not available:
+            _logger.info(
+                "smart_routing: route_turn skipped for session=%s: "
+                "harness=%s bars every candidate model",
+                session_id,
+                harness,
+            )
+            return None, None
 
     result = await _caps.routing_client.route(user_message, available)
     if result is None:
         return None, None
 
-    _logger.info(
-        "smart_routing: model=%s rationale=%s",
-        result.model,
-        result.rationale,
-    )
-    return result.model, {"model": result.model, "rationale": result.rationale}
+    # An injected arm can still come back barred (the menu is offered whole), and
+    # a turn cannot change harness — so swap the model for one this gateway
+    # accepts. Nothing servable means no routing: the turn keeps its model.
+    model = result.model
+    raw_model = result.raw_model
+    if harness_bars_model(harness, model, prefixes=prefixes):
+        candidates = available.get(harness or "", [])
+        substitute = substitute_model(
+            raw_model or model,
+            candidates,
+            prefixes=prefixes,
+            barred=_HARNESS_EXCLUDED_MODELS.get(harness or "", ()),
+        )
+        if substitute is None:
+            _logger.info(
+                "smart_routing: route_turn skipped for session=%s: harness=%s cannot run %s",
+                session_id,
+                harness,
+                model,
+            )
+            return None, None
+        raw_model = raw_model or model
+        model = substitute
+
+    _logger.info("smart_routing: session=%s model=%s", session_id, model)
+    # The rationale paraphrases the user's prompt, so it stays off INFO.
+    _logger.debug("smart_routing: session=%s rationale=%s", session_id, result.rationale)
+    verdict: dict[str, Any] = {"model": model, "rationale": result.rationale}
+    if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
+        verdict["raw_model"] = raw_model
+    return model, verdict

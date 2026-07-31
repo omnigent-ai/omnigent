@@ -75,10 +75,11 @@ def validate_model_override(value: str) -> str:
 _CLAUDE_FAMILY_HARNESSES: frozenset[str] = frozenset(
     {"claude-native", "native-claude", "claude-sdk", "claude_sdk"}
 )
-# CODEX_CANONICAL_HARNESSES stays single-vendor (GPT-only): the gateway serves
-# codex over the Anthropic-incompatible Responses wire, and codex >= 0.137
-# dropped the chat/completions wire that was the only path to Claude — so a
-# codex x Claude dispatch is genuinely broken and must fail loud here.
+# CODEX_CANONICAL_HARNESSES is restricted to the codex-compatible families
+# (see is_codex_compatible_model): the gateway serves codex over the
+# Anthropic-incompatible Responses wire, and codex >= 0.137 dropped the
+# chat/completions wire that was the only path to Claude — so a codex x Claude
+# dispatch is genuinely broken and must fail loud here.
 # openai-agents (and its "openai-agents-sdk" / "agents_sdk" spellings) is
 # intentionally not included: a live SDK probe completed a Claude
 # tool-calling turn on the gateway over the chat wire, so the harness is
@@ -109,15 +110,43 @@ _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
 _DATABRICKS_GATEWAY_PREFIX = "databricks-"
 
 
+# Vendor tokens that name a codex-runnable model. GPT/codex ids are the
+# obvious case; GLM and Kimi serve on the same OpenResponses wire codex
+# speaks (see the Responses-capable listing in
+# ``omnigent/pi_native_credentials.py``), so codex can run them too.
+_CODEX_COMPATIBLE_SEGMENT_TOKENS: tuple[str, ...] = ("gpt", "codex", "glm", "kimi")
+
+# Ids are matched per segment (``-``/``_``/``.``/``/`` separated) with an
+# optional trailing generation number, so ``system.ai.glm-5-2`` and
+# ``kimi-k2-instruct`` match while an unrelated endpoint name that merely
+# contains the letters (``glmqlfit-eval``) does not.
+_ID_SEGMENT_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def is_codex_compatible_model(model: str) -> bool:
+    """Report whether *model* can run on a codex harness.
+
+    :param model: Model id in any vocabulary, e.g. ``"databricks-glm-5-2"``.
+    :returns: ``True`` for the GPT/codex, GLM, and Kimi families.
+    """
+    segments = _ID_SEGMENT_SPLIT.split(model.lower())
+    return any(
+        re.fullmatch(rf"{token}\d*", segment)
+        for segment in segments
+        for token in _CODEX_COMPATIBLE_SEGMENT_TOKENS
+    )
+
+
 def model_family_mismatch(harness: str, model: str) -> str | None:
     """
     Return a rejection reason when *model*'s family cannot run on *harness*.
 
     Family is detected by vendor token: Claude ids contain ``"claude"``
-    (``databricks-claude-opus-4-8``), GPT ids contain ``"gpt"`` or
-    ``"codex"`` (``databricks-gpt-5-4``). Single-vendor harnesses reject
-    the other family and ids whose family cannot be determined — failing
-    loud at dispatch beats an opaque harness/gateway error after spawn.
+    (``databricks-claude-opus-4-8``); codex-compatible ids name gpt,
+    codex, glm, or kimi (``databricks-gpt-5-4``, ``system.ai.glm-5-2``).
+    Single-vendor harnesses reject the other family and ids whose family
+    cannot be determined — failing loud at dispatch beats an opaque
+    harness/gateway error after spawn.
     The Gemini-native ``antigravity`` harness rejects the Claude/GPT
     families and any ``databricks-`` gateway id (it has no gateway path),
     but accepts Gemini shapes and bare/ambiguous ids the SDK may honor.
@@ -132,19 +161,22 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     canon = canonicalize_harness(harness)
     lower = model.lower()
     is_claude = "claude" in lower
+    # Antigravity's reject-list stays the narrow GPT/codex rule: GLM and Kimi
+    # ids carry no Gemini-native verdict, so they are not newly excluded here.
     is_gpt = "gpt" in lower or "codex" in lower
     if canon in _CLAUDE_FAMILY_HARNESSES and not is_claude:
         return (
             f"harness {canon!r} only runs Claude models (id containing "
-            f"'claude'); got {model!r}. Use the codex worker for GPT models "
-            "or the pi / openai-agents worker for any other gateway model."
-        )
-    if canon in CODEX_CANONICAL_HARNESSES and not is_gpt:
-        return (
-            f"harness {canon!r} only runs GPT models (id containing 'gpt' "
-            f"or 'codex'); got {model!r}. Use the claude_code worker for "
-            "Claude models or the pi / openai-agents worker for any other "
+            f"'claude'); got {model!r}. Use the codex worker for GPT / GLM / "
+            "Kimi models or the pi / openai-agents worker for any other "
             "gateway model."
+        )
+    if canon in CODEX_CANONICAL_HARNESSES and not is_codex_compatible_model(model):
+        return (
+            f"harness {canon!r} only runs codex-compatible models (id naming "
+            f"'gpt', 'codex', 'glm', or 'kimi'); got {model!r}. Use the "
+            "claude_code worker for Claude models or the pi / openai-agents "
+            "worker for any other gateway model."
         )
     if canon in _ANTIGRAVITY_FAMILY_HARNESSES and (
         is_claude or is_gpt or lower.startswith(_DATABRICKS_GATEWAY_PREFIX)

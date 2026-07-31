@@ -8,8 +8,15 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from omnigent.server.smart_routing import RoutingClient
+    from omnigent.server.smart_routing import RoutingClient, RoutingSettings
     from omnigent.spec.types import LLMConfig, PolicySpec
+
+
+def _default_routing_settings() -> RoutingSettings:
+    """Build the default :class:`RoutingSettings` (imported lazily)."""
+    from omnigent.server.smart_routing import RoutingSettings
+
+    return RoutingSettings()
 
 
 @dataclass
@@ -78,3 +85,8 @@ class RuntimeCaps:
     # Managed deployments can supply a different implementation (e.g.
     # a rules engine or remote service).  ``None`` disables routing.
     routing_client: RoutingClient | None = None
+    # Routing knobs parsed from the ``routing:`` block of the server --config
+    # YAML (router name, extraction model, scenario menus, subagent fail mode).
+    # Always present so consumers read one value object instead of re-parsing
+    # config; the defaults describe an unconfigured deployment.
+    routing_settings: RoutingSettings = field(default_factory=_default_routing_settings)
