@@ -626,6 +626,64 @@ def test_ensure_default_native_agents_seeds_qwen_card(seed_stores: _SeedStores) 
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+def test_ensure_default_native_agents_seeds_every_native_agent(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    The loop seeds every ``NATIVE_CODING_AGENTS`` entry under its stable id.
+
+    Guards the whole seeded set (not just one card): each native agent must be
+    registered as a session-scope-NULL built-in, keyed by its name-derived
+    :func:`builtin_agent_id`, with a retrievable bundle. A harness dropped from
+    the loop — or seeded under the wrong name/id — is caught here.
+    """
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+
+    server_app._ensure_default_native_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    for agent in NATIVE_CODING_AGENTS:
+        seeded = seed_stores.agent_store.get_by_name(agent.agent_name)
+        assert seeded is not None, f"{agent.agent_name} was not registered"
+        assert seeded.id == builtin_agent_id(agent.agent_name)
+        assert seeded.session_id is None, "built-ins must be session-scope NULL"
+        assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_native_agents_raises_when_provider_missing(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native agent with no provider row raises instead of silently unseeding."""
+    from omnigent.errors import OmnigentError
+
+    monkeypatch.setattr(server_app, "native_provider_for_key", lambda _key: None)
+    with pytest.raises(OmnigentError, match="no provider row to seed from"):
+        server_app._ensure_default_native_agents(
+            seed_stores.agent_store,
+            seed_stores.artifact_store,
+            seed_stores.agent_cache,
+        )
+
+
+def test_build_native_bundle_raises_without_materialize_hook() -> None:
+    """A provider missing its ``materialize_agent_spec`` hook raises loudly."""
+    from omnigent.errors import OmnigentError
+    from omnigent.harness_plugins import NativeHarnessProvider
+
+    provider = NativeHarnessProvider(
+        key="ghost",
+        run_native="omnigent.ghost_native:run_ghost_native",
+        auto_create_terminal="omnigent.runner.native:_launch_ghost",
+        materialize_agent_spec=None,
+    )
+    with pytest.raises(OmnigentError, match="no materialize_agent_spec hook"):
+        server_app._build_native_bundle(provider)
+
+
 def test_ensure_default_native_agents_is_idempotent(seed_stores: _SeedStores) -> None:
     """A second seed call is a no-op — startup runs the seeder every boot."""
     server_app._ensure_default_native_agents(

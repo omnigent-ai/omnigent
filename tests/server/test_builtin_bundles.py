@@ -21,20 +21,17 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
+from omnigent.native_coding_agents import NATIVE_CODING_AGENTS as _NATIVE_CODING_AGENTS
 from omnigent.server import app
 from omnigent.spec import load, materialize_bundle
 
 # Native built-ins are seeded through one registry-driven builder,
-# ``_build_native_bundle(provider)`` (PR 1.7). We exercise a representative
-# spread of the model-arg variants: claude/pi (bare tmpdir), codex (required
-# keyword-only model), kiro (defaulted model). Each spec entry is
-# ``<agent_name>.yaml``, proving the right spec was materialized.
-_NATIVE_BUILDERS = [
-    ("claude", "claude-native-ui.yaml"),
-    ("codex", "codex-native-ui.yaml"),
-    ("pi", "pi-native-ui.yaml"),
-    ("kiro", "kiro-native-ui.yaml"),
-]
+# ``_build_native_bundle(provider)`` (PR 1.7). We exercise EVERY native agent
+# (not a sample) so each harness's materialize path — and both model-arg shapes
+# (codex requires keyword-only model, kiro/opencode default it, the rest take
+# just tmpdir) — is covered directly rather than only transitively via e2e.
+# Each spec entry is ``<agent_name>.yaml``, proving the right spec materialized.
+_NATIVE_BUILDERS = [(agent.key, f"{agent.agent_name}.yaml") for agent in _NATIVE_CODING_AGENTS]
 
 # Shipped-example built-ins keep their hand-written named builders. The bool is
 # whether the source is a shipped example a stripped deployment may omit.
