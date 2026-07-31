@@ -27,6 +27,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.onboarding.providers import default_chat_model
 
 console = Console()
 
@@ -471,7 +472,7 @@ class _SupervisorConfig:
     """Configuration for the supervisor agent in a multi-agent setup.
 
     :param harness: Harness name, e.g. ``"openai-agents"`` or ``"claude-sdk"``.
-    :param model: Model identifier, e.g. ``"gpt-4o"``. ``None`` for CLI
+    :param model: Provider model identifier. ``None`` for CLI
         harnesses that manage their own model selection.
     :param task: User-provided collaboration task description, or ``None``
         if the user skipped the prompt.
@@ -1101,6 +1102,19 @@ def _prompt_cli_supervisor_config(harness_name: str) -> _SupervisorConfig:
     return _SupervisorConfig(harness=harness_name)
 
 
+def _default_supervisor_model(
+    *,
+    base_url: str | None,
+    profile: str | None,
+) -> str | None:
+    """Return the catalog suggestion for a known supervisor provider."""
+    if profile is not None:
+        return default_chat_model("databricks")
+    if base_url is None:
+        return default_chat_model("openai")
+    return None
+
+
 def _prompt_openai_agents_config() -> _SupervisorConfig:
     """Configure the openai-agents supervisor.
 
@@ -1215,7 +1229,7 @@ def _prompt_openai_agents_config() -> _SupervisorConfig:
 
             if sub == 2:
                 # --- Pick model ---
-                default_model = "databricks-gpt-5-4" if profile else "gpt-4o"
+                default_model = _default_supervisor_model(base_url=base_url, profile=profile)
                 console.print()
                 console.print("  [bold]Which model should the supervisor use?[/bold]")
                 model = _text_prompt("Supervisor model", default=default_model)
