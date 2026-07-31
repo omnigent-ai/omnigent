@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import TypedDict, cast
 
 import click
 import httpx
@@ -82,7 +82,7 @@ def is_valid_cursor_chat_id(chat_id: str | None) -> bool:
     Used to gate the persisted ``external_session_id`` before it is used as a
     cursor store-path component or passed to ``cursor-agent --resume``.
     """
-    return bool(chat_id) and _CURSOR_CHAT_ID_RE.fullmatch(chat_id) is not None
+    return chat_id is not None and _CURSOR_CHAT_ID_RE.fullmatch(chat_id) is not None
 
 
 _AGENT_NAME = "cursor-native-ui"
@@ -219,6 +219,25 @@ _CURSOR_DISPLAY_SUFFIXES = frozenset(
 )
 
 
+class CursorModelOption(TypedDict):
+    """One model picker row parsed from ``cursor-agent models``."""
+
+    id: str
+    displayName: str
+    isDefault: bool
+    isCurrent: bool
+
+
+class _CursorSessionPatch(TypedDict, total=False):
+    terminal_launch_args: list[str]
+    model_override: str
+
+
+class _CursorSessionMetadata(TypedDict, total=False):
+    labels: dict[str, str]
+    terminal_launch_args: list[str]
+
+
 def _cursor_base_model_id(compound_id: str) -> str:
     """Normalize a Cursor model/variant id to its injectable base id."""
     base_id = _CURSOR_VARIANT_SUFFIX_RE.sub("", compound_id)
@@ -236,9 +255,9 @@ def _cursor_base_display_name(display_name: str) -> str:
     return " ".join(words)
 
 
-def parse_cursor_cli_model_options(output: str) -> list[dict[str, Any]]:
+def parse_cursor_cli_model_options(output: str) -> list[CursorModelOption]:
     """Parse ``cursor-agent models`` output into base-model picker rows."""
-    options_by_id: dict[str, dict[str, Any]] = {}
+    options_by_id: dict[str, CursorModelOption] = {}
     default_model_id: str | None = None
     current_model_id: str | None = None
     for raw_line in output.splitlines():
@@ -277,7 +296,7 @@ def list_cursor_cli_model_options(
     *,
     env: Mapping[str, str] | None = None,
     timeout_s: float = 10.0,
-) -> list[dict[str, Any]]:
+) -> list[CursorModelOption]:
     """Discover base-model picker options from the installed Cursor CLI."""
     executable = resolve_cursor_executable(env=env)
     completed = subprocess.run(
@@ -349,7 +368,7 @@ def _materialize_cursor_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "cursor-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: dict[str, object] = {
         "name": _AGENT_NAME,
         "prompt": (
             "Cursor is running in the session terminal. The user drives the "
@@ -545,7 +564,7 @@ async def _prepare_cursor_terminal_via_daemon(
             ext = payload.get("external_session_id") if isinstance(payload, dict) else None
             if isinstance(ext, str) and is_valid_cursor_chat_id(ext):
                 resume_chat_id = ext
-            patch: dict[str, Any] = {}
+            patch: _CursorSessionPatch = {}
             if persist_args:
                 patch["terminal_launch_args"] = persist_args
             if model is not None:
@@ -591,7 +610,7 @@ async def _create_cursor_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first cursor-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _CursorSessionMetadata = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -614,7 +633,7 @@ async def _create_cursor_session(
 async def _patch_cursor_session(
     client: httpx.AsyncClient,
     session_id: str,
-    patch: dict[str, Any],
+    patch: _CursorSessionPatch,
 ) -> None:
     """
     PATCH a cursor-native session's persisted launch config.
@@ -634,7 +653,7 @@ async def _patch_cursor_session(
         )
 
 
-async def _fetch_cursor_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_cursor_session(client: httpx.AsyncClient, session_id: str) -> dict[str, object]:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:
@@ -644,9 +663,9 @@ async def _fetch_cursor_session(client: httpx.AsyncClient, session_id: str) -> d
             f"Failed to fetch conversation {session_id!r} ({resp.status_code}): {error_text(resp)}"
         )
     payload = resp.json()
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not all(isinstance(key, str) for key in payload):
         raise click.ClickException("Conversation fetch returned non-object JSON.")
-    return payload
+    return cast(dict[str, object], payload)
 
 
 async def _ensure_cursor_terminal_on_runner(client: httpx.AsyncClient, session_id: str) -> None:
