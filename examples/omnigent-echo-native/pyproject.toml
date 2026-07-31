@@ -1,0 +1,31 @@
+[project]
+name = "omnigent-echo-native"
+version = "0.1.0"
+description = "Example community native-harness plugin for Omnigent (the reference native contribution)."
+requires-python = ">=3.12"
+# A real plugin pins the core it was built against, e.g. "omnigent==0.3.0.dev0".
+# The example keeps the dependency loose so it installs against a sibling
+# checkout via [tool.uv.sources] below.
+dependencies = ["omnigent"]
+
+# The entry point that makes core discover this plugin. `omni`/the server call
+# `omnigent.harness_plugins.plugin_state()`, which loads every entry point in
+# this group and merges the returned HarnessContribution.
+[project.entry-points."omnigent.community.harness"]
+echo = "omnigent.community.harness.echo.plugin:get_contribution"
+
+# Local sibling-checkout wiring so `uv pip install -e .` builds against the
+# in-repo core rather than a published wheel. A standalone plugin repo points
+# this at wherever its omnigent checkout lives.
+[tool.uv.sources]
+omnigent = { path = "../..", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The implementation modules live under the reserved namespace
+# `omnigent.community.harness.*` (core rejects flat packages / builtin-name
+# overrides). Declare the namespaced package explicitly for the build backend.
+[tool.hatch.build.targets.wheel]
+packages = ["omnigent"]

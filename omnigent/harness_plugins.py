@@ -811,11 +811,38 @@ def _module_part(import_path: str) -> str:
     return import_path.split(":", 1)[0]
 
 
+# NativeHarnessProvider fields that carry a dotted import path the resolver
+# imports at dispatch time (so they must live under COMMUNITY_MODULE_PREFIX for a
+# community plugin). ``key`` is an identifier and ``bridge_id_label_key`` is a
+# session-label key, not code — both are excluded.
+_NATIVE_PROVIDER_IMPORT_PATH_FIELDS: tuple[str, ...] = (
+    "run_native",
+    "auto_create_terminal",
+    "spawn_env_builder",
+    "interrupt_handler",
+    "stop_handler",
+    "materialize_agent_spec",
+    "bridge_dir",
+)
+
+
+def _native_provider_import_paths(contribution: HarnessContribution) -> list[str]:
+    """Return every dotted import path a contribution's native providers resolve."""
+    paths: list[str] = []
+    for provider in contribution.native_providers:
+        for field_name in _NATIVE_PROVIDER_IMPORT_PATH_FIELDS:
+            value = getattr(provider, field_name)
+            if value:
+                paths.append(value)
+    return paths
+
+
 def _community_paths(contribution: HarnessContribution) -> list[str]:
     paths: list[str] = []
     paths.extend(contribution.harness_modules.values())
     paths.extend(contribution.spawn_env_builders.values())
     paths.extend(spec.generator for spec in contribution.background_title_generators.values())
+    paths.extend(_native_provider_import_paths(contribution))
     return paths
 
 
@@ -852,6 +879,88 @@ def _native_agent_identity_values(contribution: HarnessContribution) -> set[str]
     return values
 
 
+# Native-provider hooks a community plugin MUST supply — the launch/route path
+# cannot run without them. The remaining hooks are optional (interrupt/stop fall
+# through to the in-process cancel; materialize_agent_spec only gates built-in
+# seeding; bridge_dir only feeds the cost-popup lookup).
+_REQUIRED_NATIVE_PROVIDER_HOOKS: tuple[str, ...] = ("run_native", "auto_create_terminal")
+
+
+def _validate_native_contribution(
+    contribution: HarnessContribution,
+    *,
+    entry_point_name: str,
+) -> str | None:
+    """Validate a community plugin's native-terminal contribution.
+
+    Native terminal harnesses ARE supported (the runner runs every native
+    harness through the ``NativeHarnessProvider`` seam). A contribution that
+    ships native metadata must be internally consistent: each declared agent
+    needs a provider row (and vice versa) keyed by the same ``key``, and each
+    provider must supply the hooks the launch path requires. Import-path prefix
+    and identity-collision checks are enforced by the shared community-validator
+    (native provider hook paths are included via ``_community_paths``, and agent
+    identity values via ``_native_agent_identity_values``).
+
+    :param contribution: The plugin's contribution.
+    :param entry_point_name: The entry-point name, for error messages.
+    :returns: An error string when the native metadata is inconsistent, else
+        ``None`` (including when the plugin ships no native metadata).
+    """
+    if not (contribution.native_agents or contribution.native_providers):
+        return None
+
+    agent_keys = [agent.key for agent in contribution.native_agents]
+    provider_keys = [provider.key for provider in contribution.native_providers]
+    agent_key_set = set(agent_keys)
+    provider_key_set = set(provider_keys)
+
+    if len(agent_key_set) != len(agent_keys):
+        dupes = sorted({k for k in agent_keys if agent_keys.count(k) > 1})
+        return (
+            f"community harness plugin {entry_point_name!r} declares duplicate native "
+            f"agent keys: {dupes}"
+        )
+    if len(provider_key_set) != len(provider_keys):
+        dupes = sorted({k for k in provider_keys if provider_keys.count(k) > 1})
+        return (
+            f"community harness plugin {entry_point_name!r} declares duplicate native "
+            f"provider keys: {dupes}"
+        )
+
+    agents_without_provider = sorted(agent_key_set - provider_key_set)
+    if agents_without_provider:
+        return (
+            f"community harness plugin {entry_point_name!r} declares native agents without a "
+            f"matching provider row: {agents_without_provider}"
+        )
+    providers_without_agent = sorted(provider_key_set - agent_key_set)
+    if providers_without_agent:
+        return (
+            f"community harness plugin {entry_point_name!r} declares native providers without a "
+            f"matching agent row: {providers_without_agent}"
+        )
+
+    # Every declared native agent's harness id must be in valid_harnesses, or the
+    # runner/spec layer can never route to it.
+    for agent in contribution.native_agents:
+        if agent.harness not in contribution.valid_harnesses:
+            return (
+                f"community harness plugin {entry_point_name!r} native agent {agent.key!r} "
+                f"declares harness {agent.harness!r}, which is not in valid_harnesses"
+            )
+
+    for provider in contribution.native_providers:
+        for hook in _REQUIRED_NATIVE_PROVIDER_HOOKS:
+            if not getattr(provider, hook):
+                return (
+                    f"community harness plugin {entry_point_name!r} native provider "
+                    f"{provider.key!r} is missing required hook {hook!r}"
+                )
+
+    return None
+
+
 def _validate_community_contribution(
     contribution: HarnessContribution,
     *,
@@ -868,11 +977,9 @@ def _validate_community_contribution(
                 f"{path!r}; expected {COMMUNITY_MODULE_PREFIX}*"
             )
 
-    if contribution.native_harnesses or contribution.native_agents:
-        return (
-            f"community harness plugin {entry_point_name!r} registers native terminal "
-            "metadata, but community native terminal harnesses are not supported yet"
-        )
+    native_error = _validate_native_contribution(contribution, entry_point_name=entry_point_name)
+    if native_error is not None:
+        return native_error
 
     existing_harness_spellings: set[str] = set()
     existing_install_keys: set[str] = set()
@@ -1130,6 +1237,48 @@ def harness_catalog() -> list[dict[str, Any]]:
             rows.append(acp_row)
     except Exception:  # noqa: BLE001 — a malformed acp: block must never break the catalog
         _logger.debug("acp catalog rows skipped", exc_info=True)
+    return rows
+
+
+def native_agent_catalog() -> list[dict[str, Any]]:
+    """Return JSON-serializable native-agent rows for ``GET /v1/harnesses``.
+
+    Built-in *and* community native agents (after PR 2.1 accepts them). Each row
+    is the native agent's stable identity (``key`` / ``agent_name`` / ``harness``
+    / ``wrapper_label`` / ``terminal_name`` / ``display_name`` /
+    ``subagent_wrapper_label``) plus its harness ``capabilities`` and the
+    ``fork_history`` axis, so the web can drive native-agent recognition,
+    fork-history gating, and capability gating off the server instead of the
+    hardcoded ``web/src/lib/nativeCodingAgents.ts`` literals (PR 2.3).
+
+    Only fields with an unambiguous server source are emitted. The web literal
+    additionally carries UI-presentation fields (``iconKind``, ``sortRank``, a
+    marketing ``displayName`` like "Claude Code" vs the row's "Claude", and a
+    picker-capability list) that have no clean registry source today; whether to
+    add those to ``NativeCodingAgent`` is deferred to the PR 2.3 review (see the
+    workstream doc) rather than expanding the frozen wire shape here.
+
+    :returns: One row per native coding agent, ordered by ``key`` for stability.
+    """
+    capabilities = harness_capabilities()
+    rows: list[dict[str, Any]] = []
+    for agent in sorted(native_agents(), key=lambda a: a.key):
+        capability = capabilities.get(agent.harness)
+        rows.append(
+            {
+                "key": agent.key,
+                "agent_name": agent.agent_name,
+                "harness": agent.harness,
+                "wrapper_label": agent.wrapper_label,
+                "terminal_name": agent.terminal_name,
+                "display_name": agent.display_name,
+                "subagent_wrapper_label": agent.subagent_wrapper_label,
+                "fork_history": (
+                    capability.fork_history.value if capability is not None else None
+                ),
+                "capabilities": capability.as_dict() if capability is not None else None,
+            }
+        )
     return rows
 
 
