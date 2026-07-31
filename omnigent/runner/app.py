@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.codex_native_bridge import CodexNativeBridgeState
     from omnigent.terminals.registry import TerminalListEntry
 
 import click
@@ -3662,7 +3663,7 @@ def create_runner_app(
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> Any | None:
+    ) -> CodexNativeBridgeState | None:
         from omnigent.codex_native_bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
