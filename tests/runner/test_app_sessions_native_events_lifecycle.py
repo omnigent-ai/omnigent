@@ -14,6 +14,7 @@ from omnigent import (
     claude_native_bridge,
     codex_native_bridge,
     cursor_native,
+    cursor_native_bridge,
     kiro_native,
     kiro_native_bridge,
 )
@@ -340,6 +341,19 @@ async def test_cursor_native_model_options_use_cli_catalog(
         }
     ]
     monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", lambda: expected)
+    injected: list[tuple[str, str | None]] = []
+
+    def _inject_model(
+        _bridge_dir: Path,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> None:
+        del timeout_s
+        injected.append((model, expected_display_name))
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _inject_model)
     spec = AgentSpec(
         spec_version=1,
         name="t",
@@ -362,9 +376,15 @@ async def test_cursor_native_model_options_use_cli_catalog(
         )
         assert create_resp.status_code == 201, create_resp.text
         response = await client.get(f"/v1/sessions/{conv_id}/cursor-model-options")
+        event_response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "provider-latest"},
+        )
 
     assert response.status_code == 200
     assert response.json() == {"models": expected}
+    assert event_response.status_code == 204
+    assert injected == [("provider-latest", "Provider Latest")]
 
 
 @pytest.mark.asyncio

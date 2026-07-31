@@ -2223,11 +2223,17 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
     """
     from omnigent.spec.types import ExecutorSpec
 
-    captured: list[tuple[Any, str, float]] = []
+    captured: list[tuple[Any, str, str | None, float]] = []
 
-    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> None:
         """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, model, timeout_s))
+        captured.append((bridge_dir, model, expected_display_name, timeout_s))
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
 
@@ -2269,8 +2275,9 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
         f"got {resp.status_code}: {resp.text}"
     )
     assert len(captured) == 1, f"Expected one inject_model_command call, got {len(captured)}."
-    _bridge_dir, model, timeout_s = captured[0]
+    _bridge_dir, model, expected_display_name, timeout_s = captured[0]
     assert model == "gpt-5.2", f"Expected the model id passed through, got {model!r}."
+    assert expected_display_name is None
     assert timeout_s == 1.0
 
 
@@ -2348,9 +2355,15 @@ async def test_events_model_change_on_cursor_native_session_returns_503_when_not
     """
     from omnigent.spec.types import ExecutorSpec
 
-    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> None:
         """Simulate the bridge-not-ready path."""
-        del bridge_dir, model, timeout_s
+        del bridge_dir, model, expected_display_name, timeout_s
         raise RuntimeError("tmux target is not advertised")
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)

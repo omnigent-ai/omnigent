@@ -1796,6 +1796,7 @@ def create_runner_app(
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
         str, asyncio.Task[ClaudeNativeUcodeConfig | None]
@@ -3098,6 +3099,7 @@ def create_runner_app(
 
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
@@ -4480,11 +4482,14 @@ def create_runner_app(
         if model is None or not model.strip():
             return Response(status_code=204)
         bridge_dir = bridge_dir_for_session_id(conv_id)
+        selected_model = model.strip()
+        expected_display_name = _session_cursor_model_names.get(conv_id, {}).get(selected_model)
         try:
             await asyncio.to_thread(
                 inject_model_command,
                 bridge_dir,
-                model=model.strip(),
+                model=selected_model,
+                expected_display_name=expected_display_name,
                 timeout_s=1.0,
             )
         except (RuntimeError, ValueError) as exc:
@@ -5404,6 +5409,7 @@ def create_runner_app(
             )
             _session_spec_cache.pop(conv, None)
             _session_skills_cache.pop(conv, None)
+            _session_cursor_model_names.pop(conv, None)
             _drop_session_claude_launch_config(conv)
             _session_tool_schemas.pop(conv, None)
             _session_snapshot_cache.pop(conv, None)
@@ -8065,6 +8071,11 @@ def create_runner_app(
                     ),
                 },
             )
+        _session_cursor_model_names[session_id] = {
+            str(option["id"]): str(option["displayName"])
+            for option in models
+            if option.get("id") and option.get("displayName")
+        }
         return JSONResponse(status_code=200, content={"models": models})
 
     @app.get("/v1/sessions/{session_id}/claude-model-options")
@@ -8312,6 +8323,7 @@ def create_runner_app(
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
