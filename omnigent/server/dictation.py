@@ -404,7 +404,8 @@ class SherpaDictationEngine:
         cleaned = _PUNCT_STRIP_RE.sub("", text.lower())
         try:
             with self._lock:
-                return self._punct.add_punctuation_with_case(cleaned)
+                result = self._punct.add_punctuation_with_case(cleaned)
+            return result if isinstance(result, str) else text
         except Exception:  # noqa: BLE001 - never fail a take over cosmetics
             return text
 
