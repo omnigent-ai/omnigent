@@ -68,8 +68,8 @@ a non-empty ``arguments`` block (the registry declares it
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -111,7 +111,7 @@ _UNPRICED_ASK: PolicyResponse = {
 }
 
 
-def _usage_is_unpriced(usage: dict[str, Any]) -> bool:
+def _usage_is_unpriced(usage: Mapping[str, object]) -> bool:
     """Return ``True`` when token usage is present but cost is unpriced.
 
     The session has had at least one turn (token counters are non-zero) yet
@@ -555,7 +555,7 @@ def cost_budget(
                     }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 def _user_daily_cost_usd(event: PolicyEvent) -> float:
@@ -740,7 +740,7 @@ def user_daily_cost_budget(
                     }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # session_state key recording the highest ``ask_thresholds_usd`` checkpoint
@@ -880,12 +880,12 @@ def subagent_cost_budget(
                     }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.cost.cost_budget",
         "kind": "factory",
