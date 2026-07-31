@@ -108,6 +108,7 @@ def test_databricks_supervisor_uses_catalog_default(monkeypatch: pytest.MonkeyPa
 
 def test_custom_supervisor_endpoint_requires_explicit_model(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """An unknown custom endpoint never inherits an unrelated vendor model."""
     monkeypatch.setenv("OPENAI_API_KEY", "configured")
@@ -120,9 +121,11 @@ def test_custom_supervisor_endpoint_requires_explicit_model(
 
     monkeypatch.setattr(wizard, "default_chat_model", unexpected_catalog_lookup)
 
+    answers = iter(("", "custom-model"))
+
     def prompt(label: str, *, default: str | None = None, **_: object) -> str:
         assert (label, default) == ("Supervisor model", None)
-        return "custom-model"
+        return next(answers)
 
     monkeypatch.setattr(wizard, "_text_prompt", prompt)
 
@@ -130,3 +133,26 @@ def test_custom_supervisor_endpoint_requires_explicit_model(
 
     assert config.model == "custom-model"
     assert config.base_url == "https://gateway.example.test/v1"
+    assert "Please enter a model id." in capsys.readouterr().out
+
+
+def test_openai_supervisor_requires_model_when_catalog_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty OpenAI catalog falls back to explicit operator input."""
+    monkeypatch.setenv("OPENAI_API_KEY", "configured")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setattr(wizard, "_list_databricks_profiles", list)
+    monkeypatch.setattr(wizard, "_arrow_menu", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(wizard, "default_chat_model", lambda provider: None)
+    answers = iter(("", "operator-model"))
+
+    def prompt(label: str, *, default: str | None = None, **_: object) -> str:
+        assert (label, default) == ("Supervisor model", None)
+        return next(answers)
+
+    monkeypatch.setattr(wizard, "_text_prompt", prompt)
+
+    config = wizard._prompt_openai_agents_config()
+
+    assert config.model == "operator-model"

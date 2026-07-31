@@ -1233,6 +1233,9 @@ def _prompt_openai_agents_config() -> _SupervisorConfig:
                 console.print()
                 console.print("  [bold]Which model should the supervisor use?[/bold]")
                 model = _text_prompt("Supervisor model", default=default_model)
+                if not model:
+                    console.print("  [red]Please enter a model id.[/red]")
+                    continue
 
                 return _SupervisorConfig(
                     harness="openai-agents",
