@@ -887,6 +887,8 @@ def create_app(
             from omnigent.server.accounts_bootstrap import bootstrap_admin
 
             _accounts_cfg = auth_provider._accounts_config
+            if _accounts_cfg is None:
+                raise ValueError("accounts auth provider requires accounts_config")
             _bootstrap_result = bootstrap_admin(
                 account_store,
                 init_admin_password=_accounts_cfg.init_admin_password,
@@ -1747,16 +1749,17 @@ def create_app(
         # config is wired AND its provider can actually serve a managed
         # launch (staged providers parse but reject at launch — they
         # must not advertise the option).
-        managed_sandboxes_enabled = (
-            sandbox_config is not None and sandbox_config.managed_launch_supported
-        )
         # sandbox_provider names the backing provider (e.g. "modal",
         # "islo") so the web UI can label the option per provider
         # ("Modal Sandbox" / "Islo Sandbox") instead of the
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
-        sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        managed_sandboxes_enabled = False
+        sandbox_provider = None
+        if sandbox_config is not None and sandbox_config.managed_launch_supported:
+            managed_sandboxes_enabled = True
+            sandbox_provider = sandbox_config.provider
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
