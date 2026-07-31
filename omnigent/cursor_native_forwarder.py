@@ -509,9 +509,9 @@ def _read_last_used_model(store_path: Path) -> str | None:
 
     cursor records the active model in the ``meta`` table under key ``"0"`` as a
     hex-encoded JSON blob carrying ``lastUsedModel`` — the *base* model id (e.g.
-    ``"gpt-5.2"``, ``"claude-opus-4-6"``), the same namespace the curated picker
-    catalog (:func:`omnigent.cursor_native.cursor_base_model_options`) and the
-    ``/model`` picker use, so a mirrored value matches a picker option. It
+    ``"gpt-5.2"``, ``"claude-opus-4-6"``), the same namespace the live CLI
+    catalog parser and the ``/model`` picker use, so a mirrored value matches a
+    picker option. It
     updates in place whenever the user switches model in the TUI, so polling it
     is how the web picker learns of a terminal-side switch (the reverse of
     :func:`omnigent.cursor_native_bridge.inject_model_command`).

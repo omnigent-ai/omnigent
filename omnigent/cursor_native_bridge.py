@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import click
+
 from omnigent._platform import stable_user_id
 
 #: Env var carrying the bridge dir into the harness executor process.
@@ -739,6 +741,7 @@ def inject_model_command(
     bridge_dir: Path,
     *,
     model: str,
+    expected_display_name: str | None = None,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
     """Switch the live Cursor model by driving the TUI ``/model`` picker.
@@ -752,8 +755,10 @@ def inject_model_command(
     the cursor analog of claude-native's ``inject_slash_command('/model …')``.
 
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
-    :param model: cursor-agent model id, e.g. ``"gpt-5.2"`` (the same ids
-        ``cursor-agent --list-models`` reports).
+    :param model: cursor-agent base model id, e.g. ``"gpt-5.2"`` (derived from
+        ``cursor-agent models`` by stripping effort variants).
+    :param expected_display_name: Display name from the already-fetched live
+        picker catalog. ``None`` refreshes the catalog before switching.
     :param timeout_s: Per-readiness-gate timeout.
     :raises RuntimeError: If the tmux target is never advertised, the TUI has
         exited, a tmux command fails, or the picker reports no match for *model*
@@ -763,6 +768,19 @@ def inject_model_command(
     model = model.strip()
     if not model:
         raise RuntimeError("cursor-native model switch requires a non-empty model id")
+    if expected_display_name is None:
+        try:
+            expected_display_name = next(
+                option["displayName"]
+                for option in _live_cursor_model_options()
+                if option.get("id") == model
+            )
+        except (click.ClickException, OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise RuntimeError("cursor-native could not verify the live model catalog") from exc
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"cursor model {model!r} is not available in the live catalog"
+            ) from exc
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
@@ -794,7 +812,8 @@ def inject_model_command(
     time.sleep(_MODEL_PICKER_SETTLE_S)
     # Re-read after the settle: a transient "No matches" can flash mid-filter,
     # and a real match may only resolve once the debounce fires.
-    if _PICKER_NO_MATCH_MARKER in _capture_pane(socket_path, tmux_target):
+    settled_pane = _capture_pane(socket_path, tmux_target)
+    if _PICKER_NO_MATCH_MARKER in settled_pane:
         # Dismiss the picker and clear the composer so the literal "/model <id>"
         # can't be submitted as a chat message, then fail loudly so the web
         # surfaces an honest error instead of silently selecting nothing.
@@ -804,7 +823,44 @@ def inject_model_command(
             f"cursor model {model!r} is not available in the picker (no match); "
             "the model was not switched"
         )
+    highlighted_row = _picker_highlighted_row(settled_pane)
+    if (
+        _PICKER_MATCH_MARKER not in settled_pane
+        or highlighted_row is None
+        or not _picker_row_matches_display(highlighted_row, expected_display_name)
+    ):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+        _clear_composer(socket_path, tmux_target)
+        raise RuntimeError(
+            f"cursor model {model!r} did not resolve to its exact picker row; "
+            "the model was not switched"
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+
+
+def _live_cursor_model_options() -> list[dict[str, Any]]:
+    """Read the same live catalog that supplies Cursor's Web picker."""
+    from omnigent.cursor_native import list_cursor_cli_model_options
+
+    return list_cursor_cli_model_options()
+
+
+def _picker_highlighted_row(pane: str) -> str | None:
+    """Return the text of Cursor's currently highlighted picker row."""
+    for line in pane.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("→"):
+            return stripped.removeprefix("→").strip()
+    return None
+
+
+def _picker_row_matches_display(row: str, display_name: str) -> bool:
+    """Match a base display name without accepting a longer-name prefix."""
+    normalized_row = " ".join(row.casefold().split())
+    normalized_display = " ".join(display_name.casefold().split())
+    return normalized_row == normalized_display or normalized_row.startswith(
+        f"{normalized_display} "
+    )
 
 
 def _wait_for_pane_settle(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:

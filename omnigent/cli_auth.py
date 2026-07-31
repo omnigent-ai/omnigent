@@ -18,10 +18,12 @@ See ``designs/OIDC_AUTH.md`` §CLI Login Flow.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import stat
+import tempfile
 import time
 from pathlib import Path
 
@@ -53,6 +55,58 @@ def _normalize_server_url(server_url: str) -> str:
     return server_url.rstrip("/")
 
 
+def _write_tokens_file(path: Path, data: dict[str, dict[str, str | float]]) -> None:
+    """Atomically write the auth-tokens file, never exposing it readable.
+
+    The previous sequence was ``path.write_text(...)`` followed by ``os.chmod``.
+    ``write_text`` creates a missing file at the process umask (``0o644`` on a
+    typical box), so on the very first login — exactly when a session JWT is
+    first persisted — the token sat world-readable on disk until the ``chmod``
+    landed. ``clear_token`` did not ``chmod`` at all, relying on the mode of a
+    file that may not have been created here.
+
+    Mirrors ``claude_native_bridge._atomic_write_user_json``: write a
+    ``0o600`` temp beside the target, ``fsync``, then ``os.replace``. The temp
+    is created by :mod:`tempfile` with owner-only permissions before any bytes
+    are written, and the rename means a crash mid-write can no longer truncate
+    the file and lose every stored token.
+
+    Hardens the parent to ``0o700`` first (``mkdir`` alone won't
+    re-permission an existing ``0o755`` dir), so every writer routes
+    through here — including ``clear_token``.
+
+    :param path: Destination file, i.e. ``~/.omnigent/auth_tokens.json``.
+    :param data: The full token map to serialise.
+    :returns: None.
+    :raises OSError: If the temp cannot be written or replaced into place.
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(path.parent, stat.S_IRWXU)
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+
+
 def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
     """Create or update a server's record in the auth-tokens file.
 
@@ -66,7 +120,6 @@ def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
         ``{"token": "...", "user_id": "...", "expires_at": 1750000000.0}``.
     """
     path = _token_file_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     data: dict[str, dict[str, str | float]] = {}
     if path.exists():
@@ -77,8 +130,7 @@ def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
 
     data[_normalize_server_url(server_url)] = entry
 
-    path.write_text(json.dumps(data, indent=2))
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    _write_tokens_file(path, data)
 
 
 def store_token(
@@ -318,4 +370,4 @@ def clear_token(server_url: str) -> None:
     key = _normalize_server_url(server_url)
     if key in data:
         del data[key]
-        path.write_text(json.dumps(data, indent=2))
+        _write_tokens_file(path, data)

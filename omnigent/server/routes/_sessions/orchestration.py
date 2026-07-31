@@ -6099,7 +6099,7 @@ async def _handle_mcp_tools_call(
         # If the policy returned transformed arguments (e.g.
         # PII-redacted args), use them instead of the originals.
         if call_result.data is not None:
-            arguments = call_result.data
+            arguments = cast("dict[str, object]", call_result.data)
 
     # ── Server-side sys_advise_models intercept ──────────────────────────
     # After policy evaluation (DENY/ASK handled above); arguments may have
@@ -6323,18 +6323,13 @@ async def _fetch_model_options(
 
     Three shapes:
 
-    * **cursor-native** — a curated *static* base catalog
-      (:func:`omnigent.cursor_native.cursor_base_model_options`), returned
-      directly on every snapshot. It deliberately bypasses the runner-backed
-      cache below: the catalog never changes per session, and routing it
-      through that cache would let a ``refresh_state`` snapshot (which pops the
-      cache) blank the picker on an effort/model change.
-    * **codex-native / kiro-native** — a *live* catalog only the bound runner
-      can read (its app-server ``model/list``). Like skills, this stays off the
-      snapshot hot path: the first snapshot kicks a background fetch and returns
-      ``[]``; subsequent snapshots serve the cache. The cache outlives the
-      runner: with no runner bound (asleep session) it keeps serving, and a
-      stale-marked entry serves while a live re-fetch replaces it.
+    * **codex-native / cursor-native / kiro-native** — a *live* catalog only
+      the bound runner can read from the installed CLI. Like skills, this stays
+      off the snapshot hot path: the first snapshot kicks a background fetch
+      and returns ``[]``; subsequent snapshots serve the cache. The cache
+      outlives the runner: with no runner bound (asleep session) it keeps
+      serving, and a stale-marked entry serves while a live re-fetch replaces
+      it.
     * **claude-native** — the provider-neutral aliases from the exact launch
       config, refreshed from Databricks before each new terminal starts.
       With no runner bound and a cold cache (server restart while the
@@ -6350,10 +6345,6 @@ async def _fetch_model_options(
         the runner-owned options are not yet available.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    if wrapper == _CURSOR_NATIVE_WRAPPER_LABEL_VALUE:
-        from omnigent.cursor_native import cursor_base_model_options
-
-        return cursor_base_model_options()
     if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
         # pi-native's catalog is PUSHED by its extension (its live
         # ``ctx.modelRegistry``), not fetched: that reflects the models pi
@@ -6501,14 +6492,16 @@ async def _get_session_snapshot(
         runner_client = get_runner_client()
 
     if refresh_state:
-        # Re-discover runner-backed overlays. Drop the model catalog only
-        # when a live runner can serve the re-fetch immediately; with no
-        # runner bound the cached catalog is all there is — keep serving it
-        # (stale) so a reload of an asleep session doesn't blank the picker.
+        wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        # Cursor effort/model changes refresh snapshots; keep its previous
+        # options visible until the asynchronous CLI re-fetch replaces them.
+        # Other live catalogs retain their existing drop-on-refresh contract.
         _invalidate_runner_backed_snapshot_state(
             session_id,
             cancel_inflight=False,
-            drop_model_options=runner_client is not None,
+            drop_model_options=(
+                runner_client is not None and wrapper != _CURSOR_NATIVE_WRAPPER_LABEL_VALUE
+            ),
         )
 
     status = _session_status_from_cache(session_id)

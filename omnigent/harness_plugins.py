@@ -33,6 +33,7 @@ from omnigent.harness_capabilities import (
     AuthModel,
     EffortFamily,
     Elicitation,
+    ForkHistory,
     HarnessCapabilities,
     IntegrationMode,
     ModelFamily,
@@ -305,6 +306,14 @@ _RS = Resume
 _EF = EffortFamily
 _MF = ModelFamily
 _AU = AuthModel
+_FH = ForkHistory
+
+# Bench shell-tool provocation prompts (moved off the bench's hardcoded
+# _NATIVE_TOOL_PROVOCATION table): the generic variant, and a Bash-specific one
+# for harnesses whose exec tool is literally "Bash". Both keep the
+# "omnigent-bench-ok" placeholder the bench token-swaps per allow/deny probe.
+_SHELL_PROMPT = "Use your shell/terminal tool to run this exact command: echo omnigent-bench-ok"
+_BASH_PROMPT = "Use the Bash tool to run this exact command: echo omnigent-bench-ok"
 
 # Trailing two bools are (interrupt, streaming). Only the four P0 SDK harnesses
 # (claude-sdk, codex, pi, openai-agents) have these verified live by the harness
@@ -322,6 +331,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="Bash",
+        shell_tool_prompt=_BASH_PROMPT,
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
@@ -333,6 +345,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="shell",
+        shell_tool_prompt=_SHELL_PROMPT,
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
@@ -350,6 +365,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="Bash",
+        shell_tool_prompt=_BASH_PROMPT,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -362,6 +380,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        fork_history=_FH.PREAMBLE,
+        # No shell-tool provocation: cursor-native was intentionally absent from
+        # the bench's table (its tool probe is skipped), so leave shell_tool_* None.
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
@@ -376,6 +397,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        fork_history=_FH.NONE,
+        shell_tool_name="shell",
+        shell_tool_prompt=_SHELL_PROMPT,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -387,6 +411,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.NONE,
+        shell_tool_name="run_command",
+        shell_tool_prompt=_SHELL_PROMPT,
     ),
     "goose-native": _C(
         _IM.NATIVE_TUI,
@@ -398,6 +425,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.NONE,
+        shell_tool_name="developer__shell",
+        shell_tool_prompt=_SHELL_PROMPT,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
@@ -410,6 +440,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="run_shell_command",
+        shell_tool_prompt=_SHELL_PROMPT,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
@@ -421,6 +454,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.NONE,
+        shell_tool_name="Bash",
+        shell_tool_prompt=_BASH_PROMPT,
     ),
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
@@ -432,6 +468,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.PREAMBLE,
+        # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
+        # shell_tool_* stay None.
     ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
@@ -443,6 +482,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="terminal",
+        shell_tool_prompt=_SHELL_PROMPT,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
