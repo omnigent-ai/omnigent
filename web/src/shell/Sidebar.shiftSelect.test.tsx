@@ -45,18 +45,23 @@ describe("computeShiftSelectRange", () => {
 
 // ── Integration tests ───────────────────────────────────────────────────────
 
-const { projectsMock, conversationsRef, projectSessionsMock } = vi.hoisted(() => ({
+const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock } = vi.hoisted(() => ({
   projectsMock: [] as string[],
   conversationsRef: {
     current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
   },
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
+  bulkArchiveMock: { mutate: vi.fn() },
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkArchiveConversations: () => ({
+    mutate: bulkArchiveMock.mutate,
+    isPending: false,
+    isError: false,
+  }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
@@ -165,6 +170,7 @@ function renderSidebar() {
 
 beforeEach(() => {
   useConvMock.mockReset();
+  bulkArchiveMock.mutate.mockReset();
   localStorage.clear();
   projectsMock.length = 0;
   projectSessionsMock.current = {};
@@ -264,6 +270,52 @@ describe("Sidebar shift-click selection", () => {
     // grow the selection (it has no checkbox and its link stays a navigation).
     fireEvent.click(screen.getByRole("link", { name: "c1" }), { shiftKey: true });
     expect(screen.getByText("3 selected")).toBeInTheDocument();
+  });
+
+  it("resolves a folder session outside the global window for shift-select AND bulk archive", async () => {
+    // Regression: the folder paginates independently of the global list, so it
+    // can render a member (p3) the global window hasn't loaded. Projects-scope
+    // selection must resolve rows against the folder's own query, not the global
+    // list — otherwise p3 would toggle a count but silently drop from the range
+    // and from the bulk action.
+    projectsMock.push("Alpha");
+    // Global window: only p1, p2 (p3 is beyond it).
+    mockConversations([
+      conv("p1", { labels: { omni_project: "Alpha" } }),
+      conv("p2", { labels: { omni_project: "Alpha" } }),
+    ]);
+    // The folder's OWN query returns p1, p2, p3 — p3 is out-of-window.
+    projectSessionsMock.current["Alpha"] = [
+      conv("p1", { labels: { omni_project: "Alpha" } }),
+      conv("p2", { labels: { omni_project: "Alpha" } }),
+      conv("p3", { labels: { omni_project: "Alpha" } }),
+    ];
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+
+    // Shift-select p1 → p3: the range must span all three (including the
+    // out-of-window p3), not collapse to a single toggle.
+    fireEvent.click(await screen.findByRole("link", { name: "p1" }));
+    fireEvent.click(screen.getByRole("link", { name: "p3" }), { shiftKey: true });
+    await waitFor(() => {
+      expect(screen.getByText("3 selected")).toBeInTheDocument();
+    });
+
+    // Bulk-archive must fire with ALL three ids — p3 must not be silently
+    // dropped because the global window didn't resolve it.
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+    await waitFor(() => {
+      expect(bulkArchiveMock.mutate).toHaveBeenCalledTimes(1);
+    });
+    const [{ ids, archived }] = bulkArchiveMock.mutate.mock.calls[0];
+    expect(archived).toBe(true);
+    expect([...ids].sort()).toEqual(["p1", "p2", "p3"]);
   });
 
   it("normal click after shift-select sets a new anchor", async () => {
