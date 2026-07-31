@@ -5412,7 +5412,7 @@ def create_runner_app(
                 return resolved, None
             return None, None
 
-        async def proxy_stream():
+        async def proxy_stream() -> AsyncIterator[bytes]:
             import asyncio as _asyncio
             import json as _json
 
