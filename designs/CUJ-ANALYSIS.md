@@ -339,7 +339,7 @@ injection (agent holds a placeholder, proxy swaps the real secret). Mapped under
 
 ### 2.G  Onboarding, credentials & auth (incl. token refresh) ✅
 
-**First-run setup** — `omnigent setup` wizard (`onboarding/wizard.py`): provider picker, **ambient detection**
+**First-run setup** — `omnigent setup` (`cli.py` / `cli_config.py`): provider picker, **ambient detection**
 (`onboarding/ambient.py` scans installed CLIs — Claude.app, Codex, LM Studio), saves `~/.omnigent/config.yaml`.
 Databricks profile aliasing reuses same-host profiles to avoid redundant OAuth (`onboarding/setup.py:_alias_profile`).
 

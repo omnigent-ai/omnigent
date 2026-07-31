@@ -123,7 +123,9 @@ async function drain(): Promise<void> {
   // Timer turns must elapse in order to flush each queued stage.
   /* oxlint-disable no-await-in-loop */
   for (let k = 0; k < 4; k += 1) {
-    await new Promise<void>((r) => setTimeout(r, 0));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
   }
   /* oxlint-enable no-await-in-loop */
 }

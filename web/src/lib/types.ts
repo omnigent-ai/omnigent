@@ -96,7 +96,7 @@ export interface Response {
   /** "queued" | "in_progress" | "completed" | "failed" | "incomplete" | "cancelled". */
   status: string;
   model: string;
-  output?: Array<Record<string, unknown>>;
+  output?: Record<string, unknown>[];
   createdAt?: number;
   completedAt?: number | null;
   previousResponseId?: string | null;
@@ -353,7 +353,7 @@ export interface Session {
    * raw SSE shape so the existing `sse.ts` parser can fold them
    * back into the block stream.
    */
-  pendingElicitations?: Array<Record<string, unknown>>;
+  pendingElicitations?: Record<string, unknown>[];
   /**
    * Un-consumed web-composer user messages on native-terminal
    * sessions at snapshot time. Replayed so a client that posted then
@@ -404,11 +404,11 @@ export interface Session {
    * build time so the panel survives page refresh. Empty array for
    * non-claude-native sessions or before the first turn creates todos.
    */
-  todos?: Array<{
+  todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
   /**
    * Skills the bound agent has access to (bundled + host-discovered,
    * subject to the spec's ``skills_filter``). Populated by the

@@ -16,6 +16,19 @@ expressions for Seatbelt), but the *decision* of which paths to mask
 is identical. Centralising the walker here guarantees both backends
 hide exactly the same set of entries; only the emit shape differs.
 
+Recursion is controlled by the ``recursive`` flag, which defaults to
+``False`` (top-level-only) — the same default as the spec key
+``cwd_hidden_scan_recursive`` that every sandbox backend threads
+through, so the walker and the product agree on one default. Set it
+to ``True`` (spec: ``cwd_hidden_scan_recursive: true``) to walk the
+whole tree.
+
+Top-level-only is the scalable default for medium/large projects: it
+still masks the credential-shaped dotfiles that live at the root of
+``cwd`` / ``$HOME`` (``.git``, ``.env``, ``.aws``, ``.ssh``, ...)
+without paying to walk the whole tree. Deeply nested dotfiles are left
+visible in that mode; enable recursion for untrusted trees.
+
 The walker also implements the bounded-traversal contract:
 
 - ``cwd_hidden_scan_max_entries`` caps how many filesystem entries
@@ -133,6 +146,7 @@ def scan_cwd_mask_entries(
     safe_roots: Sequence[Path],
     max_entries: int,
     overflow: str,
+    recursive: bool = False,
     logger_name: str | None = None,
     scope_label: str = "cwd",
     deprioritize_names: Sequence[str] = _DEFAULT_DEPRIORITIZED_DIRS,
@@ -189,6 +203,16 @@ def scan_cwd_mask_entries(
         disable the cap.
     :param overflow: One of ``"error"``, ``"warn"``, ``"unlimited"``.
         See module docstring for per-mode semantics.
+    :param recursive: Whether to descend into subdirectories. Defaults
+        to ``False`` (top-level-only), matching the spec key
+        ``cwd_hidden_scan_recursive`` that every backend passes
+        through. When ``False`` the walker scans only the immediate
+        children of *cwd* — the top-level dotfile / escaping-symlink
+        checks still run, but a dotfile nested below the top level
+        (e.g. ``cwd/src/config/.env``) is NOT masked, and the entry
+        cap and deprioritization machinery are effectively no-ops
+        because no subtree is ever queued. Pass ``True`` to walk the
+        whole tree.
     :param logger_name: Logger name used for the warn-mode warning
         message. ``None`` falls back to this module's logger; backends
         pass their own logger name so the warning surfaces under the
@@ -291,7 +315,9 @@ def scan_cwd_mask_entries(
             # Not masked — recurse only into real directories so a
             # rogue symlink-to-dir can't cause a loop. Deprioritized
             # dirs go to the deferred tier so they're walked last.
-            if child.is_dir(follow_symlinks=False):
+            # When ``recursive`` is False we scan only the top level of
+            # each root, so we never descend past the immediate children.
+            if recursive and child.is_dir(follow_symlinks=False):
                 if child.name in deprioritize:
                     deferred.append(child_path)
                 else:

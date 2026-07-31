@@ -41,6 +41,7 @@ def _scan(
     safe_roots: list[Path] | None = None,
     max_entries: int = _DEFAULT_MAX,
     overflow: str = "error",
+    recursive: bool = True,
     deprioritize_names: list[str] | None = None,
 ) -> list[MaskedEntry]:
     """
@@ -65,6 +66,10 @@ def _scan(
         cap/overflow tests can assert on the raised :class:`OSError`;
         note this differs from the production default (``"warn"``),
         which is pinned in the spec-parser tests instead.
+    :param recursive: Whether the walker descends into subdirectories.
+        Default ``True`` here so the existing recursive-behaviour
+        tests keep passing; note the production default is ``False``
+        (top-level only), pinned in the spec-parser tests.
     :param deprioritize_names: Directory basenames walked last.
         ``None`` (the default) lets the walker apply its own default
         (``("node_modules",)``); pass ``[]`` to disable
@@ -83,6 +88,7 @@ def _scan(
             safe_roots=roots,
             max_entries=max_entries,
             overflow=overflow,
+            recursive=recursive,
         )
     return scan_cwd_mask_entries(
         cwd.resolve(strict=False),
@@ -90,6 +96,7 @@ def _scan(
         safe_roots=roots,
         max_entries=max_entries,
         overflow=overflow,
+        recursive=recursive,
         deprioritize_names=deprioritize_names,
     )
 
@@ -242,6 +249,52 @@ def test_nested_dotfile_is_marked(tmp_path: Path) -> None:
     assert entry.kind == "file"
     # Sibling non-dotfile stays visible.
     assert _entry_for(entries, nested_dir / "main.py") is None
+
+
+def test_non_recursive_masks_top_level_only(tmp_path: Path) -> None:
+    """
+    With ``recursive=False`` the walker masks top-level dotfiles but
+    leaves dotfiles nested below the top level visible. This is the
+    scalable production default: top-level ``.env`` is still hidden,
+    but the walker never descends ``cwd/services/api``.
+    """
+    top_secret = tmp_path / ".env"
+    top_secret.write_text("TOP=secret")
+    nested_dir = tmp_path / "services" / "api"
+    nested_dir.mkdir(parents=True)
+    nested_secret = nested_dir / ".env"
+    nested_secret.write_text("DB_PASSWORD=secret")
+
+    entries = _scan(tmp_path, allow_hidden=[".venv"], recursive=False)
+
+    top_entry = _entry_for(entries, top_secret)
+    assert top_entry is not None
+    assert top_entry.kind == "file"
+    assert _entry_for(entries, nested_secret) is None, (
+        "Non-recursive scan must not descend into subdirectories; nested .env should stay visible."
+    )
+
+
+def test_non_recursive_ignores_nested_escaping_symlink(tmp_path: Path) -> None:
+    """
+    The symlink-escape defense is depth-1 in non-recursive mode: a
+    top-level escaping symlink is masked but one nested under a
+    subdirectory is not (the walker never reaches it).
+    """
+    target = Path("/etc/shadow")
+    if not target.exists():
+        pytest.skip("/etc/shadow not present on this host")
+    top_link = tmp_path / "leak"
+    top_link.symlink_to(target)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    nested_link = sub / "leak"
+    nested_link.symlink_to(target)
+
+    entries = _scan(tmp_path, allow_hidden=[".venv"], recursive=False)
+
+    assert _entry_for(entries, top_link) is not None
+    assert _entry_for(entries, nested_link) is None
 
 
 def test_walker_prunes_at_masked_dotdir(tmp_path: Path) -> None:

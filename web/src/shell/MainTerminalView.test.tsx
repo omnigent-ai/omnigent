@@ -1,3 +1,5 @@
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
@@ -27,7 +29,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (AGENT_TERMINAL_IDS, terminalTabKey) —
   // only the network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(),
 }));
 

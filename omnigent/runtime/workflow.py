@@ -870,6 +870,8 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     assert auth_source is not None  # base_urls non-empty ⇒ one family resolved
     env[_HARNESS_GATEWAY_FLAG["pi"]] = "true"
     env["HARNESS_PI_GATEWAY_BASE_URLS"] = json.dumps(base_urls, sort_keys=True)
+    if openai is not None and openai.wire_api is not None:
+        env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] = openai.wire_api
     env["HARNESS_PI_GATEWAY_HOST"] = _origin_of(next(iter(base_urls.values())))
     env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] = _provider_auth_command(auth_source)
     # Model precedence: spec model > provider ``models.default`` > catalog

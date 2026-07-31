@@ -2248,6 +2248,14 @@ def register_core_routes(
                 code=ErrorCode.NOT_FOUND,
             ) from exc
 
+        # The catalog cache is keyed by session, not harness family, and
+        # outlives runner death — after a switch its rows may belong to the
+        # old wrapper. Drop them (and any in-flight fetch against the old
+        # endpoint) so the next live snapshot re-fetches the new family's.
+        _invalidate_runner_backed_snapshot_state(
+            session_id, cancel_inflight=True, drop_model_options=True
+        )
+
         # Tell every connected client the binding changed so they re-derive
         # session state (presentation labels, bound agent) from a fresh
         # snapshot. Without this, a client that bound before the switch keeps

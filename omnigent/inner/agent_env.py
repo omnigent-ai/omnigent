@@ -101,9 +101,12 @@ def declared_passthrough(os_env: object | None) -> tuple[str, ...]:
     """Env-var names the spec declared for passthrough.
 
     Lives on ``os_env.sandbox.env_passthrough``. Returns an empty tuple when
-    any link in that chain is absent. Duplicated from
-    ``codex_executor._declared_passthrough`` so non-codex harnesses do not have
-    to import the codex module to read a field that belongs to the sandbox spec.
+    any link in that chain is absent.
+
+    Lives here rather than in any one executor so no harness has to import a
+    sibling harness's module to read a field that belongs to the sandbox spec.
+    Duck-typed on purpose: the only contract is the ``sandbox.env_passthrough``
+    chain, so a caller holding a partially-built or stubbed spec is fine.
     """
     sandbox = getattr(os_env, "sandbox", None) if os_env is not None else None
     names = getattr(sandbox, "env_passthrough", None) if sandbox is not None else None

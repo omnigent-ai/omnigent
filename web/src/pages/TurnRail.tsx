@@ -20,7 +20,9 @@ export interface Turn {
 }
 
 /** Scroll container for the rail; also drives its own scroll for fetch-on-top. */
-type Scroller = { el: HTMLElement };
+interface Scroller {
+  el: HTMLElement;
+}
 
 // Rail scrollTop below which we treat the user as "near the top" and page in
 // older history — mirrors HistoryAutoLoader's transcript threshold.
