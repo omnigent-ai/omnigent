@@ -2318,7 +2318,8 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     auto-bootstrap: it launches Codex in the session terminal, derives the
     gateway auth from its own credentials, and pre-accepts the first-run
     trust/onboarding prompts — no CLI client required. ``model=None`` lets the
-    configured provider's default model win (matching ``_build_codex_native_bundle``).
+    configured provider's default model win (matching the seeded codex bundle
+    built via ``_build_native_bundle``).
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
