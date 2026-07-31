@@ -119,7 +119,7 @@ function mockChildTree(tree: Record<string, ChildSessionInfo[]>) {
 
 /** Agent-type → category-icon expectations. Order-sensitive cases (review
  *  before code, test before code) guard the substring precedence. */
-const ICON_CASES: Array<[string | null, ReturnType<typeof iconForAgentType>]> = [
+const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
   ["Explore", SearchIcon],
   ["deep-researcher", BookOpenIcon],
   ["planner", CompassIcon],
@@ -334,12 +334,12 @@ describe("SubagentsPanel", () => {
     expect(screen.queryByTestId("add-agent-dialog")).toBeNull();
   });
 
-  const AGENT_KIND_CASES: Array<{
+  const AGENT_KIND_CASES: {
     name: string;
     labels: Record<string, string>;
     agentName?: string | null;
     expectedKind: string;
-  }> = [
+  }[] = [
     {
       name: "claude-native wrapper → claude-native marker",
       labels: { "omnigent.wrapper": "claude-code-native-ui" },
