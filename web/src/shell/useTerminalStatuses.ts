@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type ConnectionState } from "@/components/blocks/TerminalSession";
-import { type TerminalInfo } from "@/hooks/useTerminals";
+import type { ConnectionState } from "@/components/blocks/TerminalSession";
+import type { TerminalInfo } from "@/hooks/useTerminals";
 import { useTerminalActivityStore } from "@/store/terminalActivity";
 import { deriveTerminalStatus, type TerminalStatus } from "./terminalStatus";
 

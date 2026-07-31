@@ -120,7 +120,7 @@ export function moveColumnToIndex(
  * contains `y`, or -1 if none.
  */
 export function rowIndexAtY(
-  rowRects: ReadonlyArray<{ top: number; bottom: number }>,
+  rowRects: readonly { top: number; bottom: number }[],
   y: number,
 ): number {
   for (let i = 0; i < rowRects.length; i++) {
@@ -134,7 +134,7 @@ export function rowIndexAtY(
  * or -1 if none.
  */
 export function colIndexAtX(
-  cellRects: ReadonlyArray<{ left: number; right: number; cellIndex: number }>,
+  cellRects: readonly { left: number; right: number; cellIndex: number }[],
   x: number,
 ): number {
   for (const r of cellRects) {

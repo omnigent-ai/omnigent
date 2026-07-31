@@ -196,6 +196,20 @@ export function AppShell() {
   const [openFiles, setOpenFiles] = useState<string[]>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).openFiles ?? []) : [],
   );
+  // Ordered list of open shell tabs (``terminalTabKey`` values) shown in the
+  // right rail's tab strip beside the file tabs. ``selectedTerminalKey`` is the
+  // active one (mutually exclusive with ``selectedFilePath`` — the rail's
+  // content slot shows one thing). Not persisted: terminal keys are
+  // session-scoped and the PTYs don't survive a reload, so a fresh visit starts
+  // with no shell tabs; a prune effect drops keys whose terminal has gone away.
+  const [openTerminals, setOpenTerminals] = useState<string[]>([]);
+  const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(null);
+  // Whether the workspace rail is maximized (covers the full content region,
+  // hiding the chat column). Session-transient — a fresh visit starts docked.
+  const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
+  // Sidebar open-state captured when entering full screen, so exiting can
+  // restore whatever the user had (collapsed stays collapsed; open reopens).
+  const sidebarOpenBeforeMaximizeRef = useRef(false);
   // false = full folder tree ("All"), true = changed-files-only flat list.
   // Surfaced as the Changed | All toggle inside the Files panel. Seeded from
   // the persisted, app-global preference (defaults to "All") so the choice
@@ -427,12 +441,11 @@ export function AppShell() {
     () => inventoryTerminals(terminals, terminalFirst),
     [terminals, terminalFirst],
   );
-  // The agent's spec declares shell access (a ``terminals:`` block) —
-  // the rail's Shells tab then shows BY DEFAULT, before any shell
-  // exists: its empty state carries the "+ New shell" affordance, so
-  // an empty tab is an entry point, not a dead end. Agents without
-  // shell access only get the tab once a shell actually exists
-  // (e.g. attached by other means).
+  // Whether the agent's spec declares shell access (a ``terminals:`` block).
+  // The desktop rail's Shells TAB shows only once a shell exists (creation is
+  // via the tab-strip "+" menu), but the MOBILE Shells drawer — which has no
+  // "+" menu — must be reachable at zero shells so its "+ New shell" row is the
+  // create entry point. So mobile gates on declared access too.
   const agentSupportsShells = (boundAgent?.terminals ?? []).length > 0;
   // The "root" session for the Subagents tab. The rail renders the whole
   // spawn tree from the top-level session, so when the user is inside a
@@ -509,26 +522,17 @@ export function AppShell() {
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
-        // Shells tab: shown by default when the agent's spec declares
-        // shell access (the empty state offers "+ New shell"), or once a
-        // shell exists for agents that don't. Inventory view: the
-        // embedded REPL terminal of terminal-first SDK sessions doesn't
-        // count — a session whose only terminal is the REPL and whose
-        // agent has no shell access shows no tab. ``hideTerminalsTab``
-        // is label-derived and starts false; ``railTerminals`` starts
-        // empty and ``agentSupportsShells`` starts false while the agent
-        // loads, so native sessions don't flash the tab.
-        terminals: !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
+        // Shells tab: shown only once a shell actually exists — creating one
+        // is now done from the tab strip's "+" menu, so an agent that merely
+        // *declares* shell access with no open shell shows no (empty) tab.
+        // Inventory view: the embedded REPL terminal of terminal-first SDK
+        // sessions doesn't count. ``hideTerminalsTab`` is label-derived and
+        // ``railTerminals`` starts empty while the agent loads, so native
+        // sessions don't flash the tab.
+        terminals: !hideTerminalsTab && railTerminals.length > 0,
         todos: todosSupported && todos.length > 0,
       }) as const,
-    [
-      showFilesPanel,
-      hideTerminalsTab,
-      railTerminals.length,
-      agentSupportsShells,
-      todosSupported,
-      todos.length,
-    ],
+    [showFilesPanel, hideTerminalsTab, railTerminals.length, todosSupported, todos.length],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -752,6 +756,18 @@ export function AppShell() {
     const nextSelected = urlFile ?? persisted.selectedFilePath ?? null;
     setOpenFiles(nextOpenFiles);
     setSelectedFilePath(nextSelected);
+    // Shell tabs are session-scoped and not persisted — a switch starts the
+    // incoming session with no open shell tabs (the prune effect would drop
+    // stale keys anyway once its terminals load).
+    setOpenTerminals([]);
+    setSelectedTerminalKey(null);
+    // A maximized rail is transient too — the incoming session starts docked.
+    // If we were maximized, restore the sidebar we collapsed on entry (the
+    // toggle handler won't run on a session switch).
+    setRightPanelMaximized((wasMaximized) => {
+      if (wasMaximized) restoreSidebarAfterMaximize();
+      return false;
+    });
     // A selected file must be visible in the rail. The Agents/Todos/Terminals
     // tabs don't render the inline viewer, so pull the rail to Files.
     if (nextSelected && nextTab !== "files") {
@@ -835,6 +851,10 @@ export function AppShell() {
   const openFileViewer = useCallback(
     (path: string) => {
       setSelectedFilePath(path);
+      // A file and a shell tab can't both own the rail's content slot —
+      // opening a file deselects any active shell tab (its tab stays in the
+      // strip).
+      setSelectedTerminalKey(null);
       // Add the path to the open tabs if it isn't already open; activating an
       // already-open tab just re-selects it (no duplicate).
       setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
@@ -938,6 +958,25 @@ export function AppShell() {
     setRightPanelOpen(next);
   };
 
+  // Toggle the workspace rail's full-screen (maximized) state. Entering
+  // collapses the left sidebar (the maximized rail wants the full width) after
+  // stashing its prior open-state; exiting restores that state. The sidebar
+  // side effect is done here — outside any state updater — so the maximize
+  // setter stays a plain boolean flip. ``restoreSidebarAfterMaximize`` is
+  // shared with the session-switch reset, which also drops out of full screen.
+  const restoreSidebarAfterMaximize = useCallback(() => {
+    setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
+  }, []);
+  const toggleRightPanelMaximized = () => {
+    if (!rightPanelMaximized) {
+      sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+      setSidebarOpen(false);
+    } else {
+      restoreSidebarAfterMaximize();
+    }
+    setRightPanelMaximized((prev) => !prev);
+  };
+
   // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
   // here where both panels' open-state lives.
   useSidebarToggleHotkeys({
@@ -1034,6 +1073,11 @@ export function AppShell() {
       setFileViewerCommentsOpen(false);
       clearFileViewerUrl();
     }
+    // Clicking a static nav tab deselects any active shell tab (it stays in
+    // the strip) so the picked tab's content shows in the single slot.
+    if (selectedTerminalKey !== null) {
+      setSelectedTerminalKey(null);
+    }
   }
 
   function openTerminalsPanel(key: string) {
@@ -1046,6 +1090,59 @@ export function AppShell() {
     setTodosPanelOpen(false); // close mobile tasks drawer
     setPanelInitialKey(key);
   }
+
+  // Open a shell as a tab in the desktop workspace rail (the mobile path
+  // still uses ``openTerminalsPanel`` → full-screen drawer). Adds the key to
+  // the open-tabs strip if new, activates it, and reveals the rail. Clearing
+  // the selected file keeps the rail's single content slot unambiguous — a
+  // shell tab and a file tab can't both be "active".
+  const openTerminalTab = useCallback(
+    (key: string) => {
+      setOpenTerminals((prev) => (prev.includes(key) ? prev : [...prev, key]));
+      setSelectedTerminalKey(key);
+      setSelectedFilePath(null);
+      setFileViewerCommentsOpen(false);
+      clearFileViewerUrl();
+      setExecutionLogsKey(null);
+      setFilesPanelOpen(false);
+      setSubagentsPanelOpen(false);
+      setShellsPanelOpen(false);
+      setTodosPanelOpen(false);
+      setRightPanelOpen(true);
+      if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+    },
+    [clearFileViewerUrl, conversationId],
+  );
+
+  // Close a single shell tab. If it was the active one, activate its neighbor
+  // (prefer the previous tab, else the next); when none remain the selection
+  // clears and the rail falls back to the Shells list. Mirrors ``closeFile``.
+  const closeTerminalTab = useCallback((key: string) => {
+    setOpenTerminals((prev) => {
+      const idx = prev.indexOf(key);
+      if (idx === -1) return prev;
+      const next = prev.filter((k) => k !== key);
+      setSelectedTerminalKey((active) => {
+        if (active !== key) return active;
+        if (next.length === 0) return null;
+        return next[idx - 1] ?? next[idx] ?? next[0];
+      });
+      return next;
+    });
+  }, []);
+
+  // Prune shell tabs whose terminal has gone away (closed by the agent, or the
+  // runner went offline and emptied the list). Keeps the strip from pointing at
+  // dead PTYs; the active selection falls back to the Shells list when its tab
+  // is dropped.
+  useEffect(() => {
+    const valid = new Set(terminals.map((t) => terminalTabKey(t)));
+    setOpenTerminals((prev) => {
+      const next = prev.filter((k) => valid.has(k));
+      return next.length === prev.length ? prev : next;
+    });
+    setSelectedTerminalKey((active) => (active !== null && !valid.has(active) ? null : active));
+  }, [terminals]);
 
   function openExecutionLogsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1324,7 +1421,12 @@ export function AppShell() {
                     shellsPanelOpen,
                     todosPanelOpen,
                     hideTerminalsTab,
-                    showShellsTab: railTabsAvailable.terminals,
+                    // Mobile: reachable when a shell exists OR the agent
+                    // declares shell access (so the drawer's "+ New shell" row
+                    // can create the first one). Desktop rail tab stays gated
+                    // on an existing shell (railTabsAvailable.terminals).
+                    showShellsTab:
+                      !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
                     terminalsLength: railTerminals.length,
                     todosSupported,
                     todosCompleted,
@@ -1379,7 +1481,12 @@ export function AppShell() {
                     onCloseFile={closeFile}
                     onShowScopeView={showScopeView}
                     onCommentsOpenChange={setFileViewerCommentsOpen}
-                    openTerminalsPanel={openTerminalsPanel}
+                    openTerminalTab={openTerminalTab}
+                    openTerminals={openTerminals}
+                    selectedTerminalKey={selectedTerminalKey}
+                    onCloseTerminal={closeTerminalTab}
+                    maximized={rightPanelMaximized}
+                    onToggleMaximized={toggleRightPanelMaximized}
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}
@@ -1453,6 +1560,9 @@ export function AppShell() {
                   <InlineTerminalsSection
                     conversationId={conversationId}
                     onExpand={openTerminalsPanel}
+                    // Mobile has no tab strip "+" menu, so the drawer carries
+                    // the "+ New shell" create row.
+                    showNewShell
                   />
                 </MobilePanelDrawer>
               )}

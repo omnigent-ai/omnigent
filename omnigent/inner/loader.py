@@ -822,6 +822,8 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     fields = OSEnvSandboxSpec.__dataclass_fields__
     max_entries_raw = data.get("cwd_hidden_scan_max_entries")
     overflow_raw = data.get("cwd_hidden_scan_overflow")
+    recursive_raw = data.get("cwd_hidden_scan_recursive")
+    mask_paths_raw = data.get("mask_paths")
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=data.get("read_paths"),
@@ -847,6 +849,12 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
             if overflow_raw is not None
             else fields["cwd_hidden_scan_overflow"].default
         ),
+        cwd_hidden_scan_recursive=(
+            bool(recursive_raw)
+            if recursive_raw is not None
+            else fields["cwd_hidden_scan_recursive"].default
+        ),
+        mask_paths=list(mask_paths_raw) if mask_paths_raw is not None else None,
         env_passthrough=data.get("env_passthrough"),
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,

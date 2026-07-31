@@ -3,7 +3,7 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
-import { type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -103,7 +103,7 @@ vi.mock("@/hooks/useConversations", async () => {
 // so the stub lifts it from the trigger child onto the native <select>.
 vi.mock("@/components/ui/select", async () => {
   const { Children, isValidElement } = await import("react");
-  const SelectTrigger = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
   const Select = ({
     value,
     onValueChange,
@@ -133,7 +133,7 @@ vi.mock("@/components/ui/select", async () => {
     Select,
     SelectTrigger,
     SelectValue: () => null,
-    SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
     SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
       <option value={value}>{children}</option>
     ),

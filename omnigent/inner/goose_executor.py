@@ -36,9 +36,9 @@ import contextlib
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -50,11 +50,25 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     TextChunk,
+    ToolSpec,
     TurnComplete,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 
 logger = logging.getLogger(__name__)
+
+# Goose speaks the extensible ACP JSON-RPC schema; consumers narrow fields
+# before use.
+_AcpJsonObject: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+
+class _PolicyVerdict(Protocol):
+    action: str
+
+
+_PolicyEvaluator: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_PolicyVerdict]]
+_ElicitationHandler: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[bool]]
+_ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObject]]
 
 # ACP error code Goose maps to a filesystem "not found" (ENOENT) when a
 # delegated ``fs/read_text_file`` fails — the shared ACP client lib special-
@@ -125,7 +139,7 @@ _PROTOCOL_VERSION = 1
 _DEFAULT_BUILTINS = ("developer",)
 
 
-def _inline_text_file_data(file_data: Any) -> str:  # type: ignore[explicit-any]
+def _inline_text_file_data(file_data: object) -> str:
     """Decode a text ``input_file`` ``file_data`` data URI into inline text.
 
     Mirrors the qwen/codex executors: ``input_file`` blocks may carry a
@@ -149,7 +163,7 @@ def _inline_text_file_data(file_data: Any) -> str:  # type: ignore[explicit-any]
         return ""
 
 
-def _parse_image_data_uri(data_uri: Any) -> tuple[str, str] | None:  # type: ignore[explicit-any]
+def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     """Split an ``image/*`` ``data:`` URI into ``(mime_type, base64_payload)``.
 
     Returns ``None`` for anything that isn't an inline ``image/*`` data URI
@@ -218,13 +232,13 @@ class GooseExecutor(Executor):
         self._goose_path = goose_path or "goose"
         self._builtins = tuple(builtins) if builtins is not None else _DEFAULT_BUILTINS
 
-        self._proc: asyncio.subprocess.Process | None = None  # type: ignore[name-defined]
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()  # type: ignore[explicit-any]
+        self._proc: asyncio.subprocess.Process | None = None
+        self._queue: asyncio.Queue[_AcpJsonObject] = asyncio.Queue()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
 
         self._rpc_id: int = 0
-        self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}  # type: ignore[explicit-any]
+        self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
 
         self._session_id: str | None = None
         self._initialized: bool = False
@@ -240,14 +254,14 @@ class GooseExecutor(Executor):
         # policy + human-consent elicitation rather than blind auto-approve.
         # ``None`` means "no bridge wired" (standalone use / unit tests), in
         # which case permission falls back to allow. See :meth:`_decide_permission`.
-        self._policy_evaluator: Any | None = None  # type: ignore[explicit-any]
-        self._elicitation_handler: Any | None = None  # type: ignore[explicit-any]
+        self._policy_evaluator: _PolicyEvaluator | None = None
+        self._elicitation_handler: _ElicitationHandler | None = None
         # Adapter-injected tool bridge + the Omnigent-tool MCP relay it backs.
         # Exposes Omnigent builtin tools to goose via session/new.mcpServers
         # (the shared serve-mcp relay); goose keeps its own developer tools.
-        self._tool_executor: Any | None = None  # type: ignore[explicit-any]
+        self._tool_executor: _ToolExecutor | None = None
         self._mcp = OmnigentAcpMcp(label="goose")
-        self._omnigent_tools: list[Any] = []  # type: ignore[explicit-any]
+        self._omnigent_tools: list[ToolSpec] = []
 
     # ------------------------------------------------------------------
     # Low-level ACP transport
@@ -412,7 +426,7 @@ class GooseExecutor(Executor):
                 if not line:
                     continue
                 try:
-                    msg: dict[str, Any] = json.loads(line)  # type: ignore[explicit-any]
+                    msg: _AcpJsonObject = json.loads(line)
                 except json.JSONDecodeError:
                     logger.debug("goose: non-JSON stdout line: %r", line[:200])
                     continue
@@ -436,7 +450,7 @@ class GooseExecutor(Executor):
                     fut.set_exception(exc)
             await self._queue.put({"type": "error", "message": str(exc)})
 
-    async def _send(self, msg: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+    async def _send(self, msg: _AcpJsonObject) -> None:
         """Write one newline-terminated JSON message to goose stdin."""
         assert self._proc and self._proc.stdin
         encoded = (json.dumps(msg) + "\n").encode("utf-8")
@@ -446,14 +460,14 @@ class GooseExecutor(Executor):
     async def _rpc(
         self,
         method: str,
-        params: dict[str, Any],  # type: ignore[explicit-any]
+        params: _AcpJsonObject,
         timeout: float = _INIT_TIMEOUT_SECONDS,
-    ) -> dict[str, Any]:  # type: ignore[explicit-any]
+    ) -> _AcpJsonObject:
         """Send a JSON-RPC 2.0 request and await its response."""
         self._rpc_id += 1
         req_id = self._rpc_id
         loop = asyncio.get_event_loop()
-        fut: asyncio.Future[dict[str, Any]] = loop.create_future()  # type: ignore[explicit-any]
+        fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
 
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
@@ -537,7 +551,7 @@ class GooseExecutor(Executor):
     # Server-initiated requests (agent → client)
     # ------------------------------------------------------------------
 
-    async def _respond_to_agent_request(self, request: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+    async def _respond_to_agent_request(self, request: _AcpJsonObject) -> None:
         """Answer a server-initiated ACP request from goose.
 
         - ``session/request_permission`` — decide via Omnigent's TOOL_CALL policy
@@ -555,8 +569,8 @@ class GooseExecutor(Executor):
         params = request.get("params", {}) or {}
         logger.debug("goose agent request: method=%s id=%s", method, req_id)
 
-        result: dict[str, Any] | None = None  # type: ignore[explicit-any]
-        error: dict[str, Any] | None = None  # type: ignore[explicit-any]
+        result: _AcpJsonObject | None = None
+        error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
                 allow = await self._decide_permission(params)
@@ -576,7 +590,7 @@ class GooseExecutor(Executor):
             logger.debug("goose agent request %s failed: %s", method, exc)
             error = {"code": -32603, "message": f"{method} failed: {exc}"}
 
-        reply: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id}  # type: ignore[explicit-any]
+        reply: _AcpJsonObject = {"jsonrpc": "2.0", "id": req_id}
         if error is not None:
             reply["error"] = error
         else:
@@ -600,7 +614,7 @@ class GooseExecutor(Executor):
             self._os_environment = env
         return self._os_environment
 
-    async def _handle_fs_read(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+    async def _handle_fs_read(self, params: _AcpJsonObject) -> _AcpJsonObject:
         """Serve an ACP ``fs/read_text_file`` by reading through the OSEnvironment.
 
         ACP params ``{path, line?, limit?}`` (1-based start line, max line count;
@@ -630,7 +644,7 @@ class GooseExecutor(Executor):
             raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
         return {"content": result.get("content", "")}
 
-    async def _handle_fs_write(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+    async def _handle_fs_write(self, params: _AcpJsonObject) -> _AcpJsonObject:
         """Serve an ACP ``fs/write_text_file`` by writing through the OSEnvironment.
 
         ACP params ``{path, content}``; the write goes through the helper so the
@@ -654,7 +668,7 @@ class GooseExecutor(Executor):
         return {}
 
     @staticmethod
-    def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:  # type: ignore[explicit-any]
+    def _extract_tool_call(params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
         """Pull ``(tool_name, tool_input)`` from a ``session/request_permission``.
 
         Goose's payload carries a ``toolCall`` with a human ``title`` (e.g.
@@ -672,7 +686,7 @@ class GooseExecutor(Executor):
             args = {}
         return str(name), args
 
-    async def _decide_permission(self, params: dict[str, Any]) -> bool:  # type: ignore[explicit-any]
+    async def _decide_permission(self, params: _AcpJsonObject) -> bool:
         """Decide allow/deny for a permission request — policy then elicitation.
 
         Mirrors :meth:`QwenExecutor._decide_permission`:
@@ -735,9 +749,7 @@ class GooseExecutor(Executor):
         return True
 
     @staticmethod
-    def _permission_outcome(  # type: ignore[explicit-any]
-        params: dict[str, Any], *, allow: bool
-    ) -> dict[str, Any]:
+    def _permission_outcome(params: _AcpJsonObject, *, allow: bool) -> _AcpJsonObject:
         """Map an allow/deny decision to an ACP permission ``outcome``.
 
         On allow, prefer a once-scoped grant (``allow_once``) over
@@ -747,7 +759,7 @@ class GooseExecutor(Executor):
         """
         options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
 
-        def _pick(*kinds: str) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+        def _pick(*kinds: str) -> _AcpJsonObject | None:
             for kind in kinds:
                 for opt in options:
                     if opt.get("kind") == kind:
@@ -773,9 +785,9 @@ class GooseExecutor(Executor):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _image_blocks_from_content(content: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
+    def _image_blocks_from_content(content: object) -> list[_AcpJsonObject]:
         """Build ACP ``image`` prompt blocks from a message's ``input_image`` blocks."""
-        out: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        out: list[_AcpJsonObject] = []
         if not isinstance(content, list):
             return out
         for block in content:
@@ -789,9 +801,9 @@ class GooseExecutor(Executor):
 
     @staticmethod
     def _text_from_blocks(
-        blocks: list[Any],
+        blocks: list[object],
         *,
-        emit_image_marker: bool = False,  # type: ignore[explicit-any]
+        emit_image_marker: bool = False,
     ) -> str:
         """Extract prompt text from a Responses-API content-block list.
 
@@ -825,7 +837,7 @@ class GooseExecutor(Executor):
         return "\n".join(parts)
 
     @classmethod
-    def _history_prefix(cls, prior: list[Any]) -> str:  # type: ignore[explicit-any]
+    def _history_prefix(cls, prior: Sequence[object]) -> str:
         """Serialize prior conversation turns into a text prefix.
 
         On a *fresh* ACP session (the first turn of a newly spawned/respawned
@@ -879,7 +891,7 @@ class GooseExecutor(Executor):
         return self._context_window
 
     @staticmethod
-    def _usage_from_result(result: dict[str, Any]) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+    def _usage_from_result(result: _AcpJsonObject) -> dict[str, int] | None:
         """Map Goose's final ``result.usage`` to Omnigent's usage keys.
 
         Goose reports ``{totalTokens, inputTokens, outputTokens}``; Omnigent's
@@ -888,7 +900,7 @@ class GooseExecutor(Executor):
         usage = result.get("usage")
         if not isinstance(usage, dict):
             return None
-        out: dict[str, Any] = {}
+        out: dict[str, int] = {}
         if isinstance(usage.get("inputTokens"), int):
             out["input_tokens"] = usage["inputTokens"]
         if isinstance(usage.get("outputTokens"), int):
@@ -960,7 +972,7 @@ class GooseExecutor(Executor):
     async def run_turn(
         self,
         messages: list[Message],
-        tools: list[Any],  # type: ignore[explicit-any]  # goose runs its own tools; used for the Omnigent MCP relay
+        tools: list[ToolSpec],
         system_prompt: str,
         config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the interface
     ) -> AsyncIterator[ExecutorEvent]:
@@ -989,7 +1001,7 @@ class GooseExecutor(Executor):
 
         # Build the prompt payload from the most recent user message.
         user_text = ""
-        image_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        image_blocks: list[_AcpJsonObject] = []
         latest_user_idx: int | None = None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
@@ -1024,7 +1036,7 @@ class GooseExecutor(Executor):
                 user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 
-        prompt_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        prompt_blocks: list[_AcpJsonObject] = []
         if user_text or not image_blocks:
             prompt_blocks.append({"type": "text", "text": user_text})
         prompt_blocks.extend(image_blocks)
@@ -1041,7 +1053,7 @@ class GooseExecutor(Executor):
         self._rpc_id += 1
         req_id = self._rpc_id
         loop = asyncio.get_event_loop()
-        fut: asyncio.Future[dict[str, Any]] = loop.create_future()  # type: ignore[explicit-any]
+        fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
 
         await self._send(

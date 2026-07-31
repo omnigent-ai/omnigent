@@ -268,7 +268,7 @@ function* closeText(state: ReducerState, itemId: string | null = null): Generato
   state.fullText = "";
 }
 
-function outputTextFromMessageContent(content: Array<Record<string, unknown>>): string {
+function outputTextFromMessageContent(content: Record<string, unknown>[]): string {
   let text = "";
   for (const block of content) {
     if (block.type !== "output_text") continue;
@@ -903,6 +903,8 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
     case "session_mcp_startup":
     case "session_input_consumed":
     case "session_created":
+      return;
+
     // Mutates an existing block in the chat-store; see
     // `handleSessionEvent`.
     case "elicitation_resolved":

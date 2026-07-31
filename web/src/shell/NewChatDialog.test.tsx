@@ -1,3 +1,8 @@
+import type * as IdentityModule from "@/lib/identity";
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as ChatStoreModule from "@/store/chatStore";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -43,7 +48,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // Only authenticatedFetch is stubbed (the create POST under test);
 // the module's other exports stay real for any other consumer in the tree.
 vi.mock("@/lib/identity", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/identity")>()),
+  ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({
@@ -87,7 +92,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // empty list so it doesn't fire its own authenticatedFetch (which would skew
 // the create-POST call-count / call-order assertions below).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  ...(await importOriginal<typeof UseConversationsModule>()),
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
@@ -95,7 +100,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",
@@ -131,7 +136,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 // tests can assert the prepended attachment marker. Everything else
 // (composerAttachmentKey, useChatStore, …) stays real for the render tree.
 vi.mock("@/store/chatStore", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/store/chatStore")>()),
+  ...(await importOriginal<typeof ChatStoreModule>()),
   setPendingInitialPrompt: vi.fn(),
 }));
 
@@ -642,19 +647,28 @@ function setupLandingMocks() {
     data: undefined,
   } as unknown as ReturnType<typeof useHostWorktrees>);
   mockHosts([host("online")]);
-  useHostModelOptionsMock.mockReturnValue({
-    data: [
-      { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
-      {
-        id: "sonnet",
-        model: "system.ai.claude-sonnet-4-6[1m]",
-        displayName: "Sonnet 4.6",
-      },
-      { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
-    ],
-    isLoading: false,
-    isError: false,
-  } as unknown as ReturnType<typeof useHostModelOptions>);
+  useHostModelOptionsMock.mockImplementation(
+    (_hostId, harness) =>
+      ({
+        data:
+          harness === "codex-native"
+            ? [
+                { id: "databricks-gpt-5-5", displayName: "GPT-5.5", isDefault: true },
+                { id: "databricks-gpt-5-6", displayName: "GPT-5.6" },
+              ]
+            : [
+                { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
+                {
+                  id: "sonnet",
+                  model: "system.ai.claude-sonnet-4-6[1m]",
+                  displayName: "Sonnet 4.6",
+                },
+                { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
+              ],
+        isLoading: false,
+        isError: false,
+      }) as unknown as ReturnType<typeof useHostModelOptions>,
+  );
   mockAgents([
     {
       id: "a1",
@@ -1063,10 +1077,51 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     // Open Codex's (a2) config modal — it carries the approval-mode select.
     openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
     openSelect("new-chat-landing-config-approval");
     expect(screen.getByText("Full access")).toBeTruthy();
     expect(screen.getByText("Read only")).toBeTruthy();
+  });
+
+  it("sends the selected Codex launch model without changing Claude's remembered model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+
+    openAgentConfig("a2");
+    openSelect("new-chat-landing-config-model");
+    expect(screen.getAllByText("Default (databricks-gpt-5-5)").length).toBeGreaterThan(0);
+    expect(screen.getByText("databricks-gpt-5-6")).toBeTruthy();
+    fireEvent.click(screen.getByText("databricks-gpt-5-6"));
+    saveConfig();
+
+    // The Codex model is remembered under codex-native only; Claude Code's
+    // picker should reopen on its own Default instead of inheriting the GPT id.
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Default");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).not.toContain(
+      "databricks-gpt-5-6",
+    );
+    saveConfig();
+
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "databricks-gpt-5-6",
+    );
+    saveConfig();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.model_override).toBe("databricks-gpt-5-6");
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
   });
 
   it("arms codex full bypass via the Approval dropdown and shows the warning banner", () => {

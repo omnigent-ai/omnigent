@@ -464,6 +464,7 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
                 "image": "docker.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cluster": "my-gateway",
+                "workspace": "team-alpha",
             },
         }
     )
@@ -478,6 +479,7 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.cluster == "my-gateway"
+    assert fake.workspace == "team-alpha"
 
 
 def test_parse_openshell_without_section_defaults(
@@ -496,6 +498,7 @@ def test_parse_openshell_without_section_defaults(
     assert fake.image is None
     assert fake.env is None
     assert fake.cluster is None
+    assert fake.workspace is None
 
 
 def test_parse_valid_kubernetes_config_builds_parameterized_factory(
@@ -909,6 +912,215 @@ def test_parse_kubernetes_pvc_mounts_allows_same_claim_at_two_paths() -> None:
                 "pvc_mounts": [
                     {"claim_name": "shared", "mount_path": "/mnt/a"},
                     {"claim_name": "shared", "mount_path": "/mnt/b", "read_only": False},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+
+
+def test_parse_kubernetes_secret_mounts_normalizes_and_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """secret_mounts parse into normalized {secret_name, mount_path} on the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "secret_mounts": [
+                    {"secret_name": "git-token", "mount_path": "/mnt/secrets/git"},
+                    {"secret_name": "npm-token", "mount_path": "/mnt/secrets/npm"},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.secret_mounts == [
+        {"secret_name": "git-token", "mount_path": "/mnt/secrets/git"},
+        {"secret_name": "npm-token", "mount_path": "/mnt/secrets/npm"},
+    ]
+
+
+def test_parse_kubernetes_without_secret_mounts_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted (or empty) secret_mounts reach the launcher as None — no volumes added."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"secret_mounts": []},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.secret_mounts is None
+
+
+@pytest.mark.parametrize(
+    ("secret_mounts", "expected_fragment"),
+    [
+        # Wrong container shapes.
+        ("git-token", "must be a list"),
+        ([["git-token"]], "must be a mapping"),
+        # Unknown / missing keys. read_only is NOT a secret_mounts key (a Secret
+        # volume is read-only by nature), so it reads as an unknown key.
+        ([{"secret_name": "s", "mount_path": "/mnt/x", "read_only": True}], "unknown key"),
+        ([{"secret_name": "s", "mount_path": "/mnt/x", "default_mode": 292}], "unknown key"),
+        ([{"mount_path": "/mnt/x"}], "secret_name"),
+        ([{"secret_name": "s"}], "mount_path"),
+        # Bad Secret names (Secret names are DNS-1123 subdomains).
+        ([{"secret_name": "Bad_Secret", "mount_path": "/mnt/x"}], "secret_name"),
+        # Bad mount paths: relative, unnormalized, doubled-slash, root, reserved.
+        ([{"secret_name": "s", "mount_path": "mnt/x"}], "absolute"),
+        ([{"secret_name": "s", "mount_path": "/mnt/../etc"}], "normalized"),
+        ([{"secret_name": "s", "mount_path": "/mnt/x/"}], "normalized"),
+        ([{"secret_name": "s", "mount_path": "//mnt/x"}], "normalized"),
+        ([{"secret_name": "s", "mount_path": "/"}], "reserved"),
+        ([{"secret_name": "s", "mount_path": "/home/omnigent/data"}], "reserved"),
+        ([{"secret_name": "s", "mount_path": "/var/run/secrets/x"}], "reserved"),
+        # Ancestors of reserved paths would mount over HOME / the Secret projections.
+        ([{"secret_name": "s", "mount_path": "/home"}], "reserved"),
+        ([{"secret_name": "s", "mount_path": "/var/run"}], "reserved"),
+        ([{"secret_name": "s", "mount_path": "/etc"}], "reserved"),
+        # Duplicates / nesting between entries.
+        (
+            [
+                {"secret_name": "a", "mount_path": "/mnt/x"},
+                {"secret_name": "b", "mount_path": "/mnt/x"},
+            ],
+            "duplicate",
+        ),
+        (
+            [
+                {"secret_name": "a", "mount_path": "/mnt/x"},
+                {"secret_name": "b", "mount_path": "/mnt/x/sub"},
+            ],
+            "nested",
+        ),
+    ],
+)
+def test_parse_kubernetes_secret_mounts_invalid_fails_loud(
+    secret_mounts: object, expected_fragment: str
+) -> None:
+    """An operator typo in secret_mounts fails at parse (server startup), not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"secret_mounts": secret_mounts},
+            }
+        )
+
+
+@pytest.mark.parametrize("mount_path", ["/home/other", "/var/lib", "/runway", "/mnt/secrets"])
+def test_parse_kubernetes_secret_mounts_reserved_check_is_segment_aware(mount_path: str) -> None:
+    """Siblings sharing a string prefix with a reserved path (or its parent) are allowed."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"secret_mounts": [{"secret_name": "s", "mount_path": mount_path}]},
+        }
+    )
+    assert cfg is not None
+
+
+@pytest.mark.parametrize(
+    ("secret_path", "expected_fragment"),
+    [("/mnt/data", "same mount_path"), ("/mnt/data/token", "nested")],
+)
+def test_parse_kubernetes_rejects_pvc_and_secret_mount_overlap(
+    secret_path: str, expected_fragment: str
+) -> None:
+    """A secret_mounts path equal to or nested under a pvc_mounts path fails loud."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "pvc_mounts": [{"claim_name": "c", "mount_path": "/mnt/data"}],
+                    "secret_mounts": [{"secret_name": "s", "mount_path": secret_path}],
+                },
+            }
+        )
+
+
+def test_parse_kubernetes_pvc_and_secret_mounts_coexist_at_distinct_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-overlapping PVC and Secret mounts both reach the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [{"claim_name": "datasets", "mount_path": "/mnt/datasets"}],
+                "secret_mounts": [{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}],
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.pvc_mounts == [
+        {"claim_name": "datasets", "mount_path": "/mnt/datasets", "read_only": True}
+    ]
+    assert fake.secret_mounts == [{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}]
+
+
+def test_parse_kubernetes_secret_mounts_sibling_prefix_is_not_nested() -> None:
+    """/mnt/data vs /mnt/database share a string prefix but are distinct mounts."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "secret_mounts": [
+                    {"secret_name": "a", "mount_path": "/mnt/data"},
+                    {"secret_name": "b", "mount_path": "/mnt/database"},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+
+
+def test_parse_kubernetes_secret_mounts_nesting_is_rejected_regardless_of_order() -> None:
+    """The pairwise collision check catches nesting anywhere in a 3-entry list."""
+    with pytest.raises(ValueError, match="nested"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "secret_mounts": [
+                        {"secret_name": "a", "mount_path": "/mnt/x/sub"},
+                        {"secret_name": "b", "mount_path": "/mnt/y"},
+                        {"secret_name": "c", "mount_path": "/mnt/x"},
+                    ]
+                },
+            }
+        )
+
+
+def test_parse_kubernetes_secret_mounts_allows_same_secret_at_two_paths() -> None:
+    """One Secret may be projected at two distinct paths."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "secret_mounts": [
+                    {"secret_name": "shared", "mount_path": "/mnt/a"},
+                    {"secret_name": "shared", "mount_path": "/mnt/b"},
                 ]
             },
         }

@@ -25,9 +25,9 @@ import os
 import signal
 import subprocess
 from contextlib import suppress
-from typing import Protocol
+from typing import Protocol, TypedDict
 
-import psutil
+import psutil  # type: ignore[import-untyped]
 
 from omnigent._platform import IS_POSIX
 
@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 _killpg_fn = getattr(os, "killpg", None)
 _getpgid_fn = getattr(os, "getpgid", None)
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+_CREATE_NEW_PROCESS_GROUP = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+
+class SpawnKwargs(TypedDict, total=False):
+    """Platform-specific process-group arguments accepted by subprocess APIs."""
+
+    start_new_session: bool
+    creationflags: int
 
 
 class _ProcessLike(Protocol):
@@ -58,7 +66,7 @@ class _ProcessLike(Protocol):
         pass
 
 
-def spawn_kwargs() -> dict[str, object]:
+def spawn_kwargs() -> SpawnKwargs:
     """
     Keyword args that isolate a child process into its own group/session.
 
@@ -73,7 +81,7 @@ def spawn_kwargs() -> dict[str, object]:
     """
     if IS_POSIX:
         return {"start_new_session": True}
-    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
 
 
 def _killpg(pid: int, sig: int) -> bool:
@@ -204,7 +212,7 @@ def process_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
-        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        return bool(psutil.Process(pid).status() != psutil.STATUS_ZOMBIE)
     except psutil.NoSuchProcess:
         # Includes psutil.ZombieProcess (a NoSuchProcess subclass).
         return False

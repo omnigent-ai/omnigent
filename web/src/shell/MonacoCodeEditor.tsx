@@ -52,13 +52,13 @@ type EditorOptions = EditorProps["options"];
 // the find widget is open, close it, and subscribe to open/close changes.
 const FIND_CONTROLLER_ID = "editor.contrib.findController";
 interface FindController extends monaco.editor.IEditorContribution {
-  getState(): {
+  getState: () => {
     readonly isRevealed: boolean;
-    onFindReplaceStateChange(listener: (e: { isRevealed: boolean }) => void): {
-      dispose(): void;
+    onFindReplaceStateChange: (listener: (e: { isRevealed: boolean }) => void) => {
+      dispose: () => void;
     };
   };
-  closeFindWidget(): void;
+  closeFindWidget: () => void;
 }
 
 // How long the transient "Saved" badge stays up before the status chip clears
