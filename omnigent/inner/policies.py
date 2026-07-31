@@ -60,15 +60,18 @@ PolicyResponsePayload: TypeAlias = dict[str, object]
 
 class _LabelRule(Protocol):
     @property
-    def values(self) -> Sequence[str]: ...
+    def values(self) -> Sequence[str]:
+        raise NotImplementedError
 
 
 class _PolicySession(Protocol):
     @property
-    def labels(self) -> Mapping[str, str]: ...
+    def labels(self) -> Mapping[str, str]:
+        raise NotImplementedError
 
     @property
-    def _root_label_schema(self) -> Mapping[str, _LabelRule]: ...
+    def _root_label_schema(self) -> Mapping[str, _LabelRule]:
+        raise NotImplementedError
 
 
 _POLICY_SYSTEM_PROMPT = (
