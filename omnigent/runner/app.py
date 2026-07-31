@@ -8593,7 +8593,8 @@ class _SpawnEnvBuilder(Protocol):
         *,
         cwd: Path | None,
         workdir: Path | None,
-    ) -> dict[str, str]: ...
+    ) -> dict[str, str]:
+        raise NotImplementedError
 
 
 def _build_spawn_env_from_spec(
