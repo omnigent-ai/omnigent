@@ -2920,7 +2920,7 @@ class ClaudeSDKExecutor(Executor):
             present in the latest user message.
         """
         if resume_session:
-            return ClaudeSDKExecutor._extract_latest_user_content(messages)
+            return ClaudeSDKExecutor._extract_trailing_user_content(messages)
 
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         if len(messages) <= 1 or len(user_messages) <= 1:
@@ -2994,3 +2994,75 @@ class ClaudeSDKExecutor(Executor):
                     return _to_anthropic_content_blocks(content)
                 return str(content)
         return ""
+
+    @staticmethod
+    def _extract_trailing_user_content(
+        messages: list[Message],
+    ) -> str | list[dict[str, Any]]:
+        """
+        Extract the trailing run of consecutive user messages for the SDK.
+
+        On a resumed SDK session the client already has all prior turns
+        cached, so only the *new* user input is sent. Normally that is a
+        single user message, but when the runner batches several buffered
+        steered messages into one continuation turn (see
+        ``_check_and_start_next_turn``), the tail of history holds more than
+        one brand-new user message the SDK has never seen. Sending only the
+        last (as :meth:`_extract_latest_user_content` does) silently drops
+        the earlier ones. This collects every user message after the last
+        non-user (assistant / tool) message and concatenates them so all
+        newly-buffered input reaches the model.
+
+        Text messages are joined with blank lines. If any message in the
+        trailing run carries multimodal content blocks, the whole run is
+        returned as a single list of Anthropic content blocks so the bytes
+        survive.
+
+        :param messages: Conversation history.
+        :returns: A string prompt, or a list of Anthropic content
+            block dicts when the trailing run is multimodal.
+        """
+        trailing: list[Message] = []
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                trailing.append(msg)
+            else:
+                break
+        trailing.reverse()
+        if not trailing:
+            return ""
+        if len(trailing) == 1:
+            return ClaudeSDKExecutor._extract_latest_user_content(trailing)
+
+        # Convert each trailing user message to Anthropic content blocks.
+        # If any block is non-text (image/document), keep the structured
+        # list so the bytes reach the model; otherwise join the text.
+        block_runs: list[list[dict[str, Any]]] = []
+        has_non_text = False
+        for msg in trailing:
+            content = msg.get("content")
+            if content is None:
+                block_runs.append([])
+            elif isinstance(content, str):
+                block_runs.append([_text_block(content)])
+            elif isinstance(content, list):
+                converted = _to_anthropic_content_blocks(content)
+                block_runs.append(converted)
+                if any(b.get("type") != "text" for b in converted):
+                    has_non_text = True
+            else:
+                block_runs.append([_text_block(str(content))])
+
+        if has_non_text:
+            merged: list[dict[str, Any]] = []
+            for run in block_runs:
+                merged.extend(run)
+            return merged
+
+        texts = [
+            b["text"]
+            for run in block_runs
+            for b in run
+            if b.get("type") == "text" and b.get("text")
+        ]
+        return "\n\n".join(texts)

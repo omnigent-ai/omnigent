@@ -58,6 +58,69 @@ class TestPromptExtraction(unittest.TestCase):
             "Second question",
         )
 
+    def test_resumed_session_includes_all_trailing_user_messages(self):
+        """Batched buffered steers: all trailing user messages must reach the SDK.
+
+        When the runner collapses several buffered steered messages into one
+        continuation turn, history ends in >1 consecutive user message the SDK
+        has never seen. Sending only the last silently drops the earlier ones
+        (the two-steer "second message ignored" bug). All trailing user
+        messages must be concatenated into the prompt.
+        """
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "steer one"},
+            {"role": "user", "content": "steer two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("steer one", prompt)
+        self.assertIn("steer two", prompt)
+        # Prior turns are SDK-cached on resume — not replayed.
+        self.assertNotIn("First question", prompt)
+
+    def test_resumed_session_trailing_run_stops_at_assistant(self):
+        """Only the trailing run of user messages (after the last non-user) is sent."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "old one"},
+            {"role": "user", "content": "old two"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "new one"},
+            {"role": "user", "content": "new two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("new one", prompt)
+        self.assertIn("new two", prompt)
+        self.assertNotIn("old one", prompt)
+        self.assertNotIn("old two", prompt)
+
+    def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
+        """A multimodal message in the trailing run keeps structured blocks for all."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "describe this"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,aGVsbG8=",
+                    },
+                    {"type": "input_text", "text": "and this too"},
+                ],
+            },
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIsInstance(prompt, list)
+        types = [b.get("type") for b in prompt]
+        self.assertIn("image", types)
+        joined = " ".join(b.get("text", "") for b in prompt if b.get("type") == "text")
+        self.assertIn("describe this", joined)
+        self.assertIn("and this too", joined)
+
     def test_empty_messages(self):
         executor = self._make_executor()
         self.assertEqual(executor._build_prompt([], resume_session=False), "")
