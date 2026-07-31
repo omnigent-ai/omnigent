@@ -229,6 +229,20 @@ function showSharedTab() {
   fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
 }
 
+/** Open the Projects header kebab (expand-all / revert / select sessions). */
+function openProjectsMenu() {
+  fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+    button: 0,
+    ctrlKey: false,
+  });
+}
+
+/** Close an open dropdown menu (Radix marks the rest of the tree aria-hidden
+    while open, so folder buttons aren't queryable until it closes). */
+function closeProjectsMenu() {
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+}
+
 beforeEach(() => {
   useConvMock.mockReset();
   useHostsMock.mockReset();
@@ -1143,11 +1157,14 @@ describe("Sidebar project sections", () => {
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
 
     // Open just one folder, then expand all → every folder opens and the
-    // control flips to "revert".
+    // control flips to "revert". Expand-all / revert live in the Projects
+    // header kebab, so open it before clicking the menu item.
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    openProjectsMenu();
     fireEvent.click(screen.getByTestId("expand-all-projects"));
     expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "true");
+    openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
 
     // Revert to last state → restores exactly the set that was open before
@@ -1169,8 +1186,10 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     // Open every folder by hand → the control is revert (not expand-all).
+    // Expand-all / revert live in the Projects header kebab; open it to check.
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
     fireEvent.click(screen.getByRole("button", { name: /^Beta/ }));
+    openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
     expect(screen.getByTestId("revert-projects")).toBeInTheDocument();
 
@@ -1181,14 +1200,18 @@ describe("Sidebar project sections", () => {
       "false",
     );
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+    openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+    closeProjectsMenu();
 
     // After expand-all, a manual collapse of one folder retires the snapshot, so
     // the next full manual expansion reverts to collapse-all (not the stale set).
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    openProjectsMenu();
     fireEvent.click(screen.getByTestId("expand-all-projects")); // snapshot = [Alpha]
     fireEvent.click(screen.getByRole("button", { name: /^Beta/ })); // manual toggle clears it
     fireEvent.click(screen.getByRole("button", { name: /^Beta/ })); // back to all open by hand
+    openProjectsMenu();
     fireEvent.click(screen.getByTestId("revert-projects"));
     expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
       "aria-expanded",
@@ -1207,17 +1230,40 @@ describe("Sidebar project sections", () => {
     ]);
     renderSidebar();
 
-    // Offered while the group is expanded (default).
+    // Offered (in the header kebab) while the group is expanded (default).
+    openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+    closeProjectsMenu();
 
-    // Collapse the "Projects" group → control disappears.
+    // Collapse the "Projects" group → control disappears from the kebab.
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
     expect(screen.queryByTestId("revert-projects")).toBeNull();
+    closeProjectsMenu();
 
     // Re-expanding the group brings it back.
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+  });
+
+  it("enters session-selection mode from the Projects header kebab", () => {
+    projectsMock.push("Alpha");
+    mockConversations([
+      conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_loose", "Claude Code"),
+    ]);
+    renderSidebar();
+
+    // Not selecting yet: the bulk-action bar's exit control is absent.
+    expect(screen.queryByRole("button", { name: "Exit selection mode" })).toBeNull();
+
+    // "Select sessions" in the Projects kebab flips the whole sidebar into
+    // selection mode (same mode the Sessions-header trigger opens).
+    openProjectsMenu();
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
   });
 
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {
