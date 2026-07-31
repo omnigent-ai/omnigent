@@ -116,6 +116,11 @@ dependencies = [
     # onto the core server boot path via app.py; previously only a transitive
     # dep, declared directly now that we import it.
     "python-dateutil>=2.8,<3",
+    # Windows ships no IANA time zone database, so stdlib `zoneinfo` finds no
+    # keys at all there — even `ZoneInfo("UTC")`. The scheduled-task scheduler
+    # resolves per-task IANA zones and is imported on the core server boot path,
+    # so without this `omnigent server` fails to start on Windows.
+    "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]

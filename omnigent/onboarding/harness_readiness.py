@@ -29,8 +29,8 @@ import os
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
-from omnigent._platform import resolve_cli_binary
-from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness, is_native_harness
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
@@ -405,7 +405,12 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 
 
 def _harness_availability(canonical: str) -> HarnessAvailability:
-    """Return picker-facing availability for one canonical harness spelling."""
+    """Return picker-facing availability for one canonical harness spelling.
+
+    Platform support is NOT judged here — :func:`configured_harness_map` gates
+    native harnesses per spelling before consulting this, because the codex
+    family shares one cache entry across native and non-native spellings.
+    """
     if _is_codex_family_harness(canonical):
         from omnigent.codex_native import _codex_auth_unavailable_reason
 
@@ -471,6 +476,9 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     binary is on ``PATH``. Codex entries use a structured string reason when
     unavailable: ``"binary-missing"`` or ``"needs-auth"``.
 
+    Native (tmux/PTY) harnesses always map to ``False`` on Windows, whatever
+    their CLI's install/auth state — that host cannot start them at all.
+
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": "needs-auth",
         "claude-sdk": True, "openai-agents": True, "pi": True, "qwen": True}``.
@@ -497,6 +505,22 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     result: dict[str, HarnessAvailability] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
+        if IS_WINDOWS and is_native_harness(canonical):
+            # Native harnesses boot a vendor TUI inside a private tmux server on
+            # a PTY; Windows has neither, so the runner rejects them outright
+            # (`_native_terminal_start_error` in runner/native/orchestration.py,
+            # `reject_native_on_windows` in cli_common.py). Every branch in
+            # `_harness_availability` judges only "CLI on PATH / signed in",
+            # which a Windows box satisfies — so `claude-native` reported ready,
+            # the picker offered it, and the launch died at run time.
+            #
+            # Gated per SPELLING, above the cache, on purpose: the codex family
+            # shares one `("codex",)` cache entry across `codex` (not native)
+            # and `codex-native` (native). Gating inside `_harness_availability`
+            # would let whichever spelling this set happened to yield first
+            # decide the verdict for all three.
+            result[spelling] = False
+            continue
         cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
         if cache_key not in availability_cache:
             availability_cache[cache_key] = _harness_availability(canonical)

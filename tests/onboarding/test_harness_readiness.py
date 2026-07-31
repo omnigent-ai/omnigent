@@ -9,11 +9,25 @@ import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
+import omnigent.onboarding.harness_readiness as hr
 from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_to_non_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin readiness to the non-Windows path unless a test opts out.
+
+    Native harnesses are hard-gated to ``False`` on Windows (no PTY, no tmux),
+    so on a Windows dev box every install/auth assertion in this module would
+    otherwise collapse to ``False`` and silently test the platform gate instead
+    of the logic it means to cover. The tests that DO exercise the gate set
+    ``IS_WINDOWS`` themselves, overriding this.
+    """
+    monkeypatch.setattr(hr, "IS_WINDOWS", False)
 
 
 @pytest.fixture(autouse=True)
@@ -585,3 +599,82 @@ def test_antigravity_native_requires_credential(
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     assert harness_is_configured("antigravity-native") is True
     assert harness_is_configured("native-antigravity") is True
+
+
+# Native harnesses boot a vendor TUI in a private tmux server on a PTY. Windows
+# has neither, so the runner rejects them outright — readiness has to agree.
+@pytest.mark.parametrize(
+    "harness",
+    [
+        "claude-native",
+        "native-claude",
+        "codex-native",
+        "cursor-native",
+        "opencode-native",
+        "pi-native",
+    ],
+)
+def test_native_harnesses_report_unavailable_on_windows(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """A Windows host reports native harnesses False even with the CLI present.
+
+    Regression: every readiness branch judged only "binary on PATH / signed
+    in", which a Windows box satisfies — so ``claude-native`` reported ready,
+    the web picker offered it, and the launch then died at run time with
+    ``native_terminal_start_failed``.
+    """
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(hr, "IS_WINDOWS", True)
+
+    assert configured_harness_map()[harness] is False
+
+
+def test_native_harnesses_are_not_platform_gated_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Off Windows the gate is inert — CLI install/auth state still decides.
+
+    Guards against the fix over-reaching into the platforms that can actually
+    run these harnesses.
+    """
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(hr, "IS_WINDOWS", False)
+
+    # Not asserting True: an installed-but-not-signed-in CLI legitimately
+    # reports "needs-auth". The point is that the platform never forces False.
+    assert configured_harness_map()["claude-native"] is not False
+
+
+def test_windows_gate_covers_only_native_harnesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK harnesses stay available on Windows — they need no PTY or tmux."""
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(hr, "IS_WINDOWS", True)
+
+    available = configured_harness_map()
+    assert available["claude-sdk"] is True
+    assert available["openai-agents"] is True
+
+
+def test_windows_gate_separates_codex_from_codex_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The codex family's shared cache entry must not leak across the gate.
+
+    ``codex`` (headless, not native) and ``codex-native`` share one
+    ``("codex",)`` cache key. Gating inside ``_harness_availability`` made the
+    verdict depend on which spelling the (unordered) spelling set yielded
+    first: either ``codex-native`` leaked ``False`` onto plain ``codex``, or
+    plain ``codex`` leaked its install state onto ``codex-native``. Assert both
+    independently so the gate stays above the cache.
+    """
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(hr, "IS_WINDOWS", True)
+
+    available = configured_harness_map()
+    for native in ("codex-native", "native-codex"):
+        assert available[native] is False, f"{native} must be gated on Windows"
+    # Plain `codex` is not a native harness — the gate must not touch it.
+    assert available["codex"] is not False

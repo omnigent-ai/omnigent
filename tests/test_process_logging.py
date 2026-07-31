@@ -21,6 +21,32 @@ from omnigent.process_logging import (
 )
 
 
+def test_child_logging_popen_kwargs_pins_child_stdio_to_utf8() -> None:
+    """Children get UTF-8 stdio so a non-Latin-1 glyph can't crash a daemon.
+
+    Regression: the child's stdout is a log file, so Python picks the locale
+    encoding (cp1252 on Windows). The host daemon's "✓ Connected as ..."
+    banner then raised ``UnicodeEncodeError`` inside its serve loop, which
+    the caller read as a dropped tunnel and retried forever.
+    """
+    env: dict[str, str] = {}
+
+    with child_logging_popen_kwargs(env):
+        pass
+
+    assert env["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_child_logging_popen_kwargs_keeps_explicit_stdio_encoding() -> None:
+    """An encoding the caller already chose stays authoritative."""
+    env = {"PYTHONIOENCODING": "utf-16"}
+
+    with child_logging_popen_kwargs(env):
+        pass
+
+    assert env["PYTHONIOENCODING"] == "utf-16"
+
+
 @pytest.mark.skipif(not IS_POSIX, reason="pass_fds is POSIX-only")
 def test_child_logging_popen_kwargs_duplicates_explicit_log_fd() -> None:
     """An explicit mirror fd is duplicated before child stderr is redirected."""

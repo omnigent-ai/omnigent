@@ -17,8 +17,7 @@ fire spawns a real agent session, so a runaway cadence is expensive.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone, tzinfo
 
 from dateutil.rrule import rrulestr
 
@@ -27,7 +26,10 @@ from dateutil.rrule import rrulestr
 # cadence we allow: hourly is a useful ceiling with a hard bound on runaway cost.
 MIN_INTERVAL_SECONDS = 60 * 60
 
-_UTC = ZoneInfo("UTC")
+# `timezone.utc`, not `ZoneInfo("UTC")`: the fixed offset needs no IANA tz
+# database, so this module still imports on a host without one (Windows without
+# `tzdata`) instead of taking the whole server down at boot.
+_UTC = timezone.utc
 
 # Fixed anchor for the interval check. Using a constant UTC instant (rather
 # than ``datetime.now``) makes validation deterministic — the same rule always
@@ -53,7 +55,7 @@ class RRuleValidationError(ValueError):
     """Raised when an RRULE string is malformed or violates a scheduler rule."""
 
 
-def _anchor_dtstart(after: datetime, tz: ZoneInfo) -> datetime:
+def _anchor_dtstart(after: datetime, tz: tzinfo) -> datetime:
     """Localize ``after`` to ``tz`` and return midnight of that local day.
 
     Anchoring at midnight gives occurrences a deterministic phase regardless of
@@ -76,7 +78,7 @@ def _anchor_dtstart(after: datetime, tz: ZoneInfo) -> datetime:
 def get_next_fire_time(
     rule_str: str,
     after: datetime,
-    tz: ZoneInfo,
+    tz: tzinfo,
 ) -> datetime | None:
     """Compute the next fire strictly after ``after``, evaluated in ``tz``.
 
@@ -108,7 +110,7 @@ class RRuleTrigger:
 
     rule: str
 
-    def next_fire_after(self, after: datetime, tz: ZoneInfo) -> datetime | None:
+    def next_fire_after(self, after: datetime, tz: tzinfo) -> datetime | None:
         """Return the next fire strictly after ``after`` in ``tz``.
 
         :param after: The instant to search after (tz-aware).
@@ -129,7 +131,7 @@ def _parse(rule_str: str, dtstart: datetime):
         raise RRuleValidationError(f"Invalid RRULE {rule_str!r}: {exc}") from exc
 
 
-def validate_rrule(rule_str: str, tz: ZoneInfo | None = None) -> RRuleTrigger:  # noqa: ARG001
+def validate_rrule(rule_str: str, tz: tzinfo | None = None) -> RRuleTrigger:  # noqa: ARG001
     """Parse and validate an RRULE string for use as a recurring trigger.
 
     Beyond syntax, enforces that the rule (a) fires at least twice within the

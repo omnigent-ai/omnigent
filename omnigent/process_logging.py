@@ -349,7 +349,18 @@ def child_logging_popen_kwargs(env: dict[str, str]) -> Iterator[dict[str, object
     Mutates *env* only when ``--log-to-stderr`` requested a mirror and the
     current process has an interactive stderr. On POSIX the returned kwargs
     include ``pass_fds`` so a detached child can still write logs to that TTY.
+
+    Always pins the child's stdio to UTF-8. Children spawned through here get
+    ``stdout``/``stderr`` redirected to a log file, so Python picks the
+    locale encoding for those streams — cp1252 on Windows, ASCII under a C
+    locale. Any ``print`` of a non-Latin-1 glyph (the "✓ Connected as ..."
+    host banner, for one) then raises ``UnicodeEncodeError`` from inside the
+    daemon's serve loop, which reads as a dropped connection and wedges the
+    caller in a reconnect loop. Log readers already decode with
+    ``errors="replace"``, so UTF-8 bytes are safe to write. ``setdefault``
+    keeps an explicit caller/user value authoritative.
     """
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     owned_fd: int | None = None
     if env_truthy(env.get(LOG_TO_STDERR_ENV_VAR)) and IS_POSIX:
         fd_text = env.get(LOG_TTY_FD_ENV_VAR)

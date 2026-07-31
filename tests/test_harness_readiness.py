@@ -7,6 +7,17 @@ import pytest
 from omnigent.onboarding import harness_readiness as hr
 
 
+@pytest.fixture(autouse=True)
+def _default_to_non_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin readiness to the non-Windows path.
+
+    Native harnesses (``pi-native`` among them) are hard-gated to ``False`` on
+    Windows, which would otherwise turn these CLI-install assertions into
+    assertions about the platform gate when the suite runs on a Windows box.
+    """
+    monkeypatch.setattr(hr, "IS_WINDOWS", False)
+
+
 @pytest.mark.parametrize("harness", ["pi", "pi-native", "native-pi"])
 def test_pi_harnesses_gate_on_pi_cli(harness: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """``pi`` and ``pi-native`` are both gated on the ``pi`` CLI being installed.
