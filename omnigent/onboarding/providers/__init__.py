@@ -131,7 +131,7 @@ _MLFLOW_CATALOG_URL = (
 _CATALOG_TTL_SECONDS = 3600
 _CATALOG_STALE_IF_ERROR_SECONDS = 7 * 24 * 60 * 60
 _CATALOG_DISK_SCHEMA_VERSION = 1
-_CATALOG_UPSTREAM_SCHEMA_VERSION = "1.0"
+_CATALOG_UPSTREAM_SCHEMA_MAJOR = 1
 _CATALOG_CACHE_PROVIDER_RE = re.compile(r"^[a-z0-9_-]+$")
 
 
@@ -181,11 +181,27 @@ def _catalog_cache_path(provider: str) -> Path | None:
     return _catalog_cache_root() / f"{provider}.json"
 
 
+def _supported_catalog_schema_version(value: object) -> bool:
+    """Return whether *value* has a compatible MLflow catalog major version."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == _CATALOG_UPSTREAM_SCHEMA_MAJOR
+    if not isinstance(value, str):
+        return False
+    components = value.split(".")
+    return (
+        bool(components)
+        and all(component.isdigit() for component in components)
+        and int(components[0]) == _CATALOG_UPSTREAM_SCHEMA_MAJOR
+    )
+
+
 def _valid_catalog_payload(value: object) -> TypeGuard[dict[str, Any]]:
-    """Return whether *value* matches the supported MLflow catalog schema."""
+    """Return whether *value* matches a compatible MLflow catalog schema."""
     if not isinstance(value, dict):
         return False
-    if value.get("schema_version") != _CATALOG_UPSTREAM_SCHEMA_VERSION:
+    if not _supported_catalog_schema_version(value.get("schema_version")):
         return False
     models = value.get("models")
     return isinstance(models, dict) and all(
@@ -301,8 +317,10 @@ def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
     Return the MLflow catalog for *provider* through memory and disk caches.
 
     Fresh cache entries last one hour. A live failure can use a validated disk
-    entry for seven days; otherwise callers receive an empty dict. Setting
-    ``OMNIGENT_DISABLE_CATALOG_LOOKUP=1`` bypasses every cache tier and network.
+    entry for seven days and retains that fallback in memory for at most one
+    cache TTL before retrying discovery. Otherwise callers receive an empty
+    dict. Setting ``OMNIGENT_DISABLE_CATALOG_LOOKUP=1`` bypasses every cache
+    tier and network.
 
     :param provider: Provider name, e.g. ``"anthropic"``.
     :returns: Parsed catalog dict (``schema_version`` + ``models`` keys),

@@ -445,6 +445,22 @@ def test_provider_catalog_rejects_incompatible_cache_metadata(
     assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == {}
 
 
+@pytest.mark.parametrize("schema_version", ["1", "1.0", "1.1", 1])
+def test_provider_catalog_accepts_compatible_schema_versions(schema_version: object) -> None:
+    """Compatible major versions tolerate upstream minor and representation changes."""
+    catalog = {"schema_version": schema_version, "models": {}}
+
+    assert _providers_mod._valid_catalog_payload(catalog)
+
+
+@pytest.mark.parametrize("schema_version", ["2.0", 2, True, "invalid", None])
+def test_provider_catalog_rejects_incompatible_schema_versions(schema_version: object) -> None:
+    """Malformed and unsupported major versions cannot enter the cache."""
+    catalog = {"schema_version": schema_version, "models": {}}
+
+    assert not _providers_mod._valid_catalog_payload(catalog)
+
+
 def test_provider_catalog_rejects_incompatible_live_schema(
     real_catalog_loader: Path,
     monkeypatch: pytest.MonkeyPatch,
