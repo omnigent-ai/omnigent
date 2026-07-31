@@ -1076,7 +1076,9 @@ def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObje
     :returns: The matching Omnigent hook metadata dicts (possibly
         empty), each with ``key``, ``currentHash``, ``trustStatus``.
     """
-    result = _string_object_dict(listed.get("result")) or listed
+    result = _string_object_dict(listed.get("result"))
+    if result is None:
+        result = listed
     data = _object_list(result.get("data")) or []
     for raw_entry in data:
         entry = _string_object_dict(raw_entry)
@@ -1114,7 +1116,9 @@ def _hooks_list_diagnostics(listed: _JsonObject, cwd: str) -> str:
         ``"hooks/list returned no hooks (codex loaded none — likely an "
         "invalid per-session config.toml)"``.
     """
-    result = _string_object_dict(listed.get("result")) or listed
+    result = _string_object_dict(listed.get("result"))
+    if result is None:
+        result = listed
     data = _object_list(result.get("data")) or []
     entries = [entry for raw in data if (entry := _string_object_dict(raw)) is not None]
     if not entries or all(not (_object_list(entry.get("hooks")) or []) for entry in entries):
