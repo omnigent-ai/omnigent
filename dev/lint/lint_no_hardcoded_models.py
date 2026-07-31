@@ -34,13 +34,8 @@ MODEL_ID_RE = re.compile(
 
 TEXT_EXTENSIONS = {".json", ".toml", ".yaml", ".yml", ".sh"}
 SOURCE_EXTENSIONS = {".py", *TEXT_EXTENSIONS}
-SCAN_ROOTS = (
-    Path("omnigent"),
-    Path("scripts"),
-    Path("examples"),
-    Path(".github"),
-    Path("dev/lint"),
-)
+SCAN_ROOTS = (Path("."),)
+GENERATED_PATHS = {Path("openapi.json")}
 SKIP_PARTS = {
     ".git",
     ".mypy_cache",
@@ -215,6 +210,7 @@ def scan(path: Path) -> list[Hit]:
     if (
         not path.is_file()
         or path.suffix not in SOURCE_EXTENSIONS
+        or Path(_repo_relative(path)) in GENERATED_PATHS
         or any(part in SKIP_PARTS for part in path.parts)
     ):
         return []
@@ -235,6 +231,7 @@ def _iter_scannable_paths() -> list[Path]:
         for raw_path in output.decode().split("\0")
         if raw_path
         if (path := Path(raw_path)).suffix in SOURCE_EXTENSIONS
+        if path not in GENERATED_PATHS
         if not any(part in SKIP_PARTS for part in path.parts)
     ]
 

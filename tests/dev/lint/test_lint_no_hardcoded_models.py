@@ -169,18 +169,21 @@ def test_precommit_trigger_matches_scan_surface() -> None:
         if hook["id"] == "no-hardcoded-models"
     )
     files_pattern = re.compile(hook["files"])
-    exclude_pattern = re.compile(config["exclude"])
+    global_exclude_pattern = re.compile(config["exclude"])
+    hook_exclude_pattern = re.compile(hook["exclude"])
     tracked_paths = {
         Path(path) for path in subprocess.check_output(["git", "ls-files"]).decode().splitlines()
     }
     triggered_paths = {
         path
         for path in tracked_paths
-        if files_pattern.search(path.as_posix()) and not exclude_pattern.search(path.as_posix())
+        if files_pattern.search(path.as_posix())
+        and not global_exclude_pattern.search(path.as_posix())
+        and not hook_exclude_pattern.search(path.as_posix())
     }
     scanned_paths = set(_iter_scannable_paths())
 
     assert triggered_paths == scanned_paths
     for root in SCAN_ROOTS:
         for extension in SOURCE_EXTENSIONS:
-            assert files_pattern.fullmatch(f"{root.as_posix()}/lint_probe{extension}")
+            assert files_pattern.search((root / f"lint_probe{extension}").as_posix())
