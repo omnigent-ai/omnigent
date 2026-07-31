@@ -22,7 +22,7 @@ export function SkillPills({
   skills,
   onPick,
 }: {
-  skills: ReadonlyArray<{ name: string; description: string }>;
+  skills: readonly { name: string; description: string }[];
   onPick: (name: string) => void;
 }) {
   if (skills.length === 0) return null;

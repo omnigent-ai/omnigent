@@ -3624,7 +3624,7 @@ interface ComposerProps {
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
-  skills: ReadonlyArray<{ name: string; description: string }>,
+  skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
   showCompact = true,
@@ -3658,7 +3658,7 @@ export function buildSlashCommandMap(
  * :returns: A ``Set`` of slash-prefixed names.
  */
 export function buildSlashCommandWithArgsSet(
-  skills: ReadonlyArray<{ name: string; description: string }>,
+  skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
 ): Set<string> {
@@ -6032,7 +6032,7 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode";
-  const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
+  const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
     usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 

@@ -48,7 +48,7 @@ const getRecognitionCtor = (): SpeechRecognitionCtor | null => {
 };
 
 // FFT bin ranges per bar, weighted toward voice frequencies (~100Hz–3kHz).
-const BAR_BINS: ReadonlyArray<readonly [number, number]> = [
+const BAR_BINS: readonly (readonly [number, number])[] = [
   [1, 3],
   [3, 6],
   [6, 10],
