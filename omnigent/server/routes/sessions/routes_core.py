@@ -441,11 +441,11 @@ def register_core_routes(
                 )
                 host_registry.send_text(conn, launch_frame)
                 try:
-                    result = await asyncio.wait_for(future, timeout=30.0)
+                    launch_result = await asyncio.wait_for(future, timeout=30.0)
                 except asyncio.TimeoutError:
                     conn.pending_launches.pop(request_id, None)
-                    result = {"status": "failed", "error": "host launch timed out"}
-                if result.get("status") == "failed":
+                    launch_result = {"status": "failed", "error": "host launch timed out"}
+                if launch_result.get("status") == "failed":
                     # Lenient on every create-time launch failure, including
                     # an unconfigured harness: the picker's readiness data
                     # can be stale (the user may have run `omnigent setup`
@@ -459,7 +459,7 @@ def register_core_routes(
                         "Host %s failed to launch runner for session %s: %s",
                         launch_host_id,
                         resp.id,
-                        result.get("error"),
+                        launch_result.get("error"),
                     )
                     # The runner never booted, so its pending=False clear
                     # will never fire. Clear the spin-up flag here so a
@@ -870,6 +870,7 @@ def register_core_routes(
         # The tasks table has been removed — status comes exclusively from
         # the relay-fed ``_session_status_cache``.
         unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
+        perms_by_conv: dict[str, list[SessionPermission]]
         if permission_store is not None:
             perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
                 asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
@@ -892,7 +893,7 @@ def register_core_routes(
                     conv_ids,
                 ),
             )
-            perms_by_conv: dict[str, list[SessionPermission]] = {}
+            perms_by_conv = {}
             user_is_admin = False
         # In-memory lookup — no I/O, so batching avoids re-acquiring
         # the index's lock per row but otherwise has no DB cost.
