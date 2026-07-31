@@ -7,10 +7,7 @@ type ImeKeyboardEvent = {
   };
 };
 
-export function isImeCompositionKeyEvent(
-  event: ImeKeyboardEvent,
-  isComposing: boolean = false,
-): boolean {
+export function isImeCompositionKeyEvent(event: ImeKeyboardEvent, isComposing = false): boolean {
   return (
     isComposing ||
     event.nativeEvent.isComposing === true ||

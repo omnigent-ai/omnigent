@@ -3627,7 +3627,7 @@ export function buildSlashCommandMap(
   skills: ReadonlyArray<{ name: string; description: string }>,
   showEffort: boolean,
   showModel: boolean,
-  showCompact: boolean = true,
+  showCompact = true,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {

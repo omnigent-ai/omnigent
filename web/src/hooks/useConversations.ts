@@ -271,8 +271,8 @@ async function fetchConversationsPage({
  * the Archived settings view's project filter.
  */
 export function useConversations(
-  searchQuery: string = "",
-  includeArchived: boolean = false,
+  searchQuery = "",
+  includeArchived = false,
   options: UseConversationsOptions = {},
   project?: string,
 ) {
