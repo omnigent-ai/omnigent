@@ -737,6 +737,12 @@ def build_agent_bundle(
                     "model": sa["name"],
                     "connection": {"api_key": "test-key"},
                 },
+                # A ``config.yaml`` sub-agent goes through the strict
+                # spec_version:1 parser, which requires an explicit
+                # harness for an omnigent executor. Default to the same
+                # harness the parent uses; callers may override via
+                # ``sa["executor"]``.
+                "executor": sa.get("executor", {"config": {"harness": "claude-sdk"}}),
             }
             if "description" in sa:
                 sa_config["description"] = sa["description"]
@@ -778,6 +784,7 @@ async def create_test_agent(
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
     include_llm: bool = True,
+    sub_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Create an agent via multipart session create and return the agent JSON.
@@ -805,6 +812,11 @@ async def create_test_agent(
         :func:`build_agent_bundle`. ``None`` omits guardrails.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
+    :param sub_agents: Optional sub-agent config dicts declared in the
+        bundle, each with at least a ``"name"`` key, e.g.
+        ``[{"name": "worker"}]``. Required for tests that create a child
+        session with a ``sub_agent_name`` — the create route rejects an
+        undeclared name.
     :returns: Parsed agent response body from the session agent
         endpoint, with an extra ``_session_id`` key for the owning
         session.
@@ -817,6 +829,7 @@ async def create_test_agent(
         skills=skills,
         guardrails=guardrails,
         include_llm=include_llm,
+        sub_agents=sub_agents,
     )
     metadata: dict[str, Any] = {}
     headers: dict[str, str] = {}
