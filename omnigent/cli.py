@@ -89,7 +89,7 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
 
 
 def _parse_model_prefixes(
-    raw: Any,  # type: ignore[explicit-any]  # str | list | None from YAML
+    raw: Any,  # str | list | None from YAML
 ) -> list[str]:
     """Normalize the ``model_prefix`` config into a list of prefixes.
 
@@ -105,8 +105,8 @@ def _parse_model_prefixes(
 
 
 def _build_external_routing_client(
-    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
-) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
+    routing_cfg: Any,  # parsed YAML block
+) -> Any | None:  # ExternalRoutingClient | None
     """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
     Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
@@ -164,8 +164,8 @@ def _build_external_routing_client(
 
 
 def _build_local_llm_routing_client(
-    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
-) -> Any | None:  # type: ignore[explicit-any]  # LLMRoutingClient | None
+    server_llm: Any,  # LLMConfig | None
+) -> Any | None:  # LLMRoutingClient | None
     """Build the built-in :class:`LLMRoutingClient` from the ``llm:`` block.
 
     :param server_llm: The parsed server-level ``LLMConfig``.
@@ -192,7 +192,7 @@ def _server_uvicorn_log_config(
     log_path: Path | None = None,
     *,
     log_to_stderr: bool | None = None,
-) -> dict[str, Any]:  # type: ignore[explicit-any]
+) -> dict[str, Any]:
     """
     Return Uvicorn logging config with request-duration access logs.
 
@@ -851,7 +851,7 @@ def _resolve_auto_open_conversation_from_config(cfg: dict[str, Any]) -> bool:  #
 
 
 def _normalize_harness_scalar_on_write(
-    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    cfg: dict[str, Any],
     path: Path,
 ) -> bool:
     """Migrate a legacy scalar ``harness:`` to the mapping form in *cfg*.
@@ -986,7 +986,7 @@ def _materialize_internal_beta_agents() -> Path:
 
 
 def _save_local_config(
-    settings: dict[str, str | bool | Mapping[str, Any]],  # type: ignore[explicit-any]
+    settings: dict[str, str | bool | Mapping[str, Any]],
     unset_keys: tuple[str, ...] = (),
     deep_merge_keys: tuple[str, ...] = (),
 ) -> None:
@@ -3604,7 +3604,7 @@ def server(
         cleanly within the graceful window.
         """
 
-        async def shutdown(self, sockets=None) -> None:  # type: ignore[override]
+        async def shutdown(self, sockets=None) -> None:
             import asyncio as _asyncio
 
             from omnigent.runtime import session_stream as _session_stream
@@ -7903,7 +7903,7 @@ def _parse_config_settings(
 
 
 def _harness_deep_merge_keys(
-    parsed: dict[str, str | bool | Mapping[str, Any]],  # type: ignore[explicit-any]
+    parsed: dict[str, str | bool | Mapping[str, Any]],
 ) -> tuple[str, ...]:
     """Rewrite a ``harness=<id>`` setting for deep-merge into the harness mapping.
 
@@ -7949,7 +7949,7 @@ def _validate_unset_keys(unset_keys: tuple[str, ...]) -> list[str]:
 
 
 def _format_harness_for_display(
-    value: object,  # type: ignore[explicit-any]
+    value: object,
 ) -> tuple[str, list[str]]:
     """Render a ``harness`` config value for ``config list``.
 
@@ -7969,7 +7969,7 @@ def _format_harness_for_display(
 
 
 def _resolve_harness_startup_args(
-    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    cfg: dict[str, Any],
     harness: str,
     cli_args: tuple[str, ...],
 ) -> tuple[str, ...]:
@@ -7991,7 +7991,7 @@ def _resolve_harness_startup_args(
 
 
 def _print_config_default_rows(
-    cfg: dict[str, object],  # type: ignore[explicit-any]
+    cfg: dict[str, object],
 ) -> None:
     """Print one ``key=value`` row per config default, handling the ``harness`` key.
 
