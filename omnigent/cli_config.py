@@ -177,7 +177,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     import signal
     import tempfile
 
-    from omnigent.onboarding.internal_beta import DEFAULT_PROFILES
+    import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
     from omnigent.onboarding.setup import CONFLICTING_ENV_VARS
 
     original_cfg = Path.home() / ".databrickscfg"
@@ -203,7 +203,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     if original_cfg.exists():
         orig_cfg.read(original_cfg)
     cfg = configparser.ConfigParser()
-    for spec in DEFAULT_PROFILES:
+    for spec in internal_beta.DEFAULT_PROFILES:
         if orig_cfg.has_section(spec.name):
             cfg[spec.name] = dict(orig_cfg[spec.name])
 
@@ -245,7 +245,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         orig_cfg = configparser.ConfigParser()
         if original_cfg.exists():
             orig_cfg.read(original_cfg)
-        for spec in DEFAULT_PROFILES:
+        for spec in internal_beta.DEFAULT_PROFILES:
             if tmp_cfg.has_section(spec.name):
                 orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
         write_tmp = original_cfg.with_suffix(".tmp")

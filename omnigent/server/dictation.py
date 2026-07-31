@@ -345,7 +345,7 @@ class SherpaDictationEngine:
             model; silently skipped when absent or incomplete.
         :raises RuntimeError: If the ASR file set is incomplete.
         """
-        import sherpa_onnx
+        import sherpa_onnx  # type: ignore[import-not-found]
 
         files = _asr_files(asr_dir)
         if files is None:
@@ -424,7 +424,7 @@ class _SherpaStream:
 
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
         """Decode one PCM chunk; fold an endpoint into ``finalized``."""
-        import numpy as np
+        import numpy as np  # type: ignore[import-not-found]
 
         # Drop a trailing odd byte rather than crash the take; the next
         # frame realigns (client frames are always whole samples).
