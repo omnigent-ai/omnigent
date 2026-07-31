@@ -86,7 +86,7 @@ class RunnerSubprocess:
     startup_timeout_s: float = 30.0
     extra_env: dict[str, str] | None = None
     _process: subprocess.Popen[bytes] | None = None
-    _tmp_dir: tempfile.TemporaryDirectory | None = None
+    _tmp_dir: tempfile.TemporaryDirectory[str] | None = None
 
     def __enter__(self) -> RunnerSubprocess:
         if self.socket_path is None:
