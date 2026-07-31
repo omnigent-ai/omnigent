@@ -51,28 +51,36 @@ jobs:
       # Check-first: does each lockfile already satisfy its manifests? These
       # checks pass on a consistent-but-not-latest lock, so routine in-range
       # transitive drift does NOT trigger a regen; only a real manifest/lock
-      # desync (the case this job exists to catch) flips `drifted=true`.
+      # desync (the case this job exists to catch) flips a flag.
+      #
+      # Per-ecosystem flags: gating each regen on its own flag keeps a desync in
+      # one ecosystem from forcing a from-scratch re-resolve of the other, which
+      # would reintroduce the in-range transitive churn this job avoids. `any`
+      # drives the shared token/PR steps below.
       - name: Check lockfile consistency
         id: check
         run: |
-          drifted=false
-          uv lock --check || drifted=true
+          drifted_uv=false
+          drifted_pnpm=false
+          uv lock --check || drifted_uv=true
           # --lockfile-only: verify the lock satisfies the manifests without a
           # full node_modules install; --frozen-lockfile fails on any desync.
-          pnpm install --frozen-lockfile --lockfile-only || drifted=true
-          echo "drifted=$drifted" >> "$GITHUB_OUTPUT"
-          if [ "$drifted" = "true" ]; then
-            echo "Lockfiles are out of sync with the manifests — regenerating."
-          else
-            echo "Lockfiles already satisfy the manifests — nothing to do."
+          pnpm install --frozen-lockfile --lockfile-only || drifted_pnpm=true
+          any=false
+          if [ "$drifted_uv" = "true" ] || [ "$drifted_pnpm" = "true" ]; then
+            any=true
           fi
+          echo "drifted_uv=$drifted_uv" >> "$GITHUB_OUTPUT"
+          echo "drifted_pnpm=$drifted_pnpm" >> "$GITHUB_OUTPUT"
+          echo "drifted=$any" >> "$GITHUB_OUTPUT"
+          echo "uv.lock drifted=$drifted_uv, pnpm-lock.yaml drifted=$drifted_pnpm"
 
       # 7-day cooldown comes from uv.toml (`exclude-newer = "P7D"`) and from
       # pnpm-workspace.yaml (`minimumReleaseAge: 10080`), recorded as a relative
       # span; an env-var cutoff would stamp an absolute date and break later
       # `uv sync --locked` / `pnpm install --frozen-lockfile`.
       - name: Regenerate uv.lock
-        if: steps.check.outputs.drifted == 'true'
+        if: steps.check.outputs.drifted_uv == 'true'
         run: uv lock
 
       # pnpm's cooldown is configured in pnpm-workspace.yaml and respected by
@@ -80,7 +88,7 @@ jobs:
       # --lockfile-only keeps an existing in-range pin without re-applying the
       # cooldown, so we drop it first.
       - name: Regenerate pnpm-lock.yaml
-        if: steps.check.outputs.drifted == 'true'
+        if: steps.check.outputs.drifted_pnpm == 'true'
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
