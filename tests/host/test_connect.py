@@ -318,6 +318,121 @@ async def test_handle_model_options_filters_direct_openai_through_codex_catalog(
     ]
 
 
+async def test_handle_model_options_tolerates_codex_discovery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery failures keep the implicit default without unsafe model rows."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(ModelEntry(id="unverified-model", family="openai"),),
+            note="test OpenAI catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="key",
+            family="openai",
+            base_url="https://api.openai.com",
+            detail="test OpenAI key",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+
+    async def _failed_codex_options() -> list[dict[str, object]]:
+        raise TimeoutError("test discovery timeout")
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _failed_codex_options,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[],
+    )
+
+
+async def test_handle_model_options_marks_only_first_codex_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed Codex catalogs cannot mark multiple picker rows as default."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    model_ids = ("coding-first", "coding-second")
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=tuple(ModelEntry(id=model_id, family="openai") for model_id in model_ids),
+            note="test OpenAI catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="key",
+            family="openai",
+            base_url="https://api.openai.com",
+            detail="test OpenAI key",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+
+    async def _multiple_codex_defaults() -> list[dict[str, object]]:
+        return [
+            {"model": model_id, "displayName": model_id, "isDefault": True}
+            for model_id in model_ids
+        ]
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _multiple_codex_defaults,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {"id": "coding-first", "displayName": "coding-first", "isDefault": True},
+        {"id": "coding-second", "displayName": "coding-second"},
+    ]
+
+
 async def test_handle_model_options_keeps_custom_gateway_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

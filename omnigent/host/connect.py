@@ -1893,7 +1893,13 @@ class HostProcess:
                     available_ids = {model.id for model in listing.models}
                     models = []
                     seen: set[str] = set()
-                    for option in await discover_codex_model_options():
+                    selected_default = False
+                    try:
+                        codex_options = await discover_codex_model_options()
+                    except Exception:
+                        _logger.exception("Failed to discover Codex-compatible pre-launch models")
+                        codex_options = []
+                    for option in codex_options:
                         raw_id = option.get("model") or option.get("id")
                         if (
                             not isinstance(raw_id, str)
@@ -1904,8 +1910,11 @@ class HostProcess:
                         seen.add(raw_id)
                         display_name = option.get("displayName")
                         is_default = raw_id == default_id or (
-                            default_model is None and option.get("isDefault") is True
+                            default_model is None
+                            and not selected_default
+                            and option.get("isDefault") is True
                         )
+                        selected_default = selected_default or is_default
                         models.append(
                             {
                                 "id": raw_id,
