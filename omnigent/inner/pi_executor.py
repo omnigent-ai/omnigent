@@ -44,7 +44,7 @@ import subprocess
 import tempfile
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
@@ -52,9 +52,9 @@ from omnigent import model_catalog
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_metadata import ModelWireAPI
+from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
-from omnigent.pi_model_compatibility import SYSTEM_AI_RESPONSES_KEYWORDS
+from omnigent.pi_model_compatibility import SYSTEM_AI_RESPONSES_KEYWORDS, unsupported_in_pi
 from omnigent.pi_native_credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
@@ -584,82 +584,8 @@ def _find_pi_cli() -> str | None:
 # Databricks models.json generation
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Databricks model definitions for Pi's models.json
-# ---------------------------------------------------------------------------
-# Databricks exposes API styles at different URL paths. ucode state can
-# override these provider URLs; the host-derived defaults remain for legacy
-# profile-only usage.
-
-# Each static entry declares ``input: ["text", "image"]`` for the same reason
-# the dynamic-registration path does (see _build_models_json): Pi's
-# transformMessages strips image blocks unless the model entry advertises
-# image input. These are all vision-capable models, and the run model is often
-# a static id — in which case _build_models_json's append is skipped, so the
-# capability has to be declared here too or attached images are silently
-# dropped (#515/#516).
-_DATABRICKS_OPENAI_MODELS: list[_JsonObject] = [
-    {
-        "id": "databricks-gpt-5-4-mini",
-        "name": "GPT-5.4 Mini",
-        "contextWindow": 1047576,
-        "maxTokens": 32768,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-gpt-5-4",
-        "name": "GPT-5.4",
-        "contextWindow": 1047576,
-        "maxTokens": 32768,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-gpt-5-5",
-        "name": "GPT-5.5",
-        # OSS profile endpoint metadata: 400K total context, 128K max output.
-        "contextWindow": 400000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-gpt-5-5-pro",
-        "name": "GPT-5.5 Pro",
-        # OSS profile endpoint metadata: 400K total context, 128K max output.
-        "contextWindow": 400000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-]
-
-_DATABRICKS_ANTHROPIC_MODELS: list[_JsonObject] = [
-    {
-        "id": "databricks-claude-opus-4-8",
-        "name": "Claude Opus 4.8",
-        # Gateway-verified caps: >1000000 input rejects, 128001+ output rejects.
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-claude-sonnet-4-6",
-        "name": "Claude Sonnet 4.6",
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-claude-sonnet-4-5",
-        "name": "Claude Sonnet 4.5",
-        # Gateway rejects this model past ~200k input.
-        "contextWindow": 200000,
-        "maxTokens": 16384,
-        "input": ["text", "image"],
-    },
-]
-
-# Empty: the only listed endpoint (meta-llama-3.3-70b) no longer exists on
-# the gateway. The provider stays so non-Claude/GPT ids keep a routing home.
-_DATABRICKS_COMPLETIONS_MODELS: list[_JsonObject] = []
+# Databricks exposes API styles at different URL paths. Live Unity Catalog
+# model services populate each provider; MLflow metadata adds token limits.
 
 # Prefix-matched env var names allowed into the Pi subprocess. Only
 # known-safe categories pass: Pi's own config knobs, proxy settings,
@@ -745,22 +671,18 @@ def _build_models_json(
     token: str,
     base_urls: dict[str, str] | None = None,
     model: str | None = None,
+    catalog_models: Sequence[model_catalog.ModelEntry] = (),
     model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
     openai_wire_api: str | None = None,
 ) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
-    # keep provider fields explicit while treating Pi-owned model entries as
-    # opaque JSON objects.
-    """Build a Pi ``models.json`` with three gateway providers.
+    """Build a Pi ``models.json`` with protocol-specific gateway providers.
 
     Each provider targets a different API gateway path and wire format so
-    the correct protocol is used for each model family. The static model
-    lists cover the known Databricks-gateway ids; *model* additionally
-    registers the resolved run model so a gateway model outside those
-    lists (an OpenRouter/LiteLLM id like ``moonshotai/kimi-k2.6``, or a
-    Databricks id newer than the static list) resolves instead of Pi
-    failing with "Model not found" — Pi only accepts ``provider/<model>``
-    selectors whose id is registered under that provider.
+    the correct protocol is used for each model family. Live catalog models
+    populate Pi's picker; *model* additionally registers the resolved run
+    model so an offline catalog or generic gateway still launches. Pi only
+    accepts ``provider/<model>`` selectors whose id is registered there.
 
     :param host: Databricks workspace URL used for legacy profile-only
         defaults.
@@ -772,7 +694,9 @@ def _build_models_json(
         ``"moonshotai/kimi-k2.6"``; registered (bare ``{"id": ...}``, the
         same shape ucode writes) under the provider
         :func:`_pi_provider_for_model` routes it to when absent from the
-        static list. ``None`` skips registration (Pi picks its default).
+        catalog. ``None`` skips registration (Pi picks its default).
+    :param catalog_models: Live Databricks model-service entries, optionally
+        enriched with MLflow limits. Empty leaves only *model* registered.
     :param model_wire_apis: Databricks model ids mapped to catalog-reported
         wire surfaces. Missing GPT metadata defaults to Responses.
     :param openai_wire_api: Configured wire for a generic OpenAI-compatible
@@ -814,27 +738,34 @@ def _build_models_json(
         "supportsStrictMode": False,
         "supportsReasoningEffort": False,
     }
+    provider_models: dict[str, list[_JsonObject]] = {
+        "databricks-openai": [],
+        "databricks": [],
+        "databricks-anthropic": [],
+        "databricks-mlflow": [],
+        "databricks-completions": [],
+    }
+    for catalog_model in catalog_models:
+        model_id = catalog_model.id
+        if unsupported_in_pi(model_id.lower()):
+            continue
+        wire_apis = wire_catalog.get(model_id.lower(), catalog_model.metadata.wire_apis)
+        provider_name = _pi_provider_for_model(model_id, wire_apis)
+        registered_model = catalog_model
+        if model is not None and model.lower() in _databricks_model_aliases(model_id):
+            registered_model = replace(catalog_model, id=model)
+        provider_models[provider_name].append(_pi_model_json_entry(registered_model))
     config: _PiModelsConfig = {
         "providers": {
-            # Newer GPT models (gpt-5-5, gpt-5-6-*, gpt-5-3-codex) → OpenAI
-            # Responses API at the AI Gateway. These models reject function
-            # tools via /chat/completions but work via /responses. The Responses
-            # API now supports tool-result chaining on subsequent turns.
+            # Models advertising Responses support use the AI Gateway's Codex
+            # surface, including tool-result chaining on subsequent turns.
             "databricks-openai": {
                 "baseUrl": codex_gateway_url,
                 "apiKey": token,
                 "api": "openai-responses",
                 "authHeader": True,
                 "compat": _openai_responses_compat,
-                "models": [
-                    m
-                    for m in _DATABRICKS_OPENAI_MODELS
-                    if isinstance((model_id := m.get("id")), str)
-                    and _pi_needs_responses_api(
-                        model_id,
-                        wire_catalog.get(model_id.lower()),
-                    )
-                ],
+                "models": provider_models["databricks-openai"],
             },
             # Older GPT models → OpenAI Chat Completions at serving-endpoints.
             "databricks": {
@@ -842,15 +773,7 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "openai-completions",
                 "compat": _openai_responses_compat,
-                "models": [
-                    m
-                    for m in _DATABRICKS_OPENAI_MODELS
-                    if isinstance((model_id := m.get("id")), str)
-                    and not _pi_needs_responses_api(
-                        model_id,
-                        wire_catalog.get(model_id.lower()),
-                    )
-                ],
+                "models": provider_models["databricks"],
             },
             # Claude models → Anthropic Messages API.
             # ``authHeader`` sends ``Authorization: Bearer <token>`` instead
@@ -860,7 +783,7 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "anthropic-messages",
                 "authHeader": True,
-                "models": _DATABRICKS_ANTHROPIC_MODELS,
+                "models": provider_models["databricks-anthropic"],
             },
             # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
             "databricks-mlflow": {
@@ -875,7 +798,7 @@ def _build_models_json(
                     "supportsReasoningEffort": False,
                     "supportsUsageInStreaming": False,
                 },
-                "models": [],
+                "models": provider_models["databricks-mlflow"],
             },
             # Everything else (Llama, etc.) → same endpoint, same API
             "databricks-completions": {
@@ -891,11 +814,13 @@ def _build_models_json(
                     # (which carries include_usage) with 400 "unknown field".
                     "supportsUsageInStreaming": False,
                 },
-                "models": _DATABRICKS_COMPLETIONS_MODELS,
+                "models": provider_models["databricks-completions"],
             },
         },
     }
     if model is not None:
+        # Explicit selections must launch even when picker compatibility
+        # filtering hides the equivalent discovered entry.
         provider = config["providers"][
             _pi_provider_for_model(
                 model,
@@ -904,9 +829,6 @@ def _build_models_json(
             )
         ]
         if not any(entry.get("id") == model for entry in provider["models"]):
-            # Rebind (don't append): the static lists are module-level
-            # constants shared across builds, so in-place mutation would
-            # leak this run's model id into every later models.json.
             # Declare image input: Pi's transformMessages drops every image
             # block ("model does not support images") unless the model entry
             # advertises it, so a dynamically-registered vision model would
@@ -937,6 +859,18 @@ def _pi_model_is_reasoning(model: str) -> bool:
     """Return whether *model* needs Pi's ``reasoning: true`` model flag."""
     lower = model.lower()
     return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
+
+
+def _pi_model_json_entry(model: model_catalog.ModelEntry) -> _JsonObject:
+    """Translate normalized catalog metadata into Pi's model schema."""
+    entry: _JsonObject = {"id": model.id, "input": ["text", "image"]}
+    if model.metadata.context_window is not None:
+        entry["contextWindow"] = model.metadata.context_window
+    if model.metadata.max_output_tokens is not None:
+        entry["maxTokens"] = model.metadata.max_output_tokens
+    if _pi_model_is_reasoning(model.id):
+        entry["reasoning"] = True
+    return entry
 
 
 def _pi_needs_responses_api(
@@ -991,15 +925,78 @@ def _databricks_model_wire_catalog(
     """Index UC wire metadata by both system and serving-endpoint aliases."""
     catalog: dict[str, frozenset[ModelWireAPI]] = {}
     for model in models:
-        model_id = model.id.lower()
-        aliases = {model_id}
-        if model_id.startswith("system.ai."):
-            aliases.add(f"databricks-{model_id.removeprefix('system.ai.')}")
-        elif model_id.startswith("databricks-"):
-            aliases.add(f"system.ai.{model_id.removeprefix('databricks-')}")
-        for alias in aliases:
+        for alias in _databricks_model_aliases(model.id):
             catalog[alias] = model.metadata.wire_apis
     return catalog
+
+
+def _databricks_model_aliases(model_id: str) -> frozenset[str]:
+    """Return equivalent Unity Catalog and serving-endpoint model ids."""
+    normalized = model_id.lower()
+    aliases = {normalized}
+    if normalized.startswith("system.ai."):
+        aliases.add(f"databricks-{normalized.removeprefix('system.ai.')}")
+    elif normalized.startswith("databricks-"):
+        aliases.add(f"system.ai.{normalized.removeprefix('databricks-')}")
+    return frozenset(aliases)
+
+
+def _enrich_databricks_model_catalog(
+    discovered: Sequence[model_catalog.ModelEntry],
+    metadata_models: Sequence[model_catalog.ModelEntry],
+) -> tuple[model_catalog.ModelEntry, ...]:
+    """Add MLflow limits and capabilities to live workspace models."""
+    metadata_by_alias = {
+        alias: model.metadata
+        for model in metadata_models
+        for alias in _databricks_model_aliases(model.id)
+    }
+    enriched: list[model_catalog.ModelEntry] = []
+    for model in discovered:
+        metadata = next(
+            (
+                metadata_by_alias[alias]
+                for alias in _databricks_model_aliases(model.id)
+                if alias in metadata_by_alias
+            ),
+            None,
+        )
+        if metadata is None:
+            enriched.append(model)
+            continue
+        discovered_metadata = model.metadata
+        enriched.append(
+            replace(
+                model,
+                metadata=ModelMetadata(
+                    supported_capabilities=(
+                        discovered_metadata.supported_capabilities
+                        or metadata.supported_capabilities
+                    ),
+                    unsupported_capabilities=(
+                        discovered_metadata.unsupported_capabilities
+                        or metadata.unsupported_capabilities
+                    ),
+                    context_window=(
+                        discovered_metadata.context_window
+                        if discovered_metadata.context_window is not None
+                        else metadata.context_window
+                    ),
+                    max_output_tokens=(
+                        discovered_metadata.max_output_tokens
+                        if discovered_metadata.max_output_tokens is not None
+                        else metadata.max_output_tokens
+                    ),
+                    cost_tier=(
+                        discovered_metadata.cost_tier
+                        if discovered_metadata.cost_tier is not None
+                        else metadata.cost_tier
+                    ),
+                    wire_apis=discovered_metadata.wire_apis or metadata.wire_apis,
+                ),
+            )
+        )
+    return tuple(enriched)
 
 
 async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # type: ignore[explicit-any]
@@ -1087,7 +1084,7 @@ class _PiRpcSession:
         :param cwd: Working directory for the subprocess, or ``None``
             to inherit the parent's.
         :param model: Pi model selector, e.g.
-            ``"databricks-anthropic/databricks-claude-sonnet-4-6"``.
+            ``"databricks-anthropic/gateway-model-id"``.
             ``None`` lets Pi pick its default.
         :param system_prompt: Text appended to Pi's default system
             prompt via ``--append-system-prompt``. ``None`` skips it.
@@ -1632,7 +1629,7 @@ def _aggregate_pi_turn_usage(
         reported no usage for the turn.
     :param fallback_model: The executor's configured model id, used only
         when no captured message carried a ``model``,
-        e.g. ``"databricks-claude-sonnet-4-6"``.
+        e.g. ``"gateway-model-id"``.
     :returns: A turn-level usage dict for ``TurnComplete.usage`` carrying
         summed ``input_tokens`` / ``output_tokens`` / ``total_tokens`` /
         ``cache_read_input_tokens`` / ``cache_creation_input_tokens``, a
@@ -1704,7 +1701,7 @@ class PiExecutor(Executor):
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
-        :param model: Override the model name, e.g. ``"databricks-claude-sonnet-4-6"``.
+        :param model: Override the model name, e.g. ``"gateway-model-id"``.
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
@@ -1773,6 +1770,7 @@ class PiExecutor(Executor):
         if openai_wire_api not in (None, RESPONSES_WIRE_API, CHAT_WIRE_API):
             raise ValueError(f"unsupported Pi OpenAI wire API: {openai_wire_api!r}")
         self._openai_wire_api = openai_wire_api
+        self._gateway_model_entries: tuple[model_catalog.ModelEntry, ...] | None = None
         self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
         self._gateway_auth_command = gateway_auth_command
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
@@ -2022,11 +2020,12 @@ class PiExecutor(Executor):
         return None
 
     async def _load_gateway_model_wire_apis(self) -> dict[str, frozenset[ModelWireAPI]]:
-        """Fetch Databricks model wire metadata once per executor."""
+        """Fetch and cache the live Databricks model catalog."""
         if self._gateway_model_wire_apis is not None:
             return self._gateway_model_wire_apis
         workspace_url = self._gateway_workspace_url if self._gateway else None
         if workspace_url is None:
+            self._gateway_model_entries = ()
             self._gateway_model_wire_apis = {}
             return self._gateway_model_wire_apis
         try:
@@ -2037,12 +2036,26 @@ class PiExecutor(Executor):
             )
         except Exception:  # noqa: BLE001 — catalog outage uses conservative routing
             logger.warning(
-                "Pi could not fetch Databricks model wire metadata; "
-                "unknown GPT models will use Responses",
+                "Pi could not fetch Databricks model metadata; "
+                "the picker will show only the selected model",
                 exc_info=True,
             )
+            self._gateway_model_entries = ()
             self._gateway_model_wire_apis = {}
             return self._gateway_model_wire_apis
+        try:
+            metadata_models = await run_sync_on_thread(
+                model_catalog.catalog_model_entries,
+                "databricks",
+            )
+        except Exception:  # noqa: BLE001 — live availability remains authoritative
+            logger.info(
+                "Pi could not enrich the live Databricks model list with MLflow metadata",
+                exc_info=True,
+            )
+        else:
+            models = _enrich_databricks_model_catalog(models, metadata_models)
+        self._gateway_model_entries = tuple(models)
         self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
         return self._gateway_model_wire_apis
 
@@ -2123,6 +2136,7 @@ class PiExecutor(Executor):
                 self._databricks_token,
                 self._base_urls_override,
                 model=effective_model,
+                catalog_models=self._gateway_model_entries or (),
                 model_wire_apis=self._gateway_model_wire_apis,
                 openai_wire_api=self._openai_wire_api,
             )

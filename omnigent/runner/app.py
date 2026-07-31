@@ -22,7 +22,7 @@ import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
@@ -8580,6 +8580,17 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
 _HARNESS_MODEL_ENV_KEY = model_env_keys()
 
 
+class _SpawnEnvBuilder(Protocol):
+    def __call__(
+        self,
+        spec: object,
+        *,
+        cwd: Path | None,
+        workdir: Path | None,
+    ) -> dict[str, str]:
+        raise NotImplementedError
+
+
 def _build_spawn_env_from_spec(
     spec: Any,
     harness: str,
@@ -8656,7 +8667,13 @@ def _build_spawn_env_from_spec(
             builder_path = spawn_env_builders().get(harness)
             if builder_path is not None:
                 builder = load_object(builder_path)
-                env = builder(effective_spec, cwd=cwd, workdir=workdir)
+                if not callable(builder):
+                    raise TypeError(f"spawn environment builder {builder_path!r} is not callable")
+                env = cast(_SpawnEnvBuilder, builder)(
+                    effective_spec,
+                    cwd=cwd,
+                    workdir=workdir,
+                )
             else:
                 # Native terminal harnesses and unknown harnesses build env elsewhere.
                 return None

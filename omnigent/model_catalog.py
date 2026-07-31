@@ -369,6 +369,7 @@ def catalog_model_entries(provider_name: str) -> tuple[ModelEntry, ...]:
                     supported_capabilities=frozenset(supported),
                     unsupported_capabilities=frozenset(unsupported),
                     context_window=model.max_input_tokens,
+                    max_output_tokens=model.max_output_tokens,
                     cost_tier=cost_tiers.get(index),
                 ),
             )
@@ -895,6 +896,8 @@ def _listing_payload(listing: ModelListing) -> _JsonObject:
         metadata = entry.metadata
         if metadata.context_window is not None:
             row["context_window"] = metadata.context_window
+        if metadata.max_output_tokens is not None:
+            row["max_output_tokens"] = metadata.max_output_tokens
         capabilities = {
             capability.value: supported
             for supported, values in (
