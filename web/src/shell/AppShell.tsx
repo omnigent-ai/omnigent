@@ -207,6 +207,9 @@ export function AppShell() {
   // Whether the workspace rail is maximized (covers the full content region,
   // hiding the chat column). Session-transient — a fresh visit starts docked.
   const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
+  // Sidebar open-state captured when entering full screen, so exiting can
+  // restore whatever the user had (collapsed stays collapsed; open reopens).
+  const sidebarOpenBeforeMaximizeRef = useRef(false);
   // false = full folder tree ("All"), true = changed-files-only flat list.
   // Surfaced as the Changed | All toggle inside the Files panel. Seeded from
   // the persisted, app-global preference (defaults to "All") so the choice
@@ -438,13 +441,6 @@ export function AppShell() {
     () => inventoryTerminals(terminals, terminalFirst),
     [terminals, terminalFirst],
   );
-  // The agent's spec declares shell access (a ``terminals:`` block) —
-  // the rail's Shells tab then shows BY DEFAULT, before any shell
-  // exists: its empty state carries the "+ New shell" affordance, so
-  // an empty tab is an entry point, not a dead end. Agents without
-  // shell access only get the tab once a shell actually exists
-  // (e.g. attached by other means).
-  const agentSupportsShells = (boundAgent?.terminals ?? []).length > 0;
   // The "root" session for the Subagents tab. The rail renders the whole
   // spawn tree from the top-level session, so when the user is inside a
   // descendant we walk the parent chain to the top via ``useRootSessionId``
@@ -520,26 +516,17 @@ export function AppShell() {
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
-        // Shells tab: shown by default when the agent's spec declares
-        // shell access (the empty state offers "+ New shell"), or once a
-        // shell exists for agents that don't. Inventory view: the
-        // embedded REPL terminal of terminal-first SDK sessions doesn't
-        // count — a session whose only terminal is the REPL and whose
-        // agent has no shell access shows no tab. ``hideTerminalsTab``
-        // is label-derived and starts false; ``railTerminals`` starts
-        // empty and ``agentSupportsShells`` starts false while the agent
-        // loads, so native sessions don't flash the tab.
-        terminals: !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
+        // Shells tab: shown only once a shell actually exists — creating one
+        // is now done from the tab strip's "+" menu, so an agent that merely
+        // *declares* shell access with no open shell shows no (empty) tab.
+        // Inventory view: the embedded REPL terminal of terminal-first SDK
+        // sessions doesn't count. ``hideTerminalsTab`` is label-derived and
+        // ``railTerminals`` starts empty while the agent loads, so native
+        // sessions don't flash the tab.
+        terminals: !hideTerminalsTab && railTerminals.length > 0,
         todos: todosSupported && todos.length > 0,
       }) as const,
-    [
-      showFilesPanel,
-      hideTerminalsTab,
-      railTerminals.length,
-      agentSupportsShells,
-      todosSupported,
-      todos.length,
-    ],
+    [showFilesPanel, hideTerminalsTab, railTerminals.length, todosSupported, todos.length],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1464,7 +1451,22 @@ export function AppShell() {
                     selectedTerminalKey={selectedTerminalKey}
                     onCloseTerminal={closeTerminalTab}
                     maximized={rightPanelMaximized}
-                    onToggleMaximized={() => setRightPanelMaximized((prev) => !prev)}
+                    onToggleMaximized={() =>
+                      setRightPanelMaximized((prev) => {
+                        if (!prev) {
+                          // Entering full screen: remember the sidebar state, then
+                          // collapse it so the maximized rail gets the full width.
+                          setSidebarOpen((open) => {
+                            sidebarOpenBeforeMaximizeRef.current = open;
+                            return false;
+                          });
+                        } else {
+                          // Exiting: restore whatever the sidebar was before.
+                          setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
+                        }
+                        return !prev;
+                      })
+                    }
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}

@@ -1,22 +1,19 @@
-"""E2E: the rail's "+ New shell" affordance and typing into the shell.
+"""E2E: creating a shell from the tab strip's "+" menu and typing into it.
 
-The right rail's Shells tab shows by default whenever the session agent
-declares a non-empty ``terminals:`` block — its empty state carries a
-virtual "+ New shell" row (``NewTerminalButton`` in
-``web/src/shell/NewTerminalButton.tsx``). With a single declared
-terminal name the row creates the shell directly on click (no dropdown),
-POSTing ``/resources/terminals`` and handing the new terminal's tab key
-to ``onExpand``, which opens it in the main column via
-``MainTerminalView``. None of this needs an LLM turn — the user, not the
-agent, launches the shell — so these tests never send a chat message.
+The right rail's tab strip carries a "+" ("Open new") menu whenever the
+session agent declares a non-empty ``terminals:`` block (``NewTabMenu`` in
+``web/src/shell/WorkspacePanel.tsx``). Picking "Shell" with a single
+declared terminal name creates it directly, POSTing ``/resources/terminals``
+and opening the new terminal as a rail tab (its xterm renders in the rail's
+content slot). None of this needs an LLM turn — the user, not the agent,
+launches the shell — so these tests never send a chat message.
 
 Three behaviors are covered:
 
-1. **"+ New shell" launches and opens a shell.** Clicking the row creates
-   a ``zsh`` shell and replaces the main session view with it: the
-   chrome-light shell view (``MainTerminalView``'s ``isShellView``) shows
-   a header naming the shell and a "Close shell" X, its xterm connects,
-   and the X returns to the conversation surface.
+1. **"+" → Shell launches and opens a shell.** Picking Shell creates a
+   ``zsh`` shell that opens as a rail tab (``zsh · u-…``): its xterm
+   connects in the rail's content slot, the chat page is left undisturbed,
+   and the tab's "x" closes it back to the Shells list.
 
 2. **The user can type a command into the shell.** We type ``pwd`` into
    the connected shell and assert it keeps running — the keystrokes are
@@ -48,22 +45,21 @@ from tests.e2e_ui.conftest import open_right_rail
 
 
 def _open_new_shell(page: Page) -> None:
-    """Open the Shells tab and click the "+ New shell" row.
+    """Create a shell via the tab strip's "+" → Shell menu.
 
-    Leaves the rail's Shells tab active with the create POST fired. Scopes
-    every lookup to the desktop "Workspace" rail so it never matches the
-    hidden mobile drawer that mirrors the same controls.
+    Leaves the create POST fired and the new shell opening as a rail tab.
+    Scopes every lookup to the desktop "Workspace" rail so it never matches
+    the hidden mobile drawer that mirrors the same controls.
 
     :param page: Playwright page already navigated to ``/c/{id}``.
     """
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    # Shells is present by default — the agent declares a ``zsh`` terminal,
-    # so the tab shows before any shell exists with the "+ New shell"
-    # affordance as its whole content.
-    rail.get_by_role("tab", name=re.compile("Shells")).click()
-    # Single declared name → the row creates directly on click (no dropdown).
-    rail.get_by_role("button", name="New shell").click()
+    # The "+" menu is the shell entry point (the agent declares a ``zsh``
+    # terminal, so it renders). Open it and pick "Shell" — a single declared
+    # type launches the default directly.
+    rail.get_by_role("button", name="Open new").click()
+    page.get_by_role("menuitem", name=re.compile("Shell")).click()
 
 
 def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, str]) -> None:

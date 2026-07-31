@@ -17,7 +17,7 @@ terminal regardless of the app theme.
 
 This is exactly the pair the feature exists for: a light terminal under a dark
 app, and a dark terminal under a light app. The shell is user-launched (no LLM
-turn) via the rail's "+ New shell" affordance, mirroring
+turn) via the tab strip's "+" → Shell menu, mirroring
 ``shells/test_new_shell.py``.
 """
 
@@ -64,11 +64,11 @@ def _pick_terminal_theme(page: Page, mode: str) -> None:
 
 
 def _open_new_shell(page: Page) -> None:
-    """Open the Shells tab and click "+ New shell" (mirrors test_new_shell)."""
+    """Create a shell via the tab strip's "+" → Shell menu (mirrors test_new_shell)."""
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name=re.compile("Shells")).click()
-    rail.get_by_role("button", name="New shell").click()
+    rail.get_by_role("button", name="Open new").click()
+    page.get_by_role("menuitem", name=re.compile("Shell")).click()
 
 
 def _connected_main_terminal(page: Page):

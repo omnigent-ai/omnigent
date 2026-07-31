@@ -14,17 +14,6 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: vi.fn(),
 }));
 
-// These tests cover row navigation, not shell creation. The button
-// needs a QueryClient (it reads the session agent for its access
-// gate); its behavior is covered by NewTerminalButton.test.tsx. The
-// marker keeps the variant visible so the virtual-row placement is
-// assertable.
-vi.mock("./NewTerminalButton", () => ({
-  NewTerminalButton: ({ variant }: { variant?: string }) => (
-    <div data-testid="new-shell-button" data-variant={variant} />
-  ),
-}));
-
 const useTerminalsMock = vi.mocked(useTerminals);
 
 function makeTerminal(id: string, name: string, session: string): TerminalInfo {
@@ -117,24 +106,12 @@ describe("InlineTerminalsSection rows open shells in the main view", () => {
     expect(screen.getByRole("button", { name: /s1/ })).toBeInTheDocument();
   });
 
-  it("renders only the virtual new-shell row when the only terminal is the embedded REPL", () => {
+  it("renders an empty list (no new-shell row) when the only terminal is the embedded REPL", () => {
     renderInlineSection([makeTerminal("terminal_tui_main", "tui", "main")]);
 
-    // No centered empty-state copy — the list IS the surface, and with
-    // zero shells it consists of just the virtual "+ New shell" row.
-    const row = screen.getByTestId("new-shell-button");
-    expect(row).toHaveAttribute("data-variant", "row");
+    // Shell creation lives in the tab strip's "+" menu, not here — so no
+    // "+ New shell" affordance in the list, and no centered empty-state copy.
+    expect(screen.queryByRole("button", { name: /new shell/i })).toBeNull();
     expect(screen.queryByText("No shells running.")).toBeNull();
-  });
-
-  it("keeps the virtual new-shell row above the shell rows", () => {
-    renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")]);
-
-    const row = screen.getByTestId("new-shell-button");
-    expect(row).toHaveAttribute("data-variant", "row");
-    // Leading keeps the affordance at a fixed spot — trailing would
-    // drift down as shells accumulate.
-    const shellRow = screen.getByRole("button", { name: /s1/ });
-    expect(row.compareDocumentPosition(shellRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

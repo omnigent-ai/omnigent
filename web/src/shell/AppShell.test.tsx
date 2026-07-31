@@ -61,7 +61,10 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  Sidebar: () => <div data-testid="sidebar" />,
+  // Reflect the open prop so tests can assert sidebar collapse/expand.
+  Sidebar: ({ open }: { open: boolean }) => (
+    <div data-testid="sidebar" data-open={open ? "true" : "false"} />
+  ),
 }));
 vi.mock("./FilesPanel", () => ({
   // Scope-only stand-in matching the real FilesPanel after the open-file tabs
@@ -1051,7 +1054,7 @@ describe("Chat-mode terminal panel layout", () => {
 });
 
 describe("Workspace rail maximize", () => {
-  it("toggles the rail between docked and full-screen (covering the content region)", () => {
+  it("toggles the rail between docked and full-screen, collapsing the sidebar on maximize", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -1061,21 +1064,46 @@ describe("Workspace rail maximize", () => {
     renderShell("/c/conv_abc");
 
     const rail = () => screen.getByRole("complementary", { name: "Workspace" });
-    // Docked baseline: fixed-width flex child, no absolute-cover classes.
+    // Open the sidebar first (jsdom defaults it closed) so we can prove maximize
+    // collapses it. Docked baseline: fixed-width flex child, no cover classes.
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
 
-    // Maximize → the rail breaks out to cover the content region.
+    // Maximize → the rail breaks out to cover the content region, and the left
+    // sidebar collapses so the maximized rail owns the full content width.
     fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
     expect(rail().className).toContain("md:absolute");
     expect(rail().className).toContain("md:inset-0");
     // Still keeps the docked card inset/rounding — only the width changes.
     expect(rail().className).toContain("md:m-2");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
-    // Minimize → back to the docked flex child.
+    // Minimize → back to the docked flex child, and the sidebar is restored to
+    // its pre-maximize state (it was open, so it reopens).
     fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("keeps the sidebar collapsed after exiting full screen if it was collapsed before", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell("/c/conv_abc");
+
+    // Sidebar starts collapsed (jsdom default). Maximize then exit — it must
+    // stay collapsed, not spuriously reopen.
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
   });
 });
 
@@ -1959,13 +1987,11 @@ describe("Embedded REPL terminal rail inventory", () => {
     expect(tab).toHaveTextContent(/Shells\s*1/);
   });
 
-  it("shows the Shells tab by default when the agent declares shell access", () => {
-    // No shells exist yet (only the embedded REPL, which is excluded
-    // from the inventory), but the agent's spec has a terminals: block
-    // — the tab must show anyway so the "+ New shell" empty state is
-    // reachable. A missing tab here means the gate still requires an
-    // existing shell; a "0" in the tab means the badge leaked for the
-    // empty default state.
+  it("hides the Shells tab when no shell exists, even if the agent declares shell access", () => {
+    // Shell creation now lives in the tab strip's "+" menu, so the Shells tab
+    // is a pure list — it must NOT show just because the agent declares a
+    // terminals: block. Here the only terminal is the embedded REPL (excluded
+    // from the inventory), so there's no shell to list and no tab.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
       isLoading: false,
@@ -1988,14 +2014,32 @@ describe("Embedded REPL terminal rail inventory", () => {
 
     renderShell("/c/conv_sdk");
 
+    expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
+  });
+
+  it("shows the Shells tab once a shell exists", () => {
+    // A real (non-REPL) shell in the inventory surfaces the tab, which lists it.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_zsh_s1", name: "zsh", session: "s1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    mockConversations([{ id: "conv_sdk", permission_level: null }]);
+
+    renderShell("/c/conv_sdk");
+
     const tab = screen.getByRole("tab", { name: /Shells/i });
-    expect(tab).not.toHaveTextContent(/0/);
     // Display order: Shells sits to the RIGHT of Agents in the strip.
     const agentsTab = screen.getByRole("tab", { name: /Agents/i });
     expect(agentsTab.compareDocumentPosition(tab) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // Selecting the tab mounts the shells section (whose empty state
-    // carries the new-shell affordance), not a fall-through to the
-    // Files panel — the content branch must share the trigger's gate.
+    // Selecting it mounts the shells list.
     fireEvent.mouseDown(tab);
     expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
   });
@@ -2635,24 +2679,16 @@ describe("Mobile session menu", () => {
     expect(screen.getByRole("menuitem", { name: /Shells/i })).toBeInTheDocument();
   });
 
-  it("shows the Shells entry on mobile when the agent declares shell access", () => {
-    // No user shells exist yet (only the embedded REPL, excluded from the
-    // Shells inventory), but the agent declares a terminals: block. Mobile
-    // must mirror the desktop rail so the empty-state "+ New shell" entry
-    // point is reachable before the first shell exists.
+  it("shows the Shells entry on mobile once a shell exists", () => {
+    // Mobile mirrors the desktop rail's Shells gate: the entry shows only when
+    // a real (non-REPL) shell exists to list — creation is via the "+" menu.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      {
-        id: "conv_sdk",
-        permission_level: null,
-        labels: { "omnigent.ui": "terminal" },
-      },
-    ]);
+    mockConversations([{ id: "conv_sdk", permission_level: null }]);
     useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
+      terminals: [{ id: "terminal_zsh_s1", name: "zsh", session: "s1", running: true }],
       isLoading: false,
       error: null,
     });
@@ -2663,9 +2699,8 @@ describe("Mobile session menu", () => {
     renderShell("/c/conv_sdk");
     openSessionMenu();
 
-    const shellsEntry = screen.getByRole("menuitem", { name: /^Shells$/i });
+    const shellsEntry = screen.getByRole("menuitem", { name: /^Shells/i });
     expect(shellsEntry).toBeInTheDocument();
-    expect(shellsEntry).not.toHaveTextContent(/0/);
     fireEvent.click(shellsEntry);
 
     const drawer = screen.getByTestId("shells-panel-drawer");

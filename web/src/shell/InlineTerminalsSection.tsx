@@ -1,15 +1,12 @@
-// Shells tab content for the right-side rail: a virtual "+ New shell"
-// row on top, then the session's shells as rows. Clicking a shell row
-// does NOT open an in-rail split — it hands the shell to `onExpand`,
-// which replaces the main session view with that shell
-// (MainTerminalView for terminal-first sessions, the full-width push
-// panel otherwise). The rail stays a lightweight index; the terminal
-// always gets the full main column.
+// Shells tab content for the right-side rail: the session's shells as
+// rows. Clicking a shell row hands it to `onExpand`, which opens the
+// shell as a rail tab. Creating a new shell is done from the tab strip's
+// "+" menu (see NewTabMenu), not from here. The rail stays a lightweight
+// index.
 
 import { TerminalIcon } from "lucide-react";
 import { useMemo } from "react";
 import { inventoryTerminals, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
-import { NewTerminalButton } from "./NewTerminalButton";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -34,14 +31,10 @@ export function InlineTerminalsSection({ conversationId, onExpand }: InlineTermi
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-      {/* Always a plain top-aligned list: a virtual "+ New shell" row
-          first (gated inside NewTerminalButton on the agent's terminal
-          access — leading keeps it at a fixed spot instead of drifting
-          down as shells accumulate), then the shell rows. With zero
-          shells the virtual row is the whole list — no centered
-          empty-state copy. */}
+      {/* Plain top-aligned list of the session's shells. New shells are
+          created from the tab strip's "+" menu, not here — so an empty list
+          shows nothing (the "+" is the entry point). */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto py-1">
-        <NewTerminalButton conversationId={conversationId} onCreated={onExpand} variant="row" />
         {terminals.map((t) => (
           <button
             key={terminalTabKey(t)}

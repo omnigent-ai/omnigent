@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
@@ -42,7 +43,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
   ),
 }));
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
   useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
 }));
@@ -369,16 +370,19 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
     cleanup();
 
-    // With an open file tab → still exactly one "+", now living in the flexible
-    // open-tabs region so it trails the last tab.
+    // With an open file tab → still exactly one "+", now trailing the tabs. It
+    // sits OUTSIDE the scrolling tabs region (as its next sibling) so it stays
+    // pinned when the tabs overflow instead of scrolling/overlapping.
     declaresShell();
     renderWorkspace({ openFiles: ["src/App.tsx"] });
     const plus = screen.getByRole("button", { name: "Open new" });
     expect(plus).toBeInTheDocument();
-    // Its ancestor open-tabs region also holds the file tab's close button.
-    const region = plus.closest("div.\\@min-\\[500px\\]\\/rail\\:flex-1");
-    expect(region).not.toBeNull();
-    expect(region).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+    // The scrolling tabs region (holds the file tab's close button) is the
+    // "+" wrapper's immediately-preceding sibling — the "+" is not inside it.
+    const plusWrapper = plus.parentElement!;
+    const tabsRegion = plusWrapper.previousElementSibling as HTMLElement;
+    expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+    expect(tabsRegion).not.toContainElement(plus);
   });
 
   it("offers Shell (gated on declared terminals), creating one and opening it as a tab", async () => {
@@ -403,6 +407,73 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // Launches the first declared shell and opens the created terminal's tab.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+  });
+
+  it("launches the default shell directly when several are declared (type selection is optional)", async () => {
+    // Multiple declared terminals → "Shell" nests a submenu to pick a type, but
+    // clicking it directly launches the default (declared[0]) without forcing a
+    // selection.
+    useSessionAgentMock.mockReturnValue({
+      data: { terminals: ["zsh", "bash", "fish"] },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    const created = { id: "terminal_zsh_s1", name: "zsh", session: "u-2", running: true };
+    const mutate = vi.fn((_name: string, opts?: { onSuccess?: (info: unknown) => void }) =>
+      opts?.onSuccess?.(created),
+    );
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
+
+    // Open the "+" menu and click the "Shell" submenu trigger directly.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
+
+    // Launches the default (first-declared) shell without a further pick.
+    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+  });
+
+  it("remembers the picked shell type as the new default (persisted + check-marked)", async () => {
+    window.localStorage.removeItem("omnigent:preferred-shell");
+    useSessionAgentMock.mockReturnValue({
+      data: { terminals: ["zsh", "bash", "fish"] },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    const mutate = vi.fn();
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    renderWorkspace({ showBrowserTab: false });
+
+    // Open the submenu (ArrowRight — a plain click on "Shell" launches the
+    // default instead) and pick "bash", which persists as the preferred type.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const shellTrigger = await screen.findByRole("menuitem", { name: /shell/i });
+    shellTrigger.focus();
+    fireEvent.keyDown(shellTrigger, { key: "ArrowRight" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^bash$/i }));
+    expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
+    expect(window.localStorage.getItem("omnigent:preferred-shell")).toBe("bash");
+
+    // A fresh menu seeds its default from the persisted pick — clicking "Shell"
+    // now launches bash without opening the submenu.
+    cleanup();
+    mutate.mockClear();
+    useSessionAgentMock.mockReturnValue({
+      data: { terminals: ["zsh", "bash", "fish"] },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    renderWorkspace({ showBrowserTab: false });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
+    expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
+
+    window.localStorage.removeItem("omnigent:preferred-shell");
   });
 });
 
@@ -453,40 +524,39 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
   });
 
-  it("keeps exactly one ml-auto in the strip with open tabs (divider pins the right cluster)", () => {
-    // With open tabs the single ml-auto moves to the divider, which drags the
-    // nav group + maximize right together. Neither the nav group nor the
-    // maximize button may add a second ml-auto.
+  it("keeps exactly one ml-auto in the strip with open tabs (nav tabs stay left, maximize pins right)", () => {
+    // The nav tabs stay anchored on the LEFT with open tabs — the open-tabs
+    // region renders to their right and the maximize button keeps the row's
+    // single ml-auto. Two ml-auto siblings would split the free space.
     renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
-    // The nav tablist and the maximize button both trail the divider — no
-    // ml-auto of their own.
+    // The nav tablist stays left — no ml-auto of its own.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
-    expect(screen.getByRole("button", { name: "Full screen" }).parentElement).not.toHaveClass(
+    // The maximize button owns the single ml-auto, pinning it right.
+    expect(screen.getByRole("button", { name: "Full screen" }).parentElement).toHaveClass(
       "ml-auto",
     );
-    // The divider (aria-hidden, no container-query gate) is present so it shows
-    // at any rail width.
+    // The divider is present (separating the nav tabs from the open tabs) and
+    // stays container-query gated to the ≥500px anchored case.
     const divider = strip().querySelector(".bg-border-strong");
     expect(divider).not.toBeNull();
-    expect(divider).toHaveClass("ml-auto");
-    expect(divider).not.toHaveClass("@min-[500px]/rail:block");
+    expect(divider).not.toHaveClass("ml-auto");
   });
 
   it("does not leave a phantom gap: empty tab strips render nothing, so the '+' hugs the last tab", () => {
     // FileTabsStrip / TerminalTabsStrip must return null when empty — an empty
-    // wrapper would still occupy a slot in the region's gap and push the "+"
-    // away from the last tab. With a file open (and no shells), the open-tabs
-    // region should hold exactly two children: the file-tabs strip and the "+".
+    // wrapper would still occupy a slot in the scroller's gap and offset the
+    // trailing "+". With a file open (and no shells) the scroller should hold
+    // exactly one child: the file-tabs strip (the empty terminal strip is null).
     declaresShell();
     renderWorkspace({ openFiles: ["src/App.tsx"] });
 
     const plus = screen.getByRole("button", { name: "Open new" });
-    const region = plus.closest("div.\\@min-\\[500px\\]\\/rail\\:flex-1")!;
-    expect(region.children).toHaveLength(2);
-    // The "+" hugs the last tab by cancelling the region gap.
-    expect(plus.parentElement).toHaveClass("-ml-0.5");
+    // Scroller is the "+" wrapper's preceding sibling; it holds only the tabs.
+    const tabsRegion = plus.parentElement!.previousElementSibling as HTMLElement;
+    expect(tabsRegion.children).toHaveLength(1);
+    expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
   });
 
   it("gives the full-screen button no left padding", () => {

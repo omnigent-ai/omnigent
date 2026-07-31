@@ -1,5 +1,6 @@
 import {
   BotIcon,
+  CheckIcon,
   FileIcon,
   FilesIcon,
   GlobeIcon,
@@ -11,7 +12,7 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
-import { type ReactElement, useCallback, useEffect, useRef } from "react";
+import { type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -19,6 +20,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -55,13 +59,27 @@ function WorkspaceTabTooltip({
   );
 }
 
+// localStorage key for the last shell type launched from the "+" menu, so the
+// choice is remembered across the menu's remounts (it renders in two spots) and
+// reloads. App-global (not per-session): the user's preferred shell rarely
+// varies by conversation.
+const PREFERRED_SHELL_KEY = "omnigent:preferred-shell";
+
+function readPreferredShell(): string | null {
+  try {
+    return window.localStorage.getItem(PREFERRED_SHELL_KEY);
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // NewTabMenu — the "+" affordance in the tab strip. Opens a small dropdown
-// ("Open new") offering the surfaces a user can spin up on demand: a Browser
-// (switches the rail to the embedded browser tab) and a Shell (creates a
-// terminal and opens it as a rail tab). Each entry self-gates — Browser only
-// when the embedded browser is available, Shell only when the agent's spec
-// declares terminal access — so the menu renders nothing when neither applies.
+// ("Open new") to spin up a Shell as a rail tab. When the agent declares a
+// single terminal, "Shell" launches it directly; when several are declared,
+// "Shell" nests a submenu so the user picks which type to launch — the last
+// pick is remembered (check-marked, and launched on a plain "Shell" click).
+// Gated on the agent's spec declaring terminal access — renders nothing else.
 // ---------------------------------------------------------------------------
 
 function NewTabMenu({
@@ -78,20 +96,42 @@ function NewTabMenu({
 }) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
+  // Remembered shell type, persisted across remounts/reloads. Seeded from
+  // localStorage so the "+" in either strip spot agrees on the current pick.
+  const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
   // Shell access mirrors NewTerminalButton's gate: the agent's spec must
-  // declare a non-empty ``terminals:`` block. The first declared name is the
-  // default we launch (native wrappers put ``$SHELL`` first).
+  // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
   // Nothing to offer → no "+" button at all. (The embedded browser is one view
   // per conversation, reached via its own pinned tab, so it's not offered here.)
   if (!canOpenShell) return null;
 
-  const launchShell = () => {
-    create.mutate(declaredTerminals[0], {
+  // The default launched on a plain "Shell" click: the remembered pick when it
+  // is still a declared type, else the first declared name.
+  const defaultShell =
+    preferred !== null && declaredTerminals.includes(preferred) ? preferred : declaredTerminals[0];
+
+  const launchShell = (name: string) => {
+    create.mutate(name, {
       onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
     });
   };
+
+  // Launch a type and remember it as the new default for next time.
+  const pickShell = (name: string) => {
+    setPreferred(name);
+    try {
+      window.localStorage.setItem(PREFERRED_SHELL_KEY, name);
+    } catch {
+      /* storage unavailable — the in-memory pick still holds for this mount */
+    }
+    launchShell(name);
+  };
+
+  // One declared shell → a direct "Shell" action. Several → a nested submenu
+  // so the user picks which type to launch (mirrors NewTerminalButton's picker).
+  const multipleShells = declaredTerminals.length > 1;
 
   return (
     <DropdownMenu>
@@ -109,10 +149,47 @@ function NewTabMenu({
       </WorkspaceTabTooltip>
       <DropdownMenuContent align="start">
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={launchShell} disabled={create.isPending}>
-          <TerminalIcon className="size-4" />
-          Shell
-        </DropdownMenuItem>
+        {multipleShells ? (
+          <DropdownMenuSub>
+            {/* Clicking "Shell" launches the remembered default immediately —
+                the type selection is optional. Hover/right-arrow still opens the
+                submenu to pick a specific type. onClick fires the default and
+                lets the menu close on its own; preventDefault stops the click
+                from only toggling the submenu open. */}
+            <DropdownMenuSubTrigger
+              disabled={create.isPending}
+              onClick={(e) => {
+                e.preventDefault();
+                launchShell(defaultShell);
+              }}
+            >
+              <TerminalIcon className="size-4" />
+              Shell
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              {declaredTerminals.map((name) => (
+                <DropdownMenuItem
+                  key={name}
+                  onSelect={() => pickShell(name)}
+                  disabled={create.isPending}
+                >
+                  <CheckIcon
+                    className={cn("size-4", name === defaultShell ? "opacity-100" : "opacity-0")}
+                  />
+                  {name}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ) : (
+          <DropdownMenuItem
+            onSelect={() => launchShell(declaredTerminals[0])}
+            disabled={create.isPending}
+          >
+            <TerminalIcon className="size-4" />
+            Shell
+          </DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -566,67 +643,17 @@ export function WorkspacePanel({
           affordance, so an empty tab is an entry point, not a dead end.
           The Agents tab keys off ``rootSessionId``, so inside a child
           it lists the siblings + a "main" link back to the parent. */}
-      {/* Tab strip scroll behavior is rail-width-driven (container query):
-          - ≥500px: the static tabs stay put and ONLY the file tabs scroll —
-            so the outer row is overflow-x-hidden and the file-tabs region owns
-            the scroller (see below).
-          - <500px: there isn't room to keep the static tabs anchored, so the
-            WHOLE row scrolls — the outer row is the scroller (base
-            overflow-x-auto) and the file region just overflows into it.
-          overflow-y stays hidden so overflow-x:auto can't spawn a vertical
-          scrollbar that eats horizontal space. */}
-      <div className="shrink-0 flex items-center overflow-x-auto overflow-y-hidden border-b border-border px-2 py-2 [scrollbar-width:thin] @min-[500px]/rail:overflow-x-hidden [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
-        {(openFiles.length > 0 || openTerminals.length > 0) && (
-          <>
-            {/* Open-tabs region (file tabs + shell tabs). ≥500px (rail container
-                query): the ONLY horizontal scroller (flex-1 + overflow-x-auto),
-                so the static tabs stay anchored to the right. <500px: shrink-0
-                with NO overflow set — it keeps its natural width and the whole
-                row overflows into the outer scroller, so the strip scrolls as
-                one. (overflow-y-hidden must stay scoped to the ≥500px case:
-                setting it while overflow-x is `visible` would force overflow-x
-                to `auto`, turning this into its own scroller and defeating the
-                <500px whole-strip scroll.) */}
-            <div className="flex shrink-0 items-center gap-0.5 [scrollbar-width:thin] @min-[500px]/rail:min-w-0 @min-[500px]/rail:flex-1 @min-[500px]/rail:overflow-x-auto @min-[500px]/rail:overflow-y-hidden [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
-              <FileTabsStrip
-                openFiles={openFiles}
-                activeFilePath={selectedFilePath}
-                onFileSelect={openFileViewer}
-                onCloseFile={onCloseFile}
-              />
-              <TerminalTabsStrip
-                openTerminals={openTerminals}
-                activeTerminalKey={selectedTerminalKey}
-                labelFor={terminalLabelFor}
-                onSelect={openTerminalTab}
-                onClose={onCloseTerminal}
-              />
-              {/* With open tabs, the "+" trails the last tab so it reads as
-                  "add another tab" rather than a nav control. -ml-0.5 cancels
-                  the region's gap-0.5 so it hugs the last tab. */}
-              <NewTabMenu
-                conversationId={conversationId}
-                onOpenTerminal={openTerminalTab}
-                triggerClassName="-ml-0.5"
-              />
-            </div>
-            {/* 1px divider separating the open tabs from the static tabs. It's
-                the leftmost element of the right cluster (divider + nav tabs +
-                maximize), so it carries the row's single ml-auto that pushes
-                that whole cluster flush right — keeping the divider glued to the
-                nav group instead of stranded by the auto-gap. */}
-            <div
-              aria-hidden
-              className="mx-[4px] ml-auto h-[14px] w-px shrink-0 self-center bg-border-strong"
-            />
-          </>
-        )}
+      {/* Tab strip: the static nav tabs + divider stay pinned on the left at
+          every rail width, and ONLY the file-tabs region scrolls (it owns the
+          horizontal scroller — see below). The outer row never scrolls
+          (overflow-x-hidden), so the divider is a fixed boundary that doesn't
+          drift when the tabs scroll. */}
+      <div className="shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-2">
         <Tabs
-          // Static group — never compresses (shrink-0). When open tabs exist
-          // the divider before it owns the row's ml-auto and drags this group
-          // (and the trailing maximize) flush right; with no open tabs there's
-          // no divider, so the maximize button owns ml-auto and this group
-          // stays left. Exactly one ml-auto in the row either way.
+          // Static group — never compresses (shrink-0) and stays anchored on
+          // the LEFT whether or not tabs are open. The open tabs render to its
+          // right; the maximize button owns the row's single ml-auto and pins
+          // to the right edge.
           className="shrink-0"
           // When a file or shell tab is active no fixed trigger should
           // highlight, so feed the radix group a sentinel that matches none of
@@ -717,6 +744,47 @@ export function WorkspacePanel({
             )}
           </TabsList>
         </Tabs>
+        {(openFiles.length > 0 || openTerminals.length > 0) && (
+          <>
+            {/* 1px divider separating the static nav tabs from the open tabs.
+                Pinned (outside the scrolling file-tabs region), so it stays put
+                at every rail width while the tabs scroll past it. */}
+            <div
+              aria-hidden
+              className="mx-[4px] h-[14px] w-px shrink-0 self-center bg-border-strong"
+            />
+            {/* Open-tabs region (file tabs + shell tabs) — the horizontal
+                scroller. It sizes to its content and shrinks+scrolls only when
+                the tabs would overflow (min-w-0, no flex-1), so the "+" outside
+                it hugs the last tab when they fit and stays pinned when they
+                don't. overflow-y-hidden stops overflow-x:auto from spawning a
+                vertical scrollbar that eats horizontal space. */}
+            <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              <FileTabsStrip
+                openFiles={openFiles}
+                activeFilePath={selectedFilePath}
+                onFileSelect={openFileViewer}
+                onCloseFile={onCloseFile}
+              />
+              <TerminalTabsStrip
+                openTerminals={openTerminals}
+                activeTerminalKey={selectedTerminalKey}
+                labelFor={terminalLabelFor}
+                onSelect={openTerminalTab}
+                onClose={onCloseTerminal}
+              />
+            </div>
+            {/* "+" trails the last tab but sits OUTSIDE the scroller, so it
+                stays pinned (never scrolls under / overlaps the tabs) when they
+                overflow, and hugs the last tab when they fit. ml-[2px] keeps the
+                same gap the scroller's gap-0.5 gives between tabs. */}
+            <NewTabMenu
+              conversationId={conversationId}
+              onOpenTerminal={openTerminalTab}
+              triggerClassName="ml-[2px]"
+            />
+          </>
+        )}
         {/* "+" — open a new Shell tab. With no open tabs it sits here, right
             after the nav tabs (next to Shells); once tabs exist it moves into
             the open-tabs region to trail the last tab (see above). Self-gates
@@ -724,14 +792,13 @@ export function WorkspacePanel({
         {openFiles.length === 0 && openTerminals.length === 0 && (
           <NewTabMenu conversationId={conversationId} onOpenTerminal={openTerminalTab} />
         )}
-        {/* Maximize/minimize toggle, at the rightmost edge. It owns the row's
-            single ml-auto ONLY when there are no open tabs (nav group stays
-            left, this pins right). With open tabs the nav group carries ml-auto
-            and this button just trails it — a second ml-auto here would split
-            the free space and strand the nav group mid-strip. */}
+        {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
+            which absorbs the free space before it. When open tabs exist their
+            ≥500px flex-1 region absorbs the space instead, so the button still
+            hugs the right. */}
         <WorkspaceTabTooltip
           label={maximized ? "Exit full screen" : "Full screen"}
-          className={cn(openFiles.length === 0 && openTerminals.length === 0 && "ml-auto")}
+          className="ml-auto"
         >
           <button
             type="button"
