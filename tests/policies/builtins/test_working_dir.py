@@ -318,6 +318,18 @@ def test_env_prefix_stripped_before_classifying() -> None:
         "sudo -u root git -C /other status",
         "env -i git -C /other status",
         "sudo -nu root git worktree add /tmp/wt",
+        # ``env -S`` runs the string it splits, so the cd is INSIDE the flag's
+        # value — consuming it as an ordinary value left no tokens to classify.
+        "env -S 'cd /etc'",
+        "env --split-string='cd /etc'",
+        "env --split-string 'cd /etc'",
+        "env -iS 'cd /etc'",
+        "env -u FOO -S 'cd /etc'",
+        "env -S 'git worktree add /tmp/wt'",
+        "sudo -u root env -S 'cd /etc'",
+        # An absolute path names the same wrapper.
+        "/usr/bin/sudo -u root cd /etc",
+        "/usr/bin/env -S 'cd /etc'",
     ],
 )
 def test_option_taking_wrapper_does_not_hide_the_dir_op(command: str) -> None:
@@ -343,6 +355,8 @@ def test_option_taking_wrapper_does_not_hide_the_dir_op(command: str) -> None:
         "command -p ls",
         "time -p pytest",
         "timeout 60 npm test",
+        "env -S 'npm test'",
+        "env -S 'git status'",
     ],
 )
 def test_option_taking_wrapper_around_benign_command_abstains(command: str) -> None:

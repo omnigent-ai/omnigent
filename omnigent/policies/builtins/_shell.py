@@ -5,7 +5,7 @@ operations, ``working_dir`` for directory / worktree switches) all face the
 same problem: a single ``sys_os_shell`` ``command`` string can chain several
 commands (``a && b ; c``), prefix them with env-assignments or wrappers
 (``sudo``, ``env``, ``VAR=x``), and hide the real command inside a shell
-interpreter (``bash -c "<cmd>"``) or ``eval``. A policy that only looked at
+interpreter (``bash -c "<cmd>"``, ``env -S "<cmd>"``) or ``eval``. A policy that only looked at
 the first token would be trivially bypassable.
 
 This module factors out the *generic* primitives for breaking a command into
@@ -71,11 +71,22 @@ _FLAG_WRAPPERS: dict[str, frozenset[str]] = {
             "--user",
         }
     ),
+    # ``-S`` takes a value like the rest, but that value is a command string —
+    # see :data:`_ENV_SPLIT_STRING_FLAGS`, which captures it instead of skipping.
     "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
     "command": frozenset(),
     "time": frozenset({"-f", "--format", "-o", "--output"}),
     "exec": frozenset({"-a"}),
 }
+
+# ``env -S '<cmd>'`` / ``env --split-string='<cmd>'`` do not merely pass a value
+# to ``env`` — coreutils splits the string into words and RUNS it, making ``env``
+# a command interpreter like ``sh -c``. Treating ``-S`` as an ordinary value flag
+# would swallow the whole command as the flag's value and leave NO tokens to
+# classify, so the segment would abstain → ALLOW (and with no tokens, not even
+# :func:`is_unresolved_invocation` could catch it). Its value is therefore
+# *captured* rather than skipped, and re-parsed via :func:`unwrap_shell_command`.
+_ENV_SPLIT_STRING_FLAGS: frozenset[str] = frozenset({"-S", "--split-string"})
 
 # Flag-wrappers that ALSO consume a leading positional (a duration) after their
 # own flags: ``timeout 5m git push`` / ``timeout -s KILL 5m git push``.
@@ -187,6 +198,15 @@ def real_invocation_tokens(tokens: list[str]) -> list[str]:
     """
     Drop leading env-assignments and command wrappers to reach the real argv.
 
+    Wrappers are matched on the basename, so an absolute path (``/usr/bin/sudo
+    -u root git push``) is stripped like the bare word — otherwise the path
+    token would be left as the apparent command and the push would slip past
+    the gate exactly as an unmodelled wrapper flag would.
+
+    An ``env -S '<cmd>'`` wrapper is left in place instead of stripped: its
+    string is a command to re-parse, which is :func:`unwrap_shell_command`'s
+    job, not a value to skip over.
+
     :param tokens: shlex-split tokens of one segment, e.g.
         ``["sudo", "GIT_SSH=x", "git", "push"]`` or
         ``["timeout", "-s", "KILL", "5m", "git", "push"]``.
@@ -196,16 +216,24 @@ def real_invocation_tokens(tokens: list[str]) -> list[str]:
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token in CMD_WRAPPERS or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+        word = token.rsplit("/", 1)[-1]
+        if word in CMD_WRAPPERS or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
             index += 1
             continue
-        if token in _FLAG_WRAPPERS:
-            index = _skip_flag_wrapper_args(
+        if word in _FLAG_WRAPPERS:
+            next_index, split_string = _skip_flag_wrapper_args(
                 tokens,
                 index + 1,
-                value_flags=_FLAG_WRAPPERS[token],
-                has_duration=token in _DURATION_WRAPPERS,
+                value_flags=_FLAG_WRAPPERS[word],
+                has_duration=word in _DURATION_WRAPPERS,
+                capture_flags=_ENV_SPLIT_STRING_FLAGS if word == "env" else frozenset(),
             )
+            if split_string is not None:
+                # ``env -S`` RUNS the captured string — stop at the wrapper so
+                # the caller unwraps and re-parses it rather than losing the
+                # command into a consumed flag value.
+                break
+            index = next_index
             continue
         break
     return tokens[index:]
@@ -237,7 +265,8 @@ def _skip_flag_wrapper_args(
     *,
     value_flags: frozenset[str],
     has_duration: bool,
-) -> int:
+    capture_flags: frozenset[str] = frozenset(),
+) -> tuple[int, str | None]:
     """
     Skip a flag-wrapper's own option flags (and its duration positional).
 
@@ -251,24 +280,32 @@ def _skip_flag_wrapper_args(
     only against the whole token. Its value is a separate token only when the
     option is the bundle's LAST character; otherwise the rest of the token is
     the attached value (``nice -n10`` / ``stdbuf -oL``) and nothing further is
-    consumed.
+    consumed. Only the first value-taking option of a bundle is modelled, which
+    is the only form ``getopt`` itself can honor — a value option that is not
+    last ends the bundle by taking the remainder as its value.
 
     :param tokens: The full token list of the segment.
     :param index: Index of the first token after the wrapper word.
     :param value_flags: The wrapper's flags that consume a separate value token.
     :param has_duration: Whether the wrapper takes a leading duration positional
         (``timeout``).
-    :returns: Index of the wrapped command's first token.
+    :param capture_flags: Flags whose value is a *command string* to re-parse
+        rather than an opaque value to skip (:data:`_ENV_SPLIT_STRING_FLAGS`).
+    :returns: ``(index, captured)`` — the index of the wrapped command's first
+        token, and the value of a *capture_flags* option when one was present
+        (else ``None``).
     """
+    captured: str | None = None
     while index < len(tokens) and tokens[index].startswith("-"):
         flag = tokens[index]
         index += 1
-        if index >= len(tokens):
-            break
         if flag.startswith("--"):
             # Long options take a separate value only in the ``--flag value``
             # form; ``--flag=value`` is a single token needing no lookahead.
-            if flag in value_flags:
+            name, equals, attached = flag.partition("=")
+            if name in capture_flags:
+                captured = attached if equals else _value_at(tokens, index)
+            if flag in value_flags and index < len(tokens):
                 index += 1
             continue
         bundle = flag[1:]
@@ -276,24 +313,55 @@ def _skip_flag_wrapper_args(
             (pos for pos, opt in enumerate(bundle) if f"-{opt}" in value_flags),
             None,
         )
-        if position is not None and position == len(bundle) - 1:
+        if position is None:
+            continue
+        is_last = position == len(bundle) - 1
+        if f"-{bundle[position]}" in capture_flags:
+            captured = _value_at(tokens, index) if is_last else bundle[position + 1 :]
+        if is_last and index < len(tokens):
             index += 1
     if has_duration and index < len(tokens):
         index += 1
-    return index
+    return index, captured
+
+
+def _value_at(tokens: list[str], index: int) -> str | None:
+    """
+    Return ``tokens[index]``, or ``None`` when the option's value is missing.
+
+    :param tokens: The full token list of the segment.
+    :param index: Index of the token holding an option's separate value.
+    :returns: The value token, or ``None`` past the end (``env -S`` with no
+        string runs nothing, so there is nothing to re-parse).
+    """
+    return tokens[index] if index < len(tokens) else None
 
 
 def unwrap_shell_command(tokens: list[str]) -> str | None:
     """
     Return the inner command string of a shell-interpreter / ``eval`` wrapper.
 
+    ``env -S '<cmd>'`` counts as one: coreutils splits the string into words and
+    runs it, so it is a command interpreter wearing an option flag. Without
+    unwrapping it, the string is consumed as an ordinary flag value and the
+    segment yields no command at all — a silent ALLOW of whatever it hides.
+
     :param tokens: Real invocation tokens (env-prefixes / wrappers already
-        stripped), e.g. ``["bash", "-c", "git push origin main"]`` or
-        ``["eval", "git", "push"]``.
+        stripped), e.g. ``["bash", "-c", "git push origin main"]``,
+        ``["eval", "git", "push"]`` or ``["env", "-S", "git push origin main"]``.
     :returns: The wrapped command string to re-parse, or ``None`` when *tokens*
-        is not a shell-interpreter / ``eval`` invocation.
+        is not a shell-interpreter / ``eval`` / ``env -S`` invocation.
     """
     head = tokens[0].rsplit("/", 1)[-1]
+    if head == "env":
+        _, split_string = _skip_flag_wrapper_args(
+            tokens,
+            1,
+            value_flags=_FLAG_WRAPPERS["env"],
+            has_duration=False,
+            capture_flags=_ENV_SPLIT_STRING_FLAGS,
+        )
+        return split_string
     if head in SHELL_INTERPRETERS:
         for i, tok in enumerate(tokens):
             if _INTERPRETER_C_FLAG.fullmatch(tok) and i + 1 < len(tokens):
