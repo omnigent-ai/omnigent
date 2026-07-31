@@ -638,11 +638,11 @@ class OSEnvSandboxSpec:
     cwd_hidden_scan_overflow: str = "warn"
     # Whether the dotfile / escaping-symlink masker recurses into
     # subdirectories. ``False`` (default) scans only the immediate
-    # children of cwd and each ``read_paths`` root — the top-level
-    # dotfiles (``.git``, ``.env``, ``.aws``, ``.ssh``, ...) that
-    # carry the overwhelming majority of secrets are still masked,
-    # but the walker no longer pays to descend the whole tree. This
-    # is the scalable default: a recursive walk of a medium/large
+    # children of cwd and each ``read_paths`` / ``write_paths`` root —
+    # the top-level dotfiles (``.git``, ``.env``, ``.aws``, ``.ssh``,
+    # ...) that carry the overwhelming majority of secrets are still
+    # masked, but the walker no longer pays to descend the whole tree.
+    # This is the scalable default: a recursive walk of a medium/large
     # project (or ``read_paths: ["~/"]``) visits enormous numbers of
     # entries and routinely trips :attr:`cwd_hidden_scan_max_entries`.
     #
