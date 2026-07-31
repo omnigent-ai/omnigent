@@ -44,6 +44,40 @@ describe("SessionWarningBanner", () => {
     expect(banner).toHaveTextContent("Sub-agent routing isn't enforced");
   });
 
+  // The banner floats over the chat instead of sitting in the flow: an
+  // in-flow strip pushed the whole conversation down when a warning arrived
+  // mid-session. It must also stay inside the chat column (no sidebar/panel
+  // coverage) and let clicks and scrolling pass through outside its rows.
+  it("floats over the chat column without reflowing it", () => {
+    render(<SessionWarningBanner warnings={[{ code: SUBAGENT_ROUTING_UNENFORCED }]} />);
+    const strip = screen.getByTestId("session-warning-banner");
+    expect(strip).toHaveClass(
+      "absolute",
+      "top-14",
+      "z-20",
+      "pointer-events-none",
+      "md:right-[var(--workspace-panel-offset,0px)]",
+    );
+    const row = screen.getByTestId(`session-warning-${SUBAGENT_ROUTING_UNENFORCED}`);
+    // The row itself stays interactive and bounded, so it can't span into the
+    // neighbouring panes.
+    expect(row).toHaveClass("pointer-events-auto", "max-w-2xl");
+  });
+
+  it("stacks multiple warnings downward inside the overlay", () => {
+    render(
+      <SessionWarningBanner
+        warnings={[
+          { code: SUBAGENT_ROUTING_UNENFORCED, harness: "codex-native" },
+          { code: SUBAGENT_ROUTING_UNENFORCED, harness: "claude-native" },
+        ]}
+      />,
+    );
+    const strip = screen.getByTestId("session-warning-banner");
+    expect(strip).toHaveClass("flex", "flex-col");
+    expect(strip.children).toHaveLength(2);
+  });
+
   it("ignores unknown warning codes rather than leaking the raw code", () => {
     render(<SessionWarningBanner warnings={[{ code: "some_future_warning", reason: "x" }]} />);
     // Hidden, not rendered raw: the UI has no copy for it yet.

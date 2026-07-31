@@ -1474,6 +1474,8 @@ export function AppShell() {
                     onOpenMainExecutionLog: openMainExecutionLog,
                   }}
                 />
+                {/* Overlays the top of the chat column (like the header) so a
+                    warning arriving mid-session never shifts the messages. */}
                 <SessionWarningBanner warnings={activeSession?.warnings} />
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />

@@ -3497,6 +3497,28 @@ describe("AppShell — session warning banner", () => {
     }
   });
 
+  // The strip must overlay the chat column, not sit between the header and
+  // <main> in the flow — in-flow it shifted the whole conversation down the
+  // moment a warning arrived.
+  it("mounts the banner as an overlay in the chat column, not in the flow", () => {
+    mockConversations([]);
+    useSessionMock.mockReturnValue({
+      session: sessionWith([
+        { code: "subagent_routing_unenforced", harness: "codex-native" },
+      ]) as never,
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_warned");
+    const banner = screen.getByTestId("session-warning-banner");
+    expect(banner).toHaveClass("absolute");
+    // Same positioning context as the header, so it can't cover the sidebar.
+    const column = banner.parentElement;
+    expect(column).toHaveClass("relative");
+    expect(column?.querySelector("header")).not.toBeNull();
+    expect(column?.querySelector("main")).not.toBeNull();
+  });
+
   it("ignores a warning code the UI has no copy for", () => {
     mockConversations([]);
     useSessionMock.mockReturnValue({

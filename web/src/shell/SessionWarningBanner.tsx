@@ -1,4 +1,4 @@
-// Session-scoped warning strip under the chat header.
+// Session-scoped warning strip floating under the chat header.
 //
 // Surfaces degraded-but-running conditions the user must know about while
 // the session keeps working — today only `subagent_routing_unenforced`,
@@ -55,8 +55,15 @@ function warningTitle(warning: SessionWarning): string {
 
 /**
  * Warning strip for the active session. Renders nothing when the session
- * has no warning the UI knows about — the common case — so the header keeps
- * its current layout.
+ * has no warning the UI knows about — the common case.
+ *
+ * Floats over the top of the chat column instead of sitting in the flow, so
+ * appearing mid-session never shifts the conversation down. It shares the
+ * chat header's positioning contract: anchored inside the chat column (never
+ * over the sidebar), stopping short of the workspace panel via
+ * `--workspace-panel-offset`, and stacked just under the header's z-30. The
+ * strip itself ignores pointer events so the chat underneath stays
+ * scrollable and clickable; each warning row takes them back.
  *
  * @param warnings - The session snapshot's warnings.
  */
@@ -64,12 +71,15 @@ export function SessionWarningBanner({ warnings }: { warnings?: SessionWarning[]
   const visible = renderableWarnings(warnings);
   if (visible.length === 0) return null;
   return (
-    <div data-testid="session-warning-banner" className="flex flex-col">
+    <div
+      data-testid="session-warning-banner"
+      className="pointer-events-none absolute inset-x-0 top-14 z-20 flex flex-col items-start gap-1 px-2 md:right-[var(--workspace-panel-offset,0px)]"
+    >
       {visible.map((warning) => (
         <div
           key={`${warning.code}:${warning.harness ?? ""}`}
           data-testid={`session-warning-${warning.code}`}
-          className="flex items-start gap-2 border-b border-border bg-warning/10 px-3 py-1.5 text-xs text-foreground"
+          className="pointer-events-auto flex max-w-2xl items-start gap-2 rounded-md border border-border bg-warning/10 px-3 py-1.5 text-xs text-foreground shadow-md backdrop-blur-xl backdrop-saturate-150"
         >
           <AlertTriangleIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-warning" />
           <span className="min-w-0">
