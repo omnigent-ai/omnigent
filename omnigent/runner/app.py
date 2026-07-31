@@ -2891,6 +2891,20 @@ def create_runner_app(
         # Native terminal transcripts are mirrored from the underlying
         # runtime — a trailing user item can be a real failed native turn —
         # so skip the history load (and its attachment downloads) entirely.
+        #
+        # Skip the recovery-turn check when the server set
+        # suppress_recovery_turn=True in the init envelope.  That flag means
+        # the server is about to forward the triggering message immediately
+        # after this handshake completes.  If the message was already
+        # persisted to DB before the init call (invariant I1), the history
+        # load would see it and start a redundant recovery turn; the
+        # subsequent forward would then find _active_turns occupied, buffer
+        # the message, and re-process it once the recovery turn finishes —
+        # causing the first message to be silently ignored (sandbox/lakebox
+        # wake) or processed twice (managed relaunch).
+        _suppress_recovery = (
+            init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
+        )
         history: list[dict[str, Any]]
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
@@ -2907,7 +2921,7 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if needs_turn and session_id not in _active_turns:
+            if needs_turn and session_id not in _active_turns and not _suppress_recovery:
                 _active_turns[session_id] = None
                 _publish_turn_status(session_id, "running")
                 msg_body = {
