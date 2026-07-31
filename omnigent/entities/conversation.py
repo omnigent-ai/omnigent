@@ -118,6 +118,13 @@ class Conversation:
         ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
+    :param subagent_routing_override: Per-session subagent-routing
+        switch: ``"on"`` routes native/SDK subagent spawns, ``"off"``
+        leaves them on the parent's model, and ``None`` (the default)
+        inherits the session's main routing state (its own — or its
+        parent's — ``cost_control_mode_override == "on"``). Mutable via
+        ``PATCH /v1/sessions/{id}`` at any time; read per spawn by the
+        route-subagent relay, so a change takes effect on the next spawn.
     :param harness_override: Per-session harness override for the
         bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
         ``None`` means use the harness declared in the agent spec
@@ -213,6 +220,7 @@ class Conversation:
     reasoning_effort: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     harness_override: str | None = None
     sub_agent_name: str | None = None
     external_session_id: str | None = None
@@ -532,6 +540,24 @@ class RoutingDecisionData(BaseModel):
     :param rationale: The router's one-line explanation, shown as muted
         secondary text, e.g. ``"Multi-file refactor needs deep
         reasoning."``.
+    :param harness: Harness the decision applies to, e.g.
+        ``"claude-native"`` or ``"codex"``. ``None`` when the decision
+        picked a model only (no harness dimension).
+    :param scope: What the decision governs — ``"session"`` (auto-harness
+        session routing), ``"turn"`` (per-turn routing), ``"child_session"``
+        (an Omnigent-spawned sub-agent) or ``"native_subagent"`` (a Task /
+        ``spawn_agent`` spawn routed inside the harness). Defaults to
+        ``"turn"`` so rows persisted before this field deserialize.
+    :param decision_id: Router decision identifier, e.g.
+        ``"3f1c…"``. Correlates the transcript item with the routing
+        telemetry event and the child-sessions API row. ``None`` for
+        decisions made before decision ids existed.
+    :param raw_model: The router-vocabulary pick before resolution to a
+        servable catalog id, e.g. ``"gpt-5-6-sol"``. ``None`` when the
+        pick needed no resolution.
+    :param attempted_override: Model an LLM-supplied ``args.model``
+        asked for and the router overrode, e.g.
+        ``"databricks-gpt-5-5"``. ``None`` when nothing was attempted.
     """
 
     model: str
@@ -541,6 +567,11 @@ class RoutingDecisionData(BaseModel):
     #: item is being mirrored into the parent's transcript, e.g. ``"claude_code"``.
     #: ``None`` for session-local routing decisions (the usual case).
     agent: str | None = None
+    harness: str | None = None
+    scope: Literal["session", "turn", "child_session", "native_subagent"] = "turn"
+    decision_id: str | None = None
+    raw_model: str | None = None
+    attempted_override: str | None = None
 
     @field_validator("model")
     @classmethod
