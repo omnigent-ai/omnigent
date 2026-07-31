@@ -32,6 +32,9 @@ class SessionCreatedEvent:
     :param agent_name: Agent name for known multi-agent orchestrators
         (e.g. ``"polly"``, ``"debby"``); ``None`` for all other agents to
         avoid leaking user-defined agent names.
+    :param routing_enabled: ``True`` when smart routing is on for this
+        session at creation time.  Later toggles arrive as
+        :class:`RoutingSettingChangedEvent`.
     """
 
     installation_id: str | None
@@ -44,6 +47,7 @@ class SessionCreatedEvent:
     is_fork: bool
     is_sub_agent: bool
     agent_name: str | None = None
+    routing_enabled: bool = False
 
 
 @dataclass
@@ -128,3 +132,79 @@ class PolicyDeletedEvent:
     scope: str
     session_id: str | None
     anon_user_id: str | None
+
+
+@dataclass
+class RoutingDecisionEvent:
+    """Fired once per smart-routing decision the server makes.
+
+    Covers every scope the router decides at: a turn's model, a spawned
+    child session's model, the harness picked for an auto-harness session,
+    and a native-subagent spawn.  Mirror copies written into a parent's
+    transcript do not fire a second event — one decision, one event,
+    joinable to the transcript chip by ``decision_id``.
+
+    Nothing free-form is recorded: the judge's rationale and the routed
+    prompt never leave the process, and model ids are reduced to
+    allowlisted tokens by :mod:`omnigent.telemetry.model_labels` because a
+    servable id can be a user-named workspace endpoint.
+
+    :param installation_id: Server-side installation ID.
+    :param session_id: Omnigent conversation/session identifier.  No
+        ``anon_user_id`` is carried: the deciding paths run without a
+        request identity, and ``SessionCreatedEvent`` already maps a
+        session to its user.
+    :param scope: What the decision governs: ``"turn"``,
+        ``"child_session"``, ``"session"`` (auto-harness) or
+        ``"native_subagent"``.
+    :param harness: Harness the decision applies to, e.g. ``"codex"``.
+    :param action: ``"allow"``, ``"rewrite"``, ``"redirect"`` or
+        ``"deny"``.  Server-side turn decisions are ``"rewrite"`` when
+        applied and ``"allow"`` when not.
+    :param applied: ``True`` when the pick actually changed the spawn/turn.
+    :param model_family: Vendor family token of the picked model, e.g.
+        ``"claude"``; ``"other"`` when unrecognised.
+    :param model_tier: Capability tier token of the picked model, e.g.
+        ``"opus"``; ``"other"`` when unrecognised.
+    :param raw_model_resolved: ``True`` when the router answered in its own
+        vocabulary and Omnigent had to resolve it to a servable id.
+    :param overrode_agent_model: ``True`` when the router overrode a model
+        the calling agent asked for.
+    :param decision_id: Decision identity shared with the transcript chip.
+    """
+
+    installation_id: str | None
+    session_id: str
+    scope: str
+    harness: str | None
+    action: str
+    applied: bool
+    model_family: str | None
+    model_tier: str | None
+    raw_model_resolved: bool
+    overrode_agent_model: bool
+    decision_id: str
+
+
+@dataclass
+class RoutingSettingChangedEvent:
+    """Fired when a routing setting is changed on a live session.
+
+    This is the mid-session enable/disable signal: pair it with
+    ``SessionCreatedEvent.routing_enabled`` to reconstruct a session's
+    routing state over time.
+
+    :param installation_id: Server-side installation ID.
+    :param session_id: Omnigent conversation/session identifier.
+    :param anon_user_id: First 16 hex chars of ``sha256("<installation_id>:<user_id>")``.
+    :param setting: Which setting changed; today always
+        ``"subagent_routing"``.
+    :param value: ``"on"``, ``"off"``, or ``"default"`` when the override
+        was cleared and the session falls back to the agent's setting.
+    """
+
+    installation_id: str | None
+    session_id: str
+    anon_user_id: str | None
+    setting: str
+    value: str
