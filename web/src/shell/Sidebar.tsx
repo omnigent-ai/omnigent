@@ -1572,7 +1572,10 @@ function ConversationList({
   // archived/deleted). Exit selection mode in that case so the user isn't
   // stranded without its controls. Suppressed while the list is refetching: a
   // background refetch can briefly yield an empty page, and exiting on that
-  // transient would kick the user out of selection mode mid-task.
+  // transient would kick the user out of selection mode mid-task. The projects
+  // pool unions global-derived membership with the folder queries, so a single
+  // folder's transient-empty refetch can't zero it while any member is still in
+  // the global window (only a genuinely empty pool exits).
   useEffect(() => {
     if (!selectionMode || conversationsQuery.isFetching) return;
     const pool =
