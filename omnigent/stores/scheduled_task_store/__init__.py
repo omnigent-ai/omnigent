@@ -7,6 +7,7 @@ table and its ``scheduled_task_runs`` history table.
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -97,7 +98,7 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_active(self) -> list[ScheduledTask]:
+    def list_active(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks ordered by ``created_at ASC, id ASC``.
 
@@ -108,7 +109,7 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+    def list_active_all_workspaces(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks across every workspace.
 
@@ -206,7 +207,7 @@ class ScheduledTaskStore(ABC):
         *,
         limit: int = 100,
         after_id: str | None = None,
-    ) -> tuple[list[ScheduledTaskRun], str | None]:
+    ) -> tuple[builtins.list[ScheduledTaskRun], str | None]:
         """
         List one page of a task's runs ordered by ``scheduled_at DESC, id DESC``
         (most recent first).
@@ -280,7 +281,10 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_running_runs_for_tasks(self, scheduled_task_ids: list[str]) -> list[ScheduledTaskRun]:
+    def list_running_runs_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> builtins.list[ScheduledTaskRun]:
         """
         List ``running`` runs for the given tasks in the current workspace.
 
@@ -297,7 +301,10 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_latest_run_status_for_tasks(self, scheduled_task_ids: list[str]) -> dict[str, str]:
+    def list_latest_run_status_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> dict[str, str]:
         """
         Return each task's MOST RECENT run status in one windowed query.
 
