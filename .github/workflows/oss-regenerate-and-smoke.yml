@@ -87,14 +87,16 @@ jobs:
           rm -f pnpm-lock.yaml
           pnpm install --lockfile-only
 
-      # Validate BEFORE committing: the Docker build proves the regenerated
-      # locks + public registries produce a working image.
+      # Always run, on both paths: when drifted, this validates the freshly
+      # regenerated locks BEFORE they're committed; when not drifted, it's the
+      # ongoing 12h proof that the committed locks + public registries still
+      # build a working image (catches buildability regressions independent of
+      # manifest state — e.g. a yanked package that still satisfies the lock's
+      # specifiers, or a Dockerfile change).
       - name: Docker build (FE + Python, public registries)
-        if: steps.check.outputs.drifted == 'true'
         run: docker build -f deploy/docker/Dockerfile -t omnigent-smoke .
 
       - name: CLI smoke
-        if: steps.check.outputs.drifted == 'true'
         run: docker run --rm omnigent-smoke omnigent --help
 
       # App token = distinct actor (not GITHUB_TOKEN) so the regen PR runs its
