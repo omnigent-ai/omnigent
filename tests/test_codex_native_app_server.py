@@ -27,6 +27,7 @@ from omnigent.codex_native_app_server import (
     _sync_codex_developer_instructions,
     build_codex_native_server,
     discover_codex_model_options,
+    trust_codex_router_hooks,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
@@ -815,6 +816,40 @@ def test_write_codex_policy_hooks_file_no_symlink_unchanged(tmp_path: Path) -> N
     assert set(payload["hooks"]) == {"PreToolUse", "PostToolUse", "UserPromptSubmit"}
 
 
+def test_write_codex_policy_hooks_file_merges_router_hooks(tmp_path: Path) -> None:
+    """Routing hooks share the one hooks.json codex loads, user hooks kept."""
+    from omnigent.codex_native_app_server import _write_codex_policy_hooks_file
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text(
+        '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo bye"}]}]}}'
+    )
+
+    _write_codex_policy_hooks_file(
+        codex_home,
+        bridge_dir,
+        sys.executable,
+        router_bridge_dir=router_dir,
+        router_session_id="conv_abc",
+        user_hooks_source=user_hooks,
+    )
+
+    hooks = json.loads((codex_home / "hooks.json").read_text())["hooks"]
+    commands = [h["command"] for entry in hooks["PreToolUse"] for h in entry["hooks"]]
+    assert any("codex_router_hook" in c and "--session-id conv_abc" in c for c in commands)
+    assert any("codex_policy_hook" in c or "policy" in c for c in commands)
+    # The routing canary / audit events and the user's own hook survive.
+    assert "SessionStart" in hooks
+    assert "SubagentStart" in hooks
+    assert hooks["Stop"][0]["hooks"][0]["command"] == "echo bye"
+
+
 async def test_missing_hook_raises() -> None:
     """
     No discovered Omnigent hook fails loud (anti fail-open).
@@ -1056,6 +1091,46 @@ async def test_unknown_codex_version_treated_as_supported(
         await server.close()
 
 
+async def test_old_codex_with_routing_armed_keeps_user_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Arming subagent routing on old codex must not delete the user's hooks.
+
+    On codex < 0.129 no generated hooks file is written, so the user's
+    ``hooks.json`` has to stay symlinked into the private home. Fails if
+    the routing arm drops the symlink and nothing takes its place.
+    """
+    from omnigent.inner.codex_executor import CODEX_ROUTER_DIR_ENV_VAR
+
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    user_hooks = real_codex_home / "hooks.json"
+    user_hooks.write_text(
+        json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "user-stop"}]}]}})
+    )
+    codex_home = tmp_path / "codex-home"
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _fake_wait_until_ready)
+    _set_codex_version(monkeypatch, (0, 128, 0))
+
+    server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
+    server.env = {CODEX_ROUTER_DIR_ENV_VAR: str(router_dir)}
+    await server.start()
+    try:
+        hooks_path = codex_home / "hooks.json"
+        assert hooks_path.exists()
+        assert json.loads(hooks_path.read_text())["hooks"]["Stop"]
+        assert server.router_hooks_registered is False
+    finally:
+        await server.close()
+
+
 async def test_trust_failure_is_fail_open_with_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1217,3 +1292,136 @@ class TestPinCodexConfigModel:
         # read_codex_config_model resolves codex-home under the bridge dir.
         _pin_codex_config_model(home, "databricks-gpt-5-4-mini")
         assert read_codex_config_model(bridge_dir) == "databricks-gpt-5-4-mini"
+
+
+# --- Subagent-routing hook trust ---------------------------------------
+#
+# Empirically (codex-cli 0.145.0) ``--dangerously-bypass-hook-trust`` does
+# NOT make hooks run under ``codex app-server``: an untrusted SessionStart
+# hook stayed silent with the flag and fired only once its
+# ``hooks.state.<key>.trusted_hash`` was persisted. The routing hooks
+# therefore need their own trust pass; the policy pass filters by module
+# and would leave them untrusted (a silent fail-open on the spawn gate).
+
+_ROUTER_CANARY_COMMAND = (
+    "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
+    "session-canary --bridge-dir /b"
+)
+_ROUTER_GATE_COMMAND = (
+    "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
+    "route-subagent --bridge-dir /b --harness codex-native"
+)
+
+
+async def test_router_hooks_are_trusted_via_batchwrite() -> None:
+    """Untrusted routing hooks are trusted with their currentHash."""
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+            _hook("canary", _ROUTER_CANARY_COMMAND, "untrusted", "sha256:canary"),
+        ]
+    )
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+
+    writes = _batchwrite_calls(client)
+    assert len(writes) == 1
+    edit = writes[0].params["edits"][0]
+    assert edit["keyPath"] == "hooks.state"
+    assert edit["value"] == {
+        "gate": {"trusted_hash": "sha256:gate"},
+        "canary": {"trusted_hash": "sha256:canary"},
+    }
+    assert writes[0].params["reloadUserConfig"] is True
+
+
+async def test_router_hook_trust_never_touches_user_or_policy_hooks() -> None:
+    """Only the routing hooks are trusted by the routing pass."""
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+            _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
+            _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
+        ]
+    )
+    await trust_codex_router_hooks(client.request, cwd=_CWD)
+    assert _batchwrite_calls(client)[0].params["edits"][0]["value"] == {
+        "gate": {"trusted_hash": "sha256:gate"}
+    }
+
+
+async def test_router_hook_trust_reports_still_untrusted_without_raising() -> None:
+    """A routing-trust failure is reported, never raised (policy must survive)."""
+    client = _FakeCodexClient(
+        hooks=[_hook("gate", _ROUTER_GATE_COMMAND, "untrusted")], flip_on_trust=False
+    )
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == ["gate"]
+    assert len(_batchwrite_calls(client)) == 1
+
+
+async def test_router_hook_trust_noop_without_routing_hooks() -> None:
+    """No routing hooks registered → no write, no failure."""
+    client = _FakeCodexClient(hooks=[_hook("policy", _OUR_COMMAND, "trusted")])
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+    assert _batchwrite_calls(client) == []
+
+
+async def test_already_trusted_router_hooks_skip_batchwrite() -> None:
+    """Routing hooks already trusted issue no config write."""
+    client = _FakeCodexClient(hooks=[_hook("gate", _ROUTER_GATE_COMMAND, "trusted")])
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+    assert _batchwrite_calls(client) == []
+
+
+async def test_trust_step_covers_router_hooks_when_routing_armed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The startup trust step trusts the routing hooks alongside the policy hook."""
+    from omnigent.inner.codex_executor import CODEX_ROUTER_DIR_ENV_VAR
+
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+        ]
+    )
+
+    async def _fake_connect(self: Any) -> None:
+        return None
+
+    async def _fake_close(self: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient.connect", _fake_connect
+    )
+    monkeypatch.setattr("omnigent.codex_native_app_server.CodexAppServerClient.close", _fake_close)
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient.request",
+        lambda self, method, params: client.request(method, params),
+    )
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", Path(_CWD))
+    server.env[CODEX_ROUTER_DIR_ENV_VAR] = str(tmp_path / "bridge")
+    server.router_hooks_registered = True
+    await server._trust_policy_hooks()
+
+    trusted = {}
+    for write in _batchwrite_calls(client):
+        trusted.update(write.params["edits"][0]["value"])
+    assert set(trusted) == {"policy", "gate"}
+
+
+async def test_policy_hook_command_runs_python_isolated() -> None:
+    """The policy hook command passes ``-I`` before ``-m``.
+
+    Same silent fail-open as the routing hooks: codex runs hooks with the
+    session workspace as cwd, so without isolation a workspace containing an
+    ``omnigent`` directory shadows the installed package and the policy gate
+    dies on an import error codex never reports.
+    """
+    import shlex
+
+    from omnigent.codex_native_app_server import _codex_policy_hook_command
+
+    argv = shlex.split(_codex_policy_hook_command(Path("/b"), "/venv/bin/python"))
+    assert argv[1:3] == ["-I", "-m"]

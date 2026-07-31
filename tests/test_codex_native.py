@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from collections.abc import Callable
@@ -10178,3 +10179,101 @@ def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     assert err is not None
     assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in err
     assert "startup timed out" in err
+
+
+# --- Subagent-routing enforcement watcher ------------------------------
+
+
+def _routing_bridge_dir(tmp_path: Path) -> Path:
+    """
+    Build a bridge dir that looks like routing was wired for the session.
+
+    :param tmp_path: Test temp dir.
+    :returns: Bridge dir holding the router advertisement.
+    """
+    from omnigent.runner.subagent_routing import ADVERTISEMENT_FILE
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / ADVERTISEMENT_FILE).write_text(
+        json.dumps({"url": "http://127.0.0.1:1", "token": "t", "session_id": "conv_123"})
+    )
+    return bridge_dir
+
+
+def test_routing_warnings_flag_missing_canary_without_any_relayed_decision(
+    tmp_path: Path,
+) -> None:
+    """Routing armed + canary never fired ⇒ unenforced warning.
+
+    The regression: the check used to require a *relayed decision*, but the
+    routing gate is what relays them — so the one case that matters (codex
+    skipped every generated hook, nothing was ever gated) reported nothing.
+    """
+    bridge_dir = _routing_bridge_dir(tmp_path)
+    warnings = codex_native_forwarder.subagent_routing_warnings("conv_123", bridge_dir)
+    assert [w["code"] for w in warnings] == ["subagent_routing_unenforced"]
+    assert "canary" in warnings[0]["reason"]
+
+
+def test_routing_warnings_silent_when_routing_not_armed(tmp_path: Path) -> None:
+    """No router advertisement ⇒ routing is off, so nothing to warn about."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    assert codex_native_forwarder.subagent_routing_warnings("conv_123", bridge_dir) == []
+
+
+def test_routing_warnings_silent_once_canary_fired(tmp_path: Path) -> None:
+    """A fired canary proves the hooks ran; no warning is emitted."""
+    from omnigent.inner.codex_executor import _CODEX_ROUTER_CANARY_FILENAME
+
+    bridge_dir = _routing_bridge_dir(tmp_path)
+    (bridge_dir / _CODEX_ROUTER_CANARY_FILENAME).write_text("{}")
+    assert codex_native_forwarder.subagent_routing_warnings("conv_123", bridge_dir) == []
+
+
+def test_enforcement_watcher_posts_warning_when_canary_never_appears(
+    tmp_path: Path,
+) -> None:
+    """The watcher posts the unenforced warning on its first tick after a turn."""
+    bridge_dir = _routing_bridge_dir(tmp_path)
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            turn_observed = asyncio.Event()
+            task = asyncio.create_task(
+                codex_native_forwarder._watch_subagent_routing_enforcement(
+                    client,
+                    "conv_123",
+                    bridge_dir,
+                    interval_s=0.01,
+                    turn_observed=turn_observed,
+                )
+            )
+            await asyncio.sleep(0.02)
+            # Nothing posted before the first turn: SessionStart (and so the
+            # canary) cannot have happened yet.
+            assert posted == []
+            turn_observed.set()
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if posted:
+                    break
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+
+    assert posted, "watcher never posted the routing-unenforced warning"
+    event = posted[0]
+    assert event["type"] == "external_session_warning"
+    assert event["data"]["warnings"][0]["code"] == "subagent_routing_unenforced"

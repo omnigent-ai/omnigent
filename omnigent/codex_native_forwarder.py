@@ -383,6 +383,12 @@ class _CodexForwarderState:
 
     model: str | None = None
     posted_model: str | None = None
+    # The running thread's authoritative model, from a live
+    # ``thread/settings/updated``; beats a stale config.toml re-read.
+    settings_model: str | None = None
+    # The config.toml model as of the last _refresh_model_from_config read,
+    # so the refresh can tell an unchanged file from a rewritten one.
+    last_config_model: str | None = None
     effort: str | None = None
     posted_effort: str | None = None
     posted_effort_known: bool = False
@@ -463,6 +469,13 @@ class _CodexForwarderState:
             self._note_effort_fields(settings)
             self._note_collaboration_mode_fields(settings)
             self._note_approval_mode_fields(settings)
+            # Live thread settings are the running process's truth: remember
+            # the model so a stale config.toml re-read at the next
+            # turn/started cannot roll the mirror back (see
+            # _refresh_model_from_config).
+            model = settings.get("model")
+            if isinstance(model, str) and model:
+                self.settings_model = model
 
     def record_completed_plan(self, params: _JsonObject) -> None:
         """
@@ -1745,6 +1758,19 @@ async def supervise_forwarder(
         # outage or restart). Runs before live forwarding begins, so no
         # other writer races the dead-letter files (#1579).
         await _replay_dead_letters_on_startup(ap_client, bridge_dir)
+        # Surface "routing hooks never ran" / "spawned a model the router
+        # didn't approve" on the session's warning channel. Held until the
+        # first turn, which is when codex dispatches SessionStart (and so
+        # when the routing canary can exist at all).
+        turn_observed = asyncio.Event()
+        _enforcement_task = asyncio.create_task(
+            _watch_subagent_routing_enforcement(
+                ap_client, session_id, bridge_dir, turn_observed=turn_observed
+            ),
+            name=f"codex-routing-enforcement-{session_id}",
+        )
+        _ENFORCEMENT_TASKS.add(_enforcement_task)
+        _enforcement_task.add_done_callback(_ENFORCEMENT_TASKS.discard)
         # Synthesize the thread's MCP startup round (see the comment on
         # _CODEX_MCP_STARTUP_STATUS_METHOD): the fresh-launch forwarder
         # starts right at thread creation, which is when codex boots its
@@ -1823,6 +1849,9 @@ async def supervise_forwarder(
                     # waiting forever on an idle fresh thread.
                     if not thread_active.is_set() and _event_indicates_thread_active(event):
                         thread_active.set()
+                        # Same signal releases the routing-enforcement watcher:
+                        # the canary can only exist once a turn has begun.
+                        turn_observed.set()
                     await _handle_event(
                         ap_client,
                         session_id=target.session_id,
@@ -1848,6 +1877,11 @@ async def supervise_forwarder(
             subscribe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await subscribe_task
+            # A session that never took a turn leaves the watcher parked on
+            # ``turn_observed``, where closing the client cannot reach it.
+            _enforcement_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _enforcement_task
             await client.close()
 
 
@@ -2727,26 +2761,39 @@ async def _maybe_handle_codex_request(
 
 def _refresh_model_from_config(bridge_dir: Path, forwarder_state: _CodexForwarderState) -> None:
     """
-    Update the forwarder's known model from this session's ``config.toml``.
+    Update the forwarder's known model from config.toml and thread settings.
 
-    Reads the source-of-truth model via the shared
-    :func:`~omnigent.codex_native_bridge.read_codex_config_model` (the
-    ``model`` key an in-TUI ``/model`` writes — see that function for why
-    config.toml is the source of truth and its caveats) and stores it on
-    ``forwarder_state.model`` so a following ``_sync_model_change`` mirrors
-    it to Omnigent as ``model_override``. This mirror is a fallback to the codex
-    hook, which stamps the live model onto the evaluation request at gate
-    time; the gate prefers the hook's value. No-op when the model can't be
-    determined, leaving the prior value.
+    Reads the ``model`` key an in-TUI ``/model`` writes via the shared
+    :func:`~omnigent.codex_native_bridge.read_codex_config_model` and stores
+    the freshest value on ``forwarder_state.model`` so a following
+    ``_sync_model_change`` mirrors it to Omnigent as ``model_override``. This
+    mirror is a fallback to the codex hook, which stamps the live model onto
+    the evaluation request at gate time; the gate prefers the hook's value.
+
+    Precedence: a config.toml value that CHANGED since the last read wins
+    (an in-TUI ``/model`` or the executor's mirror write — the freshest
+    signal). An unchanged config defers to the last live
+    ``thread/settings/updated`` model when one was seen: an
+    Omnigent-initiated ``thread/settings/update`` switches the running
+    thread without touching config.toml, so re-adopting the stale file
+    would revert a routed model one turn after it applied. No-op when
+    nothing is known, leaving the prior value.
 
     :param bridge_dir: The session's native-Codex bridge directory.
     :param forwarder_state: Mutable forwarder state whose ``model`` is
         updated in place.
     :returns: None.
     """
-    model = read_codex_config_model(bridge_dir)
-    if model:
-        forwarder_state.model = model
+    config_model = read_codex_config_model(bridge_dir)
+    config_changed = bool(config_model) and config_model != forwarder_state.last_config_model
+    if config_model:
+        forwarder_state.last_config_model = config_model
+    if config_changed:
+        forwarder_state.model = config_model
+    elif forwarder_state.settings_model:
+        forwarder_state.model = forwarder_state.settings_model
+    elif config_model:
+        forwarder_state.model = config_model
 
 
 async def _sync_model_change(
@@ -5725,6 +5772,186 @@ async def _post_external_item(
             response.status_code,
             response.text[:1000],
         )
+
+
+# Strong refs for the per-session enforcement watchers; the forwarder
+# cancels its own task when it stops.
+_ENFORCEMENT_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _post_session_warnings(
+    client: httpx.AsyncClient,
+    session_id: str,
+    warnings: list[dict[str, Any]],
+) -> None:
+    """
+    Publish session-scoped warnings so the chat header can show them.
+
+    An empty list is posted too: the server reads it as "condition
+    repaired" and clears the banner, so skipping it would leave a stale
+    warning up for the rest of the session.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param warnings: Warning payloads, each ``{"code", "harness", "reason"}``.
+    :returns: None.
+    """
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type="external_session_warning",
+        data={"warnings": warnings},
+    )
+    _log_failed_session_event_post("external_session_warning", response)
+
+
+def subagent_routing_armed(bridge_dir: Path) -> bool:
+    """
+    Report whether subagent routing was set up for this session.
+
+    Presence of the router advertisement in the bridge dir is the signal:
+    the runner writes it exactly when it wires the ``route-subagent``
+    endpoint, which is also when the routing hooks are generated. This must
+    not be inferred from *relayed decisions* — the routing gate is the thing
+    that relays them, so gating on decisions makes "the gate never ran"
+    undetectable.
+
+    "Armed" is not "expected to enforce": hooks are installed on every
+    native session so the setting can be flipped mid-session, so a posted
+    warning is re-checked against the session's *effective* subagent-routing
+    state where it reaches a client (see
+    ``_visible_session_warnings`` in the server's session orchestration).
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``True`` when the router advertisement is present.
+    """
+    from omnigent.runner.subagent_routing import ADVERTISEMENT_FILE
+
+    return (bridge_dir / ADVERTISEMENT_FILE).is_file()
+
+
+def subagent_routing_warnings(session_id: str, bridge_dir: Path) -> list[dict[str, Any]]:
+    """
+    Report why this session's subagent routing is not being enforced.
+
+    Two independent checks: the ``SessionStart`` canary (absent means codex
+    skipped the generated hooks, so no spawn is gated at all), and the
+    ``SubagentStart`` audit (a spawn that started on a model the router
+    never approved).
+
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory holding the canary and
+        audit files.
+    :returns: Warning payloads; empty when routing is off for this session
+        or enforcement is intact.
+    """
+    from omnigent.inner.codex_executor import (
+        codex_router_canary_fired,
+        read_codex_spawn_audit,
+        reconcile_spawn_audit,
+        subagent_routing_unenforced_warning,
+    )
+    from omnigent.runner.subagent_routing import relayed_decisions
+
+    if not subagent_routing_armed(bridge_dir):
+        # Routing is off for this session — no enforcement claim to check.
+        return []
+    if not codex_router_canary_fired(bridge_dir):
+        return [
+            subagent_routing_unenforced_warning(
+                "SessionStart canary did not fire; codex did not run the generated "
+                "routing hooks (untrusted, or the hook command failed)."
+            )
+        ]
+    return reconcile_spawn_audit(read_codex_spawn_audit(bridge_dir), relayed_decisions(session_id))
+
+
+async def _watch_subagent_routing_enforcement(
+    client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+    *,
+    interval_s: float = 30.0,
+    turn_observed: asyncio.Event | None = None,
+) -> None:
+    """
+    Re-check subagent-routing enforcement while the session runs.
+
+    Both signals are written by codex asynchronously (the canary at session
+    start, audit lines as spawns happen), so a single check at forwarder
+    startup would miss most of them. Only *transitions* are posted: an
+    unchanged verdict is already on the server (warnings dedupe there on
+    ``(code, harness)``), and re-posting an empty list every tick meant a
+    healthy session issued a clear-everything request every 30s forever.
+    The "repaired" clear is posted exactly once, on the edge back to
+    healthy.
+
+    Codex dispatches ``SessionStart`` when a thread's *first turn* begins,
+    not at ``thread/start``, so checking before then would flag every idle
+    session. *turn_observed* holds the first check until the forwarder has
+    seen the thread go active.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id.
+    :param bridge_dir: Native Codex bridge directory.
+    :param interval_s: Seconds between checks.
+    :param turn_observed: Set by the forwarder on the thread's first
+        activity. ``None`` checks immediately (tests / resumed sessions).
+    :returns: None. Runs until cancelled.
+    """
+    armed = subagent_routing_armed(bridge_dir)
+    _logger.info(
+        "subagent routing enforcement watcher started for session %s (armed=%s, interval=%ss)",
+        session_id,
+        armed,
+        interval_s,
+    )
+    if turn_observed is not None:
+        await turn_observed.wait()
+    # ``None`` until the first check: the server has no verdict yet, so the
+    # first result is always a transition (including a healthy one, which
+    # clears anything a previous forwarder left behind).
+    posted: list[dict[str, Any]] | None = None
+    while not client.is_closed:
+        await asyncio.sleep(interval_s)
+        if client.is_closed:
+            return
+        try:
+            warnings = subagent_routing_warnings(session_id, bridge_dir)
+            if posted is not None and _same_warnings(posted, warnings):
+                _logger.debug("subagent routing enforcement unchanged for session %s", session_id)
+                continue
+            if warnings:
+                _logger.info(
+                    "posting subagent routing warnings for session %s: %s",
+                    session_id,
+                    [w.get("code") for w in warnings],
+                )
+            else:
+                _logger.info("subagent routing enforcement repaired for session %s", session_id)
+            await _post_session_warnings(client, session_id, warnings)
+            posted = warnings
+        except (httpx.HTTPError, OSError):
+            _logger.debug("subagent routing enforcement check failed", exc_info=True)
+
+
+def _same_warnings(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> bool:
+    """Report whether two warning lists describe the same state.
+
+    Compared on the fields the server dedupes and renders on, so a changed
+    timestamp or field order is not a transition.
+
+    :param left: Previously posted warnings.
+    :param right: Freshly computed warnings.
+    :returns: ``True`` when the two carry the same warnings.
+    """
+
+    def _key(warnings: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+        return sorted(
+            (str(w.get("code")), str(w.get("harness")), str(w.get("reason"))) for w in warnings
+        )
+
+    return _key(left) == _key(right)
 
 
 async def _post_status(

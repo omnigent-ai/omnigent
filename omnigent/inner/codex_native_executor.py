@@ -22,6 +22,7 @@ from omnigent.codex_native_bridge import (
     read_bridge_state,
     read_mcp_startup,
     update_active_turn_id,
+    write_codex_config_model,
 )
 from omnigent.inner.codex_goal_command import goal_objective_from_content
 from omnigent.inner.executor import (
@@ -301,6 +302,20 @@ class CodexNativeExecutor(Executor):
                                     **settings_overrides,
                                 },
                             )
+                            # Mirror the accepted switch into config.toml —
+                            # the file the forwarder's model mirror and the
+                            # cost-gate hook read. thread/settings/update does
+                            # not write it, so without this the stale launch
+                            # model is mirrored back at the next turn/started
+                            # and silently reverts the switch.
+                            switched_model = settings_overrides.get("model")
+                            if isinstance(switched_model, str) and switched_model:
+                                if not write_codex_config_model(self._bridge_dir, switched_model):
+                                    _logger.warning(
+                                        "Failed to mirror codex model switch into "
+                                        "config.toml: model=%s",
+                                        switched_model,
+                                    )
                         turn_params: dict[str, object] = {
                             "threadId": state.thread_id,
                             "input": input_items,
