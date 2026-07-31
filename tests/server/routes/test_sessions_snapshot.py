@@ -1045,18 +1045,10 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_serves_static_cursor_model_options(
+async def test_session_snapshot_fetches_live_cursor_model_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Cursor-native model options are a curated *static* catalog, served directly.
-
-    Unlike codex (live runner ``model/list``), cursor's catalog never changes
-    per session, so the snapshot returns it on the FIRST read with no runner
-    round-trip and no background fetch. Serving it directly (not through the
-    runner-backed cache) is what keeps the picker from blanking on a
-    ``refresh_state`` snapshot — the regression behind the effort-change bug.
-    """
+    """Cursor options are fetched from the runner and cached for later snapshots."""
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
@@ -1081,6 +1073,18 @@ async def test_session_snapshot_serves_static_cursor_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
+            if url.endswith("/cursor-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "provider-latest",
+                                "displayName": "Provider Latest",
+                                "isDefault": True,
+                            }
+                        ]
+                    }
+                )
             return _FakeResponse({"status": "idle"})
 
     fake_client = _FakeRunnerClient()
@@ -1102,20 +1106,25 @@ async def test_session_snapshot_serves_static_cursor_model_options(
         conversations={"4747fb03a3b45bb1f96bf130f4d704e5": conv},
     )
 
-    # First snapshot already carries the full catalog — no kick-and-empty.
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "4747fb03a3b45bb1f96bf130f4d704e5",
+    )
+    assert first.model_options == []
+
+    await _drain_model_options("4747fb03a3b45bb1f96bf130f4d704e5")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "4747fb03a3b45bb1f96bf130f4d704e5",
     )
 
-    # No runner round-trip for cursor model options (served statically).
-    assert not any("model-options" in url for url in fake_client.get_calls)
-    ids = [m.id for m in snapshot.model_options]
-    assert "claude-opus-4-6" in ids and "gpt-5.2" in ids and "composer-2.5" in ids
-    # base-id namespace only — no flattened effort variants leak through.
-    assert not any("-high" in i or "-xhigh" in i for i in ids)
-    # The cache must stay untouched — that's what makes it refresh_state-proof.
-    assert "4747fb03a3b45bb1f96bf130f4d704e5" not in _mod._model_options_cache
+    assert [m.id for m in snapshot.model_options] == ["provider-latest"]
+    assert snapshot.model_options[0].displayName == "Provider Latest"
+    assert (
+        "/v1/sessions/4747fb03a3b45bb1f96bf130f4d704e5/cursor-model-options"
+        in fake_client.get_calls
+    )
+    assert "4747fb03a3b45bb1f96bf130f4d704e5" in _mod._model_options_cache
 
 
 @pytest.mark.asyncio

@@ -752,8 +752,8 @@ def inject_model_command(
     the cursor analog of claude-native's ``inject_slash_command('/model …')``.
 
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
-    :param model: cursor-agent model id, e.g. ``"gpt-5.2"`` (the same ids
-        ``cursor-agent --list-models`` reports).
+    :param model: cursor-agent base model id, e.g. ``"gpt-5.2"`` (derived from
+        ``cursor-agent models`` by stripping effort variants).
     :param timeout_s: Per-readiness-gate timeout.
     :raises RuntimeError: If the tmux target is never advertised, the TUI has
         exited, a tmux command fails, or the picker reports no match for *model*

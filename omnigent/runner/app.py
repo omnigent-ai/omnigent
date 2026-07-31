@@ -8042,6 +8042,31 @@ def create_runner_app(
             )
         return JSONResponse(status_code=200, content={"models": models})
 
+    @app.get("/v1/sessions/{session_id}/cursor-model-options")
+    async def get_session_cursor_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "cursor-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.cursor_native import list_cursor_cli_model_options
+
+        try:
+            models = await asyncio.to_thread(list_cursor_cli_model_options)
+        except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+            _logger.warning(
+                "Cursor-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "cursor_native_model_options_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="cursor-native model options"
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"models": models})
+
     @app.get("/v1/sessions/{session_id}/claude-model-options")
     async def get_session_claude_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "claude-native":

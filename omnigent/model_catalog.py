@@ -19,9 +19,8 @@ Enumeration is deterministic per provider kind:
 - ``key`` (openai family) / ``gateway`` / ``local`` →
   ``GET <base_url>/v1/models`` with a bearer token (source
   ``"openai-compatible"``).
-- ``subscription`` → a curated static list (source ``"static"``,
-  ``verified: false`` — CLI logins expose no listing API). The cursor
-  harnesses always resolve here: cursor-agent brings its own login.
+- ``subscription`` → live CLI discovery for Cursor; curated static aliases for
+  CLIs without a listing API (source ``"static"``, ``verified: false``).
 - ``cli-config`` → the codex curated static list (source ``"static"``,
   ``verified: false`` — the credential lives in the CLI's own config
   file and is resolved by the CLI at launch).
@@ -40,6 +39,7 @@ import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+import click
 import httpx
 from cachetools import TTLCache
 
@@ -190,8 +190,8 @@ class ModelListing:
     """A worker's enumerated model list plus its provenance.
 
     :param source: Where the list came from — ``"gateway"``,
-        ``"openai-compatible"``, ``"anthropic-api"``, ``"static"``, or
-        ``"none"``.
+        ``"openai-compatible"``, ``"anthropic-api"``, ``"cli"``,
+        ``"static"``, or ``"none"``.
     :param verified: ``True`` when the list was fetched live from the
         provider; ``False`` for static/curated or empty listings.
     :param models: The enumerated models, e.g.
@@ -915,6 +915,8 @@ def _redacted_failure_reason(exc: Exception) -> str:
         return "provider auth command timed out"
     if isinstance(exc, subprocess.SubprocessError):
         return "provider auth command failed"
+    if isinstance(exc, click.ClickException):
+        return exc.message
     if isinstance(exc, httpx.HTTPStatusError):
         return f"listing endpoint returned HTTP {exc.response.status_code}"
     if isinstance(exc, httpx.HTTPError):
@@ -955,7 +957,7 @@ def _listing_for_provider(
                 "this worker cannot run here"
             ),
         )
-    if provider.kind == SUBSCRIPTION_KIND:
+    if provider.kind == SUBSCRIPTION_KIND and provider.cli != "cursor-agent":
         return _static_subscription_listing(provider)
     if provider.kind == CLI_CONFIG_KIND:
         return _static_cli_config_listing(provider)
@@ -966,13 +968,21 @@ def _listing_for_provider(
     if cached is not None:
         return cached
     try:
-        if provider.kind == DATABRICKS_KIND:
+        if provider.kind == SUBSCRIPTION_KIND:
+            listing = _fetch_cursor_cli_listing(provider)
+        elif provider.kind == DATABRICKS_KIND:
             listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
             listing = _fetch_anthropic_listing(provider, transport=transport)
         else:
             listing = _fetch_openai_compatible_listing(provider, transport=transport)
-    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError) as exc:
+    except (
+        click.ClickException,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as exc:
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
@@ -988,6 +998,22 @@ def _listing_for_provider(
     with _listing_cache_lock:
         _listing_cache[cache_key] = listing
     return listing
+
+
+def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build a live listing from the installed Cursor CLI."""
+    from omnigent.cursor_native import list_cursor_cli_model_options
+
+    options = list_cursor_cli_model_options()
+    return ModelListing(
+        source="cli",
+        verified=True,
+        models=tuple(
+            ModelEntry(id=str(option["id"]), family=model_family_token(str(option["id"])))
+            for option in options
+        ),
+        note=f"live models advertised by the {provider.cli or 'cursor-agent'} CLI",
+    )
 
 
 def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
@@ -1012,16 +1038,9 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 def _subscription_static_ids(cli: str) -> tuple[str, ...]:
     """Return the curated model ids for a subscription CLI.
 
-    :param cli: The CLI short-name, e.g. ``"claude"`` or ``"cursor-agent"``.
+    :param cli: The CLI short-name, e.g. ``"claude"`` or ``"codex"``.
     :returns: Curated model ids; empty for an unknown CLI.
     """
-    if cli == "cursor-agent":
-        # Reuse the web picker's curated base-model catalog (derived from
-        # ``cursor-agent models``); imported lazily to keep this module off
-        # the TUI launcher's import path.
-        from omnigent.cursor_native import cursor_base_model_options
-
-        return tuple(str(option["id"]) for option in cursor_base_model_options())
     return _SUBSCRIPTION_STATIC_MODELS.get(cli, ())
 
 

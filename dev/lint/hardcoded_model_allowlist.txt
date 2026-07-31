@@ -18,17 +18,6 @@
 .github/workflows/security-triage.yml databricks-claude-sonnet-4-6 1
 .github/workflows/vscode-release-pr.yml databricks-claude-sonnet-4-6 1
 omnigent/cli_config.py claude-opus-4-5-20251101-v1:0 1
-omnigent/cursor_native.py claude-opus-4-5 1
-omnigent/cursor_native.py claude-opus-4-6 1
-omnigent/cursor_native.py claude-opus-4-7 1
-omnigent/cursor_native.py claude-opus-4-8 1
-omnigent/cursor_native.py claude-sonnet-4-5 1
-omnigent/cursor_native.py claude-sonnet-4-6 1
-omnigent/cursor_native.py gpt-5.2 1
-omnigent/cursor_native.py gpt-5.2-codex 1
-omnigent/cursor_native.py gpt-5.3-codex 1
-omnigent/cursor_native.py gpt-5.4 1
-omnigent/cursor_native.py gpt-5.5 1
 omnigent/inner/pi_executor.py databricks-claude-opus-4-8 1
 omnigent/inner/pi_executor.py databricks-claude-sonnet-4-5 1
 omnigent/inner/pi_executor.py databricks-claude-sonnet-4-6 1

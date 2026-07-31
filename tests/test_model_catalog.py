@@ -837,23 +837,58 @@ def test_cli_config_listing_is_static_and_unverified(
     assert "cannot run here" not in listing.note
 
 
-def test_cursor_listing_is_static_with_curated_base_models(
+def test_cursor_listing_uses_live_cli_base_models(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A cursor worker lists the curated cursor-agent base models.
+    """A cursor worker lists base models discovered from cursor-agent.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     """
+    from omnigent import cursor_native
+
     _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.setattr(
+        cursor_native,
+        "list_cursor_cli_model_options",
+        lambda: [
+            {
+                "id": "provider-latest",
+                "displayName": "Provider Latest",
+                "isDefault": True,
+                "isCurrent": False,
+            }
+        ],
+    )
     listing = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
-    assert listing.source == "static"
-    assert listing.verified is False
-    ids = [m.id for m in listing.models]
-    # Spot-check the picker catalog rather than pinning the whole list —
-    # it is regenerated when cursor ships models.
-    assert "composer-2.5" in ids
-    assert "cannot run here" not in listing.note
+    assert listing.source == "cli"
+    assert listing.verified is True
+    assert [m.id for m in listing.models] == ["provider-latest"]
+    assert "live models advertised" in listing.note
+
+
+def test_cursor_listing_failure_is_empty_and_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A transient Cursor CLI failure does not cache an empty catalog."""
+    from omnigent import cursor_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    calls = 0
+
+    def fail() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        raise OSError("cursor unavailable")
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", fail)
+
+    first = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+    second = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+
+    assert first.source == second.source == "none"
+    assert first.models == second.models == ()
+    assert calls == 2
 
 
 def test_none_listing_explains_dead_worker(

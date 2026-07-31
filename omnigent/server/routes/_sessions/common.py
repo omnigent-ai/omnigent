@@ -631,10 +631,10 @@ _UPLOAD_READ_CHUNK_BYTES: int = 1024 * 1024
 
 
 # Live runner-owned model catalogs, keyed by wrapper label to route segment.
-# Static catalogs bypass this cache so ``refresh_state`` cannot blank them.
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE: "claude-model-options",
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
