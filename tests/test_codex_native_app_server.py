@@ -20,13 +20,118 @@ from omnigent.codex_native_app_server import (
     CodexNativeAppServer,
     _codex_policy_hooks_settings,
     _hooks_list_diagnostics,
+    _model_discovery_cache,
     _our_policy_hooks_from_list,
     _sync_codex_developer_instructions,
     build_codex_native_server,
+    discover_codex_model_options,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
 from omnigent.inner.codex_executor import _populate_codex_home_config
+
+
+async def test_discover_codex_model_options_strips_secrets_and_stops_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-launch discovery uses an empty home, no credentials, and clean teardown."""
+    from omnigent import codex_native_app_server
+
+    captured_env: dict[str, str] = {}
+
+    class _FakeProcess:
+        pid = None
+        returncode: int | None = None
+        terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -1
+
+        async def wait(self) -> int:
+            self.returncode = 0 if self.returncode is None else self.returncode
+            return self.returncode
+
+    process = _FakeProcess()
+
+    async def _fake_start(
+        *,
+        codex_path: str,
+        listen_url: str,
+        env: dict[str, str],
+        cwd: Path,
+    ) -> _FakeProcess:
+        assert codex_path == "/test/codex"
+        assert listen_url.startswith("ws://127.0.0.1:")
+        assert cwd.is_dir()
+        assert Path(env["CODEX_HOME"]).is_dir()
+        captured_env.update(env)
+        return process
+
+    async def _fake_wait(process: _FakeProcess, port: int) -> None:
+        assert process is not None
+        assert port > 0
+
+    class _FakeClient:
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            assert ws_url.startswith("ws://127.0.0.1:")
+            assert client_name == "omnigent-codex-model-discovery"
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            params: dict[str, object],
+        ) -> dict[str, object]:
+            assert method == "model/list"
+            assert params == {"includeHidden": False}
+            return {
+                "result": {
+                    "data": [
+                        {
+                            "id": "coding-model",
+                            "model": "coding-model",
+                            "isDefault": True,
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            }
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_clean_codex_env",
+        lambda: {
+            "PATH": "/bin",
+            "OPENAI_API_KEY": "openai-secret",
+            "OPENAI_BASE_URL": "https://example.invalid/v1",
+            "DATABRICKS_BEARER": "databricks-secret",
+            "DATABRICKS_CODEX_TOKEN": "databricks-secret",
+        },
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_start_codex_model_discovery_process",
+        _fake_start,
+    )
+    monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", _fake_wait)
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+    _model_discovery_cache.clear()
+
+    options = await discover_codex_model_options(codex_path="/test/codex")
+
+    assert options == [{"id": "coding-model", "model": "coding-model", "isDefault": True}]
+    assert captured_env == {"PATH": "/bin", "CODEX_HOME": captured_env["CODEX_HOME"]}
+    assert process.terminated is True
+    _model_discovery_cache.clear()
 
 
 def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
