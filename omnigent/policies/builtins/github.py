@@ -1072,8 +1072,7 @@ def github_policy(
         if op.kind == "write":
             if deny_tag_push and op.tag_push:
                 return _deny(
-                    f"{deny_reason} Pushing tags is blocked by policy "
-                    f"(deny_tag_push is enabled)."
+                    f"{deny_reason} Pushing tags is blocked by policy (deny_tag_push is enabled)."
                 )
             return _gate_write(
                 {op.repo} if op.repo else set(),
