@@ -40,7 +40,7 @@ from omnigent.onboarding.ucode_setup import (
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
     from omnigent.onboarding.ambient import DetectedProvider
-    from omnigent.onboarding.openclaw_config import OpenClawDiscovery
+    from omnigent.onboarding.openclaw_config import OpenClawDiscovery, SourceKind
     from omnigent.onboarding.provider_config import ProviderEntry
 
 # _INTERNAL_BETA_DEFAULT_SERVER (internal Databricks Apps host) moved to
@@ -1675,9 +1675,10 @@ def _manage_cursor_harness() -> None:
         from omnigent._platform import resolve_cli_binary
 
         cli_installed = harness_cli_installed(CURSOR_KEY)
+        install_spec = harness_install_spec(CURSOR_KEY)
         if cli_installed:
             cli_status = "logged in" if harness_cli_logged_in(CURSOR_KEY) else "needs login"
-        elif resolve_cli_binary(harness_install_spec(CURSOR_KEY).binary) is not None:
+        elif install_spec is not None and resolve_cli_binary(install_spec.binary) is not None:
             cli_status = "needs upgrade"
         else:
             cli_status = "not installed"
@@ -2262,7 +2263,8 @@ def _choose_openclaw_source() -> OpenClawDiscovery | None:
 
     detected: list[OpenClawDiscovery] = []
     options: list[str] = []
-    for source, path in zip(("acpx", "openclaw"), default_config_paths(), strict=True):
+    sources: tuple[SourceKind, SourceKind] = ("acpx", "openclaw")
+    for source, path in zip(sources, default_config_paths(), strict=True):
         try:
             exists = path.exists()
         except OSError:
@@ -3836,12 +3838,12 @@ def _run_configure_harnesses_interactive() -> None:
         selectable: list[bool] = []
         row_target: list[str | None] = []
         descriptions: list[str] = []
-        for target, name, status_text, kind, desc in harness_rows:
+        for row_key, name, status_text, kind, desc in harness_rows:
             status_text = _truncate_cells(status_text, max_status_width)
             glyph, color = status_styles[kind]
             options.append(f"{name.ljust(name_col)}[{color}]{glyph} {escape(status_text)}[/]")
             selectable.append(True)
-            row_target.append(target)
+            row_target.append(row_key)
             descriptions.append(desc)
         options.append("Quit")
         selectable.append(True)
@@ -3857,32 +3859,32 @@ def _run_configure_harnesses_interactive() -> None:
         )
         if idx < 0:  # Esc / q — exit
             return
-        target = row_target[idx]
-        if target == CURSOR_KEY:
+        selected_target = row_target[idx]
+        if selected_target == CURSOR_KEY:
             _manage_cursor_harness()
-        elif target == COPILOT_KEY:
+        elif selected_target == COPILOT_KEY:
             _manage_copilot_harness()
-        elif target in families:
-            _manage_harness_providers(target)
-        elif target == _ANTIGRAVITY:
+        elif selected_target in families:
+            _manage_harness_providers(selected_target)
+        elif selected_target == _ANTIGRAVITY:
             _manage_antigravity_harness()
-        elif target == _QWEN:
+        elif selected_target == _QWEN:
             _manage_qwen_harness()
-        elif target == _OPENCODE:
+        elif selected_target == _OPENCODE:
             _manage_opencode_harness()
-        elif target == _GOOSE:
+        elif selected_target == _GOOSE:
             _manage_goose_harness()
-        elif target == _ACP_IMPORT:
+        elif selected_target == _ACP_IMPORT:
             _import_openclaw_agents()
-        elif target == _ACP_ADD:
+        elif selected_target == _ACP_ADD:
             _add_acp_agent()
-        elif isinstance(target, str) and target.startswith(_ACP_AGENT_PREFIX):
-            _manage_acp_agent(target[len(_ACP_AGENT_PREFIX) :])
-        elif target == _HERMES:
+        elif isinstance(selected_target, str) and selected_target.startswith(_ACP_AGENT_PREFIX):
+            _manage_acp_agent(selected_target[len(_ACP_AGENT_PREFIX) :])
+        elif selected_target == _HERMES:
             _manage_hermes_harness()
-        elif target == _KIRO:
+        elif selected_target == _KIRO:
             _manage_kiro_harness()
-        elif target == _KIMI:
+        elif selected_target == _KIMI:
             _manage_kimi_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
