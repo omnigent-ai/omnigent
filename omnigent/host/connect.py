@@ -1844,7 +1844,60 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
-        if canonicalize_harness(frame.harness) != "claude-native":
+        harness = canonicalize_harness(frame.harness) or frame.harness
+        if harness == "codex-native":
+            try:
+                from omnigent.codex_native_app_server import resolve_native_codex_launch
+                from omnigent.model_catalog import list_models_for_worker, resolve_catalog_model
+                from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+                launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+                spec = AgentSpec(
+                    spec_version=1,
+                    name="codex-native-prelaunch",
+                    executor=ExecutorSpec(
+                        type="omnigent",
+                        config={
+                            "harness": "codex-native",
+                            **({"profile": launch.profile} if launch.profile else {}),
+                        },
+                    ),
+                )
+                listing = await asyncio.to_thread(list_models_for_worker, spec, "codex-native")
+                default_model = launch.model
+                if default_model is None and launch.profile is not None:
+                    default_model = (
+                        await asyncio.to_thread(
+                            resolve_catalog_model,
+                            "databricks",
+                            family="openai",
+                        )
+                    ).model_id
+                default_id = (
+                    default_model if default_model in {m.id for m in listing.models} else None
+                )
+                models = [
+                    {
+                        "id": model.id,
+                        "displayName": model.id,
+                        **({"isDefault": True} if model.id == default_id else {}),
+                    }
+                    for model in listing.models
+                ]
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Codex model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Codex model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=models,
+            )
+
+        if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",

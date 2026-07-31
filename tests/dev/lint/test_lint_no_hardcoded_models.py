@@ -12,6 +12,7 @@ import yaml
 
 from dev.lint.lint_no_hardcoded_models import (
     ALLOWLIST_PATH,
+    OWNED_FALLBACK_PATH,
     SCAN_ROOTS,
     SOURCE_EXTENSIONS,
     Hit,
@@ -37,6 +38,73 @@ def test_scan_ignores_python_prose_mentions(tmp_path: Path) -> None:
     clean.write_text('"""For example, databricks-claude-sonnet-4-6."""\n')
 
     assert scan(clean) == []
+
+
+def test_scan_allows_complete_central_fallback_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    fallback_module = Path("omnigent/model_fallbacks.py")
+    fallback_module.parent.mkdir()
+    fallback_module.write_text(
+        '_MODELS = ("gpt-5.5", "gpt-5.4")\n'
+        'FIRST = StaticModelFallback(model_ids=_MODELS, owner="one", '
+        'provenance="release", discovery_gap="no API")\n'
+        'SECOND = StaticModelFallback(model_ids=_MODELS, owner="two", '
+        'provenance="release", discovery_gap="no API")\n'
+    )
+
+    assert scan(fallback_module) == []
+
+
+def test_owned_fallback_registry_satisfies_structural_boundary() -> None:
+    """The production registry needs no count-based model allowances."""
+    assert OWNED_FALLBACK_PATH.is_file()
+    assert scan(OWNED_FALLBACK_PATH) == []
+
+
+def test_scan_flags_incomplete_central_fallback_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    fallback_module = Path("omnigent/model_fallbacks.py")
+    fallback_module.parent.mkdir()
+    fallback_module.write_text(
+        '_MODELS = ("gpt-5.5",)\n'
+        'FALLBACK = StaticModelFallback(model_ids=_MODELS, owner="one", '
+        'provenance="release", discovery_gap="")\n'
+    )
+
+    assert [(hit.line, hit.model) for hit in scan(fallback_module)] == [(1, "gpt-5.5")]
+
+
+def test_scan_flags_fallback_model_tuple_used_outside_owned_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    fallback_module = Path("omnigent/model_fallbacks.py")
+    fallback_module.parent.mkdir()
+    fallback_module.write_text(
+        '_MODELS = ("gpt-5.5",)\n'
+        'FALLBACK = StaticModelFallback(model_ids=_MODELS, owner="one", '
+        'provenance="release", discovery_gap="no API")\n'
+        "DEFAULT_MODELS = _MODELS\n"
+    )
+
+    assert [(hit.line, hit.model) for hit in scan(fallback_module)] == [(1, "gpt-5.5")]
+
+
+def test_scan_flags_fallback_shape_outside_central_module(tmp_path: Path) -> None:
+    dirty = tmp_path / "fallbacks.py"
+    dirty.write_text(
+        'FALLBACK = StaticModelFallback(model_ids=("gpt-5.5",), owner="one", '
+        'provenance="release", discovery_gap="no API")\n'
+    )
+
+    assert [(hit.line, hit.model) for hit in scan(dirty)] == [(1, "gpt-5.5")]
 
 
 def test_scan_flags_yaml_model_key(tmp_path: Path) -> None:

@@ -1,6 +1,6 @@
 # Native Harness Plugin Interface (Modular Registry Proposal)
 
-Status: draft
+Status: Phase 1 complete (2026-07-31); Phase 2 (community + web) pending.
 Supersedes nothing; extends `designs/harness-plugin-interface.md`.
 
 ## Problem
@@ -331,8 +331,9 @@ validator keeps rejecting community native metadata throughout Phase 1.
 After 1.1 + 1.2 land, PRs 1.3, 1.4, 1.7, 1.8 touch mostly disjoint hubs and can
 proceed in parallel. The runner sub-stack (1.5a → 1.5b → 1.5c → 1.6) is serial —
 each reuses the prior's context object — and is the critical path.
-**Phase 1 subtotal: ~20–29 engineer-days** (revised up from ~17–25 after the
-runner exploration split 1.5 into 1.5a/b/c and re-scoped 1.6; see below).
+**Phase 1 subtotal (as estimated): ~20–29 engineer-days.** **Actual: all 10 PRs
+landed (1.4 descoped, 1.5b split into i/ii); see the Implementation progress
+ledger and the Phase 1 retrospective in Calibration below.**
 
 ### Phase 2 — Open to community packages
 
@@ -387,62 +388,102 @@ out of 1.7; tool-call probes become plugin-drivable via a small 1.8 field; and
 
 ### Effort summary
 
-- **Phase 1** (internal seam): ~20–29 engineer-days across 10 PRs (1.1–1.4,
-  1.5a/b/c, 1.6, 1.7, 1.8).
-- **Phase 2** (community + web): ~9–12 engineer-days across 4 PRs.
-- **Total: ~29–41 engineer-days** across ~14 PRs (2.3 may split further).
-  Folding in review cycles, CI, and runner e2e validation, that is realistically
-  **~2.5–3.5 calendar months** done alongside other work. The critical path is
-  1.1 → 1.2 → 1.5a → 1.5b → 1.5c → 1.6, then 2.2 → 2.3 (web); the risk center is
-  the **runner sub-stack (1.5b in particular)**, where the divergent
-  `_auto_create_*` signatures and the `_supervise_*_bridges` invariants live.
+- **Phase 1** (internal seam): **DONE.** Estimated ~20–29 engineer-days across
+  10 PRs; actually shipped as 10 PRs (1.4 descoped, 1.5b split into i/ii) merged
+  over 4 calendar days (07-28 → 07-31) as a focused stack. See the Phase 1
+  retrospective in Calibration.
+- **Phase 2** (community + web): ~9–12 engineer-days across 4 PRs — **remaining
+  work.** 2.1 (validator flip) depends only on 1.1 and can start immediately;
+  2.2 depends on 1.8's capability catalog (landed); 2.3 (web) is the largest FE
+  piece and the new risk center; 2.4 ships the example plugin + docs.
+- **Critical path remaining: 2.1 → 2.2 → 2.3 (web), with 2.4 alongside.** The
+  runner sub-stack that was the original risk center is behind us with no
+  invariant regressions.
 
-### Calibration (updated 2026-07-27, after 1.1–1.3 landed + runner exploration)
+### Calibration — Phase 1 retrospective (updated 2026-07-31, all of Phase 1 landed)
 
-Grounding the estimates in built evidence rather than the original guesses:
+Estimate vs. actual, grounded in the shipped ledger:
 
-- **Additive/mechanical PRs come in under estimate.** 1.1 (provider model +
-  resolver) and 1.3 (resume-hub collapse, net −261 lines) each landed in ~½ day
-  of code vs. the 1–2d / 2d budgeted. 1.1 was cheap partly because the resolver
-  was ~90% pre-built (`load_object` already did dotted-path → callable). Expect
-  1.4, 2.1, 2.4 to likewise come in low.
-- **The real cost is test-shape churn, not the seam.** 1.3's core rewrite was
-  trivial; the time went into the tests that pin the exact call shape (kwarg
-  renames, a parametrized dispatch table, catching an over-reach where launch-
-  path expectations were flipped before their hub was migrated). This scales
-  with how many tests pin a hub — and the runner has the most (the ~19k-line
-  split native suite, #3149).
-- **The runner is bigger than the original single "1.5" line implied.** Reading
-  the code (not guessing) showed spawn-env, launch, and terminal-route each need
-  their own PR, `_auto_create_*` has 11 divergent signatures (so the seam needs
-  a `NativeLaunchContext`, not a uniform call), and interrupt/stop (1.6) closes
-  over app-scope state (needs DI, not a move). Hence 1.5 → 1.5a/b/c and 1.6
-  re-scoped upward.
-- **Net:** trim the additive PRs, **hold the runner sub-stack** until 1.5a is
-  measured. The back-loaded risk profile is confirmed, not softened, by the
-  three fast early PRs — 1.1–1.3 being fast is evidence the foundation is sound,
-  not that 1.5b will be. A 2-week compression of remaining Phase 1 is plausible
-  only if the runner sub-stack goes cleanly; that is the one unmeasured unknown.
+- **Estimate: ~20–29 engineer-days across 10 PRs. Actual: 10 PRs merged in 4
+  calendar days (07-28 → 07-31).** The engineer-day estimate assumed the work
+  ran alongside other duties with normal review latency; run as a focused
+  stack it compressed hard. The *shape* of the estimate held (relative sizing
+  was right); the calendar framing (~2.5–3.5 months) did not survive contact
+  with a dedicated push.
+- **Additive/mechanical PRs came in under estimate — confirmed.** 1.1, 1.3,
+  1.5a landed fast; 1.1 rode the pre-built `load_object` resolver. The
+  prediction that "1.4, 2.1, 2.4 likewise come in low" is untested for 2.x
+  (1.4 was descoped).
+- **The real cost was test-shape churn + review-caught behavior bugs, not the
+  seam itself.** Every substantial PR's time went into the tests that pin exact
+  call shapes and into behavior-preservation defects caught in review, not the
+  mechanical collapse:
+  - 1.2 shipped a **commit-boundary defect** (test edits its production code
+    needed were committed in 1.3) — surfaced only because 1.2 was opened
+    stacked/isolated.
+  - 1.5b-ii's first cut had a **claude force-recreate/transfer-inbound
+    ordering bug** (short-circuited before the inbound check) — caught by
+    review, fixed with a dedicated test.
+  - 1.7 dropped built-in agent-name constants and let tests fall to magic-string
+    literals; restored as a shared public block after review. It also missed the
+    opencode e2e in the first sweep (follow-up #3656).
+  - 1.8's first derivation used canonical-only fork-history ids and **regressed
+    the reversed-`native-*`-spelling gating** (`native-claude` etc. don't
+    canonicalize) — caught by an existing test in the broad run, fixed to emit
+    both spellings.
+- **The runner was correctly re-scoped, and the split paid off.** Reading the
+  code (not guessing) drove 1.5 → 1.5a/b/c and 1.5b → 1.5b-i/ii, isolating the
+  8 uniform launch arms from the 3 special ones. 1.6's DI extraction
+  (`NativeInterruptRunner`, mirroring `CodexGoalRunner`) matched the prediction
+  that interrupt/stop needed a dependency-injection context, not a plain move.
+  The `_supervise_*_bridges` invariants were preserved with no incident.
+- **Recurring operational friction (not code):** the local `uv` shell wrapper
+  rewrites `uv.lock` registry URLs to an internal proxy on every `uv run` —
+  guarded on every commit with `command uv run --no-sync` + `git restore
+  uv.lock`. And a class of **full-suite-only test failures** (a shared
+  model-catalog cache polluting `test_sessions_snapshot`; a locally-installed
+  `qwen-openclaw-test` plugin) reproduce on clean `main` and pass in isolation —
+  environmental, not regressions, but they cost verification time each PR.
+- **Lesson for Phase 2:** the estimate-vs-actual gap was almost entirely
+  calendar-vs-effort framing, not sizing error. Keep sizing the PRs the same
+  way; stop projecting calendar months for a focused stack.
 
 ### Implementation progress
 
-Append-only ledger — one line per PR as it opens, updated to `landed` on merge.
-The plan tables above stay the stable target; this tracks what has actually
-shipped. **~14 PRs total** (Phase 1: 1.1–1.4, 1.5a/b/c, 1.6, 1.7, 1.8;
-Phase 2: 2.1–2.4).
+Ledger of what actually shipped — the plan tables above stay the stable target.
+**Phase 1 is complete: 10 PRs landed 2026-07-28 → 07-31.** 1.4 (CLI) was
+descoped during execution (see note below); 1.5 split into 1.5a/b/c and 1.5b
+into 1.5b-i/ii once the runner exploration showed the launch arms didn't share a
+signature.
 
-| PR | Status | Link |
-|---|---|---|
-| 1.1 Provider model + resolver | landed | #3239 |
-| 1.2 Signature normalization | landed | #3244 |
-| 1.3 Resume hubs | landed | #3314 |
-| 1.5a Runner spawn-env | landed | #3495 |
-| 1.5b-i Runner launch (scaffolding + 8 uniform arms) | landed | #3500 |
-| 1.5b-ii Runner launch (3 special arms + turn-path opencode) | landed | #3501 |
-| 1.5c Runner terminal-ensure (attach path) | landed | #3543 |
-| 1.6 Runner interrupt/stop (migration; gap-fill deferred) | landed | #3568 |
-| 1.7 Server seeding loop | landed | #3599 |
-| 1.8 Derive enumerations + fork_history/shell-tool capability axes | in review | (this PR) |
+| PR | Status | Link | Merged |
+|---|---|---|---|
+| 1.1 Provider model + resolver | landed | #3239 | 07-28 |
+| 1.2 Signature normalization | landed | #3244 | 07-29 |
+| 1.3 Resume hubs | landed | #3314 | 07-29 |
+| 1.4 CLI subcommands | **descoped** | — | — |
+| 1.5a Runner spawn-env | landed | #3495 | 07-29 |
+| 1.5b-i Runner launch (scaffolding + 8 uniform arms) | landed | #3500 | 07-29 |
+| 1.5b-ii Runner launch (3 special arms + turn-path opencode) | landed | #3501 | 07-30 |
+| 1.5c Runner terminal-ensure (attach path) | landed | #3543 | 07-30 |
+| 1.6 Runner interrupt/stop (migration; gap-fill deferred) | landed | #3568 | 07-31 |
+| 1.7 Server seeding loop | landed | #3599 | 07-31 |
+| 1.7 follow-up: opencode e2e onto shared agent-name constant | landed | #3656 | 07-31 |
+| 1.8 Derive enumerations + fork_history/shell-tool capability axes | landed | #3648 | 07-31 |
+
+**1.4 descoped.** The CLI-subcommand collapse (`cli_native.py` → a loop over
+`native_agents()`) is orthogonal to making native harnesses community-pluggable:
+the 11 hand-written `@cli.command` funcs are a *local* readability win, not a
+dispatch hub the seam must own, and nothing in Phase 2 depends on it. Deferred as
+optional cleanup rather than run for its own sake. `_reject_native_on_windows`
+staying per-command is captured under Risks.
+
+**Two behavior-preservation deltas landed as intended, called out here for the
+record:** (1) the qwen-native error label shifted lowercase `"qwen"` →
+`"Qwen Code"` (the agent's `display_name`) in the 1.5b/c runner collapse —
+cosmetic; (2) the antigravity attach path now starts the MCP comment relay (the
+shared launch context wires it for all harnesses), a benign superset the builder
+already guards. Both are pinned by tests and were surfaced in the respective PRs.
 
 ## Risks and open questions
 
@@ -478,15 +519,20 @@ Phase 2: 2.1–2.4).
 
 ## Bottom line
 
-The data model is ready, Phase 0 (the file splits) has landed, and 1.1–1.3 are
-in review. The remaining work is untangling native orchestration from five
-`runner/app.py` chains and four other hubs into a `NativeHarnessProvider`
-behavior seam, then flipping the validator — sequenced as ~14 PRs (Phase 1:
-1.1–1.4, 1.5a/b/c, 1.6, 1.7, 1.8; Phase 2: 2.1–2.4), ~29–41 engineer-days total.
-The additive foundation (1.1) landed cheap and the additive/mechanical PRs are
-coming in under estimate; the estimate now lives almost entirely in the serial
-runner sub-stack (1.5a → 1.5b → 1.5c → 1.6), where the code — read, not guessed —
-shows divergent `_auto_create_*` signatures (needing a `NativeLaunchContext`),
-closure-bound interrupt/stop handlers (needing DI), and the `_supervise_*_bridges`
-invariants. Measure 1.5a (bounded spawn-env) before committing a runner
-timeline.
+**Phase 1 is complete (2026-07-31).** Every built-in native harness now runs
+*through* the `NativeHarnessProvider` seam: launch, terminal-route, interrupt/stop,
+spawn-env, resume, built-in seeding, and the capability-derived enumerations are
+all registry-driven, with 1.4 (CLI) descoped as optional cleanup. The runner
+sub-stack — the original risk center — landed with its `_supervise_*_bridges`
+forward-cursor / double-post invariants intact and no behavior regressions beyond
+two intentional, test-pinned deltas (qwen error label, antigravity relay).
+
+**Remaining work is Phase 2 — the actual payoff:** flip
+`_validate_community_contribution` to accept native contributions (2.1), expose
+native rows + capabilities on `/v1/harnesses` (2.2), drive the web off that
+endpoint instead of the `web/src/lib` literals (2.3, the largest front-end piece
+and new risk center), and ship a benchable example native plugin + docs (2.4).
+2.1 is unblocked and can start now; 2.2 needs 1.8's catalog (landed). The
+estimate-vs-actual lesson from Phase 1: the sizing was right, the calendar-month
+framing was not — size Phase 2 PRs the same way, don't project months for a
+focused stack.
