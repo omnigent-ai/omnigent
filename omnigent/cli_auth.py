@@ -40,7 +40,7 @@ def _token_file_path() -> Path:
     """
     from omnigent_ui_sdk.terminal._config import state_dir
 
-    return state_dir() / _TOKEN_FILE_NAME
+    return Path(state_dir()) / _TOKEN_FILE_NAME
 
 
 def _normalize_server_url(server_url: str) -> str:

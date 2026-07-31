@@ -509,7 +509,9 @@ def _derive_workspace_profile_name(workspace_url: str, existing: dict[str, str])
 
     for spec in DEFAULT_PROFILES:
         if _host_matches(spec.host, workspace_url):
-            return spec.name
+            name = spec.name
+            if isinstance(name, str):
+                return name
     netloc = urlparse(workspace_url).netloc
     # The first DNS label is the most human-recognizable handle; fall back
     # to the full netloc, then a constant, so we never return an empty name.
