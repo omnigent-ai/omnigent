@@ -6099,7 +6099,7 @@ async def _handle_mcp_tools_call(
         # If the policy returned transformed arguments (e.g.
         # PII-redacted args), use them instead of the originals.
         if call_result.data is not None:
-            arguments = call_result.data
+            arguments = cast("dict[str, object]", call_result.data)
 
     # ── Server-side sys_advise_models intercept ──────────────────────────
     # After policy evaluation (DENY/ASK handled above); arguments may have
