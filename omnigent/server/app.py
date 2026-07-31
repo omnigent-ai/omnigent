@@ -570,6 +570,11 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     if materialize is None:
         raise OmnigentError(f"native provider {provider.key!r} has no materialize_agent_spec hook")
     with tempfile.TemporaryDirectory() as tmpdir:
+        # The bridge understands only the ``model`` axis: pass ``model=None`` iff
+        # the materializer declares that parameter, else call it bare. A future
+        # harness whose materializer needs a *different* required kwarg will fail
+        # loud here (missing-argument TypeError at seed time) rather than route —
+        # add that axis explicitly if/when it appears.
         kwargs = {"model": None} if "model" in inspect.signature(materialize).parameters else {}
         spec_path = materialize(Path(tmpdir), **kwargs)
         bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
