@@ -27,9 +27,46 @@ def test_scan_flags_python_model_assignment(tmp_path: Path) -> None:
     ]
 
 
-def test_scan_ignores_python_prose_mentions(tmp_path: Path) -> None:
+def test_scan_flags_python_positional_argument(tmp_path: Path) -> None:
+    dirty = tmp_path / "dirty.py"
+    dirty.write_text('resolve("databricks-claude-sonnet-4-6")\n')
+
+    assert [(hit.line, hit.model) for hit in scan(dirty)] == [
+        (1, "databricks-claude-sonnet-4-6"),
+    ]
+
+
+def test_scan_flags_python_bare_collection(tmp_path: Path) -> None:
+    dirty = tmp_path / "dirty.py"
+    dirty.write_text('("databricks-claude-sonnet-4-6", "gpt-oss-120b")\n')
+
+    assert [(hit.line, hit.model) for hit in scan(dirty)] == [
+        (1, "databricks-claude-sonnet-4-6"),
+        (1, "gpt-oss-120b"),
+    ]
+
+
+def test_scan_ignores_model_family_fragments(tmp_path: Path) -> None:
     clean = tmp_path / "clean.py"
-    clean.write_text('"""For example, databricks-claude-sonnet-4-6."""\n')
+    clean.write_text(
+        'prefixes = ("databricks-claude-opus-", "databricks-claude-fable-")\n'
+        'families = ("gpt-oss",)\n'
+    )
+
+    assert scan(clean) == []
+
+
+def test_scan_ignores_python_docstrings(tmp_path: Path) -> None:
+    clean = tmp_path / "clean.py"
+    clean.write_text(
+        '"""For example, databricks-claude-sonnet-4-6."""\n'
+        "class Example:\n"
+        '    """For example, gpt-5.5."""\n'
+        "    def sync(self):\n"
+        '        """For example, claude-opus-4-1."""\n'
+        "    async def async_(self):\n"
+        '        """For example, gemini-2.5-pro."""\n'
+    )
 
     assert scan(clean) == []
 
@@ -109,7 +146,10 @@ def test_scan_flags_yaml_model_key(tmp_path: Path) -> None:
         "notes: databricks-gpt-5-5\n"
     )
 
-    assert [(hit.line, hit.model) for hit in scan(dirty)] == [(2, "databricks-gpt-5-5")]
+    assert [(hit.line, hit.model) for hit in scan(dirty)] == [
+        (2, "databricks-gpt-5-5"),
+        (3, "databricks-gpt-5-5"),
+    ]
 
 
 def test_scan_ignores_tests(tmp_path: Path) -> None:

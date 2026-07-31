@@ -611,7 +611,7 @@ def register_native_commands(cli: click.Group) -> None:
     @click.option(
         "--model",
         default=None,
-        help="Cursor model to use for the native TUI (e.g. gpt-5.2, claude-4.6-sonnet-medium).",
+        help="Cursor model id to use for the native TUI.",
     )
     @click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
     def cursor(
@@ -629,7 +629,7 @@ def register_native_commands(cli: click.Group) -> None:
         \b
         Examples:
           omnigent cursor
-          omnigent cursor --model gpt-5.2
+          omnigent cursor --model MODEL_ID
           omnigent cursor --resume conv_abc123
           omnigent cursor --resume                 # interactive picker
           omnigent cursor --mode plan              # start in plan (read-only) mode

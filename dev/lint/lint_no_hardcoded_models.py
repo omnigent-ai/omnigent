@@ -18,7 +18,7 @@ MODEL_ID_RE = re.compile(
     \b(?:
         databricks-(?:claude|gpt|gemini|llama|mistral|mixtral|deepseek|qwen|kimi|dbrx|grok|meta)-[a-z0-9][a-z0-9._:/-]*
       | system\.ai\.[a-z0-9][a-z0-9._:/-]*
-      | (?:openai/)?gpt-(?:\d|oss)[a-z0-9._:/-]*
+      | (?:openai/)?(?:gpt-\d[a-z0-9._:/-]*|gpt-oss-[a-z0-9][a-z0-9._:/-]*)
       | o[134](?:-[a-z0-9][a-z0-9._:/-]*)?
       | claude-(?:opus|sonnet|haiku|fable|\d)[a-z0-9._:/-]*
       | gemini-\d[a-z0-9][a-z0-9._:/-]*
@@ -27,7 +27,7 @@ MODEL_ID_RE = re.compile(
       | llama-\d[a-z0-9][a-z0-9._:/-]*
       | mistral-[a-z0-9][a-z0-9._:/-]*
       | deepseek-[a-z0-9][a-z0-9._:/-]*
-    )\b
+    )\b(?![a-z0-9._:/-])
     """,
     re.VERBOSE,
 )
@@ -72,51 +72,6 @@ def _repo_relative(path: Path) -> str:
         return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
     except ValueError:
         return path.as_posix()
-
-
-def _target_name(node: ast.expr) -> str:
-    """Return the user-visible name for an assignment target."""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    if isinstance(node, ast.Subscript):
-        return _target_name(node.value)
-    if isinstance(node, ast.Starred):
-        return _target_name(node.value)
-    if isinstance(node, (ast.Tuple, ast.List)):
-        return " ".join(filter(None, (_target_name(item) for item in node.elts)))
-    return ""
-
-
-def _key_name(node: ast.expr | None) -> str:
-    """Return a literal dict key name when statically knowable."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.Name):
-        return node.id
-    return ""
-
-
-def _is_model_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
-    """Return True if a string literal lives in model-selection data."""
-    current = node
-    while current in parents:
-        parent = parents[current]
-        if isinstance(parent, ast.keyword) and parent.arg and "model" in parent.arg.lower():
-            return True
-        if isinstance(parent, ast.Assign):
-            if any("model" in _target_name(target).lower() for target in parent.targets):
-                return True
-        elif isinstance(parent, ast.AnnAssign):
-            if "model" in _target_name(parent.target).lower():
-                return True
-        elif isinstance(parent, ast.Dict):
-            for key, value in zip(parent.keys, parent.values, strict=True):
-                if value is current and "model" in _key_name(key).lower():
-                    return True
-        current = parent
-    return False
 
 
 def _extract_models(text: str) -> list[str]:
@@ -200,33 +155,48 @@ def _owned_fallback_model_literals(tree: ast.Module) -> set[ast.Constant]:
     return exempt
 
 
+def _docstring_nodes(tree: ast.Module) -> set[ast.Constant]:
+    """Return literal nodes used as module, class, or function docstrings."""
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    docstrings: set[ast.Constant] = set()
+    for owner in ast.walk(tree):
+        if not isinstance(owner, owners) or not owner.body:
+            continue
+        first = owner.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstrings.add(first.value)
+    return docstrings
+
+
 def _scan_python(path: Path) -> list[Hit]:
-    """Scan Python syntax-aware string literals in model contexts."""
+    """Scan every non-docstring Python string literal."""
     try:
         tree = ast.parse(path.read_text())
     except (SyntaxError, UnicodeDecodeError):
         return []
 
-    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     exempt = (
         _owned_fallback_model_literals(tree)
         if _repo_relative(path) == OWNED_FALLBACK_PATH.as_posix()
         else set()
     )
+    exempt.update(_docstring_nodes(tree))
     hits: list[Hit] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
         if node in exempt:
             continue
-        if not _is_model_context(node, parents):
-            continue
         hits.extend(Hit(path, node.lineno, model) for model in _extract_models(node.value))
     return hits
 
 
 def _scan_text(path: Path) -> list[Hit]:
-    """Scan config/shell files for model-looking ids on model-looking lines."""
+    """Scan non-comment config and shell lines for model-looking ids."""
     try:
         lines = path.read_text().splitlines()
     except UnicodeDecodeError:
@@ -235,8 +205,6 @@ def _scan_text(path: Path) -> list[Hit]:
     hits: list[Hit] = []
     for line_number, line in enumerate(lines, start=1):
         if line.lstrip().startswith("#"):
-            continue
-        if "model" not in line.lower():
             continue
         hits.extend(Hit(path, line_number, model) for model in _extract_models(line))
     return hits
