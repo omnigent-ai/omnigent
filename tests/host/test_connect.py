@@ -7,6 +7,7 @@ import logging
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -180,6 +181,60 @@ async def test_handle_model_options_does_not_invent_codex_default(
     )
 
     assert result.models == [{"id": "gpt-live", "displayName": "gpt-live"}]
+
+
+async def test_handle_model_options_uses_databricks_catalog_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Databricks profile path labels its effective catalog default."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="gateway",
+            verified=True,
+            models=(
+                ModelEntry(id="databricks-gpt-default", family="openai"),
+                ModelEntry(id="databricks-gpt-fast", family="openai"),
+            ),
+            note="test catalog",
+        ),
+    )
+
+    def _fake_resolve_catalog_model(provider: str, *, family: str) -> SimpleNamespace:
+        assert provider == "databricks"
+        assert family == "openai"
+        return SimpleNamespace(model_id="databricks-gpt-default")
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        _fake_resolve_catalog_model,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile="oss",
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {
+            "id": "databricks-gpt-default",
+            "displayName": "databricks-gpt-default",
+            "isDefault": True,
+        },
+        {"id": "databricks-gpt-fast", "displayName": "databricks-gpt-fast"},
+    ]
 
 
 async def test_handle_model_options_rejects_unsupported_harness() -> None:

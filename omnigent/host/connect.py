@@ -1844,7 +1844,7 @@ class HostProcess:
         if harness == "codex-native":
             try:
                 from omnigent.codex_native_app_server import resolve_native_codex_launch
-                from omnigent.model_catalog import list_models_for_worker
+                from omnigent.model_catalog import list_models_for_worker, resolve_catalog_model
                 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
                 launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
@@ -1861,6 +1861,14 @@ class HostProcess:
                 )
                 listing = await asyncio.to_thread(list_models_for_worker, spec, "codex-native")
                 default_model = launch.model
+                if default_model is None and launch.profile is not None:
+                    default_model = (
+                        await asyncio.to_thread(
+                            resolve_catalog_model,
+                            "databricks",
+                            family="openai",
+                        )
+                    ).model_id
                 default_id = (
                     default_model if default_model in {m.id for m in listing.models} else None
                 )
