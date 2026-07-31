@@ -2371,6 +2371,35 @@ def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch
     assert "X-Databricks-Org-Id" not in headers
 
 
+def test_remote_headers_keys_by_host_id_on_workspace_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host_id rides as the Dicer slice-key header on the workspace mount.
+
+    The native attach WebSocket handshake (claude / codex / antigravity) and
+    its reconnects build their headers here, so the host_id must surface as the
+    routing header to reach the replica holding the runner's tunnel. It is
+    emitted only on the workspace-hosted mount; no host_id, or a local /
+    self-hosted server, sends none.
+    """
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+
+    mount = "https://acme.databricks.com/api/2.0/omnigent"
+    assert (
+        _remote_headers(server_url=mount, host_id="host_abc")["X-Databricks-Omnigent-Slice-Key"]
+        == "host_abc"
+    )
+    # No host_id → no slice-key header on the same mount.
+    assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(server_url=mount)
+    # Local / self-hosted server → no slice-key header even with a host_id.
+    assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(
+        server_url="http://127.0.0.1:6767", host_id="host_abc"
+    )
+
+
 def test_server_headers_do_not_encode_runner_affinity() -> None:
     """Runner affinity is persisted by PATCH /v1/sessions, not headers."""
     headers = chat_module._server_headers(runner_id="runner_local_test")
@@ -2671,7 +2700,9 @@ def _stub_run_repl_deps(
     monkeypatch.setattr(_repl_pkg, "run_repl", _fake_run_repl)
     monkeypatch.setattr("omnigent.repl._repl.run_repl", _fake_run_repl)
     monkeypatch.setattr("omnigent.chat.OmnigentClient", _FakeClientCtx)
-    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None: None)
+    monkeypatch.setattr(
+        "omnigent.chat._server_auth", lambda server_url=None, *, session_id=None: None
+    )
     monkeypatch.setattr(
         "omnigent.repl._tmux_pane.register_pane",
         lambda **_kw: None,
@@ -2904,7 +2935,7 @@ def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.cli_auth.databricks_request_headers",
-        lambda _url: {"X-Databricks-Org-Id": "2850744067564480"},
+        lambda _url, *, host_id=None: {"X-Databricks-Org-Id": "2850744067564480"},
     )
     # Isolate from real Databricks SDK resolution: the bearer is irrelevant
     # here — only the routing header is under test.

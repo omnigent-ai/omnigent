@@ -29,6 +29,8 @@ import {
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
+import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
+import { readLastHostChoice } from "@/lib/hostPreferences";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
 // action. 250 ms is short enough to feel live, long enough to batch the
@@ -202,9 +204,45 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     pushWatched();
   }, [pushWatched, activeId]);
 
+  // Freeze the fallback slice key (the modal host over all seen sessions) once
+  // the session list first settles, then start the updates socket — which keys
+  // its `?omnigent_slice_key=` off that frozen value. Gating start() on the
+  // latch (rather than starting eagerly) matters ONLY for this WS: it's a
+  // persistent connection, so starting pre-latch (empty map → no key) and then
+  // re-keying would force a reconnect. Ordinary `authenticatedFetch` fallback
+  // routes (e.g. /v1/hosts) don't gate — they just read the frozen value and a
+  // pre-latch miss self-corrects on their next refetch.
+  //
+  // Latch on the first conversations query to reach a settled state (success,
+  // empty, OR error — a user with zero sessions must still release the gate).
+  // The session list itself is NOT gated (it populates the map the modal reads;
+  // gating it on the modal would deadlock).
   useEffect(() => {
-    sessionUpdatesSocket.start();
+    const tryResolveAndStart = (): boolean => {
+      const settled = queryClient
+        .getQueryCache()
+        .getAll()
+        .some(
+          (q) =>
+            Array.isArray(q.queryKey) &&
+            q.queryKey[0] === "conversations" &&
+            (q.state.status === "success" || q.state.status === "error"),
+        );
+      if (!settled) return false;
+      resolveModalHost(readLastHostChoice);
+      sessionUpdatesSocket.start();
+      return true;
+    };
+    // Already settled (cache warm from a prior mount)? Start immediately.
+    if (tryResolveAndStart()) return;
+    // Otherwise wait for the first settle, then start once and unsubscribe.
+    const unsubscribe = queryClient.getQueryCache().subscribe(() => {
+      if (isModalHostResolved() || tryResolveAndStart()) unsubscribe();
+    });
+    return unsubscribe;
+  }, [queryClient]);
 
+  useEffect(() => {
     let invalidateTimer: ReturnType<typeof setTimeout> | null = null;
     const scheduleInvalidate = () => {
       if (invalidateTimer !== null) return;

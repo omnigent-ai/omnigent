@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { ImageIcon } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
-import { getOmnigentHostConfig, hostFetch } from "@/lib/host";
+import { getOmnigentHostConfig } from "@/lib/host";
+import { authenticatedFetch } from "@/lib/identity";
 import { ZoomableImage } from "@/components/ImageLightbox";
 
 export interface SessionImageProps {
@@ -22,8 +23,10 @@ export interface SessionImageProps {
  * keep it as-is (native streaming + HTTP caching). Embedded, the host proxies
  * the API behind a path prefix and cookie+CSRF auth that a browser `<img>` GET
  * can't satisfy (no way to send the prefix or the CSRF header), so we pull the
- * bytes through the host fetcher — which handles both — and render an object
- * URL, with explicit loading and error states.
+ * bytes through `authenticatedFetch` — which handles the prefix/auth AND stamps
+ * the Dicer slice key so this host-scoped file-content read reaches the replica
+ * holding the session's runner tunnel — and render an object URL, with explicit
+ * loading and error states.
  */
 export function SessionImage({ path, alt, className }: SessionImageProps) {
   // Host config is installed once at embed startup and never changes, so it's
@@ -49,7 +52,7 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
     setBlobUrl(null);
     let cancelled = false;
     let objectUrl: string | null = null;
-    hostFetch(path)
+    authenticatedFetch(path)
       .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(`HTTP ${res.status}`))))
       .then((blob) => {
         if (cancelled) return;

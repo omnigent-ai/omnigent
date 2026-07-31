@@ -14,7 +14,33 @@
 // Vite dev proxy keep working. Identity rides the ingress/dev proxy on the
 // handshake, as with those sockets.
 
-import { resolveWebSocketUrl } from "@/lib/host";
+import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+import { modalHostId } from "@/lib/sessionHost";
+
+/**
+ * Build the `ws(s)://` URL for the dictation stream.
+ *
+ * On the managed (embedded) UI, append `?omnigent_slice_key=<modal host>` — the
+ * same query-param seam the session-updates and terminal-attach sockets use
+ * (a browser WS handshake can't set request headers). Dictation is NOT
+ * host-scoped — any replica transcribes a take equally, so correctness is
+ * unaffected either way. It's a LOAD-BALANCING lever: without a key, Dicer
+ * hashes the whole workspace onto one replica, so a busy workspace's mic takes
+ * all pile onto a single pod — bad for a CPU-bound engine with a per-pod
+ * concurrent-take cap ({@link DictationBusyError} / `OMNIGENT_DICTATION_MAX_STREAMS`).
+ * {@link modalHostId} is per-user (the host backing most of THIS user's
+ * sessions), so keying by it spreads a workspace's takes across many pods —
+ * finer-grained than per-workspace. Omitted on standalone (no Dicer) and until
+ * the modal host resolves (→ no key → workspace-id default).
+ */
+function buildDictationUrl(): string {
+  const path = "/v1/dictation/stream";
+  if (!getOmnigentHostConfig().fetcher) return resolveWebSocketUrl(path);
+  const sliceKey = modalHostId();
+  return resolveWebSocketUrl(
+    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
+  );
+}
 
 /** A transcript event pushed by the server over the dictation stream. */
 export type DictationEvent =
@@ -226,7 +252,7 @@ export class DictationSession {
     let ws: WebSocket | null = null;
     let audioContext: AudioContext | null = null;
     try {
-      ws = new WebSocket(resolveWebSocketUrl("/v1/dictation/stream"));
+      ws = new WebSocket(buildDictationUrl());
       ws.binaryType = "arraybuffer";
       await waitForReady(ws);
       // Detect a close during the async audio-graph setup below: the

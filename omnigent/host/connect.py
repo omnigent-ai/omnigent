@@ -99,6 +99,7 @@ from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
@@ -547,6 +548,7 @@ def _build_runner_env(
     workspace: str,
     parent_pid: int,
     initial_auth_token: str | None = None,
+    host_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -596,6 +598,12 @@ def _build_runner_env(
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    if host_id:
+        # Tell the runner its host so its tunnel co-locates with the host's on
+        # one replica (turn dispatch / terminal-attach for its sessions reach
+        # it there). The runner forwards this to databricks_request_headers,
+        # which emits the routing header only on the workspace-hosted server.
+        env[RUNNER_SLICE_KEY_ENV_VAR] = host_id
     return env
 
 
@@ -1135,6 +1143,7 @@ class HostProcess:
             workspace=str(workspace),
             parent_pid=os.getpid(),
             initial_auth_token=initial_auth_token,
+            host_id=self._identity.host_id,
         )
 
         try:
@@ -2225,7 +2234,11 @@ class HostProcess:
         # hosts (no recorded selector), so neither is affected.
         from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_request_headers(self._server_url))
+        # Pin this host's tunnel to its replica via the host_id; the builder
+        # emits the routing header only on the workspace-hosted server.
+        headers.update(
+            databricks_request_headers(self._server_url, host_id=self._identity.host_id)
+        )
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:

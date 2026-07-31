@@ -13,6 +13,8 @@
 // unexpected wire shape all resolve to `undefined`, and the caller falls back
 // to the generic body. This module never takes down the notification path.
 
+import { authenticatedFetch } from "@/lib/identity";
+
 /**
  * How many trailing items to scan for the last assistant message. A turn
  * usually ends on the assistant's final message, but it may be followed by a
@@ -104,7 +106,13 @@ export async function fetchLastAssistantText(
 ): Promise<string | undefined> {
   try {
     const params = new URLSearchParams({ limit: String(SCAN_ITEMS), order: "desc" });
-    const res = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`);
+    // authenticatedFetch (not bare fetch): this is a session-scoped read, so it
+    // must carry the Dicer slice key (the session's host_id, derived from the
+    // /v1/sessions/{id} path) to reach the replica holding that session's runner
+    // tunnel on the managed server — same reason SessionImage byte-fetch uses it.
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    );
     if (!res.ok) return undefined;
     const json = (await res.json()) as { data?: unknown };
     const items = Array.isArray(json.data) ? json.data : [];

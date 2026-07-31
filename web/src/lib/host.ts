@@ -100,6 +100,26 @@ export function getOmnigentHostConfig(): OmnigentHostConfig {
 }
 
 /**
+ * Whether the server this UI talks to is a Databricks workspace-hosted server,
+ * which sits behind the managed multi-replica sharding layer (Dicer) — so
+ * host-scoped traffic must carry the host_id slice key to reach the replica
+ * holding that host's runner tunnel.
+ *
+ * True in two deployments:
+ * - **Embedded** (managed UI in the monolith): a host `fetcher` is installed.
+ * - **Standalone dev against a workspace**: `npm run dev` pointed at a
+ *   Databricks workspace URL, where `vite.config.ts` inlines
+ *   `VITE_DATABRICKS_WORKSPACE=true`. No fetcher is installed here, so the flag
+ *   is the only signal.
+ *
+ * False for a bare local / self-hosted server (single replica, no Dicer), where
+ * emitting the key would just dirty the access log.
+ */
+export function isDatabricksWorkspace(): boolean {
+  return _config.fetcher != null || import.meta.env.VITE_DATABRICKS_WORKSPACE === "true";
+}
+
+/**
  * The host-provided user search function, or `undefined` when none is
  * configured. Consumers use the absence to stay inert (plain text input).
  */

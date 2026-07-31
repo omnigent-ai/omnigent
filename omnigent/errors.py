@@ -34,6 +34,18 @@ class ErrorCode:
         §Elicitation completion invariant.
     :cvar RUNNER_UNAVAILABLE: No online runner can serve the
         requested dispatch (HTTP 503).
+    :cvar HOST_UNAVAILABLE: The session's bound runner exists but its
+        tunnel is not registered on the replica that served this request
+        (HTTP 503). Distinct from ``RUNNER_UNAVAILABLE`` (no runner bound
+        anywhere): here the request was routed to the wrong replica —
+        typically because the caller sent a Dicer slice key that no
+        longer matches where the host's tunnel lives (version skew
+        between a slice-key-aware UI/CLI and the host's registration).
+        The client's fallback retries the request WITHOUT the slice key
+        so it routes by the workspace-id default instead. A plain 503
+        code string would be indistinguishable from a genuinely-dead
+        runner, so a keyless retry would be pointless; this dedicated
+        code is the discriminator that makes the retry worthwhile.
     :cvar UNAUTHORIZED: No valid authentication credentials (HTTP 401).
     :cvar FORBIDDEN: Authenticated but insufficient permissions (HTTP 403).
     :cvar RUNNER_CAPABILITY_MISMATCH: The selected runner cannot
@@ -56,6 +68,7 @@ class ErrorCode:
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
+    HOST_UNAVAILABLE = "host_unavailable"
     RUNNER_CAPABILITY_MISMATCH = "runner_capability_mismatch"
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
@@ -76,6 +89,10 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can fix them; investigation needed in the harness wrap).
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: 500,
     ErrorCode.RUNNER_UNAVAILABLE: 503,
+    # Same 503 as RUNNER_UNAVAILABLE so a slice-key-unaware client still
+    # treats it as a transient failure; the distinct code string is what
+    # lets a slice-key-aware client retry without the key.
+    ErrorCode.HOST_UNAVAILABLE: 503,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: 503,
     # 412 Precondition Failed: the request is well-formed but the host
     # can't satisfy it until the user runs `omnigent setup` there —

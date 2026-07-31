@@ -1,6 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HEARTBEAT_WATCHDOG_MS, sessionUpdatesSocket } from "./sessionUpdatesSocket";
 
+// Mutable host-config + modal host so a case can flip the embed fetcher on and
+// set the resolved modal host without touching real host state. Defaults (no
+// fetcher, no host) keep the watchdog suite above on the standalone path, where
+// buildUpdatesUrl emits no slice key — its behavior is unchanged.
+let _mockFetcher: (() => void) | undefined;
+let _mockModalHost: string | null = null;
+vi.mock("@/lib/host", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./host")>()),
+  getOmnigentHostConfig: () => ({ fetcher: _mockFetcher }),
+  // Standalone builds the ws URL from window.location, which jsdom sets to
+  // http://localhost — mirror that so URL assertions are deterministic.
+  resolveWebSocketUrl: (path: string) => `ws://localhost${path}`,
+}));
+vi.mock("@/lib/sessionHost", () => ({
+  // buildUpdatesUrl reads the resolved modal host_id; the provider (not tested
+  // here) owns resolving it, so the test drives it directly.
+  modalHostId: () => _mockModalHost,
+}));
+
 // Minimal stand-in for the browser WebSocket: records sends/closes and lets
 // the test drive the lifecycle (open, message) by hand. A real socket can't be
 // opened in jsdom, and we need deterministic control over when frames arrive
@@ -58,6 +77,8 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     FakeWebSocket.instances = [];
+    _mockFetcher = undefined;
+    _mockModalHost = null;
     vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
   });
 
@@ -121,3 +142,66 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
 // Reconnect backoff is capped at 5 s + jitter; advancing past 5 s guarantees
 // the scheduled reconnect timer has fired regardless of the random jitter.
 const RECONNECT_CEILING_MS = 5_001;
+
+describe("sessionUpdatesSocket slice-key routing", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances = [];
+    _mockFetcher = undefined;
+    _mockModalHost = null;
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+  });
+
+  afterEach(() => {
+    sessionUpdatesSocket.stop();
+    vi.unstubAllGlobals();
+  });
+
+  it("keys the updates WS by the modal host on the managed (embedded) UI", () => {
+    // Embedded (fetcher present) + a resolved modal host → the cross-host
+    // updates WS rides ?omnigent_slice_key= so its standing rescan lands on that
+    // host's replica (warm relay cache) rather than scattering by workspace-id.
+    _mockFetcher = () => {};
+    _mockModalHost = "host_abc";
+    sessionUpdatesSocket.start();
+    expect(latestWs().url).toBe(
+      "ws://localhost/v1/sessions/updates?omnigent_slice_key=host_abc",
+    );
+  });
+
+  it("omits the key on standalone (no embed fetcher)", () => {
+    // No Dicer in front of a standalone/self-hosted server → no key.
+    _mockFetcher = undefined;
+    _mockModalHost = "host_abc";
+    sessionUpdatesSocket.start();
+    expect(latestWs().url).toBe("ws://localhost/v1/sessions/updates");
+  });
+
+  it("omits the key when the modal host is unresolved / null", () => {
+    // Before resolution, or a zero-session user → no key → workspace-id default.
+    _mockFetcher = () => {};
+    _mockModalHost = null;
+    sessionUpdatesSocket.start();
+    expect(latestWs().url).toBe("ws://localhost/v1/sessions/updates");
+  });
+
+  it("reconnects with the SAME slice key (frozen modal host → no re-key churn)", () => {
+    // The modal host is resolved once and never changes, so a reconnect must
+    // rebuild the identical URL — the whole point of gating start() on the
+    // resolution latch is that the persistent WS never re-keys.
+    vi.useFakeTimers();
+    _mockFetcher = () => {};
+    _mockModalHost = "host_abc";
+    sessionUpdatesSocket.start();
+    const first = latestWs();
+    const firstUrl = first.url;
+    first.open();
+    // Trip the watchdog to force a reconnect.
+    vi.advanceTimersByTime(HEARTBEAT_WATCHDOG_MS);
+    vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+    const second = latestWs();
+    expect(second).not.toBe(first);
+    expect(second.url).toBe(firstUrl);
+    expect(second.url).toBe("ws://localhost/v1/sessions/updates?omnigent_slice_key=host_abc");
+    vi.useRealTimers();
+  });
+});
