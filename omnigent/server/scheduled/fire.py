@@ -531,7 +531,7 @@ async def _resolve_owner_host(deps: FireDeps, task: ScheduledTask) -> str:
     hosts = await asyncio.to_thread(deps.host_store.list_hosts, owner)
     for host in hosts:
         if deps.host_registry.get(host.host_id) is not None:
-            return host.host_id
+            return str(host.host_id)
     raise _CannotLaunchScheduledFire(
         "no online host is available for the scheduled task owner",
         error_code="no_online_host",
@@ -588,7 +588,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     # Connected-host, existing-workspace runs create the conversation directly.
     # Future execution modes such as managed sandbox, branch selection, and
     # replay/backfill must use shared session-create orchestration.
-    conv = await asyncio.to_thread(
+    conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
         title=task.name,
@@ -596,7 +596,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         workspace=task.workspace,
     )
     if task.model_override is not None or task.reasoning_effort is not None:
-        updated = await asyncio.to_thread(
+        updated: Conversation | None = await asyncio.to_thread(
             deps.conversation_store.update_conversation,
             conv.id,
             model_override=task.model_override,
