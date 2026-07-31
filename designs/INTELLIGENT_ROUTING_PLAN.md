@@ -591,6 +591,11 @@ Stack: `./run-server.sh` / `./run-host.sh` / `./run-frontend.sh` in
   when absent from the caller's workspace.
 - **Feed to Ivan**: encrypted Codex spawn prompts cap task-aware quality for
   in-harness codex subagent routing (signal lives in `task_name` only).
+- **Routing-availability liveness probe** — §10 decision 9 gates on
+  config-level availability only; a gateway that is configured but down still
+  offers Smart Routing. Follow-up, not MVP.
+- **Move the `routes:select` call host-side** so routing auth/workspace always
+  matches the host's inference; availability is already host-derived.
 
 ## 9. Risks
 
@@ -712,6 +717,29 @@ shipped on `routing-mvp`; decision 5 is in flight.
    config modal's Model picker (which drives the same `/model` path), so
    routing introduces no new surprise. Not worth a save/restore dance for MVP;
    revisit if a non-persisting model API lands upstream.
+
+9. **Smart Routing is only offered where the apply layer can work (Bryan,
+   2026-07-31).**  Availability is now *routing available* (config-level: the
+   server has a routing client — the existing `smart_routing_enabled` surface)
+   **AND** the selected host's inference for that harness family being
+   AI-Gateway-backed. Each of the three surfaces gates independently:
+   *Configure Claude Code* → Model needs the host's claude-native launch to
+   resolve the gateway env (`ANTHROPIC_BASE_URL` + api-key helper — the
+   resolution the runner logs as `configured=True`); *Configure Codex* → Model
+   needs the host's codex provider `base_url` to be on the workspace AI Gateway
+   (the `…/ai-gateway/codex/v1` family); the top-level **Smart Routing** harness
+   row needs **both**, since it routes over the five-arm `both` menu.
+   The signal is a per-host, per-harness fact computed host-side by reusing the
+   launch config resolutions as a cheap check (config resolution only — no
+   launching, no network), reported as a `gateway_inference` map alongside
+   `configured_harnesses` in the host readiness surface and echoed by
+   `GET /v1/hosts`. **Absent means unknown and does not gate** (hosts on older
+   builds keep every option), to be tightened once hosts have rolled forward.
+   Web classification stays in the single `smartRoutingAvailability.ts` point as
+   a new `not-gateway-backed` cause, ordered after `harnesses-unready`.
+   Rationale: a routed session on a non-gateway host resolves a model the pane
+   cannot reach, so the pick is worse than no pick. Deliberately **no liveness
+   probing** — config-level availability only (see §8).
 
 ---
 
