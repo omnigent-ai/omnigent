@@ -9,7 +9,6 @@ host (not the server) runs git. See designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import secrets
 from dataclasses import dataclass
@@ -21,6 +20,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.routes._host_rpc import await_host_rpc_result
 
 _logger = logging.getLogger(__name__)
 
@@ -80,54 +80,7 @@ class CreatedWorktree:
     branch: str
 
 
-async def _await_host_worktree_result(
-    *,
-    host_registry: HostRegistry,
-    host_conn: HostConnection,
-    pending: dict[str, asyncio.Future[dict[str, object]]],
-    request_id: str,
-    frame: str,
-    op: str,
-) -> dict[str, object]:
-    """
-    Send a worktree frame and await its matching result over the tunnel.
-
-    Shared plumbing for the create/remove proxies: register a future on
-    ``pending`` keyed by ``request_id``, enqueue ``frame``, await the
-    reply, and clean up on every path.
-
-    :param host_registry: Registry used to enqueue the outbound frame.
-    :param host_conn: Live host connection.
-    :param pending: The connection's pending-future map for this op
-        (``pending_create_worktrees`` or ``pending_remove_worktrees``).
-    :param request_id: Correlation id already embedded in ``frame``.
-    :param frame: Encoded host frame to send.
-    :param op: Short label for error messages, e.g.
-        ``"worktree creation"``.
-    :returns: The host's result dict (``status`` plus op-specific
-        fields).
-    :raises WorktreeHostUnavailableError: On connection loss or no
-        reply within :data:`_WORKTREE_TIMEOUT_S`.
-    """
-    future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
-    pending[request_id] = future
-    try:
-        try:
-            host_registry.send_text(host_conn, frame)
-        except ConnectionError as exc:
-            raise WorktreeHostUnavailableError(
-                f"host '{host_conn.host_id}' connection lost during {op}"
-            ) from exc
-        try:
-            return await asyncio.wait_for(future, timeout=_WORKTREE_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            raise WorktreeHostUnavailableError(
-                f"host '{host_conn.host_id}' did not respond to {op} within "
-                f"{_WORKTREE_TIMEOUT_S:.0f}s (it may be running an older version "
-                "that does not support worktrees)"
-            ) from exc
-    finally:
-        pending.pop(request_id, None)
+_WORKTREE_UNAVAILABLE_HINT = "it may be running an older version that does not support worktrees"
 
 
 async def create_worktree_on_host(
@@ -164,13 +117,16 @@ async def create_worktree_on_host(
             base_branch=base_branch,
         )
     )
-    result = await _await_host_worktree_result(
+    result = await await_host_rpc_result(
         host_registry=host_registry,
         host_conn=host_conn,
         pending=host_conn.pending_create_worktrees,
         request_id=request_id,
         frame=frame,
         op="worktree creation",
+        timeout=_WORKTREE_TIMEOUT_S,
+        unavailable_exc=WorktreeHostUnavailableError,
+        unavailable_hint=_WORKTREE_UNAVAILABLE_HINT,
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(
@@ -217,13 +173,16 @@ async def remove_worktree_on_host(
             delete_branch=delete_branch,
         )
     )
-    result = await _await_host_worktree_result(
+    result = await await_host_rpc_result(
         host_registry=host_registry,
         host_conn=host_conn,
         pending=host_conn.pending_remove_worktrees,
         request_id=request_id,
         frame=frame,
         op="worktree removal",
+        timeout=_WORKTREE_TIMEOUT_S,
+        unavailable_exc=WorktreeHostUnavailableError,
+        unavailable_hint=_WORKTREE_UNAVAILABLE_HINT,
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(
@@ -259,13 +218,16 @@ async def list_worktrees_on_host(
             repo_path=repo_path,
         )
     )
-    result = await _await_host_worktree_result(
+    result = await await_host_rpc_result(
         host_registry=host_registry,
         host_conn=host_conn,
         pending=host_conn.pending_list_worktrees,
         request_id=request_id,
         frame=frame,
         op="worktree listing",
+        timeout=_WORKTREE_TIMEOUT_S,
+        unavailable_exc=WorktreeHostUnavailableError,
+        unavailable_hint=_WORKTREE_UNAVAILABLE_HINT,
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(

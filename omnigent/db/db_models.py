@@ -288,6 +288,14 @@ class SqlAgent(OmnigentBase):
     kind: Mapped[int] = mapped_column(SmallInteger)
     description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Git-source provenance for agents imported from a git repo (NULL for
+    # non-git agents). git_url NULL ⇒ not git-backed / no refresh. git_host_id
+    # records the host that cloned it, so refresh re-clones on the same host.
+    git_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    git_ref: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    git_subpath: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    git_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    git_host_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),

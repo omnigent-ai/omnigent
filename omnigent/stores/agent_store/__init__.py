@@ -33,6 +33,12 @@ class AgentStore(ABC):
         name: str,
         bundle_location: str,
         description: str | None = None,
+        *,
+        git_url: str | None = None,
+        git_ref: str | None = None,
+        git_subpath: str | None = None,
+        git_commit: str | None = None,
+        git_host_id: str | None = None,
     ) -> Agent:
         """
         Register a new template agent. Name must be unique among
@@ -48,6 +54,12 @@ class AgentStore(ABC):
             e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :param description: Optional free-text description of the
             agent's purpose.
+        :param git_url: Clone URL when imported from git; ``None`` for
+            non-git agents.
+        :param git_ref: Tracked branch/ref used during import.
+        :param git_subpath: Agent dir within the repo; ``None`` = root.
+        :param git_commit: Resolved commit SHA that was bundled.
+        :param git_host_id: ID of the host that cloned the repo.
         :returns: The newly created :class:`Agent`.
         """
         ...
@@ -119,16 +131,24 @@ class AgentStore(ABC):
         self,
         agent_id: str,
         bundle_location: str,
+        *,
+        git_commit: str | None = None,
+        git_host_id: str | None = None,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump its version, and
         set ``updated_at``. Returns the updated agent, or ``None``
-        if no agent with the given ID exists.
+        if no agent with the given ID exists. ``git_commit`` and
+        ``git_host_id`` are written only when explicitly provided.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param git_commit: New resolved commit SHA to record on a git
+            refresh, or ``None`` to leave unchanged.
+        :param git_host_id: Host ID that performed the re-clone, or
+            ``None`` to leave unchanged.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """

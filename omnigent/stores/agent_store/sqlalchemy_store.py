@@ -88,6 +88,12 @@ class SqlAlchemyAgentStore(AgentStore):
         name: str,
         bundle_location: str,
         description: str | None = None,
+        *,
+        git_url: str | None = None,
+        git_ref: str | None = None,
+        git_subpath: str | None = None,
+        git_commit: str | None = None,
+        git_host_id: str | None = None,
     ) -> Agent:
         """
         Register a new template agent in the database.
@@ -99,6 +105,13 @@ class SqlAlchemyAgentStore(AgentStore):
         :param bundle_location: Artifact store key for the bundle,
             e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :param description: Optional free-text description.
+        :param git_url: Clone URL when imported from git; ``None`` for
+            non-git agents.
+        :param git_ref: Tracked branch/ref used during import.
+        :param git_subpath: Agent dir within the repo; ``None`` = root.
+        :param git_commit: Resolved commit SHA that was bundled.
+        :param git_host_id: ID of the host that cloned the repo, so
+            refresh can re-clone on the same host.
         :returns: The newly created :class:`Agent`.
         """
         row = SqlAgent(
@@ -109,6 +122,11 @@ class SqlAlchemyAgentStore(AgentStore):
             version=1,
             kind=encode_agent_kind("template"),
             description=description,
+            git_url=git_url,
+            git_ref=git_ref,
+            git_subpath=git_subpath,
+            git_commit=git_commit,
+            git_host_id=git_host_id,
         )
         with self._session() as session:
             # Template names are unique within a workspace. This can't be a
@@ -258,15 +276,24 @@ class SqlAlchemyAgentStore(AgentStore):
         self,
         agent_id: str,
         bundle_location: str,
+        *,
+        git_commit: str | None = None,
+        git_host_id: str | None = None,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump version, and set
-        ``updated_at``.
+        ``updated_at``. ``git_commit`` and ``git_host_id`` are written
+        only when explicitly provided; ``None`` (the default) leaves the
+        stored value unchanged.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param git_commit: New resolved commit SHA to record on a git
+            refresh, or ``None`` to leave the existing value unchanged.
+        :param git_host_id: Host ID that performed the re-clone, or
+            ``None`` to leave the existing value unchanged.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
@@ -277,6 +304,10 @@ class SqlAlchemyAgentStore(AgentStore):
             row.bundle_location = bundle_location
             row.version = row.version + 1
             row.updated_at = now_epoch()
+            if git_commit is not None:
+                row.git_commit = git_commit
+            if git_host_id is not None:
+                row.git_host_id = git_host_id
         # Reverse lookup targets the AP DB — see _session_id_for_agent.
         session_id: str | None = None
         if row.kind == encode_agent_kind("session"):

@@ -36,6 +36,13 @@ class Agent:
     description: str | None = None
     updated_at: int | None = None
     session_id: str | None = None  # owning conversation id; None for template agents
+    # Git-source provenance (all None for non-git agents). git_url None ⇒ not
+    # git-backed. git_host_id is the host that cloned it, reused on refresh.
+    git_url: str | None = None
+    git_ref: str | None = None
+    git_subpath: str | None = None
+    git_commit: str | None = None
+    git_host_id: str | None = None
 
 
 @dataclass

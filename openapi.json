@@ -72,6 +72,61 @@
             "description": "Optional free-text description of the agent's purpose.",
             "title": "Description"
           },
+          "git_commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Commit"
+          },
+          "git_host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Host Id"
+          },
+          "git_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Ref"
+          },
+          "git_subpath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Subpath"
+          },
+          "git_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Url"
+          },
           "harness": {
             "anyOf": [
               {
@@ -1743,6 +1798,46 @@
           "type"
         ],
         "title": "HeartbeatEvent",
+        "type": "object"
+      },
+      "ImportGitBody": {
+        "properties": {
+          "git_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Ref"
+          },
+          "git_subpath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Subpath"
+          },
+          "git_url": {
+            "title": "Git Url",
+            "type": "string"
+          },
+          "host_id": {
+            "title": "Host Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "git_url",
+          "host_id"
+        ],
+        "title": "ImportGitBody",
         "type": "object"
       },
       "ImportItemInput": {
@@ -7054,6 +7149,92 @@
           }
         },
         "summary": "List Builtin Agents",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/import-git": {
+      "post": {
+        "description": "Clone a git repo on the given host, bundle, validate, and register.\n\nThe clone is always performed on a host (never server-side).  The\n`host_id` in the request body must refer to a host that is currently\nonline; if it is offline the route returns 409 CONFLICT.\n\n**Parameters**\n\n- `body` \u2014 Import spec with `git_url`, optional `git_ref`, optional `git_subpath`, and required `host_id`.\n\n**Returns:** The newly registered `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 INVALID_INPUT for bad URL, duplicate name, or bundle validation failure; 409 CONFLICT when the host is offline; 401 UNAUTHORIZED when unauthenticated in multi-user mode.",
+        "operationId": "import_git_v1_agents_import_git_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportGitBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Git",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/{agent_id}/refresh": {
+      "post": {
+        "description": "Re-clone the tracked branch HEAD on the same host, re-bundle, and update.\n\nThe refresh always uses the `git_host_id` stored on the agent at\nimport time. If that host is now offline the route returns 409 CONFLICT.\n\n**Returns:** The updated `AgentObject` (or unchanged if no new commits).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 NOT_FOUND if the agent does not exist; 400 INVALID_INPUT if the agent was not imported from git or has no host binding; 409 CONFLICT if the bound host is offline; 400 INVALID_INPUT if the repo name has changed.",
+        "operationId": "refresh_git_v1_agents__agent_id__refresh_post",
+        "parameters": [
+          {
+            "description": "ID of the agent to refresh.",
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Git",
         "tags": [
           "agents"
         ]

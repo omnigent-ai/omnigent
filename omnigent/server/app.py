@@ -67,6 +67,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.routes.agents import create_agents_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -2323,6 +2324,18 @@ def create_app(
         create_builtin_agents_router(
             agent_store,
             agent_cache,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["agents"],
+    )
+    # Git agent import/refresh (POST /v1/agents/import-git, /v1/agents/{id}/refresh).
+    # Clones host-side via the host tunnel, so it reads app.state.host_registry.
+    app.include_router(
+        create_agents_router(
+            agent_store,
+            agent_cache,
+            artifact_store,
             auth_provider=auth_provider,
         ),
         prefix="/v1",

@@ -27,6 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
+    HostCloneAndBundleResultFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
@@ -571,6 +572,20 @@ async def _receive_loop(
                         "status": frame.status,
                         "worktree_path": frame.worktree_path,
                         "branch": frame.branch,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostCloneAndBundleResultFrame):
+            clone_future = conn.pending_clone_bundles.pop(frame.request_id, None)
+            if clone_future is not None and not clone_future.done():
+                clone_future.set_result(
+                    {
+                        "status": frame.status,
+                        "bundle_b64": frame.bundle_b64,
+                        "commit_sha": frame.commit_sha,
+                        "resolved_ref": frame.resolved_ref,
                         "error": frame.error,
                     }
                 )

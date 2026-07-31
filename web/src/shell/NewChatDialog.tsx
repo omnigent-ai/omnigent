@@ -162,7 +162,10 @@ import type { CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
+import { ImportAgentFromGitDialog } from "./ImportAgentFromGitDialog";
+import { GitAgentProvenance } from "@/components/GitAgentProvenance";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
+import type { AgentObject } from "@/lib/agentsApi";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
@@ -819,6 +822,7 @@ export function AgentHarnessPicker({
   pendingAgentId,
   onSelectPending,
   onCreateCustomAgent,
+  onImportFromGit,
   sandboxSelected,
   allowCreateCustomAgent = true,
   onOpenChange,
@@ -839,6 +843,9 @@ export function AgentHarnessPicker({
   pendingAgentId: string;
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
+  /** Opens the "Import from Git" dialog. Optional so embedders that don't
+   *  offer git import (e.g. project settings) simply omit the menu item. */
+  onImportFromGit?: () => void;
   sandboxSelected: boolean;
   /** Whether to offer the "Create custom agent" action. Defaults true; an
    *  embedder that only picks an existing agent (e.g. project settings) can
@@ -880,7 +887,7 @@ export function AgentHarnessPicker({
   // Back row), instead of opening a hover flyout. `mobilePage` is the open
   // group (null = the main list); inert on desktop.
   const isMobile = useIsMobileViewport();
-  const [mobilePage, setMobilePage] = useState<"more" | "custom" | null>(null);
+  const [mobilePage, setMobilePage] = useState<"more" | "custom" | "create" | null>(null);
   // Reset to the main list whenever the menu closes so it never reopens on a
   // stale drill-in page.
   useEffect(() => {
@@ -919,6 +926,25 @@ export function AgentHarnessPicker({
   // closes the menu. Run-config knobs moved to the gear-icon config modal.
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = agent.id === effectiveAgentId;
+    // Git-imported agents get a provenance line + Refresh below the name.
+    // The row content becomes a column so the extra line stacks under it.
+    if (agent.git_url) {
+      return (
+        <DropdownMenuItem
+          key={agent.id}
+          data-testid={`new-chat-landing-agent-${agent.id}`}
+          data-active={active ? "true" : undefined}
+          onSelect={() => onSelectAgent(agent)}
+          className="flex-col items-stretch gap-1 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+        >
+          <div className="flex items-start gap-2">
+            {renderRowInner(agent, true)}
+            {renderBadge(agent)}
+          </div>
+          <GitAgentProvenance agent={agent} />
+        </DropdownMenuItem>
+      );
+    }
     return (
       <DropdownMenuItem
         key={agent.id}
@@ -973,15 +999,69 @@ export function AgentHarnessPicker({
   // sandbox has no create path for an uploaded bundle), unless the embedder
   // opts out (it has no create flow to route the action to).
   const canCreateAgent = !sandboxSelected && allowCreateCustomAgent;
-  const createAgentItem = canCreateAgent ? (
+  // The two ways to create a custom agent, grouped under a "Create custom
+  // agent" submenu so it reads as one concept with two entry points:
+  //   • Create in UI  — the manual config form (CreateAgentDialog)
+  //   • Import from Git — clone host-side from a repo
+  // "Import from Git" only appears when the embedder wires the handler.
+  const createInUiItem = (
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
       onSelect={onCreateCustomAgent}
       className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
     >
       <PlusIcon className="size-3.5" />
-      Create custom agent
+      Configure manually
     </DropdownMenuItem>
+  );
+  const importFromGitItem = onImportFromGit ? (
+    <DropdownMenuItem
+      data-testid="new-chat-landing-import-git"
+      onSelect={onImportFromGit}
+      className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+    >
+      <GitBranchIcon className="size-3.5" />
+      Import from Git
+    </DropdownMenuItem>
+  ) : null;
+  // Shared body of the "Create custom agent" submenu (desktop flyout + mobile
+  // drill-in page).
+  const createAgentSubmenuBody = (
+    <>
+      {createInUiItem}
+      {importFromGitItem}
+    </>
+  );
+  // The "Create custom agent" affordance: a hover submenu on desktop, an
+  // in-place drill-in page on touch (mirroring the "Custom agents" group).
+  const createAgentGroup = canCreateAgent ? (
+    isMobile ? (
+      <DropdownMenuItem
+        data-testid="new-chat-landing-create-agent-group"
+        onSelect={(e) => {
+          e.preventDefault();
+          setMobilePage("create");
+        }}
+        className="items-center gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+      >
+        <PlusIcon className="size-3.5" />
+        <span className="flex-1">Create custom agent</span>
+        <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
+      </DropdownMenuItem>
+    ) : (
+      <DropdownMenuSub>
+        <DropdownMenuSubTrigger
+          data-testid="new-chat-landing-create-agent-group"
+          className="items-center gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+        >
+          <PlusIcon className="size-3.5" />
+          <span className="flex-1">Create custom agent</span>
+        </DropdownMenuSubTrigger>
+        <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto p-1">
+          {createAgentSubmenuBody}
+        </DropdownMenuSubContent>
+      </DropdownMenuSub>
+    )
   ) : null;
   const hasCustomGroup = hasCustomAgents;
   // Shared body for the custom-agents submenu (desktop flyout + mobile page):
@@ -1006,7 +1086,7 @@ export function AgentHarnessPicker({
       {canCreateAgent && (
         <>
           <DropdownMenuSeparator />
-          {createAgentItem}
+          {createAgentGroup}
         </>
       )}
     </>
@@ -1015,12 +1095,14 @@ export function AgentHarnessPicker({
   // list refresh — can't strand the menu on an empty page).
   const showMore = isMobile && mobilePage === "more" && moreHarnessEntries.length > 0;
   const showCustom = isMobile && mobilePage === "custom" && hasCustomGroup;
+  const showCreate = isMobile && mobilePage === "create" && canCreateAgent;
   // If the open page's group disappears (or the viewport grows to desktop),
   // fall back to the main list so a reopened menu never lands on an empty page.
   useEffect(() => {
     if (mobilePage === "more" && !showMore) setMobilePage(null);
     if (mobilePage === "custom" && !showCustom) setMobilePage(null);
-  }, [mobilePage, showMore, showCustom]);
+    if (mobilePage === "create" && !showCreate) setMobilePage(null);
+  }, [mobilePage, showMore, showCustom, showCreate]);
 
   return (
     <DropdownMenu
@@ -1094,6 +1176,23 @@ export function AgentHarnessPicker({
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             {moreHarnessEntries.map(renderEntry)}
+          </div>
+        ) : showCreate ? (
+          // Mobile drill-in page for the "Create custom agent" options.
+          <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+            <DropdownMenuItem
+              data-testid="new-chat-landing-page-back"
+              onSelect={(e) => {
+                e.preventDefault();
+                setMobilePage(null);
+              }}
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-13 font-medium"
+            >
+              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
+              <span className="truncate">Create custom agent</span>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            {createAgentSubmenuBody}
           </div>
         ) : showCustom ? (
           // Mobile drill-in page for custom agents.
@@ -1188,9 +1287,10 @@ export function AgentHarnessPicker({
                   </DropdownMenuSubContent>
                 </DropdownMenuSub>
               ))}
-            {/* No custom agents to group: surface the create action directly so
-            it stays discoverable instead of hiding behind an empty submenu. */}
-            {!hasCustomGroup && createAgentItem}
+            {/* No custom agents to group: surface the "Create custom agent"
+            submenu directly so it stays discoverable instead of hiding behind
+            an empty "Custom agents" submenu. */}
+            {!hasCustomGroup && createAgentGroup}
           </>
         )}
       </DropdownMenuContent>
@@ -1652,6 +1752,10 @@ export function NewChatLandingScreen() {
   // tar.gz, and uses multipart POST instead of the normal JSON path.
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [pendingAgent, setPendingAgent] = useState<AgentBundleInput | null>(null);
+  // "Import from Git" dialog state. Unlike the pending-bundle create flow,
+  // a git import creates a real template agent server-side immediately, so
+  // on success we just refresh the catalog and select the returned agent.
+  const [importGitOpen, setImportGitOpen] = useState(false);
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
 
@@ -3315,6 +3419,7 @@ export function NewChatLandingScreen() {
                   pendingAgentId={PENDING_AGENT_ID}
                   onSelectPending={handleSelectPending}
                   onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                  onImportFromGit={() => setImportGitOpen(true)}
                   sandboxSelected={sandboxSelected}
                 />
                 {/* Gear — opens the selected agent's run-config modal. Hidden
@@ -3973,6 +4078,19 @@ export function NewChatLandingScreen() {
           setPendingAgent(input);
           setPickedAgentId(PENDING_AGENT_ID);
           setPickedHarness(null);
+        }}
+      />
+
+      {/* Import-from-Git dialog — clones host-side and registers a template
+          agent. On success, refresh the catalog and select the new agent. */}
+      <ImportAgentFromGitDialog
+        open={importGitOpen}
+        onOpenChange={setImportGitOpen}
+        onImported={(agent: AgentObject) => {
+          void queryClient.invalidateQueries({ queryKey: ["available-agents"] });
+          setPickedHarness(null);
+          setPickedAgentId(agent.id);
+          writeLastAgentId(agent.id);
         }}
       />
     </div>

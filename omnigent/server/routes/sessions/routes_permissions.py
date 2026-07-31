@@ -441,4 +441,9 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
         policies=policies,
         skills=skills,
         terminals=terminals,
+        git_url=agent.git_url,
+        git_ref=agent.git_ref,
+        git_subpath=agent.git_subpath,
+        git_commit=agent.git_commit,
+        git_host_id=agent.git_host_id,
     )

@@ -68,6 +68,8 @@ class HostFrameKind(str, Enum):
     FS_RESULT = "host.fs_result"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
+    CLONE_AND_BUNDLE = "host.clone_and_bundle"
+    CLONE_AND_BUNDLE_RESULT = "host.clone_and_bundle_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -466,6 +468,56 @@ class HostCreateWorktreeResultFrame:
 
 
 @dataclass
+class HostCloneAndBundleFrame:
+    """Server → host: clone a remote git repo and return a bundle.
+
+    The host clones ``git_url`` at the given ``git_ref`` (defaulting to the
+    remote HEAD when ``None``), optionally scoped to ``git_subpath``, and
+    returns the result as a base64-encoded ``.tar.gz`` bundle inside
+    :class:`HostCloneAndBundleResultFrame`.
+
+    :param request_id: Correlates the result, e.g. ``"req_clone_1"``.
+    :param git_url: Remote repository URL to clone, e.g.
+        ``"https://github.com/owner/repo.git"``.
+    :param git_ref: Branch, tag, or SHA to check out, e.g.
+        ``"main"`` or ``"v1.2.3"``. ``None`` uses the remote's default
+        branch.
+    :param git_subpath: Optional subdirectory inside the repo to bundle,
+        e.g. ``"packages/core"``. ``None`` bundles the entire repo root.
+    """
+
+    request_id: str
+    git_url: str
+    git_ref: str | None = None
+    git_subpath: str | None = None
+
+
+@dataclass
+class HostCloneAndBundleResultFrame:
+    """Host → server: outcome of a clone-and-bundle request.
+
+    :param request_id: Correlates to the
+        :class:`HostCloneAndBundleFrame`, e.g. ``"req_clone_1"``.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param bundle_b64: Base64-encoded ``.tar.gz`` bundle bytes of the
+        cloned tree (or subpath). ``None`` on failure.
+    :param commit_sha: Resolved HEAD commit SHA, e.g.
+        ``"a1b2c3d4e5f6..."``. ``None`` on failure.
+    :param resolved_ref: The branch or tag actually checked out, e.g.
+        ``"main"`` when ``git_ref`` was ``None``. ``None`` on failure.
+    :param error: Error message when ``status`` is ``"failed"``,
+        e.g. ``"repository not found"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    bundle_b64: str | None = None
+    commit_sha: str | None = None
+    resolved_ref: str | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostRemoveWorktreeFrame:
     """Server → host: remove a git worktree (opt-in session cleanup).
 
@@ -823,6 +875,8 @@ HostFrame = (
     | HostListDirResultFrame
     | HostCreateWorktreeFrame
     | HostCreateWorktreeResultFrame
+    | HostCloneAndBundleFrame
+    | HostCloneAndBundleResultFrame
     | HostRemoveWorktreeFrame
     | HostRemoveWorktreeResultFrame
     | HostListWorktreesFrame
@@ -1022,6 +1076,28 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "worktree_path": frame.worktree_path,
                 "branch": frame.branch,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostCloneAndBundleFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_AND_BUNDLE.value,
+                "request_id": frame.request_id,
+                "git_url": frame.git_url,
+                "git_ref": frame.git_ref,
+                "git_subpath": frame.git_subpath,
+            }
+        )
+    if isinstance(frame, HostCloneAndBundleResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_AND_BUNDLE_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "bundle_b64": frame.bundle_b64,
+                "commit_sha": frame.commit_sha,
+                "resolved_ref": frame.resolved_ref,
                 "error": frame.error,
             }
         )
@@ -1268,6 +1344,10 @@ def _decode_known_host_frame(
             return _decode_create_worktree(msg)
         case HostFrameKind.CREATE_WORKTREE_RESULT:
             return _decode_create_worktree_result(msg)
+        case HostFrameKind.CLONE_AND_BUNDLE:
+            return _decode_clone_and_bundle(msg)
+        case HostFrameKind.CLONE_AND_BUNDLE_RESULT:
+            return _decode_clone_and_bundle_result(msg)
         case HostFrameKind.REMOVE_WORKTREE:
             return _decode_remove_worktree(msg)
         case HostFrameKind.REMOVE_WORKTREE_RESULT:
@@ -1552,6 +1632,38 @@ def _decode_create_worktree_result(
         status=_required_str(msg, "status"),
         worktree_path=_optional_nullable_str(msg, "worktree_path"),
         branch=_optional_nullable_str(msg, "branch"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_clone_and_bundle(msg: dict[str, Any]) -> HostCloneAndBundleFrame:
+    """Decode a host.clone_and_bundle request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.clone_and_bundle frame.
+    """
+    return HostCloneAndBundleFrame(
+        request_id=_required_str(msg, "request_id"),
+        git_url=_required_str(msg, "git_url"),
+        git_ref=_optional_nullable_str(msg, "git_ref"),
+        git_subpath=_optional_nullable_str(msg, "git_subpath"),
+    )
+
+
+def _decode_clone_and_bundle_result(
+    msg: dict[str, Any],
+) -> HostCloneAndBundleResultFrame:
+    """Decode a host.clone_and_bundle_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.clone_and_bundle_result frame.
+    """
+    return HostCloneAndBundleResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        bundle_b64=_optional_nullable_str(msg, "bundle_b64"),
+        commit_sha=_optional_nullable_str(msg, "commit_sha"),
+        resolved_ref=_optional_nullable_str(msg, "resolved_ref"),
         error=_optional_nullable_str(msg, "error"),
     )
 

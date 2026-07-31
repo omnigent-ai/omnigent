@@ -429,6 +429,34 @@ tools:
       required: [query]
 ```
 
+## Importing an agent from git
+
+Instead of running a local file, you can import an agent straight from a git
+repository through the web UI (New Chat → **Create custom agent** → **Import
+from Git**). You supply the repository URL and, optionally, a branch and a
+subpath; the clone runs **on a selected host** using that host's ambient git
+credentials (the same model as git worktrees), so private repos work without
+uploading any tokens to the server.
+
+Repository layout:
+
+- The imported directory must contain a `config.yaml` at its root — either the
+  repository root, or the directory named by the **subpath** if you set one.
+  Sibling files the agent references (e.g. `AGENTS.md`, a `skills/` directory)
+  are bundled alongside it.
+- The `.git` directory is stripped before bundling — only the working tree is
+  imported, never history.
+- The bundle is size-capped (12 MiB) to keep the transfer host-friendly; point
+  the subpath at just the agent directory rather than importing a large
+  monorepo root.
+
+After import you can **refresh** the agent from the New Chat picker, which
+re-clones the tracked branch on the same host and advances to its latest
+commit (bumping the agent's version only when the content actually changed).
+The agent's `name` is fixed at import time and is **immutable across
+refreshes** — if the repo later renames the agent in its `config.yaml`, the
+refresh is rejected rather than silently forking a second agent.
+
 ## Validation tips
 
 - Keep examples free of secrets, workspace URLs, customer data, and private

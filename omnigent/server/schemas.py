@@ -287,6 +287,13 @@ class AgentObject(BaseModel):
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
     builtin: bool = False
+    # Git-source provenance for agents imported from a git repo (all None for
+    # non-git agents). git_url None ⇒ not git-backed / no refresh.
+    git_url: str | None = None
+    git_ref: str | None = None
+    git_subpath: str | None = None
+    git_commit: str | None = None
+    git_host_id: str | None = None
 
 
 # ── Session Policies ───────────────────────────────────────────

@@ -193,13 +193,16 @@ async def _seed_workspace(page) -> None:
 
 
 async def _open_create_agent(page) -> None:
-    """Open the agent picker and click "Create custom agent".
+    """Open the agent picker and reach the "Configure manually" dialog.
 
-    With no custom agents registered, the create action is a top-level row in
-    the picker (it only folds into a "Custom agents" submenu once custom agents
-    exist), so open the dropdown and click the create item directly.
+    "Create custom agent" is a submenu grouping two actions ("Configure
+    manually" + "Import from Git"); with no custom agents registered it's a
+    top-level submenu (it nests under "Custom agents" once custom agents
+    exist). Open the picker, hover/open the "Create custom agent" submenu,
+    then click "Configure manually".
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()
+    await page.get_by_test_id("new-chat-landing-create-agent-group").click()
     await page.get_by_test_id("new-chat-landing-create-agent").click()
 
 
@@ -209,7 +212,7 @@ async def _open_create_agent(page) -> None:
 def test_create_agent_dialog_opens_from_dropdown(
     seeded_session: tuple[str, str],
 ) -> None:
-    """The agent dropdown shows a "Create custom agent" item that opens the dialog."""
+    """The agent dropdown groups create actions and opens the manual dialog."""
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_dialog_opens(base_url, session_id))
 
@@ -231,14 +234,18 @@ async def _drive_dialog_opens(base_url: str, session_id: str) -> None:
             )
 
             # Open the agent dropdown. With no custom agents yet, "Create custom
-            # agent" is a top-level row (not behind a "Custom agents" submenu).
+            # agent" is a top-level submenu (not nested under "Custom agents").
             await page.get_by_test_id("new-chat-landing-agent-select").click()
 
-            # "Create custom agent" item should be visible.
+            # The "Create custom agent" submenu trigger should be visible; open
+            # it to reveal "Configure manually" + "Import from Git".
+            create_group = page.get_by_test_id("new-chat-landing-create-agent-group")
+            await expect(create_group).to_be_visible()
+            await create_group.click()
+
+            # "Configure manually" opens the manual create dialog.
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
             await expect(create_item).to_be_visible()
-
-            # Click it — dialog should open.
             await create_item.click()
             dialog = page.get_by_test_id("create-agent-dialog")
             await expect(dialog).to_be_visible(timeout=5_000)
@@ -465,13 +472,15 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
             )
 
             # On the sandbox, "Create custom agent" is not offered (a managed
-            # sandbox has no create path for an uploaded bundle), so it's never
-            # in the DOM.
+            # sandbox has no create path for an uploaded bundle), so the create
+            # submenu group is never in the DOM.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
+            await expect(page.get_by_test_id("new-chat-landing-create-agent-group")).to_have_count(
+                0
+            )
 
-            # Switch to the connected host: with no custom agents yet, create is
-            # a top-level row (not behind a "Custom agents" submenu) and opens.
+            # Switch to the connected host: with no custom agents yet, the
+            # create submenu is top-level (not nested under "Custom agents").
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
@@ -479,6 +488,9 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            create_group = page.get_by_test_id("new-chat-landing-create-agent-group")
+            await expect(create_group).to_be_visible()
+            await create_group.click()
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
             await expect(create_item).to_be_visible()
             await create_item.click()

@@ -115,6 +115,11 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # by a same-named ``omnigent run`` upload, but lets a newer
         # upload supersede the latter.
         builtin=agent.session_id is None and agent.id == builtin_agent_id(agent.name),
+        git_url=agent.git_url,
+        git_ref=agent.git_ref,
+        git_subpath=agent.git_subpath,
+        git_commit=agent.git_commit,
+        git_host_id=agent.git_host_id,
     )
 
 

@@ -511,6 +511,11 @@ The same file can declare sub-agents and reviewers. For a fuller example, see
 Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/examples/polly/), and the
 [Agent YAML spec](https://github.com/omnigent-ai/omnigent/blob/main/docs/AGENT_YAML_SPEC.md) for the full schema.
 
+Already have an agent in a git repo? Import it directly from the New Chat
+dialog (**Create custom agent → Import from Git**) and refresh it later to the
+branch's latest commit — see
+[Importing an agent from git](https://github.com/omnigent-ai/omnigent/blob/main/docs/AGENT_YAML_SPEC.md#importing-an-agent-from-git).
+
 ---
 
 ## Telemetry
