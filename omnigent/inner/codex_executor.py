@@ -24,9 +24,9 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from . import _proc
@@ -375,59 +375,25 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
 
-    Uses a prefix allowlist so only known-safe categories pass through
-    (proxy settings, locale, OpenAI retry knobs, etc.). Keys in
-    :data:`_CODEX_ENV_DENY_EXACT` are excluded even when their prefix
-    matches; ``OPENAI_API_KEY`` is stripped so the codex CLI falls
-    back to subscription auth (``auth.json``) rather than a developer
-    API key that would charge separately.
+    Thin wrapper over :func:`omnigent.inner.agent_env.clean_agent_env`; the
+    families below are codex's own on top of the shared safe base. Keys in
+    :data:`_CODEX_ENV_DENY_EXACT` are excluded even when their prefix matches;
+    ``OPENAI_API_KEY`` is stripped so the codex CLI falls back to subscription
+    auth (``auth.json``) rather than a developer API key that would charge
+    separately.
 
     :returns: Filtered environment dict.
     """
-    env: dict[str, str] = {}
-    allow_prefixes = (
-        "OPENAI_",
-        "HTTP_",
-        "HTTPS_",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "SSL_",
-        "REQUESTS_",
-        "CODEX_HOME",
-        "XDG_",
-        "LANG",
-        "LC_",
+    return clean_agent_env(
+        allow_prefixes=("OPENAI_", "REQUESTS_", "CODEX_HOME"),
+        allow_exact=(
+            "PYTHONUTF8",
+            "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
+            "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+        ),
+        deny_exact=_CODEX_ENV_DENY_EXACT,
+        extra_allowed=extra_allow,
     )
-    allow_exact = {
-        "HOME",
-        "PATH",
-        "TERM",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "PYTHONUTF8",
-        "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
-        "DATABRICKS_CODEX_TOKEN",  # env_key referenced by ~/.codex/config.toml's DB provider
-        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
-    } | set(extra_allow)
-    for key, value in os.environ.items():
-        if key in _CODEX_ENV_DENY_EXACT:
-            continue
-        if key in allow_exact or key.startswith(allow_prefixes):
-            env[key] = value
-    return env
-
-
-def _declared_passthrough(os_env: OSEnvSpec | None) -> tuple[str, ...]:
-    """Env-var names an agent declared for tool passthrough.
-
-    Lives on ``os_env.sandbox.env_passthrough`` (an
-    :class:`OSEnvSandboxSpec` field), not on ``OSEnvSpec`` directly.
-    Returns an empty tuple when any link in that chain is absent.
-    """
-    if os_env is not None and os_env.sandbox is not None and os_env.sandbox.env_passthrough:
-        return tuple(os_env.sandbox.env_passthrough)
-    return ()
 
 
 def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
@@ -2333,7 +2299,7 @@ class CodexExecutor(Executor):
                 f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
             )
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
+        self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()

@@ -41,7 +41,9 @@ const {
   // mock derives each folder's rows from this by label, mirroring the server's
   // ?project= filter — so tests that seed project sessions via the global list
   // keep working without a separate per-project fixture.
-  conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  conversationsRef: {
+    current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
+  },
   // Server-authoritative pinned ids. Kept in a ref (not the legacy localStorage
   // key, which the one-time migration clears on mount) so a seeded pin survives
   // the first render. `seedPins` sets it; the toggle mock mutates it.
@@ -111,7 +113,7 @@ vi.mock("@/hooks/useConversations", () => ({
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
+          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
         ));
     return {
       data: enabled
@@ -153,6 +155,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
+import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -240,6 +243,9 @@ beforeEach(() => {
   pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
+  // The bound session's startup signal (send in flight / PTY pending) feeds
+  // the row's "starting" badge; reset so one test's state can't leak.
+  useChatStore.setState({ conversationId: null, status: "idle", terminalPending: false });
 });
 
 /** Seed the server-authoritative pinned set (replaces the old localStorage seed). */
@@ -514,6 +520,30 @@ describe("Sidebar session list", () => {
     const idleRow = screen.getByRole("link", { name: /conv_idle/ }).closest("li")!;
     expect(within(idleRow).queryByTestId("session-state-badge")).toBeNull();
     expect(within(idleRow).queryByText("now")).toBeNull();
+  });
+
+  it("shows a starting spinner on the bound session while a send is waking it", () => {
+    // The launch/relaunch window: the user sent a message (local status
+    // "streaming") but the server hasn't confirmed `running` — a cold boot or
+    // a send waking a disconnected runner. The row's server status is stale
+    // ("failed" after a runner disconnect), yet the sidebar must show the
+    // session is coming up, matching the chat's "Starting up…" indicator.
+    mockConversations([
+      conv("conv_waking", "Claude Code", { status: "failed" }),
+      conv("conv_other", "Claude Code"),
+    ]);
+    useChatStore.setState({ conversationId: "conv_waking", status: "streaming" });
+
+    renderSidebar();
+
+    const wakingRow = screen.getByRole("link", { name: /conv_waking/ }).closest("li")!;
+    expect(within(wakingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+    // Only the bound session reads the store signal — other rows stay bare.
+    const otherRow = screen.getByRole("link", { name: /conv_other/ }).closest("li")!;
+    expect(within(otherRow).queryByTestId("session-state-badge")).toBeNull();
   });
 
   it("shows the full session title in a styled tooltip on hover", async () => {

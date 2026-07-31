@@ -36,6 +36,8 @@ from omnigent.model_metadata import (
     ModelCostTier,
     ModelIntent,
     ModelMetadata,
+    ModelReasoningMetadata,
+    ModelReasoningMode,
     ModelWireAPI,
 )
 from omnigent.model_resolver import ModelResolutionError, ModelResolutionSource
@@ -497,10 +499,11 @@ def _databricks_transport(
 
     _UC_PAGE = {
         "model_services": [
-            _uc_service("system.ai.claude-sonnet-4-6", ["mlflow/v1/chat/completions"]),
+            _uc_service("system.ai.claude-sonnet-4-6", ["anthropic/v1/messages"]),
             _uc_service(
                 "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
             ),
+            _uc_service("system.ai.gpt-responses-only", ["openai/v1/responses"]),
             _uc_service("system.ai.meta-llama-3-3-70b-instruct", ["mlflow/v1/chat/completions"]),
             _uc_service("system.ai.qwen3-embedding", ["mlflow/v1/embeddings"]),
         ]
@@ -530,10 +533,10 @@ def _stub_workspace_creds(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_databricks_listing_filters_to_chat_llms(
+def test_databricks_listing_filters_to_llm_wire_surfaces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The gateway listing keeps chat LLM endpoints and tags families.
+    """The gateway listing keeps supported LLM wires and tags families.
 
     The embeddings endpoint must be excluded — including it would let an
     orchestrator dispatch a worker onto a non-chat endpoint.
@@ -558,11 +561,21 @@ def test_databricks_listing_filters_to_chat_llms(
     assert set(by_id) == {
         "system.ai.claude-sonnet-4-6",
         "system.ai.gpt-5-4",
+        "system.ai.gpt-responses-only",
         "system.ai.meta-llama-3-3-70b-instruct",
     }
     assert by_id["system.ai.claude-sonnet-4-6"].family == "claude"
     assert by_id["system.ai.gpt-5-4"].family == "openai"
     assert by_id["system.ai.meta-llama-3-3-70b-instruct"].family == "other"
+    assert by_id["system.ai.claude-sonnet-4-6"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.ANTHROPIC_MESSAGES}
+    )
+    assert by_id["system.ai.gpt-5-4"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_CHAT, ModelWireAPI.OPENAI_RESPONSES}
+    )
+    assert by_id["system.ai.gpt-responses-only"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_RESPONSES}
+    )
 
 
 def test_databricks_listing_skips_explicitly_non_ready_endpoints(
@@ -627,6 +640,7 @@ def test_databricks_listing_skips_explicitly_non_ready_endpoints(
             {
                 "system.ai.claude-sonnet-4-6",
                 "system.ai.gpt-5-4",
+                "system.ai.gpt-responses-only",
                 "system.ai.meta-llama-3-3-70b-instruct",
             },
             id="pi-everything",
@@ -749,7 +763,29 @@ def test_anthropic_api_listing_uses_api_key_headers(
             200,
             json={
                 "data": [
-                    {"type": "model", "id": "claude-opus-4-8", "display_name": "Claude Opus 4.8"},
+                    {
+                        "type": "model",
+                        "id": "claude-opus-4-8",
+                        "display_name": "Claude Opus 4.8",
+                        "max_input_tokens": 1_000_000,
+                        "capabilities": {
+                            "thinking": {
+                                "supported": True,
+                                "types": {
+                                    "enabled": {"supported": False},
+                                    "adaptive": {"supported": True},
+                                },
+                            },
+                            "effort": {
+                                "supported": True,
+                                "low": {"supported": True},
+                                "medium": {"supported": True},
+                                "high": {"supported": True},
+                                "xhigh": {"supported": True},
+                                "max": {"supported": True},
+                            },
+                        },
+                    },
                     {
                         "type": "model",
                         "id": "claude-sonnet-4-6",
@@ -771,6 +807,11 @@ def test_anthropic_api_listing_uses_api_key_headers(
     assert requests_seen[0].headers["anthropic-version"] == "2023-06-01"
     assert listing.source == "anthropic-api"
     assert [m.id for m in listing.models] == ["claude-opus-4-8", "claude-sonnet-4-6"]
+    opus = listing.models[0]
+    assert opus.context_window == 1_000_000
+    assert opus.metadata.supports(ModelCapability.REASONING) is True
+    assert opus.metadata.reasoning is not None
+    assert opus.metadata.reasoning.modes == frozenset({ModelReasoningMode.ADAPTIVE})
 
 
 def test_subscription_listing_is_static_and_unverified(
@@ -1148,6 +1189,10 @@ def test_catalog_payload_serializes_normalized_model_metadata() -> None:
                     context_window=200_000,
                     cost_tier=ModelCostTier.STANDARD,
                     wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+                    reasoning=ModelReasoningMetadata(
+                        modes=frozenset({ModelReasoningMode.ADAPTIVE}),
+                        efforts=frozenset({"low", "high"}),
+                    ),
                 ),
             ),
         ),
@@ -1164,6 +1209,7 @@ def test_catalog_payload_serializes_normalized_model_metadata() -> None:
             "capabilities": {"tool-use": True, "vision": False},
             "cost_tier": "standard",
             "wire_apis": ["openai-responses"],
+            "reasoning": {"modes": ["adaptive"], "efforts": ["high", "low"]},
         }
     ]
 
@@ -1268,30 +1314,21 @@ def test_resolve_catalog_default_preserves_provider_policy(
     assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
 
 
-@pytest.mark.parametrize(
-    ("provider", "family", "expected_model"),
-    [
-        ("anthropic", "claude", "claude-opus-4-8"),
-        ("openai", "openai", "gpt-5.5"),
-    ],
-)
-def test_resolve_catalog_default_preserves_provider_pin_when_catalog_lags(
+def test_resolve_catalog_default_preserves_provider_tier_policy(
     monkeypatch: pytest.MonkeyPatch,
-    provider: str,
-    family: str,
-    expected_model: str,
 ) -> None:
-    """Provider pins remain valid before the remote catalog learns their ids."""
+    """Default resolution retains broadly accessible provider tiers."""
     monkeypatch.setattr(
         "omnigent.onboarding.providers.get_chat_models",
         lambda _provider: [
-            ModelInfo(name=f"{family}-catalog-model", provider=provider, mode="chat")
+            ModelInfo(name="claude-opus-new", provider="anthropic", mode="chat"),
+            ModelInfo(name="claude-sonnet-stable", provider="anthropic", mode="chat"),
         ],
     )
 
-    resolution = resolve_catalog_model(provider, family=family)
+    resolution = resolve_catalog_model("anthropic", family="claude")
 
-    assert resolution.model_id == expected_model
+    assert resolution.model_id == "claude-sonnet-stable"
     assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
 
 

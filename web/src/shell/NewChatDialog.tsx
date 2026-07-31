@@ -68,6 +68,7 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { attachmentKey } from "@/lib/attachments";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
@@ -99,8 +100,7 @@ import {
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
-import { getCliServerUrl } from "@/lib/host";
-import { getOmnigentHostConfig } from "@/lib/host";
+import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
   readLastHostChoice,
@@ -158,7 +158,7 @@ import {
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { type CostControlMode } from "@/components/CostRoutingControl";
+import type { CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
@@ -737,7 +737,7 @@ export function deriveRepoName(url: string): string | null {
  */
 export function matchSkillInvocation(
   text: string,
-  skills: ReadonlyArray<{ name: string }>,
+  skills: readonly { name: string }[],
 ): { name: string; args: string } | null {
   const trimmed = text.trim();
   if (!isSlashCommandText(trimmed)) return null;
@@ -1588,7 +1588,7 @@ function HarnessConfigModal({
 // message, attachments and picker selections survive the unmount that happens
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
-type LandingDraft = {
+interface LandingDraft {
   message: string;
   files: File[];
   pickedAgentId: string | null;
@@ -1607,7 +1607,7 @@ type LandingDraft = {
   pickedModel: string;
   pickedEffort: string;
   costControlMode: CostControlMode;
-};
+}
 
 let landingDraft: LandingDraft | null = null;
 
@@ -3246,7 +3246,7 @@ export function NewChatLandingScreen() {
               <div className="flex flex-wrap gap-1.5 px-4 pb-2">
                 {files.map((file, i) => (
                   <span
-                    key={i}
+                    key={attachmentKey(file)}
                     className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                   >
                     {file.type.startsWith("image/") ? (

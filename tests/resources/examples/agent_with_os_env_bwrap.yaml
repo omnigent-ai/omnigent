@@ -8,15 +8,19 @@
 #   - Read-only cwd by default. The agent can ``sys_os_read`` files
 #     under cwd but every ``sys_os_write`` / ``sys_os_edit`` /
 #     redirect-via-shell attempt is rejected.
-#   - Dotfiles / dotdirs anywhere under cwd are masked recursively.
-#     ``.env``, ``.git/``, ``.aws/``, ``.ssh/``, ``services/api/.env``,
-#     etc. are all invisible inside the sandbox. The default allowlist
-#     passes through ``.venv`` (matched by basename, so nested venvs
-#     work too); extend it with ``cwd_allow_hidden:`` (see below)
-#     for ``.git``, ``.gitignore``, etc.
-#     The recursive scan is bounded by
+#   - Top-level dotfiles / dotdirs under cwd (and under each
+#     ``read_paths`` root) are masked by default. ``.env``, ``.git/``,
+#     ``.aws/``, ``.ssh/`` at the root are invisible inside the
+#     sandbox. Scanning is NON-recursive by default — a nested
+#     ``services/api/.env`` stays visible unless you opt into
+#     ``cwd_hidden_scan_recursive: true`` (see below), which is the
+#     scalable default for medium/large trees. The default allowlist
+#     passes through ``.venv`` (matched by basename); extend it with
+#     ``cwd_allow_hidden:`` (see below) for ``.git``, ``.gitignore``,
+#     etc. When recursion is enabled the scan is bounded by
 #     ``cwd_hidden_scan_max_entries`` (default 50000); behavior at
-#     the cap is controlled by ``cwd_hidden_scan_overflow``.
+#     the cap is controlled by ``cwd_hidden_scan_overflow``. Hide a
+#     specific file/folder by any path via ``mask_paths:`` (below).
 #   - A pre-generated writable scratch directory mounted as
 #     ``$TMPDIR``. Use this for any artifact the agent needs to
 #     produce while keeping the real cwd untouched.
@@ -129,6 +133,25 @@ os_env:
     # respect ignore rules. Entries must be plain names — no ``/``,
     # no ``..``, no absolute paths (validated at spec parse time).
     # cwd_allow_hidden: [".venv", ".git", ".gitignore"]
+
+    # Optional: recurse into subdirectories when masking dotfiles /
+    # escaping symlinks. Default false — only the top level of cwd
+    # and each read_paths root is scanned, which keeps spawn fast on
+    # medium/large projects while still hiding the top-level secrets
+    # (``.env``, ``.git``, ``.aws``, ``.ssh``, ...). Set to true for
+    # untrusted trees where a deeply-nested dotfile (e.g.
+    # ``services/api/.env``) would be an unacceptable leak; the cap /
+    # overflow knobs below then bound the cost of the full walk.
+    # cwd_hidden_scan_recursive: true
+
+    # Optional: explicitly hide specific files/folders regardless of
+    # name or depth (on top of the dotfile mask). Each entry is a
+    # path resolved like read_paths (``~`` expanded, relative to cwd).
+    # Use this to hide a named secret the dotfile masker won't catch,
+    # or a deeply-nested dotfile without turning on full recursion.
+    # mask_paths:
+    #   - config/production.key
+    #   - ~/.config/private
 
     # Optional: cap on the number of filesystem entries the recursive
     # dotfile walker visits under cwd. The walker prunes at masked

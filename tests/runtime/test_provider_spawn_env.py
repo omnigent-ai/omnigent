@@ -34,6 +34,7 @@ from omnigent.runtime.workflow import (
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
     _build_qwen_spawn_env,
+    _resolve_catalog_default_model,
     _resolve_provider_for_build,
 )
 from omnigent.spec.types import (
@@ -147,7 +148,13 @@ def _make_spec(
     )
 
 
-def _key_family(base_url: str, api_key: str, default_model: str) -> dict[str, object]:
+def _key_family(
+    base_url: str,
+    api_key: str,
+    default_model: str,
+    *,
+    wire_api: str | None = None,
+) -> dict[str, object]:
     """
     Build a single provider-family config block (inline static key).
 
@@ -157,11 +164,14 @@ def _key_family(base_url: str, api_key: str, default_model: str) -> dict[str, ob
     :param default_model: The family's ``models.default``, e.g. ``"gpt-4o"``.
     :returns: A family mapping ready to nest under a provider entry.
     """
-    return {
+    family: dict[str, object] = {
         "base_url": base_url,
         "api_key": api_key,
         "models": {"default": default_model},
     }
+    if wire_api is not None:
+        family["wire_api"] = wire_api
+    return family
 
 
 def _anthropic_default_config() -> dict[str, object]:
@@ -493,6 +503,23 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
 
 
+def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:
+    """Pi routes a generic OpenAI provider using configured wire metadata."""
+    config = _openai_default_config()
+    provider = config["providers"]["vendor-openai"]
+    provider["openai"] = _key_family(
+        "https://openai.example.com/v1",
+        "sk-oai-secret",
+        "gpt-default-model",
+        wire_api="responses",
+    )
+    _write_config(config_home, config)
+
+    env = _build_pi_spawn_env(_make_spec(harness="pi"), workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] == "responses"
+
+
 # ── Named ProviderAuth selection ───────────────────────────────────────────
 
 
@@ -629,6 +656,31 @@ def _key_family_no_model(base_url: str, api_key: str) -> dict[str, object]:
     :returns: A family mapping with no ``models`` key.
     """
     return {"base_url": base_url, "api_key": api_key}
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "catalog_family"),
+    [("anthropic", "claude"), ("openai", "openai")],
+)
+def test_catalog_default_fails_clearly_when_discovery_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+    catalog_family: str,
+) -> None:
+    """Known-family runtime defaults fail clearly without catalog data."""
+    from omnigent.errors import OmnigentError
+
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda _provider: [])
+
+    with pytest.raises(
+        OmnigentError,
+        match=r"Set 'executor.model'.*provider 'models.default'.*retry",
+    ):
+        _resolve_catalog_default_model(
+            provider_name,
+            catalog_family,
+            context=f"provider family {provider_name!r}",
+        )
 
 
 def test_claude_sdk_falls_back_to_catalog_default_model(config_home: Path) -> None:
@@ -1247,6 +1299,7 @@ def test_kimi_no_provider_emits_no_gateway_vars(config_home: Path) -> None:
 
     env = _build_kimi_spawn_env(spec, cwd=None)
 
+    assert "HARNESS_KIMI_MODEL" not in env
     assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
     assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
     assert "HARNESS_KIMI_GATEWAY_PROVIDER" not in env

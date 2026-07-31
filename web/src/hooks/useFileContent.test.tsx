@@ -48,13 +48,15 @@ function Probe({ id, path }: { id: string | undefined; path: string | null }) {
 }
 
 async function flushMicrotasks() {
-  await new Promise((r) => setTimeout(r, 10));
+  await new Promise((resolve) => {
+    setTimeout(resolve, 10);
+  });
 }
 
-type ChatStoreState = {
+interface ChatStoreState {
   conversationId: string | null;
   sessionStatus: "idle" | "running" | "waiting" | "failed";
-};
+}
 
 // `useChatStore` is a selector hook: state in, derived value out.
 // Our consumer reads `s.conversationId` and `s.sessionStatus`.

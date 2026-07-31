@@ -1842,6 +1842,86 @@ def test_parse_os_env_sandbox_cwd_hidden_scan_defaults(tmp_path: Path) -> None:
     assert spec.os_env is not None and spec.os_env.sandbox is not None
     assert spec.os_env.sandbox.cwd_hidden_scan_max_entries == 50000
     assert spec.os_env.sandbox.cwd_hidden_scan_overflow == "warn"
+    assert spec.os_env.sandbox.cwd_hidden_scan_recursive is False
+    assert spec.os_env.sandbox.mask_paths is None
+
+
+def test_parse_os_env_sandbox_mask_and_recursive_explicit_values(tmp_path: Path) -> None:
+    """
+    Explicit ``cwd_hidden_scan_recursive`` + ``mask_paths`` values
+    pass through to the spec unchanged.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "tuned-mask",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "cwd_hidden_scan_recursive": True,
+                "mask_paths": ["config/production.key", "~/secrets"],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.os_env is not None and spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_hidden_scan_recursive is True
+    assert spec.os_env.sandbox.mask_paths == ["config/production.key", "~/secrets"]
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    ["yes", 1, ["true"]],
+    ids=["string", "int", "list"],
+)
+def test_parse_os_env_sandbox_cwd_hidden_scan_recursive_validation(
+    tmp_path: Path, bad_value: object
+) -> None:
+    """Non-boolean ``cwd_hidden_scan_recursive`` fails at parse time."""
+    config = {
+        "spec_version": 1,
+        "name": "bad-recursive",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "cwd_hidden_scan_recursive": bad_value,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"must be a boolean"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "bad_value,match_regex",
+    [
+        ("not-a-list", r"must be a list"),
+        ([123], r"entries must be strings"),
+        ([""], r"must not be empty strings"),
+    ],
+    ids=["not_list", "non_string_entry", "empty_entry"],
+)
+def test_parse_os_env_sandbox_mask_paths_validation(
+    tmp_path: Path, bad_value: object, match_regex: str
+) -> None:
+    """``mask_paths`` must be a list of non-empty strings."""
+    config = {
+        "spec_version": 1,
+        "name": "bad-mask",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "mask_paths": bad_value,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match_regex):
+        parse(tmp_path)
 
 
 def test_parse_os_env_sandbox_cwd_hidden_scan_explicit_values(tmp_path: Path) -> None:

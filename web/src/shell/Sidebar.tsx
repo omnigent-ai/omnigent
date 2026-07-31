@@ -9,6 +9,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -100,6 +101,7 @@ import {
 import {
   type Conversation,
   type PinnedConversationsResult,
+  BulkConversationMutationError,
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
@@ -136,6 +138,7 @@ import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
@@ -191,6 +194,12 @@ const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
+// Rows report an in-progress inline-rename edit here so ConversationList can
+// hold the sort order for the edit's whole duration — the pointer often
+// leaves the list while typing, and a reorder then would shuffle rows around
+// the open input (and can even blur it mid-edit, committing a half-typed
+// title). See the order-freeze block in ConversationList.
+const RowEditHoldContext = createContext<(id: string, editing: boolean) => void>(() => {});
 
 function SidebarRowDataProvider({
   projectNamesById,
@@ -793,35 +802,33 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 onExit={exitSelectionMode}
               />
             ) : (
-              <>
-                <Button
-                  asChild
-                  variant="ghost"
-                  className={cn(
-                    "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
-                    SIDEBAR_HOVER_HIGHLIGHT,
-                    isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="inbox-button"
+              >
+                <Link to="/inbox" onClick={onNavClick}>
+                  <InboxIcon className="size-3.5 text-muted-foreground" />
+                  Inbox
+                  {inboxCount > 0 && (
+                    <span
+                      aria-label={
+                        inboxCount === 1
+                          ? "1 inbox item waiting"
+                          : `${inboxCount} inbox items waiting`
+                      }
+                      className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
+                    >
+                      {inboxCount}
+                    </span>
                   )}
-                  data-testid="inbox-button"
-                >
-                  <Link to="/inbox" onClick={onNavClick}>
-                    <InboxIcon className="size-3.5 text-muted-foreground" />
-                    Inbox
-                    {inboxCount > 0 && (
-                      <span
-                        aria-label={
-                          inboxCount === 1
-                            ? "1 inbox item waiting"
-                            : `${inboxCount} inbox items waiting`
-                        }
-                        className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
-                      >
-                        {inboxCount}
-                      </span>
-                    )}
-                  </Link>
-                </Button>
-              </>
+                </Link>
+              </Button>
             )}
           </div>
 
@@ -963,6 +970,7 @@ function ProjectFolder({
   onToggleCollapsed,
   pinnedConversationIds,
   activeOverride,
+  frozenSortKeys,
   scrollRoot,
   onRowClick,
   onTogglePinned,
@@ -980,6 +988,9 @@ function ProjectFolder({
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
   activeOverride: ActiveChatOverride | null;
+  /** Pointer-inside sort-key freeze shared with the flat list (see
+      ConversationList); null while the pointer is outside the list. */
+  frozenSortKeys: Map<string, number> | null;
   scrollRoot: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
@@ -997,8 +1008,9 @@ function ProjectFolder({
     return sortByUpdatedAtDesc(
       loaded.filter((c) => !pinnedSet.has(c.id)),
       activeOverride,
+      frozenSortKeys,
     );
-  }, [query.data, pinnedSet, activeOverride]);
+  }, [query.data, pinnedSet, activeOverride, frozenSortKeys]);
 
   // Register this folder's rendered IDs synchronously during render so the
   // shift-select range uses the real per-project data, not the global list.
@@ -1203,6 +1215,33 @@ function ConversationList({
     setActiveOverride((prev) => computeNextActiveOverride(activeId, allConversations, prev));
   }, [activeId, allConversations]);
 
+  // While the pointer is inside the list OR a rename edit is open, pin every
+  // row's sort key so background updated_at bumps can't reorder rows under
+  // the cursor / around the edit input — a row sliding into place
+  // mid-interaction receives the click / right-click and the rename it
+  // triggers, hitting a session the user never aimed at; a reorder during an
+  // edit can move (and blur) the input, committing a half-typed title. The
+  // map accumulates keys lazily inside sortByUpdatedAtDesc (a render-time ref
+  // write, like projectRenderedIdsRef) and is cleared once neither hold is
+  // active, when the order snaps back to reality.
+  const frozenKeysRef = useRef<Map<string, number>>(new Map());
+  const [pointerInside, setPointerInside] = useState(false);
+  const [editingIds, setEditingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const reportRowEditing = useCallback((id: string, editing: boolean) => {
+    setEditingIds((prev) => {
+      if (prev.has(id) === editing) return prev;
+      const next = new Set(prev);
+      if (editing) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+  const orderFrozen = pointerInside || editingIds.size > 0;
+  const frozenKeys = orderFrozen ? frozenKeysRef.current : null;
+  useEffect(() => {
+    if (!orderFrozen) frozenKeysRef.current.clear();
+  }, [orderFrozen]);
+
   // Build sections: Pinned and Archived are peeled off; the rest splits into
   // the viewer's own sessions (Chats) and ones shared with them. Archived
   // sessions render in their own group at the bottom (below "Shared with
@@ -1251,7 +1290,11 @@ function ConversationList({
                 !pinnedIdSet.has(c.id),
             );
             inProject.forEach((c) => filedIds.add(c.id));
-            return { id, name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
+            return {
+              id,
+              name,
+              conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
+            };
           });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
@@ -1263,10 +1306,12 @@ function ConversationList({
     const sessions = sortByUpdatedAtDesc(
       tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
+      frozenKeys,
     );
     const archived = sortByUpdatedAtDesc(
       allWithPinned.filter((c) => c.archived === true),
       activeOverride,
+      frozenKeys,
     );
     return { pinned, sessions, archived, projectGroups };
   }, [
@@ -1274,6 +1319,7 @@ function ConversationList({
     pinnedConversations,
     pinnedSet,
     activeOverride,
+    frozenKeys,
     projects,
     activeTab,
     viewerId,
@@ -1602,221 +1648,183 @@ function ConversationList({
         onDragEnd={handleDragEnd}
         onDragCancel={() => setActiveDrag(null)}
       >
-        <div className="flex flex-col gap-4 pr-1">
-          {/* Removing a filed session from its project means dropping it back
+        <RowEditHoldContext.Provider value={reportRowEditing}>
+          <div
+            className="flex flex-col gap-4 pr-1"
+            data-testid="sidebar-conversation-list"
+            // Freeze the sort order while the pointer is over the list so rows
+            // never move under the cursor. The frozen-keys map is cleared by the
+            // effect above once no hold (pointer or open rename edit) remains.
+            onMouseEnter={() => setPointerInside(true)}
+            onMouseLeave={() => setPointerInside(false)}
+          >
+            {/* Removing a filed session from its project means dropping it back
             onto the flat "Chats" list — so the Chats section itself is the
             ungroup target (wrapped below). This top strip is only a FALLBACK
             for when there are no ungrouped chats yet, so the Chats section
             isn't rendered and there'd otherwise be nowhere to drop. */}
-          {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-            <UngroupDropZone />
-          )}
-          {totalVisible === 0 ? (
-            <>
-              <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
-              {/* The list is one paginated stream ordered by updated_at across
+            {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
+              <UngroupDropZone />
+            )}
+            {totalVisible === 0 ? (
+              <>
+                <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+                {/* The list is one paginated stream ordered by updated_at across
               owned + shared sessions, so the current tab can be empty on the
               loaded window while its sessions live on a later page. Keep the
               sentinel mounted so pagination continues instead of stranding the
               user on a false "empty" state. */}
-              {hasMorePages && (
-                <InfiniteScrollSentinel
-                  hasMore={hasMorePages}
-                  isFetching={isFetchingNextPage}
-                  fetchMore={fetchNextPage}
-                  scrollRoot={scrollContainerRef}
-                />
-              )}
-            </>
-          ) : (
-            <>
-              {sections.pinned.length > 0 && (
-                // Drop a session here to pin it — pin-precedence then floats it
-                // out of any project into this section. Active only while dragging
-                // an unpinned session; outline-only highlight.
-                <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
-                  <ConversationSection
-                    title="Pinned"
-                    conversations={sections.pinned}
-                    pinnedConversationIds={pinnedConversationIds}
-                    collapsed={effectiveCollapsedSections.includes("Pinned")}
-                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
-                    onRowClick={onRowClick}
-                    onTogglePinned={onTogglePinned}
-                    selectionMode={selectionMode}
-                    selectedIds={selectedIds}
-                    onToggleSelected={onToggleSelected}
-                    onProjectAssigned={expandProject}
+                {hasMorePages && (
+                  <InfiniteScrollSentinel
+                    hasMore={hasMorePages}
+                    isFetching={isFetchingNextPage}
+                    fetchMore={fetchNextPage}
+                    scrollRoot={scrollContainerRef}
                   />
-                </PinDropZone>
-              )}
-              {/* Projects: a "Projects" group header, with each project rendered as
-              a collapsible folder row nested beneath it. Folders default
-              collapsed; an empty folder shows "No sessions". The folder icon marks
-              a project row; the group/section headers carry no icon or count.
-              Shown on the "mine" tab even with zero projects, so "New project"
-              (create-empty) is discoverable — projects are a My-sessions tool. */}
-              {activeTab !== "shared" && (
-                <SectionGroup
-                  title="Projects"
-                  collapsed={effectiveCollapsedSections.includes("Projects")}
-                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                  headerAction={(() => {
-                    const allNames = sections.projectGroups.map((g) => g.name);
-                    // "New project" is always available (even when collapsed) so
-                    // the create-empty flow is reachable; the expand/revert control
-                    // is only meaningful when there are folders and the group is open.
-                    const showExpandControls =
-                      !effectiveCollapsedSections.includes("Projects") && allNames.length > 0;
-                    // Once every folder is open the only useful move is to undo it,
-                    // so the control flips to "revert" — which restores the set open
-                    // before "Expand all", or collapses everything when there's no
-                    // real last state (folders opened by hand). Otherwise it expands.
-                    const allExpanded =
-                      allNames.length > 0 && allNames.every((n) => expandedProjects.includes(n));
-                    return (
-                      // gap-0.5 between the two controls mirrors the row/folder
-                      // icon spacing, so every right-gutter pair lines up.
-                      <div className="flex items-center gap-0.5">
-                        {showExpandControls &&
-                          (allExpanded ? (
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  aria-label="Collapse to previous"
-                                  data-testid="revert-projects"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    revertProjects();
-                                  }}
-                                >
-                                  <Minimize2Icon className="size-3.5" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent side="bottom">Collapse to previous</TooltipContent>
-                            </Tooltip>
-                          ) : (
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  aria-label="Expand all"
-                                  data-testid="expand-all-projects"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    expandAllProjects(allNames);
-                                  }}
-                                >
-                                  <Maximize2Icon className="size-3.5" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent side="bottom">Expand all</TooltipContent>
-                            </Tooltip>
-                          ))}
-                        <NewProjectButton onCreated={expandProject} />
-                      </div>
-                    );
-                  })()}
-                >
-                  {sections.projectGroups.map((group) => (
-                    <ProjectFolder
-                      key={group.name}
-                      name={group.name}
-                      projectId={group.id}
-                      expanded={expandedProjects.includes(group.name)}
-                      // Best-effort marker from the globally-loaded window: a
-                      // collapsed folder hasn't fetched its own sessions yet.
-                      marker={projectMarkerState(group.conversations)}
-                      onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                )}
+              </>
+            ) : (
+              <>
+                {sections.pinned.length > 0 && (
+                  // Drop a session here to pin it — pin-precedence then floats it
+                  // out of any project into this section. Active only while dragging
+                  // an unpinned session; outline-only highlight.
+                  <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
+                    <ConversationSection
+                      title="Pinned"
+                      conversations={sections.pinned}
                       pinnedConversationIds={pinnedConversationIds}
-                      activeOverride={activeOverride}
-                      scrollRoot={scrollContainerRef}
+                      collapsed={effectiveCollapsedSections.includes("Pinned")}
+                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
                       onRowClick={onRowClick}
                       onTogglePinned={onTogglePinned}
                       selectionMode={selectionMode}
                       selectedIds={selectedIds}
                       onToggleSelected={onToggleSelected}
                       onProjectAssigned={expandProject}
-                      projectRenderedIdsRef={projectRenderedIdsRef}
                     />
-                  ))}
-                  {sections.projectGroups.length === 0 &&
-                    !effectiveCollapsedSections.includes("Projects") && (
-                      <p className="px-3 py-1.5 text-xs text-muted-foreground">
-                        No projects yet. Create one to group your sessions.
-                      </p>
-                    )}
-                </SectionGroup>
-              )}
-              {sections.sessions.length > 0 && (
-                // Drop a session here to send it to the flat "Chats" list — where
-                // unfiled, unpinned sessions live. Active while dragging a filed
-                // session (removes it from its project) or a pinned one (unpins
-                // it), since both have somewhere to land here.
-                <ChatsDropZone
-                  active={activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)}
-                >
-                  <ConversationSection
-                    title="Sessions"
-                    conversations={sections.sessions}
-                    pinnedConversationIds={pinnedConversationIds}
-                    collapsed={effectiveCollapsedSections.includes("Chats")}
-                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-                    onRowClick={onRowClick}
-                    onTogglePinned={onTogglePinned}
-                    selectionMode={selectionMode}
-                    selectedIds={selectedIds}
-                    onToggleSelected={onToggleSelected}
-                    onProjectAssigned={expandProject}
+                  </PinDropZone>
+                )}
+                {/* Projects: a "Projects" group header, with each project rendered as
+              a collapsible folder row nested beneath it. Folders default
+              collapsed; an empty folder shows "No sessions". The folder icon marks
+              a project row; the group/section headers carry no icon or count.
+              Shown on the "mine" tab even with zero projects, so "New project"
+              (create-empty) is discoverable — projects are a My-sessions tool. */}
+                {activeTab !== "shared" && (
+                  <SectionGroup
+                    title="Projects"
+                    collapsed={effectiveCollapsedSections.includes("Projects")}
+                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
                     headerAction={
-                      !selectionMode ? (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon-xs"
-                              aria-label="Select sessions"
-                              data-testid="toggle-selection-mode"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                onEnterSelectionMode();
-                              }}
-                            >
-                              <ListChecksIcon className="size-3.5" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent side="bottom">Select sessions</TooltipContent>
-                        </Tooltip>
-                      ) : undefined
+                      <ProjectHeaderActions
+                        projectNames={sections.projectGroups.map((group) => group.name)}
+                        collapsed={effectiveCollapsedSections.includes("Projects")}
+                        expandedProjects={expandedProjects}
+                        onExpandAll={expandAllProjects}
+                        onRevert={revertProjects}
+                        onProjectCreated={expandProject}
+                      />
                     }
-                  />
-                </ChatsDropZone>
-              )}
-              {/* Both tabs render this same Pinned / Projects / Sessions tree;
+                  >
+                    {sections.projectGroups.map((group) => (
+                      <ProjectFolder
+                        key={group.name}
+                        name={group.name}
+                        projectId={group.id}
+                        expanded={expandedProjects.includes(group.name)}
+                        // Best-effort marker from the globally-loaded window: a
+                        // collapsed folder hasn't fetched its own sessions yet.
+                        marker={projectMarkerState(group.conversations)}
+                        onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                        pinnedConversationIds={pinnedConversationIds}
+                        activeOverride={activeOverride}
+                        frozenSortKeys={frozenKeys}
+                        scrollRoot={scrollContainerRef}
+                        onRowClick={onRowClick}
+                        onTogglePinned={onTogglePinned}
+                        selectionMode={selectionMode}
+                        selectedIds={selectedIds}
+                        onToggleSelected={onToggleSelected}
+                        onProjectAssigned={expandProject}
+                        projectRenderedIdsRef={projectRenderedIdsRef}
+                      />
+                    ))}
+                    {sections.projectGroups.length === 0 &&
+                      !effectiveCollapsedSections.includes("Projects") && (
+                        <p className="px-3 py-1.5 text-xs text-muted-foreground">
+                          No projects yet. Create one to group your sessions.
+                        </p>
+                      )}
+                  </SectionGroup>
+                )}
+                {sections.sessions.length > 0 && (
+                  // Drop a session here to send it to the flat "Chats" list — where
+                  // unfiled, unpinned sessions live. Active while dragging a filed
+                  // session (removes it from its project) or a pinned one (unpins
+                  // it), since both have somewhere to land here.
+                  <ChatsDropZone
+                    active={
+                      activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)
+                    }
+                  >
+                    <ConversationSection
+                      title="Sessions"
+                      conversations={sections.sessions}
+                      pinnedConversationIds={pinnedConversationIds}
+                      collapsed={effectiveCollapsedSections.includes("Chats")}
+                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
+                      onRowClick={onRowClick}
+                      onTogglePinned={onTogglePinned}
+                      selectionMode={selectionMode}
+                      selectedIds={selectedIds}
+                      onToggleSelected={onToggleSelected}
+                      onProjectAssigned={expandProject}
+                      headerAction={
+                        !selectionMode ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                aria-label="Select sessions"
+                                data-testid="toggle-selection-mode"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  onEnterSelectionMode();
+                                }}
+                              >
+                                <ListChecksIcon className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="bottom">Select sessions</TooltipContent>
+                          </Tooltip>
+                        ) : undefined
+                      }
+                    />
+                  </ChatsDropZone>
+                )}
+                {/* Both tabs render this same Pinned / Projects / Sessions tree;
               `sections` is scoped to the active tab's conversations (owned vs.
               shared), and Projects is empty on the Shared tab. */}
-              {/* Archived sessions are no longer listed here — they live on the
+                {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-              {/* Infinite-scroll sentinel for the global list. Pagination extends
+                {/* Infinite-scroll sentinel for the global list. Pagination extends
               the Chats list, so it hides with a collapsed Chats group — a loader
               under a collapsed group reads orphaned. */}
-              {!effectiveCollapsedSections.includes("Chats") && (
-                <InfiniteScrollSentinel
-                  hasMore={hasMorePages}
-                  isFetching={isFetchingNextPage}
-                  fetchMore={fetchNextPage}
-                  scrollRoot={scrollContainerRef}
-                />
-              )}
-            </>
-          )}
-        </div>
+                {!effectiveCollapsedSections.includes("Chats") && (
+                  <InfiniteScrollSentinel
+                    hasMore={hasMorePages}
+                    isFetching={isFetchingNextPage}
+                    fetchMore={fetchNextPage}
+                    scrollRoot={scrollContainerRef}
+                  />
+                )}
+              </>
+            )}
+          </div>
+        </RowEditHoldContext.Provider>
         {/* The dragged row's preview follows the pointer (rendered in a portal),
           a compact card showing the session's title. */}
         <DragOverlay dropAnimation={null}>
@@ -2021,6 +2029,72 @@ function SectionHeader({
   );
 }
 
+function ProjectHeaderActions({
+  projectNames,
+  collapsed,
+  expandedProjects,
+  onExpandAll,
+  onRevert,
+  onProjectCreated,
+}: {
+  projectNames: string[];
+  collapsed: boolean;
+  expandedProjects: string[];
+  onExpandAll: (projectNames: string[]) => void;
+  onRevert: () => void;
+  onProjectCreated: (projectName: string) => void;
+}) {
+  const showExpandControls = !collapsed && projectNames.length > 0;
+  const allExpanded =
+    projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
+
+  return (
+    <div className="flex items-center gap-0.5">
+      {showExpandControls &&
+        (allExpanded ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Collapse to previous"
+                data-testid="revert-projects"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onRevert();
+                }}
+              >
+                <Minimize2Icon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Collapse to previous</TooltipContent>
+          </Tooltip>
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Expand all"
+                data-testid="expand-all-projects"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onExpandAll(projectNames);
+                }}
+              >
+                <Maximize2Icon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">Expand all</TooltipContent>
+          </Tooltip>
+        ))}
+      <NewProjectButton onCreated={onProjectCreated} />
+    </div>
+  );
+}
+
 // A collapsible group that nests other sections under a single header (e.g.
 // "Projects" wrapping each project folder). Reuses SectionHeader so the group
 // header is visually identical to a leaf section header.
@@ -2175,7 +2249,7 @@ function ConversationSection({
 // against this — rather than `ComponentProps<typeof DropdownMenuItem>` — lets
 // either family satisfy `MenuComponents` so `ConversationMenuItems` can author
 // the menu body once and render it under either menu kind.
-type MenuItemProps = {
+interface MenuItemProps {
   children?: ReactNode;
   className?: string;
   disabled?: boolean;
@@ -2183,9 +2257,9 @@ type MenuItemProps = {
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
   "data-testid"?: string;
-};
+}
 
-type MenuComponents = {
+interface MenuComponents {
   Item: ComponentType<MenuItemProps>;
   Separator: ComponentType<{ className?: string }>;
   Sub: ComponentType<{ children?: ReactNode }>;
@@ -2195,7 +2269,7 @@ type MenuComponents = {
     "data-testid"?: string;
   }>;
   SubContent: ComponentType<{ children?: ReactNode; className?: string }>;
-};
+}
 
 // Two stable bundles, one per Radix menu family. Annotated so a future prop
 // divergence surfaces here rather than at the call site.
@@ -2592,6 +2666,10 @@ function SessionTooltipContent({
   );
 }
 
+// Max gap between the first click and the dblclick of one double-click.
+// Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
+const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
+
 function ConversationRow({
   conversation,
   isPinned,
@@ -2662,6 +2740,19 @@ function ConversationRow({
   const stopSession = useStopSession();
   const isArchived = conversation.archived === true;
   const [isEditing, setIsEditing] = useState(false);
+  // Hold the list's sort order while this row's rename input is open — the
+  // pointer usually drifts out of the sidebar during typing, and a reorder
+  // then would shuffle rows around (or move + blur) the input. Cleanup covers
+  // commit, cancel, and unmount alike. Layout effect (not passive): rename
+  // can start with the pointer already outside the list (context menu is a
+  // portal), and a passive effect would leave a post-paint frame where churn
+  // could reorder — and blur — the just-mounted input before the hold lands.
+  const reportRowEditing = useContext(RowEditHoldContext);
+  useLayoutEffect(() => {
+    if (!isEditing) return;
+    reportRowEditing(conversation.id, true);
+    return () => reportRowEditing(conversation.id, false);
+  }, [isEditing, conversation.id, reportRowEditing]);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
   // The kebab menu is controlled so the project submenu can close the whole
@@ -2741,12 +2832,22 @@ function ConversationRow({
   // surface the actionable approval tag. The row still renders bold (the
   // unread signal) via `hasUnseenMessages` below.
   const derivedState = getSessionState(conversation);
+  // The bound session's launch/relaunch window: a send is in flight (local
+  // status "streaming") or the runner is auto-creating the PTY
+  // (`terminalPending`), but the server hasn't confirmed `running` yet — a
+  // cold boot, or a send waking a disconnected runner. Without this the row
+  // shows nothing while the session is visibly "Starting up…" in the chat.
+  // Only the bound (open) conversation has this store state; other rows read
+  // false, and the server-derived states above win once they land.
+  const isStartingUp = useChatStore(
+    (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
+  );
   const sessionState =
     derivedState?.kind === "awaiting"
       ? derivedState
       : hasUnseenMessages
         ? { kind: "unseen" as const }
-        : derivedState;
+        : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -2788,6 +2889,11 @@ function ConversationRow({
     },
     [setDragNodeRef],
   );
+  // Timestamps of the last two clicks this row received, for the dblclick
+  // rename guard: the list can reorder between the two clicks of a
+  // double-click (an updated_at bump slides another row under the cursor),
+  // and only a row that saw both clicks may enter rename.
+  const recentClickTimesRef = useRef<number[]>([]);
 
   if (isEditing) {
     return (
@@ -2943,6 +3049,7 @@ function ConversationRow({
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
       onClick={(e) => {
+        recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
         // Swallow the click that trails a drag so it doesn't navigate.
         if (justDraggedRef.current) {
           e.preventDefault();
@@ -2960,6 +3067,16 @@ function ConversationRow({
         if (selectionMode) return;
         if (!isOwner) return;
         e.preventDefault();
+        // The dblclick's own second click was already recorded above, so
+        // exactly ONE recent click means the first click landed on a different
+        // row — the list reordered mid-double-click and renaming here would
+        // hit the wrong session. Zero recent clicks (synthetic dblclick with
+        // no click events, e.g. in tests) stays allowed.
+        const now = performance.now();
+        const recent = recentClickTimesRef.current.filter(
+          (t) => now - t <= DOUBLE_CLICK_PAIR_WINDOW_MS,
+        );
+        if (recent.length === 1) return;
         setIsEditing(true);
       }}
       title={isMobile ? (conversation.title ?? conversation.id) : undefined}
@@ -3160,7 +3277,12 @@ function ConversationRow({
           </DropdownMenu>
         </div>
       )}
-      <PermissionsModal sessionId={conversation.id} open={shareOpen} onOpenChange={setShareOpen} />
+      <PermissionsModal
+        sessionId={conversation.id}
+        open={shareOpen}
+        onOpenChange={setShareOpen}
+        canDelegateApprovals={isOwner}
+      />
       <Dialog
         open={deleteOpen}
         onOpenChange={(open) => {
@@ -3374,8 +3496,11 @@ function DeletingRow({
     );
   }
   return (
+    // Match the interactive row's box metrics (h-7, font-size, radius) so the
+    // swap only changes color/opacity — otherwise the row visibly grows and
+    // shifts the list while a delete is in flight.
     <div
-      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-sm text-muted-foreground opacity-70"
+      className="sidebar-compact-text flex h-7 w-full items-center gap-1.5 rounded-[var(--radius-otto-sm)] px-2 text-muted-foreground opacity-70"
       data-testid="conversation-deleting"
       aria-live="polite"
     >
@@ -3795,9 +3920,11 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }
 
   return (
-    // pl-1 + the input's px-1 line the text up with the row's px-2 title;
-    // py-1 around the size-7 buttons matches the 36px single-line row height.
-    <div className="flex items-center gap-1 rounded-md bg-muted py-1 pr-1 pl-1">
+    // Match the interactive row's box metrics (h-7, sidebar-compact-text) so
+    // entering edit mode doesn't grow the row or bump the font size. pl-1 + the
+    // input's px-1 line the text up with the row's px-2 title; the size-6
+    // buttons sit inside the 28px row height.
+    <div className="sidebar-compact-text flex h-7 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1">
       <input
         ref={inputRef}
         type="text"
@@ -3812,12 +3939,12 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
         data-testid="rename-conversation-input"
-        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-1 text-sm outline-none md:select-text"
+        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
       />
       <Button
         type="button"
         variant="ghost"
-        size="icon-sm"
+        size="icon-xs"
         aria-label="Save rename"
         onMouseDown={(e) => {
           // Prevent the input's blur from firing before the commit.
@@ -3830,7 +3957,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       <Button
         type="button"
         variant="ghost"
-        size="icon-sm"
+        size="icon-xs"
         aria-label="Cancel rename"
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => {
@@ -3929,8 +4056,14 @@ function BulkActionBar({
         if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
         onDeselectAll();
       },
-      onError: (err: any) => {
-        if (activeId && err?.succeeded?.includes(activeId)) navigate("/", { replace: true });
+      onError: (error) => {
+        if (
+          activeId &&
+          error instanceof BulkConversationMutationError &&
+          error.succeeded.includes(activeId)
+        ) {
+          navigate("/", { replace: true });
+        }
       },
     });
   }

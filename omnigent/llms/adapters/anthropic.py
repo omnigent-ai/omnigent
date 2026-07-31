@@ -7,24 +7,46 @@ Messages API. Ported from MLflow AI Gateway's AnthropicAdapter.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
+import logging
+import secrets
+import threading
 import time
 from collections.abc import AsyncIterator
 from typing import Any
+from urllib.parse import quote
 
 import httpx
+from cachetools import TTLCache
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.adapters._content import parse_data_uri
 from omnigent.llms.adapters.base import BaseAdapter
+from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.model_metadata import ModelMetadata, ModelReasoningMode
 from omnigent.reasoning_effort import ANTHROPIC_EFFORTS, validate_effort_or_llm_error
+
+_logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.anthropic.com/v1"
 _API_VERSION = "2023-06-01"
 _DEFAULT_MAX_TOKENS = 16384
 _REQUEST_TIMEOUT = 120
 _STREAM_TIMEOUT = 300
+_MODEL_METADATA_TIMEOUT_S = 10.0
+_MODEL_METADATA_TTL_S = 300.0
+_MODEL_METADATA_CACHE_PARTITION_SALT = secrets.token_bytes(32)
+# One round avoids blocking the event loop; API keys are already high-entropy secrets.
+_MODEL_METADATA_CACHE_PARTITION_ITERATIONS = 1
+_MODEL_METADATA_CACHE: TTLCache[tuple[str, str, bytes], ModelMetadata] = TTLCache(
+    maxsize=128,
+    ttl=_MODEL_METADATA_TTL_S,
+)
+_MODEL_METADATA_IN_FLIGHT: dict[tuple[str, str, bytes], asyncio.Task[ModelMetadata | None]] = {}
+_MODEL_METADATA_CACHE_LOCK = threading.Lock()
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -62,12 +84,21 @@ class AnthropicAdapter(BaseAdapter):
             iterator.
         """
         params = connection_params or {}
-        payload = _chat_to_anthropic(messages, model, tools, extra)
         headers = _build_headers(
             api_key_override=params.get("api_key"),
         )
         override_base = params.get("base_url")
         effective_base = override_base.rstrip("/") if override_base else _BASE_URL
+        model_metadata = None
+        if extra.get("reasoning_effort"):
+            model_metadata = await _get_anthropic_model_metadata(headers, effective_base, model)
+        payload = _chat_to_anthropic(
+            messages,
+            model,
+            tools,
+            extra,
+            model_metadata=model_metadata,
+        )
 
         if stream:
             payload["stream"] = True
@@ -96,6 +127,8 @@ def _chat_to_anthropic(
     model: str,
     tools: list[dict[str, Any]] | None,
     extra: dict[str, Any],
+    *,
+    model_metadata: ModelMetadata | None = None,
 ) -> dict[str, Any]:
     """
     Convert Chat Completions messages to Anthropic Messages API payload.
@@ -104,6 +137,7 @@ def _chat_to_anthropic(
     :param model: Model name.
     :param tools: OpenAI-format tool schemas or ``None``.
     :param extra: Additional kwargs.
+    :param model_metadata: Live capability metadata, when available.
     :returns: Anthropic API request payload.
     """
     payload: dict[str, Any] = {"model": model}
@@ -160,12 +194,119 @@ def _chat_to_anthropic(
     if reasoning_effort := extra.pop("reasoning_effort", None):
         effort = validate_effort_or_llm_error(reasoning_effort, "Anthropic", ANTHROPIC_EFFORTS)
         if effort is not None:
-            payload["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": _effort_to_budget(effort, max_tokens),
-            }
+            reasoning = model_metadata.reasoning if model_metadata is not None else None
+            if reasoning is not None and ModelReasoningMode.ADAPTIVE in reasoning.modes:
+                if reasoning.efforts:
+                    effort = validate_effort_or_llm_error(
+                        effort,
+                        f"Anthropic model {model}",
+                        reasoning.efforts,
+                    )
+                payload["thinking"] = {"type": "adaptive"}
+                payload["output_config"] = {"effort": effort}
+            else:
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": _effort_to_budget(effort, max_tokens),
+                }
+            payload.pop("temperature", None)
+            payload.pop("top_p", None)
 
     return payload
+
+
+def _models_url(base_url: str) -> str:
+    """Return the Anthropic Models API URL for an adapter base URL."""
+    trimmed = base_url.rstrip("/")
+    return f"{trimmed}/models" if trimmed.endswith("/v1") else f"{trimmed}/v1/models"
+
+
+async def _get_anthropic_model_metadata(
+    headers: dict[str, str],
+    base_url: str,
+    model: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> ModelMetadata | None:
+    """Fetch and cache one model's live capability metadata."""
+    # PBKDF2 creates an opaque process-local cache partition, not a persisted credential hash.
+    credential_partition = hashlib.pbkdf2_hmac(
+        "sha256",
+        headers.get("x-api-key", "").encode(),
+        _MODEL_METADATA_CACHE_PARTITION_SALT,
+        _MODEL_METADATA_CACHE_PARTITION_ITERATIONS,
+    )
+    cache_key = (base_url, model, credential_partition)
+    with _MODEL_METADATA_CACHE_LOCK:
+        if cache_key in _MODEL_METADATA_CACHE:
+            return _MODEL_METADATA_CACHE[cache_key]
+        task = _MODEL_METADATA_IN_FLIGHT.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(
+                _fetch_anthropic_model_metadata(
+                    headers,
+                    base_url,
+                    model,
+                    cache_key,
+                    transport=transport,
+                )
+            )
+            _MODEL_METADATA_IN_FLIGHT[cache_key] = task
+
+    # Keep the shared lookup alive if one waiting request is cancelled.
+    return await asyncio.shield(task)
+
+
+async def _fetch_anthropic_model_metadata(
+    headers: dict[str, str],
+    base_url: str,
+    model: str,
+    cache_key: tuple[str, str, bytes],
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> ModelMetadata | None:
+    """Fetch model metadata and cache successful lookups."""
+    try:
+        try:
+            url = f"{_models_url(base_url)}/{quote(model, safe='')}"
+            async with httpx.AsyncClient(
+                transport=transport,
+                timeout=_MODEL_METADATA_TIMEOUT_S,
+            ) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+            metadata = (
+                parse_anthropic_model_metadata(payload) if isinstance(payload, dict) else None
+            )
+        except (httpx.HTTPError, ValueError):
+            _logger.warning(
+                "Anthropic model metadata lookup failed for %s; "
+                "fixed-budget fallback may be unsupported",
+                model,
+                exc_info=True,
+            )
+            return None
+
+        if metadata is not None:
+            with _MODEL_METADATA_CACHE_LOCK:
+                _MODEL_METADATA_CACHE[cache_key] = metadata
+        return metadata
+    finally:
+        current_task = asyncio.current_task()
+        with _MODEL_METADATA_CACHE_LOCK:
+            if _MODEL_METADATA_IN_FLIGHT.get(cache_key) is current_task:
+                del _MODEL_METADATA_IN_FLIGHT[cache_key]
+
+
+def _clear_model_metadata_cache() -> None:
+    """Clear cached model metadata for tests."""
+    with _MODEL_METADATA_CACHE_LOCK:
+        _MODEL_METADATA_CACHE.clear()
+        tasks = list(_MODEL_METADATA_IN_FLIGHT.values())
+        _MODEL_METADATA_IN_FLIGHT.clear()
+    for task in tasks:
+        task.cancel()
 
 
 def _convert_assistant_message(m: dict[str, Any]) -> dict[str, Any]:
@@ -361,8 +502,8 @@ def _effort_to_budget(effort: str, max_tokens: int) -> int:
     :param max_tokens: The max_tokens setting for the request.
     :returns: Budget token count.
     """
-    effort = validate_effort_or_llm_error(effort, "Anthropic", ANTHROPIC_EFFORTS)
-    match effort:
+    validated_effort = validate_effort_or_llm_error(effort, "Anthropic", ANTHROPIC_EFFORTS)
+    match validated_effort:
         case "low":
             return min(1024, max_tokens)
         case "medium":

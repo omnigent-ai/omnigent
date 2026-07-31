@@ -26,6 +26,7 @@ import {
   resolvedThemeToMonaco,
 } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
+import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
 
 interface MonacoDiffViewerProps {
@@ -107,6 +108,12 @@ export function MonacoDiffViewer({
   const diffEditorRef = useRef<Parameters<DiffOnMount>[0] | null>(null);
   const [mounted, setMounted] = useState(false);
 
+  // The diff scrolls inside Monaco, so its offset is cached per conversation +
+  // file rather than via the DOM scroll-restore hook. Kept in its own namespace
+  // so a file's diff and its editor view don't share one offset.
+  const scrollKeyRef = useRef("");
+  scrollKeyRef.current = `viewer-diff:${conversationId}:${path}`;
+
   const handleMount: DiffOnMount = useCallback(
     (diffEditor, monaco) => {
       diffEditorRef.current = diffEditor;
@@ -121,6 +128,13 @@ export function MonacoDiffViewer({
             ? monaco.editor.EndOfLineSequence.CRLF
             : monaco.editor.EndOfLineSequence.LF,
         );
+      // Restore the reader's place in the diff and cache further scrolling under
+      // the diff's own key.
+      attachEditorScrollRestore(
+        modified,
+        () => scrollKeyRef.current,
+        () => modifiedEditorRef.current === modified,
+      );
       setMounted(true);
     },
     [after],

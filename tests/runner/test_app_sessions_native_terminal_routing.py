@@ -162,7 +162,9 @@ async def test_create_session_terminal_ensure_routes_claude_native(
             name="launched",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _stub_auto_create
+    )
     monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
     monkeypatch.setattr(
         SessionResourceRegistry,
@@ -234,7 +236,9 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
         """Fail if the ensure endpoint tries to publish the live banner."""
         raise AssertionError("ensure endpoint must not publish response.error")
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _failing_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _failing_auto_create
+    )
     monkeypatch.setattr(
         "omnigent.runner.app._publish_native_terminal_start_error",
         _unexpected_live_publish,
@@ -491,7 +495,9 @@ async def test_create_session_terminal_ensure_routes_codex_native(
             name="launched",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_codex_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _stub_auto_create
+    )
     monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
     monkeypatch.setattr(
         SessionResourceRegistry,
@@ -977,7 +983,9 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
             id="terminal_claude_main", type="terminal", session_id=session_id, name="re-created"
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _stub_auto_create
+    )
 
     registry = TerminalRegistry()
     dead_instance = TerminalInstance(

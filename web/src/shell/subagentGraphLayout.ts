@@ -136,7 +136,7 @@ export function buildTree(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   depth: number,
-  visited: Set<string> = new Set(),
+  visited = new Set<string>(),
 ): TreeNode {
   visited.add(rootId);
   const children = childrenMap.get(rootId) ?? [];

@@ -636,6 +636,36 @@ class OSEnvSandboxSpec:
     # (untrusted source trees, supervisor-spawned forks) where an
     # unmasked dotfile past the cap would be an unacceptable leak.
     cwd_hidden_scan_overflow: str = "warn"
+    # Whether the dotfile / escaping-symlink masker recurses into
+    # subdirectories. ``False`` (default) scans only the immediate
+    # children of cwd and each ``read_paths`` root — the top-level
+    # dotfiles (``.git``, ``.env``, ``.aws``, ``.ssh``, ...) that
+    # carry the overwhelming majority of secrets are still masked,
+    # but the walker no longer pays to descend the whole tree. This
+    # is the scalable default: a recursive walk of a medium/large
+    # project (or ``read_paths: ["~/"]``) visits enormous numbers of
+    # entries and routinely trips :attr:`cwd_hidden_scan_max_entries`.
+    #
+    # L6 (security trade-off): with the top-level-only default, a
+    # dotfile nested below the first level (e.g.
+    # ``cwd/services/api/.env`` or ``~/projects/foo/.netrc``) is NOT
+    # masked and stays readable by the sandboxed helper. Set this to
+    # ``True`` for untrusted source trees where a deeply-nested
+    # credential file would be an unacceptable leak; the cap /
+    # overflow knobs then bound the cost of the full walk.
+    cwd_hidden_scan_recursive: bool = False
+    # Explicit files/directories to hide from the sandboxed helper,
+    # regardless of whether their basename starts with ``.``. Each
+    # entry is a path string resolved like ``read_paths`` (``~`` is
+    # expanded; relative paths are taken against cwd; ``$VAR`` is NOT
+    # expanded). Directories are masked as an empty view, files as an
+    # empty file — the same masking the dotfile walker emits. Use this
+    # to hide a specific secret the name-based masker wouldn't catch
+    # (e.g. ``config/production.key``) or a deeply-nested dotfile
+    # without turning on full recursion. Applied on top of the
+    # dotfile mask in every mode. ``None`` and ``[]`` both mean "no
+    # explicit masks".
+    mask_paths: list[str] | None = None
     # Environment-variable allowlist for the helper subprocess, beyond
     # the always-passed minimal default (PATH/HOME/USER/LANG/LC_*/etc.;
     # see :data:`omnigent.inner.os_env._DEFAULT_ENV_PASSTHROUGH`).

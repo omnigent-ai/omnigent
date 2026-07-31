@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -317,7 +318,7 @@ class AcpExecutor(Executor):
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
         self._image_supported = False
-        env = os.environ.copy()
+        env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
         self._proc = await asyncio.create_subprocess_exec(
@@ -484,29 +485,69 @@ class AcpExecutor(Executor):
     # ACP handshake
     # ------------------------------------------------------------------
 
+    def _build_spawn_env(self) -> dict[str, str]:
+        """The env handed to the generic ACP subprocess.
+
+        Deny-by-default: base + the spec's ``env_passthrough``. No prefix family
+        is added because the executor cannot know which vendor an arbitrary ACP
+        agent belongs to. Previously ``os.environ.copy()`` handed the CLI every
+        host secret (#3445).
+
+        Kept as a named builder so the spawn-env canary can drive the real thing
+        rather than a hand-copied prefix list.
+        """
+        return clean_agent_env(
+            allow_prefixes=(),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
+
+    def _warn_initialize_failed(self, reason: str) -> None:
+        """Point a failed handshake at the env allowlist.
+
+        A generic ACP agent gets the base environment plus whatever
+        ``os_env.sandbox.env_passthrough`` declares — nothing else, since the
+        executor cannot know which variable an arbitrary agent authenticates
+        with. An agent that reads e.g. ``GEMINI_API_KEY`` therefore starts
+        unauthenticated and usually dies during ``initialize``. That looks like
+        a protocol fault, so name the likely cause once here rather than let
+        every operator rediscover it.
+        """
+        logger.warning(
+            "acp initialize failed for %r: %s. If this agent authenticates from an "
+            "environment variable, declare it in os_env.sandbox.env_passthrough — "
+            "the spawn environment is filtered to the base set plus that list.",
+            self._config.command,
+            reason,
+        )
+
     async def _ensure_initialized(self) -> None:
         """Perform the ``initialize`` handshake if not already done."""
         if self._initialized:
             return
-        resp = await self._rpc(
-            _AGENT_METHOD_INITIALIZE,
-            {
-                "protocolVersion": _PROTOCOL_VERSION,
-                "clientInfo": {"name": "omnigent", "version": "1.0"},
-                "clientCapabilities": {
-                    "fs": {
-                        "readTextFile": self._fs_delegation,
-                        "writeTextFile": self._fs_delegation,
+        try:
+            resp = await self._rpc(
+                _AGENT_METHOD_INITIALIZE,
+                {
+                    "protocolVersion": _PROTOCOL_VERSION,
+                    "clientInfo": {"name": "omnigent", "version": "1.0"},
+                    "clientCapabilities": {
+                        "fs": {
+                            "readTextFile": self._fs_delegation,
+                            "writeTextFile": self._fs_delegation,
+                        },
+                        "terminal": False,
                     },
-                    "terminal": False,
                 },
-            },
-            timeout=_INIT_TIMEOUT_SECONDS,
-        )
-        if "error" in resp:
-            raise RuntimeError(
-                f"ACP initialize failed: {resp['error'].get('message', resp['error'])}"
+                timeout=_INIT_TIMEOUT_SECONDS,
             )
+        except Exception as exc:
+            # Covers the child dying or timing out before it answers.
+            self._warn_initialize_failed(str(exc))
+            raise
+        if "error" in resp:
+            message = resp["error"].get("message", resp["error"])
+            self._warn_initialize_failed(str(message))
+            raise RuntimeError(f"ACP initialize failed: {message}")
         prompt_caps = (
             (resp.get("result") or {}).get("agentCapabilities", {}).get("promptCapabilities", {})
         )

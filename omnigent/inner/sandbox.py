@@ -88,6 +88,15 @@ class SandboxPolicy:
     :param cwd_hidden_scan_overflow: One of ``"error"``, ``"warn"``,
         or ``"unlimited"``. See :class:`OSEnvSandboxSpec` for the
         per-mode semantics.
+    :param cwd_hidden_scan_recursive: When ``False`` (default) the
+        dotfile / escaping-symlink masker scans only the top level of
+        cwd and each read root; when ``True`` it recurses the full
+        tree. See :class:`OSEnvSandboxSpec` for the security
+        trade-off.
+    :param mask_paths: Explicit files/directories the helper must not
+        see, resolved to absolute paths by the backend. Masked with
+        the same emit shape as the dotfile walker's entries (empty
+        dir / empty file). ``None`` means no explicit masks.
     :param env_passthrough: User-declared environment-variable names
         the helper subprocess is allowed to inherit beyond the
         always-passed minimal default
@@ -151,6 +160,8 @@ class SandboxPolicy:
     cwd_allow_hidden: list[str] | None = None
     cwd_hidden_scan_max_entries: int = 50000
     cwd_hidden_scan_overflow: str = "warn"
+    cwd_hidden_scan_recursive: bool = False
+    mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
     egress_relay_port: int | None = None
@@ -179,6 +190,10 @@ class SandboxPolicy:
             ),
             "cwd_hidden_scan_max_entries": self.cwd_hidden_scan_max_entries,
             "cwd_hidden_scan_overflow": self.cwd_hidden_scan_overflow,
+            "cwd_hidden_scan_recursive": self.cwd_hidden_scan_recursive,
+            "mask_paths": (
+                [str(path) for path in self.mask_paths] if self.mask_paths is not None else None
+            ),
             "env_passthrough": (
                 list(self.env_passthrough) if self.env_passthrough is not None else None
             ),
@@ -220,6 +235,12 @@ class SandboxPolicy:
         max_entries = max_entries_raw if isinstance(max_entries_raw, int) else 50000
         overflow_raw = data.get("cwd_hidden_scan_overflow", "warn")
         overflow = overflow_raw if isinstance(overflow_raw, str) else "warn"
+        recursive_raw = data.get("cwd_hidden_scan_recursive", False)
+        recursive = recursive_raw if isinstance(recursive_raw, bool) else False
+        mask_paths_data = data.get("mask_paths")
+        mask_paths: list[Path] | None = None
+        if isinstance(mask_paths_data, list):
+            mask_paths = [Path(str(path)) for path in mask_paths_data]
         env_passthrough_data = data.get("env_passthrough")
         env_passthrough: list[str] | None = None
         if isinstance(env_passthrough_data, list):
@@ -250,6 +271,8 @@ class SandboxPolicy:
             cwd_allow_hidden=cwd_allow_hidden,
             cwd_hidden_scan_max_entries=max_entries,
             cwd_hidden_scan_overflow=overflow,
+            cwd_hidden_scan_recursive=recursive,
+            mask_paths=mask_paths,
             env_passthrough=env_passthrough,
             spawn_env_allowlist=spawn_env_allowlist,
             egress_relay_port=egress_relay_port,
@@ -476,6 +499,8 @@ def _clone_policy_with(
         ),
         cwd_hidden_scan_max_entries=policy.cwd_hidden_scan_max_entries,
         cwd_hidden_scan_overflow=policy.cwd_hidden_scan_overflow,
+        cwd_hidden_scan_recursive=policy.cwd_hidden_scan_recursive,
+        mask_paths=(list(policy.mask_paths) if policy.mask_paths is not None else None),
         env_passthrough=(
             list(policy.env_passthrough) if policy.env_passthrough is not None else None
         ),

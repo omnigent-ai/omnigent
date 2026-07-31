@@ -53,22 +53,26 @@ if TYPE_CHECKING:
 _CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT"}
 
 
-def _load_global_config(*a, **k):  # type: ignore[no-untyped-def]
+def _load_global_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     import omnigent.cli as _cli
 
-    return _cli._load_global_config(*a, **k)
+    return _cli._load_global_config()
 
 
-def _save_global_config(*a, **k):  # type: ignore[no-untyped-def]
+def _save_global_config(  # type: ignore[explicit-any]
+    settings: collections.abc.Mapping[str, Any],
+    unset_keys: tuple[str, ...] = (),
+    deep_merge_keys: tuple[str, ...] = (),
+) -> None:
     import omnigent.cli as _cli
 
-    return _cli._save_global_config(*a, **k)
+    _cli._save_global_config(settings, unset_keys, deep_merge_keys)
 
 
-def _load_effective_config(*a, **k):  # type: ignore[no-untyped-def]
+def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     import omnigent.cli as _cli
 
-    return _cli._load_effective_config(*a, **k)
+    return _cli._load_effective_config()
 
 
 # Node version hint shared by the preflight problem messages and surfaced
@@ -728,8 +732,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # releases (e.g. a brand-new claude-sonnet-4-6 won't be listed yet), so
         # a fixed picker would block the user from a model they can actually
         # use. Pre-fill the canonical default and let the user type ANY model
-        # id. Blank → the default (or no pin when unknown). Always persisting
-        # a pin keeps a later re-add from silently dropping ``models.default``.
+        # id. Blank accepts a known catalog default; without one, the prompt
+        # requires an explicit model id.
         from omnigent.onboarding.providers import default_chat_model
 
         catalog_default = default_chat_model(provider)
@@ -860,9 +864,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             wire_api = RESPONSES_WIRE_API if wire_choice == 0 else CHAT_WIRE_API
         # Default model per served surface. A gateway has NO catalog default,
         # so without a pin routing would fall back to a vendor model the
-        # gateway can't serve. The OpenAI surface pre-fills a broadly-served
-        # OSS default (moonshotai/kimi-k2.6, via the openrouter pin); the
-        # user can type any gateway model id.
+        # gateway can't serve. The OpenAI surface pre-fills the catalog's
+        # preferred Kimi-family model; if none is advertised, the user must
+        # type a gateway model id explicitly.
         from omnigent.onboarding.providers import default_chat_model
 
         models: dict[str, str] = {}

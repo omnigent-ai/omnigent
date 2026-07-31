@@ -122,7 +122,7 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from ._cwd_scan import scan_cwd_mask_entries
+from ._cwd_scan import MaskedEntry, MaskKind, scan_cwd_mask_entries
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
     SandboxBackend,
@@ -423,6 +423,12 @@ class SeatbeltSandboxBackend(SandboxBackend):
                     name,
                 )
 
+        mask_paths = (
+            [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]
+            if sandbox_spec.mask_paths
+            else None
+        )
+
         return SandboxPolicy(
             backend_type=self.type_name,
             active=True,
@@ -433,6 +439,8 @@ class SeatbeltSandboxBackend(SandboxBackend):
             cwd_allow_hidden=cwd_allow_hidden,
             cwd_hidden_scan_max_entries=sandbox_spec.cwd_hidden_scan_max_entries,
             cwd_hidden_scan_overflow=sandbox_spec.cwd_hidden_scan_overflow,
+            cwd_hidden_scan_recursive=sandbox_spec.cwd_hidden_scan_recursive,
+            mask_paths=mask_paths,
             env_passthrough=(
                 list(sandbox_spec.env_passthrough)
                 if sandbox_spec.env_passthrough is not None
@@ -981,6 +989,7 @@ def _build_profile(
         safe_roots=safe_roots,
         max_entries=policy.cwd_hidden_scan_max_entries,
         overflow=policy.cwd_hidden_scan_overflow,
+        recursive=policy.cwd_hidden_scan_recursive,
         logger_name=__name__,
     )
     for entry in mask_entries:
@@ -993,6 +1002,18 @@ def _build_profile(
             already_seen=seen_mask_paths,
         )
     )
+    # Explicit operator-declared masks: deny these regardless of name
+    # or depth, on top of the dotfile walk. A directory becomes a
+    # ``(subpath ...)`` deny and a file/other a ``(literal ...)`` deny.
+    # ``is_dir`` follows symlinks (unlike the walker); a missing path
+    # still emits a harmless literal deny (no re-stat drop like bwrap).
+    for mask_path in policy.mask_paths or []:
+        key = str(mask_path)
+        if key in seen_mask_paths:
+            continue
+        seen_mask_paths.add(key)
+        kind: MaskKind = "dir" if mask_path.is_dir() else "file"
+        mask_entries.append(MaskedEntry(path=mask_path, kind=kind))
     if mask_entries:
         lines.append("")
         lines.append(";; Dotfile / escaping-symlink mask (cwd + read_paths)")
@@ -1811,6 +1832,7 @@ def _scan_read_paths_mask_entries(
                 safe_roots=safe_roots,
                 max_entries=policy.cwd_hidden_scan_max_entries,
                 overflow=policy.cwd_hidden_scan_overflow,
+                recursive=policy.cwd_hidden_scan_recursive,
                 logger_name=__name__,
                 scope_label="read_paths",
             )

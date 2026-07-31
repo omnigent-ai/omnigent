@@ -9,7 +9,7 @@
     "build:embed": "vite build --config vite.embed.config.ts",
     "type-check": "tsc -b",
     "preview": "vite preview",
-    "lint": "oxlint .",
+    "lint": "oxlint --deny-warnings .",
     "lint:fix": "oxlint --fix .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
