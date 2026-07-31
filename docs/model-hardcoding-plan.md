@@ -171,6 +171,14 @@ catalog advertises, while generic OpenAI-compatible providers honor their
 configured wire. If Databricks discovery is unavailable, an unknown GPT uses
 Responses rather than a release-specific completions allowlist.
 
+## Pi Picker Migration
+
+Inner Pi sessions populate their model registry from live Unity Catalog model
+services instead of a release-specific Databricks list. MLflow metadata adds
+context and output limits when available. If discovery is unavailable, the
+resolved run model is still registered so launch does not depend on picker
+enumeration; no stale alternatives are offered.
+
 ## Kiro Picker Migration
 
 The Kiro Web picker now runs `kiro-cli chat --list-models --format json` on the

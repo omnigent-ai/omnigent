@@ -10,8 +10,9 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import logging
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TypeVar, cast
 
 from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
@@ -804,7 +805,11 @@ def _entry_points() -> tuple[importlib.metadata.EntryPoint, ...]:
     discovered = importlib.metadata.entry_points()
     if hasattr(discovered, "select"):
         return tuple(discovered.select(group=COMMUNITY_ENTRY_POINT_GROUP))
-    return tuple(discovered.get(COMMUNITY_ENTRY_POINT_GROUP, ()))
+    legacy = cast(
+        Mapping[str, Iterable[importlib.metadata.EntryPoint]],
+        discovered,
+    )
+    return tuple(legacy.get(COMMUNITY_ENTRY_POINT_GROUP, ()))
 
 
 def _module_part(import_path: str) -> str:
@@ -970,28 +975,35 @@ def reset_plugin_state_for_tests() -> None:
     _state = None
 
 
-def _merge_dict(attr: str) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
+_Value = TypeVar("_Value")
+
+
+def _merge_dict(
+    getter: Callable[[HarnessContribution], Mapping[str, _Value]],
+) -> dict[str, _Value]:
+    merged: dict[str, _Value] = {}
     for contribution in plugin_state().contributions:
-        merged.update(getattr(contribution, attr))
+        merged.update(getter(contribution))
     return merged
 
 
-def _merge_set(attr: str) -> frozenset[str]:
+def _merge_set(
+    getter: Callable[[HarnessContribution], Iterable[str]],
+) -> frozenset[str]:
     merged: set[str] = set()
     for contribution in plugin_state().contributions:
-        merged.update(getattr(contribution, attr))
+        merged.update(getter(contribution))
     return frozenset(merged)
 
 
 def valid_harnesses() -> frozenset[str]:
     """Return canonical harness ids accepted by installed contributions."""
-    return _merge_set("valid_harnesses")
+    return _merge_set(lambda contribution: contribution.valid_harnesses)
 
 
 def harness_aliases() -> dict[str, str]:
     """Return alias-to-canonical harness ids."""
-    return _merge_dict("aliases")
+    return _merge_dict(lambda contribution: contribution.aliases)
 
 
 def accepted_harnesses() -> frozenset[str]:
@@ -1001,7 +1013,7 @@ def accepted_harnesses() -> frozenset[str]:
 
 def native_harnesses() -> frozenset[str]:
     """Return native CLI harness ids and native aliases."""
-    return _merge_set("native_harnesses")
+    return _merge_set(lambda contribution: contribution.native_harnesses)
 
 
 def native_agents() -> tuple[NativeCodingAgent, ...]:
@@ -1030,7 +1042,7 @@ def native_provider_for_key(key: str) -> NativeHarnessProvider | None:
 
 def harness_modules() -> dict[str, str]:
     """Return runtime harness module mapping, aliases included."""
-    modules = _merge_dict("harness_modules")
+    modules = _merge_dict(lambda contribution: contribution.harness_modules)
     for alias, canonical in harness_aliases().items():
         module = modules.get(canonical)
         if module is not None:
@@ -1040,37 +1052,37 @@ def harness_modules() -> dict[str, str]:
 
 def model_env_keys() -> dict[str, str]:
     """Return harness-to-model-env-var mapping."""
-    return _merge_dict("model_env_keys")
+    return _merge_dict(lambda contribution: contribution.model_env_keys)
 
 
 def spawn_env_builders() -> dict[str, str]:
     """Return harness-to-spawn-env-builder import paths."""
-    return _merge_dict("spawn_env_builders")
+    return _merge_dict(lambda contribution: contribution.spawn_env_builders)
 
 
 def background_title_generators() -> dict[str, BackgroundTitleGeneratorSpec]:
     """Return harness-to-background-title-generator registrations."""
-    return _merge_dict("background_title_generators")
+    return _merge_dict(lambda contribution: contribution.background_title_generators)
 
 
 def install_specs() -> dict[str, HarnessInstallSpec]:
     """Return plugin-provided install specs."""
-    return _merge_dict("install_specs")
+    return _merge_dict(lambda contribution: contribution.install_specs)
 
 
 def harness_install_keys() -> dict[str, str]:
     """Return harness/alias to install-spec key mappings."""
-    return _merge_dict("harness_install_keys")
+    return _merge_dict(lambda contribution: contribution.harness_install_keys)
 
 
 def missing_install_packages() -> dict[str, str]:
     """Return optional harness spellings to package names."""
-    return _merge_dict("missing_install_package")
+    return _merge_dict(lambda contribution: contribution.missing_install_package)
 
 
 def harness_labels() -> dict[str, str]:
     """Return labels for non-native harness picker/catalog rows."""
-    return _merge_dict("harness_labels")
+    return _merge_dict(lambda contribution: contribution.harness_labels)
 
 
 def harness_capabilities() -> dict[str, HarnessCapabilities]:
@@ -1080,10 +1092,10 @@ def harness_capabilities() -> dict[str, HarnessCapabilities]:
     capabilities). This is the single source of truth for "what can this
     harness do?".
     """
-    return _merge_dict("capabilities")
+    return _merge_dict(lambda contribution: contribution.capabilities)
 
 
-def harness_catalog() -> list[dict[str, Any]]:
+def harness_catalog() -> list[dict[str, object]]:
     """Return stable JSON-serializable harness catalog rows.
 
     Each row carries ``id`` and ``label``; rows for harnesses with declared
@@ -1102,11 +1114,11 @@ def harness_catalog() -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         ui_setup_steps = None  # type: ignore[assignment]
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, object]] = []
     for harness in sorted(labels, key=lambda key: labels[key].lower()):
         if harness not in valid_harnesses():
             continue
-        row: dict[str, Any] = {"id": harness, "label": labels[harness]}
+        row: dict[str, object] = {"id": harness, "label": labels[harness]}
         capability = capabilities.get(harness)
         if capability is not None:
             row["capabilities"] = capability.as_dict()
@@ -1124,7 +1136,7 @@ def harness_catalog() -> list[dict[str, Any]]:
         from omnigent.onboarding.acp_auth import acp_agents
 
         for agent in acp_agents():
-            acp_row: dict[str, Any] = {"id": f"acp:{agent.slug}", "label": agent.name}
+            acp_row: dict[str, object] = {"id": f"acp:{agent.slug}", "label": agent.name}
             if acp_capability is not None:
                 acp_row["capabilities"] = acp_capability.as_dict()
             rows.append(acp_row)
@@ -1133,7 +1145,7 @@ def harness_catalog() -> list[dict[str, Any]]:
     return rows
 
 
-def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, Any]]]:
+def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, str | None]]]:
     """Map every harness spelling to its ordered UI setup steps.
 
     The web setup dialog looks steps up by the harness a *session* declares —
@@ -1161,7 +1173,7 @@ def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, Any]]]:
     }
 
 
-def load_object(import_path: str) -> Any:
+def load_object(import_path: str) -> object:
     """Load ``module:attribute`` or ``module.attribute``."""
     if ":" in import_path:
         module_name, attr = import_path.split(":", 1)

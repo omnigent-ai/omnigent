@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Literal
 
 from omnigent.policies.schema import (
     PolicyCallable,
@@ -24,6 +24,22 @@ from omnigent.policies.schema import (
 )
 
 _log = logging.getLogger(__name__)
+
+_ContextAction = Literal["ASK", "DENY"]
+
+
+def _normalise_action(action: object, *, policy_name: str) -> _ContextAction:
+    candidate = action.upper() if isinstance(action, str) else "ASK"
+    if candidate == "DENY":
+        return "DENY"
+    if candidate != "ASK":
+        _log.warning(
+            "%s: unknown action %r — defaulting to ASK",
+            policy_name,
+            action,
+        )
+    return "ASK"
+
 
 # ── detect_task_switch ────────────────────────────────────────────────────────
 
@@ -49,7 +65,7 @@ Return strict JSON only:
 {"verdict": "CONTINUATION" | "TASK_SWITCH"}
 """
 
-_TASK_SWITCH_SCHEMA: dict[str, Any] = {
+_TASK_SWITCH_SCHEMA: dict[str, object] = {
     "format": {
         "type": "json_schema",
         "name": "task_switch_verdict",
@@ -89,7 +105,7 @@ def _strip_code_fences(text: str) -> str:
     return stripped
 
 
-def _extract_text(response: Any) -> str:
+def _extract_text(response: object) -> str:
     """Pull plain text out of a PolicyLLMClient response."""
     text = getattr(response, "output_text", None)
     if isinstance(text, str) and text.strip():
@@ -156,13 +172,7 @@ def detect_task_switch(
         enforced via structured output regardless.
     :returns: An async policy callable that fires on ``request`` events.
     """
-    normalised_action = action.upper() if isinstance(action, str) else "ASK"
-    if normalised_action not in {"DENY", "ASK"}:
-        _log.warning(
-            "detect_task_switch: unknown action %r — defaulting to ASK",
-            action,
-        )
-        normalised_action = "ASK"
+    normalised_action = _normalise_action(action, policy_name="detect_task_switch")
 
     async def evaluate(event: PolicyEvent) -> PolicyResponse | None:
         """Classify the new user message and flag task switches.
@@ -285,7 +295,7 @@ def detect_task_switch(
         # Unrecognised verdict — fail open.
         return None
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── detect_thrashing ─────────────────────────────────────────────────────────
@@ -373,13 +383,7 @@ def detect_thrashing(
         (default) or ``"DENY"``.
     :returns: A policy callable that fires on ``tool_result`` events.
     """
-    normalised_action = action.upper() if isinstance(action, str) else "ASK"
-    if normalised_action not in {"DENY", "ASK"}:
-        _log.warning(
-            "detect_thrashing: unknown action %r — defaulting to ASK",
-            action,
-        )
-        normalised_action = "ASK"
+    normalised_action = _normalise_action(action, policy_name="detect_thrashing")
 
     def evaluate(event: PolicyEvent) -> PolicyResponse | None:
         """Track tool-result outcomes and flag sustained failure runs.
@@ -460,12 +464,12 @@ def detect_thrashing(
 
         return state_update
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.context.detect_task_switch",
         "kind": "factory",
