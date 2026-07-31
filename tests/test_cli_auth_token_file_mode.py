@@ -83,6 +83,16 @@ def test_clear_token_keeps_the_file_private(state):
     assert stat.S_IMODE(state.stat().st_mode) == 0o600
 
 
+@posix_only
+def test_clear_token_hardens_a_preexisting_world_traversable_dir(state):
+    """A dir that predates this fix at 0o755 is tightened even on a clear-only path."""
+    cli_auth.store_token(SERVER, "eyJ-A", "alice@example.com", 1.0)
+    cli_auth.store_token("http://other:1", "eyJ-B", "bob@example.com", 1.0)
+    os.chmod(state.parent, 0o755)
+    cli_auth.clear_token(SERVER)
+    assert stat.S_IMODE(state.parent.stat().st_mode) == 0o700
+
+
 def test_tokens_round_trip(state):
     cli_auth.store_token(SERVER, "eyJ-A", "alice@example.com", 9e9)
     cli_auth.store_token("http://other:1", "eyJ-B", "bob@example.com", 9e9)

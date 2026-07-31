@@ -71,11 +71,19 @@ def _write_tokens_file(path: Path, data: dict[str, dict[str, str | float]]) -> N
     are written, and the rename means a crash mid-write can no longer truncate
     the file and lose every stored token.
 
+    Hardens the parent to ``0o700`` first (``mkdir`` alone won't
+    re-permission an existing ``0o755`` dir), so every writer routes
+    through here — including ``clear_token``.
+
     :param path: Destination file, i.e. ``~/.omnigent/auth_tokens.json``.
     :param data: The full token map to serialise.
     :returns: None.
     :raises OSError: If the temp cannot be written or replaced into place.
     """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(path.parent, stat.S_IRWXU)
+
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -112,11 +120,6 @@ def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
         ``{"token": "...", "user_id": "...", "expires_at": 1750000000.0}``.
     """
     path = _token_file_path()
-    # 0o700: the directory holds session JWTs; a default-mode mkdir leaves it
-    # world-traversable (0o755).
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(path.parent, stat.S_IRWXU)
 
     data: dict[str, dict[str, str | float]] = {}
     if path.exists():
