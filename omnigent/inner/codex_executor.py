@@ -16,7 +16,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,7 +128,7 @@ _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
 
-def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any] | None:
+def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, object] | None:
     """Map a ``thread/tokenUsage/updated`` payload's ``last`` breakdown
     onto the wire shape that :class:`TurnComplete` consumes.
 
@@ -161,7 +161,7 @@ def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any]
     input_total = int(last.get("inputTokens") or 0)
     # Clamp so a malformed cached > total never makes input_tokens negative.
     cached = min(int(last.get("cachedInputTokens") or 0), input_total)
-    usage: dict[str, Any] = {
+    usage: dict[str, object] = {
         "input_tokens": input_total - cached,  # non-cached portion
         "output_tokens": int(last.get("outputTokens") or 0),
         "total_tokens": int(last.get("totalTokens") or 0),
@@ -351,24 +351,32 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
-    """
-    Indirection point for ``asyncio.create_subprocess_exec``.
+_ProcessPath: TypeAlias = str | bytes | os.PathLike[str] | os.PathLike[bytes]
 
-    Exists so tests can stub the subprocess creation without
-    patching ``asyncio.create_subprocess_exec`` globally (patching
-    ``omnigent.inner.codex_executor.asyncio.create_subprocess_exec``
-    walks the dotted path into the real ``asyncio`` module
-    singleton and leaks the mock into every other test in the
-    process).
 
-    :param args: Positional argv components forwarded to
-        ``asyncio.create_subprocess_exec``.
-    :param kwargs: Keyword args (``stdin``, ``stdout``, ``stderr``,
-        ``env``, ``cwd``, ...) forwarded as-is.
-    :returns: The spawned subprocess handle.
-    """
-    return await asyncio.create_subprocess_exec(*args, **kwargs)
+async def _create_subprocess_exec(
+    program: _ProcessPath,
+    *args: _ProcessPath,
+    stdin: int | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    env: Mapping[str, str] | Mapping[bytes, bytes] | None = None,
+    cwd: _ProcessPath | None = None,
+    start_new_session: bool = False,
+    creationflags: int = 0,
+) -> asyncio.subprocess.Process:
+    """Start a subprocess through the module-local test seam."""
+    return await asyncio.create_subprocess_exec(
+        program,
+        *args,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        env=env,
+        cwd=cwd,
+        start_new_session=start_new_session,
+        creationflags=creationflags,
+    )
 
 
 def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
@@ -715,7 +723,7 @@ def _populate_codex_home_config(
             "true",
             "yes",
         }
-    symlink_files = _CODEX_HOME_SYMLINK_FILES
+    symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
     for filename in symlink_files:
@@ -1034,7 +1042,7 @@ def _session_key(messages: list[Message]) -> str:
 
 def _extract_latest_user_content(
     messages: list[Message],
-) -> str | list[dict[str, Any]]:
+) -> str | list[CodexParams]:
     """
     Extract the latest user message content.
 
@@ -1061,7 +1069,7 @@ def _extract_latest_user_content(
 
 def _build_initial_prompt(
     messages: list[Message],
-) -> str | list[dict[str, Any]]:
+) -> str | list[CodexParams]:
     """
     Build the initial prompt for a fresh Codex thread.
 
@@ -1093,9 +1101,7 @@ def _build_initial_prompt(
     return "\n".join(lines)
 
 
-def _prompt_for_turn(
-    messages: list[Message], *, is_new_thread: bool
-) -> str | list[dict[str, Any]]:
+def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:
     """
     Choose the prompt payload for a Codex turn.
 
@@ -1115,8 +1121,8 @@ def _prompt_for_turn(
 
 
 def _to_codex_input_items(
-    blocks: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    blocks: list[CodexParams],
+) -> list[CodexParams]:
     """
     Convert Responses API content blocks to Codex app-server
     ``turn/start`` input items.
@@ -1130,7 +1136,7 @@ def _to_codex_input_items(
         ``input_text``, ``input_image``, ``input_file``).
     :returns: Codex input item dicts.
     """
-    items: list[dict[str, Any]] = []
+    items: list[CodexParams] = []
     for block in blocks:
         block_type = block.get("type")
         if block_type in ("input_text", "output_text", "text"):
@@ -1320,7 +1326,7 @@ class _CodexAppServerSession:
         # turn breakdown, mapped to the wire shape. Consumed (and cleared)
         # on the next ``turn/completed`` so each TurnComplete carries the
         # usage for the turn that just finished.
-        self._last_turn_usage: dict[str, int] | None = None
+        self._last_turn_usage: dict[str, object] | None = None
 
     async def start(self) -> None:
         if self._started:

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 import pytest
 
 from omnigent.onboarding import providers as _providers_mod
@@ -21,6 +26,7 @@ from omnigent.onboarding.providers import (
 # (the full parsed dict with a "models" key).
 _FAKE_CATALOG: dict[str, dict] = {
     "anthropic": {
+        "schema_version": "1.0",
         "models": {
             "claude-opus-4-8": {
                 "mode": "chat",
@@ -47,9 +53,10 @@ _FAKE_CATALOG: dict[str, dict] = {
                 "mode": "embedding",
                 "capabilities": {},
             },
-        }
+        },
     },
     "openai": {
+        "schema_version": "1.0",
         "models": {
             "gpt-5.5-audio-preview-2026-06-01": {
                 "mode": "chat",
@@ -71,9 +78,10 @@ _FAKE_CATALOG: dict[str, dict] = {
                 "capabilities": {"function_calling": True},
                 "context_window": {"max_input": 16385, "max_output": 4096},
             },
-        }
+        },
     },
     "openrouter": {
+        "schema_version": "1.0",
         "models": {
             "openai/gpt-6": {
                 "mode": "chat",
@@ -95,16 +103,17 @@ _FAKE_CATALOG: dict[str, dict] = {
                 "capabilities": {"function_calling": True},
                 "context_window": {"max_input": 997952, "max_output": 65536},
             },
-        }
+        },
     },
     "gemini": {
+        "schema_version": "1.0",
         "models": {
             "gemini/gemini-2.5-flash": {
                 "mode": "chat",
                 "capabilities": {"function_calling": True},
                 "context_window": {"max_input": 1000000, "max_output": 8192},
             },
-        }
+        },
     },
 }
 
@@ -119,6 +128,21 @@ def mock_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
         "_fetch_provider_catalog",
         lambda provider: _FAKE_CATALOG.get(provider, {}),
     )
+
+
+@pytest.fixture
+def real_catalog_loader(
+    mock_catalog: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Path:
+    """Restore the real loader with an isolated persistent cache root."""
+    del mock_catalog
+    monkeypatch.setattr(_providers_mod, "_fetch_provider_catalog", _REAL_FETCH_PROVIDER_CATALOG)
+    monkeypatch.setattr(_providers_mod, "_catalog_cache_root", lambda: tmp_path)
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    _providers_mod._catalog_cache.clear()
+    return tmp_path
 
 
 # ── get_all_providers ──────────────────────────────────────
@@ -246,11 +270,11 @@ def test_find_catalog_models_matches_vendor_namespaced_families() -> None:
 
 
 def test_shared_provider_catalog_caches_success_and_failure(
+    real_catalog_loader: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The shared TTL cache absorbs repeated lookups, including failures."""
-    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
-    _providers_mod._catalog_cache.clear()
+    del real_catalog_loader
     calls: list[str] = []
 
     def _download(provider: str) -> dict | None:
@@ -266,6 +290,297 @@ def test_shared_provider_catalog_caches_success_and_failure(
     assert _REAL_FETCH_PROVIDER_CATALOG("xai") == {}
     assert _REAL_FETCH_PROVIDER_CATALOG("xai") == {}
     assert calls == ["anthropic", "xai"]
+
+
+def test_provider_catalog_persists_validated_live_result(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful live fetch writes source and schema metadata atomically."""
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: 1_000.0)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["anthropic"]
+
+    value = json.loads((real_catalog_loader / "anthropic.json").read_text())
+    assert value["cache_schema_version"] == 1
+    assert value["catalog_schema_version"] == "1.0"
+    assert value["source_url"].endswith("/anthropic.json")
+    assert value["fetched_at"] == 1_000.0
+    assert value["catalog"] == _FAKE_CATALOG["anthropic"]
+
+
+def test_provider_catalog_reuses_fresh_disk_without_network(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh validated disk entry wins after the process cache is cleared."""
+    now = 2_000.0
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: now)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+    _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    _providers_mod._catalog_cache.clear()
+
+    def _unexpected_download(_provider: str) -> None:
+        raise AssertionError("fresh disk cache must avoid network discovery")
+
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", _unexpected_download)
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: now + 60)
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["anthropic"]
+    assert (real_catalog_loader / "anthropic.json").is_file()
+
+
+def test_provider_catalog_uses_stale_disk_only_after_live_failure(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stale-but-bounded entry is used with observable provenance."""
+    fetched_at = 3_000.0
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: fetched_at)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+    _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    _providers_mod._catalog_cache.clear()
+    monkeypatch.setattr(
+        _providers_mod,
+        "_catalog_now",
+        lambda: fetched_at + _providers_mod._CATALOG_TTL_SECONDS + 1,
+    )
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", lambda _provider: None)
+
+    with caplog.at_level(logging.WARNING, logger=_providers_mod.__name__):
+        result = _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+
+    assert result == _FAKE_CATALOG["anthropic"]
+    assert "Using stale model catalog cache" in caplog.text
+    assert "provider=anthropic" in caplog.text
+    assert "source=https://github.com/" in caplog.text
+    assert (real_catalog_loader / "anthropic.json").is_file()
+
+
+def test_provider_catalog_rejects_over_age_cache(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An entry beyond the stale-if-error window never becomes a default."""
+    fetched_at = 4_000.0
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: fetched_at)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+    _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    _providers_mod._catalog_cache.clear()
+    monkeypatch.setattr(
+        _providers_mod,
+        "_catalog_now",
+        lambda: fetched_at + _providers_mod._CATALOG_STALE_IF_ERROR_SECONDS + 1,
+    )
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", lambda _provider: None)
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == {}
+    assert (real_catalog_loader / "anthropic.json").is_file()
+
+
+def test_provider_catalog_repairs_corrupt_cache_from_live_fetch(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable JSON is ignored and replaced by the next valid download."""
+    cache_path = real_catalog_loader / "anthropic.json"
+    cache_path.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: 5_000.0)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["anthropic"]
+    assert json.loads(cache_path.read_text())["catalog"] == _FAKE_CATALOG["anthropic"]
+
+
+@pytest.mark.parametrize(
+    "metadata_override",
+    [
+        {"cache_schema_version": 999},
+        {"catalog_schema_version": "2.0"},
+        {"source_url": "https://catalog.invalid/anthropic.json"},
+    ],
+    ids=("cache-schema", "catalog-schema", "source-url"),
+)
+def test_provider_catalog_rejects_incompatible_cache_metadata(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_override: dict[str, object],
+) -> None:
+    """Incompatible wrapper provenance is not used after a live failure."""
+    source_url = _providers_mod._catalog_source_url("anthropic")
+    value = {
+        "cache_schema_version": 1,
+        "catalog_schema_version": "1.0",
+        "source_url": source_url,
+        "fetched_at": 6_000.0,
+        "catalog": _FAKE_CATALOG["anthropic"],
+    }
+    value.update(metadata_override)
+    (real_catalog_loader / "anthropic.json").write_text(json.dumps(value), encoding="utf-8")
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: 6_001.0)
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", lambda _provider: None)
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == {}
+
+
+@pytest.mark.parametrize("schema_version", ["1", "1.0", "1.1", 1])
+def test_provider_catalog_accepts_compatible_schema_versions(schema_version: object) -> None:
+    """Compatible major versions tolerate upstream minor and representation changes."""
+    catalog = {"schema_version": schema_version, "models": {"model": {}}}
+
+    assert _providers_mod._valid_catalog_payload(catalog)
+
+
+@pytest.mark.parametrize("schema_version", ["2.0", 2, True, "invalid", "².0", None])
+def test_provider_catalog_rejects_incompatible_schema_versions(schema_version: object) -> None:
+    """Malformed and unsupported major versions cannot enter the cache."""
+    catalog = {"schema_version": schema_version, "models": {"model": {}}}
+
+    assert not _providers_mod._valid_catalog_payload(catalog)
+
+
+def test_provider_catalog_rejects_empty_model_map() -> None:
+    """An empty upstream result cannot replace useful last-known-good data."""
+    assert not _providers_mod._valid_catalog_payload({"schema_version": "1.0", "models": {}})
+
+
+def test_provider_catalog_rejects_incompatible_live_schema(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsupported upstream schema is neither returned nor persisted."""
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: {"schema_version": "2.0", "models": {"model": {}}},
+    )
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == {}
+    assert list(real_catalog_loader.iterdir()) == []
+
+
+def test_empty_live_catalog_preserves_stale_last_known_good(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient empty response falls back without overwriting the disk cache."""
+    fetched_at = 6_500.0
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: fetched_at)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+    _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    cache_path = real_catalog_loader / "anthropic.json"
+    original_cache = cache_path.read_text()
+    _providers_mod._catalog_cache.clear()
+    monkeypatch.setattr(
+        _providers_mod,
+        "_catalog_now",
+        lambda: fetched_at + _providers_mod._CATALOG_TTL_SECONDS + 1,
+    )
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: {"schema_version": "1.0", "models": {}},
+    )
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["anthropic"]
+    assert cache_path.read_text() == original_cache
+
+
+def test_catalog_source_url_quotes_provider_path_characters() -> None:
+    """Provider input cannot inject release-path or query delimiters."""
+    url = _providers_mod._catalog_source_url("anthropic/../../asset?download=1")
+
+    assert url.endswith("/anthropic%2F..%2F..%2Fasset%3Fdownload%3D1.json")
+
+
+def test_disabled_catalog_lookup_bypasses_memory_disk_and_network(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The test isolation switch cannot inherit developer cache state."""
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: 7_000.0)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+    _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    assert (real_catalog_loader / "anthropic.json").is_file()
+    monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
+
+    def _unexpected(*_args: object) -> None:
+        raise AssertionError("disabled lookup must bypass every catalog cache tier")
+
+    monkeypatch.setattr(_providers_mod, "_read_disk_catalog", _unexpected)
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", _unexpected)
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == {}
+
+
+def test_concurrent_catalog_writes_leave_one_complete_entry(
+    real_catalog_loader: Path,
+) -> None:
+    """Concurrent processes can race without exposing partial JSON."""
+    source_url = _providers_mod._catalog_source_url("anthropic")
+
+    def _write(index: int) -> None:
+        catalog = {
+            "schema_version": "1.0",
+            "models": {f"model-{index}": {"mode": "chat"}},
+        }
+        _providers_mod._write_disk_catalog(
+            _providers_mod._DiskCatalogEntry(
+                catalog=catalog,
+                source_url=source_url,
+                fetched_at=float(index),
+            ),
+            "anthropic",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(_write, range(32)))
+
+    entry = _providers_mod._read_disk_catalog("anthropic", source_url)
+    assert entry is not None
+    assert len(entry.catalog["models"]) == 1
+    assert list(real_catalog_loader.iterdir()) == [real_catalog_loader / "anthropic.json"]
+
+
+def test_provider_catalog_without_live_or_cached_data_fails_empty(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh install still fails clearly instead of inventing a model."""
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", lambda _provider: None)
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == {}
+    assert list(real_catalog_loader.iterdir()) == []
 
 
 def test_get_chat_models_filters_to_chat_mode() -> None:

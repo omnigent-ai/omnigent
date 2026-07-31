@@ -14,11 +14,9 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: vi.fn(),
 }));
 
-// These tests cover row navigation, not shell creation. The button
-// needs a QueryClient (it reads the session agent for its access
-// gate); its behavior is covered by NewTerminalButton.test.tsx. The
-// marker keeps the variant visible so the virtual-row placement is
-// assertable.
+// The "+ New shell" button needs a QueryClient (reads the session agent for
+// its access gate); its behavior is covered by NewTerminalButton.test.tsx. A
+// marker keeps its presence assertable.
 vi.mock("./NewTerminalButton", () => ({
   NewTerminalButton: ({ variant }: { variant?: string }) => (
     <div data-testid="new-shell-button" data-variant={variant} />
@@ -52,7 +50,11 @@ const TERMINAL_FIRST_SDK_CTX = {
   terminalStartingUp: false,
 } as TerminalFirstContextValue;
 
-function renderInlineSection(terminals: TerminalInfo[], onExpand: (key: string) => void = vi.fn()) {
+function renderInlineSection(
+  terminals: TerminalInfo[],
+  onExpand: (key: string) => void = vi.fn(),
+  { showNewShell = false }: { showNewShell?: boolean } = {},
+) {
   useTerminalsMock.mockReturnValue({
     terminals,
     isLoading: false,
@@ -60,7 +62,11 @@ function renderInlineSection(terminals: TerminalInfo[], onExpand: (key: string) 
   });
   return render(
     <TerminalFirstContextProvider value={TERMINAL_FIRST_SDK_CTX}>
-      <InlineTerminalsSection conversationId="conv_terminal" onExpand={onExpand} />
+      <InlineTerminalsSection
+        conversationId="conv_terminal"
+        onExpand={onExpand}
+        showNewShell={showNewShell}
+      />
     </TerminalFirstContextProvider>,
   );
 }
@@ -117,23 +123,24 @@ describe("InlineTerminalsSection rows open shells in the main view", () => {
     expect(screen.getByRole("button", { name: /s1/ })).toBeInTheDocument();
   });
 
-  it("renders only the virtual new-shell row when the only terminal is the embedded REPL", () => {
+  it("renders an empty list (no new-shell row) when the only terminal is the embedded REPL", () => {
     renderInlineSection([makeTerminal("terminal_tui_main", "tui", "main")]);
 
-    // No centered empty-state copy — the list IS the surface, and with
-    // zero shells it consists of just the virtual "+ New shell" row.
-    const row = screen.getByTestId("new-shell-button");
-    expect(row).toHaveAttribute("data-variant", "row");
+    // Desktop default: shell creation lives in the tab strip's "+" menu, not
+    // here — so no "+ New shell" row, and no centered empty-state copy.
+    expect(screen.queryByTestId("new-shell-button")).toBeNull();
     expect(screen.queryByText("No shells running.")).toBeNull();
   });
 
-  it("keeps the virtual new-shell row above the shell rows", () => {
-    renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")]);
+  it("shows a leading '+ New shell' row when showNewShell is set (mobile drawer)", () => {
+    // Mobile has no tab-strip "+" menu, so the drawer opts in to the create row.
+    renderInlineSection([makeTerminal("terminal_bash_s1", "bash", "s1")], vi.fn(), {
+      showNewShell: true,
+    });
 
     const row = screen.getByTestId("new-shell-button");
     expect(row).toHaveAttribute("data-variant", "row");
-    // Leading keeps the affordance at a fixed spot — trailing would
-    // drift down as shells accumulate.
+    // Leading — it sits before the shell rows so it stays at a fixed spot.
     const shellRow = screen.getByRole("button", { name: /s1/ });
     expect(row.compareDocumentPosition(shellRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });

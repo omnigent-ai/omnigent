@@ -206,6 +206,19 @@ The same policy supplies the final runtime fallback for key, gateway, and local
 providers. Explicit agent and provider defaults still win; without either,
 runtime discovery fails with configuration guidance when no catalog is available.
 
+## Persistent Catalog Resilience
+
+The shared MLflow catalog boundary persists one validated last-known-good file
+per provider in the platform user-cache directory. A cache is fresh for one
+hour; if live retrieval fails, a validated entry remains usable for up to seven
+days and logs its source and age. Atomic replacement prevents concurrent
+processes from exposing partial JSON.
+
+Cache files record their own schema version, the upstream catalog schema,
+source URL, and fetch time. Corrupt, incompatible, wrong-source, or over-age
+entries are ignored. `OMNIGENT_DISABLE_CATALOG_LOOKUP=1` bypasses in-memory,
+disk, and network lookup so tests cannot inherit developer-machine state.
+
 ## Configuration Help Text
 
 Setup prompts, routing policy schemas, and spawn-tool descriptions explain the

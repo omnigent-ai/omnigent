@@ -225,6 +225,11 @@ function SidebarRowDataProvider({
  */
 type SidebarTab = "mine" | "shared";
 
+// Bulk-selection targets either the flat "Sessions" list or the sessions
+// nested inside project folders; the active scope decides which rows show
+// checkboxes and where the bulk-action bar renders.
+type SelectionScope = "sessions" | "projects";
+
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
@@ -420,6 +425,10 @@ export function useMigrateLocalPinsToServer(
 
 export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
   const [selectionMode, setSelectionMode] = useState(false);
+  // Which rows the current selection targets: the flat "Sessions" list, or the
+  // sessions nested inside project folders. Set when selection mode is entered
+  // (from the Sessions header or the Projects header kebab, respectively).
+  const [selectionScope, setSelectionScope] = useState<SelectionScope>("sessions");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   // Which session tab is shown. "mine" (default) keeps the full Pinned /
   // Projects / Chats structure; "shared" is a flat list of sessions others
@@ -434,8 +443,6 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
-  const getVisibleConversationsRef = useRef<() => Conversation[]>(() => []);
-  const [visibleConversationCount, setVisibleConversationCount] = useState(0);
 
   const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
@@ -458,18 +465,24 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
     });
   }, []);
 
-  const selectAll = useCallback((conversations: Conversation[]) => {
-    setSelectedIds(new Set(conversations.map((c) => c.id)));
-  }, []);
-
   const deselectAll = useCallback(() => {
     setSelectedIds(new Set());
   }, []);
 
   const exitSelectionMode = useCallback(() => {
     setSelectionMode(false);
+    setSelectionScope("sessions");
     setSelectedIds(new Set());
     lastSelectedIdRef.current = null;
+  }, []);
+
+  // Enter selection mode targeting a given scope; clear any prior selection so
+  // rows from the previous scope don't linger.
+  const enterSelectionMode = useCallback((scope: SelectionScope) => {
+    setSelectionScope(scope);
+    setSelectedIds(new Set());
+    lastSelectedIdRef.current = null;
+    setSelectionMode(true);
   }, []);
 
   // One paginated session list — sessions are no longer split by
@@ -791,52 +804,40 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 Automations
               </Link>
             </Button>
-            {selectionMode ? (
-              <BulkActionBar
-                selectedIds={selectedIds}
-                allConversations={loadedRows}
-                visibleCount={visibleConversationCount}
-                onSelectAll={() => selectAll(getVisibleConversationsRef.current())}
-                onDeselectAll={deselectAll}
-                onClear={deselectAll}
-                onExit={exitSelectionMode}
-              />
-            ) : (
-              <Button
-                asChild
-                variant="ghost"
-                className={cn(
-                  "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
-                  SIDEBAR_HOVER_HIGHLIGHT,
-                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+            <Button
+              asChild
+              variant="ghost"
+              className={cn(
+                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                SIDEBAR_HOVER_HIGHLIGHT,
+                isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+              )}
+              data-testid="inbox-button"
+            >
+              <Link to="/inbox" onClick={onNavClick}>
+                <InboxIcon className="size-3.5 text-muted-foreground" />
+                Inbox
+                {inboxCount > 0 && (
+                  <span
+                    aria-label={
+                      inboxCount === 1
+                        ? "1 inbox item waiting"
+                        : `${inboxCount} inbox items waiting`
+                    }
+                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
+                  >
+                    {inboxCount}
+                  </span>
                 )}
-                data-testid="inbox-button"
-              >
-                <Link to="/inbox" onClick={onNavClick}>
-                  <InboxIcon className="size-3.5 text-muted-foreground" />
-                  Inbox
-                  {inboxCount > 0 && (
-                    <span
-                      aria-label={
-                        inboxCount === 1
-                          ? "1 inbox item waiting"
-                          : `${inboxCount} inbox items waiting`
-                      }
-                      className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
-                    >
-                      {inboxCount}
-                    </span>
-                  )}
-                </Link>
-              </Button>
-            )}
+              </Link>
+            </Button>
           </div>
 
           {/* Session-scope tabs: split the viewer's own sessions ("My
           sessions") from ones shared with them ("Shared with me"). Sits above
           the scrolling list (non-scrolling) so it stays put while the list
-          scrolls. Hidden during selection mode, where the bulk-action bar owns
-          this strip. */}
+          scrolls. Hidden during selection mode to keep the strip quiet while
+          the bulk-action bar sits under the Sessions header. */}
           {multiUser && !selectionMode && (
             <div className="px-2 pb-2">
               <Tabs
@@ -879,13 +880,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               pinnedConversationIds={pinnedConversationIds}
               pinnedConversations={pinnedConversations}
               onTogglePinned={togglePinnedConversation}
-              onEnterSelectionMode={() => setSelectionMode(true)}
+              onEnterSelectionMode={enterSelectionMode}
               selectionMode={selectionMode}
+              selectionScope={selectionScope}
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
+              onDeselectAll={deselectAll}
+              onExitSelectionMode={exitSelectionMode}
               getVisibleIdsRef={getVisibleIdsRef}
-              getVisibleConversationsRef={getVisibleConversationsRef}
-              onVisibleCountChange={setVisibleConversationCount}
             />
           </nav>
         </>
@@ -978,7 +980,7 @@ function ProjectFolder({
   selectedIds,
   onToggleSelected,
   onProjectAssigned,
-  projectRenderedIdsRef,
+  onConversationsLoaded,
 }: {
   name: string;
   /** First-class project id, or null for a label-only folder. */
@@ -998,7 +1000,12 @@ function ProjectFolder({
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
-  projectRenderedIdsRef?: RefObject<Map<string, string[]>>;
+  /** Report this folder's own loaded (rendered) sessions to the parent. The
+      folder paginates independently of the global window, so bulk-selection in
+      the projects scope must resolve selected rows against these — not the
+      global list — or an out-of-window member would silently drop from the
+      action. */
+  onConversationsLoaded?: (name: string, conversations: Conversation[]) => void;
 }) {
   const query = useProjectSessions(name, expanded);
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
@@ -1012,15 +1019,12 @@ function ProjectFolder({
     );
   }, [query.data, pinnedSet, activeOverride, frozenSortKeys]);
 
-  // Register this folder's rendered IDs synchronously during render so the
-  // shift-select range uses the real per-project data, not the global list.
-  const renderedIds = useMemo(
-    () => (expanded ? conversations.map((c) => c.id) : []),
-    [expanded, conversations],
-  );
-  if (projectRenderedIdsRef) {
-    projectRenderedIdsRef.current.set(name, renderedIds);
-  }
+  // Publish the folder's rendered rows upward so projects-scope bulk selection
+  // resolves them (the parent sources its action set from these, not the global
+  // paginated window).
+  useEffect(() => {
+    onConversationsLoaded?.(name, conversations);
+  }, [name, conversations, onConversationsLoaded]);
 
   // While the first page loads, show a "Loading…" footer instead of the "No
   // chats" empty state (which would otherwise flash before rows arrive).
@@ -1100,13 +1104,14 @@ interface ConversationListProps {
   // outside the loaded pagination window still renders in the Pinned section.
   pinnedConversations: Conversation[];
   onTogglePinned: (conversationId: string) => void;
-  onEnterSelectionMode: () => void;
+  onEnterSelectionMode: (scope: SelectionScope) => void;
   selectionMode: boolean;
+  selectionScope: SelectionScope;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
+  onDeselectAll: () => void;
+  onExitSelectionMode: () => void;
   getVisibleIdsRef: RefObject<() => string[]>;
-  getVisibleConversationsRef: RefObject<() => Conversation[]>;
-  onVisibleCountChange: (count: number) => void;
 }
 
 // Ownership drives the My-vs-Shared split and every owner-only row action.
@@ -1164,11 +1169,12 @@ function ConversationList({
   onTogglePinned,
   onEnterSelectionMode,
   selectionMode,
+  selectionScope,
   selectedIds,
   onToggleSelected,
+  onDeselectAll,
+  onExitSelectionMode,
   getVisibleIdsRef,
-  getVisibleConversationsRef,
-  onVisibleCountChange,
 }: ConversationListProps) {
   // Viewer id for the owner-based My/Shared split below.
   const viewerId = useViewerId();
@@ -1200,11 +1206,6 @@ function ConversationList({
     return map;
   }, [projects]);
 
-  // Each ProjectFolder registers its actually-rendered conversation IDs here
-  // (synchronously during render) so shift-select ranges use the real rendered
-  // order, not the global paginated list which can diverge.
-  const projectRenderedIdsRef = useRef<Map<string, string[]>>(new Map());
-
   // Freeze the active chat's sort key while you're inside it so an
   // updated_at bump from sending a message doesn't reorder the row
   // out from under you. Snapshot is dropped on navigate-away so the
@@ -1222,8 +1223,8 @@ function ConversationList({
   // triggers, hitting a session the user never aimed at; a reorder during an
   // edit can move (and blur) the input, committing a half-typed title. The
   // map accumulates keys lazily inside sortByUpdatedAtDesc (a render-time ref
-  // write, like projectRenderedIdsRef) and is cleared once neither hold is
-  // active, when the order snaps back to reality.
+  // write) and is cleared once neither hold is active, when the order snaps
+  // back to reality.
   const frozenKeysRef = useRef<Map<string, number>>(new Map());
   const [pointerInside, setPointerInside] = useState(false);
   const [editingIds, setEditingIds] = useState<ReadonlySet<string>>(() => new Set());
@@ -1324,6 +1325,11 @@ function ConversationList({
     activeTab,
     viewerId,
   ]);
+
+  // Scope-active flags: which section owns the current selection UI (checkboxes
+  // + bulk-action bar). Only one is ever true at a time.
+  const sessionsSelecting = selectionMode && selectionScope === "sessions";
+  const projectsSelecting = selectionMode && selectionScope === "projects";
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -1515,6 +1521,75 @@ function ConversationList({
     });
   }, [expandedViaButton, revertSnapshot]);
 
+  // Sessions each expanded ProjectFolder has actually rendered, keyed by
+  // project name. A folder paginates independently of the global window, so its
+  // rows can include members the global list hasn't loaded; projects-scope
+  // selection must resolve against these to avoid silently dropping an
+  // out-of-window row from a bulk action. Folders report via
+  // `onConversationsLoaded`; collapsed folders report `[]`.
+  const [folderConversations, setFolderConversations] = useState<Map<string, Conversation[]>>(
+    () => new Map(),
+  );
+  const handleFolderConversationsLoaded = useCallback(
+    (name: string, conversations: Conversation[]) => {
+      setFolderConversations((prev) => {
+        const existing = prev.get(name);
+        // Skip the update when the id set is unchanged, so a background refetch
+        // that returns the same rows doesn't churn state (and re-render).
+        if (
+          existing &&
+          existing.length === conversations.length &&
+          existing.every((c, i) => c.id === conversations[i]?.id)
+        ) {
+          return prev;
+        }
+        const next = new Map(prev);
+        next.set(name, conversations);
+        return next;
+      });
+    },
+    [],
+  );
+
+  // The projects-scope selection pool: the folders' own rendered rows (the
+  // authoritative, possibly-out-of-window set) unioned with the global-derived
+  // membership as a fallback for folders that haven't reported yet. Deduped by
+  // id. This backs the bulk-action bar, the shift-select range, and the
+  // stranding guard so all three agree on what's selectable.
+  const projectSessionPool = useMemo(() => {
+    const byId = new Map<string, Conversation>();
+    for (const group of sections.projectGroups) {
+      for (const c of group.conversations) byId.set(c.id, c);
+    }
+    for (const rows of folderConversations.values()) {
+      for (const c of rows) byId.set(c.id, c);
+    }
+    return [...byId.values()];
+  }, [sections.projectGroups, folderConversations]);
+
+  // The bulk-action bar lives under the header of the section it targets, so it
+  // unmounts when that section empties (e.g. every selected session
+  // archived/deleted). Exit selection mode in that case so the user isn't
+  // stranded without its controls. Suppressed while the list is refetching: a
+  // background refetch can briefly yield an empty page, and exiting on that
+  // transient would kick the user out of selection mode mid-task. The projects
+  // pool unions global-derived membership with the folder queries, so a single
+  // folder's transient-empty refetch can't zero it while any member is still in
+  // the global window (only a genuinely empty pool exits).
+  useEffect(() => {
+    if (!selectionMode || conversationsQuery.isFetching) return;
+    const pool =
+      selectionScope === "projects" ? projectSessionPool.length : sections.sessions.length;
+    if (pool === 0) onExitSelectionMode();
+  }, [
+    selectionMode,
+    selectionScope,
+    sections.sessions.length,
+    projectSessionPool.length,
+    conversationsQuery.isFetching,
+    onExitSelectionMode,
+  ]);
+
   // The project the currently-selected session is filed under, if any. Derived
   // as a primitive so the auto-expand effect below only fires when the
   // selection (or its project) changes — not on every background list refetch,
@@ -1554,37 +1629,22 @@ function ConversationList({
       ...visible("Chats", sections.sessions),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
-  useEffect(() => {
-    onVisibleCountChange(orderedConversationIds.length);
-  }, [orderedConversationIds.length, onVisibleCountChange]);
-  getVisibleConversationsRef.current = () => {
-    const visible = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : [...list];
-    const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (name: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
-    return [
-      ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
-      ...visible("Chats", sections.sessions),
-    ];
-  };
-  // Getter that builds the shift-select visible order on demand (at click
-  // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
-  // during render — guarantees the project segment is always fresh even when a
-  // ProjectFolder re-renders independently (async query resolve, session
-  // re-sort) without triggering a parent re-render.
+  // Getter for the shift-select range, built on demand (at click time). Scopes
+  // to whichever section is selectable: the flat Sessions list, or the sessions
+  // across expanded project folders (in render order). For projects scope the
+  // range uses each folder's own reported rows — the same source the folder
+  // renders — so a shift target the global window hasn't loaded still resolves.
+  // Rows outside the active scope have no checkboxes, so they never enter a range.
   getVisibleIdsRef.current = () => {
-    const vis = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
-    const projCollapsed = effectiveCollapsedSections.includes("Projects");
-    return [
-      ...vis("Pinned", sections.pinned),
-      ...(projCollapsed
-        ? []
-        : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
-      ...vis("Chats", sections.sessions),
-    ];
+    if (selectionScope === "projects") {
+      if (effectiveCollapsedSections.includes("Projects")) return [];
+      return sections.projectGroups.flatMap((g) => {
+        if (!expandedProjects.includes(g.name)) return [];
+        const rows = folderConversations.get(g.name) ?? g.conversations;
+        return rows.map((c) => c.id);
+      });
+    }
+    return effectiveCollapsedSections.includes("Chats") ? [] : sections.sessions.map((c) => c.id);
   };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
@@ -1698,7 +1758,7 @@ function ConversationList({
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
                       onRowClick={onRowClick}
                       onTogglePinned={onTogglePinned}
-                      selectionMode={selectionMode}
+                      selectionMode={false}
                       selectedIds={selectedIds}
                       onToggleSelected={onToggleSelected}
                       onProjectAssigned={expandProject}
@@ -1716,15 +1776,31 @@ function ConversationList({
                     title="Projects"
                     collapsed={effectiveCollapsedSections.includes("Projects")}
                     onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+                    afterHeader={
+                      projectsSelecting ? (
+                        <BulkActionBar
+                          selectedIds={selectedIds}
+                          allConversations={projectSessionPool}
+                          onDeselectAll={onDeselectAll}
+                          onExit={onExitSelectionMode}
+                        />
+                      ) : undefined
+                    }
                     headerAction={
-                      <ProjectHeaderActions
-                        projectNames={sections.projectGroups.map((group) => group.name)}
-                        collapsed={effectiveCollapsedSections.includes("Projects")}
-                        expandedProjects={expandedProjects}
-                        onExpandAll={expandAllProjects}
-                        onRevert={revertProjects}
-                        onProjectCreated={expandProject}
-                      />
+                      !selectionMode ? (
+                        <ProjectHeaderActions
+                          projectNames={sections.projectGroups.map((group) => group.name)}
+                          collapsed={effectiveCollapsedSections.includes("Projects")}
+                          expandedProjects={expandedProjects}
+                          hasProjectSessions={sections.projectGroups.some(
+                            (group) => group.conversations.length > 0,
+                          )}
+                          onExpandAll={expandAllProjects}
+                          onRevert={revertProjects}
+                          onProjectCreated={expandProject}
+                          onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                        />
+                      ) : undefined
                     }
                   >
                     {sections.projectGroups.map((group) => (
@@ -1743,11 +1819,11 @@ function ConversationList({
                         scrollRoot={scrollContainerRef}
                         onRowClick={onRowClick}
                         onTogglePinned={onTogglePinned}
-                        selectionMode={selectionMode}
+                        selectionMode={projectsSelecting}
                         selectedIds={selectedIds}
                         onToggleSelected={onToggleSelected}
                         onProjectAssigned={expandProject}
-                        projectRenderedIdsRef={projectRenderedIdsRef}
+                        onConversationsLoaded={handleFolderConversationsLoaded}
                       />
                     ))}
                     {sections.projectGroups.length === 0 &&
@@ -1776,10 +1852,20 @@ function ConversationList({
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
                       onRowClick={onRowClick}
                       onTogglePinned={onTogglePinned}
-                      selectionMode={selectionMode}
+                      selectionMode={sessionsSelecting}
                       selectedIds={selectedIds}
                       onToggleSelected={onToggleSelected}
                       onProjectAssigned={expandProject}
+                      afterHeader={
+                        sessionsSelecting ? (
+                          <BulkActionBar
+                            selectedIds={selectedIds}
+                            allConversations={sections.sessions}
+                            onDeselectAll={onDeselectAll}
+                            onExit={onExitSelectionMode}
+                          />
+                        ) : undefined
+                      }
                       headerAction={
                         !selectionMode ? (
                           <Tooltip>
@@ -1792,7 +1878,7 @@ function ConversationList({
                                 data-testid="toggle-selection-mode"
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  onEnterSelectionMode();
+                                  onEnterSelectionMode("sessions");
                                 }}
                               >
                                 <ListChecksIcon className="size-3.5" />
@@ -2033,16 +2119,22 @@ function ProjectHeaderActions({
   projectNames,
   collapsed,
   expandedProjects,
+  hasProjectSessions,
   onExpandAll,
   onRevert,
   onProjectCreated,
+  onEnterSelectionMode,
 }: {
   projectNames: string[];
   collapsed: boolean;
   expandedProjects: string[];
+  /** Whether any project holds sessions — gates the "Select sessions" item, so
+      it isn't offered when there's nothing under any folder to select. */
+  hasProjectSessions: boolean;
   onExpandAll: (projectNames: string[]) => void;
   onRevert: () => void;
   onProjectCreated: (projectName: string) => void;
+  onEnterSelectionMode: () => void;
 }) {
   const showExpandControls = !collapsed && projectNames.length > 0;
   const allExpanded =
@@ -2050,47 +2142,47 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      {showExpandControls &&
-        (allExpanded ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Collapse to previous"
-                data-testid="revert-projects"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onRevert();
-                }}
-              >
+      <NewProjectButton onCreated={onProjectCreated} />
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Project list actions"
+            data-testid="project-list-actions"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <MoreHorizontalIcon className="size-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+          {showExpandControls &&
+            (allExpanded ? (
+              <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
                 <Minimize2Icon className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">Collapse to previous</TooltipContent>
-          </Tooltip>
-        ) : (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Expand all"
+                Collapse to previous
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem
                 data-testid="expand-all-projects"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onExpandAll(projectNames);
-                }}
+                onSelect={() => onExpandAll(projectNames)}
               >
                 <Maximize2Icon className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">Expand all</TooltipContent>
-          </Tooltip>
-        ))}
-      <NewProjectButton onCreated={onProjectCreated} />
+                Expand all
+              </DropdownMenuItem>
+            ))}
+          {hasProjectSessions && (
+            <DropdownMenuItem
+              data-testid="projects-select-sessions"
+              onSelect={() => onEnterSelectionMode()}
+            >
+              <ListChecksIcon className="size-3.5" />
+              Select sessions
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }
@@ -2103,6 +2195,7 @@ function SectionGroup({
   collapsed,
   onToggleCollapsed,
   headerAction,
+  afterHeader,
   children,
 }: {
   title: string;
@@ -2111,6 +2204,9 @@ function SectionGroup({
   /** Optional control overlaid at the group header's right edge (e.g. the
       "collapse all projects" toggle). Hover/focus-revealed on desktop. */
   headerAction?: ReactNode;
+  /** Optional content rendered directly under the header, above the children
+      (and shown even when collapsed) — e.g. the bulk-selection action bar. */
+  afterHeader?: ReactNode;
   children: ReactNode;
 }) {
   return (
@@ -2130,11 +2226,12 @@ function SectionGroup({
           // — NOT :focus-within — so clicking the button with the mouse doesn't
           // leave it stuck visible: React reuses the same node when it swaps
           // expand↔revert, so the clicked button keeps focus afterward.
-          <div className="-translate-y-1/2 absolute top-1/2 right-1 hidden items-center transition-opacity md:flex md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-hover/header:opacity-100">
+          <div className="-translate-y-1/2 absolute top-1/2 right-1 hidden items-center transition-opacity md:flex md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100">
             {headerAction}
           </div>
         )}
       </div>
+      {afterHeader}
       {!collapsed && <div className="flex flex-col gap-0.5">{children}</div>}
     </section>
   );
@@ -2156,6 +2253,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  afterHeader,
   footer,
   onProjectAssigned,
 }: {
@@ -2181,6 +2279,9 @@ function ConversationSection({
   /** Optional control overlaid at the header's right edge (e.g. a project's
       kebab). Hover/focus-revealed on desktop, always shown on mobile. */
   headerAction?: ReactNode;
+  /** Optional content rendered directly under the header, above the rows (and
+      shown even when collapsed) — e.g. the bulk-selection action bar. */
+  afterHeader?: ReactNode;
   /** Optional content rendered after the rows inside the expanded body (e.g. a
       project folder's own infinite-scroll sentinel / loading row). */
   footer?: ReactNode;
@@ -2212,6 +2313,7 @@ function ConversationSection({
           )}
         </div>
       )}
+      {afterHeader}
       {!isCollapsed && (
         <>
           {conversations.length === 0 && emptyMessage ? (
@@ -3044,7 +3146,7 @@ function ConversationRow({
               : "pr-28 md:pr-2"),
         !selectionMode && "md:group-hover:pr-14 md:group-focus-within:pr-14",
         !selectionMode && menuOpen && "md:pr-14",
-        selectionMode && "pr-10",
+        selectionMode && "pr-2 pl-8",
         isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
@@ -3180,7 +3282,7 @@ function ConversationRow({
         </Tooltip>
       )}
       {selectionMode ? (
-        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 right-2.5 flex items-center">
+        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
           {isSelected ? (
             <SquareCheckIcon className="size-4 text-primary" />
           ) : (
@@ -3974,18 +4076,12 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
 function BulkActionBar({
   selectedIds,
   allConversations,
-  visibleCount,
-  onSelectAll,
   onDeselectAll,
-  onClear,
   onExit,
 }: {
   selectedIds: Set<string>;
   allConversations: Conversation[];
-  visibleCount: number;
-  onSelectAll: () => void;
   onDeselectAll: () => void;
-  onClear: () => void;
   onExit: () => void;
 }) {
   const navigate = useNavigate();
@@ -4018,8 +4114,19 @@ function BulkActionBar({
     ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
   const count = selectedIds.size;
-  const allSelected = count > 0 && count === visibleCount;
   const isBusy = bulkArchive.isPending || bulkDelete.isPending;
+
+  // Delete acts only on owned rows, so surface that count on the control when it
+  // differs from "N selected" — otherwise a mixed-ownership selection (reachable
+  // in projects scope, where a folder can hold others' sessions) reads
+  // "3 selected" while Delete hits fewer. Used for both the tooltip (visual) and
+  // the aria-label (assistive tech). Archive needs no such hint: its gate
+  // (`allSelectedSameArchiveGroup`) only enables it when every owned row shares
+  // one archive state, and archived rows never appear in a selectable section.
+  const deleteLabel =
+    ownedSelected.length > 0 && ownedSelected.length !== count
+      ? `Delete ${ownedSelected.length}`
+      : "Delete";
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
 
@@ -4070,37 +4177,15 @@ function BulkActionBar({
 
   return (
     <>
-      <div className="relative mt-3 flex flex-col gap-1.5">
-        <div className="relative flex min-h-8 items-center gap-1.5 px-2 pr-9">
-          <span className="shrink-0 whitespace-nowrap text-sm text-muted-foreground">
-            {count === 0 ? "None selected" : `${count} selected`}
-          </span>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-6 px-1.5 text-sm"
-            onClick={allSelected ? onDeselectAll : onSelectAll}
-          >
-            {allSelected ? "Deselect all" : "Select all"}
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-6 px-1.5 text-sm"
-            disabled={count === 0}
-            onClick={onClear}
-          >
-            Clear
-          </Button>
+      <div className="mt-1 mb-1 flex flex-col gap-1.5">
+        <div className="flex h-7 items-center gap-2 rounded-lg border border-border bg-background px-2">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 type="button"
-                variant="secondary"
-                size="icon-sm"
-                className="-translate-y-1/2 absolute top-1/2 right-0 shrink-0 rounded-full"
+                variant="ghost"
+                size="icon-xs"
+                className="shrink-0"
                 aria-label="Exit selection mode"
                 data-testid="toggle-selection-mode"
                 onClick={onExit}
@@ -4110,61 +4195,79 @@ function BulkActionBar({
             </TooltipTrigger>
             <TooltipContent side="bottom">Exit selection</TooltipContent>
           </Tooltip>
-        </div>
+          <span className="sidebar-compact-text shrink-0 whitespace-nowrap font-medium">
+            {count} selected
+          </span>
 
-        <div className="flex items-center gap-1.5 px-2">
-          {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 gap-1.5 text-xs"
-              disabled={isBusy}
-              onClick={handleArchive}
-              data-testid="bulk-archive"
-            >
-              {bulkArchive.isPending ? (
-                <Loader2Icon className="size-3 animate-spin" />
-              ) : (
-                <ArchiveIcon className="size-3" />
-              )}
-              Archive
-            </Button>
-          )}
-          {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 gap-1.5 text-xs"
-              disabled={isBusy}
-              onClick={handleUnarchive}
-              data-testid="bulk-unarchive"
-            >
-              {bulkArchive.isPending ? (
-                <Loader2Icon className="size-3 animate-spin" />
-              ) : (
-                <ArchiveRestoreIcon className="size-3" />
-              )}
-              Unarchive
-            </Button>
-          )}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
-            disabled={isBusy || ownedSelected.length === 0}
-            onClick={() => setConfirmDeleteOpen(true)}
-            data-testid="bulk-delete"
-          >
-            {bulkDelete.isPending ? (
-              <Loader2Icon className="size-3 animate-spin" />
-            ) : (
-              <Trash2Icon className="size-3" />
+          <div className="ml-auto flex items-center gap-0.5">
+            {!(allSelectedSameArchiveGroup && archivedSelected.length > 0) && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    disabled={isBusy || nonArchivedSelected.length === 0}
+                    onClick={handleArchive}
+                    aria-label="Archive selected"
+                    data-testid="bulk-archive"
+                  >
+                    {bulkArchive.isPending ? (
+                      <Loader2Icon className="size-3.5 animate-spin" />
+                    ) : (
+                      <ArchiveIcon className="size-3.5" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Archive</TooltipContent>
+              </Tooltip>
             )}
-            Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
-          </Button>
+            {allSelectedSameArchiveGroup && archivedSelected.length > 0 && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    disabled={isBusy}
+                    onClick={handleUnarchive}
+                    aria-label="Unarchive selected"
+                    data-testid="bulk-unarchive"
+                  >
+                    {bulkArchive.isPending ? (
+                      <Loader2Icon className="size-3.5 animate-spin" />
+                    ) : (
+                      <ArchiveRestoreIcon className="size-3.5" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Unarchive</TooltipContent>
+              </Tooltip>
+            )}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  className={cn("shrink-0", ownedSelected.length > 0 && "text-destructive")}
+                  disabled={isBusy || ownedSelected.length === 0}
+                  onClick={() => setConfirmDeleteOpen(true)}
+                  aria-label={deleteLabel}
+                  data-testid="bulk-delete"
+                >
+                  {bulkDelete.isPending ? (
+                    <Loader2Icon className="size-3.5 animate-spin" />
+                  ) : (
+                    <Trash2Icon className="size-3.5" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">{deleteLabel}</TooltipContent>
+            </Tooltip>
+          </div>
         </div>
 
         {(bulkArchive.isError || bulkDelete.isError) && (

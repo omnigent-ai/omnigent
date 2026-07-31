@@ -629,6 +629,10 @@ module = "claude_agent_sdk.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = ["copilot", "copilot.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "agents.*"
 ignore_missing_imports = true
 
