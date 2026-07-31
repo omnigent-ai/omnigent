@@ -254,6 +254,7 @@ def create_host_tunnel_router(
                 user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
+                gateway_inference=frame.gateway_inference,
             )
 
             conn = host_registry.register(
@@ -482,8 +483,12 @@ async def _receive_loop(
                 host_store.update_harness_readiness,
                 host_id,
                 frame.configured_harnesses,
+                frame.gateway_inference,
             )
             conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            conn.hello.gateway_inference = (
+                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
+            )
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)
@@ -628,6 +633,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -640,6 +646,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )

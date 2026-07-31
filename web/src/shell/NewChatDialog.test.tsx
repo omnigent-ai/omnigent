@@ -3172,6 +3172,49 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(screen.getByTestId(siblingTestId)).toBeTruthy();
   });
 
+  // Per-family gateway gating: the apply layer rewrites the model through the
+  // workspace AI gateway, so a family the host doesn't back there can't be
+  // routed — and each dialog gates on its OWN family only.
+  it.each([
+    ["Claude Code", "a1", { "claude-native": false }, false],
+    ["Claude Code", "a1", { "claude-native": true }, true],
+    ["Claude Code", "a1", { "codex-native": false }, true],
+    ["Codex", "a2", { "codex-native": false }, false],
+    ["Codex", "a2", { "codex-native": true }, true],
+    ["Codex", "a2", { "claude-native": false }, true],
+  ] as const)(
+    "%s Model dropdown with gateway_inference %j offers Smart Routing: %s",
+    (_label, agentId, gateway, offered) => {
+      mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+      renderLanding({ smart_routing_enabled: true });
+      openAgentConfig(agentId);
+      if (!offered && agentId === "a2") {
+        // Codex's Model row is only ever there for Smart Routing.
+        expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+        expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
+        return;
+      }
+      openSelect("new-chat-landing-config-model");
+      if (offered) {
+        expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
+      } else {
+        expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
+        expect(screen.getByRole("option", { name: "Opus 4.8" })).toBeTruthy();
+      }
+    },
+  );
+
+  it("offers Smart Routing on a host that reports no gateway_inference at all", () => {
+    // Older host / server: unknown must not gate the option away.
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    openSelect("new-chat-landing-config-model");
+    expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
+    closeMenu();
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
+  });
+
   it("freezes Effort to an em-dash while Smart Routing is selected", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("a1");
@@ -3596,6 +3639,55 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     renderLanding({ smart_routing_enabled: true });
     openPicker();
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
+  });
+
+  // The five-arm menu needs both families on the workspace AI gateway, so
+  // either one the host doesn't back takes the whole row away.
+  it.each([
+    ["codex isn't gateway-backed", { "claude-native": true, "codex-native": false }],
+    ["claude isn't gateway-backed", { "claude-native": false, "codex-native": true }],
+    ["neither is gateway-backed", { "claude-native": false, "codex-native": false }],
+  ])("hides the row when %s", (_case, gateway) => {
+    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+    renderLanding({ smart_routing_enabled: true });
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+  });
+
+  it.each([
+    ["both families gateway-backed", { "claude-native": true, "codex-native": true }],
+    ["the host reports nothing", undefined],
+    ["the host reports another family only", { "claude-sdk": false }],
+  ])("shows the row when %s", (_case, gateway) => {
+    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+    renderLanding({ smart_routing_enabled: true });
+    openPicker();
+    expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
+  });
+
+  it("announces the gateway as the cause when a host switch takes the row away", async () => {
+    mockHosts([
+      { ...host("online", 1), gateway_inference: { "claude-native": true, "codex-native": true } },
+      { ...host("online", 2), gateway_inference: { "claude-native": true, "codex-native": false } },
+    ] as Host[]);
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    expect(screen.queryByTestId("new-chat-landing-smart-routing-dropped")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const target = screen
+      .getAllByText("machine-2")
+      .find((el) => el.closest('[role="menuitem"]') !== null);
+    fireEvent.click(target!);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-2"),
+    );
+
+    const notice = await screen.findByTestId("new-chat-landing-smart-routing-dropped");
+    expect(notice.textContent).toContain(
+      "needs Codex running on the workspace AI gateway on machine-2",
+    );
   });
 
   it("hides the row when only one native wrapper agent is registered", () => {

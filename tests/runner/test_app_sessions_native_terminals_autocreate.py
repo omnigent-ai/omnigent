@@ -988,7 +988,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # ``omnigent.claude_native`` per call, so patch it at the source.
     monkeypatch.setattr(
         "omnigent.claude_native._ucode_config_for_profile",
-        lambda profile: ucode,
+        lambda profile, *, refresh_models=True: ucode,
     )
 
     captured: dict[str, Any] = {}

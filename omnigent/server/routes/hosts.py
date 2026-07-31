@@ -268,7 +268,9 @@ async def _proxy_install_harness(
     :param harness: The UI harness identifier to install, e.g. ``"claude"``.
     :returns: Dict with the result fields: ``status`` (``"ok"`` /
         ``"failed"``), ``configured_harnesses`` (the refreshed readiness map or
-        ``None``), ``error`` (string or ``None``).
+        ``None``), ``gateway_inference`` (the refreshed per-harness
+        AI-Gateway-backed inference map or ``None``), ``error`` (string or
+        ``None``).
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
     request_id = secrets.token_hex(8)
@@ -328,7 +330,8 @@ async def _proxy_store_secret(
     :param host_registry: Server-side registry; used to enqueue the frame.
     :param host_conn: Live host connection.
     :param frame: The store-secret frame to forward (carries the secret).
-    :returns: Dict with ``status`` / ``configured_harnesses`` / ``error``.
+    :returns: Dict with ``status`` / ``configured_harnesses`` /
+        ``gateway_inference`` / ``error``.
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
     request_id = frame.request_id
@@ -557,7 +560,10 @@ def create_hosts_router(
         information for online hosts.
 
         :param request: The incoming request (for auth).
-        :returns: ``{"hosts": [...]}`` with host details.
+        :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
+            ``name``, ``owner``, ``status``, ``sandbox_provider``,
+            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
+            the host never reported it).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -595,6 +601,9 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    # ``None`` means the host never reported it — emitted as-is
+                    # so a client can tell "unknown" from "not gateway-backed".
+                    "gateway_inference": host.gateway_inference,
                 }
             )
         return {"hosts": result}
@@ -606,7 +615,8 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
-        :returns: Host details dict.
+        :returns: Host details dict — the ``list_hosts`` fields (including
+            ``gateway_inference``, ``None`` when unreported) plus ``runners``.
         :raises HTTPException: 404 if the host does not exist.
         """
         # require_user: with an auth provider configured, an
@@ -633,6 +643,9 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            # ``None`` means the host never reported it — emitted as-is so a
+            # client can tell "unknown" from "not gateway-backed".
+            "gateway_inference": host.gateway_inference,
             "runners": [],
         }
 
@@ -1225,8 +1238,10 @@ def create_hosts_router(
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param harness: Harness identifier to install, e.g. ``"claude"``.
         :returns: ``{"object": "harness_install", "harness": ...,
-            "configured_harnesses": {...}}`` — the host's refreshed readiness
-            map so the UI can flip the badge without a reconnect.
+            "configured_harnesses": {...}, "gateway_inference": {...} | None}``
+            — the host's refreshed readiness map so the UI can flip the badge
+            without a reconnect, plus its refreshed gateway-inference map
+            (``None`` when the host didn't report one).
         :raises HTTPException: 404 when the feature is disabled or the host is
             unknown, 400 when the harness is not UI-installable, 403 when the
             caller is not the host owner, 409 when the host is offline, 502 on
@@ -1297,6 +1312,8 @@ def create_hosts_router(
             "object": "harness_install",
             "harness": harness,
             "configured_harnesses": result.get("configured_harnesses") or {},
+            # Passed through as-is: ``None`` is "unknown", not "none backed".
+            "gateway_inference": result.get("gateway_inference"),
         }
 
     @router.post("/hosts/{host_id}/harnesses/{harness}/credential")
@@ -1327,8 +1344,10 @@ def create_hosts_router(
         :param harness: Harness being configured, e.g. ``"claude"``.
         :param body: The credential payload (kind + secret / gateway / adopt).
         :returns: ``{"object": "harness_credential", "harness": ...,
-            "configured_harnesses": {...}}`` — refreshed readiness so the UI can
-            flip the badge without a reconnect.
+            "configured_harnesses": {...}, "gateway_inference": {...} | None}``
+            — refreshed readiness so the UI can flip the badge without a
+            reconnect, plus the refreshed gateway-inference map (``None`` when
+            the host didn't report one).
         :raises HTTPException: 404 when disabled or host unknown, 400 when the
             harness isn't UI-configurable or the body is invalid, 403 when not
             the owner, 409 when offline, 502 on host-side failure, 504 on
@@ -1396,6 +1415,8 @@ def create_hosts_router(
             "object": "harness_credential",
             "harness": harness,
             "configured_harnesses": result.get("configured_harnesses") or {},
+            # Passed through as-is: ``None`` is "unknown", not "none backed".
+            "gateway_inference": result.get("gateway_inference"),
         }
 
     @router.get("/hosts/{host_id}/credentials/detected")

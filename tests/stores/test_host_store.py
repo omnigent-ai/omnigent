@@ -180,6 +180,54 @@ def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> No
     assert fetched.status == "online"
 
 
+def test_upsert_persists_and_resets_gateway_inference(host_store: HostStore) -> None:
+    host_id = "7f97ff655a2e6c8179bd67f6a386c6d7"
+    host_store.upsert_on_connect(
+        host_id=host_id,
+        name="laptop-gw",
+        user_id="alice@example.com",
+        configured_harnesses={"codex": True},
+        gateway_inference={"codex": True, "claude-native": False},
+    )
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.gateway_inference == {"codex": True, "claude-native": False}
+
+    # Reconnect from a build that doesn't report it: back to unknown (NULL),
+    # never a stale map and never {}.
+    host_store.upsert_on_connect(
+        host_id=host_id,
+        name="laptop-gw",
+        user_id="alice@example.com",
+    )
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.gateway_inference is None
+
+
+def test_update_harness_readiness_replaces_gateway_inference(host_store: HostStore) -> None:
+    host_id = "8a08009766395d81709d78060497d7e8"
+    host_store.upsert_on_connect(
+        host_id=host_id,
+        name="laptop-gw-live",
+        user_id="alice@example.com",
+        configured_harnesses={"codex": True},
+        gateway_inference={"codex": False},
+    )
+
+    host_store.update_harness_readiness(host_id, {"codex": True}, {"codex": True})
+
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.gateway_inference == {"codex": True}
+
+    # A refresh with no gateway map clears it back to unknown.
+    host_store.update_harness_readiness(host_id, {"codex": True})
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.gateway_inference is None
+
+
 def test_malformed_configured_harnesses_column_reads_as_none(
     host_store: HostStore,
     db_uri: str,

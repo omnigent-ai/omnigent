@@ -6726,10 +6726,15 @@ def test_resolve_native_claude_config_global_databricks_auth_uses_ucode(
         api_key_helper="databricks auth token",
         model="databricks-claude",
     )
-    seen: dict[str, str | None] = {}
+    seen: dict[str, str | bool | None] = {}
 
-    def _fake_ucode(profile: str | None) -> claude_native.ClaudeNativeUcodeConfig:
+    def _fake_ucode(
+        profile: str | None,
+        *,
+        refresh_models: bool = True,
+    ) -> claude_native.ClaudeNativeUcodeConfig:
         seen["profile"] = profile
+        seen["refresh_models"] = refresh_models
         return sentinel
 
     monkeypatch.setattr(claude_native, "_ucode_config_for_profile", _fake_ucode)
@@ -6738,6 +6743,8 @@ def test_resolve_native_claude_config_global_databricks_auth_uses_ucode(
     assert cfg is sentinel
     # The global auth block's profile was threaded to the ucode path.
     assert seen["profile"] == "oss"
+    # Launch resolution keeps refreshing the model catalog by default.
+    assert seen["refresh_models"] is True
 
 
 def test_resolve_native_claude_config_databricks_provider_uses_ucode(
@@ -6752,7 +6759,7 @@ def test_resolve_native_claude_config_databricks_provider_uses_ucode(
     monkeypatch.setattr(
         claude_native,
         "_ucode_config_for_profile",
-        lambda profile: seen.setdefault("profile", profile),
+        lambda profile, *, refresh_models=True: seen.setdefault("profile", profile),
     )
 
     claude_native.resolve_native_claude_config(spec=_no_auth_claude_spec())

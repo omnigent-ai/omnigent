@@ -122,6 +122,7 @@ import {
 } from "@/lib/agentLabels";
 import {
   SMART_ROUTING_ARMS,
+  hostBacksHarnessWithGateway,
   smartRoutingDroppedMessage,
   smartRoutingUnavailableReason,
   type SmartRoutingUnavailableCause,
@@ -2365,13 +2366,25 @@ export function NewChatLandingScreen() {
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
+  // Warn-only readiness signal for the agent picker: only meaningful when
+  // a connected host is selected (a sandbox provisions its own tooling).
+  // Selection stays allowed — the host re-checks at launch and the create
+  // call surfaces a specific error if the harness really can't run.
+  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   // Smart Routing as a Model choice is offered on the two native harnesses
   // whose running CLI accepts a per-turn model switch (the server injects
   // ``/model`` when cost_control_mode_override is "on"). Everything else routes
   // via the fully-auto harness instead, which picks harness + model up front.
+  // Each family gates on its OWN inference: the apply layer rewrites the model
+  // through the workspace AI gateway, so a host whose Claude Code runs off
+  // something else can still offer routing on Codex, and vice versa.
   const smartRoutingEligible =
     smartRoutingEnabled &&
-    (selectedNativeHarness === "claude-native" || selectedNativeHarness === "codex-native");
+    ((selectedNativeHarness === "claude-native" &&
+      hostBacksHarnessWithGateway(harnessWarningHost, "claude-native")) ||
+      (selectedNativeHarness === "codex-native" &&
+        hostBacksHarnessWithGateway(harnessWarningHost, "codex-native")));
   // Top-level Smart Routing (the "Harnesses" row, no bundle agent): the router
   // picks native Claude Code or Codex per task. It rides a placeholder wrapper
   // agent for the create call, so the pick lives in pickedHarness alone.
@@ -2604,12 +2617,6 @@ export function NewChatLandingScreen() {
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
   const isNativeTerminalAgent = isNativeCodingAgent(selectedAgent);
-  const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
-  // Warn-only readiness signal for the agent picker: only meaningful when
-  // a connected host is selected (a sandbox provisions its own tooling).
-  // Selection stays allowed — the host re-checks at launch and the create
-  // call surfaces a specific error if the harness really can't run.
-  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   const selectedAgentUnconfigured = harnessUnconfiguredOnHost(
     selectedAgent?.harness,
     harnessWarningHost,
@@ -2637,6 +2644,11 @@ export function NewChatLandingScreen() {
           smartRoutingWrappers.claude != null && smartRoutingWrappers.codex != null,
         unreadyHarnesses: SMART_ROUTING_ARMS.filter((harness) =>
           harnessUnconfiguredOnHost(harness, harnessWarningHost),
+        ),
+        // The five-arm menu the top-level row drives needs BOTH families on the
+        // gateway, so either one the host doesn't back takes the row away.
+        notGatewayBackedHarnesses: SMART_ROUTING_ARMS.filter(
+          (harness) => !hostBacksHarnessWithGateway(harnessWarningHost, harness),
         ),
       }),
     [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost],

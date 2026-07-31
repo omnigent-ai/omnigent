@@ -1735,6 +1735,44 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     return "openai"
 
 
+def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
+    """Inference base URL a resolved launch pins, or None when it defers to Codex's own login.
+
+    Mirrors how the launch is actually applied: the Databricks-profile branch of
+    :func:`build_native_codex_app` derives the base URL from the profile host,
+    while a generic provider carries it inside the generated
+    ``model_providers.…`` config override.
+
+    :param launch: Resolved native-Codex launch, e.g. one returned by
+        :func:`resolve_native_codex_launch`.
+    :returns: The base URL the launch routes through, or ``None`` when the
+        launch pins none.
+    """
+    if launch.profile is not None:
+        host = _databricks_gateway_host(launch.profile)
+        if not host:
+            return None
+        return _databricks_codex_base_url(host.rstrip("/"))
+    for override in launch.config_overrides:
+        _, sep, table = override.partition("=")
+        if not sep or not override.startswith("model_providers."):
+            continue
+        marker = "base_url="
+        index = table.find(marker)
+        if index < 0:
+            continue
+        decoder = json.JSONDecoder()
+        try:
+            base_url, _ = decoder.raw_decode(table[index + len(marker) :])
+        except ValueError:
+            continue
+        if isinstance(base_url, str):
+            return base_url
+    # A cli-config entry pins only a provider *name*; its table lives in the
+    # user's ~/.codex/config.toml, which this process does not read.
+    return None
+
+
 def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCodexLaunch | None:
     """Build a native-Codex launch that routes through a single provider entry.
 

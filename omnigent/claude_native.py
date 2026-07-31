@@ -2099,6 +2099,8 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
 
 def _native_claude_config_from_entry(
     entry: ProviderEntry,
+    *,
+    refresh_models: bool = True,
 ) -> ClaudeNativeUcodeConfig | None:
     """Map a resolved provider entry to a native Claude launch config.
 
@@ -2111,6 +2113,8 @@ def _native_claude_config_from_entry(
       Claude Enterprise seat) — intentional, not a fallback to ucode.
 
     :param entry: The resolved provider entry.
+    :param refresh_models: Forwarded to the ucode path's model discovery; pass
+        ``False`` for a network-free lookup.
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
     from omnigent.onboarding.provider_config import (
@@ -2127,7 +2131,7 @@ def _native_claude_config_from_entry(
         return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
         _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
-        return _ucode_config_for_profile(entry.profile)
+        return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
     _logger.info("native-claude routing: Claude CLI login (subscription provider %r)", entry.name)
     return None
 
@@ -2135,6 +2139,7 @@ def _native_claude_config_from_entry(
 def resolve_native_claude_config(
     *,
     spec: AgentSpec | None,
+    refresh_models: bool = True,
 ) -> ClaudeNativeUcodeConfig | None:
     """Resolve the native Claude Code launch config across all offerings.
 
@@ -2158,6 +2163,9 @@ def resolve_native_claude_config(
 
     :param spec: The agent spec, or ``None`` for the bare ``omnigent
         claude`` launch.
+    :param refresh_models: Query Databricks for the workspace's current Claude
+        model services while resolving the ucode config. Capability checks that
+        only need the routing shape pass ``False`` to stay network-free.
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
     from omnigent.onboarding.detected import effective_config_with_detected
@@ -2175,18 +2183,18 @@ def resolve_native_claude_config(
     if spec is not None:
         entry = _resolve_provider_for_build(spec, harness_type="claude-sdk")
         if entry is not None:
-            return _native_claude_config_from_entry(entry)
-        return _ucode_config_for_profile(spec.executor.profile)
+            return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
+        return _ucode_config_for_profile(spec.executor.profile, refresh_models=refresh_models)
 
     # 2. Spec-less (omnigent claude): explicit default wins first.
     explicit = load_config()
     entry = default_provider_for_harness(explicit, "claude-sdk")
     if entry is not None:
-        return _native_claude_config_from_entry(entry)
+        return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
     # A global databricks auth block → ucode.
     global_auth = _load_global_auth()
     if isinstance(global_auth, DatabricksAuth):
-        return _ucode_config_for_profile(global_auth.profile)
+        return _ucode_config_for_profile(global_auth.profile, refresh_models=refresh_models)
     if global_auth is not None:
         # A global api_key auth: let Claude's own login handle it (parity
         # with the subscription path); the in-process harness would inject
@@ -2195,7 +2203,7 @@ def resolve_native_claude_config(
     # 3. Ambient detection (first run without configure).
     entry = default_provider_for_harness(effective_config_with_detected(explicit), "claude-sdk")
     if entry is not None:
-        return _native_claude_config_from_entry(entry)
+        return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
     _logger.info(
         "native-claude routing: Claude CLI login (no provider configured for the Claude "
         "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "

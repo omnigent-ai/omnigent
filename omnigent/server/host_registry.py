@@ -224,8 +224,8 @@ class HostConnection:
     :param pending_installs: Per-``request_id`` futures for in-flight
         ``host.install_harness`` requests. Resolved when the host sends
         ``host.install_harness_result``. Values carry the result fields
-        (``status``, ``configured_harnesses``, ``error``). Same ``Any``
-        typing rationale as ``pending_stats``.
+        (``status``, ``configured_harnesses``, ``gateway_inference``,
+        ``error``). Same ``Any`` typing rationale as ``pending_stats``.
     :param inflight_installs: Install tasks used to coalesce concurrent
         install requests for the same harness family (a double-click, or
         two spellings of one npm package) onto one in-flight install, so
@@ -235,8 +235,9 @@ class HostConnection:
     :param pending_secret_writes: Per-``request_id`` futures for in-flight
         ``host.store_secret`` requests (a UI-driven harness credential write).
         Resolved when the host sends ``host.store_secret_result``. Values carry
-        the result fields (``status``, ``configured_harnesses``, ``error``) —
-        never the secret. Same ``Any`` typing rationale as ``pending_stats``.
+        the result fields (``status``, ``configured_harnesses``,
+        ``gateway_inference``, ``error``) — never the secret. Same ``Any``
+        typing rationale as ``pending_stats``.
     :param credential_write_lock: Serializes credential writes to this host so
         two overlapping requests (a double-click, or key + gateway in quick
         succession) can't interleave the daemon's non-atomic

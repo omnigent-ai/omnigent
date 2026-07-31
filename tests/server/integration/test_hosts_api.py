@@ -57,6 +57,7 @@ def _websocket_scope(path: str) -> dict[str, object]:
 def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
+    gateway_inference: dict[str, bool] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -64,6 +65,9 @@ def _make_hello(
     :param configured_harnesses: Per-harness readiness map to report,
         e.g. ``{"claude-sdk": True}``; ``None`` mimics an older host
         that doesn't report it.
+    :param gateway_inference: Per-harness AI-Gateway-backed inference map to
+        report, e.g. ``{"claude-native": True}``; ``None`` mimics a host that
+        doesn't report it.
     :returns: JSON-encoded hello frame.
     """
     return encode_host_frame(
@@ -72,6 +76,7 @@ def _make_hello(
             frame_protocol_version=1,
             name=name,
             configured_harnesses=configured_harnesses,
+            gateway_inference=gateway_inference,
         )
     )
 
@@ -106,6 +111,7 @@ async def _connect_host(
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
+    gateway_inference: dict[str, bool] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -115,6 +121,8 @@ async def _connect_host(
     :param name: Host name for the hello frame.
     :param configured_harnesses: Readiness map for the hello frame,
         e.g. ``{"codex": False}``; ``None`` mimics an older host.
+    :param gateway_inference: Gateway-inference map for the hello frame,
+        e.g. ``{"codex": True}``; ``None`` mimics a host that doesn't report it.
     :returns: Connected ASGI communicator.
     """
     path = f"/v1/hosts/{host_id}/tunnel"
@@ -124,7 +132,10 @@ async def _connect_host(
     assert accepted["type"] == "websocket.accept"
 
     await comm.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, configured_harnesses)},
+        {
+            "type": "websocket.receive",
+            "text": _make_hello(name, configured_harnesses, gateway_inference),
+        },
     )
     while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
@@ -296,6 +307,61 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
 
     assert resp.status_code == 200
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
+
+
+async def test_hosts_api_surfaces_gateway_inference(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the gateway-inference map a host reports in its hello is persisted
+    and surfaced by both GET /v1/hosts and GET /v1/hosts/{id}.
+
+    This is the signal the web UI gates Smart Routing on. If it is dropped
+    anywhere along hello → upsert_on_connect → hosts route, the UI would offer
+    Smart Routing on a host whose apply layer cannot work.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(
+        app,
+        registry,
+        configured_harnesses={"claude-native": True, "codex": True},
+        gateway_inference={"claude-native": True, "codex": False},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["gateway_inference"] == {
+        "claude-native": True,
+        "codex": False,
+    }
+    assert single.status_code == 200
+    assert single.json()["gateway_inference"] == {"claude-native": True, "codex": False}
+
+
+async def test_hosts_api_gateway_inference_null_for_older_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify a host that never reported gateway inference lists with
+    ``gateway_inference`` null — unknown, never ``{}``.
+
+    ``{}`` would gate Smart Routing away from every old host; ``null`` is the
+    contract the web helper keys on to leave it enabled.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["gateway_inference"] is None
+    assert single.status_code == 200
+    assert single.json()["gateway_inference"] is None
 
 
 async def test_get_host_404(
