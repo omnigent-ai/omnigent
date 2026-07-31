@@ -29,8 +29,10 @@ Schema:
 from __future__ import annotations
 
 import time
+from typing import cast
 
 from sqlalchemy import and_, delete, exists, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -392,18 +394,21 @@ class SqlAlchemyAccountStore:
         opaque-to-bruteforce-guessing).
         """
         with self._session() as session:
-            result = session.execute(
-                update(SqlAccountToken)
-                .where(
-                    and_(
-                        SqlAccountToken.workspace_id == current_workspace_id(),
-                        SqlAccountToken.id == token_id,
-                        SqlAccountToken.kind == encode_account_token_kind(kind),
-                        SqlAccountToken.redeemed_at.is_(None),
-                        SqlAccountToken.expires_at > now_epoch_seconds,
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlAccountToken)
+                    .where(
+                        and_(
+                            SqlAccountToken.workspace_id == current_workspace_id(),
+                            SqlAccountToken.id == token_id,
+                            SqlAccountToken.kind == encode_account_token_kind(kind),
+                            SqlAccountToken.redeemed_at.is_(None),
+                            SqlAccountToken.expires_at > now_epoch_seconds,
+                        )
                     )
-                )
-                .values(redeemed_at=now_epoch_seconds)
+                    .values(redeemed_at=now_epoch_seconds)
+                ),
             )
             if result.rowcount == 0:
                 return None
@@ -421,11 +426,14 @@ class SqlAlchemyAccountStore:
         :returns: The number of rows deleted.
         """
         with self._session() as session:
-            result = session.execute(
-                delete(SqlAccountToken).where(
-                    SqlAccountToken.workspace_id == current_workspace_id(),
-                    SqlAccountToken.expires_at <= now_epoch_seconds,
-                )
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlAccountToken).where(
+                        SqlAccountToken.workspace_id == current_workspace_id(),
+                        SqlAccountToken.expires_at <= now_epoch_seconds,
+                    )
+                ),
             )
             return result.rowcount
 
@@ -457,18 +465,21 @@ class SqlAlchemyAccountStore:
             it was missing / wrong-kind / already-redeemed / expired.
         """
         with self._session() as session:
-            result = session.execute(
-                update(SqlAccountToken)
-                .where(
-                    and_(
-                        SqlAccountToken.workspace_id == current_workspace_id(),
-                        SqlAccountToken.id == token_id,
-                        SqlAccountToken.kind == encode_account_token_kind("invite"),
-                        SqlAccountToken.redeemed_at.is_(None),
-                        SqlAccountToken.expires_at > now_epoch_seconds,
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlAccountToken)
+                    .where(
+                        and_(
+                            SqlAccountToken.workspace_id == current_workspace_id(),
+                            SqlAccountToken.id == token_id,
+                            SqlAccountToken.kind == encode_account_token_kind("invite"),
+                            SqlAccountToken.redeemed_at.is_(None),
+                            SqlAccountToken.expires_at > now_epoch_seconds,
+                        )
                     )
-                )
-                .values(redeemed_at=now_epoch_seconds, user_id=email)
+                    .values(redeemed_at=now_epoch_seconds, user_id=email)
+                ),
             )
             return result.rowcount == 1
 
