@@ -763,6 +763,16 @@ def inject_model_command(
     model = model.strip()
     if not model:
         raise RuntimeError("cursor-native model switch requires a non-empty model id")
+    try:
+        expected_display_name = next(
+            option["displayName"]
+            for option in _live_cursor_model_options()
+            if option.get("id") == model
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise RuntimeError("cursor-native could not verify the live model catalog") from exc
+    except StopIteration as exc:
+        raise RuntimeError(f"cursor model {model!r} is not available in the live catalog") from exc
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
@@ -794,7 +804,8 @@ def inject_model_command(
     time.sleep(_MODEL_PICKER_SETTLE_S)
     # Re-read after the settle: a transient "No matches" can flash mid-filter,
     # and a real match may only resolve once the debounce fires.
-    if _PICKER_NO_MATCH_MARKER in _capture_pane(socket_path, tmux_target):
+    settled_pane = _capture_pane(socket_path, tmux_target)
+    if _PICKER_NO_MATCH_MARKER in settled_pane:
         # Dismiss the picker and clear the composer so the literal "/model <id>"
         # can't be submitted as a chat message, then fail loudly so the web
         # surfaces an honest error instead of silently selecting nothing.
@@ -804,7 +815,35 @@ def inject_model_command(
             f"cursor model {model!r} is not available in the picker (no match); "
             "the model was not switched"
         )
+    highlighted_row = _picker_highlighted_row(settled_pane)
+    if (
+        _PICKER_MATCH_MARKER not in settled_pane
+        or highlighted_row is None
+        or expected_display_name.casefold() not in highlighted_row.casefold()
+    ):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+        _clear_composer(socket_path, tmux_target)
+        raise RuntimeError(
+            f"cursor model {model!r} did not resolve to its exact picker row; "
+            "the model was not switched"
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+
+
+def _live_cursor_model_options() -> list[dict[str, Any]]:
+    """Read the same live catalog that supplies Cursor's Web picker."""
+    from omnigent.cursor_native import list_cursor_cli_model_options
+
+    return list_cursor_cli_model_options()
+
+
+def _picker_highlighted_row(pane: str) -> str | None:
+    """Return the text of Cursor's currently highlighted picker row."""
+    for line in pane.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("→"):
+            return stripped.removeprefix("→").strip()
+    return None
 
 
 def _wait_for_pane_settle(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:

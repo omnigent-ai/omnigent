@@ -6492,12 +6492,16 @@ async def _get_session_snapshot(
         runner_client = get_runner_client()
 
     if refresh_state:
-        # Re-discover runner-backed overlays while continuing to serve the
-        # previous model catalog until the asynchronous refresh replaces it.
+        wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+        # Cursor effort/model changes refresh snapshots; keep its previous
+        # options visible until the asynchronous CLI re-fetch replaces them.
+        # Other live catalogs retain their existing drop-on-refresh contract.
         _invalidate_runner_backed_snapshot_state(
             session_id,
             cancel_inflight=False,
-            drop_model_options=False,
+            drop_model_options=(
+                runner_client is not None and wrapper != _CURSOR_NATIVE_WRAPPER_LABEL_VALUE
+            ),
         )
 
     status = _session_status_from_cache(session_id)

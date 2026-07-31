@@ -1128,15 +1128,18 @@ async def test_session_snapshot_fetches_live_cursor_model_options(
 
 
 @pytest.mark.asyncio
-async def test_cursor_snapshot_refresh_serves_cached_options_while_reloading(
+@pytest.mark.parametrize("wrapper_name", ["cursor", "codex"])
+async def test_snapshot_refresh_scopes_cached_options_to_cursor(
     monkeypatch: pytest.MonkeyPatch,
+    wrapper_name: str,
 ) -> None:
     """
-    ``refresh_state=True`` refreshes Cursor without blanking its picker.
+    ``refresh_state=True`` retains only Cursor's previous picker options.
 
     Browser reloads and effort changes can request a refresh while the runner
     catalog fetch is still in flight. The previous catalog remains available
-    until the live Cursor response replaces it.
+    for Cursor until the live response replaces it; Codex retains its existing
+    drop-on-refresh behavior.
     """
     from omnigent.server.routes import sessions as _mod
 
@@ -1172,7 +1175,7 @@ async def test_cursor_snapshot_refresh_serves_cached_options_while_reloading(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/cursor-model-options"):
+            if url.endswith(f"/{wrapper_name}-model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -1197,7 +1200,10 @@ async def test_cursor_snapshot_refresh_serves_cached_options_while_reloading(
         root_conversation_id="3626053dfa9668a8604cc06e0b590ae0",
         agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         labels={
-            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: getattr(
+                _mod,
+                f"_{wrapper_name.upper()}_NATIVE_WRAPPER_LABEL_VALUE",
+            ),
         },
     )
     conv_store = _ConversationStore(
@@ -1210,7 +1216,8 @@ async def test_cursor_snapshot_refresh_serves_cached_options_while_reloading(
         "3626053dfa9668a8604cc06e0b590ae0",
         refresh_state=True,
     )
-    assert [m.id for m in refreshed.model_options] == ["stale-model"]
+    expected_during_refresh = ["stale-model"] if wrapper_name == "cursor" else []
+    assert [m.id for m in refreshed.model_options] == expected_during_refresh
     await _drain_model_options("3626053dfa9668a8604cc06e0b590ae0")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
@@ -1218,7 +1225,7 @@ async def test_cursor_snapshot_refresh_serves_cached_options_while_reloading(
     )
 
     assert (
-        "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/cursor-model-options"
+        f"/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/{wrapper_name}-model-options"
         in fake_client.get_calls
     )
     assert [m.id for m in snapshot.model_options] == ["fresh-model"]

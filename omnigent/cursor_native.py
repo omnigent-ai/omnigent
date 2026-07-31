@@ -239,6 +239,8 @@ def _cursor_base_display_name(display_name: str) -> str:
 def parse_cursor_cli_model_options(output: str) -> list[dict[str, Any]]:
     """Parse ``cursor-agent models`` output into base-model picker rows."""
     options_by_id: dict[str, dict[str, Any]] = {}
+    default_model_id: str | None = None
+    current_model_id: str | None = None
     for raw_line in output.splitlines():
         match = _CURSOR_MODEL_LINE_RE.fullmatch(raw_line.strip())
         if match is None:
@@ -258,10 +260,16 @@ def parse_cursor_cli_model_options(output: str) -> list[dict[str, Any]]:
                 "isCurrent": False,
             },
         )
-        option["isDefault"] = bool(option["isDefault"] or "default" in tags)
+        if "default" in tags and default_model_id is None:
+            default_model_id = model_id
+        if "current" in tags and current_model_id is None:
+            current_model_id = model_id
     options = list(options_by_id.values())
     if not options:
         raise ValueError("cursor-agent model list did not contain any valid models")
+    for option in options:
+        option["isDefault"] = option["id"] == default_model_id
+        option["isCurrent"] = option["id"] == current_model_id
     return options
 
 

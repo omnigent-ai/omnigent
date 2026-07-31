@@ -202,9 +202,22 @@ def test_parse_cursor_cli_model_options_normalizes_base_ids() -> None:
             "id": "composer-2.5",
             "displayName": "Composer 2.5",
             "isDefault": False,
-            "isCurrent": False,
+            "isCurrent": True,
         },
     ]
+
+
+def test_parse_cursor_cli_model_options_keeps_one_default_and_current() -> None:
+    """Conflicting CLI tags resolve deterministically in catalog order."""
+    models = cursor_native.parse_cursor_cli_model_options(
+        """Available models
+first-high - First High (default, current)
+second-low - Second Low (default, current)
+"""
+    )
+
+    assert [model["id"] for model in models if model["isDefault"]] == ["first"]
+    assert [model["id"] for model in models if model["isCurrent"]] == ["first"]
 
 
 def test_parse_cursor_cli_model_options_logs_unmapped_claude_ids(

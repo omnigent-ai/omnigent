@@ -194,6 +194,11 @@ class TestInjectModelGate:
     ) -> None:
         """A landed filter ("Models matching") commits the selection with Enter."""
         bridge_dir = _prepare_bridge(tmp_path)
+        monkeypatch.setattr(
+            cursor_native_bridge,
+            "_live_cursor_model_options",
+            lambda: [{"id": "gpt-5.2", "displayName": "GPT-5.2"}],
+        )
         captured = _install_fake_tmux(
             monkeypatch, pane_captures=[f'{_IDLE}\nModels matching "gpt-5.2"\n →  GPT-5.2   High']
         )
@@ -211,6 +216,11 @@ class TestInjectModelGate:
     ) -> None:
         """ "No matches" fails loudly, dismisses the picker, and never presses Enter."""
         bridge_dir = _prepare_bridge(tmp_path)
+        monkeypatch.setattr(
+            cursor_native_bridge,
+            "_live_cursor_model_options",
+            lambda: [{"id": "bogus-model", "displayName": "Bogus Model"}],
+        )
         captured = _install_fake_tmux(
             monkeypatch, pane_captures=[f"{_IDLE}\n → /model bogus-model\n    No matches"]
         )
@@ -233,6 +243,11 @@ class TestInjectModelGate:
         matching" header the gate must refuse to press Enter.
         """
         bridge_dir = _prepare_bridge(tmp_path)
+        monkeypatch.setattr(
+            cursor_native_bridge,
+            "_live_cursor_model_options",
+            lambda: [{"id": "gpt-5.2", "displayName": "GPT-5.2"}],
+        )
         captured = _install_fake_tmux(
             monkeypatch, pane_captures=[f"{_IDLE}\n → /model gpt-5.2\n    No matches"]
         )
@@ -242,6 +257,31 @@ class TestInjectModelGate:
             cursor_native_bridge.inject_model_command(bridge_dir, model="gpt-5.2")
 
         assert ["-t", _TARGET, "Enter"] not in _send_keys_calls(captured)
+
+    def test_rejects_fuzzy_match_for_a_different_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fuzzy top result cannot silently select a different catalog row."""
+        bridge_dir = _prepare_bridge(tmp_path)
+        monkeypatch.setattr(
+            cursor_native_bridge,
+            "_live_cursor_model_options",
+            lambda: [{"id": "requested-model", "displayName": "Requested Model"}],
+        )
+        captured = _install_fake_tmux(
+            monkeypatch,
+            pane_captures=[
+                f'{_IDLE}\nModels matching "requested-model"\n →  Different Model   High'
+            ],
+        )
+        monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+
+        with pytest.raises(RuntimeError, match="exact picker row"):
+            cursor_native_bridge.inject_model_command(bridge_dir, model="requested-model")
+
+        tails = _send_keys_calls(captured)
+        assert ["-t", _TARGET, "Enter"] not in tails
+        assert ["-t", _TARGET, "Escape"] in tails
 
 
 class TestHooksConfig:
