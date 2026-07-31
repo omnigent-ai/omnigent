@@ -367,6 +367,7 @@ def _codex_command_approval_response(
         decisions, e.g. ``{"availableDecisions": [...]}``.
     :returns: Codex command approval response payload.
     """
+    decision: str | dict[str, dict[str, list[str]]]
     if method == _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD:
         amendment = _result_execpolicy_amendment(result.content)
         if result.action == "accept" and amendment is not None:

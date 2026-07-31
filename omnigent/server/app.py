@@ -2506,7 +2506,7 @@ class _SPAStaticFiles(StaticFiles):
             return
         await super().__call__(scope, receive, send)
 
-    async def get_response(self, path: str, scope: Scope) -> Response:  # type: ignore[override]
+    async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
         try:
             response = await super().get_response(path, scope)

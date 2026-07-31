@@ -121,7 +121,7 @@ class SqlAlchemyProjectStore(ProjectStore):
 
     def _name_taken(
         self,
-        session,  # type: ignore[no-untyped-def]
+        session,
         *,
         owner_user_id: str | None,
         name: str,

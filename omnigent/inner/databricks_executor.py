@@ -340,7 +340,7 @@ class _DatabricksBearerAuth(httpx.Auth):
 
     def __init__(
         self,
-        config: Any,  # type: ignore[explicit-any]
+        config: Any,
         profile_name: str | None = None,
         failure_message: str | None = None,
     ) -> None:
