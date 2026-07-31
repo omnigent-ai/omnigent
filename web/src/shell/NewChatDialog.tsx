@@ -144,6 +144,7 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
+import type { NativeModelOption } from "@/lib/types";
 import { useProjectConfig, useProjects, moveConversationToProject } from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
@@ -303,6 +304,22 @@ const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
   description: "Runs Codex with no approval prompts and no command sandbox",
   args: [] as string[],
 };
+
+function displayModelId(option: Pick<NativeModelOption, "id">): string {
+  return option.id;
+}
+
+function displayModelName(option: Pick<NativeModelOption, "id" | "displayName">): string {
+  return option.displayName ?? option.id;
+}
+
+function defaultModelLabel(
+  options: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[],
+  display: (option: Pick<NativeModelOption, "id" | "displayName">) => string,
+): string {
+  const dflt = options.find((option) => option.isDefault);
+  return dflt ? `Default (${display(dflt)})` : "Default";
+}
 
 function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
   const isOnline = host.status === "online";
@@ -1224,6 +1241,8 @@ function HarnessConfigModal({
   pickedModel,
   claudeModelOptions,
   claudeModelsLoading,
+  codexModelOptions,
+  codexModelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1248,8 +1267,10 @@ function HarnessConfigModal({
   cursorExecMode: string;
   bypassSandbox: boolean;
   pickedModel: string;
-  claudeModelOptions: readonly { id: string; displayName: string }[];
+  claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
+  codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  codexModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1270,6 +1291,9 @@ function HarnessConfigModal({
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
   const isCodex = entryHarness === "codex-native";
+  const modelOptions = isCodex ? codexModelOptions : claudeModelOptions;
+  const modelsLoading = isCodex ? codexModelsLoading : claudeModelsLoading;
+  const modelDisplay = isCodex ? displayModelId : displayModelName;
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
@@ -1337,9 +1361,14 @@ function HarnessConfigModal({
           mode: draftPermission,
         });
     } else if (hasApproval) {
+      if (isCodex) setPickedModel(draftModel);
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
-      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftApproval });
+      if (entryHarness)
+        writeHarnessOption(entryHarness, {
+          mode: draftApproval,
+          ...(isCodex ? { model: draftModel } : {}),
+        });
     } else if (hasCursor) {
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
@@ -1469,6 +1498,42 @@ function HarnessConfigModal({
                 />
               </ConfigRow>
             </>
+          )}
+
+          {hasApproval && isCodex && (
+            <ConfigRow label="Model" description="Underlying LLM">
+              <Select value={modelValue} onValueChange={onModelChange}>
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="new-chat-landing-config-model"
+                  aria-label="Model"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent
+                  position="popper"
+                  align="start"
+                  className="[&_[data-slot=select-item]]:pl-2.5"
+                >
+                  <SelectItem value={MODEL_SELECT_DEFAULT}>
+                    {defaultModelLabel(modelOptions, modelDisplay)}
+                  </SelectItem>
+                  {modelOptions.map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      {displayModelId(m)}
+                    </SelectItem>
+                  ))}
+                  {modelsLoading && (
+                    <div className="px-2.5 py-1 text-xs text-muted-foreground">Loading models…</div>
+                  )}
+                  {!modelsLoading && modelOptions.length === 0 && (
+                    <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                      Models unavailable
+                    </div>
+                  )}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
           )}
 
           {hasApproval && (
@@ -1765,6 +1830,11 @@ export function NewChatLandingScreen() {
     "claude-native",
     !sandboxSelected,
   );
+  const { data: hostCodexModelOptions, isLoading: hostCodexModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    "codex-native",
+    !sandboxSelected,
+  );
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -1777,6 +1847,10 @@ export function NewChatLandingScreen() {
             displayName: option.displayName ?? option.id,
           })),
     [hostClaudeModelOptions, sandboxSelected],
+  );
+  const codexModelOptions = useMemo(
+    () => (sandboxSelected ? [] : (hostCodexModelOptions ?? [])),
+    [hostCodexModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -2217,7 +2291,17 @@ export function NewChatLandingScreen() {
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
           : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
             approvalMode);
-      return [{ label: "Approval", value: approvalValue }, ...routingRow];
+      const modelRows = isCodex
+        ? [
+            {
+              label: "Model",
+              value:
+                codexModelOptions.find((m) => m.id === pickedModel)?.id ??
+                defaultModelLabel(codexModelOptions, displayModelId),
+            },
+          ]
+        : [];
+      return [...modelRows, { label: "Approval", value: approvalValue }, ...routingRow];
     }
     if (supportsCursorMode) {
       const modeValue =
@@ -2242,6 +2326,7 @@ export function NewChatLandingScreen() {
     routingOn,
     pickedModel,
     claudeModelOptions,
+    codexModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -2308,13 +2393,20 @@ export function NewChatLandingScreen() {
       );
     } else if (supportsApprovalMode) {
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
+      setPickedModel(
+        selectedNativeHarness === "codex-native" &&
+          stored.model != null &&
+          codexModelOptions.some((m) => m.id === stored.model)
+          ? stored.model
+          : "",
+      );
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     }
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness, claudeModelOptions]);
+  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -2804,6 +2896,7 @@ export function NewChatLandingScreen() {
       // straight to that dir, which also sidesteps the "branch already
       // exists" guard.
       const agent = agentList.find((a) => a.id === effectiveAgentId);
+      const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
@@ -2888,11 +2981,14 @@ export function NewChatLandingScreen() {
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
                     : undefined,
             // Model + reasoning effort, persisted on the session row before
-            // the runner launches. Only claude-native surfaces the picker, so
-            // only its agents carry the choice; the runner reads them as
-            // `--model` / `--effort` at terminal launch. An unselected ("")
-            // knob is omitted so Claude Code keeps its own configured model.
-            model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
+            // the runner launches. Claude and Codex read model_override at
+            // terminal launch; an unselected ("") knob is omitted so the
+            // harness keeps its own configured/default model.
+            model_override:
+              (agentSupportsPermissionMode || nativeAgent?.harness === "codex-native") &&
+              pickedModel
+                ? pickedModel
+                : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
             // Smart routing toggle — server-side. The "Auto" harness always
@@ -3370,6 +3466,10 @@ export function NewChatLandingScreen() {
                     claudeModelOptions={claudeModelOptions}
                     claudeModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
+                    }
+                    codexModelOptions={codexModelOptions}
+                    codexModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
                     }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}

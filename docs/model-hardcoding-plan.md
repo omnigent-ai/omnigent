@@ -32,6 +32,10 @@ The remaining pins fall into a few buckets:
 - When a supported file or the baseline changes, `.pre-commit-config.yaml` runs
   the hook across the full tracked lint surface so both new pins and stale
   allowlist counts fail.
+- Unavoidable static aliases pass only when Python AST analysis proves they are
+  confined to complete `StaticModelFallback` records in
+  `omnigent/model_fallbacks.py`, including non-empty owner, provenance, and
+  discovery-gap metadata.
 - New hardcoded ids fail unless the allowlist count is intentionally updated,
   while removing a pin requires lowering or deleting its baseline entry.
 
@@ -200,6 +204,13 @@ Setup prompts, routing policy schemas, and spawn-tool descriptions explain the
 expected provider-configured model value without embedding release-specific ids.
 Concrete examples belong in tests or provider-owned documentation so runtime
 help does not recommend stale models.
+
+## Static Fallback Ownership
+
+The remaining Claude and Codex aliases live only in
+`omnigent/model_fallbacks.py`. Each fallback records its adapter owner, catalog
+provenance, and the discovery gap that prevents a live listing. `sys_list_models`
+surfaces those fields whenever it returns an unverified static catalog.
 
 ## Kimi Example Default
 

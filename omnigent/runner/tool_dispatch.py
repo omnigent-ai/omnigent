@@ -28,13 +28,14 @@ import os
 import re
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
+    from omnigent.spec.types import AgentSpec
 
 import httpx
 
@@ -103,6 +104,31 @@ from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 
 _logger = logging.getLogger(__name__)
 
+_JsonObject = dict[str, object]
+_EventPublisher = Callable[[str, _JsonObject], None]
+
+
+class _DynamicCallable(Protocol):
+    """Callable loaded from an agent spec's dotted Python path."""
+
+    def __call__(self, **kwargs: object) -> object:
+        raise NotImplementedError
+
+
+class _AsyncDynamicCallable(Protocol):
+    """Async callable loaded from an agent spec's dotted Python path."""
+
+    def __call__(self, **kwargs: object) -> Awaitable[object]:
+        raise NotImplementedError
+
+
+def _string_object_dict(value: object) -> _JsonObject | None:
+    """Return *value* as a string-keyed object mapping when valid."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("_JsonObject", value)
+
+
 _INBOX_OUTPUT_MAX_CHARS = 12000
 _OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
 _RUNNER_EXECUTION_TIMEOUT_S = 7200.0
@@ -157,7 +183,7 @@ class _SubagentInboxEvaluation:
         be requeued for a future drain attempt.
     """
 
-    payload: dict[str, Any]
+    payload: _JsonObject
     retry_original: bool = False
 
 
@@ -407,7 +433,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
 )
 
 
-def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
+def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -445,26 +471,32 @@ def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
     )
     from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
-    schemas: list[dict[str, Any]] = []
+    schemas: list[_JsonObject] = []
 
-    def _append(function_dict: dict[str, Any]) -> None:
+    def _append(function_dict: _JsonObject) -> None:
+        name = function_dict.get("name")
+        if not isinstance(name, str):
+            return
+        description = function_dict.get("description")
+        parameters = _string_object_dict(function_dict.get("parameters")) or {
+            "type": "object",
+            "properties": {},
+        }
         schemas.append(
             {
-                "name": function_dict["name"],
-                "description": function_dict.get("description", ""),
-                "parameters": function_dict.get(
-                    "parameters", {"type": "object", "properties": {}}
-                ),
+                "name": name,
+                "description": description if isinstance(description, str) else "",
+                "parameters": parameters,
             }
         )
 
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        for _schema in ToolManager(spec).get_tool_schemas():
-            _fn = _schema["function"]
-            if _fn["name"] in _NATIVE_RELAY_BUILTIN_TOOLS:
-                _append(_fn)
+        for schema in ToolManager(spec).get_tool_schemas():
+            function = _string_object_dict(schema.get("function"))
+            if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
+                _append(function)
     else:
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
 
@@ -481,7 +513,12 @@ def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
             SysAddPolicyTool,
             SysPolicyRegistryTool,
         ):
-            _append(_cls().get_schema()["function"])
+            fallback_schema = _string_object_dict(_cls().get_schema())
+            if fallback_schema is None:
+                continue
+            function = _string_object_dict(fallback_schema.get("function"))
+            if function is not None:
+                _append(function)
 
     # OS tools (sys_os_*), relayed unconditionally to override any harness-static
     # versions and centralize policy enforcement. Create a minimal OSEnvironment
@@ -497,14 +534,23 @@ def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
     )
     try:
         _os_env = create_os_environment(_os_spec)
-        for _tool in (
-            SysOsReadTool(_os_env),
-            SysOsWriteTool(_os_env),
-            SysOsEditTool(_os_env),
-            SysOsShellTool(_os_env),
-        ):
-            _append(_tool.get_schema()["function"])
-        _os_env.close()
+        if _os_env is None:
+            raise RuntimeError("OSEnvironment factory returned None")
+        try:
+            for tool in (
+                SysOsReadTool(_os_env),
+                SysOsWriteTool(_os_env),
+                SysOsEditTool(_os_env),
+                SysOsShellTool(_os_env),
+            ):
+                tool_schema = _string_object_dict(tool.get_schema())
+                function = (
+                    _string_object_dict(tool_schema.get("function")) if tool_schema else None
+                )
+                if function is not None:
+                    _append(function)
+        finally:
+            _os_env.close()
     except Exception:  # noqa: BLE001 — OS env setup is best-effort for schema only
         _logger.debug("Could not create OSEnvironment for native relay OS tool schemas")
 
@@ -548,27 +594,35 @@ _ALL_LOCAL_TOOLS = (
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
 
-def is_action_required(event: dict[str, Any]) -> bool:
+def _event_item(event: _JsonObject) -> _JsonObject:
+    """Return an event's item object, or an empty object when malformed."""
+    return _string_object_dict(event.get("item")) or {}
+
+
+def is_action_required(event: _JsonObject) -> bool:
     """Check if an SSE event is an action_required tool call."""
     if event.get("type") != "response.output_item.done":
         return False
-    item = event.get("item") or {}
+    item = _event_item(event)
     return item.get("type") == "function_call" and item.get("status") == "action_required"
 
 
-def get_tool_name(event: dict[str, Any]) -> str:
+def get_tool_name(event: _JsonObject) -> str:
     """Extract the tool name from an action_required event."""
-    return (event.get("item") or {}).get("name", "")
+    name = _event_item(event).get("name")
+    return name if isinstance(name, str) else ""
 
 
-def get_call_id(event: dict[str, Any]) -> str:
+def get_call_id(event: _JsonObject) -> str:
     """Extract the call_id from an action_required event."""
-    return (event.get("item") or {}).get("call_id", "")
+    call_id = _event_item(event).get("call_id")
+    return call_id if isinstance(call_id, str) else ""
 
 
-def get_arguments(event: dict[str, Any]) -> str:
+def get_arguments(event: _JsonObject) -> str:
     """Extract the arguments JSON string from an action_required event."""
-    return (event.get("item") or {}).get("arguments", "{}")
+    arguments = _event_item(event).get("arguments")
+    return arguments if isinstance(arguments, str) else "{}"
 
 
 def should_dispatch_locally(tool_name: str) -> bool:
@@ -582,8 +636,8 @@ def should_dispatch_locally(tool_name: str) -> bool:
     return tool_name in _ALL_LOCAL_TOOLS
 
 
-def _is_spec_local_python_tool(tool_name: str, agent_spec: Any | None) -> bool:
-    local_tools = getattr(agent_spec, "local_tools", None) or []
+def _is_spec_local_python_tool(tool_name: str, agent_spec: AgentSpec | None) -> bool:
+    local_tools = agent_spec.local_tools if agent_spec is not None else []
     return any(
         getattr(info, "name", None) == tool_name
         and getattr(info, "language", None) == "python"
@@ -596,7 +650,7 @@ async def _execute_local_python_tool(
     tool_name: str,
     args: str,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     task_id: str | None,
     agent_id: str | None,
@@ -612,7 +666,7 @@ async def _execute_local_python_tool(
             workspace.mkdir(parents=True, exist_ok=True)
         ctx = ToolContext(
             task_id=task_id or conversation_id or "runner-local-tool",
-            agent_id=agent_id or getattr(agent_spec, "name", "runner-agent") or "runner-agent",
+            agent_id=agent_id or agent_spec.name or "runner-agent",
             workspace=workspace,
             conversation_id=conversation_id,
         )
@@ -626,13 +680,13 @@ async def _execute_local_python_tool(
 
 # Cache of resolved callables keyed by dotted path. Avoids
 # re-importing on every invocation of the same tool.
-_callable_cache: dict[str, Callable[..., Any]] = {}
+_callable_cache: dict[str, _DynamicCallable] = {}
 
 
 def _resolve_spec_callable(
     tool_name: str,
-    agent_spec: Any | None,
-) -> Callable[..., Any] | str:
+    agent_spec: AgentSpec | None,
+) -> _DynamicCallable | str:
     """
     Look up a custom callable tool in the agent spec and resolve it.
 
@@ -650,7 +704,7 @@ def _resolve_spec_callable(
 
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
-    local_tools = getattr(agent_spec, "local_tools", None) or []
+    local_tools = agent_spec.local_tools or []
     tool_info = next((lt for lt in local_tools if lt.name == tool_name), None)
     if tool_info is None or not tool_info.path:
         return f"Error: {tool_name} not in local dispatch table"
@@ -663,17 +717,18 @@ def _resolve_spec_callable(
         return f"Error: {tool_name} has invalid callable path {dotted_path!r}"
     mod = importlib.import_module(module_name)
     fn = getattr(mod, attr_name, None)
-    if fn is None:
+    if not callable(fn):
         return f"Error: {tool_name}: module {module_name!r} has no attribute {attr_name!r}"
-    _callable_cache[dotted_path] = fn
-    return fn
+    resolved = cast("_DynamicCallable", fn)
+    _callable_cache[dotted_path] = resolved
+    return resolved
 
 
 async def _execute_spec_callable_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Execute a custom callable tool defined in the agent spec YAML.
@@ -693,7 +748,8 @@ async def _execute_spec_callable_tool(
     if isinstance(resolved, str):
         return resolved
     if asyncio.iscoroutinefunction(resolved):
-        result = await resolved(**args)
+        async_callable = cast("_AsyncDynamicCallable", resolved)
+        result = await async_callable(**args)
     else:
         result = await asyncio.to_thread(resolved, **args)
     return str(result) if result is not None else ""
@@ -707,7 +763,7 @@ async def _execute_spec_callable_tool(
 
 def _is_uc_function_tool(
     tool_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
 ) -> bool:
     """
     Check whether *tool_name* is a UC function tool in the spec.
@@ -721,7 +777,7 @@ def _is_uc_function_tool(
     """
     if agent_spec is None:
         return False
-    local_tools = getattr(agent_spec, "local_tools", None) or []
+    local_tools = agent_spec.local_tools
     from omnigent.spec.types import ToolRuntime
 
     return any(
@@ -729,7 +785,7 @@ def _is_uc_function_tool(
     )
 
 
-def _resolve_uc_profile(agent_spec: Any) -> str | None:
+def _resolve_uc_profile(agent_spec: AgentSpec) -> str | None:
     """
     Extract the Databricks profile from the agent spec's executor
     auth configuration.
@@ -742,27 +798,28 @@ def _resolve_uc_profile(agent_spec: Any) -> str | None:
     :returns: The profile name, e.g. ``"oss"``, or ``None`` for
         SDK default resolution.
     """
-    executor = getattr(agent_spec, "executor", None)
-    if executor is None:
-        return None
+    executor = agent_spec.executor
     # Preferred: executor.auth.profile (DatabricksAuth).
-    auth = getattr(executor, "auth", None)
-    if auth is not None and hasattr(auth, "profile"):
-        return auth.profile
+    auth = executor.auth
+    auth_profile = getattr(auth, "profile", None)
+    if isinstance(auth_profile, str) and auth_profile:
+        return auth_profile
     # Deprecated: executor.profile.
-    profile = getattr(executor, "profile", None)
-    if profile:
-        return profile
+    if executor.profile:
+        return executor.profile
     # Compat bridge: executor.config["profile"].
-    config = getattr(executor, "config", None) or {}
-    return config.get("profile")
+    config = _string_object_dict(getattr(executor, "config", None))
+    if config is None:
+        return None
+    profile = config.get("profile")
+    return profile if isinstance(profile, str) and profile else None
 
 
 async def _execute_uc_function_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Execute a Unity Catalog function tool and return the output
@@ -783,7 +840,9 @@ async def _execute_uc_function_tool(
     """
     from omnigent.runner.uc_function import execute_uc_function
 
-    local_tools = getattr(agent_spec, "local_tools", None) or []
+    if agent_spec is None:
+        return f"Error: {tool_name} is not a UC function tool"
+    local_tools = agent_spec.local_tools
     tool_info = next((lt for lt in local_tools if lt.name == tool_name), None)
     if tool_info is None or tool_info.catalog_path is None:
         return f"Error: {tool_name} is not a UC function tool"
@@ -814,7 +873,7 @@ class _SubagentLabel:
     title: str | None
 
 
-def _subagent_label(child: dict[str, Any]) -> _SubagentLabel:
+def _subagent_label(child: _JsonObject) -> _SubagentLabel:
     """
     Extract child identity fields from a child-session summary.
 
@@ -831,7 +890,7 @@ def _subagent_label(child: dict[str, Any]) -> _SubagentLabel:
     )
 
 
-def _session_wrapper_label(session_payload: dict[str, Any]) -> str | None:
+def _session_wrapper_label(session_payload: _JsonObject) -> str | None:
     """
     Extract the native terminal wrapper label from a session payload.
 
@@ -839,8 +898,8 @@ def _session_wrapper_label(session_payload: dict[str, Any]) -> str | None:
         ``{"labels": {"omnigent.wrapper": "codex-native-ui"}}``.
     :returns: Wrapper label value, or ``None`` when absent.
     """
-    labels = session_payload.get("labels")
-    if not isinstance(labels, dict):
+    labels = _string_object_dict(session_payload.get("labels"))
+    if labels is None:
         return None
     wrapper = labels.get(_SESSION_WRAPPER_LABEL_KEY)
     return wrapper if isinstance(wrapper, str) and wrapper else None
@@ -853,7 +912,7 @@ def _publish_child_launching_update(
     title: str,
     tool: str,
     session_name: str,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
+    publish_event: _EventPublisher | None,
 ) -> None:
     """
     Publish the honest pre-start child state to the parent stream.
@@ -862,7 +921,7 @@ def _publish_child_launching_update(
     a busy edge yet. Surfacing ``launching`` prevents the UI/orchestrator from
     mistaking session bookkeeping for a running worker.
     """
-    event = {
+    event: _JsonObject = {
         "type": "session.child_session.updated",
         "conversation_id": parent_session_id,
         "child_session_id": child_session_id,
@@ -890,7 +949,7 @@ async def _list_child_sessions(
     limit: int = 100,
     tool: str | None = None,
     session_name: str | None = None,
-) -> list[dict[str, Any]] | str:
+) -> list[_JsonObject] | str:
     """
     Fetch child-session summaries for a parent session.
 
@@ -903,7 +962,7 @@ async def _list_child_sessions(
     :param session_name: See ``tool``.
     :returns: List of child summary dicts, or an error string.
     """
-    params: dict[str, Any] = {"limit": limit, "order": "desc"}
+    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
     if tool and session_name:
         params["tool"] = tool
         params["session_name"] = session_name
@@ -914,11 +973,12 @@ async def _list_child_sessions(
     )
     if resp.status_code >= 400:
         return f"Error: failed to list child sessions: {resp.status_code} {resp.text[:200]}"
-    payload = resp.json()
-    data = payload.get("data")
+    decoded: object = resp.json()
+    payload = _string_object_dict(decoded)
+    data = payload.get("data") if payload is not None else None
     if not isinstance(data, list):
         return "Error: server child_sessions response missing data list"
-    return [item for item in data if isinstance(item, dict)]
+    return [item for raw in data if (item := _string_object_dict(raw)) is not None]
 
 
 async def _find_existing_child_session(
@@ -927,7 +987,7 @@ async def _find_existing_child_session(
     conversation_id: str,
     agent: str,
     title: str,
-) -> dict[str, Any] | str | None:
+) -> _JsonObject | str | None:
     """
     Find an existing child session by ``(agent, title)``.
 
@@ -954,13 +1014,21 @@ async def _find_existing_child_session(
     if isinstance(children, str):
         return children
     for child in children:
-        if is_session_closed(child.get("labels"), child.get("title")):
+        raw_labels = _string_object_dict(child.get("labels"))
+        labels = (
+            {key: value for key, value in raw_labels.items() if isinstance(value, str)}
+            if raw_labels is not None
+            else None
+        )
+        title_value = child.get("title")
+        session_title = title_value if isinstance(title_value, str) else None
+        if is_session_closed(labels, session_title):
             continue
         return child
     return None
 
 
-def _subagent_message_from_args(args: dict[str, Any]) -> str | None:
+def _subagent_message_from_args(args: _JsonObject) -> str | None:
     """
     Extract the user message from ``sys_session_send`` arguments.
 
@@ -994,8 +1062,10 @@ async def _session_turn_actor(
         return None
     if resp.status_code != 200:
         return None
-    labels = resp.json().get("labels")
-    if not isinstance(labels, dict):
+    decoded: object = resp.json()
+    payload = _string_object_dict(decoded)
+    labels = _string_object_dict(payload.get("labels")) if payload is not None else None
+    if labels is None:
         return None
     actor = labels.get(_TURN_ACTOR_LABEL)
     return actor if isinstance(actor, str) and actor else None
@@ -1005,12 +1075,12 @@ async def _post_child_message_event(
     server_client: httpx.AsyncClient,
     session_id: str,
     *,
-    content: list[dict[str, Any]],
+    content: list[_JsonObject],
     created_by: str | None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
 
-    def _payload(actor: str | None) -> dict[str, Any]:
+    def _payload(actor: str | None) -> _JsonObject:
         return {
             "type": "message",
             "data": {
@@ -1044,7 +1114,7 @@ async def _post_child_message_event(
     )
 
 
-def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
+def _subagent_model_from_args(args: _JsonObject) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
 
@@ -1070,7 +1140,7 @@ def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
     return validate_model_override(raw_model)
 
 
-def _subagent_file_ids_from_args(args: dict[str, Any]) -> list[str]:
+def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
 
@@ -1171,7 +1241,7 @@ class CopyResult:
     :param error: A human-readable error string, or ``None`` on success.
     """
 
-    content: list[dict[str, Any]] | None = None
+    content: list[_JsonObject] | None = None
     error: str | None = None
 
 
@@ -1208,7 +1278,7 @@ async def _build_subagent_message_content(
     :returns: A :class:`CopyResult` — ``content`` set on success, ``error``
         set when the copy fails (surfaced to the parent agent).
     """
-    content: list[dict[str, Any]] = [{"type": "input_text", "text": str(message)}]
+    content: list[_JsonObject] = [{"type": "input_text", "text": str(message)}]
     if not file_ids:
         return CopyResult(content=content)
 
@@ -1230,13 +1300,15 @@ async def _build_subagent_message_content(
             )
         )
 
-    mapping = copy_resp.json().get("mapping")
-    if not isinstance(mapping, dict):
+    decoded: object = copy_resp.json()
+    payload = _string_object_dict(decoded)
+    mapping = _string_object_dict(payload.get("mapping")) if payload is not None else None
+    if mapping is None:
         return CopyResult(error="Error: file copy response missing 'mapping'")
 
     for old_id in file_ids:
-        entry = mapping.get(old_id)
-        if not isinstance(entry, dict):
+        entry = _string_object_dict(mapping.get(old_id))
+        if entry is None:
             return CopyResult(error=f"Error: file copy mapping missing entry for {old_id!r}")
         new_id = entry.get("new_id")
         if not isinstance(new_id, str) or not new_id:
@@ -1244,7 +1316,8 @@ async def _build_subagent_message_content(
         # The copy response preserves the source's content_type, so the
         # image-vs-file split uses the true type — no per-file metadata GET.
         # Fall back to a filename guess only when the source had none.
-        content_type = entry.get("content_type")
+        raw_content_type = entry.get("content_type")
+        content_type = raw_content_type if isinstance(raw_content_type, str) else ""
         if not content_type:
             filename = entry.get("filename")
             guessed, _ = (
@@ -1257,7 +1330,7 @@ async def _build_subagent_message_content(
     return CopyResult(content=content)
 
 
-def _find_subagent_spec(sub_agent_name: str, agent_spec: Any | None) -> Any | None:
+def _find_subagent_spec(sub_agent_name: str, agent_spec: AgentSpec | None) -> AgentSpec | None:
     """
     Look up a named sub-agent's spec in the parent's ``sub_agents`` list.
 
@@ -1269,13 +1342,13 @@ def _find_subagent_spec(sub_agent_name: str, agent_spec: Any | None) -> Any | No
     """
     if agent_spec is None:
         return None
-    for sa in getattr(agent_spec, "sub_agents", None) or []:
-        if getattr(sa, "name", None) == sub_agent_name:
-            return sa
+    for sub_agent in agent_spec.sub_agents:
+        if sub_agent.name == sub_agent_name:
+            return sub_agent
     return None
 
 
-def _subagent_harness(sub_agent_name: str, agent_spec: Any | None) -> str | None:
+def _subagent_harness(sub_agent_name: str, agent_spec: AgentSpec | None) -> str | None:
     """
     Resolve the declared harness for a named sub-agent.
 
@@ -1296,7 +1369,7 @@ def _subagent_harness(sub_agent_name: str, agent_spec: Any | None) -> str | None
     return spec_harness(sub_spec) if sub_spec is not None else None
 
 
-def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
+def _subagent_harness_override_from_args(args: _JsonObject) -> str | None:
     """
     Extract a per-dispatch harness override from ``sys_session_send`` args.
 
@@ -1321,8 +1394,8 @@ def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
 
 
 def _subagent_cost_budget_from_args(
-    args: dict[str, Any],
-) -> dict[str, Any] | None:
+    args: _JsonObject,
+) -> _JsonObject | None:
     """
     Extract and validate the per-dispatch cost budget from ``sys_session_send`` args.
 
@@ -1344,16 +1417,19 @@ def _subagent_cost_budget_from_args(
         if not isinstance(budget, dict):
             raise ValueError("cost_budget must be an object")
 
-        result: dict[str, Any] = {}
+        result: _JsonObject = {}
+        max_cost_value: float | None = None
 
         # Extract and validate max_cost_usd if present.
         if "max_cost_usd" in budget:
             max_cost = budget["max_cost_usd"]
             if max_cost is not None:
-                max_cost = float(max_cost)
-                if max_cost <= 0:
+                if not isinstance(max_cost, str | int | float):
+                    raise ValueError("cost_budget.max_cost_usd must be numeric")
+                max_cost_value = float(max_cost)
+                if max_cost_value <= 0:
                     raise ValueError("cost_budget.max_cost_usd must be > 0")
-                result["max_cost_usd"] = max_cost
+                result["max_cost_usd"] = max_cost_value
 
         # Extract and validate ask_thresholds_usd if present.
         if "ask_thresholds_usd" in budget:
@@ -1361,14 +1437,16 @@ def _subagent_cost_budget_from_args(
             if thresholds is not None:
                 if not isinstance(thresholds, list):
                     raise ValueError("cost_budget.ask_thresholds_usd must be an array")
-                thresholds = [float(t) for t in thresholds]
-                if not all(t > 0 for t in thresholds):
+                if not all(isinstance(threshold, str | int | float) for threshold in thresholds):
+                    raise ValueError("cost_budget.ask_thresholds_usd values must be numeric")
+                threshold_values = [float(threshold) for threshold in thresholds]
+                if not all(threshold > 0 for threshold in threshold_values):
                     raise ValueError("cost_budget.ask_thresholds_usd values must be > 0")
                 # Check that thresholds are less than max if both are set.
-                if "max_cost_usd" in result and result["max_cost_usd"] is not None:
-                    if any(t >= result["max_cost_usd"] for t in thresholds):
+                if max_cost_value is not None:
+                    if any(threshold >= max_cost_value for threshold in threshold_values):
                         raise ValueError("ask_thresholds_usd values must be < max_cost_usd")
-                result["ask_thresholds_usd"] = thresholds
+                result["ask_thresholds_usd"] = threshold_values
 
         # At least one must be present.
         if not result:
@@ -1378,7 +1456,9 @@ def _subagent_cost_budget_from_args(
     return None
 
 
-def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> frozenset[str]:
+def _subagent_allowed_harnesses(
+    sub_agent_name: str, agent_spec: AgentSpec | None
+) -> frozenset[str]:
     """
     Resolve the canonical harness allowlist a sub-agent opts into.
 
@@ -1393,13 +1473,7 @@ def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> 
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None:
         return frozenset()
-    executor = getattr(sub_spec, "executor", None)
-    config = getattr(executor, "config", None)
-    raw_allowed: Any = None
-    if isinstance(config, dict):
-        raw_allowed = config.get("allowed_harnesses")
-    elif config is not None:
-        raw_allowed = getattr(config, "allowed_harnesses", None)
+    raw_allowed: object = sub_spec.executor.config.get("allowed_harnesses")
     if not isinstance(raw_allowed, (list, tuple, set, frozenset)):
         return frozenset()
     return frozenset(
@@ -1413,7 +1487,7 @@ def _normalize_subagent_model(
     model: str,
     *,
     sub_agent_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     harness: str | None,
 ) -> str:
     """
@@ -1456,7 +1530,7 @@ def _normalize_subagent_model(
     return normalized
 
 
-async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
+async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
     """
     Dispatch ``sys_list_models``: per-worker model availability.
 
@@ -1923,6 +1997,7 @@ async def _execute_subagent_tool(
             return f"{copy_result.error}\n{teardown_warning}"
         return copy_result.error
     message_content = copy_result.content
+    assert message_content is not None
 
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child
