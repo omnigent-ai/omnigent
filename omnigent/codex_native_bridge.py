@@ -430,17 +430,26 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     its current transport and thread instead of injecting into stale
     state.
 
-    The subagent-routing canary is cleared for the same reason: it is the
-    proof that *this* launch's hooks ran, so a canary left by an earlier
-    launch would mask a genuine fail-open (codex skipping untrusted
-    hooks) for the rest of the session.
+    The subagent-routing canary and spawn audit are cleared for the same
+    reason: both are evidence about *this* launch, checked against the
+    routing decisions this launch's endpoint relayed. A canary left by an
+    earlier launch would mask a genuine fail-open (codex skipping
+    untrusted hooks), and a leftover audit line — whose approving decision
+    lives in the previous launch's router — reads as a spawn the router
+    never approved.
 
     :param bridge_dir: Native Codex bridge directory.
     :returns: None.
     """
-    from omnigent.inner.hook_scripts.codex_router_hook import CANARY_FILENAME
+    from omnigent.inner.hook_scripts.codex_router_hook import AUDIT_FILENAME, CANARY_FILENAME
 
-    for name in (_STATE_FILE, _STARTUP_ERROR_FILE, _MCP_STARTUP_FILE, CANARY_FILENAME):
+    for name in (
+        _STATE_FILE,
+        _STARTUP_ERROR_FILE,
+        _MCP_STARTUP_FILE,
+        CANARY_FILENAME,
+        AUDIT_FILENAME,
+    ):
         try:
             (bridge_dir / name).unlink()
         except FileNotFoundError:
