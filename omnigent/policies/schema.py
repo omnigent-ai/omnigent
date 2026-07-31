@@ -328,7 +328,8 @@ class PolicyCallable(Protocol):
             return {"result": "ALLOW"}
     """
 
-    def __call__(self, event: PolicyEvent) -> _PolicyCallableReturn: ...
+    def __call__(self, event: PolicyEvent) -> _PolicyCallableReturn:
+        raise NotImplementedError
 
 
 class PolicyCallableWithConfig(Protocol):
@@ -347,7 +348,8 @@ class PolicyCallableWithConfig(Protocol):
             ...
     """
 
-    def __call__(self, event: PolicyEvent, config: dict[str, str]) -> _PolicyCallableReturn: ...
+    def __call__(self, event: PolicyEvent, config: dict[str, str]) -> _PolicyCallableReturn:
+        raise NotImplementedError
 
 
 # ── REQUEST-phase data helpers ───────────────────────────────────────────────
