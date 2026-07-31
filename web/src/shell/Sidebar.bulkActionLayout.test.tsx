@@ -173,8 +173,9 @@ describe("bulk-action bar layout", () => {
 
     // The actions are icon-only buttons labelled for assistive tech; there
     // must be a single instance of each (no breakpoint-duplicated copies).
+    // With a single owned selection the Delete label carries no count ("Delete").
     expect(screen.getAllByRole("button", { name: "Archive selected" })).toHaveLength(1);
-    expect(screen.getAllByRole("button", { name: "Delete selected" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
   });
 
   it("shows Archive and Delete disabled at zero selection, enabling them once a row is picked", () => {

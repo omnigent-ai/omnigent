@@ -1570,9 +1570,11 @@ function ConversationList({
   // The bulk-action bar lives under the header of the section it targets, so it
   // unmounts when that section empties (e.g. every selected session
   // archived/deleted). Exit selection mode in that case so the user isn't
-  // stranded without its controls.
+  // stranded without its controls. Suppressed while the list is refetching: a
+  // background refetch can briefly yield an empty page, and exiting on that
+  // transient would kick the user out of selection mode mid-task.
   useEffect(() => {
-    if (!selectionMode) return;
+    if (!selectionMode || conversationsQuery.isFetching) return;
     const pool =
       selectionScope === "projects" ? projectSessionPool.length : sections.sessions.length;
     if (pool === 0) onExitSelectionMode();
@@ -1581,6 +1583,7 @@ function ConversationList({
     selectionScope,
     sections.sessions.length,
     projectSessionPool.length,
+    conversationsQuery.isFetching,
     onExitSelectionMode,
   ]);
 
@@ -4110,6 +4113,18 @@ function BulkActionBar({
   const count = selectedIds.size;
   const isBusy = bulkArchive.isPending || bulkDelete.isPending;
 
+  // Delete acts only on owned rows, so surface that count on the control when it
+  // differs from "N selected" — otherwise a mixed-ownership selection (reachable
+  // in projects scope, where a folder can hold others' sessions) reads
+  // "3 selected" while Delete hits fewer. Used for both the tooltip (visual) and
+  // the aria-label (assistive tech). Archive needs no such hint: its gate
+  // (`allSelectedSameArchiveGroup`) only enables it when every owned row shares
+  // one archive state, and archived rows never appear in a selectable section.
+  const deleteLabel =
+    ownedSelected.length > 0 && ownedSelected.length !== count
+      ? `Delete ${ownedSelected.length}`
+      : "Delete";
+
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
 
   function handleArchive() {
@@ -4237,7 +4252,7 @@ function BulkActionBar({
                   className={cn("shrink-0", ownedSelected.length > 0 && "text-destructive")}
                   disabled={isBusy || ownedSelected.length === 0}
                   onClick={() => setConfirmDeleteOpen(true)}
-                  aria-label="Delete selected"
+                  aria-label={deleteLabel}
                   data-testid="bulk-delete"
                 >
                   {bulkDelete.isPending ? (
@@ -4247,7 +4262,7 @@ function BulkActionBar({
                   )}
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom">Delete</TooltipContent>
+              <TooltipContent side="bottom">{deleteLabel}</TooltipContent>
             </Tooltip>
           </div>
         </div>

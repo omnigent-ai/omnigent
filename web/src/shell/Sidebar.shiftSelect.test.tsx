@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import type * as IdentityModule from "@/lib/identity";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
 import { computeShiftSelectRange, Sidebar } from "./Sidebar";
@@ -110,6 +111,14 @@ vi.mock("@/hooks/useConversations", () => ({
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+
+// Resolve the viewer to a fixed id so a conversation whose `owner` differs
+// reads as "not owned" (drives the mixed-ownership Delete-count assertion).
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => "viewer",
+  resolveIdentity: () => Promise.resolve("viewer"),
+}));
 
 import { useConversations } from "@/hooks/useConversations";
 
@@ -316,6 +325,35 @@ describe("Sidebar shift-click selection", () => {
     const [{ ids, archived }] = bulkArchiveMock.mutate.mock.calls[0];
     expect(archived).toBe(true);
     expect([...ids].sort()).toEqual(["p1", "p2", "p3"]);
+  });
+
+  it("labels Delete with the owned count when the selection is mixed-ownership", async () => {
+    // A project folder can hold sessions owned by other users (the folder query
+    // isn't ownership-filtered). Delete acts only on owned rows, so its label
+    // must reflect the owned count — not the raw "N selected" — when they differ.
+    projectsMock.push("Alpha");
+    const mine = conv("mine", { owner: "viewer", labels: { omni_project: "Alpha" } });
+    const theirs = conv("theirs", { owner: "someone_else", labels: { omni_project: "Alpha" } });
+    mockConversations([mine, theirs]);
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+
+    // Select both rows — "2 selected", but only the owned one is deletable.
+    fireEvent.click(await screen.findByRole("link", { name: "mine" }));
+    fireEvent.click(screen.getByRole("link", { name: "theirs" }));
+    await waitFor(() => {
+      expect(screen.getByText("2 selected")).toBeInTheDocument();
+    });
+
+    // Delete label carries the owned count (1), diverging from the "2 selected".
+    expect(screen.getByRole("button", { name: "Delete 1" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
 
   it("normal click after shift-select sets a new anchor", async () => {
