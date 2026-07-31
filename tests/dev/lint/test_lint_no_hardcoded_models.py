@@ -60,6 +60,7 @@ def test_scan_allows_complete_central_fallback_records(
 
 def test_owned_fallback_registry_satisfies_structural_boundary() -> None:
     """The production registry needs no count-based model allowances."""
+    assert OWNED_FALLBACK_PATH.is_file()
     assert scan(OWNED_FALLBACK_PATH) == []
 
 

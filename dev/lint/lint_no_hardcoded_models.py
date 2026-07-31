@@ -171,6 +171,7 @@ def _owned_fallback_model_literals(tree: ast.Module) -> set[ast.Constant]:
         if (literals := _literal_string_nodes(value)) is not None:
             exempt.update(literals)
 
+    # Only module-level tuples qualify; nested or conditional aliases fail closed.
     assignments: dict[str, tuple[ast.Constant, ...] | None] = {}
     for statement in tree.body:
         if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
