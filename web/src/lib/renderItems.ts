@@ -18,8 +18,19 @@
 //
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
-import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import type {
+  AnyBlock,
+  MessageContentBlock,
+  RoutingDecisionBlock,
+  ToolExecution,
+  ToolResultBlock,
+} from "./blocks";
 import { LIVE_ITEM_PREFIX } from "./blocks";
+import {
+  type RoutingDecisionExtras,
+  isSessionScopedDecision,
+  routingExtras,
+} from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
@@ -175,6 +186,8 @@ export type Bubble =
       applied: boolean;
       rationale: string;
       agent?: string;
+      /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+      routing?: RoutingDecisionExtras;
     };
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
@@ -202,6 +215,10 @@ const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "re
  * :param lastBubbleStart: block index where the last (active) bubble's
  *     group started, i.e. the only region that can change on append.
  *     ``-1`` when there were no bubbles.
+ * :param lastBubbleCount: how many bubbles that region produced — 1 normally,
+ *     more when a deferred routing chip widened the region back to the chip
+ *     (the pair, plus any bubble rendered between them). Reuse drops exactly
+ *     this many bubbles before re-walking the region.
  */
 export interface BubbleCache {
   blocks: AnyBlock[] | null;
@@ -209,6 +226,7 @@ export interface BubbleCache {
   interruptedResponseIds: readonly string[] | null;
   bubbles: Bubble[];
   lastBubbleStart: number;
+  lastBubbleCount: number;
 }
 
 const EMPTY_INTERRUPTED_RESPONSE_IDS: readonly string[] = [];
@@ -221,6 +239,7 @@ export function createBubbleCache(): BubbleCache {
     interruptedResponseIds: null,
     bubbles: [],
     lastBubbleStart: -1,
+    lastBubbleCount: 1,
   };
 }
 
@@ -291,6 +310,7 @@ export function buildBubbles(
     cache.interruptedResponseIds = interruptedResponseIds;
     cache.bubbles = markContinuedTurns(rest.bubbles, activeResponse);
     cache.lastBubbleStart = rest.lastBubbleStart;
+    cache.lastBubbleCount = rest.lastBubbleCount;
     return cache.bubbles;
   }
 
@@ -301,6 +321,7 @@ export function buildBubbles(
   cache.interruptedResponseIds = interruptedResponseIds;
   cache.bubbles = markContinuedTurns(full.bubbles, activeResponse);
   cache.lastBubbleStart = full.lastBubbleStart;
+  cache.lastBubbleCount = full.lastBubbleCount;
   return cache.bubbles;
 }
 
@@ -443,6 +464,11 @@ function reusablePrefix(
     return null;
   }
   const startBlock = cache.lastBubbleStart;
+  // A chip separated from its message by skippable blocks (claude-native's
+  // injected `/model` echo) sits BEFORE the re-walk region, because the echo
+  // opened its own bubble in between. Rebuild in full so the arriving message
+  // can still pick the chip up.
+  if (chipPendingBeforeRegion(blocks, startBlock)) return null;
   // The new array must be at least as long, and the finalized prefix
   // region must be byte-for-byte (reference-for-reference) unchanged.
   if (blocks.length < startBlock) return null;
@@ -466,7 +492,10 @@ function reusablePrefix(
       return null;
     }
   }
-  const prefix = cache.bubbles.slice(0, cache.bubbles.length - 1);
+  // Drop every bubble the re-walked region produced — normally just the last
+  // one, but a user message and its deferred routing chip come as a pair.
+  const dropped = Math.min(cache.lastBubbleCount, cache.bubbles.length);
+  const prefix = cache.bubbles.slice(0, cache.bubbles.length - dropped);
   // A reused assistant bubble whose response is still the active one
   // could change lifecycle/error without a block change — don't reuse.
   const activeId = activeResponse?.responseId;
@@ -484,6 +513,28 @@ function reusablePrefix(
 }
 
 /**
+ * Whether a still-pairable session/turn chip sits just before `startBlock`.
+ *
+ * The chip counts as pairable only while every block after it is skippable or
+ * a user message — once real assistant output follows, the chip is nobody's
+ * verdict-on-a-message and the region can be reused as usual (so a long
+ * streaming turn is not rebuilt frame after frame).
+ */
+function chipPendingBeforeRegion(blocks: AnyBlock[], startBlock: number): boolean {
+  let k = startBlock - 1;
+  while (k >= 0 && isChipPairingSkippable(blocks[k]!)) k -= 1;
+  if (k < 0) return false;
+  const chip = blocks[k]!;
+  if (chip.type !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope))
+    return false;
+  for (let j = k + 1; j < blocks.length; j += 1) {
+    const b = blocks[j]!;
+    if (!isChipPairingSkippable(b) && b.type !== "user_message") return false;
+  }
+  return true;
+}
+
+/**
  * The core block-walking loop, shared by the full and incremental
  * paths. Starts at `startIndex`, appends bubbles onto a copy of
  * `seedBubbles` (the reused finalized prefix, or `[]`), and reports
@@ -496,8 +547,11 @@ function reusablePrefix(
  * :param subIndexByResp: seeded count of assistant bubbles already
  *     emitted per responseId, so streaming-only bubbles (no itemId)
  *     keep stable `stableId`s across the reuse boundary.
- * :returns: the bubble list and the block index where the last bubble
- *     began (``-1`` if no bubbles were produced at all).
+ * :returns: the bubble list, the block index where the last bubble began
+ *     (``-1`` if no bubbles were produced at all), and how many bubbles that
+ *     final region produced — counted, not assumed: a chip deferred below its
+ *     user message widens the region back to the chip, and anything rendering
+ *     in between (claude-native's injected `/model` echo) is inside it too.
  */
 function walkBubbles(
   blocks: AnyBlock[],
@@ -506,7 +560,7 @@ function walkBubbles(
   startIndex: number,
   seedBubbles: Bubble[],
   subIndexByResp: Map<string, number>,
-): { bubbles: Bubble[]; lastBubbleStart: number } {
+): { bubbles: Bubble[]; lastBubbleStart: number; lastBubbleCount: number } {
   const bubbles: Bubble[] = [...seedBubbles];
   // One cross-bubble result index per walk: the relay backdates a
   // delayed function_call_output to its ORIGINAL turn's response id, so
@@ -522,8 +576,18 @@ function walkBubbles(
       crossBubbleResults.set(`${blk.ctx.responseId}:${blk.callId}`, blk);
     }
   }
-  // Block index where the most recently pushed bubble's group started.
+  // A session/turn chip reads as the verdict on the message that triggered it,
+  // so it renders below that message. Persistence order varies by harness:
+  // native paths write the decision first, others write it after.
+  const deferred = deferredRoutingChips(blocks, startIndex);
+  // Bubble count at the moment the walk reached each deferred chip, so a
+  // message pairing back to that chip can count every bubble the widened
+  // region produced (the `/model` echo between them renders its own bubble).
+  const bubbleCountAtChip = new Map<number, number>();
+  // Block index where the most recently pushed bubble's region started, the
+  // bubble count when that region opened, and how many bubbles it produced.
   let lastBubbleStart = bubbles.length > 0 ? 0 : -1;
+  let lastBubbleCount = 1;
   let i = startIndex;
 
   while (i < blocks.length) {
@@ -531,13 +595,21 @@ function walkBubbles(
 
     // Lifecycle markers don't render — they exist for the streaming
     // reducer and the eager URL update, not the renderer.
-    if (b.type === "response_start" || b.type === "response_end") {
+    if (isNonRenderingBlock(b)) {
       i += 1;
       continue;
     }
 
     if (b.type === "user_message") {
-      lastBubbleStart = i;
+      const chipIndex = deferred.byMessage.get(i);
+      // The pair's region starts at whichever block came first, so an
+      // incremental re-walk rebuilds both bubbles together — plus whatever
+      // rendered in between, hence the recorded count rather than `i`'s.
+      lastBubbleStart = chipIndex !== undefined ? Math.min(chipIndex, i) : i;
+      const regionBubbleStart =
+        chipIndex !== undefined
+          ? (bubbleCountAtChip.get(chipIndex) ?? bubbles.length)
+          : bubbles.length;
       bubbles.push({
         kind: "user",
         itemId: b.ctx.itemId ?? `user_${i}`,
@@ -547,12 +619,17 @@ function walkBubbles(
         // steady across the optimistic→committed swap — no remount/flink.
         stableKey: b.stableKey,
       });
+      if (chipIndex !== undefined) {
+        bubbles.push(routingChipBubble(blocks[chipIndex] as RoutingDecisionBlock, chipIndex));
+      }
+      lastBubbleCount = bubbles.length - regionBubbleStart;
       i += 1;
       continue;
     }
 
     if (b.type === "compaction_loading") {
       lastBubbleStart = i;
+      lastBubbleCount = 1;
       bubbles.push({
         kind: "compaction_loading",
         itemId: b.ctx.itemId ?? `compaction_loading_${i}`,
@@ -573,6 +650,7 @@ function walkBubbles(
         }
       }
       lastBubbleStart = i;
+      lastBubbleCount = 1;
       bubbles.push({
         kind: "compaction",
         itemId: b.ctx.itemId ?? `compaction_${i}`,
@@ -582,17 +660,18 @@ function walkBubbles(
     }
 
     if (b.type === "routing_decision") {
-      // Standalone muted chip at its transcript position (turn start),
-      // never folded into an adjacent assistant bubble.
+      // Emitted below the user message that follows it, once that bubble exists.
+      if (deferred.indexes.has(i)) {
+        bubbleCountAtChip.set(i, bubbles.length);
+        i += 1;
+        continue;
+      }
+      // Standalone muted chip at its transcript position, never folded into an
+      // adjacent assistant bubble. Sub-agent decisions stay inline where they
+      // occur — they belong to the spawn, not to the user's message.
       lastBubbleStart = i;
-      bubbles.push({
-        kind: "routing_decision",
-        itemId: b.ctx.itemId ?? `routing_${i}`,
-        model: b.model,
-        applied: b.applied,
-        rationale: b.rationale,
-        ...(b.agent !== undefined && { agent: b.agent }),
-      });
+      lastBubbleCount = 1;
+      bubbles.push(routingChipBubble(b, i));
       i += 1;
       continue;
     }
@@ -633,7 +712,7 @@ function walkBubbles(
         cur.type === "routing_decision"
       )
         break;
-      if (cur.type === "response_start" || cur.type === "response_end") {
+      if (isNonRenderingBlock(cur)) {
         i += 1;
         continue;
       }
@@ -682,6 +761,7 @@ function walkBubbles(
     const stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
 
     lastBubbleStart = groupStart;
+    lastBubbleCount = 1;
     const workedForS = turnWorkedForS(groupBlocks);
     const lastActivityAtS = turnLastActivityAtS(groupBlocks);
     bubbles.push({
@@ -696,7 +776,93 @@ function walkBubbles(
     });
   }
 
-  return { bubbles, lastBubbleStart };
+  return { bubbles, lastBubbleStart, lastBubbleCount };
+}
+
+/** Build the standalone chip bubble for a routing-decision block. */
+function routingChipBubble(b: RoutingDecisionBlock, index: number): Bubble {
+  return {
+    kind: "routing_decision",
+    itemId: b.ctx.itemId ?? `routing_${index}`,
+    model: b.model,
+    applied: b.applied,
+    rationale: b.rationale,
+    ...(b.agent !== undefined && { agent: b.agent }),
+    routing: routingExtras(b.routing),
+  };
+}
+
+/**
+ * Pair each user message with the routing decision it triggered, for the chips
+ * that need moving to land below their message.
+ *
+ * A session/turn decision is adjacent to the message it routes — only
+ * non-content blocks may sit between (see `isChipPairingSkippable`) — but on
+ * which side depends on the harness: native paths persist and stream the
+ * decision BEFORE the message,
+ * every other path after. Only the before-case needs deferring; a chip already
+ * following its message renders below it at its own position. Adjacency keeps
+ * the pair inside the incremental re-walk region, since a user bubble stays the
+ * last bubble until some later block opens the next one. Sub-agent decisions,
+ * and chips with no user message on either side, stay strictly in item order.
+ *
+ * :param startIndex: first block the walk will visit; earlier blocks belong to
+ *     the reused prefix and are already placed. The neighbour lookup still
+ *     reaches back across that boundary, so the pairing a region gets never
+ *     depends on where the walk resumed.
+ * :returns: ``byMessage`` (user block index → chip block index) plus the set of
+ *     chip indexes to skip when the walk reaches them.
+ */
+function deferredRoutingChips(
+  blocks: AnyBlock[],
+  startIndex: number,
+): { byMessage: Map<number, number>; indexes: Set<number> } {
+  const byMessage = new Map<number, number>();
+  const indexes = new Set<number>();
+  for (let j = startIndex; j < blocks.length; j += 1) {
+    const chip = blocks[j]!;
+    if (chip.type !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope)) continue;
+    // Already below its message — leave it where it is.
+    if (adjacent(blocks, j, -1)?.type === "user_message") continue;
+    const next = adjacent(blocks, j, 1);
+    if (next !== null && next.type === "user_message") {
+      byMessage.set(next.index, j);
+      indexes.add(j);
+    }
+  }
+  return { byMessage, indexes };
+}
+
+/** Lifecycle markers that produce no bubble of their own. */
+function isNonRenderingBlock(b: AnyBlock): boolean {
+  return b.type === "response_start" || b.type === "response_end";
+}
+
+/**
+ * Blocks that may sit between a routing chip and the message it routes.
+ *
+ * Wider than "renders nothing": `slash_command` is harness plumbing —
+ * claude-native applies a routed model by typing `/model <alias>` into its TUI
+ * and that injection round-trips through the transcript between the decision
+ * and the user's own message — but it DOES render, as its own assistant
+ * bubble, so a region spanning it produces more bubbles than the pair.
+ */
+function isChipPairingSkippable(b: AnyBlock): boolean {
+  return isNonRenderingBlock(b) || b.type === "slash_command";
+}
+
+/** Nearest neighbour of `from` in `step` direction, skipping non-content blocks. */
+function adjacent(
+  blocks: AnyBlock[],
+  from: number,
+  step: 1 | -1,
+): { type: AnyBlock["type"]; index: number } | null {
+  for (let k = from + step; k >= 0 && k < blocks.length; k += step) {
+    const b = blocks[k]!;
+    if (isChipPairingSkippable(b)) continue;
+    return { type: b.type, index: k };
+  }
+  return null;
 }
 
 /**

@@ -185,6 +185,7 @@ let sessionPendingInputs: Map<
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
 let sessionCostControlOverrides: Map<string, "on" | "off">;
+let sessionSubagentRoutingOverrides: Map<string, "on" | "off">;
 // Per-session labels the snapshot/PATCH handlers serve.
 let sessionLabels: Map<string, Record<string, string>>;
 
@@ -255,6 +256,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       ? (JSON.parse(init.body as string) as {
           runner_id?: string;
           cost_control_mode_override?: "on" | "off" | null;
+          subagent_routing_override?: "on" | "off" | null;
           collaboration_mode?: string;
         })
       : {};
@@ -266,6 +268,13 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
         sessionCostControlOverrides.delete(sessionId);
       } else {
         sessionCostControlOverrides.set(sessionId, body.cost_control_mode_override);
+      }
+    }
+    if ("subagent_routing_override" in body) {
+      if (body.subagent_routing_override == null) {
+        sessionSubagentRoutingOverrides.delete(sessionId);
+      } else {
+        sessionSubagentRoutingOverrides.set(sessionId, body.subagent_routing_override);
       }
     }
     if ("collaboration_mode" in body && typeof body.collaboration_mode === "string") {
@@ -281,6 +290,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       items: sessionSnapshots.get(sessionId) ?? [],
       labels,
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
+      subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
     });
   }
   if (snapshotMatch && (init?.method ?? "GET") === "GET") {
@@ -295,6 +305,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       pending_elicitations: sessionPendingElicitations.get(sessionId) ?? [],
       pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
+      subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
     });
   }
   if (url === "/v1/sessions" && init?.method === "POST") {
@@ -354,6 +365,7 @@ beforeEach(() => {
   sessionPendingElicitations = new Map();
   sessionPendingInputs = new Map();
   sessionCostControlOverrides = new Map();
+  sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
   initChatStore(client);
   useChatStore.setState({
@@ -372,6 +384,7 @@ beforeEach(() => {
     loadingConversation: false,
     conversationLoadError: null,
     costControlModeOverride: null,
+    subagentRoutingOverride: null,
     codexPlanMode: false,
     abortController: null,
     // Restore the real send action; a prior test may have stubbed it.
@@ -7974,6 +7987,88 @@ describe("chatStore — setCostControlMode", () => {
     useChatStore.setState({ conversationId: null });
     await useChatStore.getState().setCostControlMode("on");
     // No PATCH was issued — there is no session row to write to.
+    const patches = fetchMock.mock.calls.filter(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(patches).toHaveLength(0);
+  });
+});
+
+describe("chatStore — setSubagentRouting", () => {
+  /** The session PATCHes issued against `sessionId`, newest last. */
+  function patchBodies(sessionId: string): unknown[] {
+    return fetchMock.mock.calls
+      .filter(([u, init]) => {
+        const url = typeof u === "string" ? u : (u as URL | Request).toString();
+        return (
+          url === `/v1/sessions/${sessionId}` &&
+          (init as RequestInit | undefined)?.method === "PATCH"
+        );
+      })
+      .map(([, init]) => JSON.parse((init as RequestInit).body as string));
+  }
+
+  it("optimistically writes, PATCHes the wire field, and keeps the server's value", async () => {
+    seedSession("conv_sr", []);
+    await useChatStore.getState().switchTo("conv_sr");
+    // Fresh session: unset → sub-agents inherit the session's routing state.
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+
+    const settled = useChatStore.getState().setSubagentRouting("on");
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("on");
+    await settled;
+
+    expect(patchBodies("conv_sr")).toEqual([{ subagent_routing_override: "on" }]);
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("on");
+  });
+
+  it("never touches the session's own model or cost switch", async () => {
+    // This knob governs the sub-agents' models, so it must not drag the
+    // parent's `model_override` / routing switch along the way.
+    seedSession("conv_sr2", []);
+    await useChatStore.getState().switchTo("conv_sr2");
+    useChatStore.setState({ sessionModelOverride: "claude-opus-4-7" });
+
+    await useChatStore.getState().setSubagentRouting("on");
+
+    expect(patchBodies("conv_sr2")).toEqual([{ subagent_routing_override: "on" }]);
+    expect(useChatStore.getState().sessionModelOverride).toBe("claude-opus-4-7");
+    expect(useChatStore.getState().costControlModeOverride).toBeNull();
+  });
+
+  it("rolls back the optimistic write when the PATCH fails", async () => {
+    seedSession("conv_sr3", []);
+    await useChatStore.getState().switchTo("conv_sr3");
+
+    fetchMock.mockImplementationOnce((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_sr3" && init?.method === "PATCH") {
+        return mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(useChatStore.getState().setSubagentRouting("on")).rejects.toThrow();
+    // Back to inherit: the row must not claim a state the server never persisted.
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+
+  it("hydrates from the session snapshot on bind and resets on switch-away", async () => {
+    seedSession("conv_sr4", []);
+    seedSession("conv_sr5", []);
+    sessionSubagentRoutingOverrides.set("conv_sr4", "off");
+
+    await useChatStore.getState().switchTo("conv_sr4");
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("off");
+
+    await useChatStore.getState().switchTo("conv_sr5");
+    // Session-scoped: a session with no override reads back as inherit.
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+
+  it("no-ops without an active conversation", async () => {
+    useChatStore.setState({ conversationId: null });
+    await useChatStore.getState().setSubagentRouting("on");
     const patches = fetchMock.mock.calls.filter(
       ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
     );

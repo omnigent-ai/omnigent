@@ -25,6 +25,7 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
+  SessionWarning,
   SkillSummary,
 } from "./types";
 
@@ -148,6 +149,8 @@ interface SessionResponseWire {
   model_override?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
+  /** Sub-agent routing switch; `null`/absent = inherit the session's own state. */
+  subagent_routing_override?: "on" | "off" | null;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -158,6 +161,13 @@ interface SessionResponseWire {
    */
   usage_by_model?: Record<string, ModelUsageWire> | null;
   last_task_error?: { code: string; message: string } | null;
+  /**
+   * Session-scoped warnings on the status channel, e.g.
+   * ``[{code: "subagent_routing_unenforced", harness: "codex-native",
+   * reason: "hook canary never fired"}]``. Absent on servers that don't
+   * publish warnings yet — the header banner then stays hidden.
+   */
+  warnings?: SessionWarning[] | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
    * moment the snapshot was built. The live SSE stream has no
@@ -300,11 +310,15 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     harness: wire.harness ?? null,
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
+    subagentRoutingOverride: wire.subagent_routing_override,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
+    // Left undefined (not []) when the server sends nothing, so snapshot
+    // consumers can tell "no warnings" from "server doesn't publish them".
+    warnings: wire.warnings ?? undefined,
     pendingElicitations: wire.pending_elicitations ?? [],
     pendingInputs: (wire.pending_inputs ?? []).map((p) => ({
       pendingId: p.pending_id,
@@ -636,9 +650,10 @@ export async function launchRunner(
  *
  * `null` on `reasoningEffort` / `modelOverride` sends the server's
  * ``"default"`` clear alias (matches the REPL's ``/effort | /model
- * default``). `null` on `costControlModeOverride` is sent as a JSON
- * ``null`` — for that field, "off" is a real value, so explicit null
- * (not an alias) is the server's clear signal.
+ * default``). `null` on `costControlModeOverride` /
+ * `subagentRoutingOverride` is sent as a JSON ``null`` — for those fields
+ * "off" is a real value, so explicit null (not an alias) is the server's
+ * clear signal (sub-agent routing then falls back to inheriting).
  *
  * `silent: true` persists without firing the claude-native tmux
  * forward — use for bind-time auto-apply (e.g. the sticky-pref
@@ -653,6 +668,7 @@ export async function updateSession(
     modelOverride?: string | null;
     codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
+    subagentRoutingOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -670,6 +686,9 @@ export async function updateSession(
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
+  }
+  if ("subagentRoutingOverride" in updates) {
+    body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;

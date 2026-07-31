@@ -8,6 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
+import type { RoutingDecisionExtras } from "./routingDecision";
 import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
 
 /** Provider-native tool item types. */
@@ -328,6 +329,8 @@ export interface SlashCommand {
  */
 export interface RoutingDecision {
   type: "routing_decision";
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
   /** `true` when the brain ran on `model`; `false` = "would have picked". */

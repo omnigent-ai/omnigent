@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { ToolExecution } from "@/lib/blocks";
+import type { ServerInfo } from "@/lib/capabilities";
+import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -17,6 +19,8 @@ import {
   computeShowsWorking,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  isCostRoutingEligible,
+  isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
   readOnlyReasonForSessionLabels,
@@ -1322,5 +1326,68 @@ describe("isUnboundCodingFork", () => {
     // needs_workspace is workspace IS NULL, and "" never satisfies the
     // workspace-required-for-host constraint — treat it as unbound.
     expect(isUnboundCodingFork({ forkSourceId: "conv_src", workspace: "" })).toBe(true);
+  });
+});
+
+// The routing gates the ChatPage call site uses. The deployment flag is half of
+// each gate: a session-shape-eligible session on a server WITHOUT a routing
+// client must show no routing control at all, and neither must one while the
+// `/v1/info` probe is still in flight.
+describe("routing eligibility gates", () => {
+  function info(smartRouting: boolean): ServerInfo {
+    return {
+      accounts_enabled: false,
+      single_user: false,
+      login_url: null,
+      needs_setup: false,
+      databricks_features: false,
+      managed_sandboxes_enabled: false,
+      sandbox_provider: null,
+      sharing_mode: "on",
+      public_sharing_enabled: true,
+      server_version: null,
+      smart_routing_enabled: smartRouting,
+      harness_install_enabled: false,
+      installable_harnesses: [],
+      dictation_available: false,
+    };
+  }
+
+  // Top-level agent sessions: an SDK one for the per-turn gate, a native
+  // Claude Code one for the sub-agent gate (its own model is baked at launch).
+  const sdkSession = {
+    agentName: "coder",
+    parentSessionId: null,
+    harness: "claude-sdk",
+  } as unknown as Session;
+  const nativeSession = {
+    agentName: "coder",
+    parentSessionId: null,
+    harness: "claude-native",
+    labels: { "omnigent.wrapper": "claude-code" },
+  } as unknown as Session;
+
+  it.each([true, false] as const)("cost routing follows the server flag (%s)", (flag) => {
+    expect(isCostRoutingEligible(info(flag), sdkSession)).toBe(flag);
+  });
+
+  it.each([true, false] as const)("subagent routing follows the server flag (%s)", (flag) => {
+    expect(isSubagentRoutingEligible(info(flag), nativeSession)).toBe(flag);
+  });
+
+  it("both gates are off while the info probe is loading", () => {
+    expect(isCostRoutingEligible("loading", sdkSession)).toBe(false);
+    expect(isSubagentRoutingEligible("loading", nativeSession)).toBe(false);
+  });
+
+  it("a native terminal session is excluded from cost routing but not subagent routing", () => {
+    expect(isCostRoutingEligible(info(true), nativeSession)).toBe(false);
+    expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
+  });
+
+  it("both gates are off for a sub-agent (child) session even with the flag on", () => {
+    const child = { ...sdkSession, parentSessionId: "conv_parent" } as unknown as Session;
+    expect(isCostRoutingEligible(info(true), child)).toBe(false);
+    expect(isSubagentRoutingEligible(info(true), child)).toBe(false);
   });
 });

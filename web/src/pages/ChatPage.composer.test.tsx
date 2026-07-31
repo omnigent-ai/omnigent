@@ -2002,6 +2002,171 @@ describe("Composer config gear", () => {
   });
 });
 
+// The gear modal's "Subagent routing" row — the only routing control native
+// Claude/Codex sessions get. Session-shape eligibility is pinned in
+// CostRoutingControl.test.tsx (`isSubagentRoutingSession`); these tests pin the
+// row's rendering, its effective-value display, and its PATCH on Save.
+describe("Composer config gear — subagent routing", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      selectedModel: null,
+      sessionModelOverride: null,
+      llmModel: null,
+      nativeVendorOwnsModel: false,
+      selectedEffort: null,
+      costControlModeOverride: null,
+      subagentRoutingOverride: null,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  const gear = () => document.querySelector('[data-testid="composer-config-gear"]');
+  const row = () => screen.queryByTestId("composer-config-subagent-routing");
+
+  /** Open the gear modal for a native Claude session (no in-session IR control). */
+  async function openNativeModal(overrides: Record<string, unknown> = {}) {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          // Native terminal sessions keep main-model IR hidden.
+          costRoutingEligible: false,
+          subagentRoutingEligible: true,
+          ...overrides,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+  }
+
+  it("renders the row when the session is subagent-routing eligible", async () => {
+    await openNativeModal();
+    expect(row()).not.toBeNull();
+  });
+
+  it("hides the row when the session is not eligible (routing disabled or wrong harness)", async () => {
+    await openNativeModal({ subagentRoutingEligible: false });
+    expect(row()).toBeNull();
+  });
+
+  it("renders the gear for a native session whose only knob is subagent routing", () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: false,
+          costRoutingEligible: false,
+          subagentRoutingEligible: true,
+        })}
+      />,
+    );
+    expect(gear()).not.toBeNull();
+  });
+
+  // The row shows what is STORED, not an effective value guessed from the
+  // session's own switch: with no override it reads "Inherit" (the client can't
+  // even name the inherited state — a spec-default-routed session routes with
+  // `costControlModeOverride` still null), and an explicit override wins and
+  // drops the "inherited" note.
+  it.each([
+    { costControlModeOverride: "on", subagentRoutingOverride: null, shown: "Inherit" },
+    { costControlModeOverride: null, subagentRoutingOverride: null, shown: "Inherit" },
+    { costControlModeOverride: "on", subagentRoutingOverride: "off", shown: "Default" },
+    { costControlModeOverride: null, subagentRoutingOverride: "on", shown: "Smart Routing" },
+  ] as const)(
+    "displays $shown for cost-control $costControlModeOverride / override $subagentRoutingOverride",
+    async ({ costControlModeOverride, subagentRoutingOverride, shown }) => {
+      useChatStore.setState({ costControlModeOverride, subagentRoutingOverride });
+      await openNativeModal();
+      expect(row()!.textContent).toContain(shown);
+      const inherited = subagentRoutingOverride === null;
+      if (inherited) {
+        expect(screen.getByText("Following this session's model setting")).toBeTruthy();
+      } else {
+        expect(screen.queryByText("Following this session's model setting")).toBeNull();
+        expect(screen.getByText("Model routing for subagents this session spawns")).toBeTruthy();
+      }
+    },
+  );
+
+  it("keeps reading Inherit while the Model row drafts Smart Routing", async () => {
+    // An SDK session CAN switch its own model to Smart Routing, but the stored
+    // sub-agent value is still "no override" — previewing the draft here is
+    // what made picking the shown value a silent no-op.
+    useChatStore.setState({ costControlModeOverride: null, subagentRoutingOverride: null });
+    await openNativeModal({ costRoutingEligible: true });
+    expect(row()!.textContent).toContain("Inherit");
+    fireEvent.click(screen.getByTestId("composer-config-model"));
+    fireEvent.click(screen.getByRole("option", { name: "Smart Routing" }));
+    expect(row()!.textContent).toContain("Inherit");
+  });
+
+  // Both directions must PATCH: pinning a Default session to Smart Routing,
+  // and pinning an inherited-on session back to Default (the "off" value must
+  // be sent explicitly, not left to inheritance).
+  it.each([
+    { costControlModeOverride: null, pick: "on" },
+    { costControlModeOverride: "on", pick: "off" },
+    // The value inheritance was effectively already showing: pre-fix the row
+    // displayed it as selected, so Radix fired no change and the override was
+    // never persisted. With "Inherit" holding the no-override state this is a
+    // real pick that reaches the PATCH.
+    { costControlModeOverride: "on", pick: "on" },
+    { costControlModeOverride: null, pick: "off" },
+  ] as const)(
+    "PATCHes $pick on Save from cost-control $costControlModeOverride (drafted until then)",
+    async ({ costControlModeOverride, pick }) => {
+      const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ setSubagentRouting, costControlModeOverride });
+      await openNativeModal();
+      fireEvent.click(row()!);
+      fireEvent.click(document.querySelector(`[data-subagent-routing="${pick}"]`) as Element);
+      // Drafted only — nothing commits until Save.
+      expect(setSubagentRouting).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId("composer-config-save"));
+      await waitFor(() => expect(setSubagentRouting).toHaveBeenCalledWith(pick));
+    },
+  );
+
+  it("does not PATCH when the row is left untouched", async () => {
+    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: "on" });
+    await openNativeModal();
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
+    expect(setSubagentRouting).not.toHaveBeenCalled();
+  });
+
+  it("PATCHes null when an explicit override is put back to Inherit", async () => {
+    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: "on" });
+    await openNativeModal();
+    expect(row()!.textContent).toContain("Smart Routing");
+    fireEvent.click(row()!);
+    fireEvent.click(document.querySelector('[data-subagent-routing="inherit"]') as Element);
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(setSubagentRouting).toHaveBeenCalledWith(null));
+  });
+
+  it("discards a drafted pick on Cancel", async () => {
+    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setSubagentRouting });
+    await openNativeModal();
+    fireEvent.click(row()!);
+    fireEvent.click(document.querySelector('[data-subagent-routing="on"]') as Element);
+    fireEvent.click(screen.getByTestId("composer-config-cancel"));
+    expect(setSubagentRouting).not.toHaveBeenCalled();
+  });
+});
+
 describe("shouldQueueSend", () => {
   const q = (conversationId: string): QueuedMessage => ({
     queueId: `q_${conversationId}`,

@@ -72,7 +72,11 @@ import {
 } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
-import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
+import {
+  BRAIN_HARNESS_LABELS,
+  SMART_ROUTING_LABEL,
+  useBrainHarnessLabels,
+} from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { NativeModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
@@ -149,7 +153,7 @@ import {
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { isCostRoutingSession } from "@/components/CostRoutingControl";
+import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
   Dialog,
   DialogContent,
@@ -169,10 +173,13 @@ import { Switch } from "@/components/ui/switch";
 import {
   ConfigRow,
   EFFORT_SELECT_NONE,
+  EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
+  RoutingModelSelect,
 } from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -193,6 +200,45 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+
+/** Server-info as consumers see it: the probe's result, or "loading". */
+type ServerInfoValue = ServerInfo | "loading";
+
+/**
+ * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
+ * probe still in flight) reads as off, so no routing control flashes in and
+ * then disappears on a server that has none.
+ */
+function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
+  return serverInfo !== "loading" && serverInfo.smart_routing_enabled;
+}
+
+/**
+ * Whether the session's own model can be routed per turn: the deployment flag,
+ * plus a top-level agent session that is not a native terminal (their CLI bakes
+ * the model at launch and can't per-turn route).
+ */
+export function isCostRoutingEligible(
+  serverInfo: ServerInfoValue,
+  session: Session | null | undefined,
+): boolean {
+  return (
+    smartRoutingEnabled(serverInfo) &&
+    isCostRoutingSession(session) &&
+    !isNativeTerminalSession(session)
+  );
+}
+
+/**
+ * Whether the session may control the routing of the sub-agents it spawns —
+ * same deployment flag, wider session gate (native Claude/Codex included).
+ */
+export function isSubagentRoutingEligible(
+  serverInfo: ServerInfoValue,
+  session: Session | null | undefined,
+): boolean {
+  return smartRoutingEnabled(serverInfo) && isSubagentRoutingSession(session);
+}
 
 function extractUserText(content: MessageContentBlock[]): string {
   return content
@@ -870,11 +916,12 @@ export function ChatPage() {
   // excluded: their CLI bakes the model at launch and can't per-turn route, so
   // Smart Routing is meaningless there.
   const serverInfo = useServerInfo();
-  const costRoutingEligible =
-    serverInfo !== "loading" &&
-    serverInfo.smart_routing_enabled &&
-    isCostRoutingSession(activeSession) &&
-    !isNativeTerminalSession(activeSession);
+  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession);
+  // Sub-agent routing is a separate knob with a wider gate: Claude Code and
+  // Codex sessions get it in BOTH flavours (a native CLI can't per-turn route
+  // itself, but the sub-agents it spawns are routed per spawn), as do
+  // fully-auto sessions. For native sessions this is their only routing control.
+  const subagentRoutingEligible = isSubagentRoutingEligible(serverInfo, activeSession);
 
   // Non-null only when the active session is a sub-agent (child): the
   // composer then peeks a "Chatting with sub-agent …" tray and the
@@ -1148,6 +1195,7 @@ export function ChatPage() {
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
       costRoutingEligible={costRoutingEligible}
+      subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
     />
   );
@@ -1387,6 +1435,8 @@ interface MainAgentSurfaceProps {
   showPollyCodexGoalControl?: boolean;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
   costRoutingEligible: boolean;
+  /** Session passes `isSubagentRoutingSession` (Claude/Codex/auto, top-level). */
+  subagentRoutingEligible: boolean;
   /**
    * Sub-agent instance label when the active session is a child, e.g.
    * ``"check-account-eligibility"``; ``null`` for top-level sessions.
@@ -1459,6 +1509,7 @@ function MainAgentSurface({
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
   costRoutingEligible,
+  subagentRoutingEligible,
   subAgentLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
@@ -1926,6 +1977,7 @@ function MainAgentSurface({
         }
         onShowReconnectHelp={onShowReconnectHelp}
         costRoutingEligible={costRoutingEligible}
+        subagentRoutingEligible={subagentRoutingEligible}
         subAgentLabel={subAgentLabel}
         onGrowthChange={publishComposerGrowth}
       />
@@ -3168,6 +3220,7 @@ export const BubbleView = memo(
           applied={bubble.applied}
           rationale={bubble.rationale}
           agent={bubble.agent}
+          routing={bubble.routing}
         />
       );
     }
@@ -3601,6 +3654,12 @@ interface ComposerProps {
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
   costRoutingEligible?: boolean;
   /**
+   * Session passes `isSubagentRoutingSession` — a top-level Claude/Codex/auto
+   * session, which gets the gear modal's "Subagent routing" row. Wider than
+   * `costRoutingEligible`: native-terminal sessions qualify here.
+   */
+  subagentRoutingEligible?: boolean;
+  /**
    * Sub-agent instance label when the active session is a child, e.g.
    * ``"check-account-eligibility"``; ``null``/omitted for top-level
    * sessions. When set, the composer peeks a "Chatting with sub-agent …"
@@ -4021,6 +4080,7 @@ export function Composer({
   unreachable = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
+  subagentRoutingEligible = false,
   subAgentLabel = null,
   onGrowthChange,
 }: ComposerProps) {
@@ -5225,6 +5285,7 @@ export function Composer({
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
                 costRoutingEligible={costRoutingEligible}
+                subagentRoutingEligible={subagentRoutingEligible}
                 // Config changes persist server-side and apply on the next
                 // wake/turn (the runner forward is best-effort), so the gear
                 // stays live wherever a message could be sent — including
@@ -5625,17 +5686,30 @@ function formatEffortLabel(effort: string): string {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
+/** Gear-modal row governing the routing of sub-agents the session spawns. */
+const SUBAGENT_ROUTING_LABEL = "Subagent routing";
+const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session spawns";
+/** Description shown while no override is persisted (the value is inherited). */
+const SUBAGENT_ROUTING_INHERITED_DESCRIPTION = "Following this session's model setting";
+/**
+ * Sentinel for "no override persisted". A Select can't hold `null`, and Radix
+ * fires no `onValueChange` when the displayed value is re-picked — so inherit
+ * has to be its own option rather than a value the effective state collapses
+ * onto, otherwise picking the shown value would silently persist nothing.
+ */
+const SUBAGENT_ROUTING_INHERIT = "__inherit__";
+
 /**
  * In-session run-config modal opened from the composer's gear icon. The
  * live-committing analogue of the new-session ``HarnessConfigModal``: only the
- * knobs switchable mid-session appear — Model, Effort, and Smart Routing.
- * Permission/approval/cursor modes are launch-time only (no in-session state to
- * read or write), so they are intentionally absent.
+ * knobs switchable mid-session appear — Model, Effort, Smart Routing, and
+ * Subagent routing. Permission/approval/cursor modes are launch-time only (no
+ * in-session state to read or write), so they are intentionally absent.
  *
  * Like the new-session modal, changes are drafted locally and only applied on
  * Save (through the store setters ``setModel`` / ``setEffort`` /
- * ``setCostControlMode``); Cancel / dismiss discards them. The setters enforce
- * the model↔routing mutual exclusion server-side.
+ * ``setCostControlMode`` / ``setSubagentRouting``); Cancel / dismiss discards
+ * them. The setters enforce the model↔routing mutual exclusion server-side.
  */
 function SessionConfigModal({
   open,
@@ -5647,6 +5721,7 @@ function SessionConfigModal({
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
+  subagentRoutingEligible,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -5657,9 +5732,11 @@ function SessionConfigModal({
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
+  subagentRoutingEligible: boolean;
 }) {
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
 
@@ -5687,11 +5764,17 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  // `null` = inherit (no override persisted); the row then displays the
+  // inherited value with a "following the session" description.
+  const [draftSubagentRouting, setDraftSubagentRouting] = useState<"on" | "off" | null>(
+    subagentRoutingOverride,
+  );
   useEffect(() => {
     if (!open) return;
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
+    setDraftSubagentRouting(subagentRoutingOverride);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -5716,6 +5799,13 @@ function SessionConfigModal({
       setDraftRoutingOn(false);
     }
   };
+
+  // With no override persisted, sub-agents inherit the session's own routing
+  // state — which the client can't always name (a spec-default-routed session
+  // routes with `costControlModeOverride` still null), so the row offers
+  // "Inherit" as its own option instead of collapsing onto "on"/"off".
+  const subagentRoutingInherited = draftSubagentRouting === null;
+  const subagentRoutingValue = draftSubagentRouting ?? SUBAGENT_ROUTING_INHERIT;
 
   const save = () => {
     // Commit the changed knobs SEQUENTIALLY, awaiting each PATCH before the
@@ -5749,6 +5839,10 @@ function SessionConfigModal({
         // stray ``/effort`` injection would just be noise.
         if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
           await store.setEffort(draftEffort);
+        // Sub-agent routing is independent of this session's own model — a
+        // plain PATCH with no slash-command injection, so ordering is free.
+        if (subagentRoutingEligible && draftSubagentRouting !== subagentRoutingOverride)
+          await store.setSubagentRouting(draftSubagentRouting);
       } catch {
         // Individual setters already roll back their optimistic state; a failed
         // PATCH shouldn't wedge the modal open.
@@ -5776,13 +5870,16 @@ function SessionConfigModal({
           no Model dropdown to fold it into (e.g. Polly). Agents that render a
           Model dropdown (Claude, Codex, …) offer it as a Model option below. */}
           {costRoutingEligible && !showModels && (
-            <ConfigRow label="Smart Routing" description="Auto-pick the model per turn by task">
+            <ConfigRow
+              label={SMART_ROUTING_LABEL}
+              description="Auto-pick the model per turn by task"
+            >
               <div className="flex h-8 items-center justify-end">
                 <Switch
                   size="sm"
                   checked={draftRoutingOn}
                   data-testid="composer-config-smart-routing"
-                  aria-label="Smart Routing"
+                  aria-label={SMART_ROUTING_LABEL}
                   onCheckedChange={(next) => {
                     setDraftRoutingOn(next);
                     // Routing picks the model + effort per turn, so an explicit
@@ -5795,40 +5892,24 @@ function SessionConfigModal({
           )}
           {showModels && (
             <ConfigRow label="Model" description="Underlying LLM">
-              <Select value={modelValue} onValueChange={onModelChange}>
-                <SelectTrigger
-                  className="w-full"
-                  data-testid="composer-config-model"
-                  aria-label="Model"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {costRoutingEligible && (
-                    <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
-                  )}
-                  <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
-                  {modelSelectOptions.map((m) => (
-                    <SelectItem
-                      key={m.id}
-                      value={m.id}
-                      data-model-id={m.id}
-                      data-active={draftModelId === m.id ? "true" : undefined}
-                    >
-                      {m.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <RoutingModelSelect
+                value={modelValue}
+                onValueChange={onModelChange}
+                offerSmartRouting={costRoutingEligible}
+                testId="composer-config-model"
+                models={modelSelectOptions}
+                activeModelId={draftModelId}
+              />
             </ConfigRow>
           )}
           {showEffort && (
             <ConfigRow label="Effort" description="Reasoning depth vs. speed">
               <Select
-                value={draftEffort ?? EFFORT_SELECT_NONE}
+                // Routing picks the model (and its effort) per turn, so an
+                // explicit effort is meaningless: the row is frozen and reads as
+                // an em-dash placeholder (Radix shows it for the empty value).
+                value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
-                // Smart Routing picks the model + effort per turn, so an
-                // explicit effort can't apply — freeze it to Default.
                 disabled={draftRoutingOn}
               >
                 <SelectTrigger
@@ -5836,7 +5917,7 @@ function SessionConfigModal({
                   data-testid="composer-config-effort"
                   aria-label="Effort"
                 >
-                  <SelectValue />
+                  <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
@@ -5852,6 +5933,47 @@ function SessionConfigModal({
                       {formatStatusEffortLabel(level, modelPickerKind === "codex") ?? level}
                     </SelectItem>
                   ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {/* Sub-agent routing. The only routing control native Claude/Codex
+          sessions get: their own model is baked at launch, but each sub-agent
+          they spawn is routed per spawn. "Inherit" is the persisted no-override
+          state, so what the trigger shows is always what's stored. */}
+          {subagentRoutingEligible && (
+            <ConfigRow
+              label={SUBAGENT_ROUTING_LABEL}
+              description={
+                subagentRoutingInherited
+                  ? SUBAGENT_ROUTING_INHERITED_DESCRIPTION
+                  : SUBAGENT_ROUTING_DESCRIPTION
+              }
+            >
+              <Select
+                value={subagentRoutingValue}
+                onValueChange={(v) => {
+                  if (v === SUBAGENT_ROUTING_INHERIT) setDraftSubagentRouting(null);
+                  else setDraftSubagentRouting(v === "on" ? "on" : "off");
+                }}
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-subagent-routing"
+                  aria-label={SUBAGENT_ROUTING_LABEL}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value={SUBAGENT_ROUTING_INHERIT} data-subagent-routing="inherit">
+                    Inherit
+                  </SelectItem>
+                  <SelectItem value="on" data-subagent-routing="on">
+                    {SMART_ROUTING_LABEL}
+                  </SelectItem>
+                  <SelectItem value="off" data-subagent-routing="off">
+                    Default
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </ConfigRow>
@@ -5894,6 +6016,7 @@ function ComposerConfigGear({
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
+  subagentRoutingEligible,
   disabled,
   openNonce = 0,
 }: {
@@ -5904,6 +6027,7 @@ function ComposerConfigGear({
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
+  subagentRoutingEligible: boolean;
   disabled: boolean;
   openNonce?: number;
 }) {
@@ -5927,7 +6051,7 @@ function ComposerConfigGear({
     costRoutingEligible,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible) return null;
+  if (!showModels && !showEffort && !costRoutingEligible && !subagentRoutingEligible) return null;
 
   return (
     <>
@@ -5987,6 +6111,7 @@ function ComposerConfigGear({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         costRoutingEligible={costRoutingEligible}
+        subagentRoutingEligible={subagentRoutingEligible}
       />
     </>
   );
@@ -6020,18 +6145,21 @@ function useSessionConfigSummary({
   const rows: { label: string; value: string }[] = [];
   if (harnessLabel) rows.push({ label: "Harness", value: harnessLabel });
   if (showModels) {
-    rows.push({ label: "Model", value: routingOn ? "Smart Routing" : (modelLabel ?? "Default") });
+    rows.push({
+      label: "Model",
+      value: routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default"),
+    });
   }
-  // Suppress Effort while Smart Routing is on: the router picks the model and
-  // its effort per turn, so a pinned effort doesn't apply and would mislead.
+  // Suppress Effort while routing is on: the router picks the model and its
+  // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
-  // Routable agents with no Model row surface Smart Routing as a standalone row;
+  // Routable agents with no Model row surface routing as a standalone row;
   // those with a Model dropdown fold it into Model above (shown as the value).
   if (costRoutingEligible && !showModels && routingOn) {
-    rows.push({ label: "Smart Routing", value: "On" });
+    rows.push({ label: SMART_ROUTING_LABEL, value: "On" });
   }
   return rows;
 }
@@ -6178,15 +6306,15 @@ function ComposerModelEffortLabel({
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
-  // Smart Routing picks the model + effort per turn, so the label reads
-  // "Smart Routing" with no pinned model/effort — matching the gear tooltip.
+  // Routing picks the model + effort per turn, so the label reads
+  // "Smart Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
     return (
       <span
         data-testid="composer-model-effort-label"
         className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
       >
-        <span className="text-foreground">Smart Routing</span>
+        <span className="text-foreground">{SMART_ROUTING_LABEL}</span>
       </span>
     );
   }

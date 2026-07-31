@@ -1,6 +1,10 @@
 import { cleanup } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { isCostRoutingSession, shortModelName } from "./CostRoutingControl";
+import {
+  isCostRoutingSession,
+  isSubagentRoutingSession,
+  shortModelName,
+} from "./CostRoutingControl";
 
 afterEach(cleanup);
 
@@ -23,6 +27,37 @@ describe("isCostRoutingSession", () => {
   it("rejects a missing session", () => {
     expect(isCostRoutingSession(null)).toBe(false);
     expect(isCostRoutingSession(undefined)).toBe(false);
+  });
+});
+
+describe("isSubagentRoutingSession", () => {
+  const top = { agentName: "claude-native-ui", parentSessionId: null };
+
+  it("matches Claude Code and Codex in both flavours, plus the auto sentinel", () => {
+    for (const harness of ["claude-native", "claude-sdk", "codex", "codex-native", "auto"]) {
+      expect(isSubagentRoutingSession({ ...top, harness })).toBe(true);
+    }
+  });
+
+  it("rejects harnesses with no native-subagent router", () => {
+    expect(isSubagentRoutingSession({ ...top, harness: "pi" })).toBe(false);
+    expect(isSubagentRoutingSession({ ...top, harness: "cursor-native" })).toBe(false);
+    expect(isSubagentRoutingSession({ ...top, harness: null })).toBe(false);
+  });
+
+  it("rejects a child session even on a routable harness", () => {
+    expect(
+      isSubagentRoutingSession({
+        agentName: "claude-native-ui",
+        parentSessionId: "conv_parent987",
+        harness: "claude-native",
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a missing session", () => {
+    expect(isSubagentRoutingSession(null)).toBe(false);
+    expect(isSubagentRoutingSession(undefined)).toBe(false);
   });
 });
 

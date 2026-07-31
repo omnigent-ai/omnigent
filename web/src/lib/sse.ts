@@ -67,6 +67,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { routingExtrasFromWire } from "./routingDecision";
 import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
@@ -1065,6 +1066,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       applied: rec.applied === true,
       rationale: typeof rec.rationale === "string" ? rec.rationale : "",
       ...(typeof rec.agent === "string" && rec.agent.length > 0 && { agent: rec.agent }),
+      routing: routingExtrasFromWire(rec),
       itemId,
       responseId,
     } satisfies RoutingDecision;

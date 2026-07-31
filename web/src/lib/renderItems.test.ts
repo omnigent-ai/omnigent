@@ -11,6 +11,7 @@ import { BlockStream } from "./blockStream";
 import type { ConversationItem } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import { itemsToBlocks } from "./itemsToBlocks";
+import { routingDecisionBlock, routingDecisionItem } from "./__fixtures__/routingDecision";
 import {
   type Bubble,
   type RenderItem,
@@ -1350,13 +1351,9 @@ describe("buildBubbles — slash_command items", () => {
 describe("buildBubbles — routing_decision (intelligent model router) chip", () => {
   it("routing_decision block becomes a standalone routing_decision bubble, not folded into an assistant bubble", () => {
     const blocks: AnyBlock[] = [
-      {
-        type: "routing_decision",
-        ctx: ctx({ itemId: "rd_1", responseId: "routing_1" }),
-        model: "databricks-claude-opus-4-8",
-        applied: true,
+      routingDecisionBlock(ctx({ itemId: "rd_1", responseId: "routing_1" }), {
         rationale: "multi-file refactor needs deep reasoning",
-      },
+      }),
       // An assistant turn under a different responseId follows.
       {
         type: "text_done",
@@ -1379,13 +1376,11 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
 
   it("carries applied=false for a shadow verdict (would-have-picked)", () => {
     const blocks: AnyBlock[] = [
-      {
-        type: "routing_decision",
-        ctx: ctx({ itemId: "rd_shadow", responseId: "routing_2" }),
+      routingDecisionBlock(ctx({ itemId: "rd_shadow", responseId: "routing_2" }), {
         model: "databricks-claude-haiku-4-5",
         applied: false,
         rationale: "trivial question",
-      },
+      }),
     ];
     const chip = buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "routing_decision" }>;
     // applied=false drives the "would have picked" copy — a flip to true
@@ -1396,15 +1391,12 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
 
   it("reload funnel: a routing_decision item maps through itemsToBlocks to the same bubble", () => {
     const items: ConversationItem[] = [
-      {
+      routingDecisionItem({
         id: "rd_reload",
-        type: "routing_decision",
         response_id: "routing_3",
-        status: "completed",
         model: "databricks-claude-sonnet-4-6",
-        applied: true,
         rationale: "moderate knowledge work",
-      } as unknown as ConversationItem,
+      }),
     ];
     const blocks = itemsToBlocks(items);
     const bubbles = buildBubbles(blocks, null);
@@ -1438,6 +1430,464 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
     expect(chip.itemId).toBe("rd_live");
     expect(chip.applied).toBe(true);
     expect(chip.model).toBe("databricks-claude-opus-4-8");
+  });
+});
+
+// A session/turn decision is the verdict on the message that triggered it, so
+// the chip renders below that message. The persisted/streamed order differs by
+// harness — native paths put the decision first — so the walker defers those.
+describe("buildBubbles — routing chip rendered below its user message", () => {
+  function chipBlock(
+    itemId: string,
+    responseId: string,
+    scope?: "session" | "turn" | "child_session" | "native_subagent",
+  ): AnyBlock {
+    return routingDecisionBlock(ctx({ itemId, responseId }), {
+      ...(scope !== undefined ? { routing: { scope } } : {}),
+    });
+  }
+  function userBlock(itemId: string, responseId: string): AnyBlock {
+    return {
+      type: "user_message",
+      ctx: ctx({ itemId, responseId }),
+      content: [{ type: "input_text", text: "refactor it" }],
+    };
+  }
+  function doneBlock(itemId: string, responseId: string, text: string): AnyBlock {
+    return {
+      type: "text_done",
+      ctx: ctx({ itemId, responseId }),
+      fullText: text,
+      hasCodeBlocks: false,
+    };
+  }
+  // claude-native applies a routed model by typing `/model <alias>` into its
+  // TUI; the injection round-trips back through the transcript and lands
+  // BETWEEN the decision and the user's own message.
+  function modelInjectBlock(itemId: string, responseId: string, alias: string): AnyBlock {
+    return {
+      type: "slash_command",
+      ctx: ctx({ itemId, responseId }),
+      kind: "command",
+      name: "model",
+      arguments: alias,
+      output: null,
+    };
+  }
+  function startBlock(responseId: string): AnyBlock {
+    return {
+      type: "response_start",
+      ctx: ctx({ responseId }),
+      model: "coder",
+      responseId,
+      conversationId: null,
+    };
+  }
+  function endBlock(responseId: string): AnyBlock {
+    return { type: "response_end", ctx: ctx({ responseId }), status: "completed", response: null };
+  }
+  const kinds = (bubbles: Bubble[]): string[] => bubbles.map((b) => b.kind);
+  const chipIds = (bubbles: Bubble[]): string[] =>
+    bubbles.filter((b) => b.kind === "routing_decision").map((b) => b.itemId);
+
+  /**
+   * Replay *all* one block at a time, asserting at every frame that the
+   * incrementally-cached build equals a from-scratch rebuild, then check the
+   * settled order. A frame that reorders, duplicates, or drops a bubble
+   * diverges from the rebuild and fails on that frame.
+   */
+  function expectFrameByFrameStable(
+    all: AnyBlock[],
+    settledKinds: string[],
+    active: ActiveResponse | null = null,
+  ): void {
+    const cache = createBubbleCache();
+    for (let n = 1; n <= all.length; n += 1) {
+      const frame = all.slice(0, n);
+      expect(buildBubbles(frame, active, cache)).toEqual(buildBubbles(frame, active));
+    }
+    expect(kinds(cache.bubbles)).toEqual(settledKinds);
+  }
+
+  it("defers a turn-scoped chip persisted before its message to below the message", () => {
+    // Native-terminal order: routing_decision at position 1, user message at 2.
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_1", "resp_1", "turn"),
+      userBlock("u1", "resp_1"),
+      doneBlock("a1", "resp_1", "Done."),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["user", "routing_decision", "assistant"]);
+    // Deferring must not drop or duplicate anything else in the turn.
+    expect((bubbles[0] as Extract<Bubble, { kind: "user" }>).itemId).toBe("u1");
+    expect(chipIds(bubbles)).toEqual(["rd_1"]);
+  });
+
+  it("leaves a chip persisted after its message exactly where it is", () => {
+    const blocks: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      chipBlock("rd_1", "resp_1", "turn"),
+      doneBlock("a1", "resp_1", "Done."),
+    ];
+    expect(kinds(buildBubbles(blocks, null))).toEqual(["user", "routing_decision", "assistant"]);
+  });
+
+  it("defers a session-scoped and a legacy scope-less decision the same way", () => {
+    for (const scope of ["session", undefined] as const) {
+      const blocks: AnyBlock[] = [chipBlock("rd_1", "resp_1", scope), userBlock("u1", "resp_1")];
+      expect(kinds(buildBubbles(blocks, null))).toEqual(["user", "routing_decision"]);
+    }
+  });
+
+  it("leaves sub-agent decisions in item order on both sides of the message", () => {
+    for (const scope of ["child_session", "native_subagent"] as const) {
+      // A spawn's decision belongs to the spawn, not to the user's message.
+      const before: AnyBlock[] = [chipBlock("rd_sub", "resp_1", scope), userBlock("u1", "resp_1")];
+      expect(kinds(buildBubbles(before, null))).toEqual(["routing_decision", "user"]);
+      const after: AnyBlock[] = [userBlock("u1", "resp_1"), chipBlock("rd_sub", "resp_1", scope)];
+      expect(kinds(buildBubbles(after, null))).toEqual(["user", "routing_decision"]);
+    }
+  });
+
+  it("pairs per turn, so each message keeps its own chip below it", () => {
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_1", "resp_1", "turn"),
+      userBlock("u1", "resp_1"),
+      doneBlock("a1", "resp_1", "one"),
+      chipBlock("rd_2", "resp_2", "turn"),
+      userBlock("u2", "resp_2"),
+      doneBlock("a2", "resp_2", "two"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual([
+      "user",
+      "routing_decision",
+      "assistant",
+      "user",
+      "routing_decision",
+      "assistant",
+    ]);
+    expect(chipIds(bubbles)).toEqual(["rd_1", "rd_2"]);
+  });
+
+  it("pairs a chip between two messages with the message it already follows", () => {
+    // Ambiguity resolves backwards: rd_1 is the verdict on u1, and moving it
+    // below u2 would attribute it to the wrong turn.
+    const blocks: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      chipBlock("rd_1", "resp_1", "turn"),
+      userBlock("u2", "resp_2"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["user", "routing_decision", "user"]);
+    expect((bubbles[2] as Extract<Bubble, { kind: "user" }>).itemId).toBe("u2");
+  });
+
+  it("keeps a chip with no adjacent message in item order", () => {
+    // A mid-turn decision (after assistant output, before more output) is
+    // nobody's verdict-on-a-message — it stays where it happened.
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_1", "resp_1", "turn"),
+      userBlock("u1", "resp_1"),
+      doneBlock("a1", "resp_1", "thinking"),
+      chipBlock("rd_2", "resp_1", "turn"),
+      doneBlock("a2", "resp_1", "done"),
+    ];
+    expect(kinds(buildBubbles(blocks, null))).toEqual([
+      "user",
+      "routing_decision",
+      "assistant",
+      "routing_decision",
+      "assistant",
+    ]);
+  });
+
+  it("defers only the adjacent chip when two decisions precede a message", () => {
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_far", "resp_1", "turn"),
+      chipBlock("rd_near", "resp_1", "turn"),
+      userBlock("u1", "resp_1"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["routing_decision", "user", "routing_decision"]);
+    expect(chipIds(bubbles)).toEqual(["rd_far", "rd_near"]);
+  });
+
+  it("static reload: the itemsToBlocks funnel defers the persisted decision too", () => {
+    const items: ConversationItem[] = [
+      routingDecisionItem({
+        id: "rd_reload",
+        response_id: "resp_1",
+        model: "databricks-claude-sonnet-4-6",
+        rationale: "moderate knowledge work",
+        scope: "turn",
+      }),
+      {
+        id: "u1",
+        type: "message",
+        role: "user",
+        response_id: "resp_1",
+        status: "completed",
+        content: [{ type: "input_text", text: "refactor it" }],
+      } as unknown as ConversationItem,
+    ];
+    const bubbles = buildBubbles(itemsToBlocks(items), null);
+    expect(kinds(bubbles)).toEqual(["user", "routing_decision"]);
+    expect(chipIds(bubbles)).toEqual(["rd_reload"]);
+  });
+
+  it("live stream (native order): the chip defers once the message arrives", () => {
+    const cache = createBubbleCache();
+    const streaming: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    // Frame 1: only the decision has streamed — nothing to sit below yet.
+    const f1 = [chipBlock("rd_1", "resp_1", "turn")];
+    expect(kinds(buildBubbles(f1, streaming, cache))).toEqual(["routing_decision"]);
+
+    // Frame 2: the message lands and the chip moves below it, once.
+    const f2 = [...f1, userBlock("u1", "resp_1")];
+    const second = buildBubbles(f2, streaming, cache);
+    expect(kinds(second)).toEqual(["user", "routing_decision"]);
+    // Incremental output must match a from-scratch rebuild — a duplicated or
+    // dropped bubble would show up here.
+    expect(second).toEqual(buildBubbles(f2, streaming));
+
+    // Frame 3+: assistant text streams in below the finalized pair.
+    const f3 = [...f2, { type: "text_chunk", ctx: ctx({ responseId: "resp_1" }), text: "Wor" }];
+    const third = buildBubbles(f3 as AnyBlock[], streaming, cache);
+    expect(kinds(third)).toEqual(["user", "routing_decision", "assistant"]);
+    expect(third).toEqual(buildBubbles(f3 as AnyBlock[], streaming));
+
+    const f4 = [...f3, { type: "text_chunk", ctx: ctx({ responseId: "resp_1" }), text: "king" }];
+    const fourth = buildBubbles(f4 as AnyBlock[], streaming, cache);
+    expect(kinds(fourth)).toEqual(["user", "routing_decision", "assistant"]);
+    expect(fourth).toEqual(buildBubbles(f4 as AnyBlock[], streaming));
+    // The finalized pair is reused by reference, not rebuilt each frame.
+    expect(fourth[0]).toBe(third[0]);
+    expect(fourth[1]).toBe(third[1]);
+  });
+
+  it("live stream: a response_start marker between chip and message doesn't block the pairing", () => {
+    const cache = createBubbleCache();
+    const streaming: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_1", "resp_1", "turn"),
+      startBlock("resp_1"),
+      userBlock("u1", "resp_1"),
+    ];
+    const bubbles = buildBubbles(blocks, streaming, cache);
+    expect(kinds(bubbles)).toEqual(["user", "routing_decision"]);
+    expect(bubbles).toEqual(buildBubbles(blocks, streaming));
+  });
+
+  it("live stream: a second turn's chip pairs without disturbing the finalized first turn", () => {
+    const cache = createBubbleCache();
+    const done: AnyBlock[] = [
+      chipBlock("rd_1", "resp_1", "turn"),
+      userBlock("u1", "resp_1"),
+      doneBlock("a1", "resp_1", "one"),
+    ];
+    buildBubbles(done, null, cache);
+    const withChip = [...done, chipBlock("rd_2", "resp_2", "turn")];
+    buildBubbles(withChip, null, cache);
+    const next = [...withChip, userBlock("u2", "resp_2")];
+    const bubbles = buildBubbles(next, null, cache);
+    expect(kinds(bubbles)).toEqual([
+      "user",
+      "routing_decision",
+      "assistant",
+      "user",
+      "routing_decision",
+    ]);
+    expect(chipIds(bubbles)).toEqual(["rd_1", "rd_2"]);
+    expect(bubbles).toEqual(buildBubbles(next, null));
+  });
+
+  it("live stream: frame-by-frame native order always matches a from-scratch rebuild", () => {
+    expectFrameByFrameStable(
+      [
+        chipBlock("rd_1", "resp_1", "turn"),
+        userBlock("u1", "resp_1"),
+        startBlock("resp_1"),
+        { type: "text_chunk", ctx: ctx({ responseId: "resp_1" }), text: "one" },
+        doneBlock("a1", "resp_1", "one"),
+        endBlock("resp_1"),
+        chipBlock("rd_2", "resp_2", "turn"),
+        userBlock("u2", "resp_2"),
+        { type: "text_chunk", ctx: ctx({ responseId: "resp_2" }), text: "two" },
+        doneBlock("a2", "resp_2", "two"),
+      ],
+      ["user", "routing_decision", "assistant", "user", "routing_decision", "assistant"],
+    );
+  });
+
+  it("live stream: frame-by-frame message-first order always matches a from-scratch rebuild", () => {
+    expectFrameByFrameStable(
+      [
+        userBlock("u1", "resp_1"),
+        chipBlock("rd_1", "resp_1", "turn"),
+        { type: "text_chunk", ctx: ctx({ responseId: "resp_1" }), text: "one" },
+        doneBlock("a1", "resp_1", "one"),
+        userBlock("u2", "resp_2"),
+        chipBlock("rd_2", "resp_2", "turn"),
+        { type: "text_chunk", ctx: ctx({ responseId: "resp_2" }), text: "two" },
+        doneBlock("a2", "resp_2", "two"),
+      ],
+      ["user", "routing_decision", "assistant", "user", "routing_decision", "assistant"],
+    );
+  });
+
+  it("claude-native: the injected /model echo between chip and message doesn't block the pairing", () => {
+    // Observed claude-native order (chat.db, sessions "claude sonnet" /
+    // "claude opus"): decision, then the `/model <alias>` the apply layer types
+    // into the TUI, then the user's own message. codex-native has no such
+    // injection, which is why only claude rendered the chip above the message.
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_1", "routing_1", "turn"),
+      modelInjectBlock("sc_1", "resp_inject", "sonnet"),
+      userBlock("u1", "resp_u"),
+      doneBlock("a1", "resp_u", "Hi!"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["assistant", "user", "routing_decision", "assistant"]);
+    expect(chipIds(bubbles)).toEqual(["rd_1"]);
+  });
+
+  it("claude-native static reload: the itemsToBlocks funnel defers past the /model echo", () => {
+    const items: ConversationItem[] = [
+      routingDecisionItem({
+        id: "rd_reload",
+        model: "databricks-claude-sonnet-5",
+        rationale: "trivial task",
+        scope: "turn",
+      }),
+      {
+        id: "sc_reload",
+        type: "slash_command",
+        response_id: "resp_inject",
+        status: "completed",
+        kind: "command",
+        name: "model",
+        arguments: "sonnet",
+      } as unknown as ConversationItem,
+      {
+        id: "u1",
+        type: "message",
+        role: "user",
+        response_id: "resp_u",
+        status: "completed",
+        content: [{ type: "input_text", text: "hi" }],
+      } as unknown as ConversationItem,
+    ];
+    const bubbles = buildBubbles(itemsToBlocks(items), null);
+    expect(kinds(bubbles)).toEqual(["assistant", "user", "routing_decision"]);
+    expect(chipIds(bubbles)).toEqual(["rd_reload"]);
+  });
+
+  it("claude-native live stream: the chip drops below the message once it arrives", () => {
+    expectFrameByFrameStable(
+      [
+        chipBlock("rd_1", "routing_1", "turn"),
+        modelInjectBlock("sc_1", "resp_inject", "sonnet"),
+        userBlock("u1", "resp_u"),
+        { type: "text_chunk", ctx: ctx({ responseId: "resp_u" }), text: "Hi" },
+        doneBlock("a1", "resp_u", "Hi!"),
+      ],
+      ["assistant", "user", "routing_decision", "assistant"],
+    );
+  });
+
+  it("claude-native live stream: the chip+echo pattern on a SECOND turn stays stable", () => {
+    // The cache bails out while the region starts at block 0, so the first turn
+    // can never exercise reuse. On a later turn the chip↔message region also
+    // holds the `/model` echo's own bubble — a region of THREE bubbles. Assuming
+    // two left the echo bubble in the reused prefix and re-emitted it, so the
+    // echo appeared twice (duplicate React keys) on every following frame.
+    expectFrameByFrameStable(
+      [
+        userBlock("u1", "resp_1"),
+        { type: "text_chunk", ctx: ctx({ responseId: "resp_1" }), text: "one" },
+        doneBlock("a1", "resp_1", "one"),
+        endBlock("resp_1"),
+        chipBlock("rd_2", "routing_2", "turn"),
+        modelInjectBlock("sc_2", "resp_inject", "opus"),
+        userBlock("u2", "resp_u2"),
+        startBlock("resp_u2"),
+        { type: "text_chunk", ctx: ctx({ responseId: "resp_u2" }), text: "tw" },
+        { type: "text_chunk", ctx: ctx({ responseId: "resp_u2" }), text: "o" },
+        doneBlock("a2", "resp_u2", "two"),
+      ],
+      ["user", "assistant", "assistant", "user", "routing_decision", "assistant"],
+    );
+  });
+
+  it("claude-native live stream: reuse after the second-turn pair drops the whole region", () => {
+    // Same shape, asserted directly on the cache: the pair's region spans the
+    // chip, the echo bubble, and the message, so `lastBubbleCount` is 3.
+    const cache = createBubbleCache();
+    const settled: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      doneBlock("a1", "resp_1", "one"),
+      chipBlock("rd_2", "routing_2", "turn"),
+      modelInjectBlock("sc_2", "resp_inject", "opus"),
+      userBlock("u2", "resp_u2"),
+    ];
+    const first = buildBubbles(settled, null, cache);
+    expect(kinds(first)).toEqual(["user", "assistant", "assistant", "user", "routing_decision"]);
+    expect(cache.lastBubbleStart).toBe(2);
+    expect(cache.lastBubbleCount).toBe(3);
+
+    // Next frame streams the answer — the reused prefix must stop before the
+    // echo bubble, not after it.
+    const next = [
+      ...settled,
+      { type: "text_chunk", ctx: ctx({ responseId: "resp_u2" }), text: "t" },
+    ];
+    const second = buildBubbles(next as AnyBlock[], null, cache);
+    expect(kinds(second)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "user",
+      "routing_decision",
+      "assistant",
+    ]);
+    expect(second).toEqual(buildBubbles(next as AnyBlock[], null));
+    // The first turn is still reused by reference (the point of the cache).
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).toBe(first[1]);
+  });
+
+  it("keeps a chip that already follows its message put, across a /model echo", () => {
+    // Backwards adjacency skips the echo too, so the chip is not re-attributed
+    // to the NEXT turn's message.
+    const blocks: AnyBlock[] = [
+      userBlock("u1", "resp_1"),
+      modelInjectBlock("sc_1", "resp_inject", "opus"),
+      chipBlock("rd_1", "routing_1", "turn"),
+      userBlock("u2", "resp_2"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["user", "assistant", "routing_decision", "user"]);
+    expect((bubbles[3] as Extract<Bubble, { kind: "user" }>).itemId).toBe("u2");
+  });
+
+  it("streaming past an unpaired chip still reuses the finalized prefix by reference", () => {
+    // The chip-before-region rebuild must stay bounded: once real assistant
+    // output follows the chip it can never pair, so the cache resumes.
+    const cache = createBubbleCache();
+    const base: AnyBlock[] = [
+      chipBlock("rd_1", "routing_1", "turn"),
+      modelInjectBlock("sc_1", "resp_inject", "sonnet"),
+      doneBlock("a1", "resp_1", "one"),
+    ];
+    const f1 = [...base, { type: "text_chunk", ctx: ctx({ responseId: "resp_2" }), text: "tw" }];
+    const first = buildBubbles(f1 as AnyBlock[], null, cache);
+    const f2 = [...f1, { type: "text_chunk", ctx: ctx({ responseId: "resp_2" }), text: "o" }];
+    const second = buildBubbles(f2 as AnyBlock[], null, cache);
+    expect(kinds(second)).toEqual(["routing_decision", "assistant", "assistant", "assistant"]);
+    expect(second).toEqual(buildBubbles(f2 as AnyBlock[], null));
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).toBe(first[1]);
   });
 });
 

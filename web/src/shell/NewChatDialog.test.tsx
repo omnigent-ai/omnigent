@@ -101,7 +101,10 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
 // create-session fetch assertions only observe the POST/PATCH calls they own.
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),
-  useBrainHarnessLabels: () => ({
+  // Mirrors the real hook: the "auto" sentinel leads the map only when the
+  // server enables routing, so the Auto-harness tests exercise the real gate.
+  useBrainHarnessLabels: (smartRoutingEnabled = false) => ({
+    ...(smartRoutingEnabled ? { auto: "Smart Routing" } : {}),
     "claude-sdk": "Claude SDK",
     codex: "Codex",
     cursor: "Cursor",
@@ -151,6 +154,12 @@ const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const setPendingInitialPromptMock = vi.mocked(setPendingInitialPrompt);
 
 const RECENT_KEY = "omnigent:recent-workspaces";
+// Per-harness remembered option knobs (see lib/modePreferences).
+const HARNESS_OPTIONS_KEY = "omnigent:last-mode-by-harness";
+// Last harness pick per agent (see lib/harnessPreferences).
+const LAST_HARNESS_KEY = "omnigent:last-harness-by-agent";
+// Last agent pick (see lib/agentPreferences).
+const LAST_AGENT_KEY = "omnigent:last-agent-id";
 
 /**
  * Build a minimal Conversation for the directory-conflict helpers/warning.
@@ -724,6 +733,44 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
 }
 
 /** Open the picker and commit (select + close) an agent by clicking its row. */
+/** Drop the mounted landing screen + its in-memory draft, keeping localStorage. */
+function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
+  cleanup();
+  resetLandingDraft();
+  renderLanding(infoOverrides);
+}
+
+/**
+ * Type *prompt* into the landing composer, submit, and read the create call.
+ *
+ * Returns both spellings the payload assertions need: the parsed body for
+ * field checks and the raw JSON so "no field of any spelling rode along"
+ * negative assertions can substring-search it.
+ */
+async function submitAndReadBody(
+  prompt = "ship it",
+): Promise<{ raw: string; body: Record<string, unknown> }> {
+  fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+    target: { value: prompt },
+  });
+  fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+  return readCreateBody();
+}
+
+/** Wait for the create POST and read its raw + parsed body. */
+async function readCreateBody(): Promise<{ raw: string; body: Record<string, unknown> }> {
+  await waitFor(() =>
+    expect(
+      authenticatedFetchMock.mock.calls.some(
+        ([url, init]) => url === "/v1/sessions" && (init as RequestInit | undefined)?.body,
+      ),
+    ).toBe(true),
+  );
+  const call = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+  const raw = (call[1] as RequestInit).body as string;
+  return { raw, body: JSON.parse(raw) as Record<string, unknown> };
+}
+
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
@@ -3054,5 +3101,821 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
     fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Smart Routing (per-harness Model option) + the fully-auto Auto harness
+//
+// Two distinct products of the router, deliberately separate in the UI:
+//  - "Smart Routing" is a Model choice on the two native harnesses whose
+//    running CLI takes a per-turn model switch (claude-native / codex-native).
+//    It sends cost_control_mode_override: "on" with NO model_override.
+//  - The Auto harness is a harness choice on bundle agents: the router picks
+//    harness AND model, so its config modal has nothing but Permissions.
+// ---------------------------------------------------------------------------
+
+describe("NewChatLandingScreen smart routing", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  // The Model row's option set per harness. Claude Code lists its own models
+  // alongside Smart Routing; Codex resolves its catalog inside the running CLI
+  // so the pre-launch row offers only what the create call can express. With
+  // the server flag off, Smart Routing is never an option.
+  it.each([
+    ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
+    ["Claude Code", "a1", false, null, "Default"],
+    ["Codex", "a2", true, "Smart Routing", "Default"],
+  ] as const)(
+    "%s Model dropdown with the flag %s offers %s alongside %s",
+    (_label, agentId, flag, routingOption, siblingOption) => {
+      renderLanding({ smart_routing_enabled: flag });
+      openAgentConfig(agentId);
+      openSelect("new-chat-landing-config-model");
+      if (routingOption === null) {
+        expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
+      } else {
+        expect(screen.getByRole("option", { name: routingOption })).toBeTruthy();
+      }
+      expect(screen.getByRole("option", { name: siblingOption })).toBeTruthy();
+    },
+  );
+
+  // No Model row at all: Codex has nothing else to offer with the flag off,
+  // and a non-routable harness has nothing to offer even with it on. Either
+  // way that harness's own knob row is untouched.
+  it.each([
+    ["Codex with the flag off", "a2", false, null, "new-chat-landing-config-approval"],
+    [
+      "a non-routable harness with the flag on",
+      "a_cursor",
+      true,
+      {
+        id: "a_cursor",
+        name: "cursor-native-ui",
+        display_name: "Cursor",
+        description: null,
+        harness: "cursor-native",
+        skills: [],
+      } as AvailableAgent,
+      "new-chat-landing-config-cursor-mode",
+    ],
+  ] as const)("gives %s no Model row", (_case, agentId, flag, agent, siblingTestId) => {
+    if (agent) mockAgents([agent]);
+    renderLanding({ smart_routing_enabled: flag });
+    openAgentConfig(agentId);
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    expect(screen.getByTestId(siblingTestId)).toBeTruthy();
+  });
+
+  it("freezes Effort to an em-dash while Smart Routing is selected", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    // Pin an effort first, so the em-dash can't pass vacuously on an unset row.
+    pickSelectOption("new-chat-landing-config-effort", "High");
+    expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("High");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    const effort = screen.getByTestId("new-chat-landing-config-effort");
+    expect(effort).toBeDisabled();
+    expect(effort.textContent).toContain("—");
+    expect(effort.textContent).not.toContain("High");
+  });
+
+  it("sends cost_control_mode_override 'on' and no model/effort override when routing is picked", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_routed" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentConfig("a1");
+    // Pin a model + effort first so the routing pick has something to clear.
+    pickSelectOption("new-chat-landing-config-model", "Opus 4.8");
+    pickSelectOption("new-chat-landing-config-effort", "High");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+
+    const { body } = await submitAndReadBody();
+    // Anchor on a required field so the absence checks can't pass vacuously.
+    expect(body.agent_id).toBe("a1");
+    expect(body.cost_control_mode_override).toBe("on");
+    // The router picks the model (and its effort) per turn, so neither may be
+    // pinned — a model_override would suppress per-turn routing server-side.
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  // Sticky Smart Routing: the pick is remembered per harness in the same
+  // localStorage store as the mode/model/effort knobs, so a returning user's
+  // next session on that harness starts routed.
+
+  it("preselects Smart Routing on a later session for the same harness", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+    expect(
+      JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["claude-native"],
+    ).toMatchObject({ routing: "on" });
+
+    remountLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "Smart Routing",
+    );
+  });
+
+  it("remembers Codex's routing pick without touching Claude Code's", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a2");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+
+    remountLanding({ smart_routing_enabled: true });
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "Smart Routing",
+    );
+    closeMenu();
+    // Claude Code never had routing picked, so it stays on Default.
+    openAgentConfig("a1");
+    const model = screen.getByTestId("new-chat-landing-config-model");
+    expect(model.textContent).toContain("Default");
+    expect(model.textContent).not.toContain("Smart Routing");
+  });
+
+  it("drops back to Default once the user picks a model again", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+    openAgentConfig("a1");
+    openSelect("new-chat-landing-config-model");
+    // By role, not text: "Default" also labels the Permissions row's value.
+    fireEvent.click(screen.getByRole("option", { name: "Default" }));
+    saveConfig();
+
+    remountLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    const model = screen.getByTestId("new-chat-landing-config-model");
+    expect(model.textContent).toContain("Default");
+    expect(model.textContent).not.toContain("Smart Routing");
+  });
+
+  it("falls back to Default when a remembered routing pick meets a server without routing", () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on" } }),
+    );
+    renderLanding({ smart_routing_enabled: false });
+    openAgentConfig("a1");
+    const model = screen.getByTestId("new-chat-landing-config-model");
+    expect(model.textContent).toContain("Default");
+    expect(model.textContent).not.toContain("Smart Routing");
+  });
+
+  it("omits cost_control_mode_override when a remembered pick can't be honored", async () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_plain" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: false });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a1");
+    expect(body.cost_control_mode_override).toBeUndefined();
+  });
+
+  it("launches a remembered routing pick as cost_control_mode_override 'on'", async () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_routed_again" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.cost_control_mode_override).toBe("on");
+    expect(body.model_override).toBeUndefined();
+  });
+
+  it("clears a stale remembered model when Codex picks Smart Routing", async () => {
+    // Codex's modal has no model picker of its own, so a model remembered under
+    // codex-native has no other path out of the store. Left behind it rides
+    // along with routing, and a session that carries both reads as
+    // already-model-pinned server-side — routing then never runs.
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "codex-native": { model: "databricks-gpt-5-5", effort: "high" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_codex_routed" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentConfig("a2");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+    expect(
+      JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["codex-native"],
+    ).toMatchObject({ routing: "on", model: "", effort: "" });
+
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a2");
+    expect(body.cost_control_mode_override).toBe("on");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("keeps a rehydrated routing pick when the model catalog resolves later", async () => {
+    // The remembered model is validated against the host's catalog, which lands
+    // after mount — so the seed runs again once it does. A remembered "route
+    // every turn" must win both times, or the late seed re-pins the model and
+    // silently downgrades the session the user thought was routed.
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on", model: "opus" } }),
+    );
+    useHostModelOptionsMock.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      isError: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_late_catalog" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    useHostModelOptionsMock.mockReturnValue({
+      data: [{ id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" }],
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    // Any state change re-renders with the resolved catalog, re-running the seed.
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    openAgentConfig("a1");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "Smart Routing",
+    );
+    closeMenu();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    const { body } = await readCreateBody();
+    expect(body.agent_id).toBe("a1");
+    expect(body.cost_control_mode_override).toBe("on");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+});
+
+describe("NewChatLandingScreen Auto harness", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    mockAgents([
+      {
+        id: "ag_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "pi",
+        skills: [],
+      },
+    ]);
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  /** Select the Auto harness from the bundle agent's Agent Harness row. */
+  function selectAutoHarness(): void {
+    openAgentConfig("ag_polly");
+    pickSelectOption("new-chat-landing-config-harness", "Smart Routing");
+    saveConfig();
+  }
+
+  it("describes what Auto does next to its harness row", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("ag_polly");
+    openSelect("new-chat-landing-config-harness");
+    const auto = screen.getByTestId("new-chat-landing-harness-auto");
+    expect(auto.textContent).toContain("Smart Routing");
+    expect(auto.textContent).toContain("Harness and model picked per task by smart routing");
+  });
+
+  it("reads 'Smart Routing' on the composer chip, with the behavior as hover text", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    const chip = screen.getByTestId("new-chat-landing-agent-select");
+    expect(chip.textContent).toContain("Smart Routing");
+    // The agent it falls back to must not be named — the router owns the pick.
+    expect(chip.textContent).not.toContain("Polly");
+    expect(chip).toHaveAttribute("title", "Harness and model picked per task by smart routing");
+  });
+
+  it("shows only Permissions in the Auto config modal, titled 'Configure Smart Routing'", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByText("Configure Smart Routing")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-config-permission")).toBeTruthy();
+    // Every harness-specific knob is undecidable before the router picks.
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-harness")).toBeNull();
+  });
+
+  it("locks Permissions to Default — no other mode is selectable", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    const permission = screen.getByTestId("new-chat-landing-config-permission");
+    expect(permission.textContent).toContain("Default");
+    expect(permission).toBeDisabled();
+    // A disabled trigger can't open, so no other mode is reachable.
+    openSelect("new-chat-landing-config-permission");
+    expect(screen.queryByRole("option", { name: "Plan" })).toBeNull();
+    expect(screen.queryByRole("option", { name: "Bypass permissions" })).toBeNull();
+  });
+
+  it("ignores a stale non-default mode stored for the auto sentinel", () => {
+    // Nothing writes this key for "auto" anymore, but an older build could have.
+    // It must never be restored — the row is Default, and the create sends no
+    // override, so a stale "plan" can't leak into the router's pick.
+    localStorage.setItem(HARNESS_OPTIONS_KEY, JSON.stringify({ auto: { mode: "plan" } }));
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    const permission = screen.getByTestId("new-chat-landing-config-permission");
+    expect(permission.textContent).toContain("Default");
+    expect(permission.textContent).not.toContain("Plan");
+  });
+
+  it("leaves Auto via the picker: re-selecting the agent restores its own harness", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectAutoHarness();
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Smart Routing",
+    );
+    selectAgent("ag_polly");
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
+    // The Agent Harness row is back, so the full modal is reachable again.
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-harness")).toBeTruthy();
+  });
+
+  it("sends harness_override 'auto' with cost_control_mode_override 'on'", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_auto" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectAutoHarness();
+    const { body } = await submitAndReadBody();
+    expect(body.harness_override).toBe("auto");
+    expect(body.cost_control_mode_override).toBe("on");
+  });
+
+  it("sends no permission override for Auto, even after a stale mode was stored", async () => {
+    // Permissions are inherited from the machine's own Claude Code / Codex
+    // config, which is expressed by sending nothing: the permission mode rides
+    // `terminal_launch_args` as ["--permission-mode", mode], and the default
+    // omits the field entirely (same as launching claude-code on Default).
+    localStorage.setItem(HARNESS_OPTIONS_KEY, JSON.stringify({ auto: { mode: "plan" } }));
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_auto" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectAutoHarness();
+    const { raw, body } = await submitAndReadBody();
+    // Anchor on a required field so the absence checks can't pass vacuously.
+    expect(body.harness_override).toBe("auto");
+    expect(body.terminal_launch_args).toBeUndefined();
+    // No permission field of any spelling rides along.
+    expect(raw).not.toContain("permission");
+    expect(raw).not.toContain("plan");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Smart Routing as a top-level HARNESS row (no bundle agent). The router picks
+// native Claude Code or Codex per task, so the row needs both CLIs ready. It
+// binds the Claude wrapper as the create call's placeholder agent; the server
+// rebinds to whichever wrapper the router picked.
+// ---------------------------------------------------------------------------
+
+describe("NewChatLandingScreen Smart Routing harness row", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  const SMART_ROUTING_ROW = "new-chat-landing-harness-smart-routing";
+
+  function openPicker(): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  }
+
+  /** Pick the Smart Routing row out of the picker's Harnesses group. */
+  function selectSmartRoutingHarness(): void {
+    openPicker();
+    fireEvent.click(screen.getByTestId(SMART_ROUTING_ROW));
+  }
+
+  it("offers the row in its own unlabeled group above the harnesses", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openPicker();
+    const row = screen.getByTestId(SMART_ROUTING_ROW);
+    // Plain label only — no helper blurb beside it.
+    expect(row.textContent).toBe("Smart Routing");
+    // The row leads the menu, above the "Harnesses" heading and its rows.
+    const heading = screen.getByText("Harnesses");
+    expect(row.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("hides the row when the server flag is off", () => {
+    renderLanding({ smart_routing_enabled: false });
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+    // The ordinary harness rows are still there, so this isn't vacuous.
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+  });
+
+  it.each([
+    ["codex not installed", { "claude-native": true, "codex-native": false }],
+    ["claude not installed", { "claude-native": false, "codex-native": true }],
+    ["codex needs auth", { "claude-native": true, "codex-native": "needs-auth" }],
+  ])("hides the row when %s — a one-armed router is just that arm", (_case, configured) => {
+    mockHosts([{ ...host("online"), configured_harnesses: configured } as Host]);
+    renderLanding({ smart_routing_enabled: true });
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+  });
+
+  it("shows the row when the host reports both native CLIs ready", () => {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "codex-native": true },
+      } as Host,
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    openPicker();
+    expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
+  });
+
+  it("hides the row when only one native wrapper agent is registered", () => {
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+  });
+
+  it("reads 'Smart Routing' on the composer chip and highlights only its own row", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    const chip = screen.getByTestId("new-chat-landing-agent-select");
+    expect(chip.textContent).toContain("Smart Routing");
+    // The placeholder wrapper must not be named — the router owns the pick.
+    expect(chip.textContent).not.toContain("Claude Code");
+    expect(chip).toHaveAttribute("title", "Harness and model picked per task by smart routing");
+    // Two rows lit at once would misreport what runs.
+    openPicker();
+    expect(screen.getByTestId(SMART_ROUTING_ROW)).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).not.toHaveAttribute("data-active");
+  });
+
+  it("shows only a locked Permissions row, titled 'Configure Smart Routing'", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByText("Configure Smart Routing")).toBeTruthy();
+    const permission = screen.getByTestId("new-chat-landing-config-permission");
+    expect(permission.textContent).toContain("Default");
+    expect(permission).toBeDisabled();
+    // Every harness-specific knob is undecidable before the router picks.
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-config-harness")).toBeNull();
+  });
+
+  it("leaves Smart Routing by re-picking a harness row", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Smart Routing",
+    );
+    selectAgent("a2");
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Codex");
+  });
+
+  it("sends harness_override 'auto' with the routing message and routing on", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_smart" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectSmartRoutingHarness();
+    const { raw, body } = await submitAndReadBody("refactor the auth module");
+    expect(body.harness_override).toBe("auto");
+    expect(body.cost_control_mode_override).toBe("on");
+    // The server routes from this text at create time; the real message is
+    // still delivered after navigation.
+    expect(body.smart_routing_message).toBe("refactor the auth module");
+    // The placeholder the server rebinds off.
+    expect(body.agent_id).toBe("a1");
+    // Nothing that describes the placeholder's own CLI may ride along.
+    expect(body.labels).toBeUndefined();
+    expect(body.terminal_launch_args).toBeUndefined();
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(raw).not.toContain("permission");
+  });
+
+  it("sends no routing message once the pick moves off Smart Routing", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_codex" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectSmartRoutingHarness();
+    selectAgent("a2");
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a2");
+    expect(body.harness_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+  });
+
+  // Sticky Smart Routing: the row is a harness pick like any other, so it lands
+  // in the same per-agent last-harness store and a return visit starts on it.
+  // When the row can't be offered on the next visit, the pick degrades to the
+  // default selection rather than stranding a chip with no row behind it.
+
+  /** Seed the store as a previous session that ended on Smart Routing. */
+  function seedStoredSmartRouting(): void {
+    localStorage.setItem(LAST_AGENT_KEY, "a1");
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ a1: "auto-native" }));
+  }
+
+  it("stores the pick under the placeholder wrapper it binds", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
+      a1: "auto-native",
+    });
+    expect(localStorage.getItem(LAST_AGENT_KEY)).toBe("a1");
+  });
+
+  it("preselects Smart Routing on a later visit", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+
+    remountLanding({ smart_routing_enabled: true });
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Smart Routing",
+    );
+    openPicker();
+    expect(screen.getByTestId(SMART_ROUTING_ROW)).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).not.toHaveAttribute("data-active");
+  });
+
+  it.each([
+    ["codex is missing on this host", { "claude-native": true, "codex-native": false }, true],
+    ["claude is missing on this host", { "claude-native": false, "codex-native": true }, true],
+    ["routing is disabled server-side", null, false],
+  ] as const)(
+    "falls back to the default harness when %s",
+    (_case, configured, smartRoutingEnabled) => {
+      seedStoredSmartRouting();
+      if (configured) {
+        mockHosts([{ ...host("online"), configured_harnesses: configured } as Host]);
+      }
+      renderLanding({ smart_routing_enabled: smartRoutingEnabled });
+      // Exactly what an empty store would have given: the default harness pick.
+      const chip = screen.getByTestId("new-chat-landing-agent-select");
+      expect(chip.textContent).not.toContain("Smart Routing");
+      expect(chip.textContent).toContain("Claude Code");
+      // Silent: the user did nothing this visit to lose routing, and the row
+      // the notice would talk about isn't in the picker either.
+      expect(screen.queryByTestId("new-chat-landing-smart-routing-dropped")).toBeNull();
+      openPicker();
+      expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+      // The arm may come back, so the pick stays remembered.
+      expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
+        a1: "auto-native",
+      });
+    },
+  );
+
+  it("announces the downgrade when a host switch takes Smart Routing away", async () => {
+    // Dropping the pick silently reads as the UI forgetting it; the readiness
+    // slot has to say Smart Routing went away and what runs instead.
+    mockHosts([
+      {
+        ...host("online", 1),
+        configured_harnesses: { "claude-native": true, "codex-native": true },
+      },
+      {
+        ...host("online", 2),
+        configured_harnesses: { "claude-native": true, "codex-native": false },
+      },
+    ] as Host[]);
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    expect(screen.queryByTestId("new-chat-landing-smart-routing-dropped")).toBeNull();
+
+    // Switch to the host that has only one arm.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const target = screen
+      .getAllByText("machine-2")
+      .find((el) => el.closest('[role="menuitem"]') !== null);
+    fireEvent.click(target!);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-2"),
+    );
+    const notice = await screen.findByTestId("new-chat-landing-smart-routing-dropped");
+    expect(notice.textContent).toContain("Smart Routing");
+    expect(notice.textContent).toContain("Claude Code");
+    // Names the arm that's actually missing on the new host, not a generic
+    // "both arms" line that would send the user looking at the wrong CLI.
+    expect(notice.textContent).toContain("needs Codex ready on machine-2");
+    expect(notice.textContent).not.toContain("Claude Code and Codex");
+
+    // An explicit pick answers the notice — it stops nagging. (Codex folds into
+    // the picker's "More" submenu on this host, so pick the ready arm.)
+    selectAgent("a1");
+    expect(screen.queryByTestId("new-chat-landing-smart-routing-dropped")).toBeNull();
+  });
+
+  it("yields the notice slot to the harness-readiness notice", async () => {
+    // The fallback agent itself isn't ready on the new host, so the readiness
+    // notice fires too. Two amber lines in one slot is noise — "set up this
+    // harness" is the actionable one, so only it shows.
+    mockHosts([
+      {
+        ...host("online", 1),
+        configured_harnesses: { "claude-native": true, "codex-native": true },
+      },
+      {
+        ...host("online", 2),
+        configured_harnesses: { "claude-native": false, "codex-native": true },
+      },
+    ] as Host[]);
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const target = screen
+      .getAllByText("machine-2")
+      .find((el) => el.closest('[role="menuitem"]') !== null);
+    fireEvent.click(target!);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-2"),
+    );
+
+    expect(await screen.findByTestId("new-chat-landing-harness-warning")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-smart-routing-dropped")).toBeNull();
+  });
+
+  it("routes on the prompt the agent will receive, not the raw textarea value", async () => {
+    // The router must classify the delivered prompt: sanitization (and the
+    // mention preamble) happen before the create, not after it.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_smart_sanitized" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectSmartRoutingHarness();
+    const { body } = await submitAndReadBody("  refactor the auth\u0007 module  ");
+    expect(body.smart_routing_message).toBe("refactor the auth module");
+  });
+
+  it("sends no routing on a create after the restored pick degraded", async () => {
+    seedStoredSmartRouting();
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "codex-native": false },
+      } as Host,
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_degraded" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a1");
+    expect(body.harness_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+    expect(body.cost_control_mode_override).toBeUndefined();
+  });
+
+  it("forgets the pick once an explicit harness row replaces it", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    // The wrapper the sentinel is stored under: clicking its row is a pick of
+    // the wrapper, so the sentinel must not come back on the next visit.
+    selectAgent("a2");
+    selectAgent("a1");
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({});
+
+    remountLanding({ smart_routing_enabled: true });
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Claude Code",
+    );
+  });
+
+  it("leaves a bundle agent's remembered brain harness alone", () => {
+    // The sentinel shares the store with per-agent brain-harness picks, so
+    // writing/degrading it must not disturb another agent's entry.
+    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_polly: "openai-agents" }));
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
+      ag_polly: "openai-agents",
+      a1: "auto-native",
+    });
+  });
+});
+
+describe("claude-code default permission mode (payload anchor for Auto)", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it("omits terminal_launch_args when the permission mode is left on Default", async () => {
+    // The behavior Auto matches: Default = inherit the machine's own config, so
+    // the create call carries no permission flag at all.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_claude" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectAgent("a1");
+    const { raw } = await submitAndReadBody();
+    expect(JSON.parse(raw).agent_id).toBe("a1");
+    expect(JSON.parse(raw).terminal_launch_args).toBeUndefined();
+    expect(raw).not.toContain("permission");
   });
 });
