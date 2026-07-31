@@ -77,6 +77,35 @@ class TestRowToItem:
         ):
             assert _row_to_item(0, row) is None
 
+    def test_step_end_with_end_turn_is_turn_end(self) -> None:
+        """``end_turn`` is the edge that reports terminal status to the parent."""
+        row = {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "step.end",
+                "turnId": "0",
+                "step": 3,
+                "finishReason": "end_turn",
+            },
+        }
+        item = _row_to_item(28, row)
+        assert item is not None
+        assert item.kind == "turn_end"
+        assert item.response_id == "kimi:turn_end:28"
+
+    def test_step_end_with_tool_use_is_skipped(self) -> None:
+        """A step that stopped to call a tool is mid-turn, not a completion."""
+        row = {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "step.end",
+                "turnId": "0",
+                "step": 1,
+                "finishReason": "tool_use",
+            },
+        }
+        assert _row_to_item(12, row) is None
+
     def test_non_user_turn_prompt_skipped(self) -> None:
         row = {
             "type": "turn.prompt",

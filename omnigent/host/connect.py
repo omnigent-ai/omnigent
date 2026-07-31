@@ -113,6 +113,7 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -817,6 +818,10 @@ class HostProcess:
             # linger that long in the rare case a runner dies mid-worktree-op —
             # acceptable, since the leak this guards against accrues over hours,
             # not a two-minute worst case.
+            return 0
+        if not hasattr(os, "WNOHANG"):
+            # Windows: no child reparenting to a subreaper and no ``WNOHANG`` /
+            # ``waitpid(-1, ...)`` — nothing to reap and the calls would raise.
             return 0
         if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
             return self._reap_orphans_waitid()
@@ -1839,7 +1844,111 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
-        if canonicalize_harness(frame.harness) != "claude-native":
+        harness = canonicalize_harness(frame.harness) or frame.harness
+        if harness == "codex-native":
+            try:
+                from omnigent.codex_native_app_server import (
+                    discover_codex_model_options,
+                    resolve_native_codex_launch,
+                )
+                from omnigent.model_catalog import (
+                    is_direct_openai_provider,
+                    list_models_for_worker,
+                    resolve_catalog_model,
+                    resolve_model_provider,
+                )
+                from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+                launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+                spec = AgentSpec(
+                    spec_version=1,
+                    name="codex-native-prelaunch",
+                    executor=ExecutorSpec(
+                        type="omnigent",
+                        config={
+                            "harness": "codex-native",
+                            **({"profile": launch.profile} if launch.profile else {}),
+                        },
+                    ),
+                )
+                listing = await asyncio.to_thread(list_models_for_worker, spec, "codex-native")
+                default_model = launch.model
+                if default_model is None and launch.profile is not None:
+                    default_model = (
+                        await asyncio.to_thread(
+                            resolve_catalog_model,
+                            "databricks",
+                            family="openai",
+                        )
+                    ).model_id
+                default_id = (
+                    default_model if default_model in {m.id for m in listing.models} else None
+                )
+                provider = (
+                    resolve_model_provider(spec, "codex-native")
+                    if listing.source == "openai-compatible"
+                    else None
+                )
+                if provider is not None and is_direct_openai_provider(provider):
+                    available_ids = {model.id for model in listing.models}
+                    models = []
+                    seen: set[str] = set()
+                    selected_default = False
+                    try:
+                        codex_options = await discover_codex_model_options()
+                    except Exception:
+                        _logger.exception("Failed to discover Codex-compatible pre-launch models")
+                        codex_options = []
+                    for option in codex_options:
+                        raw_id = option.get("model") or option.get("id")
+                        if (
+                            not isinstance(raw_id, str)
+                            or raw_id not in available_ids
+                            or raw_id in seen
+                        ):
+                            continue
+                        seen.add(raw_id)
+                        display_name = option.get("displayName")
+                        is_default = raw_id == default_id or (
+                            default_model is None
+                            and not selected_default
+                            and option.get("isDefault") is True
+                        )
+                        selected_default = selected_default or is_default
+                        models.append(
+                            {
+                                "id": raw_id,
+                                "displayName": (
+                                    display_name
+                                    if isinstance(display_name, str) and display_name
+                                    else raw_id
+                                ),
+                                **({"isDefault": True} if is_default else {}),
+                            }
+                        )
+                else:
+                    models = [
+                        {
+                            "id": model.id,
+                            "displayName": model.id,
+                            **({"isDefault": True} if model.id == default_id else {}),
+                        }
+                        for model in listing.models
+                    ]
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Codex model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Codex model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=models,
+            )
+
+        if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -2156,11 +2265,17 @@ class HostProcess:
         headers = self._build_connect_headers()
 
         _logger.info("Connecting to %s", url)
+        # Build a verifying SSL context from a real CA bundle for wss:// — a bare
+        # default context loads zero roots on uv / python-build-standalone Pythons
+        # (no OpenSSL default cert path), which fails handshake verification.
+        # ``ssl=None`` for ws:// is the library default (no TLS).
+        ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
+                ssl=ssl_ctx,
                 # Align the host->server tunnel's protocol keepalive to the same
                 # 90 s app-level budget as the runner tunnel (not the 20 s library
                 # default that drops a busy-but-healthy tunnel with 1011 — #1116).

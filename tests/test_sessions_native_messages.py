@@ -65,6 +65,24 @@ def test_codex_native_session_uses_codex_harness_for_web_messages() -> None:
     }
 
 
+def test_native_message_forwards_authenticated_author_metadata() -> None:
+    """Native runner events carry trusted authorship separately from text."""
+    from omnigent.server.routes import sessions as sessions_routes
+
+    conv = _conversation_with_wrapper("codex-native-ui")
+
+    event = sessions_routes._build_native_terminal_message_event(
+        conv,
+        _message_event(),
+        created_by="alice@example.com",
+        author_attribution_required=True,
+    )
+
+    assert event["created_by"] == "alice@example.com"
+    assert event["author_attribution_required"] is True
+    assert event["content"] == [{"type": "input_text", "text": "hello"}]
+
+
 def test_kiro_native_session_uses_kiro_harness_for_web_messages() -> None:
     """Kiro-native web messages use the native bypass, like Codex."""
     from omnigent.server.routes import sessions as sessions_routes

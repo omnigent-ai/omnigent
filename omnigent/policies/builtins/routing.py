@@ -23,7 +23,12 @@ import json
 import logging
 from typing import Any
 
-from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
+from omnigent.policies.schema import (
+    PolicyCallable,
+    PolicyEvent,
+    PolicyResponse,
+    request_user_text,
+)
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
@@ -110,9 +115,9 @@ def deny_trivial_to_expensive_model(
     Non-expensive models, missing client, empty messages, and
     classification failures all pass through (fail open).
 
-    :param expensive_models: Model ids that should not be used for
-        trivial tasks, e.g. ``["databricks-claude-opus-4-6",
-        "openai/o3"]``. Required — the operator must explicitly
+    :param expensive_models: Provider-configured model ids that should
+        not be used for trivial tasks, e.g. ``["provider/model-id",
+        "provider-local-model-id"]``. Required — the operator must explicitly
         list the models to gate.
     :param classification_prompt: System instructions for the
         classifier LLM call. The model is constrained to respond
@@ -354,8 +359,8 @@ def intent_based_authorization() -> PolicyCallable:
             if state.get(_INTENT_KEY):
                 return None  # intent already recorded — nothing to do
 
-            message = event.get("data", "")
-            if not isinstance(message, str) or not message.strip():
+            message = request_user_text(event.get("data"))
+            if not message.strip():
                 return None
 
             return {
@@ -374,7 +379,8 @@ def intent_based_authorization() -> PolicyCallable:
             return None
 
         state = event.get("session_state") or {}
-        intent: str = state.get(_INTENT_KEY, "")
+        intent_value = state.get(_INTENT_KEY, "")
+        intent = intent_value if isinstance(intent_value, str) else ""
         if not intent:
             return None  # no intent captured yet — fail open
 
@@ -471,7 +477,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "description": (
             "Classifies the user's message as TRIVIAL or COMPLEX using "
             "the server-level LLM client with structured output. Denies "
-            "TRIVIAL tasks from using expensive models (e.g. Opus, o3). "
+            "TRIVIAL tasks from using operator-designated expensive models. "
             "Requires the server to have an llm: config block."
         ),
         "params_schema": {
@@ -481,7 +487,8 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Model ids to gate, e.g. ['databricks-claude-opus-4-6', 'openai/o3']."
+                        "Provider-configured model ids to gate for trivial tasks, "
+                        "e.g. ['provider/model-id', 'provider-local-model-id']."
                     ),
                 },
                 "classification_prompt": {

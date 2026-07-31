@@ -80,8 +80,18 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           persist-credentials: false
 
-      - name: Set up Node 20
-        uses: ./.github/actions/setup-node
+      # The pinned Playwright image doesn't ship Node, so install Node before
+      # the pnpm action (pnpm/action-setup's self-installer needs a Node binary).
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.15.1
+          standalone: true
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
@@ -106,9 +116,8 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          cd web
-          npm ci --legacy-peer-deps --no-audit --no-fund
-          npm run build
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build
 
       - name: Compare the baselines (no --update-snapshots)
         # Deliberately NOT --update-snapshots: that rewrites EVERY PNG, churning

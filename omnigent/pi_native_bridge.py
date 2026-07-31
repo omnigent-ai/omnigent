@@ -325,6 +325,30 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
     return True
 
 
+def inject_relay_into_config(bridge_dir: Path, relay_url: str, relay_token: str) -> bool:
+    """Write ``relayUrl`` and ``relayToken`` into ``config.json``.
+
+    The pi extension reads these on every policy POST via ``relayCredentials()``
+    and routes to the relay instead of the server — eliminating server bearer
+    expiry for policy evaluation.
+
+    :returns: ``True`` when the config was updated.
+    """
+    path = config_path(bridge_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("relayUrl") == relay_url and payload.get("relayToken") == relay_token:
+        return False
+    payload["relayUrl"] = relay_url
+    payload["relayToken"] = relay_token
+    _atomic_json(path, payload)
+    return True
+
+
 def _extension_source() -> str:
     """
     Return the packaged Pi extension source.

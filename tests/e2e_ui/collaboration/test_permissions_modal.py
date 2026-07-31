@@ -9,16 +9,18 @@ button, the add-user grant form, the per-row level select, and revoke —
 and pins each one against the server's ``/permissions`` state so a
 silently-broken control can't pass.
 
-Single owner identity (the headerless ``local`` user, same as every other
-e2e_ui context), so no second browser is needed: every assertion is on the
-owner's own modal plus a REST read-back. No agent run — the modal only
-needs a session to exist.
+The modal-control test uses one owner identity and REST read-backs. The
+approval-control test opens the same session as a shared editor and parks a
+real permission hook, proving the editor can reject but cannot approve until
+the owner delegates that capability. No agent run is needed.
 """
 
 from __future__ import annotations
 
 import re
+import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 
 import httpx
@@ -36,6 +38,7 @@ from tests.e2e_ui.collaboration._multi_user_server import (
 _PUBLIC_USER = "__public__"
 _LEVEL_READ = 1
 _LEVEL_EDIT = 2
+_APPROVAL_CARD = '[data-testid="approval-card"]'
 
 
 @pytest.fixture(scope="module")
@@ -55,8 +58,8 @@ def _admin_page(browser: Browser) -> Page:
     return context.new_page()
 
 
-def _permissions(base_url: str, session_id: str) -> dict[str, int]:
-    """Read the session's grants as a ``{user_id: level}`` map (admin view).
+def _permission(base_url: str, session_id: str, user_id: str) -> tuple[int, bool] | None:
+    """Read one session grant as ``(level, can_approve)`` (admin view).
 
     The multi-user server 401s headerless reads, so this authenticates as the
     admin identity the browser also uses.
@@ -67,7 +70,106 @@ def _permissions(base_url: str, session_id: str) -> dict[str, int]:
         timeout=10.0,
     )
     resp.raise_for_status()
-    return {p["user_id"]: p["level"] for p in resp.json()["permissions"]}
+    for permission in resp.json()["permissions"]:
+        if permission["user_id"] == user_id:
+            return permission["level"], permission["can_approve"]
+    return None
+
+
+def _grant_editor(
+    server: MultiUserServer,
+    user_id: str,
+    *,
+    can_approve: bool,
+) -> None:
+    """Grant edit access, optionally with delegated approval authority."""
+    resp = httpx.put(
+        f"{server.base_url}/v1/sessions/{server.session_id}/permissions",
+        json={"user_id": user_id, "level": _LEVEL_EDIT, "can_approve": can_approve},
+        headers={"X-Forwarded-Email": ADMIN_EMAIL},
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+
+
+def _pending_elicitation_ids(server: MultiUserServer) -> set[str]:
+    """Return pending elicitation ids from the admin-visible snapshot."""
+    resp = httpx.get(
+        f"{server.base_url}/v1/sessions/{server.session_id}",
+        headers={"X-Forwarded-Email": ADMIN_EMAIL},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    return {
+        item["elicitation_id"]
+        for item in resp.json().get("pending_elicitations") or []
+        if isinstance(item.get("elicitation_id"), str)
+    }
+
+
+def _park_permission_hook(
+    server: MultiUserServer,
+    elicitation_id: str,
+    sink: dict,
+) -> None:
+    """Park a real Claude permission hook and record its eventual verdict."""
+    try:
+        sink["response"] = httpx.post(
+            f"{server.base_url}/v1/sessions/{server.session_id}/hooks/permission-request",
+            json={
+                "session_id": "claude_e2e_shared",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": "/tmp",
+                "permission_mode": "default",
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"},
+                "tool_use_id": "tool_use_shared_e2e",
+                "_omnigent_elicitation_id": elicitation_id,
+            },
+            headers={"X-Forwarded-Email": ADMIN_EMAIL},
+            timeout=120.0,
+        )
+    except Exception as exc:
+        sink["error"] = exc
+
+
+def _start_permission_hook(
+    server: MultiUserServer,
+    elicitation_id: str,
+) -> dict:
+    """Start a hook worker and wait until its approval card is parked."""
+    sink: dict = {}
+    worker = threading.Thread(
+        target=_park_permission_hook,
+        args=(server, elicitation_id, sink),
+        daemon=True,
+    )
+    sink["worker"] = worker
+    worker.start()
+    _wait_for(lambda: elicitation_id in _pending_elicitation_ids(server))
+    return sink
+
+
+def _assert_hook_verdict(sink: dict, expected: str) -> None:
+    """Wait for a parked hook and assert its Claude allow/deny verdict."""
+    sink["worker"].join(timeout=30.0)
+    assert not sink["worker"].is_alive(), "permission hook did not receive the UI verdict"
+    assert "error" not in sink, f"permission hook failed: {sink.get('error')!r}"
+    response = sink["response"]
+    assert response.status_code == 200, response.text
+    decision = response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == expected
+
+
+def _resolve_for_cleanup(server: MultiUserServer, elicitation_id: str) -> None:
+    """Best-effort decline so a failed assertion cannot strand a hook worker."""
+    httpx.post(
+        f"{server.base_url}/v1/sessions/{server.session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "decline"},
+        headers={"X-Forwarded-Email": ADMIN_EMAIL},
+        timeout=10.0,
+    )
 
 
 def _wait_for(
@@ -161,7 +263,7 @@ def test_permissions_modal_controls_drive_server_state(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """Public toggle, copy-link, grant, level-change and revoke all work.
+    """Public toggle, copy-link, grant, approval delegation and revoke all work.
 
     Walks the whole modal surface in one session so each control is
     pinned against the ``/permissions`` REST state it mutates. Runs on a
@@ -182,12 +284,12 @@ def test_permissions_modal_controls_drive_server_state(
     # ── Public access switch: off → on creates a __public__ grant ────
     public_switch = dialog.get_by_role("switch")
     expect(public_switch).not_to_be_checked()
-    assert _PUBLIC_USER not in _permissions(base_url, session_id)
+    assert _permission(base_url, session_id, _PUBLIC_USER) is None
     public_switch.click()
     expect(public_switch).to_be_checked()
     # The grant lands server-side (poll briefly: the toggle fires an async
     # mutation, so the REST read can race the optimistic UI flip).
-    _wait_for(lambda: _permissions(base_url, session_id).get(_PUBLIC_USER) == _LEVEL_READ)
+    _wait_for(lambda: _permission(base_url, session_id, _PUBLIC_USER) == (_LEVEL_READ, False))
 
     # ── Copy link: writes a shareable, session-scoped URL ────────────
     dialog.get_by_role("button", name="Copy link").click()
@@ -203,18 +305,84 @@ def test_permissions_modal_controls_drive_server_state(
     dialog.get_by_role("button", name="Grant").click()
     # The new row renders the grantee and the REST state agrees at Read.
     expect(dialog.get_by_title(grantee)).to_be_visible()
-    _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_READ)
+    _wait_for(lambda: _permission(base_url, session_id, grantee) == (_LEVEL_READ, False))
 
-    # ── Change that user's level Read → Edit via the row select ──────
+    # ── Delegate approval: Read → Edit + approve ─────────────────────
+    expect(
+        dialog.get_by_text("Approvers can authorize actions that use your session credentials.")
+    ).to_be_visible()
     level_select = dialog.get_by_role("combobox", name=f"Permission level for {grantee}")
     level_select.click()
-    page.get_by_role("option", name="Edit").click()
-    _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_EDIT)
+    page.get_by_role("option", name="Edit + approve", exact=True).click()
+    expect(level_select).to_contain_text("Edit + approve")
+    _wait_for(lambda: _permission(base_url, session_id, grantee) == (_LEVEL_EDIT, True))
+
+    # ── Remove approval authority while retaining Edit access ────────
+    level_select.click()
+    page.get_by_role("option", name="Edit", exact=True).click()
+    expect(level_select).to_contain_text("Edit")
+    _wait_for(lambda: _permission(base_url, session_id, grantee) == (_LEVEL_EDIT, False))
 
     # ── Revoke the user: row disappears, grant is gone server-side ───
     dialog.get_by_role("button", name="Revoke").click()
     expect(dialog.get_by_title(grantee)).to_have_count(0)
-    _wait_for(lambda: grantee not in _permissions(base_url, session_id))
+    _wait_for(lambda: _permission(base_url, session_id, grantee) is None)
+
+
+def test_shared_editor_can_reject_but_needs_delegation_to_approve(
+    browser: Browser,
+    multi_user_server: MultiUserServer,
+) -> None:
+    """Approval controls follow the viewer's effective delegated capability."""
+    server = multi_user_server
+    editor = f"editor-{uuid.uuid4().hex[:8]}@ui.test"
+    _grant_editor(server, editor, can_approve=False)
+
+    context = browser.new_context(extra_http_headers={"X-Forwarded-Email": editor})
+    page = context.new_page()
+    elicitation_ids: list[str] = []
+    sinks: list[dict] = []
+    try:
+        # A plain editor may stop the owner's pending action, but cannot
+        # authorize it to run with the owner's session credentials.
+        editor_elicitation = f"elicit_claude_{uuid.uuid4().hex}"
+        elicitation_ids.append(editor_elicitation)
+        sinks.append(_start_permission_hook(server, editor_elicitation))
+        page.goto(f"{server.public_url}/c/{server.session_id}")
+
+        card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
+        expect(card).to_be_visible(timeout=30_000)
+        expect(card.get_by_role("note")).to_contain_text("delegated approver")
+        expect(card.get_by_role("button", name="Approve", exact=True)).to_be_disabled()
+        reject = card.get_by_role("button", name="Reject", exact=True)
+        expect(reject).to_be_enabled()
+        reject.click()
+        _assert_hook_verdict(sinks[-1], "deny")
+        _wait_for(lambda: editor_elicitation not in _pending_elicitation_ids(server))
+
+        # Once the owner delegates approval authority, a fresh snapshot makes
+        # the same editor's Approve control actionable for the next prompt.
+        _grant_editor(server, editor, can_approve=True)
+        delegated_elicitation = f"elicit_claude_{uuid.uuid4().hex}"
+        elicitation_ids.append(delegated_elicitation)
+        sinks.append(_start_permission_hook(server, delegated_elicitation))
+        page.reload()
+
+        delegated_card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
+        expect(delegated_card).to_be_visible(timeout=30_000)
+        expect(delegated_card.get_by_role("note")).to_have_count(0)
+        approve = delegated_card.get_by_role("button", name="Approve", exact=True)
+        expect(approve).to_be_enabled()
+        expect(delegated_card.get_by_role("button", name="Reject", exact=True)).to_be_enabled()
+        approve.click()
+        _assert_hook_verdict(sinks[-1], "allow")
+        _wait_for(lambda: delegated_elicitation not in _pending_elicitation_ids(server))
+    finally:
+        for elicitation_id in elicitation_ids:
+            _resolve_for_cleanup(server, elicitation_id)
+        for sink in sinks:
+            sink["worker"].join(timeout=10.0)
+        context.close()
 
 
 def test_share_modal_qr_code_opens_mobile_deep_link(

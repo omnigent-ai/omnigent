@@ -19,15 +19,15 @@ In another terminal, start the Vite dev server (port `5173`):
 
 ```bash
 cd web
-npm install
-npm run dev
+pnpm install
+pnpm run dev
 ```
 
 The Vite dev server proxies `/v1` and `/api` to `http://localhost:6767`. Set
 `OMNIGENT_URL` to override the proxy target:
 
 ```bash
-OMNIGENT_URL=http://localhost:9000 npm run dev
+OMNIGENT_URL=http://localhost:9000 pnpm run dev
 ```
 
 Additional `omnigent server` options:
@@ -46,7 +46,7 @@ Additional `omnigent server` options:
 
 ```bash
 cd web
-npm run build
+pnpm run build
 ```
 
 Vite writes the bundle to `../omnigent/server/static/web-ui/` (configured in
@@ -61,22 +61,22 @@ FastAPI app in `omnigent/server/app.py` mounts it at `/`. After a build:
 ## Lint + format
 
 ```bash
-npm run lint          # oxlint .
-npm run lint:fix      # oxlint --fix .
-npm run format        # prettier --write .
-npm run format:check  # prettier --check .
-npm run type-check    # tsc -b
+pnpm run lint          # oxlint .
+pnpm run lint:fix      # oxlint --fix .
+pnpm run format        # prettier --write .
+pnpm run format:check  # prettier --check .
+pnpm run type-check    # tsc -b
 ```
 
-`npm run type-check` runs in CI as part of the `Pre-commit checks`
+`pnpm run type-check` runs in CI as part of the `Pre-commit checks`
 job (`.github/workflows/lint.yml`) and gates merge. Run it locally
 before committing any change under `web/`.
 
 ## Test
 
 ```bash
-npm run test          # vitest run
-npm run test:watch    # vitest in watch mode
+pnpm run test          # vitest run
+pnpm run test:watch    # vitest in watch mode
 ```
 
 ## Reducer parity
@@ -97,14 +97,14 @@ the Python reducer at
 There is **no cross-language CI gate** today. When `_stream.py`
 changes for a real bug (e.g. new harness quirk, dedup edge case), the
 TypeScript port can lag — drift surfaces only when someone next runs
-`npm run test` after a behavioral change. Workflow when `_stream.py`
+`pnpm run test` after a behavioral change. Workflow when `_stream.py`
 changes:
 
 1. Read the diff to `_stream.py` (or `_blocks.py` / `_events.py`).
 2. Update `blockStream.ts` (or `blocks.ts` / `events.ts`) to match.
 3. Add or update a case in `blockStream.test.ts` that pins the new
    behavior — same shape as `test_stream.py`.
-4. `npm run test` → green.
+4. `pnpm run test` → green.
 
 If we ever decide cross-language fixture parity is worth the
 maintenance burden, we'd port the captured-fixture approach used

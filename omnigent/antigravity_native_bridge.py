@@ -855,6 +855,31 @@ _AGY_IDLE_MARKER = "? for shortcuts"
 # a mid-turn steer; submission itself is verified by draft disappearance, NOT by
 # this marker (footer text can change across agy builds or be truncated).
 _AGY_ACTIVE_MARKER = "esc to cancel"
+# agy collapses a paste carrying many line breaks into a single placeholder row
+# (``[Pasted text #1 +17 lines]``) instead of echoing the text into the composer.
+# The threshold is line-count based — ~13+ line breaks; total length does not
+# matter, so a long single-line message still renders verbatim (measured against
+# agy 1.1.8). The pasted text is therefore NEVER visible for a multi-line prompt,
+# which is exactly the shape a sub-agent task prompt has. Treated as draft content
+# so both the render gate and the submit verification key off the placeholder
+# appearing and then leaving the composer.
+_AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
+# agy's notice when a turn is submitted before its startup account-eligibility
+# check settles. The composer footer mounts ~3s after launch but eligibility is
+# not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
+# leaves the composer, so the submit verifies) and answered with this notice
+# instead of a cascade. A programmatic first turn — a sub-agent dispatch — lands
+# there every time, so the turn must be re-delivered or it is silently lost.
+# Matched case-insensitively against the pane.
+_AGY_VERIFYING_MARKER = "verifying your account eligibility"
+# How long after a submit to watch for a running turn before reading the pane for
+# the verification notice. Both signals render effectively immediately (measured
+# against agy 1.1.8), so this only bounds the fail-open path.
+_VERIFY_PROBE_TIMEOUT_S = 2.0
+# Total budget for re-delivering a turn agy rejected while verifying the account.
+_VERIFY_RETRY_TIMEOUT_S = 90.0
+# Pause between re-delivery attempts. agy asks the user to "try again shortly".
+_VERIFY_RETRY_INTERVAL_S = 3.0
 # Patterns redacted from a pane tail before it is surfaced in a delivery-failure
 # error. The agy header shows the signed-in account email, and the transcript
 # region can echo tokens/keys agy printed; redaction is best-effort and biased
@@ -1164,6 +1189,10 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     if region == baseline_region:
         return False
     candidates = _agy_draft_candidate_lines(region)
+    # A collapsed paste hides the text behind a placeholder, so no needle can
+    # match; the placeholder itself IS the draft (see _AGY_PASTE_PLACEHOLDER_RE).
+    if any(_AGY_PASTE_PLACEHOLDER_RE.search(line) for line in candidates):
+        return True
     normalized_needle = needle.strip() if needle else ""
     if not normalized_needle:
         return bool(candidates)
@@ -1308,59 +1337,58 @@ def _submit_and_verify(
     )
 
 
-def inject_user_message_via_tui(
+def _account_verification_rejected(socket_path: str, tmux_target: str) -> bool:
+    """
+    Whether agy answered the submit with its account-verification notice.
+
+    A verified submit only proves the draft left the composer, which is also true
+    when agy swallows the turn during its startup eligibility check (see
+    :data:`_AGY_VERIFYING_MARKER`). Distinguishes the two by watching for a
+    running turn first, then requiring both the notice and the idle footer before
+    retrying. The idle check prevents a stale notice from duplicating an accepted
+    turn when agy's running footer is renamed or truncated.
+
+    Fails open (returns ``False``) unless rejection is explicit within
+    :data:`_VERIFY_PROBE_TIMEOUT_S`.
+
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :returns: ``True`` when the turn was rejected and should be re-delivered.
+    """
+    deadline = time.monotonic() + _VERIFY_PROBE_TIMEOUT_S
+    pane = ""
+    while True:
+        pane = _capture_pane(socket_path, tmux_target) or pane
+        if _AGY_ACTIVE_MARKER in pane:
+            return False
+        if time.monotonic() >= deadline:
+            return _AGY_VERIFYING_MARKER in pane.lower() and _AGY_IDLE_MARKER in pane
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+
+
+def _paste_and_submit(
     bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
     *,
     content: str,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
     """
-    Deliver a user message into the agy TUI via a tmux bracketed paste + Enter.
+    Clear the composer, paste *content* through a tmux buffer, and submit it.
 
-    The executor's delivery path for EVERY web/mobile turn (sequential and
-    mid-turn steer): a turn delivered over agy's connect-RPC ``SendAgentMessage``
-    is recorded as a ``SYSTEM_MESSAGE`` the forwarder would not mirror, whereas
-    typing into the TUI creates a real ``USER_INPUT`` step the forwarder mirrors
-    in order. On a fresh session this also creates agy's conversation (agy mints
-    its id only after processing a turn), which the forwarder then discovers.
+    One delivery attempt, factored out of :func:`inject_user_message_via_tui` so
+    a turn agy rejected while verifying the account can be re-delivered verbatim.
+    Assumes the readiness gates already passed.
 
-    Steps: wait for the advertised tmux target and the agy input box (idle OR a
-    running turn — agy accepts a mid-turn paste), clear any leftover draft (Home +
-    kill-to-end), stream the content through a named tmux buffer
-    (``load-buffer``/``paste-buffer -p`` so interior newlines stay data and a
-    large message is not capped by the send-keys argv limit), wait for the draft
-    to render, then submit and verify the draft left the live composer (see
-    :func:`_submit_and_verify`).
-
-    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
-    :param content: User text from the web UI. Must be non-empty.
-    :param timeout_s: Total readiness budget, shared across the two gates
-        (``tmux.json`` advertised, then the input box mounted) so the worst case
-        is one ``timeout_s``, not two stacked.
+    :param bridge_dir: Native Antigravity bridge directory (holds the temp paste
+        file).
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :param content: User text to deliver. Must be non-empty.
     :returns: None.
-    :raises RuntimeError: When the tmux target is never advertised, the agy TUI
-        has exited, a tmux command fails, or the submit never starts a turn.
+    :raises RuntimeError: When the TUI has exited, a tmux command fails, the
+        pasted draft never renders, or the submit never starts a turn.
     """
-    if not content:
-        raise RuntimeError("antigravity-native TUI injection requires non-empty content")
-    # One shared deadline across both readiness gates: the prompt-ready gate gets
-    # only the budget the tmux-target gate did not consume, capping total
-    # readiness latency at timeout_s (the gates were previously each given a full
-    # timeout_s, so a stuck launch cost 2x before delivery even began).
-    deadline = time.monotonic() + timeout_s
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    # Fast-fail if the TUI already exited: otherwise the readiness gate polls a
-    # dead pane for the full timeout and the web message is silently lost. A clear
-    # error lets the executor surface an ExecutorError so the UI can say "restart".
-    if not _session_alive(socket_path, tmux_target):
-        raise RuntimeError(
-            "the agy terminal is no longer running (the TUI exited); restart the session"
-        )
-    _wait_for_agy_prompt_ready(
-        socket_path, tmux_target, timeout_s=max(0.0, deadline - time.monotonic())
-    )
     # Clear any leftover draft before typing: Home (C-a) + kill-to-end (C-k).
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
@@ -1426,6 +1454,87 @@ def inject_user_message_via_tui(
         baseline_region=baseline_region,
         draft_seen=draft_seen,
     )
+
+
+def inject_user_message_via_tui(
+    bridge_dir: Path,
+    *,
+    content: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """
+    Deliver a user message into the agy TUI via a tmux bracketed paste + Enter.
+
+    The executor's delivery path for EVERY web/mobile turn (sequential and
+    mid-turn steer): a turn delivered over agy's connect-RPC ``SendAgentMessage``
+    is recorded as a ``SYSTEM_MESSAGE`` the forwarder would not mirror, whereas
+    typing into the TUI creates a real ``USER_INPUT`` step the forwarder mirrors
+    in order. On a fresh session this also creates agy's conversation (agy mints
+    its id only after processing a turn), which the forwarder then discovers.
+
+    Steps: wait for the advertised tmux target and the agy input box (idle OR a
+    running turn — agy accepts a mid-turn paste), then deliver via
+    :func:`_paste_and_submit` (clear the draft, stream the content through a named
+    tmux buffer, wait for the draft to render, submit and verify it left the live
+    composer).
+
+    **Account-verification re-delivery.** A verified submit does not prove a turn
+    started: agy also consumes a turn submitted before its startup eligibility
+    check settles and answers with a notice instead (see
+    :data:`_AGY_VERIFYING_MARKER`). Delivery therefore re-sends the message while
+    that notice is agy's answer, bounded by :data:`_VERIFY_RETRY_TIMEOUT_S`, so a
+    programmatic first turn is not silently lost.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param content: User text from the web UI. Must be non-empty.
+    :param timeout_s: Total readiness budget, shared across the two gates
+        (``tmux.json`` advertised, then the input box mounted) so the worst case
+        is one ``timeout_s``, not two stacked. Does NOT cover the
+        account-verification re-delivery budget.
+    :returns: None.
+    :raises RuntimeError: When the tmux target is never advertised, the agy TUI
+        has exited, a tmux command fails, the submit never starts a turn, or agy
+        keeps rejecting the message while verifying the account.
+    """
+    if not content:
+        raise RuntimeError("antigravity-native TUI injection requires non-empty content")
+    # One shared deadline across both readiness gates: the prompt-ready gate gets
+    # only the budget the tmux-target gate did not consume, capping total
+    # readiness latency at timeout_s (the gates were previously each given a full
+    # timeout_s, so a stuck launch cost 2x before delivery even began).
+    deadline = time.monotonic() + timeout_s
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    # Fast-fail if the TUI already exited: otherwise the readiness gate polls a
+    # dead pane for the full timeout and the web message is silently lost. A clear
+    # error lets the executor surface an ExecutorError so the UI can say "restart".
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "the agy terminal is no longer running (the TUI exited); restart the session"
+        )
+    _wait_for_agy_prompt_ready(
+        socket_path, tmux_target, timeout_s=max(0.0, deadline - time.monotonic())
+    )
+    # Deliver, then re-deliver for as long as agy keeps answering with its
+    # account-verification notice (see ``_account_verification_rejected``). The
+    # happy path costs one extra pane capture: a started turn is detected on the
+    # first poll and returns immediately.
+    retry_deadline = time.monotonic() + _VERIFY_RETRY_TIMEOUT_S
+    while True:
+        _paste_and_submit(bridge_dir, socket_path, tmux_target, content=content)
+        if not _account_verification_rejected(socket_path, tmux_target):
+            return
+        if time.monotonic() >= retry_deadline:
+            raise RuntimeError(
+                "agy is still verifying the Antigravity account and rejected the message "
+                f"for {_VERIFY_RETRY_TIMEOUT_S:.0f}s; the turn was not started"
+            )
+        _logger.info(
+            "agy rejected the turn while verifying the account; re-delivering in %.0fs",
+            _VERIFY_RETRY_INTERVAL_S,
+        )
+        time.sleep(_VERIFY_RETRY_INTERVAL_S)
 
 
 def send_interaction_keys_via_tui(

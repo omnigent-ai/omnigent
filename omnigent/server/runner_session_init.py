@@ -31,6 +31,7 @@ class RunnerSessionInitializer:
         runner_client: httpx.AsyncClient,
         *,
         timeout: float,
+        suppress_recovery_turn: bool = False,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
         runner_id = conversation.runner_id
@@ -57,6 +58,7 @@ class RunnerSessionInitializer:
                     json=build_runner_session_init_payload(
                         conversation,
                         server_version=self._server_version,
+                        suppress_recovery_turn=suppress_recovery_turn,
                     ),
                     timeout=timeout,
                 ),

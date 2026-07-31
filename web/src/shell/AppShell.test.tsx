@@ -1,3 +1,7 @@
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSessionModule from "@/hooks/useSession";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
@@ -23,7 +27,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals, EMBEDDED_REPL_TERMINAL_ID)
   // — the REPL rail-inventory tests exercise the real filter; only the
   // network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
 
@@ -35,14 +39,14 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (childSessionsQueryKey, MAX_TREE_DEPTH,
   // cachedTreeContains) — only the hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
 }));
 
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // useRootSessionId stays real — with useSession mocked to a null /
   // top-level session it resolves synchronously without fetching.
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
 
@@ -184,6 +188,7 @@ vi.mock("./TerminalsPanel", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useTerminals } from "@/hooks/useTerminals";
+
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
 
@@ -191,17 +196,21 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceChangedFiles,
 } from "@/hooks/useWorkspaceChangedFiles";
+
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 
 import { useChildSessions } from "@/hooks/useChildSessions";
+
 const useChildSessionsMock = vi.mocked(useChildSessions);
 
 import { useSession } from "@/hooks/useSession";
+
 const useSessionMock = vi.mocked(useSession);
 
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
+
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 import { AppShell } from "./AppShell";
@@ -368,13 +377,13 @@ function renderShell(path: string, info?: ServerInfo) {
 }
 
 function mockConversations(
-  convs: Array<{
+  convs: {
     id: string;
     permission_level: number | null;
     labels?: Record<string, string>;
     host_id?: string | null;
     runner_id?: string | null;
-  }>,
+  }[],
 ) {
   useConvMock.mockReturnValue({
     data: {
@@ -459,7 +468,12 @@ beforeEach(() => {
   // todo list from one test doesn't leak into the next.
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
-  useChatStore.setState({ todos: [], terminalPending: false, sessionStatus: "idle" });
+  useChatStore.setState({
+    todos: [],
+    terminalPending: false,
+    sessionStatus: "idle",
+    status: "idle",
+  });
 });
 
 afterEach(cleanup);
@@ -532,6 +546,22 @@ describe("AppShell header", () => {
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
+
+  it("keeps the terminal-startup spinner when a send is relaunching a failed session", () => {
+    // A runner disconnect marks the session failed, and that status lingers
+    // until the relaunched runner pushes a fresh edge. A send in flight
+    // (local status "streaming") means the host is relaunching the runner
+    // right now, so the spinner must show through the relaunch window
+    // instead of leaving a silent gap until the runner is fully booted.
+    mockConversations([
+      { id: "conv_terminal", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useChatStore.setState({ terminalPending: true, sessionStatus: "failed", status: "streaming" });
+
+    renderShell("/c/conv_terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
 });
 
 describe("TerminalFirstContext", () => {
@@ -600,6 +630,7 @@ describe("TerminalFirstContext", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -1562,6 +1593,7 @@ describe("Subagents tab", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -2759,6 +2791,7 @@ describe("AppShell clone/fork action", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -2787,6 +2820,7 @@ describe("AppShell clone/fork action", () => {
         permissionLevel: 1,
         parentSessionId: null,
         subAgentName: null,
+        kind: "default",
       },
       isLoading: false,
       error: null,
@@ -2921,6 +2955,7 @@ describe("AppShell share action", () => {
         permissionLevel: 4,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,
@@ -3073,6 +3108,7 @@ describe("Mobile header actions menu", () => {
         permissionLevel: 1,
         parentSessionId: "conv_parent",
         subAgentName: null,
+        kind: "sub_agent",
       },
       isLoading: false,
       error: null,

@@ -20,6 +20,8 @@ scope, from the leaf :mod:`omnigent.cli_common`.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
 
 import click
 
@@ -33,6 +35,18 @@ from omnigent.cli_common import (
 from omnigent.cli_common import (
     reject_native_on_windows as _reject_native_on_windows,
 )
+
+_Args = ParamSpec("_Args")
+_Return = TypeVar("_Return")
+
+
+def _late_bound(
+    getter: Callable[[], Callable[_Args, _Return]],
+) -> Callable[_Args, _Return]:
+    def proxy(*args: _Args.args, **kwargs: _Args.kwargs) -> _Return:
+        return getter()(*args, **kwargs)
+
+    return proxy
 
 
 def register_native_commands(cli: click.Group) -> None:
@@ -51,26 +65,15 @@ def register_native_commands(cli: click.Group) -> None:
     # Resolve each shared helper on the live module per call so a test's
     # monkeypatch of ``omnigent.cli.<helper>`` is honored. Binding the function
     # objects once here would capture the pre-patch originals.
-    def _build_kiro_launch_args(*a, **k):  # type: ignore[no-untyped-def]
-        return _cli._build_kiro_launch_args(*a, **k)
-
-    def _ensure_backend(*a, **k):  # type: ignore[no-untyped-def]
-        return _cli._ensure_backend(*a, **k)
-
-    def _load_effective_config(*a, **k):  # type: ignore[no-untyped-def]
-        return _cli._load_effective_config(*a, **k)
-
-    def _reject_reserved_kiro_resume_args(*a, **k):  # type: ignore[no-untyped-def]
-        return _cli._reject_reserved_kiro_resume_args(*a, **k)
-
-    def _resolve_auto_open_conversation_from_config(*a, **k):  # type: ignore[no-untyped-def]
-        return _cli._resolve_auto_open_conversation_from_config(*a, **k)
-
-    def _resolve_harness_startup_args(*a, **k):  # type: ignore[no-untyped-def]
-        return _cli._resolve_harness_startup_args(*a, **k)
-
-    def _split_resume_value(*a, **k):  # type: ignore[no-untyped-def]
-        return _cli._split_resume_value(*a, **k)
+    _build_kiro_launch_args = _late_bound(lambda: _cli._build_kiro_launch_args)
+    _ensure_backend = _late_bound(lambda: _cli._ensure_backend)
+    _load_effective_config = _late_bound(lambda: _cli._load_effective_config)
+    _reject_reserved_kiro_resume_args = _late_bound(lambda: _cli._reject_reserved_kiro_resume_args)
+    _resolve_auto_open_conversation_from_config = _late_bound(
+        lambda: _cli._resolve_auto_open_conversation_from_config
+    )
+    _resolve_harness_startup_args = _late_bound(lambda: _cli._resolve_harness_startup_args)
+    _split_resume_value = _late_bound(lambda: _cli._split_resume_value)
 
     @cli.command(
         context_settings={
@@ -244,7 +247,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            claude_args=_resolve_harness_startup_args(cfg, "claude-native", claude_args),
+            extra_args=_resolve_harness_startup_args(cfg, "claude-native", claude_args),
             use_claude_config=use_claude_config,
             auto_open_conversation=auto_open_conversation,
             startup_profiler=startup_profiler,
@@ -358,7 +361,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            codex_args=_resolve_harness_startup_args(cfg, "codex-native", codex_args),
+            extra_args=_resolve_harness_startup_args(cfg, "codex-native", codex_args),
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
@@ -463,7 +466,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            opencode_args=_resolve_harness_startup_args(cfg, "opencode-native", opencode_args),
+            extra_args=_resolve_harness_startup_args(cfg, "opencode-native", opencode_args),
             model=model,
             auto_open_conversation=auto_open_conversation,
         )
@@ -553,7 +556,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            pi_args=_resolve_harness_startup_args(cfg, "pi-native", pi_args),
+            extra_args=_resolve_harness_startup_args(cfg, "pi-native", pi_args),
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -668,7 +671,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            cursor_args=_resolve_harness_startup_args(cfg, "cursor-native", cursor_args),
+            extra_args=_resolve_harness_startup_args(cfg, "cursor-native", cursor_args),
             model=model,
             auto_open_conversation=auto_open_conversation,
             mode=mode,
@@ -798,7 +801,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            kiro_args=launch_args,
+            extra_args=launch_args,
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
@@ -887,7 +890,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            goose_args=_resolve_harness_startup_args(cfg, "goose-native", goose_args),
+            extra_args=_resolve_harness_startup_args(cfg, "goose-native", goose_args),
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -974,7 +977,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            hermes_args=_resolve_harness_startup_args(cfg, "hermes-native", hermes_args),
+            extra_args=_resolve_harness_startup_args(cfg, "hermes-native", hermes_args),
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -1073,9 +1076,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            antigravity_args=_resolve_harness_startup_args(
-                cfg, "antigravity-native", antigravity_args
-            ),
+            extra_args=_resolve_harness_startup_args(cfg, "antigravity-native", antigravity_args),
             model=model,
             auto_open_conversation=auto_open_conversation,
             command=resolved_command or None,
@@ -1164,7 +1165,7 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            qwen_args=_resolve_harness_startup_args(cfg, "qwen-native", qwen_args),
+            extra_args=_resolve_harness_startup_args(cfg, "qwen-native", qwen_args),
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -1260,6 +1261,6 @@ def register_native_commands(cli: click.Group) -> None:
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            kimi_args=_resolve_harness_startup_args(cfg, "kimi-native", kimi_args),
+            extra_args=_resolve_harness_startup_args(cfg, "kimi-native", kimi_args),
             auto_open_conversation=auto_open_conversation,
         )

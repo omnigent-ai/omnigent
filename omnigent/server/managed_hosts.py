@@ -818,6 +818,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             image=_parse_provider_image(raw, "openshell"),
             env=_parse_provider_env(raw, "openshell"),
             cluster=_parse_provider_string(raw, "openshell", "cluster"),
+            workspace=_parse_provider_string(raw, "openshell", "workspace"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     elif provider == "kubernetes":
@@ -836,9 +837,13 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
                     "in_cluster",
                     "resources",
                     "pvc_mounts",
+                    "secret_mounts",
                 },
                 "sandbox.kubernetes",
             )
+        pvc_mounts = _parse_kubernetes_pvc_mounts(raw)
+        secret_mounts = _parse_kubernetes_secret_mounts(raw)
+        _reject_overlapping_kubernetes_mounts(pvc_mounts, secret_mounts)
         launcher_factory = _kubernetes_launcher_factory(
             image=_parse_provider_image(raw, "kubernetes"),
             env=_parse_provider_env(raw, "kubernetes"),
@@ -849,7 +854,8 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
-            pvc_mounts=_parse_kubernetes_pvc_mounts(raw),
+            pvc_mounts=pvc_mounts,
+            secret_mounts=secret_mounts,
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -1478,6 +1484,7 @@ def _openshell_launcher_factory(
     image: str | None,
     env: list[str] | None,
     cluster: str | None,
+    workspace: str | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: openshell`` path.
@@ -1491,6 +1498,9 @@ def _openshell_launcher_factory(
     :param cluster: OpenShell gateway name to connect to, or ``None`` to
         use the active gateway (``$OPENSHELL_GATEWAY`` /
         ``~/.config/openshell/active_gateway``).
+    :param workspace: OpenShell workspace for sandbox lifecycle, or
+        ``None`` to resolve from ``$OMNIGENT_OPENSHELL_WORKSPACE``
+        then ``"default"``.
     :returns: A factory producing parameterized OpenShell launchers.
     """
 
@@ -1498,7 +1508,7 @@ def _openshell_launcher_factory(
         """Construct the OpenShell launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
 
-        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster)
+        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster, workspace=workspace)
 
     return _build
 
@@ -1914,6 +1924,125 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
     return normalized or None
 
 
+def _parse_kubernetes_secret_mounts(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.secret_mounts`` list.
+
+    Each entry references a Kubernetes Secret the operator pre-created in the
+    runner namespace and projects it as a **file volume** on the host
+    container: ``{secret_name, mount_path}``. A Secret volume is refreshed in
+    place by the kubelet, so a long-lived runner picks up a rotated credential
+    without a restart — unlike ``envFrom``, frozen at container start. Refresh
+    is eventually consistent (kubelet sync, up to ~1 min), so the consumer
+    must re-read the file each use. Secret volumes are read-only, so there is
+    no ``read_only`` knob. Validated at parse time so an operator typo fails
+    server startup, not the first launch.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Normalized entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, a name
+        or path is malformed, a path is reserved, or paths collide.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("secret_mounts")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.secret_mounts' must be a list of "
+            "{secret_name, mount_path} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.secret_mounts[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        _reject_unknown_keys(entry, {"secret_name", "mount_path"}, path_prefix)
+        secret = entry.get("secret_name")
+        if not isinstance(secret, str) or not secret.strip():
+            raise ValueError(
+                f"server config '{path_prefix}.secret_name' must name a "
+                "Secret pre-created in the runner namespace"
+            )
+        secret = secret.strip()
+        _validate_dns1123_subdomain(secret, f"secret_mounts[{i}].secret_name")
+        mount = entry.get("mount_path")
+        if not isinstance(mount, str) or not mount.startswith("/"):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be an absolute "
+                "in-Pod path, e.g. '/mnt/secrets/git'"
+            )
+        # normpath preserves exactly two leading slashes (POSIX), but the
+        # kernel collapses them at mount time — reject them explicitly so
+        # '//home/omnigent' cannot slip past the reserved-prefix check.
+        if mount.startswith("//") or mount != posixpath.normpath(mount):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be a normalized "
+                f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
+            )
+        if mount == "/" or any(
+            mount == p or mount.startswith(p + "/") or p.startswith(mount + "/")
+            for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+        ):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' overlaps a reserved "
+                f"path: {mount!r} (the runner's HOME, Secret projections, and OS "
+                "directories cannot be shadowed or mounted over)"
+            )
+        normalized.append({"secret_name": secret, "mount_path": mount})
+    for a, b in itertools.combinations(normalized, 2):
+        pa, pb = str(a["mount_path"]), str(b["mount_path"])
+        if pa == pb:
+            raise ValueError(
+                "server config 'sandbox.kubernetes.secret_mounts' has a "
+                f"duplicate mount_path: {pa!r}"
+            )
+        low, high = sorted((pa, pb), key=len)
+        if high.startswith(low + "/"):
+            raise ValueError(
+                "server config 'sandbox.kubernetes.secret_mounts' has nested "
+                f"mount_paths: {low!r} contains {high!r}"
+            )
+    return normalized or None
+
+
+def _reject_overlapping_kubernetes_mounts(
+    pvc_mounts: list[dict[str, object]] | None,
+    secret_mounts: list[dict[str, object]] | None,
+) -> None:
+    """
+    Reject a ``pvc_mounts`` path that duplicates or nests with a ``secret_mounts`` path.
+
+    Each list is already de-conflicted internally by its own parser; this
+    catches a collision *across* the two mount types (e.g. a PVC at ``/mnt/x``
+    and a Secret at ``/mnt/x/token``), which would otherwise produce nested
+    volume mounts on the host container.
+
+    :param pvc_mounts: Normalized PVC mounts, or ``None``.
+    :param secret_mounts: Normalized Secret mounts, or ``None``.
+    :raises ValueError: When a PVC and a Secret mount_path are equal or nested.
+    """
+    if not pvc_mounts or not secret_mounts:
+        return
+    for pvc in pvc_mounts:
+        pa = str(pvc["mount_path"])
+        for secret in secret_mounts:
+            sb = str(secret["mount_path"])
+            if pa == sb:
+                raise ValueError(
+                    "server config 'sandbox.kubernetes' uses the same mount_path "
+                    f"for a PVC and a Secret: {pa!r}"
+                )
+            low, high = sorted((pa, sb), key=len)
+            if high.startswith(low + "/"):
+                raise ValueError(
+                    "server config 'sandbox.kubernetes' has nested pvc_mounts / "
+                    f"secret_mounts paths: {low!r} contains {high!r}"
+                )
+
+
 def _kubernetes_launcher_factory(
     *,
     image: str | None,
@@ -1926,6 +2055,7 @@ def _kubernetes_launcher_factory(
     in_cluster: bool | None,
     resources: dict[str, object] | None,
     pvc_mounts: list[dict[str, object]] | None,
+    secret_mounts: list[dict[str, object]] | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -1949,6 +2079,8 @@ def _kubernetes_launcher_factory(
     :param resources: Validated ``resources`` block, or ``None`` for defaults.
     :param pvc_mounts: Normalized PVC mount entries added to every runner Pod,
         or ``None``.
+    :param secret_mounts: Normalized Secret file-mount entries added to every
+        runner Pod (rotation-friendly credential volumes), or ``None``.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -1969,6 +2101,7 @@ def _kubernetes_launcher_factory(
             in_cluster=in_cluster,
             resources=resources,
             pvc_mounts=pvc_mounts,
+            secret_mounts=secret_mounts,
         )
 
     return _build

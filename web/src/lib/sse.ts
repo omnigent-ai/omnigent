@@ -191,7 +191,7 @@ export function* parseEventLines(lines: Iterable<string>): Iterable<StreamEvent>
 }
 
 /** Token/cost bucket keys on a `ModelUsage`, mapping wire (snake) to camel. */
-const MODEL_USAGE_FIELDS: ReadonlyArray<{ wire: string; camel: keyof ModelUsage }> = [
+const MODEL_USAGE_FIELDS: readonly { wire: string; camel: keyof ModelUsage }[] = [
   { wire: "input_tokens", camel: "inputTokens" },
   { wire: "output_tokens", camel: "outputTokens" },
   { wire: "total_tokens", camel: "totalTokens" },
@@ -1011,7 +1011,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     const content = rec.content;
     return {
       type: "message_done",
-      content: Array.isArray(content) ? (content as Array<Record<string, unknown>>) : [],
+      content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
     } satisfies MessageDone;
@@ -1144,7 +1144,7 @@ function responseFromJson(d: Record<string, unknown>): Response {
     id: String(d.id ?? ""),
     status: String(d.status ?? ""),
     model: String(d.model ?? ""),
-    output: Array.isArray(d.output) ? (d.output as Array<Record<string, unknown>>) : [],
+    output: Array.isArray(d.output) ? (d.output as Record<string, unknown>[]) : [],
     createdAt: Number(d.created_at ?? 0),
     completedAt: d.completed_at != null ? Number(d.completed_at) : null,
     previousResponseId: d.previous_response_id != null ? String(d.previous_response_id) : null,

@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
+
+from omnigent.claude_native import ClaudeNativeUcodeConfig, claude_native_model_options
 
 _EXPECTED_ROWS = [
     ("opus", "Opus 4.10"),
@@ -39,6 +44,9 @@ def _patch_session_as_claude_native(
     session_id: str,
     model_override: str | None = None,
     catalog_state: dict[str, bool] | None = None,
+    model_options: list[dict] | None = None,
+    llm_model: str = "system.ai.claude-sonnet-5",
+    host_asleep: bool = False,
 ) -> list[dict]:
     """Patch the browser's session snapshot into a claude-native response.
 
@@ -52,6 +60,11 @@ def _patch_session_as_claude_native(
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
     :param model_override: Optional session-scoped model override to expose.
     :param catalog_state: Optional mutable readiness gate for delayed options.
+    :param model_options: Catalog rows to expose; defaults to the live-alias set.
+    :param llm_model: Bound model id shown for the session.
+    :param host_asleep: Shape the snapshot like a dormant resumable managed
+        host (host-bound, resumable, aged past the startup grace); pair with
+        :func:`_force_asleep_liveness` to drive the ``host_asleep`` state.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
@@ -85,12 +98,19 @@ def _patch_session_as_claude_native(
             "omnigent.wrapper": "claude-code-native-ui",
         }
         payload["harness"] = "claude"
-        payload["llm_model"] = "system.ai.claude-sonnet-5"
+        payload["llm_model"] = llm_model
+        catalog = _MODEL_OPTIONS if model_options is None else model_options
         payload["model_options"] = (
-            _MODEL_OPTIONS if catalog_state is None or catalog_state["ready"] else []
+            catalog if catalog_state is None or catalog_state["ready"] else []
         )
         if model_override is not None:
             payload["model_override"] = model_override
+        if host_asleep:
+            payload["host_id"] = payload.get("host_id") or "host_test_managed"
+            payload["host_resumable"] = True
+            # Age the session past the startup grace so liveness can't read
+            # the runner-down state as a cold boot (see useSessionLiveness).
+            payload["created_at"] = 1_700_000_000
         latest_payload = dict(payload)
         route.fulfill(
             status=200,
@@ -139,6 +159,7 @@ def test_claude_native_picker_lists_only_live_databricks_models(
     expect(sonnet_row).to_have_attribute("data-active", "true")
     expect(page.locator('[role="option"][data-model-id="fable"]')).to_have_count(0)
     expect(page.locator('[role="option"][data-model-id="sonnet_5"]')).to_have_count(0)
+    _screenshot(page, "pinned-catalog-picker")
 
 
 def test_claude_native_picker_updates_after_delayed_catalog(
@@ -241,6 +262,169 @@ def test_claude_native_alias_selection_persists(
     assert patch_bodies[-1] == {"model_override": "opus"}
     # The read-only composer label reflects the new pick.
     expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Opus 4.10")
+
+
+def _force_asleep_liveness(page: Page, session_id: str) -> None:
+    """Patch the browser's liveness view of ``session_id`` to runner+host down.
+
+    Paired with ``_patch_session_as_claude_native(..., host_asleep=True)``
+    this yields the ``host_asleep`` liveness variant (mirrors
+    ``tests/e2e_ui/sessions/test_host_asleep_composer.py``): the ``/health``
+    poll reports both tunnels down, the sidebar list drops the session so the
+    open view derives liveness from the patched host-bound snapshot, and the
+    updates WS is blocked so a live push can't revert to the real online
+    state.
+
+    :param page: Playwright page before navigation.
+    :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
+    """
+
+    def _patch_health(route: Route) -> None:
+        request = route.request
+        if request.method != "GET" or urlparse(request.url).path != "/health":
+            route.continue_()
+            return
+        response = route.fetch()
+        payload = response.json()
+        offline = {"runner_online": False, "host_online": False}
+        if isinstance(payload.get("sessions"), dict):
+            payload["sessions"][session_id] = offline
+        if isinstance(payload.get("session"), dict):
+            payload["session"] = {**payload["session"], **offline}
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    def _drop_from_list(route: Route) -> None:
+        request = route.request
+        if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
+            route.continue_()
+            return
+        response = route.fetch()
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(rows, list):
+            payload["data"] = [
+                r for r in rows if not (isinstance(r, dict) and r.get("id") == session_id)
+            ]
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    page.route(re.compile(r"/v1/sessions(\?|$)"), _drop_from_list)
+    page.route(re.compile(r"/health(\?|$)"), _patch_health)
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+
+def test_claude_native_picker_saves_model_while_host_asleep(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """An asleep session keeps the config gear live and Save PATCHes the model.
+
+    A model/effort change persists server-side and applies when the next
+    message wakes the session, so wherever the composer stays open (here:
+    ``host_asleep``) the gear must stay enabled with the catalog-backed
+    dropdown — not inert behind a live-runner requirement.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser view is patched to an asleep claude-native shape.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _force_asleep_liveness(page, session_id)
+    patch_bodies = _patch_session_as_claude_native(page, session_id, host_asleep=True)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # Wait for liveness to resolve to host_asleep (the composer's resume
+    # placeholder) so the gear assertions exercise the asleep state, not the
+    # initial not-yet-polled window.
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_have_attribute(
+        "placeholder", re.compile("resume the sandbox host"), timeout=15_000
+    )
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_have_attribute("aria-disabled", "false")
+    gear.click()
+    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+    page.get_by_test_id("composer-config-model").click()
+    # The catalog still populates the dropdown while the session sleeps.
+    expect(page.locator('[role="option"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
+    _screenshot(page, "asleep-config-gear")
+
+    page.locator('[role="option"][data-model-id="opus"]').click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        page.get_by_test_id("composer-config-save").click()
+
+    assert patch_bodies[-1] == {"model_override": "opus"}
+
+
+def _screenshot(page: Page, name: str) -> None:
+    """Save a demo screenshot when E2E_SCREENSHOT_DIR is set (local runs)."""
+    shot_dir = os.environ.get("E2E_SCREENSHOT_DIR")
+    if shot_dir:
+        page.screenshot(path=str(Path(shot_dir) / f"{name}.png"))
+
+
+def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A pin-less gateway config renders one concrete row and no alias rows.
+
+    The catalog is produced by the real ``claude_native_model_options`` for a
+    provider config with no ``ANTHROPIC_DEFAULT_*_MODEL`` pins — the setup
+    where the subscription aliases used to appear and canonicalize to
+    Anthropic ids the gateway rejects at launch.
+    """
+    base_url, session_id = seeded_session
+    default_model = "databricks-claude-sonnet-4-5"
+    catalog = claude_native_model_options(
+        ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+            model=default_model,
+        )
+    )
+    _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_options=catalog,
+        llm_model=default_model,
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # The composer label already shows the concrete routable id.
+    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text(
+        default_model, timeout=15_000
+    )
+    _screenshot(page, "unpinned-gateway-composer")
+
+    page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-config-model").click()
+
+    # Exactly one row — the provider's routable default, pre-selected — so no
+    # alias row exists to canonicalize into an id the gateway rejects. Picking
+    # it can only ever PATCH the concrete gateway id, which the launch
+    # resolver passes through verbatim.
+    rows = page.locator('[role="option"][data-model-id]')
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_have_attribute("data-model-id", default_model)
+    expect(rows.first).to_have_attribute("data-active", "true")
+    _screenshot(page, "unpinned-gateway-picker")
 
 
 def test_claude_native_picker_prefers_session_override_over_sticky_model(

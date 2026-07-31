@@ -42,16 +42,17 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -741,8 +742,6 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 # Default model for the Databricks-profile gateway path (no gateway base URL
 # supplied directly), used when no spec/cfg model is set. On the ucode-cached
 # path the Omnigent producer resolves the model instead (see workflow.py).
-_DATABRICKS_CLAUDE_DEFAULT_MODEL = DATABRICKS_CLAUDE_DEFAULT_MODEL
-
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
@@ -1782,26 +1781,14 @@ class ClaudeSDKExecutor(Executor):
 
     async def enqueue_session_message(
         self,
-        session_key: str,
-        content: str | Message,
+        session_key: str,  # noqa: ARG002
+        content: str | Message,  # noqa: ARG002
     ) -> bool:
-        state = self._clients.get(session_key)
-        if state is None:
-            return False
-        try:
-            if isinstance(content, str):
-                prompt = content
-            else:
-                prompt = json.dumps(content, ensure_ascii=True)
-            await state.client.query(prompt, session_id=session_key)
-            return True
-        except Exception as exc:  # noqa: BLE001 — enqueue returns False on any SDK failure
-            logger.warning(
-                "Claude SDK live message enqueue failed for session %s: %s",
-                session_key,
-                exc,
-            )
-            return False
+        # query() queues a NEW turn on the SDK's stdin; it does not inject
+        # into the turn already running. Returning False lets the adapter's
+        # buffer hold the message and re-deliver it as a continuation turn
+        # once the active turn ends, preserving in-order delivery.
+        return False
 
     @staticmethod
     async def _force_close_client(client: _ClaudeClient) -> None:
@@ -1886,7 +1873,9 @@ class ClaudeSDKExecutor(Executor):
         return True
 
     def supports_live_message_queue(self) -> bool:
-        return True
+        # The SDK has no API to inject into an active turn; claiming this
+        # capability caused the one-turn-behind desync described in #3472.
+        return False
 
     def supports_tool_boundary_interrupt(self) -> bool:
         return True
@@ -2183,7 +2172,12 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = _DATABRICKS_CLAUDE_DEFAULT_MODEL
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="claude",
+            )
+            model = resolution.model_id
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
@@ -2930,7 +2924,7 @@ class ClaudeSDKExecutor(Executor):
             present in the latest user message.
         """
         if resume_session:
-            return ClaudeSDKExecutor._extract_latest_user_content(messages)
+            return ClaudeSDKExecutor._extract_trailing_user_content(messages)
 
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         if len(messages) <= 1 or len(user_messages) <= 1:
@@ -3004,3 +2998,75 @@ class ClaudeSDKExecutor(Executor):
                     return _to_anthropic_content_blocks(content)
                 return str(content)
         return ""
+
+    @staticmethod
+    def _extract_trailing_user_content(
+        messages: list[Message],
+    ) -> str | list[dict[str, Any]]:
+        """
+        Extract the trailing run of consecutive user messages for the SDK.
+
+        On a resumed SDK session the client already has all prior turns
+        cached, so only the *new* user input is sent. Normally that is a
+        single user message, but when the runner batches several buffered
+        steered messages into one continuation turn (see
+        ``_check_and_start_next_turn``), the tail of history holds more than
+        one brand-new user message the SDK has never seen. Sending only the
+        last (as :meth:`_extract_latest_user_content` does) silently drops
+        the earlier ones. This collects every user message after the last
+        non-user (assistant / tool) message and concatenates them so all
+        newly-buffered input reaches the model.
+
+        Text messages are joined with blank lines. If any message in the
+        trailing run carries multimodal content blocks, the whole run is
+        returned as a single list of Anthropic content blocks so the bytes
+        survive.
+
+        :param messages: Conversation history.
+        :returns: A string prompt, or a list of Anthropic content
+            block dicts when the trailing run is multimodal.
+        """
+        trailing: list[Message] = []
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                trailing.append(msg)
+            else:
+                break
+        trailing.reverse()
+        if not trailing:
+            return ""
+        if len(trailing) == 1:
+            return ClaudeSDKExecutor._extract_latest_user_content(trailing)
+
+        # Convert each trailing user message to Anthropic content blocks.
+        # If any block is non-text (image/document), keep the structured
+        # list so the bytes reach the model; otherwise join the text.
+        block_runs: list[list[dict[str, Any]]] = []
+        has_non_text = False
+        for msg in trailing:
+            content = msg.get("content")
+            if content is None:
+                block_runs.append([])
+            elif isinstance(content, str):
+                block_runs.append([_text_block(content)])
+            elif isinstance(content, list):
+                converted = _to_anthropic_content_blocks(content)
+                block_runs.append(converted)
+                if any(b.get("type") != "text" for b in converted):
+                    has_non_text = True
+            else:
+                block_runs.append([_text_block(str(content))])
+
+        if has_non_text:
+            merged: list[dict[str, Any]] = []
+            for run in block_runs:
+                merged.extend(run)
+            return merged
+
+        texts = [
+            b["text"]
+            for run in block_runs
+            for b in run
+            if b.get("type") == "text" and b.get("text")
+        ]
+        return "\n\n".join(texts)

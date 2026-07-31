@@ -78,13 +78,6 @@ def databricks_sdk_installed() -> bool:
         return False
 
 
-# Fallback Claude model for the Databricks AI gateway when neither the spec
-# nor the workspace's ucode state names one. Must be a ``databricks-*``
-# endpoint name — the gateway rejects Anthropic-direct ids like the CLI's
-# own ``opus[1m]`` default.
-DATABRICKS_CLAUDE_DEFAULT_MODEL = "databricks-claude-opus-4-8"
-
-
 def list_databricks_profiles() -> list[str]:
     """Return the profile section names declared in ``~/.databrickscfg``.
 

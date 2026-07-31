@@ -2,11 +2,11 @@ import { CheckCircle2Icon, CircleIcon, CircleDotIcon } from "lucide-react";
 import { useChatStore } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
 
-type TodoItem = {
+interface TodoItem {
   content: string;
   status: "pending" | "in_progress" | "completed";
   activeForm: string;
-};
+}
 
 interface TodoPanelProps {
   frameless?: boolean;

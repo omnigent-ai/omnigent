@@ -70,9 +70,13 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, TypedDict, cast
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 from omnigent.version import VERSION
 
@@ -120,6 +124,29 @@ class TelemetryConfig:
     disable_events: set[str] = field(default_factory=set)
 
 
+class _TelemetryData(TypedDict):
+    event_name: str
+    session_id: str
+    omnigent_version: str
+    schema_version: int
+    python_version: str
+    operating_system: str
+    timestamp_ns: int
+    status: str
+    duration_ms: int
+    installation_id: str | None
+    anon_user_id: str | None
+    host_installation_id: str | None
+    environment: str | None
+    params: str | None
+
+
+_TelemetryRecord = TypedDict(
+    "_TelemetryRecord",
+    {"data": _TelemetryData, "partition-key": str},
+)
+
+
 def _config_url() -> str:
     """Return the remote config URL for the running version.
 
@@ -153,7 +180,12 @@ def _fetch_remote_config() -> TelemetryConfig | None:
         url = _config_url()
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=_CONFIG_FETCH_TIMEOUT_S) as resp:
-            cfg: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
+            raw_config: object = json.loads(resp.read().decode("utf-8"))
+
+        if not isinstance(raw_config, dict):
+            _logger.debug("Telemetry config is not an object; disabling telemetry")
+            return None
+        cfg: dict[object, object] = raw_config
 
         if cfg.get("omnigent_version") != VERSION:
             _logger.debug("Telemetry config version mismatch; disabling telemetry")
@@ -161,21 +193,39 @@ def _fetch_remote_config() -> TelemetryConfig | None:
         if cfg.get("disable_telemetry") is True:
             _logger.debug("Telemetry disabled by remote config kill-switch")
             return None
-        ingestion_url: str | None = cfg.get("ingestion_url")
-        if not ingestion_url:
+        ingestion_url = cfg.get("ingestion_url")
+        if not isinstance(ingestion_url, str) or not ingestion_url:
             _logger.debug("Telemetry config missing ingestion_url; disabling telemetry")
             return None
-        if platform.system() in cfg.get("disable_os", []):
+        disable_os_value = cfg.get("disable_os", [])
+        disable_os = (
+            {item for item in disable_os_value if isinstance(item, str)}
+            if isinstance(disable_os_value, list)
+            else set()
+        )
+        if platform.system() in disable_os:
             _logger.debug("Telemetry disabled for OS %s by remote config", platform.system())
             return None
-        rollout = cfg.get("rollout_percentage", 100)
+        rollout_value = cfg.get("rollout_percentage", 100)
+        rollout = (
+            float(rollout_value)
+            if isinstance(rollout_value, (int, float)) and not isinstance(rollout_value, bool)
+            else 100.0
+        )
         if random.random() * 100 >= rollout:
             _logger.debug("Telemetry excluded by rollout_percentage=%s", rollout)
             return None
 
+        disable_events_value = cfg.get("disable_events", [])
+        disable_events = (
+            {item for item in disable_events_value if isinstance(item, str)}
+            if isinstance(disable_events_value, list)
+            else set()
+        )
+
         return TelemetryConfig(
             ingestion_url=ingestion_url,
-            disable_events=set(cfg.get("disable_events", [])),
+            disable_events=disable_events,
         )
     except Exception:
         _logger.debug("Telemetry config fetch failed; disabling telemetry", exc_info=True)
@@ -272,7 +322,7 @@ def _detect_environment() -> str | None:
         return None
 
 
-def _build_record(event: object) -> dict[str, Any]:
+def _build_record(event: object) -> _TelemetryRecord:
     """Serialise *event* into the gateway ``data`` envelope.
 
     Event-specific fields (everything except ``installation_id``) are
@@ -281,18 +331,24 @@ def _build_record(event: object) -> dict[str, Any]:
     """
     from dataclasses import asdict
 
-    fields: dict[str, Any] = asdict(event)  # type: ignore[arg-type]
-    installation_id: str | None = fields.pop("installation_id", None)
-    session_id: str | None = fields.pop("session_id", None)
-    anon_user_id: str | None = fields.pop("anon_user_id", None)
-    host_installation_id: str | None = fields.pop("host_installation_id", None)
+    fields: dict[str, object] = asdict(cast("DataclassInstance", event))
+    installation_id_value = fields.pop("installation_id", None)
+    installation_id = installation_id_value if isinstance(installation_id_value, str) else None
+    session_id_value = fields.pop("session_id", None)
+    session_id = session_id_value if isinstance(session_id_value, str) else None
+    anon_user_id_value = fields.pop("anon_user_id", None)
+    anon_user_id = anon_user_id_value if isinstance(anon_user_id_value, str) else None
+    host_installation_id_value = fields.pop("host_installation_id", None)
+    host_installation_id = (
+        host_installation_id_value if isinstance(host_installation_id_value, str) else None
+    )
 
     # All remaining event-specific fields go into params as a JSON string.
     params_str: str | None = None
     if fields:
         params_str = json.dumps(fields, default=str)
 
-    data: dict[str, Any] = {
+    data: _TelemetryData = {
         "event_name": type(event).__name__,
         "session_id": session_id or "",
         "omnigent_version": VERSION,
@@ -329,7 +385,7 @@ class TelemetryClient:
     def __init__(self) -> None:
         self._config: TelemetryConfig | None = None
         self._config_ready = threading.Event()
-        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=_MAX_QUEUE_SIZE)
+        self._queue: queue.Queue[_TelemetryRecord | None] = queue.Queue(maxsize=_MAX_QUEUE_SIZE)
         self._lock = threading.Lock()
         self._started = False
         self._stopped = False
@@ -459,7 +515,7 @@ class TelemetryClient:
 
         ingestion_url = self._config.ingestion_url
         disable_events = self._config.disable_events
-        pending: list[dict[str, Any]] = []
+        pending: list[_TelemetryRecord] = []
         last_flush = time.monotonic()
 
         while not self._stopped:
@@ -481,7 +537,7 @@ class TelemetryClient:
 
             # Apply per-event kill-switch at send time too (config may have
             # arrived after the event was queued).
-            event_name = (item.get("data") or {}).get("event_name", "")
+            event_name = item["data"]["event_name"]
             if event_name not in disable_events:
                 pending.append(item)
             self._queue.task_done()
@@ -496,7 +552,7 @@ class TelemetryClient:
             try:
                 item = self._queue.get_nowait()
                 if item is not None:
-                    event_name = (item.get("data") or {}).get("event_name", "")
+                    event_name = item["data"]["event_name"]
                     if event_name not in disable_events:
                         pending.append(item)
                 self._queue.task_done()
@@ -505,7 +561,7 @@ class TelemetryClient:
         if pending:
             self._send(pending, ingestion_url)
 
-    def _send(self, records: list[dict[str, Any]], ingestion_url: str) -> None:
+    def _send(self, records: list[_TelemetryRecord], ingestion_url: str) -> None:
         """POST a batch to the ingestion endpoint."""
         if not records:
             return
@@ -536,7 +592,7 @@ def get_client() -> TelemetryClient | None:
     return _CLIENT
 
 
-def init_client(*, config: dict[str, Any] | None = None) -> None:
+def init_client(*, config: Mapping[str, object] | None = None) -> None:
     """Initialise the module-level client if telemetry is enabled.
 
     Safe to call multiple times; idempotent after the first call.

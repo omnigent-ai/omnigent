@@ -185,6 +185,11 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
       lines that were never part of the app's UI — corrupting the seed. tmux's
       ``#{alternate_on}`` distinguishes the two.
 
+    **Screen/input modes** (alt screen, mouse tracking, DECCKM) are replayed
+    around the content via :func:`_mode_restore_escapes` — capture-pane records
+    cells only, and a TUI that enabled these before this client attached would
+    otherwise be unscrollable in the browser (see that function's docstring).
+
     :param socket_path: tmux server socket path.
     :param tmux_target: The ``-t`` target, e.g. ``"main"``.
     :returns: The captured bytes to write into xterm, or ``None`` on failure
@@ -225,24 +230,88 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     # staircase.
     normalized = _CAPTURE_ROW_SEP_RE.sub(b"\r\n", body)
     cursor = _cursor_restore_escape(meta)
-    return b"\x1b[H\x1b[2J" + normalized + cursor
+    prelude, postlude = _mode_restore_escapes(meta)
+    return prelude + b"\x1b[H\x1b[2J" + normalized + cursor + postlude
 
 
 @dataclass(frozen=True)
 class _PaneMetadata:
-    """Pane state needed to reconstruct the seed: cursor + screen mode.
+    """Pane state needed to reconstruct the seed: cursor + screen/input modes.
 
     :param cursor_x: 0-based cursor column from ``#{cursor_x}``.
     :param cursor_y: 0-based cursor row from ``#{cursor_y}``.
     :param cursor_visible: Whether ``#{cursor_flag}`` reported the cursor shown.
     :param alternate_on: Whether the pane is on the alternate screen
         (``#{alternate_on}`` == 1).
+    :param mouse_standard: DECSET 1000 (button press/release) from
+        ``#{mouse_standard_flag}``.
+    :param mouse_button: DECSET 1002 (press/release + drag) from
+        ``#{mouse_button_flag}``.
+    :param mouse_all: DECSET 1003 (any motion) from ``#{mouse_all_flag}``.
+    :param mouse_sgr: DECSET 1006 (SGR report encoding) from
+        ``#{mouse_sgr_flag}``.
+    :param mouse_utf8: DECSET 1005 (UTF-8 report encoding) from
+        ``#{mouse_utf8_flag}``.
+    :param app_cursor_keys: DECCKM (application cursor keys) from
+        ``#{keypad_cursor_flag}``.
     """
 
     cursor_x: int
     cursor_y: int
     cursor_visible: bool
     alternate_on: bool
+    mouse_standard: bool = False
+    mouse_button: bool = False
+    mouse_all: bool = False
+    mouse_sgr: bool = False
+    mouse_utf8: bool = False
+    app_cursor_keys: bool = False
+
+
+def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
+    """Build the DECSET escapes that restore the pane program's screen modes.
+
+    ``capture-pane`` replays cell contents only — the mode-set sequences the
+    program emitted at startup (enter alternate screen, enable mouse tracking)
+    happened before this client attached and are never in the ``%output``
+    stream. Without replaying them the browser xterm believes no mouse
+    tracking is active, so a wheel over a TUI that scrolls via mouse reports
+    (OpenCode, claude, vim) sends nothing at all and the view cannot scroll
+    until the program happens to re-toggle its modes.
+
+    tmux tracks each mode as a pane flag, so the seed can reconstruct them:
+
+    - Prelude (before the clear + content): ``?1049h`` when the pane is on the
+      alternate screen, so the seed paints into xterm's alt buffer and never
+      pollutes primary-screen scrollback.
+    - Postlude (after the cursor restore): the mouse tracking mode
+      (``?1000h``/``?1002h``/``?1003h``), its report encoding
+      (``?1005h``/``?1006h``), and DECCKM (``?1h``) so wheel-to-arrow
+      fallback picks the encoding the program expects.
+
+    Only enables are emitted: every attach starts a fresh xterm whose modes
+    default off, so disables would be no-ops.
+
+    :param meta: Pane metadata, or ``None`` (no modes restored).
+    :returns: ``(prelude, postlude)`` byte strings, either possibly empty.
+    """
+    if meta is None:
+        return b"", b""
+    prelude = b"\x1b[?1049h" if meta.alternate_on else b""
+    postlude = b""
+    if meta.mouse_standard:
+        postlude += b"\x1b[?1000h"
+    if meta.mouse_button:
+        postlude += b"\x1b[?1002h"
+    if meta.mouse_all:
+        postlude += b"\x1b[?1003h"
+    if meta.mouse_utf8:
+        postlude += b"\x1b[?1005h"
+    if meta.mouse_sgr:
+        postlude += b"\x1b[?1006h"
+    if meta.app_cursor_keys:
+        postlude += b"\x1b[?1h"
+    return prelude, postlude
 
 
 async def _capture_pane_metadata(
@@ -268,7 +337,9 @@ async def _capture_pane_metadata(
             "-p",
             "-t",
             tmux_target,
-            "#{cursor_x},#{cursor_y},#{cursor_flag},#{alternate_on}",
+            "#{cursor_x},#{cursor_y},#{cursor_flag},#{alternate_on},"
+            "#{mouse_standard_flag},#{mouse_button_flag},#{mouse_all_flag},"
+            "#{mouse_sgr_flag},#{mouse_utf8_flag},#{keypad_cursor_flag}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -278,12 +349,26 @@ async def _capture_pane_metadata(
     if proc.returncode != 0:
         return None
     try:
-        x_str, y_str, flag_str, alt_str = stdout.decode().strip().split(",")
+        fields = [f.strip() for f in stdout.decode().strip().split(",")]
+        if len(fields) < 4:
+            return None
+        # A tmux without some mouse/DECCKM formats expands them to "" (the
+        # field count holds), but pad regardless: a flags anomaly must cost
+        # only the optional mode replay, never the mandatory cursor and
+        # alt-screen state the rest of the seed depends on.
+        fields += ["0"] * (10 - len(fields))
+        x_str, y_str, flag_str, alt_str, std, btn, allm, sgr, utf8, ckm = fields[:10]
         return _PaneMetadata(
             cursor_x=int(x_str),
             cursor_y=int(y_str),
-            cursor_visible=flag_str.strip() == "1",
-            alternate_on=alt_str.strip() == "1",
+            cursor_visible=flag_str == "1",
+            alternate_on=alt_str == "1",
+            mouse_standard=std == "1",
+            mouse_button=btn == "1",
+            mouse_all=allm == "1",
+            mouse_sgr=sgr == "1",
+            mouse_utf8=utf8 == "1",
+            app_cursor_keys=ckm == "1",
         )
     except (ValueError, UnicodeDecodeError):
         return None

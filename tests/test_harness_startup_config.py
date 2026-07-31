@@ -64,6 +64,15 @@ def test_non_string_default_warns_and_skips(
     assert "harness.default" in capsys.readouterr().err
 
 
+def test_non_string_override_key_warns_and_skips(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    default, overrides = resolve_harness_config({"harness": {1: {"command": "/bin/codex"}}})
+    assert default is None
+    assert overrides == {}
+    assert "keys must be strings" in capsys.readouterr().err
+
+
 def test_non_mapping_harness_warns_and_returns_none(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -41,7 +41,9 @@ const {
   // mock derives each folder's rows from this by label, mirroring the server's
   // ?project= filter — so tests that seed project sessions via the global list
   // keep working without a separate per-project fixture.
-  conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  conversationsRef: {
+    current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
+  },
   // Server-authoritative pinned ids. Kept in a ref (not the legacy localStorage
   // key, which the one-time migration clears on mount) so a seeded pin survives
   // the first render. `seedPins` sets it; the toggle mock mutates it.
@@ -111,7 +113,7 @@ vi.mock("@/hooks/useConversations", () => ({
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
+          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
         ));
     return {
       data: enabled
@@ -153,6 +155,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
+import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -240,6 +243,9 @@ beforeEach(() => {
   pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
+  // The bound session's startup signal (send in flight / PTY pending) feeds
+  // the row's "starting" badge; reset so one test's state can't leak.
+  useChatStore.setState({ conversationId: null, status: "idle", terminalPending: false });
 });
 
 /** Seed the server-authoritative pinned set (replaces the old localStorage seed). */
@@ -322,7 +328,7 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
-    expect(headerActions.parentElement).toHaveClass("h-8");
+    expect(headerActions.parentElement).toHaveClass("h-12");
     const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
 
@@ -516,6 +522,30 @@ describe("Sidebar session list", () => {
     expect(within(idleRow).queryByText("now")).toBeNull();
   });
 
+  it("shows a starting spinner on the bound session while a send is waking it", () => {
+    // The launch/relaunch window: the user sent a message (local status
+    // "streaming") but the server hasn't confirmed `running` — a cold boot or
+    // a send waking a disconnected runner. The row's server status is stale
+    // ("failed" after a runner disconnect), yet the sidebar must show the
+    // session is coming up, matching the chat's "Starting up…" indicator.
+    mockConversations([
+      conv("conv_waking", "Claude Code", { status: "failed" }),
+      conv("conv_other", "Claude Code"),
+    ]);
+    useChatStore.setState({ conversationId: "conv_waking", status: "streaming" });
+
+    renderSidebar();
+
+    const wakingRow = screen.getByRole("link", { name: /conv_waking/ }).closest("li")!;
+    expect(within(wakingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+    // Only the bound session reads the store signal — other rows stay bare.
+    const otherRow = screen.getByRole("link", { name: /conv_other/ }).closest("li")!;
+    expect(within(otherRow).queryByTestId("session-state-badge")).toBeNull();
+  });
+
   it("shows the full session title in a styled tooltip on hover", async () => {
     const title = "A long session title that is truncated in the compact sidebar row";
     const now = new Date("2026-07-23T00:00:00Z").getTime();
@@ -539,8 +569,8 @@ describe("Sidebar session list", () => {
       // (bg-popover surface), not the old wide card.
       expect(tooltip.className).toContain("bg-popover");
       expect(tooltip.className).not.toContain("bg-card-solid");
-      // The title is sized to match the sidebar row name (fixed
-      // --sidebar-font-size via `sidebar-compact-text`), not rem-based text-sm.
+      // The title is sized to match the sidebar row name
+      // (`sidebar-compact-text`, 13px at the default), not the larger text-sm.
       const tooltipTitle = tooltip.querySelector("p.sidebar-compact-text");
       expect(tooltipTitle).not.toBeNull();
       expect(tooltipTitle).toHaveTextContent(title);
