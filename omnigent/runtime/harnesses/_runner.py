@@ -351,7 +351,11 @@ def _create_uvicorn_config(
     socket_path: str | None,
     bind: str | None,
 ) -> uvicorn.Config:
-    """Build the Uvicorn config for a Unix socket or TCP endpoint."""
+    """Build the Uvicorn config for the allocated runner endpoint.
+
+    Uses a Unix socket on POSIX or loopback TCP on Windows, keeps
+    per-process logging quiet, and bounds graceful connection draining.
+    """
     # Uvicorn accepts fractional seconds despite its integer annotation.
     graceful_timeout = cast("int", _GRACEFUL_SHUTDOWN_TIMEOUT_S)
     if socket_path:
@@ -396,11 +400,6 @@ def main(argv: list[str] | None = None) -> None:
     if args.parent_pid is not None:
         _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)
-    # Bind the endpoint Omnigent allocated for this conversation: a Unix socket
-    # path (``--socket``, POSIX) or a TCP loopback host:port (``--bind``,
-    # Windows). ``log_level`` keeps per-process noise low — see
-    # ``_UVICORN_LOG_LEVEL``. ``timeout_graceful_shutdown`` bounds how long
-    # uvicorn waits for active connections after SIGTERM before force-exiting.
     config = _create_uvicorn_config(app, args.socket, args.bind)
     _HardExitServer(config).run()
 
