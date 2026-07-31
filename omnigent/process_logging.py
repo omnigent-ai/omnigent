@@ -10,7 +10,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, TextIO
+from typing import BinaryIO, TextIO, TypedDict
 
 from omnigent._platform import IS_POSIX
 
@@ -20,6 +20,21 @@ LOG_TO_STDERR_ENV_VAR = "OMNIGENT_LOG_TO_STDERR"
 LOG_FORCE_COLOR_ENV_VAR = "OMNIGENT_LOG_FORCE_COLOR"
 PROCESS_LOG_FILE_ENV_VAR = "OMNIGENT_PROCESS_LOG_FILE"
 LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
+
+
+class ChildLoggingPopenKwargs(TypedDict, total=False):
+    """Keyword arguments forwarded to :class:`subprocess.Popen`."""
+
+    pass_fds: tuple[int, ...]
+
+
+class _ProcessLogStreamHandler(logging.StreamHandler[TextIO]):
+    _omnigent_process_log_stderr: bool
+
+
+class _ProcessLogFileHandler(logging.FileHandler):
+    _omnigent_process_log_path: str
+
 
 DEFAULT_LOG_SOURCE_WIDTH = 32
 DEFAULT_LOG_FUNC_WIDTH = 18
@@ -254,7 +269,7 @@ def terminal_stream_handler() -> logging.Handler:
     stream = _terminal_stream()
     if stream is None:
         return logging.NullHandler()
-    handler = logging.StreamHandler(stream)
+    handler = _ProcessLogStreamHandler(stream)
     handler._omnigent_process_log_stderr = True
     return handler
 
@@ -288,7 +303,7 @@ def configure_process_logging(
     formatter = TerminalLogFormatter(use_colors=False)
     handlers: list[logging.Handler] = []
 
-    file_handler = logging.FileHandler(path, encoding="utf-8")
+    file_handler = _ProcessLogFileHandler(path, encoding="utf-8")
     file_handler.setLevel(resolved_level)
     file_handler.setFormatter(formatter)
     file_handler._omnigent_process_log_path = str(path)
@@ -343,7 +358,7 @@ def _add_handler_once(logger: logging.Logger, handler: logging.Handler) -> None:
 
 
 @contextmanager
-def child_logging_popen_kwargs(env: dict[str, str]) -> Iterator[dict[str, object]]:
+def child_logging_popen_kwargs(env: dict[str, str]) -> Iterator[ChildLoggingPopenKwargs]:
     """Prepare inherited terminal-fd kwargs for a child process.
 
     Mutates *env* only when ``--log-to-stderr`` requested a mirror and the

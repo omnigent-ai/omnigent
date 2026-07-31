@@ -18,6 +18,7 @@ import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
 
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
@@ -117,6 +118,16 @@ from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+
+
+class _WaitidInfo(Protocol):
+    si_pid: int
+
+
+def _coerce_int(value: object) -> int:
+    """Convert a validated JSON scalar with the standard ``int`` semantics."""
+    return int(cast(str | bytes | bytearray | SupportsInt | SupportsIndex, value))
+
 
 # Binary appearance is cheap to probe, so new CLI installs surface quickly.
 HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
@@ -856,9 +867,14 @@ class HostProcess:
         """
         reaped = 0
         tracked = self._tracked_runner_pids()
+        waitid = cast(
+            "Callable[[object, int, int], _WaitidInfo | None]",
+            vars(os)["waitid"],
+        )
+        p_all = vars(os)["P_ALL"]
         while True:
             try:
-                info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                info = waitid(p_all, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             except (ChildProcessError, OSError):
                 break
             if info is None:
@@ -1707,7 +1723,7 @@ class HostProcess:
         elif frame.kind in ("key", "gateway"):
             result = store_harness_credential(
                 family=family,
-                kind=frame.kind,
+                kind=cast(Literal["key", "gateway"], frame.kind),
                 secret=frame.secret_value or "",
                 base_url=frame.base_url,
                 default_model=frame.default_model,
@@ -1999,7 +2015,7 @@ class HostProcess:
         if op == "list_or_read":
             return r.list_or_read(
                 str(params.get("path", "")),
-                limit=int(params.get("limit", 20)),
+                limit=_coerce_int(params.get("limit", 20)),
                 after=cast("str | None", params.get("after")),
                 before=cast("str | None", params.get("before")),
                 order=str(params.get("order", "desc")),
@@ -2013,7 +2029,7 @@ class HostProcess:
                 str(params.get("q", "")),
                 include=cast("str | None", params.get("include")),
                 exclude=cast("str | None", params.get("exclude")),
-                limit=int(params.get("limit", 500)),
+                limit=_coerce_int(params.get("limit", 500)),
             )
         raise ValueError(f"unknown fs op: {op!r}")
 
@@ -2553,18 +2569,18 @@ class HostProcess:
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
-            result = await asyncio.to_thread(self._handle_install_harness, frame)
-            await ws.send(encode_host_frame(result))
+            install_result = await asyncio.to_thread(self._handle_install_harness, frame)
+            await ws.send(encode_host_frame(install_result))
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.
-            result = await asyncio.to_thread(self._handle_store_secret, frame)
-            await ws.send(encode_host_frame(result))
+            secret_result = await asyncio.to_thread(self._handle_store_secret, frame)
+            await ws.send(encode_host_frame(secret_result))
         elif isinstance(frame, HostDetectCredentialsFrame):
             # Ambient detection may probe files / a localhost socket, so run it
             # off the event loop.
-            result = await asyncio.to_thread(self._handle_detect_credentials, frame)
-            await ws.send(encode_host_frame(result))
+            credentials_result = await asyncio.to_thread(self._handle_detect_credentials, frame)
+            await ws.send(encode_host_frame(credentials_result))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
@@ -2574,8 +2590,8 @@ class HostProcess:
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.
-            result = await asyncio.to_thread(self._handle_fs_request, frame)
-            await ws.send(encode_host_frame(result))
+            fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
+            await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
 
