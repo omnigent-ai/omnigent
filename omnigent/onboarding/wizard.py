@@ -1108,6 +1108,8 @@ def _default_supervisor_model(
     profile: str | None,
 ) -> str | None:
     """Return the catalog suggestion for a known supervisor provider."""
+    # These states map to the Databricks, OpenAI, and custom-endpoint menu
+    # choices respectively; unknown endpoints intentionally have no default.
     if profile is not None:
         return default_chat_model("databricks")
     if base_url is None:
