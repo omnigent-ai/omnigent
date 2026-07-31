@@ -774,7 +774,9 @@ def register_hooks_routes(
                 # an ALLOW (or now-hard DENY) collapses the ASK and falls through
                 # without a second prompt. Held across the human wait by design;
                 # a declined ASK records nothing, so siblings legitimately re-ask.
-                async with _native_ask_gate_lock(session_id, result.deciding_policy):
+                deciding_policy = result.deciding_policy
+                assert deciding_policy is not None
+                async with _native_ask_gate_lock(session_id, deciding_policy):
                     engine = _build_engine()
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
@@ -805,15 +807,15 @@ def register_hooks_routes(
                                 get_server_runner_router(),
                                 {"type": "interrupt"},
                             )
-                            verdict_body = {
+                            decline_body = {
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": exc.args[0] or "Approval was declined.",
                             }
                             return Response(
-                                content=json.dumps(verdict_body),
+                                content=json.dumps(decline_body),
                                 media_type="application/json",
                             )
-                        verdict_body: dict[str, Any] = (
+                        approval_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
                             if approved
                             else {
@@ -822,7 +824,7 @@ def register_hooks_routes(
                             }
                         )
                         return Response(
-                            content=json.dumps(verdict_body),
+                            content=json.dumps(approval_body),
                             media_type="application/json",
                         )
                 # Re-evaluation collapsed the ASK (a sibling's approval recorded
