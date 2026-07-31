@@ -3297,7 +3297,6 @@ kubernetes = [
 ]
 loadtest = [
     { name = "locust" },
-    { name = "websocket-client" },
 ]
 memory = [
     { name = "hindsight-client" },
@@ -3413,7 +3412,6 @@ requires-dist = [
     { name = "tomlkit", specifier = ">=0.12,<1" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
-    { name = "websocket-client", marker = "extra == 'loadtest'", specifier = ">=1.7,<2" },
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]

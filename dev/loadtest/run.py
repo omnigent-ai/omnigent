@@ -1,257 +1,160 @@
 #!/usr/bin/env python3
-"""Runner for the Omnigent load test — server + host + load params → run + report.
+"""Runner for the Omnigent host load test — boot a local stack, drive real turns.
 
-One command with explicit inputs, rather than a long ``locust -f … -e KEY VALUE``
-line, that also collects results into a timestamped directory:
+One command that boots the whole stack, runs the load, and writes a report.
+Because turns execute on the **host** (a runner subprocess it spawns → LLM), and
+the LLM is **mocked**, this test owns its target: it boots a local ``omnigent
+server`` + a zero-latency mock LLM (reusing the benchmark harness's
+``BenchEnvironment``), registers one agent, then runs Locust where **each user
+is a real ``omnigent host``** that creates host-bound sessions and drives real
+multi-turn conversations (see ``omnigent_load_test.py``).
 
-    python dev/loadtest/run.py \
-        --server http://localhost:8000 \
-        --host-id host_abc123 \
-        --users 50 --spawn-rate 5 --run-time 60s
+There is no ``--server`` to point at — mocking the LLM requires a stack we
+control. ``-u N`` scales the number of hosts; each host spawns real runner
+subprocesses per session, so N×M runners run on THIS machine — keep N modest
+(capacity-limited by design; it drives genuine turns rather than faking them).
 
-It resolves the target server (→ locust ``--host``), threads the omnigent host
-id and auth token through as the env vars the locustfile reads (``HOST_ID`` /
-``AUTH_TOKEN``), maps the load knobs to locust's ``-u`` / ``-r`` / ``-t``, runs
-locust headless, and writes a result set:
+Writes a timestamped result set:
 
     <out-dir>/
       run_config.json         inputs + resolved locust argv + outcome
-      report_stats.csv        locust per-endpoint stats (raw)
+      report_stats.csv        locust per-request stats (raw)
       report_failures.csv     locust failure breakdown (raw)
       report_stats_history.csv  per-10s time series (raw)
       report.html             locust's own HTML report
       console.log             full locust stdout/stderr
       summary.md              human-readable latency write-up (this tool)
 
-``--web`` opens Locust's browser UI instead (no result files — the UI owns the
-run interactively).
-
-Inputs:
-
-* ``--server``      the Omnigent server base URL to load (required).
-* ``--host-id``     the connected Omnigent host the load is scoped to (env
-                    ``HOST_ID``); the ``ws_load_test`` sockets are user-scoped,
-                    so it is recorded run context there and is the binding input
-                    for host-scoped locustfiles.
-* ``--users`` / ``--spawn-rate`` / ``--run-time``   the load parameters.
-* ``--locustfile``  which scenario to run (default the WS fan-out test).
-* ``--auth-token``  bearer token for an authenticated deployment (omit locally).
-* ``--out-dir``     where to write results (default
-                    ``dev/loadtest/results/<scenario>-<timestamp>``).
+Runs from a repo checkout only (imports ``dev.benchmarks`` + ``tests``), with
+the ``[loadtest,dev,agents-sdk]`` extras. Knobs: ``--users`` (N hosts),
+``--spawn-rate``, ``--run-time``, ``--sessions-per-user``, ``--turns-per-session``,
+``--reply-words``, ``--out-dir``.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import datetime
-import importlib.util
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-# Default scenario: the WebSocket fan-out test in this directory.
-_DEFAULT_LOCUSTFILE = Path(__file__).with_name("ws_load_test.py")
+# Repo root so ``dev.benchmarks`` and ``tests`` import when run as a script.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-# Where result directories are created when --out-dir is not given.
+_LOCUSTFILE = Path(__file__).with_name("omnigent_load_test.py")
 _RESULTS_ROOT = Path(__file__).with_name("results")
 
-# Prefix locust's --csv writes; the files it produces are "<prefix>_stats.csv",
-# "<prefix>_failures.csv", "<prefix>_stats_history.csv", "<prefix>_exceptions.csv".
+# Prefix locust's --csv writes: "<prefix>_stats.csv", "<prefix>_failures.csv", …
 _CSV_PREFIX = "report"
 
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the runner's argument parser."""
     parser = argparse.ArgumentParser(
-        description="Run an Omnigent load test against a server + host, and write a result set.",
+        description="Boot a local Omnigent stack and load-test it with real host turns.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--users", type=int, default=4, help="Concurrent hosts (locust -u).")
     parser.add_argument(
-        "--server",
-        required=True,
-        help="Omnigent server base URL to load, e.g. http://localhost:8000.",
+        "--spawn-rate", type=float, default=1.0, help="Hosts started per second (locust -r)."
     )
+    parser.add_argument("--run-time", default="120s", help="Run duration, e.g. 120s / 5m.")
     parser.add_argument(
-        "--host-id",
-        default=None,
-        help="Connected Omnigent host id the load is scoped to (env HOST_ID).",
-    )
-    parser.add_argument(
-        "--users",
+        "--sessions-per-user",
         type=int,
-        default=50,
-        help="Number of concurrent simulated users (locust -u).",
+        default=2,
+        help="Host-bound sessions each host drives, sequentially.",
     )
     parser.add_argument(
-        "--spawn-rate",
-        type=float,
-        default=5.0,
-        help="Users started per second (locust -r).",
+        "--turns-per-session",
+        type=int,
+        default=4,
+        help="Turns per session — conversation history grows across them.",
     )
     parser.add_argument(
-        "--run-time",
-        default="60s",
-        help="How long to run, e.g. 60s / 5m / 1h (locust -t).",
-    )
-    parser.add_argument(
-        "--locustfile",
-        default=str(_DEFAULT_LOCUSTFILE),
-        help="Locustfile (scenario) to run.",
-    )
-    parser.add_argument(
-        "--auth-token",
-        default=None,
-        help="Bearer token for an authenticated deployment (env AUTH_TOKEN).",
-    )
-    parser.add_argument(
-        "--session-ids",
-        default=None,
-        help="Comma-separated session ids to watch (env SESSION_IDS).",
-    )
-    parser.add_argument(
-        "--mount-prefix",
-        default="",
-        help=(
-            "Path the Omnigent app is served under when behind a reverse proxy "
-            "at a sub-path (e.g. /omnigent). Empty for a plain server."
-        ),
+        "--reply-words",
+        type=int,
+        default=60,
+        help="Word count of the mocked (streamed) assistant reply each turn.",
     )
     parser.add_argument(
         "--out-dir",
         default=None,
-        help="Directory for result files. Default: dev/loadtest/results/<scenario>-<timestamp>.",
-    )
-    parser.add_argument(
-        "--web",
-        action="store_true",
-        help="Open Locust's web UI instead of a headless run (writes no result files).",
+        help="Result directory. Default: dev/loadtest/results/omnigent_load_test-<timestamp>.",
     )
     return parser
 
 
-def _resolve_out_dir(args: argparse.Namespace) -> Path:
-    """Resolve (and create) the result directory for this run.
-
-    :param args: Parsed CLI arguments.
-    :returns: The created output directory.
-    """
-    if args.out_dir:
-        out = Path(args.out_dir)
+def _resolve_out_dir(out_dir: str | None) -> Path:
+    """Resolve (and create) the result directory for this run."""
+    if out_dir:
+        out = Path(out_dir)
     else:
-        scenario = Path(args.locustfile).stem
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        out = _RESULTS_ROOT / f"{scenario}-{stamp}"
+        out = _RESULTS_ROOT / f"omnigent_load_test-{stamp}"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
 
-def _build_locust_argv(args: argparse.Namespace, out_dir: Path) -> list[str]:
-    """Assemble the ``locust`` argv from parsed runner arguments.
+def _mock_reply(word_count: int) -> str:
+    """Build a deterministic multi-sentence reply of roughly *word_count* words."""
+    words = [
+        "This",
+        "is",
+        "a",
+        "mocked",
+        "assistant",
+        "reply",
+        "used",
+        "to",
+        "exercise",
+        "a",
+        "real",
+        "host",
+        "turn.",
+    ]
+    out: list[str] = []
+    while len(out) < word_count:
+        out.extend(words)
+    return " ".join(out[:word_count]) + "."
 
-    :param args: Parsed CLI arguments.
-    :param out_dir: Directory the CSV/HTML reports are written into.
-    :returns: Full argv beginning with ``[sys.executable, "-m", "locust"]``.
+
+def _build_locust_argv(args: argparse.Namespace, server_url: str, out_dir: Path) -> list[str]:
+    """Assemble the ``locust`` argv (current interpreter, headless, CSV+HTML).
+
+    Launches ``sys.executable -m locust`` — never a bare ``locust`` off PATH,
+    which can resolve to a broken locust from another Python.
     """
-    # Launch locust as a module of the CURRENT interpreter, not a bare
-    # ``locust`` console script. A bare name resolves through PATH, which can
-    # find a stale/broken locust from another Python (e.g. a ~/.local 3.10
-    # install missing gevent's deps) even when run.py itself runs under a venv.
-    # ``sys.executable -m locust`` guarantees the same interpreter + site.
-    argv = [
+    return [
         sys.executable,
         "-m",
         "locust",
         "-f",
-        args.locustfile,
+        str(_LOCUSTFILE),
         "--host",
-        args.server,
+        server_url,
         "-u",
         str(args.users),
         "-r",
         str(args.spawn_rate),
         "-t",
         args.run_time,
-    ]
-    if args.web:
-        # The interactive UI owns the run; it ignores -t until started and
-        # writes no CSV/HTML, so skip the report flags in this mode.
-        return argv
-    # Headless run with a full result set: CSV (machine-readable), HTML
-    # (locust's own report), and headless so no browser is needed.
-    argv += [
         "--headless",
         "--csv",
         str(out_dir / _CSV_PREFIX),
         "--html",
         str(out_dir / "report.html"),
     ]
-    return argv
-
-
-def _build_env(args: argparse.Namespace) -> dict[str, str]:
-    """Build the child environment, threading inputs the locustfile reads.
-
-    Passed as real environment variables rather than locust ``-e`` flags so they
-    reach every worker process identically.
-
-    :param args: Parsed CLI arguments.
-    :returns: The environment for the locust subprocess.
-    """
-    env = dict(os.environ)
-    if args.host_id:
-        env["HOST_ID"] = args.host_id
-    if args.auth_token:
-        env["AUTH_TOKEN"] = args.auth_token
-    if args.session_ids:
-        env["SESSION_IDS"] = args.session_ids
-    if args.mount_prefix:
-        env["MOUNT_PREFIX"] = args.mount_prefix
-    return env
-
-
-def _write_run_config(
-    out_dir: Path,
-    args: argparse.Namespace,
-    argv: list[str],
-    exit_code: int,
-) -> None:
-    """Record the run's inputs, resolved locust argv, and outcome.
-
-    The auth token is deliberately never written — only whether one was used.
-
-    :param out_dir: Result directory.
-    :param args: Parsed CLI arguments.
-    :param argv: The locust argv that was executed.
-    :param exit_code: Locust's exit code (0 = all requests passed).
-    """
-    config = {
-        "server": args.server,
-        "host_id": args.host_id,
-        "users": args.users,
-        "spawn_rate": args.spawn_rate,
-        "run_time": args.run_time,
-        "locustfile": args.locustfile,
-        "scenario": Path(args.locustfile).stem,
-        "session_ids": args.session_ids,
-        "mount_prefix": args.mount_prefix,
-        "auth": bool(args.auth_token),
-        "locust_argv": argv,
-        "exit_code": exit_code,
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-    (out_dir / "run_config.json").write_text(json.dumps(config, indent=2))
 
 
 def _read_stats(stats_csv: Path) -> list[dict[str, str]]:
-    """Read locust's ``_stats.csv`` into a list of row dicts.
-
-    :param stats_csv: Path to ``report_stats.csv``.
-    :returns: One dict per row (keyed by CSV header), empty if the file is
-        missing (e.g. locust crashed before writing stats).
-    """
+    """Read a locust ``_stats.csv`` into row dicts; empty if the file is absent."""
     if not stats_csv.is_file():
         return []
     with stats_csv.open(newline="") as fh:
@@ -261,12 +164,8 @@ def _read_stats(stats_csv: Path) -> list[dict[str, str]]:
 def _fmt_num(raw: str) -> str:
     """Format a numeric CSV cell to one decimal, or ``"-"`` if blank.
 
-    Used for both millisecond latency fields and the requests/s rate in the
-    summary table (any single-decimal numeric column), so it is named for the
+    Used for latency (ms) and the requests/s rate alike, so it is named for the
     formatting, not a unit.
-
-    :param raw: Raw CSV cell, e.g. ``"14.508"`` or ``""``.
-    :returns: A compact display string, e.g. ``"14.5"``.
     """
     if raw is None or raw == "":
         return "-"
@@ -276,37 +175,46 @@ def _fmt_num(raw: str) -> str:
         return raw
 
 
-def _write_summary(
-    out_dir: Path,
-    args: argparse.Namespace,
-    rows: list[dict[str, str]],
-    exit_code: int,
+def _write_run_config(
+    out_dir: Path, args: argparse.Namespace, argv: list[str], exit_code: int
 ) -> None:
-    """Write the human-readable ``summary.md`` from parsed stats.
+    """Record inputs, resolved locust argv, and outcome (no secrets involved)."""
+    config = {
+        "scenario": "omnigent_load_test",
+        "users_hosts": args.users,
+        "spawn_rate": args.spawn_rate,
+        "run_time": args.run_time,
+        "sessions_per_user": args.sessions_per_user,
+        "turns_per_session": args.turns_per_session,
+        "reply_words": args.reply_words,
+        "harness": "openai-agents",
+        "model": "mock (zero-latency)",
+        "locust_argv": argv,
+        "exit_code": exit_code,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    (out_dir / "run_config.json").write_text(json.dumps(config, indent=2))
 
-    Explains the latency distribution per endpoint and calls out failures, so a
-    reader does not need to open the CSV or the HTML report.
 
-    :param out_dir: Result directory.
-    :param args: Parsed CLI arguments.
-    :param rows: Parsed ``_stats.csv`` rows.
-    :param exit_code: Locust's exit code.
-    """
+def _write_summary(
+    out_dir: Path, args: argparse.Namespace, rows: list[dict[str, str]], exit_code: int
+) -> None:
+    """Write the human-readable ``summary.md`` from parsed locust stats."""
     lines: list[str] = []
-    lines.append(f"# Load test results — {Path(args.locustfile).stem}")
+    lines.append("# Load test results — omnigent_load_test (real host turns, mocked LLM)")
     lines.append("")
-    lines.append(f"- **Server:** `{args.server}`")
-    if args.host_id:
-        lines.append(f"- **Host:** `{args.host_id}`")
-    lines.append(f"- **Load:** {args.users} users, spawn {args.spawn_rate}/s, for {args.run_time}")
-    lines.append(f"- **Auth:** {'bearer token' if args.auth_token else 'none (local)'}")
+    lines.append(
+        f"- **Load:** {args.users} concurrent hosts, each driving "
+        f"{args.sessions_per_user} session(s) × {args.turns_per_session} turns per "
+        f"iteration, repeated for {args.run_time} (see the turn count below)"
+    )
+    lines.append(f"- **Mock reply:** ~{args.reply_words} words, streamed; harness openai-agents")
     outcome = "PASS — no request failures" if exit_code == 0 else f"FAIL — locust exit {exit_code}"
     lines.append(f"- **Outcome:** {outcome}")
     lines.append("")
 
-    # Locust's CSV includes an "Aggregated" row that is already the sum of the
-    # per-request-type rows — so sum only the non-Aggregated rows (else the
-    # headline count double-counts everything).
+    # Locust's CSV includes an "Aggregated" row that already sums the per-name
+    # rows — skip it so the headline count doesn't double.
     total_reqs = 0
     total_fails = 0
     for row in rows:
@@ -318,12 +226,12 @@ def _write_summary(
         except ValueError:
             pass
     fail_pct = (100.0 * total_fails / total_reqs) if total_reqs else 0.0
-    lines.append(f"**{total_reqs} requests, {total_fails} failures ({fail_pct:.2f}%).**")
+    lines.append(f"**{total_reqs} operations, {total_fails} failures ({fail_pct:.2f}%).**")
     lines.append("")
 
-    lines.append("## Latency by request (ms)")
+    lines.append("## Latency by operation (ms)")
     lines.append("")
-    lines.append("| Request | # | Fails | Avg | Med | p95 | p99 | Max | Req/s |")
+    lines.append("| Operation | # | Fails | Avg | Med | p95 | p99 | Max | Ops/s |")
     lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|")
     for row in rows:
         lines.append(
@@ -341,14 +249,13 @@ def _write_summary(
         )
     lines.append("")
 
-    # Failure breakdown, if any rows landed in the failures CSV.
     failures_csv = out_dir / f"{_CSV_PREFIX}_failures.csv"
     fail_rows = _read_stats(failures_csv)
     real_fails = [r for r in fail_rows if (r.get("Occurrences") or r.get("Occurences"))]
     if real_fails:
         lines.append("## Failures")
         lines.append("")
-        lines.append("| Request | Error | Count |")
+        lines.append("| Operation | Error | Count |")
         lines.append("|---|---|--:|")
         for r in real_fails:
             lines.append(
@@ -363,94 +270,103 @@ def _write_summary(
     lines.append("## Reading the numbers")
     lines.append("")
     lines.append(
-        "- **Avg / Med** — typical latency; a median far below the average means a "
-        "few slow outliers are pulling the mean up."
+        "- **turn** is the headline: one full post→idle agent turn that ran on a "
+        "simulated host's runner (mocked LLM), so it is Omnigent's own per-turn "
+        "overhead, not provider latency."
     )
     lines.append(
-        "- **p95 / p99** — tail latency: 95% / 99% of requests were at or below this. "
-        "Watch these, not the average — they are what a loaded client actually feels."
+        "- Turn latency **grows across a conversation** as history accumulates, so "
+        "the tail (p95/p99/max) reflects the later, longer turns."
     )
     lines.append(
-        "- **Max** — the single worst request; often a cold connection or a GC / "
-        "scheduling hiccup."
+        "- **host online** is the cost of a host subprocess registering over the "
+        "host tunnel; **session create** is the host-bound create."
     )
-    lines.append("- **Req/s** — throughput for that request type at this concurrency.")
     lines.append(
-        "- **Fails** — any non-zero value means requests errored; see the Failures "
-        "section and `console.log`. Exit code 0 means locust saw zero failures."
+        "- **Fails** — any non-zero value means operations errored; see the Failures "
+        "section and `console.log`. This is capacity-limited: N hosts × M sessions "
+        "means N×M real runner processes on this box, so failures at high N usually "
+        "mean the load box (not the server) is saturated."
     )
     lines.append("")
-    lines.append(
-        "Raw data: `report_stats.csv`, `report_stats_history.csv` "
-        "(per-10s time series), `report.html`."
-    )
+    lines.append("Raw data: `report_stats.csv`, `report_stats_history.csv`, `report.html`.")
     lines.append("")
-
     (out_dir / "summary.md").write_text("\n".join(lines))
 
 
-def main() -> int:
-    """Parse inputs, run locust, and write the result set."""
-    args = _build_parser().parse_args()
+async def _boot_and_run(args: argparse.Namespace, out_dir: Path) -> int:
+    """Boot the stack, register the agent + mock reply, run locust, write results."""
+    from dev.benchmarks.omnigent.environment import BenchEnvironment
 
-    # The default scenario needs both locust and websocket-client (module
-    # ``websocket``); check both up front so a partial install fails here with
-    # an actionable message rather than deep inside the locustfile at runtime.
-    missing = [
-        pkg
-        for pkg, mod in (("locust", "locust"), ("websocket-client", "websocket"))
-        if importlib.util.find_spec(mod) is None
-    ]
-    if missing:
-        sys.exit(
-            f"{', '.join(missing)} not importable under {sys.executable} — install "
-            "the extra: pip install -e '.[loadtest]' (or: uv sync --extra loadtest), "
-            "and run run.py with that same interpreter."
-        )
-    if not Path(args.locustfile).is_file():
-        sys.exit(f"locustfile not found: {args.locustfile}")
+    print(
+        f"Booting local stack (server + mock LLM) for {args.users} hosts × "
+        f"{args.sessions_per_user} sessions × {args.turns_per_session} turns …",
+        flush=True,
+    )
+    async with BenchEnvironment(with_runner=True) as env:
+        # Every host-bound session's turn hits the mock; a streamed multi-sentence
+        # reply makes each turn do real streaming-pipeline work at zero model latency.
+        await env.set_mock_fallback(_mock_reply(args.reply_words), stream=True)
+        agent_name = await env.ensure_agent("loadtest-agent")
+        agent_id = await env.agent_id(agent_name)
+        print(f"  stack up: {env.base_url}  (agent {agent_id})", flush=True)
 
-    env = _build_env(args)
+        argv = _build_locust_argv(args, env.base_url, out_dir)
+        child_env = {
+            **_os_environ(),
+            "LOADTEST_SERVER_URL": env.base_url,
+            "LOADTEST_AGENT_ID": agent_id,
+            "LOADTEST_MOCK_URL": env.mock_url,
+            "LOADTEST_WORKSPACE_ROOT": str(out_dir / "host-workspaces"),
+            "SESSIONS_PER_USER": str(args.sessions_per_user),
+            "TURNS_PER_SESSION": str(args.turns_per_session),
+        }
+        print(f"$ {' '.join(argv)}\n  results → {out_dir}", flush=True)
 
-    if args.web:
-        # Interactive UI: hand off to locust directly, no result files.
-        argv = _build_locust_argv(args, Path("."))
-        print(f"$ {' '.join(argv)}", flush=True)
-        os.execvpe(sys.executable, argv, env)
-
-    out_dir = _resolve_out_dir(args)
-    argv = _build_locust_argv(args, out_dir)
-    print(f"$ {' '.join(argv)}", flush=True)
-    if args.host_id:
-        print(f"  HOST_ID={args.host_id}", flush=True)
-    print(f"  results → {out_dir}", flush=True)
-
-    # Stream locust output to the console AND capture it to console.log via tee,
-    # so a scripted run keeps a full log while the operator still sees progress.
-    console_log = out_dir / "console.log"
-    with console_log.open("w") as log_fh:
-        proc = subprocess.Popen(
-            argv,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            log_fh.write(line)
-        exit_code = proc.wait()
+        console_log = out_dir / "console.log"
+        # Locust is gevent-based; run it as a subprocess (not in this asyncio
+        # loop) and stream its output to the console + console.log.
+        with console_log.open("w") as log_fh:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            assert proc.stdout is not None
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace")
+                sys.stdout.write(line)
+                log_fh.write(line)
+            exit_code = await proc.wait()
 
     _write_run_config(out_dir, args, argv, exit_code)
     rows = _read_stats(out_dir / f"{_CSV_PREFIX}_stats.csv")
     _write_summary(out_dir, args, rows, exit_code)
-
-    print(f"\nResults written to {out_dir}", flush=True)
-    print(f"  summary:  {out_dir / 'summary.md'}", flush=True)
-    print(f"  html:     {out_dir / 'report.html'}", flush=True)
+    print(f"\nResults written to {out_dir}\n  summary: {out_dir / 'summary.md'}", flush=True)
     return exit_code
+
+
+def _os_environ() -> dict[str, str]:
+    """Return a copy of the current environment (import kept local to helper)."""
+    import os
+
+    return dict(os.environ)
+
+
+def main() -> int:
+    """Parse inputs and run."""
+    args = _build_parser().parse_args()
+    import importlib.util
+
+    for pkg, mod in (("locust", "locust"), ("openai-agents", "agents")):
+        if importlib.util.find_spec(mod) is None:
+            sys.exit(
+                f"{pkg} not importable under {sys.executable} — install the extras: "
+                "pip install -e '.[loadtest,dev,agents-sdk]' (run from a repo checkout)."
+            )
+    out_dir = _resolve_out_dir(args.out_dir)
+    return asyncio.run(_boot_and_run(args, out_dir))
 
 
 if __name__ == "__main__":
