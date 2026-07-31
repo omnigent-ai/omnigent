@@ -3358,6 +3358,37 @@ def test_build_models_json_known_catalog_model_not_duplicated() -> None:
     assert anthropic_ids.count(model_id) == 1
 
 
+def test_build_models_json_registers_selected_catalog_alias_once() -> None:
+    """An equivalent live alias is rewritten to the exact launch selector."""
+    selected_model = "databricks-claude-catalog"
+    catalog_models = (
+        ModelEntry(
+            id="system.ai.claude-catalog",
+            family="claude",
+            metadata=ModelMetadata(
+                context_window=200_000,
+                wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES}),
+            ),
+        ),
+    )
+
+    result = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        model=selected_model,
+        catalog_models=catalog_models,
+    )
+
+    anthropic_models = result["providers"]["databricks-anthropic"]["models"]
+    assert anthropic_models == [
+        {
+            "id": selected_model,
+            "input": ["text", "image"],
+            "contextWindow": 200_000,
+        }
+    ]
+
+
 def test_build_models_json_does_not_leak_selected_model_between_builds() -> None:
     """A selected model from one build never appears in a later build."""
     _build_models_json("https://host.example.com", "tok", model="moonshotai/kimi-k2.6")

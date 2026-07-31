@@ -648,8 +648,7 @@ def _build_models_json(
     openai_wire_api: str | None = None,
 ) -> dict[str, Any]:  # type: ignore[explicit-any]
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
-    # see _DATABRICKS_*_MODELS and the compat/authHeader shapes below. The
-    # schema is owned by the Pi CLI and not worth a TypedDict tree here.
+    # the schema is owned by the Pi CLI and not worth a TypedDict tree here.
     """Build a Pi ``models.json`` with protocol-specific gateway providers.
 
     Each provider targets a different API gateway path and wire format so
@@ -725,7 +724,10 @@ def _build_models_json(
             continue
         wire_apis = wire_catalog.get(model_id.lower(), catalog_model.metadata.wire_apis)
         provider_name = _pi_provider_for_model(model_id, wire_apis)
-        provider_models[provider_name].append(_pi_model_json_entry(catalog_model))
+        registered_model = catalog_model
+        if model is not None and model.lower() in _databricks_model_aliases(model_id):
+            registered_model = replace(catalog_model, id=model)
+        provider_models[provider_name].append(_pi_model_json_entry(registered_model))
     config: dict[str, Any] = {  # type: ignore[explicit-any]  # Pi-owned schema, see note above
         "providers": {
             # Models advertising Responses support use the AI Gateway's Codex
@@ -790,6 +792,8 @@ def _build_models_json(
         },
     }
     if model is not None:
+        # Explicit selections must launch even when picker compatibility
+        # filtering hides the equivalent discovered entry.
         provider = config["providers"][
             _pi_provider_for_model(
                 model,
@@ -946,11 +950,21 @@ def _enrich_databricks_model_catalog(
                         discovered_metadata.unsupported_capabilities
                         or metadata.unsupported_capabilities
                     ),
-                    context_window=(discovered_metadata.context_window or metadata.context_window),
-                    max_output_tokens=(
-                        discovered_metadata.max_output_tokens or metadata.max_output_tokens
+                    context_window=(
+                        discovered_metadata.context_window
+                        if discovered_metadata.context_window is not None
+                        else metadata.context_window
                     ),
-                    cost_tier=discovered_metadata.cost_tier or metadata.cost_tier,
+                    max_output_tokens=(
+                        discovered_metadata.max_output_tokens
+                        if discovered_metadata.max_output_tokens is not None
+                        else metadata.max_output_tokens
+                    ),
+                    cost_tier=(
+                        discovered_metadata.cost_tier
+                        if discovered_metadata.cost_tier is not None
+                        else metadata.cost_tier
+                    ),
                     wire_apis=discovered_metadata.wire_apis or metadata.wire_apis,
                 ),
             )
