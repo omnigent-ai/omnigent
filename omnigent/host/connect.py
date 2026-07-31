@@ -2203,6 +2203,9 @@ class HostProcess:
             request_id=frame.request_id,
             status="ok",
             models=models,
+            # The picker names the newest model of each family; the endpoint
+            # serves older generations too, and a launch takes an exact id.
+            routable_models=list(config.routable_models) if config is not None else [],
         )
 
     @staticmethod

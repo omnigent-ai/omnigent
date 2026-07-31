@@ -804,12 +804,21 @@ class HostModelOptionsFrame:
 
 @dataclass
 class HostModelOptionsResultFrame:
-    """Host → server: pre-launch model choices resolved on that machine."""
+    """Host → server: pre-launch model choices resolved on that machine.
+
+    :param models: Picker rows the harness can be launched/switched onto
+        by name, e.g. ``[{"id": "opus", "model": "…-opus-5"}]``.
+    :param routable_models: Every model id the harness's endpoint serves,
+        including generations no picker row names — launchable exactly
+        (``--model``) even without a row, so a router may pick one.
+        Empty when the harness cannot enumerate its endpoint.
+    """
 
     request_id: str
     status: str
     models: list[_JsonObject] = field(default_factory=list)
     error: str | None = None
+    routable_models: list[str] = field(default_factory=list)
 
 
 HostFrame = (
@@ -1189,6 +1198,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "models": frame.models,
                 "error": frame.error,
+                "routable_models": frame.routable_models,
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
@@ -1811,11 +1821,17 @@ def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFram
     models = msg.get("models", [])
     if not isinstance(models, list) or not all(isinstance(model, dict) for model in models):
         raise ValueError("frame field must be a list of JSON objects: 'models'")
+    # Absent from hosts older than the routable-catalog field; the picker rows
+    # alone remain a valid answer.
+    routable = msg.get("routable_models", [])
+    if not isinstance(routable, list) or not all(isinstance(model, str) for model in routable):
+        raise ValueError("frame field must be a list of strings: 'routable_models'")
     return HostModelOptionsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         models=models,
         error=_optional_nullable_str(msg, "error"),
+        routable_models=routable,
     )
 
 

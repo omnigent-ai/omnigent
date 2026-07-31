@@ -503,6 +503,30 @@
             "title": "Pending Elicitations Count",
             "type": "integer"
           },
+          "routed_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model this sub-agent runs on when one was pinned for it, e.g. `\"databricks-claude-opus-4-8\"`. Read from the child's `model_override` \u2014 the field intelligent routing writes when it picks a model for a spawned child. `None` when the child inherits the parent/spec model.",
+            "title": "Routed Model"
+          },
+          "routing_decision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identifier of the routing decision that produced `routed_model`, mirroring `RoutingDecisionData.decision_id`. Read from the child's `omnigent.routing.decision_id` label, stamped when routing pins the model. `None` when the child was not routed.",
+            "title": "Routing Decision Id"
+          },
           "session_name": {
             "anyOf": [
               {
@@ -3215,6 +3239,42 @@
             "title": "Applied",
             "type": "boolean"
           },
+          "attempted_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model an LLM-supplied `args.model` asked for and the router overrode, e.g. `\"databricks-gpt-5-5\"`. `None` when nothing was attempted.",
+            "title": "Attempted Override"
+          },
+          "decision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Router decision identifier, e.g. `\"3f1c\u2026\"`. Correlates the transcript item with the routing telemetry event and the child-sessions API row. `None` for decisions made before decision ids existed.",
+            "title": "Decision Id"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Harness the decision applies to, e.g. `\"claude-native\"` or `\"codex\"`. `None` when the decision picked a model only (no harness dimension).",
+            "title": "Harness"
+          },
           "model": {
             "description": "The concrete brain model the router chose, e.g. `\"databricks-claude-opus-4-8\"`.",
             "title": "Model",
@@ -3223,6 +3283,30 @@
           "rationale": {
             "description": "The router's one-line explanation, shown as muted secondary text, e.g. `\"Multi-file refactor needs deep reasoning.\"`.",
             "title": "Rationale",
+            "type": "string"
+          },
+          "raw_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The router-vocabulary pick before resolution to a servable catalog id, e.g. `\"gpt-5-6-sol\"`. `None` when the pick needed no resolution.",
+            "title": "Raw Model"
+          },
+          "scope": {
+            "default": "turn",
+            "description": "What the decision governs \u2014 `\"session\"` (auto-harness session routing), `\"turn\"` (per-turn routing), `\"child_session\"` (an Omnigent-spawned sub-agent) or `\"native_subagent\"` (a Task / `spawn_agent` spawn routed inside the harness). Defaults to `\"turn\"` so rows persisted before this field deserialize.",
+            "enum": [
+              "session",
+              "turn",
+              "child_session",
+              "native_subagent"
+            ],
+            "title": "Scope",
             "type": "string"
           }
         },
@@ -5207,6 +5291,18 @@
             "description": "For sub-agent sessions, the sub-agent type name within the parent's spec tree, e.g. `\"summarizer\"`. `None` for top-level sessions.",
             "title": "Sub Agent Name"
           },
+          "subagent_routing_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session subagent-routing switch: `\"on\"` routes subagent spawns, `\"off\"` leaves them unrouted. `None` means the session inherits its main routing state (own or parent `cost_control_mode_override == \"on\"`) \u2014 the value the in-session \"Subagent routing\" row renders as \"Default\". Set via `PATCH /v1/sessions/{id}`.",
+            "title": "Subagent Routing Override"
+          },
           "terminal_launch_args": {
             "anyOf": [
               {
@@ -5287,6 +5383,14 @@
             ],
             "description": "Per-model breakdown of the same subtree usage, keyed by the raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` when no per-model usage has been recorded (older sessions recorded before this field existed, or before the first turn). Lets the UI show which models a session spent its tokens / budget on.",
             "title": "Usage By Model"
+          },
+          "warnings": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Warnings",
+            "type": "array"
           },
           "workspace": {
             "anyOf": [
@@ -6567,6 +6671,18 @@
             "description": "When `True`, persist metadata changes but skip the runner-side side effects \u2014 specifically the native `/effort` / `/model` / Codex collaboration-mode forwards into the live runtime. Used by automatic bind-time handoffs (web's sticky-pref apply on session switch, the REPL's pre-create `/model` snapshot) where injecting a visible slash command into a freshly-spawned pane would render as an unexpected \"Command model X\" item before the user has sent anything. Default `False` preserves the user-driven picker / `/model` behaviour where the live forward IS the desired feedback.",
             "title": "Silent",
             "type": "boolean"
+          },
+          "subagent_routing_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session subagent-routing switch: `\"on\"` routes subagent spawns, `\"off\"` leaves them unrouted. Explicit JSON `null` clears the override so the session inherits its main routing state again; omitting the field leaves it unchanged (same presence-is-the-clear-signal rule as `cost_control_mode_override`). Effective on the next spawn, so it can be changed at any point in a session.",
+            "title": "Subagent Routing Override"
           },
           "terminal_launch_args": {
             "anyOf": [

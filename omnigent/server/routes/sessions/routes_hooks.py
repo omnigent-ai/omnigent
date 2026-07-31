@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, NamedTuple
 
@@ -1290,5 +1291,154 @@ def register_hooks_routes(
             )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),
+            media_type="application/json",
+        )
+
+    async def _route_subagent_catalog(session_id: str) -> dict[str, list[str]] | None:
+        """
+        Fetch the session's live model catalog for subagent routing.
+
+        :param session_id: Parent session/conversation id.
+        :returns: Worker → servable model ids, or ``None`` when the runner
+            is unreachable (callers fall back to the static table).
+        """
+        from omnigent.server.smart_routing import fetch_runner_models
+
+        try:
+            runner_client = await _get_runner_client(
+                session_id, runner_router or get_server_runner_router()
+            )
+            if runner_client is None:
+                return None
+            return await fetch_runner_models(session_id, runner_client)
+        except Exception:
+            _logger.debug(
+                "route-subagent: live catalog unavailable for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
+    @router.post(
+        "/sessions/{session_id}/hooks/route-subagent",
+        # Internal runner relay — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def route_subagent_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Decide the model/harness a native subagent spawn may use.
+
+        The runner's loopback router (advertised to harness
+        ``PreToolUse`` hooks via ``subagent_router.json``) relays here
+        because ``RuntimeCaps.routing_client`` only lives in the server
+        process. Request and response follow the frozen route-subagent
+        contract; every routed verdict also lands as a
+        ``routing_decision`` transcript item.
+
+        The session's subagent-routing setting is re-read on every call
+        (it is togglable mid-session), so a session whose routing is off
+        gets its spawn allowed unchanged without calling the router.
+        Candidate models stay inside the session's own harness family
+        unless the session started in auto-harness mode.
+
+        :param request: FastAPI request — body is the route-subagent
+            request JSON.
+        :param session_id: Parent session/conversation id from the path.
+        :returns: The route-subagent decision as JSON.
+        :raises OmnigentError: 400 when the body is not a JSON object or
+            omits ``harness``.
+        """
+        from omnigent.runner.subagent_routing import (
+            SubagentRouteDecision,
+            SubagentRouteRequest,
+            auto_harness_session,
+            resolve_subagent_route,
+            store_persister,
+            subagent_routing_enabled,
+        )
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in route-subagent body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "route-subagent body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            route_request = SubagentRouteRequest.from_payload(payload)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        # A relayed spawn is evidence the harness ran its routing hook, but it
+        # is deliberately NOT turned into a clear here: the same warning code
+        # also carries the spawn-audit verdict ("started on a model the router
+        # never approved"), which a relay does not disprove — and every spawn
+        # that produces such a verdict is itself relayed, so clearing here
+        # wiped exactly the warnings the publisher had just raised (it only
+        # re-posts on a transition, so the wipe was permanent). The publisher
+        # owns the clear: its next check sees the canary and posts the repair.
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        parent = None
+        if conv is not None and conv.parent_conversation_id is not None:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+        parent_cost_control_mode = (
+            parent.cost_control_mode_override if parent is not None else None
+        )
+        if conv is None or not subagent_routing_enabled(
+            conv.subagent_routing_override,
+            cost_control_mode=conv.cost_control_mode_override,
+            parent_cost_control_mode=parent_cost_control_mode,
+        ):
+            # Allowed unchanged, and deliberately not persisted: an
+            # unrouted spawn is not a decision worth a transcript item.
+            _logger.info(
+                "route-subagent: subagent routing disabled for session=%s harness=%s",
+                session_id,
+                route_request.harness,
+            )
+            unrouted = SubagentRouteDecision(
+                action="allow",
+                rationale="subagent routing disabled for this session",
+            )
+            return Response(
+                content=json.dumps(unrouted.to_payload()),
+                media_type="application/json",
+            )
+
+        # Only a session started in auto-harness mode may be moved across
+        # harness families; everyone else is offered their own family, so a
+        # Claude Code session never gets a Codex suggestion.
+        cross_harness = auto_harness_session(conv, parent)
+        # Offer the live catalog: the static table lags model generations, and
+        # a pick the workspace serves must not look unservable and get
+        # substituted down a tier.
+        catalog = await _route_subagent_catalog(session_id)
+        decision = await resolve_subagent_route(
+            session_id,
+            route_request,
+            caps=get_caps(),
+            catalog=catalog,
+            cross_harness=cross_harness,
+            persist=store_persister(session_id, conversation_store),
+        )
+        return Response(
+            content=json.dumps(decision.to_payload()),
             media_type="application/json",
         )

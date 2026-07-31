@@ -32,6 +32,7 @@ from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_run
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     session_stream,
+    session_warnings,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -391,6 +392,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
+            _EXTERNAL_SESSION_WARNING_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
@@ -843,6 +845,26 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
+            return {"queued": False}
+        if body.type == _EXTERNAL_SESSION_WARNING_TYPE:
+            warnings = body.data.get("warnings")
+            if not isinstance(warnings, list):
+                raise OmnigentError(
+                    "external_session_warning requires a list data.warnings",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if not warnings:
+                # The publisher re-checks every tick and posts what it still
+                # sees, so an empty list is "the condition is repaired" (the
+                # router canary fired on a later turn) — drop the banner.
+                # Scoped to the codes this channel's publishers check: a
+                # warning recorded by anyone else is not covered by this
+                # post and must survive it.
+                session_warnings.clear(session_id, codes=session_warnings.EXTERNAL_WARNING_CODES)
+                return {"queued": False}
+            for warning in warnings:
+                if isinstance(warning, dict):
+                    session_warnings.record(session_id, warning)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
             status = body.data.get("status")
@@ -1825,6 +1847,9 @@ def register_events_routes(
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.
         _pushed_model_options_cache.pop(session_id, None)
+        # Same for session warnings: they are keyed by session id and no
+        # snapshot will ever read them again once the row is gone.
+        session_warnings.clear(session_id)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.
