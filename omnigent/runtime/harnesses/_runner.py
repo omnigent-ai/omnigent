@@ -46,6 +46,7 @@ import sys
 import threading
 import time
 from types import FrameType
+from typing import cast
 
 import uvicorn
 from fastapi import FastAPI
@@ -345,6 +346,33 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _create_uvicorn_config(
+    app: FastAPI,
+    socket_path: str | None,
+    bind: str | None,
+) -> uvicorn.Config:
+    """Build the Uvicorn config for a Unix socket or TCP endpoint."""
+    # Uvicorn accepts fractional seconds despite its integer annotation.
+    graceful_timeout = cast("int", _GRACEFUL_SHUTDOWN_TIMEOUT_S)
+    if socket_path:
+        return uvicorn.Config(
+            app,
+            uds=socket_path,
+            log_level=_UVICORN_LOG_LEVEL,
+            timeout_graceful_shutdown=graceful_timeout,
+        )
+    if bind:
+        host, _, port = bind.rpartition(":")
+        return uvicorn.Config(
+            app,
+            host=host,
+            port=int(port),
+            log_level=_UVICORN_LOG_LEVEL,
+            timeout_graceful_shutdown=graceful_timeout,
+        )
+    sys.exit("runner: exactly one of --socket or --bind is required")
+
+
 def main(argv: list[str] | None = None) -> None:
     """
     Runner entrypoint.
@@ -373,19 +401,7 @@ def main(argv: list[str] | None = None) -> None:
     # Windows). ``log_level`` keeps per-process noise low — see
     # ``_UVICORN_LOG_LEVEL``. ``timeout_graceful_shutdown`` bounds how long
     # uvicorn waits for active connections after SIGTERM before force-exiting.
-    if args.socket:
-        bind_kwargs: dict[str, object] = {"uds": args.socket}
-    elif args.bind:
-        host, _, port = args.bind.rpartition(":")
-        bind_kwargs = {"host": host, "port": int(port)}
-    else:
-        sys.exit("runner: exactly one of --socket or --bind is required")
-    config = uvicorn.Config(
-        app,
-        log_level=_UVICORN_LOG_LEVEL,
-        timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
-        **bind_kwargs,
-    )
+    config = _create_uvicorn_config(app, args.socket, args.bind)
     _HardExitServer(config).run()
 
 
