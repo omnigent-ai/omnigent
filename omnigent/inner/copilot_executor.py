@@ -264,11 +264,14 @@ def _encode_tool_result(result: object) -> object:
 class _CopilotSession(Protocol):
     """SDK session methods used by the executor."""
 
-    def on(self, callback: Callable[[object], None]) -> Callable[[], None]: ...
+    def on(self, callback: Callable[[object], None]) -> Callable[[], None]:
+        pass
 
-    async def send_and_wait(self, prompt: str, *, timeout: float) -> object: ...
+    async def send_and_wait(self, prompt: str, *, timeout: float) -> object:
+        pass
 
-    async def abort(self) -> object: ...
+    async def abort(self) -> object:
+        pass
 
 
 @dataclass
