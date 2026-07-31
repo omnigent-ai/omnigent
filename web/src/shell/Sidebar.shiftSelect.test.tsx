@@ -9,7 +9,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
-import { computeShiftSelectRange } from "./Sidebar";
+import { computeShiftSelectRange, Sidebar } from "./Sidebar";
 
 describe("computeShiftSelectRange", () => {
   const ids = ["a", "b", "c", "d", "e"];
@@ -105,7 +105,6 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
