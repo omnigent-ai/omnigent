@@ -200,7 +200,7 @@ not pass secrets through the environment unless the tool genuinely needs them.
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
 the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS, or
 `windows_jobobject` on Windows), so the same YAML works across platforms. Use
-`type: auto` when you want to make that choice explicit:
+`type: auto` to explicitly request the platform-default sandbox backend:
 
 ```yaml
 os_env:
