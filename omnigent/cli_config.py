@@ -904,11 +904,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # Bedrock has no catalog default and Claude's own default model is
         # usually not enabled on a Bedrock account, so pin an explicit id.
         default_model = (
-            prompt_text(
-                "Default model (Bedrock inference-profile id, e.g. "
-                "us.anthropic.claude-opus-4-5-20251101-v1:0)"
-            ).strip()
-            or None
+            prompt_text("Default model (Bedrock inference-profile id or ARN)").strip() or None
         )
         family = ANTHROPIC_FAMILY
         entry = build_bedrock_provider_entry(

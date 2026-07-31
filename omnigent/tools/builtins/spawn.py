@@ -925,11 +925,10 @@ class SysSessionCreateTool(Tool):
                         "model": {
                             "type": "string",
                             "description": (
-                                "Optional model override for the child "
-                                "session, e.g. 'system.ai.glm-5-2' or "
-                                "'databricks-claude-opus-4-8'. Sets the "
-                                "harness model at session creation; "
-                                "omit to use the agent's default."
+                                "Optional provider-configured model id for "
+                                "the child session. Sets the harness model "
+                                "at session creation; omit to use the "
+                                "agent's default."
                             ),
                         },
                     },

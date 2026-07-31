@@ -194,6 +194,13 @@ The same policy supplies the final runtime fallback for key, gateway, and local
 providers. Explicit agent and provider defaults still win; without either,
 runtime discovery fails with configuration guidance when no catalog is available.
 
+## Configuration Help Text
+
+Setup prompts, routing policy schemas, and spawn-tool descriptions explain the
+expected provider-configured model value without embedding release-specific ids.
+Concrete examples belong in tests or provider-owned documentation so runtime
+help does not recommend stale models.
+
 ## Kimi Example Default
 
 The Kimi launcher example declares only the harness. With no explicit
