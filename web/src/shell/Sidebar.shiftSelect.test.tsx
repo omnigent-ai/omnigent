@@ -47,7 +47,9 @@ describe("computeShiftSelectRange", () => {
 
 const { projectsMock, conversationsRef, projectSessionsMock } = vi.hoisted(() => ({
   projectsMock: [] as string[],
-  conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  conversationsRef: {
+    current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
+  },
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
 }));
 
@@ -75,7 +77,7 @@ vi.mock("@/hooks/useConversations", () => ({
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
+          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
         ));
     return {
       data: enabled

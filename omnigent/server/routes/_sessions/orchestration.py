@@ -4632,8 +4632,11 @@ async def _relay_runner_stream(
         _intentional_stop_sessions.discard(session_id)
         # Relay ended (runner dropped/rebound): re-discover runner-backed
         # snapshot overlays next time. Cancel in-flight fetches so they can't
-        # land stale values from the dead runner after this pop.
-        _invalidate_runner_backed_snapshot_state(session_id, cancel_inflight=True)
+        # land stale values from the dead runner; the model catalog is only
+        # marked stale so the picker keeps serving it while the session sleeps.
+        _invalidate_runner_backed_snapshot_state(
+            session_id, cancel_inflight=True, drop_model_options=False
+        )
 
 
 def _ensure_runner_relay(
@@ -6329,9 +6332,14 @@ async def _fetch_model_options(
     * **codex-native / kiro-native** — a *live* catalog only the bound runner
       can read (its app-server ``model/list``). Like skills, this stays off the
       snapshot hot path: the first snapshot kicks a background fetch and returns
-      ``[]``; subsequent snapshots serve the cache.
+      ``[]``; subsequent snapshots serve the cache. The cache outlives the
+      runner: with no runner bound (asleep session) it keeps serving, and a
+      stale-marked entry serves while a live re-fetch replaces it.
     * **claude-native** — the provider-neutral aliases from the exact launch
       config, refreshed from Databricks before each new terminal starts.
+      With no runner bound and a cold cache (server restart while the
+      session slept), the session's host resolves a pre-launch preview
+      instead — the same source the new-session picker uses.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
@@ -6357,17 +6365,37 @@ async def _fetch_model_options(
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
         return []
-    if runner_client is None:
-        return []
     cached = _model_options_cache.get(session_id)
-    if cached is not None:
+    if runner_client is None:
+        # No runner to ask (asleep / stranded): serve the last-fetched
+        # catalog so the picker stays usable for offline model changes.
+        if cached:
+            return cached
+        # Cold cache too (e.g. the server restarted while the session
+        # slept). claude-native's catalog is also resolvable by the
+        # session's host — the same pre-launch source the new-session
+        # picker uses — so fill it from there in the background.
+        if (
+            wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+            and conv.host_id is not None
+            and session_id not in _model_options_inflight
+        ):
+            task = asyncio.create_task(_load_model_options_from_host(session_id, conv.host_id))
+            _model_options_inflight[session_id] = task
+            task.add_done_callback(
+                lambda _t, sid=session_id: _model_options_inflight.pop(sid, None)
+            )
+        return []
+    if cached is not None and session_id not in _model_options_stale:
         return cached
     if session_id not in _model_options_inflight:
         path = f"/v1/sessions/{session_id}/{endpoint}"
         task = asyncio.create_task(_load_model_options(runner_client, session_id, path))
         _model_options_inflight[session_id] = task
         task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
-    return []
+    # A stale catalog serves while the re-fetch runs; success publishes
+    # ``session.model_options`` so open clients re-read the snapshot.
+    return cached or []
 
 
 async def _get_session_snapshot(
@@ -6435,8 +6463,6 @@ async def _get_session_snapshot(
         conv = await asyncio.to_thread(conv_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
-    if refresh_state:
-        _invalidate_runner_backed_snapshot_state(session_id, cancel_inflight=False)
     # Return the most recent committed items while preserving the
     # SessionResponse contract that ``items`` is chronological. The
     # store's default page is the oldest 100 (``order="asc"``), which
@@ -6473,6 +6499,17 @@ async def _get_session_snapshot(
             )
     if runner_client is None:
         runner_client = get_runner_client()
+
+    if refresh_state:
+        # Re-discover runner-backed overlays. Drop the model catalog only
+        # when a live runner can serve the re-fetch immediately; with no
+        # runner bound the cached catalog is all there is — keep serving it
+        # (stale) so a reload of an asleep session doesn't blank the picker.
+        _invalidate_runner_backed_snapshot_state(
+            session_id,
+            cancel_inflight=False,
+            drop_model_options=runner_client is not None,
+        )
 
     status = _session_status_from_cache(session_id)
     if status == "idle":

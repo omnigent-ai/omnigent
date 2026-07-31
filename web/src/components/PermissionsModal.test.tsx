@@ -315,6 +315,8 @@ describe("PermissionsModal", () => {
     // The manage grant's level is still visible to the viewer as static text.
     expect(screen.getByText("Manage")).toBeInTheDocument();
 
+    // Only one listbox can be open, so each interaction must finish first.
+    /* oxlint-disable no-await-in-loop */
     for (const trigger of triggers) {
       trigger.focus();
       fireEvent.keyDown(trigger, { key: "Enter" });
@@ -327,6 +329,7 @@ describe("PermissionsModal", () => {
       fireEvent.keyDown(listbox, { key: "Escape" });
       await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("does not fetch permissions when closed", () => {

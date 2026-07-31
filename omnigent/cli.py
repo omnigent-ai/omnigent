@@ -4824,11 +4824,17 @@ def resume(
         "local server, or a newly started local server."
     ),
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace a previously imported chat from the same harness session.",
+)
 def import_session_command(
     harness: str,
     source_session_id: str | None,
     recent_session_count: int | None,
     server: str | None,
+    force: bool,
 ) -> None:
     """Import chats from supported local coding harnesses.
 
@@ -4836,7 +4842,8 @@ def import_session_command(
     as a normal session. Qwen, Kiro, and Kimi currently preserve visible
     messages but not native tool activity; OpenCode and Pi preserve exported
     tool activity. Use --session for one chat or --last for a bounded batch. A
-    source session can only be imported once.
+    source session can only be imported once unless --force is used to replace
+    the previous import.
 
     \b
     Examples:
@@ -4845,6 +4852,7 @@ def import_session_command(
       omnigent import --harness opencode --session <session-id>
       omnigent import --harness qwen --session <session-id>
       omnigent import --harness claude --last 10
+      omnigent import --harness claude --session <session-id> --force
     """
     import httpx
 
@@ -4903,6 +4911,7 @@ def import_session_command(
             "source": imported.source,
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
+            "force": force,
             "items": [
                 {
                     "type": item.type,

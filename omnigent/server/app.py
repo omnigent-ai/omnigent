@@ -83,6 +83,7 @@ from omnigent.server.routes.sessions import (
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
+    set_server_host_registry,
     set_server_runner_router,
 )
 from omnigent.server.routes.sharing import create_sharing_router
@@ -1633,6 +1634,10 @@ def create_app(
     # request/route closure) the runner router so it can reach the bound
     # runner.
     set_server_runner_router(runner_router)
+    # Same pattern for the host registry: asleep claude-native sessions
+    # refill their model catalog from the session's host, from background
+    # tasks with no request in scope.
+    set_server_host_registry(host_registry)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
     # hold a session's runner tunnel serve the same sidebar fields. The

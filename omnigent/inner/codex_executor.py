@@ -24,7 +24,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
-from omnigent.inner.agent_env import clean_agent_env
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.spec.types import RetryPolicy
@@ -394,18 +394,6 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
     )
-
-
-def _declared_passthrough(os_env: OSEnvSpec | None) -> tuple[str, ...]:
-    """Env-var names an agent declared for tool passthrough.
-
-    Lives on ``os_env.sandbox.env_passthrough`` (an
-    :class:`OSEnvSandboxSpec` field), not on ``OSEnvSpec`` directly.
-    Returns an empty tuple when any link in that chain is absent.
-    """
-    if os_env is not None and os_env.sandbox is not None and os_env.sandbox.env_passthrough:
-        return tuple(os_env.sandbox.env_passthrough)
-    return ()
 
 
 def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
@@ -2311,7 +2299,7 @@ class CodexExecutor(Executor):
                 f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
             )
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
+        self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()

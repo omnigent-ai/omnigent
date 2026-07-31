@@ -1582,19 +1582,23 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
-  it("soft-disables the gear when the session isn't live (asleep/stranded/unknown — no runner to configure)", () => {
-    // A config change can't wake a sleeping runner (unlike a message) and
-    // those states never load the model catalog, so the gear is inert
-    // whenever the session isn't online — not just the two unreachable kinds.
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true, sessionLive: false })} />);
+  it("soft-disables the gear when the session is unreachable (host offline / stranded)", () => {
+    // No message can wake an unreachable session, so a config change has
+    // nothing to apply to — the gear is inert like the composer.
+    renderWithTooltips(<Composer {...composerProps({ showEffort: true, unreachable: true })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(gear()!);
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
-  it("keeps the gear live (not aria-disabled) on an online session", () => {
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true, sessionLive: true })} />);
+  it("keeps the gear live on an asleep session (change persists and applies on wake)", () => {
+    // Asleep/starting/unknown sessions accept sends (which wake the runner),
+    // and a config PATCH persists server-side and applies on the next
+    // wake/turn — so the gear stays live wherever the composer does.
+    renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "false");
+    fireEvent.click(gear()!);
+    expect(screen.queryByTestId("composer-config-modal")).not.toBeNull();
   });
 
   it("still shows the config tooltip on a disabled gear (soft-disable preserves hover)", async () => {
@@ -1605,7 +1609,7 @@ describe("Composer config gear", () => {
           showEffort: true,
           showModels: true,
           modelPickerKind: "claude",
-          sessionLive: false,
+          unreachable: true,
         })}
       />,
     );
@@ -1707,8 +1711,8 @@ describe("Composer config gear", () => {
     expect(screen.getByTestId("composer-config-model")).toHaveTextContent("Default");
   });
 
-  it("does not open the modal via bare /model when the gear is disabled (not live)", async () => {
-    // Bare /model bumps the open nonce; on a non-live session the gear is
+  it("does not open the modal via bare /model when the gear is disabled (unreachable)", async () => {
+    // Bare /model bumps the open nonce; on an unreachable session the gear is
     // inert, so the nonce must NOT open a modal that can't apply a change.
     const options = [{ id: "opus", model: "opus", displayName: "Opus" }] as never;
     useChatStore.setState({ codexModelOptions: options });
@@ -1717,7 +1721,7 @@ describe("Composer config gear", () => {
         {...composerProps({
           showModels: true,
           modelPickerKind: "claude",
-          sessionLive: false,
+          unreachable: true,
           codexModelOptions: options,
         })}
       />,

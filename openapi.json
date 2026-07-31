@@ -1781,6 +1781,11 @@
             "title": "External Session Id",
             "type": "string"
           },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
           "items": {
             "items": {
               "$ref": "#/components/schemas/ImportItemInput"
@@ -7747,7 +7752,7 @@
     },
     "/v1/imports": {
       "post": {
-        "description": "Import one normalized transcript, rejecting duplicate sources.",
+        "description": "Import one normalized transcript, optionally replacing its prior import.",
         "operationId": "import_session_v1_imports_post",
         "requestBody": {
           "content": {

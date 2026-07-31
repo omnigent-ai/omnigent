@@ -131,7 +131,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { __resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
+import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -242,7 +242,7 @@ beforeEach(() => {
   mocks.pinnedStore.set([]);
   // The read-state mirror is module-level (in-memory), so reset it between
   // tests to avoid a mark-unread leaking into later rows.
-  __resetReadStateForTests();
+  resetReadStateForTests();
   mockConversations([CONV]);
 });
 

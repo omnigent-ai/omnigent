@@ -101,6 +101,22 @@ describe("UserBubble markdown rendering", () => {
   });
 });
 
+describe("UserBubble system messages", () => {
+  it("keeps hook order stable when a system message becomes a regular message", () => {
+    const { rerender } = renderBubble(userBubble("[System: timer build fired]"));
+    expect(screen.getByTestId("system-message")).toBeInTheDocument();
+
+    rerender(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={userBubble("build finished")} />
+      </FileViewerContext.Provider>,
+    );
+
+    expect(screen.queryByTestId("system-message")).toBeNull();
+    expect(screen.getByText("build finished")).toBeInTheDocument();
+  });
+});
+
 describe("AssistantBubble lifecycle rendering", () => {
   it("shows an interrupted indicator for cancelled assistant bubbles", () => {
     renderBubble(assistantBubble("cancelled"));
