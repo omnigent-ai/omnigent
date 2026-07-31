@@ -585,6 +585,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert app_server.codex_home == expected_codex_home
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
+    assert build_calls[0]["trust_project"] is True
     assert "developer_instructions" not in build_calls[0]
     assert len(launched_specs) == 1
     launched = launched_specs[0]

@@ -14,6 +14,7 @@ from typing import Any
 import click
 import httpx
 import pytest
+import tomllib
 import yaml
 
 from omnigent import codex_native, codex_native_app_server, codex_native_forwarder
@@ -1097,6 +1098,43 @@ def test_build_codex_remote_args_bypass_hook_trust_default_false() -> None:
         remote_url="ws://127.0.0.1:9876",
     )
     assert "--dangerously-bypass-hook-trust" not in args
+
+
+def test_trust_codex_project_updates_private_config_only(tmp_path: Path) -> None:
+    """Headless startup trusts the workspace without changing shared config."""
+    source_config = tmp_path / "shared-config.toml"
+    source_text = '[projects."/existing"]\ntrust_level = "untrusted"\n'
+    source_config.write_text(source_text, encoding="utf-8")
+    codex_home = tmp_path / "private-home"
+    codex_home.mkdir()
+    private_config = codex_home / "config.toml"
+    private_config.write_text(source_text, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    codex_native_app_server._trust_codex_project(codex_home, workspace)
+
+    parsed = tomllib.loads(private_config.read_text(encoding="utf-8"))
+    assert parsed["projects"][str(workspace.resolve())]["trust_level"] == "trusted"
+    assert parsed["projects"]["/existing"]["trust_level"] == "untrusted"
+    assert source_config.read_text(encoding="utf-8") == source_text
+
+
+def test_build_codex_native_server_does_not_trust_project_by_default(
+    tmp_path: Path,
+) -> None:
+    """Interactive Codex launches retain the normal project trust prompt."""
+    app_server = codex_native_app_server.build_codex_native_server(
+        socket_path=tmp_path / "app.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path / "workspace",
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/opt/codex/bin/codex",
+    )
+
+    assert app_server.trust_project is False
 
 
 def test_codex_app_server_client_uses_codex_remote_handshake(
