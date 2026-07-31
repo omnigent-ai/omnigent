@@ -42,12 +42,19 @@ class RunnerSessionInitEnvelope(BaseModel):
     agent_id: str
     sub_agent_name: str | None = None
     snapshot: RunnerSessionInitSnapshot
+    # When True the runner must skip crash-recovery turn detection on this
+    # create_session call.  Set by the server whenever it calls session-init
+    # immediately before forwarding a message — the forward carries the
+    # message, so a recovery turn started from history would process it twice
+    # (once from the recovery path, once from the buffered forward).
+    suppress_recovery_turn: bool = False
 
 
 def build_runner_session_init_payload(
     conversation: Conversation,
     *,
     server_version: str,
+    suppress_recovery_turn: bool = False,
 ) -> dict[str, Any]:
     """Build the versioned initialization fields appended to the legacy body."""
     if conversation.agent_id is None:
@@ -58,6 +65,7 @@ def build_runner_session_init_payload(
         session_id=conversation.id,
         agent_id=conversation.agent_id,
         sub_agent_name=conversation.sub_agent_name,
+        suppress_recovery_turn=suppress_recovery_turn,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,

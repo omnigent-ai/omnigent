@@ -3562,7 +3562,7 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     try:
-        agent = await create_test_agent(client)
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
         parent = await _create_session(client, agent["id"])
         child_resp = await client.post(
             "/v1/sessions",
@@ -3674,7 +3674,7 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     try:
-        agent = await create_test_agent(client)
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
         parent = await _create_session(client, agent["id"])
         child_resp = await client.post(
             "/v1/sessions",

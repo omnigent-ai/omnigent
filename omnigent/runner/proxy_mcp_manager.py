@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import cast
 
 import httpx
 
@@ -37,6 +37,32 @@ from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger(__name__)
+
+_JsonObject = dict[str, object]
+_EventPublisher = Callable[[str, _JsonObject], None]
+
+
+def _json_object(value: object) -> _JsonObject | None:
+    """Return a string-keyed object mapping when the value has that shape."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("_JsonObject", value)
+
+
+def _response_json_object(response: httpx.Response) -> _JsonObject:
+    """Decode one JSON-RPC response object."""
+    value: object = response.json()
+    result = _json_object(value)
+    if result is None:
+        raise ValueError("MCP proxy response must be a JSON object")
+    return result
+
+
+def _json_object_list(value: object) -> list[_JsonObject]:
+    """Return only object entries from a JSON array."""
+    if not isinstance(value, list):
+        return []
+    return [item for raw in value if (item := _json_object(raw)) is not None]
 
 
 class ProxyMcpManager:
@@ -59,7 +85,7 @@ class ProxyMcpManager:
         self,
         session_id: str,
         ap_client: httpx.AsyncClient,
-        publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+        publish_event: _EventPublisher | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -105,7 +131,7 @@ class ProxyMcpManager:
         if not spec.mcp_servers:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
 
-        payload: dict[str, Any] = {
+        payload: _JsonObject = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
@@ -118,7 +144,7 @@ class ProxyMcpManager:
                 timeout=30.0,
             )
             resp.raise_for_status()
-            data: dict[str, Any] = resp.json()
+            data = _response_json_object(resp)
         except Exception as exc:  # noqa: BLE001 — network + HTTP errors all surface as failures
             _logger.warning(
                 "ProxyMcpManager tools/list failed for session %r: %s",
@@ -132,8 +158,12 @@ class ProxyMcpManager:
             )
 
         if "error" in data:
-            err: dict[str, Any] = data["error"]
-            msg = f"MCP proxy error {err.get('code')}: {err.get('message')}"
+            err = _json_object(data.get("error"))
+            msg = (
+                f"MCP proxy error {err.get('code')}: {err.get('message')}"
+                if err is not None
+                else "MCP proxy returned a non-object RPC error"
+            )
             _logger.warning(
                 "ProxyMcpManager tools/list returned RPC error for session %r: %s",
                 self._session_id,
@@ -145,29 +175,42 @@ class ProxyMcpManager:
                 failures={"proxy": msg},
             )
 
-        tools_list: list[dict[str, Any]] = data.get("result", {}).get("tools", [])
-        schemas: list[dict[str, Any]] = []
+        result = _json_object(data.get("result"))
+        if result is None:
+            msg = "MCP proxy returned a non-object tools/list result"
+            _logger.warning(
+                "ProxyMcpManager tools/list returned malformed result for session %r",
+                self._session_id,
+            )
+            return McpSchemasResult(
+                schemas=[],
+                tool_names=set(),
+                failures={"proxy": msg},
+            )
+        tools_list = _json_object_list(result.get("tools"))
+        schemas: list[_JsonObject] = []
         tool_names: set[str] = set()
         for tool in tools_list:
-            name = tool.get("name", "")
-            if not name:
+            name = tool.get("name")
+            if not isinstance(name, str) or not name:
                 continue
             # The Omnigent server returns ``inputSchema`` (JSON Schema from MCP).
             # Convert to the ``parameters`` key expected by LLM providers,
             # normalizing the same way RunnerMcpManager does via
             # _normalize_input_schema (ensure ``properties`` key is present).
-            raw_schema: dict[str, Any] | None = tool.get("inputSchema")
-            parameters: dict[str, Any]
+            raw_schema = _json_object(tool.get("inputSchema"))
+            parameters: _JsonObject
             if raw_schema is None:
                 parameters = {"type": "object", "properties": {}}
             elif raw_schema.get("type") == "object" and "properties" not in raw_schema:
                 parameters = {**raw_schema, "properties": {}}
             else:
                 parameters = raw_schema
-            schema: dict[str, Any] = {
+            description = tool.get("description")
+            schema: _JsonObject = {
                 "type": "function",
                 "name": name,
-                "description": tool.get("description", ""),
+                "description": description if isinstance(description, str) else "",
                 "parameters": parameters,
             }
             schemas.append(schema)
@@ -179,9 +222,7 @@ class ProxyMcpManager:
         self,
         spec: AgentSpec | None,
         tool_name: str,
-        # Values are Any because MCP tool arguments are JSON objects with
-        # heterogeneous value types (str, int, bool, nested dicts, etc.).
-        arguments: dict[str, Any],  # type: ignore[explicit-any]
+        arguments: _JsonObject,
     ) -> str:
         """Dispatch a tool call via the Omnigent server MCP proxy (``tools/call``).
 
@@ -207,7 +248,7 @@ class ProxyMcpManager:
         """
         del spec  # Omnigent server resolves spec from session context
 
-        payload: dict[str, Any] = {
+        payload: _JsonObject = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
@@ -232,7 +273,7 @@ class ProxyMcpManager:
                     ),
                 )
                 resp.raise_for_status()
-                data: dict[str, Any] = resp.json()
+                data = _response_json_object(resp)
             except Exception as exc:
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
@@ -240,7 +281,11 @@ class ProxyMcpManager:
                 ) from exc
 
             if "error" in data:
-                err: dict[str, Any] = data["error"]
+                err = _json_object(data.get("error"))
+                if err is None:
+                    raise RuntimeError(
+                        f"MCP proxy returned a non-object RPC error for tool {tool_name!r}"
+                    )
                 code = err.get("code")
                 msg = err.get("message", "")
                 # -32000 is the MCP convention for server-defined errors (tool
@@ -252,7 +297,11 @@ class ProxyMcpManager:
                     f"MCP proxy protocol error {code} for tool {tool_name!r}: {msg}"
                 )
 
-            result: dict[str, Any] = data.get("result", {})
+            result = _json_object(data.get("result"))
+            if result is None:
+                raise RuntimeError(
+                    f"MCP proxy returned a non-object result for tool {tool_name!r}"
+                )
 
             # ── ASK: Omnigent server returned InputRequiredResult ───────────────
             # Park for user approval and retry with inputResponses per the
@@ -262,8 +311,11 @@ class ProxyMcpManager:
                     # Guard against unexpected re-elicitation after one retry.
                     return json.dumps({"error": "Approval loop exceeded"})
 
-                input_requests: dict[str, Any] = result.get("inputRequests") or {}
-                request_state: str = result.get("requestState", "")
+                input_requests = _json_object(result.get("inputRequests"))
+                if input_requests is None:
+                    input_requests = {}
+                request_state_value = result.get("requestState")
+                request_state = request_state_value if isinstance(request_state_value, str) else ""
                 # The Omnigent server uses the elicitation_id as the key in
                 # inputRequests (MRTR spec: keys are server-assigned and the
                 # client CAN read them — only requestState is opaque).
@@ -273,7 +325,7 @@ class ProxyMcpManager:
                         {"error": "Approval required but no elicitation in inputRequests"}
                     )
 
-                _pub: Callable[[str, dict[str, Any]], None] = (
+                publisher: _EventPublisher = (
                     self._publish_event
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
@@ -281,7 +333,7 @@ class ProxyMcpManager:
                 approved = await pending_approvals.wait_for_user_approval(
                     elicitation_id=elicitation_id,
                     conversation_id=self._session_id,
-                    publish_event=_pub,
+                    publish_event=publisher,
                 )
 
                 payload = {
@@ -303,11 +355,14 @@ class ProxyMcpManager:
             content = result.get("content", [])
             is_error = result.get("isError", False)
             if isinstance(content, list):
-                parts = [
-                    block.get("text", "")
-                    for block in content
-                    if isinstance(block, dict) and block.get("type") == "text"
-                ]
+                parts: list[str] = []
+                for raw_block in content:
+                    block = _json_object(raw_block)
+                    if block is None or block.get("type") != "text":
+                        continue
+                    block_text = block.get("text")
+                    if isinstance(block_text, str):
+                        parts.append(block_text)
                 text = "\n".join(p for p in parts if p)
                 if is_error:
                     return json.dumps({"error": text})

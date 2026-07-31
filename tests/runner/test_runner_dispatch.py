@@ -7458,3 +7458,130 @@ async def test_spawn_async_tool_cancels_losing_future_no_leak(
     await asyncio.sleep(0)
     assert inbox.get_nowait()["status"] == "cancelled"
     assert _leaked(before) == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_phase_tool_call_policy_deny(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_spawn_async_tool`` evaluates PHASE_TOOL_CALL policy via the AP server
+    before dispatching.  A DENY verdict must suppress execution and push a
+    failed item to the inbox — the tool must never run.
+    """
+    from omnigent.runner import tool_dispatch
+
+    executed: list[str] = []
+
+    async def _should_not_run(**_kw: Any) -> str:
+        executed.append("ran")
+        return "should not reach"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _should_not_run)
+
+    policy_requests: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/policies/evaluate" in request.url.path:
+            policy_requests.append(json.loads(request.content))
+            return httpx.Response(
+                200, json={"result": "POLICY_ACTION_DENY", "reason": "test deny"}
+            )
+        return httpx.Response(404)
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        tool_dispatch._spawn_async_tool(
+            {"tool": "sys_os_shell", "args": '{"command": "echo hi"}'},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            server_client=server_client,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_policy_deny",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+        bg_task, _evt = next(iter(tasks.values()))
+        await bg_task
+
+    assert executed == [], "Tool must not execute when PHASE_TOOL_CALL is denied"
+    assert len(policy_requests) == 1
+    event = policy_requests[0]["event"]
+    assert event["type"] == "PHASE_TOOL_CALL"
+    assert event["data"]["name"] == "sys_os_shell"
+    # arguments must arrive as a dict so argument-aware policies (e.g. safety
+    # rules that inspect arguments.command) see the same structure every
+    # in-turn evaluation path delivers — not a raw JSON string.
+    assert isinstance(event["data"]["arguments"], dict), (
+        "arguments must be a dict, not a JSON string"
+    )
+    assert event["data"]["arguments"] == {"command": "echo hi"}
+
+    item = inbox.get_nowait()
+    assert item["status"] == "failed"
+    assert "policy" in item["output"].lower()
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_phase_tool_call_policy_allow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A PHASE_TOOL_CALL ALLOW verdict must let the tool execute normally.
+    """
+    from omnigent.runner import tool_dispatch
+
+    executed: list[str] = []
+
+    async def _fast(**_kw: Any) -> str:
+        executed.append("ran")
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _fast)
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if "/policies/evaluate" in request.url.path:
+            return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+        return httpx.Response(404)
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        tool_dispatch._spawn_async_tool(
+            {"tool": "sys_os_shell", "args": '{"command": "echo hi"}'},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            server_client=server_client,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_policy_allow",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+        bg_task, _evt = next(iter(tasks.values()))
+        await bg_task
+
+    assert executed == ["ran"], "Tool must execute when PHASE_TOOL_CALL is allowed"
+    item = inbox.get_nowait()
+    assert item["status"] == "completed"
+    assert item["output"] == "ok"

@@ -1,37 +1,3 @@
 # Curated baseline for dev/lint/lint_no_hardcoded_models.py.
 # Format: <path> <model-id> <allowed-count>
 # Keep counts minimal; new model pins should move behind provider/catalog resolution.
-omnigent/cli_config.py claude-opus-4-5-20251101-v1:0 1
-omnigent/cursor_native.py claude-opus-4-5 1
-omnigent/cursor_native.py claude-opus-4-6 1
-omnigent/cursor_native.py claude-opus-4-7 1
-omnigent/cursor_native.py claude-opus-4-8 1
-omnigent/cursor_native.py claude-sonnet-4-5 1
-omnigent/cursor_native.py claude-sonnet-4-6 1
-omnigent/cursor_native.py gpt-5.2 1
-omnigent/cursor_native.py gpt-5.2-codex 1
-omnigent/cursor_native.py gpt-5.3-codex 1
-omnigent/cursor_native.py gpt-5.4 1
-omnigent/cursor_native.py gpt-5.5 1
-omnigent/inner/pi_executor.py databricks-claude-opus-4-8 1
-omnigent/inner/pi_executor.py databricks-claude-sonnet-4-5 1
-omnigent/inner/pi_executor.py databricks-claude-sonnet-4-6 1
-omnigent/inner/pi_executor.py databricks-gpt-5-4 1
-omnigent/inner/pi_executor.py databricks-gpt-5-4-mini 1
-omnigent/inner/pi_executor.py databricks-gpt-5-5 1
-omnigent/inner/pi_executor.py databricks-gpt-5-5-pro 1
-omnigent/model_catalog.py claude-fable-5 1
-omnigent/model_catalog.py claude-haiku-4-5 1
-omnigent/model_catalog.py claude-opus-4-8 1
-omnigent/model_catalog.py claude-opus-5 1
-omnigent/model_catalog.py claude-sonnet-4-6 1
-omnigent/model_catalog.py claude-sonnet-5 1
-omnigent/model_catalog.py gpt-5.4 1
-omnigent/model_catalog.py gpt-5.4-mini 1
-omnigent/model_catalog.py gpt-5.5 1
-omnigent/onboarding/wizard.py databricks-gpt-5-4 1
-omnigent/onboarding/wizard.py gpt-4o 1
-omnigent/policies/builtins/routing.py databricks-claude-opus-4-6 1
-omnigent/policies/builtins/routing.py o3 1
-omnigent/tools/builtins/spawn.py databricks-claude-opus-4-8 1
-omnigent/tools/builtins/spawn.py system.ai.glm-5-2 1

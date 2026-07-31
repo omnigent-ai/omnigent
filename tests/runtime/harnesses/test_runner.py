@@ -10,6 +10,7 @@ ground here would just duplicate.
 from __future__ import annotations
 
 import pytest
+from fastapi import FastAPI
 
 from omnigent.runtime.harnesses import _runner
 
@@ -148,3 +149,25 @@ def test_load_harness_app_loads_test_fixture() -> None:
     # The harness name is also stashed for introspection /
     # logging — verifies the second app.state plumbing.
     assert app.state.harness == "test"
+
+
+def test_create_uvicorn_config_for_unix_socket() -> None:
+    config = _runner._create_uvicorn_config(FastAPI(), "/tmp/runner.sock", None)
+
+    assert config.uds == "/tmp/runner.sock"
+    assert config.timeout_graceful_shutdown == _runner._GRACEFUL_SHUTDOWN_TIMEOUT_S
+    assert config.log_level == _runner._UVICORN_LOG_LEVEL
+
+
+def test_create_uvicorn_config_for_tcp_bind() -> None:
+    config = _runner._create_uvicorn_config(FastAPI(), None, "127.0.0.1:8765")
+
+    assert config.host == "127.0.0.1"
+    assert config.port == 8765
+    assert config.timeout_graceful_shutdown == _runner._GRACEFUL_SHUTDOWN_TIMEOUT_S
+    assert config.log_level == _runner._UVICORN_LOG_LEVEL
+
+
+def test_create_uvicorn_config_requires_endpoint() -> None:
+    with pytest.raises(SystemExit, match="exactly one of --socket or --bind"):
+        _runner._create_uvicorn_config(FastAPI(), None, None)

@@ -38,8 +38,8 @@ overrides:
   '@tailwindcss/postcss': 4.3.1
   jiti: 2.7.0
   lightningcss: 1.32.0
-  postcss: 8.5.15
-  linkify-it: 5.0.1
+  postcss: 8.5.18
+  linkify-it: 5.0.2
   shiki: "catalog:"
   react: "catalog:"
   react-dom: "catalog:"
