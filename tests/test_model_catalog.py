@@ -868,7 +868,11 @@ def test_cli_config_listing_is_static_and_unverified(
     listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
     assert listing.source == "static"
     assert listing.verified is False
-    assert [m.id for m in listing.models] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+    assert [m.id for m in listing.models] == [
+        "gpt-5-6-sol",
+        "gpt-5-6-luna",
+        "gpt-5-6-terra",
+    ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.
     assert "resolved by the CLI at launch" in listing.note
@@ -897,6 +901,7 @@ def test_static_model_fallbacks_document_ownership(
     assert fallback.owner
     assert fallback.provenance
     assert fallback.discovery_gap
+
 
 def test_cursor_listing_uses_live_cli_base_models(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

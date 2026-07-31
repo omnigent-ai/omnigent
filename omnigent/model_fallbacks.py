@@ -26,7 +26,7 @@ _CLAUDE_SUBSCRIPTION_MODELS = (
     "claude-haiku-4-5",
 )
 
-_CODEX_MODELS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
+_CODEX_MODELS = ("gpt-5-6-sol", "gpt-5-6-luna", "gpt-5-6-terra")
 
 _STATIC_MODEL_FALLBACKS = {
     (SUBSCRIPTION_KIND, "claude"): StaticModelFallback(
