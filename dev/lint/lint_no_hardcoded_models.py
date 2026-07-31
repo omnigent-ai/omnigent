@@ -34,7 +34,6 @@ MODEL_ID_RE = re.compile(
 
 TEXT_EXTENSIONS = {".json", ".toml", ".yaml", ".yml", ".sh"}
 SOURCE_EXTENSIONS = {".py", *TEXT_EXTENSIONS}
-SCAN_ROOTS = (Path("."),)
 GENERATED_PATHS = {Path("openapi.json")}
 SKIP_PARTS = {
     ".git",
@@ -223,9 +222,7 @@ def scan(path: Path) -> list[Hit]:
 
 def _iter_scannable_paths() -> list[Path]:
     """Return every tracked source/config file in the lint surface."""
-    output = subprocess.check_output(
-        ["git", "ls-files", "-z", "--", *(root.as_posix() for root in SCAN_ROOTS)],
-    )
+    output = subprocess.check_output(["git", "ls-files", "-z"])
     return [
         path
         for raw_path in output.decode().split("\0")

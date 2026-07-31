@@ -379,15 +379,24 @@ def resolve_claude_native_model_selection(
             return claude_config.model
     fallback = static_model_fallback(SUBSCRIPTION_KIND, "claude")
     if fallback is None:
-        return model
-    return next(
+        raise ValueError("Claude subscription fallback has no routable Sonnet model")
+    exact_match = next(
         (
             model_id
             for model_id in fallback.model_ids
             if _claude_model_display_name("sonnet", model_id) == _UCODE_CLAUDE_CUSTOM_TIER_LABEL
         ),
-        model,
+        None,
     )
+    if exact_match is not None:
+        return exact_match
+    family_match = next(
+        (model_id for model_id in fallback.model_ids if "claude-sonnet-" in model_id.lower()),
+        None,
+    )
+    if family_match is None:
+        raise ValueError("Claude subscription fallback has no routable Sonnet model")
+    return family_match
 
 
 def _claude_model_display_name(tier: str, model_id: str) -> str:

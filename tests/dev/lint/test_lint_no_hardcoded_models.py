@@ -11,7 +11,6 @@ import yaml
 
 from dev.lint.lint_no_hardcoded_models import (
     OWNED_FALLBACK_PATH,
-    SCAN_ROOTS,
     SOURCE_EXTENSIONS,
     _iter_scannable_paths,
     scan,
@@ -65,7 +64,7 @@ def test_scan_ignores_python_docstrings(tmp_path: Path) -> None:
         "    def sync(self):\n"
         '        """For example, claude-opus-4-1."""\n'
         "    async def async_(self):\n"
-        '        """For example, gemini-2.5-pro."""\n'
+        '        """For example, gemini-3-pro."""\n'
     )
 
     assert scan(clean) == []
@@ -184,6 +183,5 @@ def test_precommit_trigger_matches_scan_surface() -> None:
     scanned_paths = set(_iter_scannable_paths())
 
     assert triggered_paths == scanned_paths
-    for root in SCAN_ROOTS:
-        for extension in SOURCE_EXTENSIONS:
-            assert files_pattern.search((root / f"lint_probe{extension}").as_posix())
+    for extension in SOURCE_EXTENSIONS:
+        assert files_pattern.search(Path(f"lint_probe{extension}").as_posix())

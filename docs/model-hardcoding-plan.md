@@ -10,8 +10,8 @@ provenance, and the discovery gap that prevents a live listing.
 
 ## Prevention
 
-- `dev/lint/lint_no_hardcoded_models.py` scans non-test Python/config/shell
-  files for concrete model ids in model-selection contexts.
+- `dev/lint/lint_no_hardcoded_models.py` scans every tracked non-test
+  Python/config/shell file for concrete model ids.
 - When a supported file changes, `.pre-commit-config.yaml` runs the hook across
   the full tracked lint surface so any non-owned hardcode fails.
 - Unavoidable static aliases pass only when Python AST analysis proves they are
@@ -23,24 +23,20 @@ provenance, and the discovery gap that prevents a live listing.
 
 ### Scope and exclusions
 
-The hook scans Python, YAML, JSON, TOML, and shell files under `omnigent`,
-`scripts`, `examples`, `.github`, and `dev/lint`. Python uses AST context;
-config and shell files use model-looking lines while ignoring comment-only
-lines.
+The hook scans tracked Python, YAML, JSON, TOML, and shell files across the
+repository. Python AST analysis checks every non-docstring string literal;
+config and shell files check every non-comment line. Tests, Markdown/prose,
+TypeScript/JavaScript, generated OpenAPI, and vendor/build trees are excluded.
 
-Tests, Markdown/prose, top-level files, `web` TypeScript/JavaScript, and
-generated/vendor trees are intentionally outside the initial lint surface.
-Tests need concrete ids as fixtures, while prose and frontend sources need
-syntax-aware handling before they can be added without excessive false
-positives.
+Concrete model ids in runtime help, logs, and errors are production literals
+and therefore fail lint. Use provider-neutral wording or synthetic identifier
+shapes there; docstrings may retain concrete examples when they materially
+improve API documentation.
 
-This is a heuristic ratchet, not a parser-level guarantee. Python detection is
-limited to model-named assignments, keyword arguments, and dictionary keys; a
-model id in an unrelated positional argument or bare collection can escape the
-check. Config and shell detection requires the model context and id on the same
-line, so multiline/block-scalar values are also outside the initial coverage.
-These gaps should be closed with syntax-aware scanners rather than broader
-regexes that would make prose false-positive.
+This remains a model-id regex ratchet rather than a parser-level guarantee for
+every provider naming scheme. Extend the regex and add a focused test when a
+new complete-id shape appears; do not broaden structural exceptions beyond
+complete owned fallback records.
 
 The hook intentionally scans the full tracked surface when a supported file
 changes. That bounded cost is what lets it enforce global absence instead of
