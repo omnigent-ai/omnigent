@@ -762,7 +762,12 @@ export function AppShell() {
     setOpenTerminals([]);
     setSelectedTerminalKey(null);
     // A maximized rail is transient too — the incoming session starts docked.
-    setRightPanelMaximized(false);
+    // If we were maximized, restore the sidebar we collapsed on entry (the
+    // toggle handler won't run on a session switch).
+    setRightPanelMaximized((wasMaximized) => {
+      if (wasMaximized) restoreSidebarAfterMaximize();
+      return false;
+    });
     // A selected file must be visible in the rail. The Agents/Todos/Terminals
     // tabs don't render the inline viewer, so pull the rail to Files.
     if (nextSelected && nextTab !== "files") {
@@ -951,6 +956,25 @@ export function AppShell() {
       clearFileViewerUrl(true);
     }
     setRightPanelOpen(next);
+  };
+
+  // Toggle the workspace rail's full-screen (maximized) state. Entering
+  // collapses the left sidebar (the maximized rail wants the full width) after
+  // stashing its prior open-state; exiting restores that state. The sidebar
+  // side effect is done here — outside any state updater — so the maximize
+  // setter stays a plain boolean flip. ``restoreSidebarAfterMaximize`` is
+  // shared with the session-switch reset, which also drops out of full screen.
+  const restoreSidebarAfterMaximize = useCallback(() => {
+    setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
+  }, []);
+  const toggleRightPanelMaximized = () => {
+    if (!rightPanelMaximized) {
+      sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+      setSidebarOpen(false);
+    } else {
+      restoreSidebarAfterMaximize();
+    }
+    setRightPanelMaximized((prev) => !prev);
   };
 
   // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
@@ -1462,22 +1486,7 @@ export function AppShell() {
                     selectedTerminalKey={selectedTerminalKey}
                     onCloseTerminal={closeTerminalTab}
                     maximized={rightPanelMaximized}
-                    onToggleMaximized={() =>
-                      setRightPanelMaximized((prev) => {
-                        if (!prev) {
-                          // Entering full screen: remember the sidebar state, then
-                          // collapse it so the maximized rail gets the full width.
-                          setSidebarOpen((open) => {
-                            sidebarOpenBeforeMaximizeRef.current = open;
-                            return false;
-                          });
-                        } else {
-                          // Exiting: restore whatever the sidebar was before.
-                          setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
-                        }
-                        return !prev;
-                      })
-                    }
+                    onToggleMaximized={toggleRightPanelMaximized}
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}

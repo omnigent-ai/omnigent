@@ -1105,6 +1105,51 @@ describe("Workspace rail maximize", () => {
     fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
   });
+
+  it("restores the collapsed sidebar when a session switch un-maximizes the rail", () => {
+    // Maximizing collapses the sidebar; the toggle handler restores it on exit,
+    // but a session switch un-maximizes directly (setRightPanelMaximized(false))
+    // — it must restore the sidebar too, or the user's open sidebar is silently
+    // lost. Same AppShell mount, only the :conversationId route param changes,
+    // so we build a tree with SessionNavButton (renderShell has none).
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_abc", permission_level: null },
+      { id: "conv_xyz", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_abc"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    // Open the sidebar, then maximize → sidebar collapses (state stashed).
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    // Switch conversation — the rail un-maximizes AND the sidebar is restored.
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    // Back to docked (a fresh session starts docked).
+    expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
+      "md:absolute",
+    );
+  });
 });
 
 describe("Subagents tab", () => {
