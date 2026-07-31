@@ -626,7 +626,7 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
             raise ValueError(
                 f"executor: key(s) {', '.join(nested)} belong to the bundle "
                 "config.yaml format; this format spells the executor flat, "
-                "e.g. executor: {harness: codex-native, model: gpt-5.4-mini}"
+                "e.g. executor: {harness: codex-native, model: MODEL_ID}"
             )
         # ``ExecutorSpec.{model,harness,profile}`` are ``str | None``;
         # missing keys map to ``None`` directly. ``data.get`` happens to

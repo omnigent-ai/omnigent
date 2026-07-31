@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from omnigent.entities import Conversation
 
-SESSION_INIT_PROTOCOL_VERSION = 2
+SessionInitProtocolVersion: TypeAlias = Literal[2]
+SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 2
 SESSION_INIT_PAYLOAD_KEY = "session_init"
 
 
-class RunnerSessionInitSnapshot(BaseModel):
+class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
     """Server-owned session state needed while starting a runner session."""
 
     model_config = ConfigDict(extra="ignore")
@@ -31,12 +32,12 @@ class RunnerSessionInitSnapshot(BaseModel):
     root_session_id: str | None = None
 
 
-class RunnerSessionInitEnvelope(BaseModel):
+class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
     """Metadata a current server can send instead of runner callback reads."""
 
     model_config = ConfigDict(extra="ignore")
 
-    protocol_version: Literal[SESSION_INIT_PROTOCOL_VERSION]
+    protocol_version: SessionInitProtocolVersion
     server_version: str
     session_id: str
     agent_id: str
@@ -55,7 +56,7 @@ def build_runner_session_init_payload(
     *,
     server_version: str,
     suppress_recovery_turn: bool = False,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     if conversation.agent_id is None:
         raise ValueError("runner session initialization requires an agent_id")
@@ -90,7 +91,7 @@ def build_runner_session_init_payload(
 
 
 def parse_runner_session_init_envelope(
-    body: dict[str, Any],
+    body: dict[str, object],
 ) -> RunnerSessionInitEnvelope | None:
     """Return a supported envelope, or ``None`` for the removable legacy path."""
     raw = body.get(SESSION_INIT_PAYLOAD_KEY)

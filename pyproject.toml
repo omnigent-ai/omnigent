@@ -652,6 +652,12 @@ ignore_missing_imports = true
 module = "daytona.*"
 ignore_missing_imports = true
 
+# islo is an optional dep (the `islo` extra); same lazy-import posture
+# as modal above.
+[[tool.mypy.overrides]]
+module = "islo.*"
+ignore_missing_imports = true
+
 # hindsight-client is an optional dep (the `hindsight` extra); the
 # hindsights tools import it lazily so the base install never needs it.
 [[tool.mypy.overrides]]

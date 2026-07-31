@@ -58,11 +58,13 @@ CEL reference: https://cel.dev/overview/cel-overview
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 try:
     import celpy
     import celpy.celtypes
+    from celpy.adapter import json_to_cel
+    from celpy.celparser import CELParseError
+    from celpy.evaluation import CELEvalError
 except ImportError:
     celpy = None  # type: ignore[assignment]
 
@@ -113,7 +115,7 @@ def cel_policy(
     env = celpy.Environment()
     try:
         ast = env.compile(expression)
-    except celpy.CELParseError as exc:
+    except CELParseError as exc:
         _log.warning("CEL compile error: %s", exc)
         raise ValueError(f"CEL policy: compile error in expression: {exc}") from exc
 
@@ -136,8 +138,8 @@ def cel_policy(
         if event.get("type") == "request":
             cel_event["data"] = request_user_text(event.get("data"))
         try:
-            result = prog.evaluate({"event": celpy.json_to_cel(cel_event)})
-        except (celpy.CELEvalError, ValueError, TypeError):
+            result = prog.evaluate({"event": json_to_cel(cel_event)})
+        except (CELEvalError, ValueError, TypeError):
             _log.debug(
                 "CEL policy eval error on event type %r, abstaining",
                 event.get("type"),
@@ -160,12 +162,12 @@ def cel_policy(
             out["reason"] = reason
         return out
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = (
+POLICY_REGISTRY: list[dict[str, object]] = (
     []
     if celpy is None
     else [

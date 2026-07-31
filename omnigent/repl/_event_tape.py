@@ -86,14 +86,14 @@ def _snapshot_event(event: object) -> dict[str, object] | None:
     model_dump = getattr(event, "model_dump", None)
     if model_dump is not None and callable(model_dump):
         try:
-            return model_dump()  # type: ignore[return-value]
+            return model_dump()
         except Exception:  # noqa: BLE001 — best-effort snapshot
             pass
 
     # Dataclasses (SDK events).
     if dataclasses.is_dataclass(event) and not isinstance(event, type):
         try:
-            return dataclasses.asdict(event)  # type: ignore[arg-type]
+            return dataclasses.asdict(event)
         except Exception:  # noqa: BLE001 — best-effort snapshot
             pass
 

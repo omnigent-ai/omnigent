@@ -142,5 +142,7 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
 
     for spec in DEFAULT_PROFILES:
         if spec.name == profile:
-            return spec.host.rstrip("/")
+            host = spec.host
+            if isinstance(host, str):
+                return host.rstrip("/")
     return None

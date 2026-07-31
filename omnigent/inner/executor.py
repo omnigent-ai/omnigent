@@ -36,6 +36,8 @@ ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ToolResult: TypeAlias = Any  # type: ignore[explicit-any]
 ToolCallMetadata: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ExecutorExtra: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+ExecutorUsage: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+CompactedMessages: TypeAlias = list[Message]
 
 # ``enqueue_session_message`` content — arbitrary user-supplied payload
 # (string text or a structured JSON value).
@@ -172,7 +174,7 @@ class TurnComplete(ExecutorEvent):
     response: str | None = None
     modified_by_policy: bool = False
     continue_turn: bool = False
-    usage: dict[str, Any] | None = None
+    usage: ExecutorUsage | None = None
 
 
 class ToolCallStatus(str, enum.Enum):
@@ -230,7 +232,7 @@ class CompactionComplete(ExecutorEvent):
     summary: str
     token_count: int
     model: str | None = None
-    compacted_messages: list[dict[str, Any]] | None = None
+    compacted_messages: CompactedMessages | None = None
 
 
 @dataclass

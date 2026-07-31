@@ -91,6 +91,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.model_fallbacks import static_model_fallback
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -110,6 +111,7 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -375,7 +377,26 @@ def resolve_claude_native_model_selection(
             return provider_fallback
         if claude_config.model:
             return claude_config.model
-    return "claude-sonnet-5"
+    fallback = static_model_fallback(SUBSCRIPTION_KIND, "claude")
+    if fallback is None:
+        raise ValueError("Claude subscription fallback has no routable Sonnet model")
+    exact_match = next(
+        (
+            model_id
+            for model_id in fallback.model_ids
+            if _claude_model_display_name("sonnet", model_id) == _UCODE_CLAUDE_CUSTOM_TIER_LABEL
+        ),
+        None,
+    )
+    if exact_match is not None:
+        return exact_match
+    family_match = next(
+        (model_id for model_id in fallback.model_ids if "claude-sonnet-" in model_id.lower()),
+        None,
+    )
+    if family_match is None:
+        raise ValueError("Claude subscription fallback has no routable Sonnet model")
+    return family_match
 
 
 def _claude_model_display_name(tier: str, model_id: str) -> str:
@@ -1882,8 +1903,7 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
         _logger.warning(
             "native-claude: bedrock provider %r sets no models.default — Claude Code "
             "will choose its own default model, which is usually not enabled on a "
-            "Bedrock account. Set models.default to a Bedrock inference-profile id "
-            "(e.g. us.anthropic.claude-opus-4-5-20251101-v1:0).",
+            "Bedrock account. Set models.default to a Bedrock inference-profile id.",
             entry.name,
         )
     _logger.info(

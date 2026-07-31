@@ -48,7 +48,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib import error, request
 
 from omnigent._platform import stable_user_id
@@ -610,6 +610,11 @@ def _message_delta_from_jsonl_text(text: str | None) -> ClaudeMessageDelta | Non
     )
 
 
+def _http_server_host_port(httpd: ThreadingHTTPServer) -> tuple[str, int]:
+    """Return the IPv4 address shape requested by local bridge servers."""
+    return cast(tuple[str, int], httpd.server_address)
+
+
 class ClaudeNativeToolRelay:
     """
     HTTP relay for Claude MCP tool calls, scoped to its caller's lifetime.
@@ -659,7 +664,7 @@ class ClaudeNativeToolRelay:
         :returns: None.
         """
         relay_file = self._bridge_dir / _TOOL_RELAY_FILE
-        host, port = self._httpd.server_address
+        host, port = _http_server_host_port(self._httpd)
         # A newer relay that overwrote the file advertises a different url
         # (this relay's socket is still bound, so its port is unique), so the
         # file is left for that relay to own.
@@ -3328,7 +3333,7 @@ def start_tool_relay(
         session_id=session_id,
     )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = httpd.server_address
+    host, port = _http_server_host_port(httpd)
     relay_info: dict[str, Any] = {
         "url": f"http://{host}:{port}",
         "token": token,
@@ -3433,7 +3438,7 @@ def _start_http_ingress(
     """
     handler_cls = _handler_factory(token, notification_queue)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = httpd.server_address
+    host, port = _http_server_host_port(httpd)
     server_info = {
         "url": f"http://{host}:{port}",
         "token": token,

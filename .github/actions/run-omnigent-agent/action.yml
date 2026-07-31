@@ -7,6 +7,9 @@ description: >-
   after this action returns — the only secret here is the model key.
 
 inputs:
+  model:
+    description: Provider-configured model id.
+    required: true
   workdir:
     description: >-
       Repo checkout dir relative to the workspace (`.` when checked out at the
@@ -78,8 +81,10 @@ runs:
       shell: bash
       env:
         GATEWAY_BASE_URL: ${{ inputs.gateway-base-url }}
+        OMNIGENT_AGENT_MODEL: ${{ inputs.model }}
       run: |
         set -euo pipefail
+        : "${OMNIGENT_AGENT_MODEL:?Set the action model input}"
         mkdir -p "$HOME/.omnigent"
         python3 -c "
         import pathlib, os, json
@@ -89,7 +94,7 @@ runs:
             'anthropic': {
                 'base_url': gw + '/anthropic',
                 'api_key_ref': 'env:LLM_API_KEY',
-                'models': {'default': 'databricks-claude-opus-4-8'},
+                'models': {'default': os.environ['OMNIGENT_AGENT_MODEL']},
             }}}}
         pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
         "

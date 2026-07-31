@@ -21,7 +21,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import Any
 
 from omnigent.policies.schema import (
     PolicyCallable,
@@ -49,7 +48,7 @@ _DEFAULT_CLASSIFICATION_PROMPT = (
 # Responses API structured output schema for the classifier.
 # Forces the model to return ``{"difficulty": "TRIVIAL"}`` or
 # ``{"difficulty": "COMPLEX"}`` — no free-text parsing needed.
-_CLASSIFICATION_SCHEMA: dict[str, Any] = {
+_CLASSIFICATION_SCHEMA: dict[str, object] = {
     "format": {
         "type": "json_schema",
         "name": "difficulty_classification",
@@ -69,7 +68,7 @@ _CLASSIFICATION_SCHEMA: dict[str, Any] = {
 }
 
 
-def _extract_response_text(response: Any) -> str:
+def _extract_response_text(response: object) -> str:
     """
     Extract the text content from an LLM response.
 
@@ -96,7 +95,8 @@ def _extract_response_text(response: Any) -> str:
     content = getattr(first, "content", None)
     if not isinstance(content, list) or not content:
         return ""
-    return getattr(content[0], "text", "") or ""
+    content_text = getattr(content[0], "text", "")
+    return content_text if isinstance(content_text, str) else ""
 
 
 def deny_trivial_to_expensive_model(
@@ -275,7 +275,7 @@ Return strict JSON only:
 {"verdict": "ON_TASK" | "OFF_TASK"}
 """
 
-_INTENT_CHECK_SCHEMA: dict[str, Any] = {
+_INTENT_CHECK_SCHEMA: dict[str, object] = {
     "format": {
         "type": "json_schema",
         "name": "intent_check_verdict",
@@ -469,7 +469,7 @@ def intent_based_authorization() -> PolicyCallable:
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.routing.deny_trivial_to_expensive_model",
         "kind": "factory",

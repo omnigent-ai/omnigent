@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from typing import Any
 
 from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
@@ -177,7 +178,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
-    def list_active(self) -> list[ScheduledTask]:
+    def list_active(self) -> builtins.list[ScheduledTask]:
         """List active scheduled tasks ordered by ``created_at ASC, id ASC``."""
         with self._session() as session:
             stmt = (
@@ -189,7 +190,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
-    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+    def list_active_all_workspaces(self) -> builtins.list[ScheduledTask]:
         """List active scheduled tasks across every workspace for scheduler boot.
 
         Pages internally by ``(workspace_id, created_at, id)`` keyset in
@@ -199,7 +200,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         batch_size = self._active_boot_batch_size
         active_code = encode_scheduled_task_state("active")
         tasks: list[ScheduledTask] = []
-        cursor: tuple[str, int, str] | None = None
+        cursor: tuple[int, int, str] | None = None
         with self._session() as session:
             while True:
                 stmt = (
@@ -357,7 +358,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         *,
         limit: int = 100,
         after_id: str | None = None,
-    ) -> tuple[list[ScheduledTaskRun], str | None]:
+    ) -> tuple[builtins.list[ScheduledTaskRun], str | None]:
         """List a task's runs ordered by ``scheduled_at DESC, id DESC``.
 
         Cursor-paginated: fetches ``limit`` runs and returns
@@ -449,7 +450,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.execute(stmt).scalars().first()
             return _run_to_entity(row) if row is not None else None
 
-    def list_running_runs_for_tasks(self, scheduled_task_ids: list[str]) -> list[ScheduledTaskRun]:
+    def list_running_runs_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> builtins.list[ScheduledTaskRun]:
         """List ``running`` runs for the given tasks in the current workspace.
 
         Powers the lazy-on-read stale backstop on the scheduled-task LIST
@@ -476,7 +480,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             rows = session.execute(stmt).scalars().all()
             return [_run_to_entity(r) for r in rows]
 
-    def list_latest_run_status_for_tasks(self, scheduled_task_ids: list[str]) -> dict[str, str]:
+    def list_latest_run_status_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> dict[str, str]:
         """Return ``{task_id: latest_run_status}`` for the given tasks.
 
         One windowed query: ``row_number()`` partitioned by ``scheduled_task_id``

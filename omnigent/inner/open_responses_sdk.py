@@ -187,7 +187,7 @@ def _convert_tools_to_responses(tools: list[ToolSpec]) -> list[ResponsesItem]:
 
 
 def _normalize_message_content(
-    content: Any,  # type: ignore[explicit-any]
+    content: Any,
     *,
     empty_placeholder: str,
 ) -> str | list[dict[str, Any]]:

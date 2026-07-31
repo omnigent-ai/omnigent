@@ -242,6 +242,7 @@ jobs:
           stderr-file: ${{ github.workspace }}/scout-stderr.log
           gateway-base-url: ${{ secrets.GATEWAY_BASE_URL }}
           llm-api-key: ${{ secrets.LLM_API_KEY }}
+          model: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
 
       - name: Parse candidates
         id: candidates
@@ -527,6 +528,7 @@ jobs:
               # env), so the unsandboxed drafter run above never sees it and it
               # can't reach the drafter's scanned stdout.
               GATEWAY_BASE_URL='${{ secrets.GATEWAY_BASE_URL }}' \
+              IMAGE_MODEL='${{ vars.OMNIGENT_CI_IMAGE_MODEL }}' \
               IMAGE_PROMPT="$image_prompt" SLUG="$slug" SITE="$SITE" POST="$post" \
               python3 -u <<'PYEOF' || echo "::warning::hero image generation failed for ${slug}; leaving heroArt blank"
           import base64, json, os, pathlib, re, urllib.request
@@ -539,7 +541,9 @@ jobs:
           m = re.match(r"(https?://[^/]+)", gw)
           if not m:
               raise SystemExit(f"cannot parse gateway host from {gw!r}")
-          model = os.environ.get("IMAGE_MODEL", "databricks-gemini-3-pro-image")
+          model = os.environ.get("IMAGE_MODEL", "").strip()
+          if not model:
+              raise SystemExit("repository variable OMNIGENT_CI_IMAGE_MODEL is empty")
           url = f"{m.group(1)}/serving-endpoints/{model}/invocations"
           style = (" Flat vector illustration, dark navy tech background with subtle "
                    "circuit lines, teal and pink accents, 16:9 wide, no text, no words, "
