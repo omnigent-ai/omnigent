@@ -3805,7 +3805,10 @@ def create_runner_app(
         )
 
     async def _codex_native_model_options(conv_id: str) -> list[dict[str, Any]]:
-        from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.codex_native_app_server import (
+            client_for_transport,
+            list_codex_model_options,
+        )
 
         state = await _codex_native_bridge_state_for_session(
             conv_id,
@@ -3819,35 +3822,12 @@ def create_runner_app(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
-        options: list[dict[str, Any]] = []
         try:
             await codex_client.connect()
-            cursor: str | None = None
-            while True:
-                params: dict[str, Any] = {"includeHidden": False}
-                if cursor is not None:
-                    params["cursor"] = cursor
-                response = await codex_client.request("model/list", params)
-                result = response.get("result")
-                if not isinstance(result, dict):
-                    raise ValueError("Codex model/list result must be an object")
-                data = result.get("data")
-                if not isinstance(data, list):
-                    raise ValueError("Codex model/list data must be a list")
-                for raw_model in data:
-                    if not isinstance(raw_model, dict):
-                        raise ValueError("Codex model/list item must be an object")
-                    options.append(raw_model)
-                next_cursor = result.get("nextCursor")
-                if next_cursor is None:
-                    break
-                if not isinstance(next_cursor, str) or not next_cursor:
-                    raise ValueError("Codex model/list nextCursor must be a string or null")
-                cursor = next_cursor
+            return await list_codex_model_options(codex_client)
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        return options
 
     async def _handle_pi_native_model_change(
         conv_id: str,

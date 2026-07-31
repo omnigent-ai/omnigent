@@ -198,6 +198,13 @@ The same policy supplies the final runtime fallback for key, gateway, and local
 providers. Explicit agent and provider defaults still win; without either,
 runtime discovery fails with configuration guidance when no catalog is available.
 
+## Configuration Help Text
+
+Setup prompts, routing policy schemas, and spawn-tool descriptions explain the
+expected provider-configured model value without embedding release-specific ids.
+Runtime help may use synthetic examples to show identifier shape; concrete
+release ids belong in tests or provider-owned documentation.
+
 ## Static Fallback Ownership
 
 The remaining Claude and Codex aliases live only in

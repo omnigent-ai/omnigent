@@ -1847,8 +1847,16 @@ class HostProcess:
         harness = canonicalize_harness(frame.harness) or frame.harness
         if harness == "codex-native":
             try:
-                from omnigent.codex_native_app_server import resolve_native_codex_launch
-                from omnigent.model_catalog import list_models_for_worker, resolve_catalog_model
+                from omnigent.codex_native_app_server import (
+                    discover_codex_model_options,
+                    resolve_native_codex_launch,
+                )
+                from omnigent.model_catalog import (
+                    is_direct_openai_provider,
+                    list_models_for_worker,
+                    resolve_catalog_model,
+                    resolve_model_provider,
+                )
                 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
                 launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
@@ -1876,14 +1884,57 @@ class HostProcess:
                 default_id = (
                     default_model if default_model in {m.id for m in listing.models} else None
                 )
-                models = [
-                    {
-                        "id": model.id,
-                        "displayName": model.id,
-                        **({"isDefault": True} if model.id == default_id else {}),
-                    }
-                    for model in listing.models
-                ]
+                provider = (
+                    resolve_model_provider(spec, "codex-native")
+                    if listing.source == "openai-compatible"
+                    else None
+                )
+                if provider is not None and is_direct_openai_provider(provider):
+                    available_ids = {model.id for model in listing.models}
+                    models = []
+                    seen: set[str] = set()
+                    selected_default = False
+                    try:
+                        codex_options = await discover_codex_model_options()
+                    except Exception:
+                        _logger.exception("Failed to discover Codex-compatible pre-launch models")
+                        codex_options = []
+                    for option in codex_options:
+                        raw_id = option.get("model") or option.get("id")
+                        if (
+                            not isinstance(raw_id, str)
+                            or raw_id not in available_ids
+                            or raw_id in seen
+                        ):
+                            continue
+                        seen.add(raw_id)
+                        display_name = option.get("displayName")
+                        is_default = raw_id == default_id or (
+                            default_model is None
+                            and not selected_default
+                            and option.get("isDefault") is True
+                        )
+                        selected_default = selected_default or is_default
+                        models.append(
+                            {
+                                "id": raw_id,
+                                "displayName": (
+                                    display_name
+                                    if isinstance(display_name, str) and display_name
+                                    else raw_id
+                                ),
+                                **({"isDefault": True} if is_default else {}),
+                            }
+                        )
+                else:
+                    models = [
+                        {
+                            "id": model.id,
+                            "displayName": model.id,
+                            **({"isDefault": True} if model.id == default_id else {}),
+                        }
+                        for model in listing.models
+                    ]
             except Exception:
                 _logger.exception("Failed to resolve pre-launch Codex model options")
                 return HostModelOptionsResultFrame(
