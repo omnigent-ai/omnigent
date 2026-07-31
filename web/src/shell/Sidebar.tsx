@@ -101,6 +101,7 @@ import {
 import {
   type Conversation,
   type PinnedConversationsResult,
+  BulkConversationMutationError,
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
@@ -4057,8 +4058,14 @@ function BulkActionBar({
         if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
         onDeselectAll();
       },
-      onError: (err: any) => {
-        if (activeId && err?.succeeded?.includes(activeId)) navigate("/", { replace: true });
+      onError: (error) => {
+        if (
+          activeId &&
+          error instanceof BulkConversationMutationError &&
+          error.succeeded.includes(activeId)
+        ) {
+          navigate("/", { replace: true });
+        }
       },
     });
   }

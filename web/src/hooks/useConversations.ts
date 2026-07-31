@@ -63,7 +63,7 @@ export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
 }
 
-class BulkConversationMutationError extends Error {
+export class BulkConversationMutationError extends Error {
   readonly failed: string[];
   readonly succeeded: string[];
   readonly total: number;
@@ -747,9 +747,9 @@ export function useBulkDeleteConversations() {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
-    onError: (err: any) => {
-      if (err?.succeeded) {
-        const idSet = new Set(err.succeeded as string[]);
+    onError: (error) => {
+      if (error instanceof BulkConversationMutationError && error.succeeded.length > 0) {
+        const idSet = new Set(error.succeeded);
         for (const queryKey of [["conversations"], ["project-sessions"]]) {
           for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
             queryKey,
@@ -758,7 +758,7 @@ export function useBulkDeleteConversations() {
             if (removed) queryClient.setQueryData(key, next);
           }
         }
-        for (const id of err.succeeded) {
+        for (const id of error.succeeded) {
           queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
