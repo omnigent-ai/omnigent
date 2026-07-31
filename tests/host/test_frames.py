@@ -80,6 +80,23 @@ def test_model_options_frames_round_trip() -> None:
             "displayName": "Sonnet 4.6",
         }
     ]
+    # Absent from an older host's payload, and present when it reports the
+    # endpoint's wider catalog.
+    assert result.routable_models == []
+    with_routable = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsResultFrame(
+                request_id="req_models",
+                status="ok",
+                routable_models=["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"],
+            )
+        )
+    )
+    assert isinstance(with_routable, HostModelOptionsResultFrame)
+    assert with_routable.routable_models == [
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
+    ]
 
 
 def test_encode_injects_traceparent_under_active_span() -> None:

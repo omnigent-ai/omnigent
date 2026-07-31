@@ -1113,7 +1113,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "1.47.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
-        (OPENAI_FAMILY, "0.137.0", None),
+        (OPENAI_FAMILY, "0.145.0", None),
         (hi.PI_KEY, "0.79.0", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),

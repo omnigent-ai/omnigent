@@ -212,6 +212,44 @@ def test_native_launch_passes_synthesized_model_as_flag() -> None:
     assert args == ("--model", "gateway-served-claude")
 
 
+def test_routed_launch_model_reaches_the_terminal_env_as_the_custom_slot() -> None:
+    """A routed exact id is launchable AND switchable back to mid-session.
+
+    Mirrors the runner's composition: the session override becomes
+    ``--model`` and the same value is pinned into Claude Code's custom picker
+    slot, which is the only spelling ``/model`` accepts for an id no family
+    alias points at (``opus`` here resolves to the newer generation).
+    """
+    from omnigent.claude_model_vocabulary import claude_model_command_arg
+    from omnigent.claude_native import claude_config_with_launch_model_pinned
+
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+        },
+        api_key_helper="printf %s sk-gateway",
+        model="databricks-claude-opus-5",
+    )
+    session_model_override = "databricks-claude-opus-4-8"
+
+    launched = claude_config_with_launch_model_pinned(config, session_model_override)
+    assert launched is not None
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override=session_model_override,
+        terminal_launch_args=None,
+    )
+    terminal_env = build_native_claude_terminal_env(launched)
+
+    assert args == ("--model", "databricks-claude-opus-4-8")
+    assert terminal_env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-8"
+    assert (
+        claude_model_command_arg(session_model_override, terminal_env)
+        == "databricks-claude-opus-4-8"
+    )
+
+
 def test_build_native_claude_terminal_env_rejects_raw_key_on_helper_path() -> None:
     """The env-build seam fails loud if a raw key rides the apiKeyHelper path.
 

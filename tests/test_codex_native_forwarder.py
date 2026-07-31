@@ -15,7 +15,10 @@ only an already-mirrored value is not re-posted.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -154,6 +157,75 @@ def test_refresh_model_from_config_updates_state(tmp_path: Path) -> None:
 
     # The selected model (gpt-5.4) replaces the prior value, ready to mirror.
     assert state.model == "gpt-5.4"
+
+
+def test_refresh_prefers_pushed_settings_model_over_stale_config(tmp_path: Path) -> None:
+    """An unchanged config.toml must not roll back a live thread-settings model.
+
+    Regression for the routed-model reversion: routing switched the running
+    thread via ``thread/settings/update`` (notified as
+    ``thread/settings/updated``), but config.toml still held the pinned
+    launch model; the next ``turn/started`` re-read the stale file and
+    mirrored the default back over ``model_override`` — reverting the routed
+    model one turn after it applied.
+    """
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    # Subscription-time read adopts the pinned launch model (baseline).
+    fwd._refresh_model_from_config(tmp_path, state)
+    assert state.model == "databricks-gpt-5-5"
+    # Omnigent pushes a routed model thread-level; the live notification wins.
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+
+    # turn/started re-read: config.toml is UNCHANGED — the pushed model holds.
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "databricks-gpt-5-6-luna"
+
+
+def test_refresh_adopts_changed_config_over_settings_model(tmp_path: Path) -> None:
+    """A config.toml that changed since the last read wins over settings.
+
+    An in-TUI ``/model`` (or the executor's mirror write) rewrites the file —
+    that is the freshest signal and must not be masked by an older
+    ``thread/settings/updated`` value.
+    """
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_model_from_config(tmp_path, state)
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+    # The user picks a third model in the TUI: /model rewrites config.toml.
+    _write_codex_config(tmp_path, 'model = "gpt-5.6-sol"\n')
+
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "gpt-5.6-sol"
+
+
+def test_refresh_launch_race_ends_on_routed_model(tmp_path: Path) -> None:
+    """Launch-race scenario: the pinned default ends up on the routed model.
+
+    The terminal launch pins the default into config.toml before first-turn
+    routing runs. The executor then pushes the routed model thread-level AND
+    mirrors it into config.toml (``write_codex_config_model``); the next
+    ``turn/started`` re-read must adopt the routed model — with or without
+    the mirror write having succeeded.
+    """
+    from omnigent.codex_native_bridge import write_codex_config_model
+
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_model_from_config(tmp_path, state)
+    # First routed turn: settings push (notification) + executor mirror write.
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+    assert write_codex_config_model(tmp_path, "databricks-gpt-5-6-luna") is True
+
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "databricks-gpt-5-6-luna"
+    # Later turns stay on the routed model (no reversion churn).
+    fwd._refresh_model_from_config(tmp_path, state)
+    assert state.model == "databricks-gpt-5-6-luna"
 
 
 def test_note_resume_response_records_model_without_seeding_baseline() -> None:
@@ -2469,3 +2541,125 @@ def test_settle_timeout_tracks_slowest_configured_server(tmp_path: Path) -> None
         '[mcp_servers.off]\ncommand = "y"\nenabled = false\nstartup_timeout_sec = 120\n',
     )
     assert fwd._mcp_startup_settle_timeout_seconds(tmp_path) == 25.0
+
+
+class _EmptyStreamCodexClient:
+    """App-server client whose event stream ends immediately."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def connect(self) -> None:
+        return None
+
+    async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        return {"result": {}}
+
+    async def iter_events(self):  # type: ignore[no-untyped-def]
+        if False:
+            yield {}
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_enforcement_watcher_does_not_leak_on_a_session_without_turns(
+    tmp_path: Path,
+) -> None:
+    """
+    A session that never takes a turn leaves no enforcement watcher behind.
+
+    The watcher parks on the first-turn gate, where closing the HTTP client
+    cannot reach it; without an explicit cancel the task (and its strong
+    ref) outlive the forwarder for the process's lifetime.
+    """
+    await fwd.supervise_forwarder(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id="conv_leak",
+        bridge_dir=tmp_path,
+        app_server_url=str(tmp_path / "app-server.sock"),
+        thread_id="thread_leak",
+        client=_EmptyStreamCodexClient(),  # type: ignore[arg-type]
+    )
+
+    assert set() == fwd._ENFORCEMENT_TASKS
+
+
+async def test_post_session_warnings_posts_an_empty_list_to_clear_the_banner() -> None:
+    """
+    A healthy tick posts ``warnings: []`` so the server clears the banner.
+
+    Skipping the empty post (the old behavior) left a banner raised by one
+    unhealthy tick up for the rest of the session.
+    """
+    client = _RecordingClient()
+
+    await fwd._post_session_warnings(client, "conv_x", [])  # type: ignore[arg-type]
+
+    assert [(url, body["type"], body["data"]) for url, body in client.posts] == [
+        ("/v1/sessions/conv_x/events", "external_session_warning", {"warnings": []})
+    ]
+
+
+async def test_enforcement_watcher_posts_only_on_transitions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A steady state must not re-post every 30s tick.
+
+    The empty "repaired" post is a clear-everything request, so emitting it
+    on every healthy tick meant one server write per open session forever.
+    """
+    verdicts: list[list[dict[str, Any]]] = [
+        [],
+        [],
+        [{"code": "subagent_routing_unenforced", "harness": "codex-native", "reason": "canary"}],
+        [{"code": "subagent_routing_unenforced", "harness": "codex-native", "reason": "canary"}],
+        [],
+        [],
+    ]
+    calls = iter(verdicts)
+
+    def _fake_warnings(session_id: str, bridge_dir: Path) -> list[dict[str, Any]]:
+        del session_id, bridge_dir
+        return next(calls, [])
+
+    monkeypatch.setattr(fwd, "subagent_routing_warnings", _fake_warnings)
+    posted: list[list[dict[str, Any]]] = []
+
+    async def _fake_post(
+        client: Any,  # type: ignore[explicit-any]
+        session_id: str,
+        warnings: list[dict[str, Any]],
+    ) -> None:
+        del client, session_id
+        posted.append(warnings)
+
+    monkeypatch.setattr(fwd, "_post_session_warnings", _fake_post)
+
+    class _OpenClient:
+        is_closed = False
+
+    task = asyncio.create_task(
+        fwd._watch_subagent_routing_enforcement(
+            _OpenClient(),  # type: ignore[arg-type]
+            "conv_x",
+            tmp_path,
+            interval_s=0.001,
+        )
+    )
+    for _ in range(300):
+        await asyncio.sleep(0.002)
+        if len(posted) >= 3:
+            break
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    # healthy (first check) → unenforced → repaired: three posts, not six.
+    assert [[w["code"] for w in group] for group in posted[:3]] == [
+        [],
+        ["subagent_routing_unenforced"],
+        [],
+    ]
+    assert len(posted) == 3

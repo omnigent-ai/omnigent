@@ -3410,34 +3410,42 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
     assert "PATCH" not in methods, f"unexpected PATCH(es): {drained}"
 
 
-def test_model_alias_for_collapses_concrete_id_to_tier_alias() -> None:
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-opus-4-8", "opus"),
+        ("anthropic/claude-opus-4-7", "opus"),
+        # The default Sonnet (4.6) collapses to the generic "sonnet" alias —
+        # the row it is bound to.
+        ("databricks-claude-sonnet-4-6", "sonnet"),
+        ("claude-sonnet-4-6", "sonnet"),
+        ("claude-haiku-4-5", "haiku"),
+        # Fable (the tier above Opus) collapses to its own alias — a miss
+        # here means a TUI switch to claude-fable-5 never reaches the picker.
+        ("claude-fable-5", "fable"),
+        ("databricks-claude-fable-5", "fable"),
+        # Sonnet 5 routes to its own opt-in picker slot, not the generic
+        # "sonnet" row — both ids contain the substring "sonnet", so a miss
+        # here means a TUI switch to the newer Sonnet generation would
+        # wrongly light up the default-Sonnet row instead.
+        ("anthropic/claude-sonnet-5", "sonnet_5"),
+        ("databricks-claude-sonnet-5", "sonnet_5"),
+        # Unknown family or empty → None (don't surface an unrenderable id).
+        ("gpt-5-4-mini", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_model_alias_for_collapses_concrete_id_to_tier_alias(
+    model: str | None, expected: str | None
+) -> None:
     """
     ``_model_alias_for`` maps a concrete transcript model id to the
     picker's tier alias so a TUI ``/model`` switch lands on a picker
     row. Covers Anthropic + Databricks-gateway id shapes and the
     no-match / empty cases (caller skips the post on ``None``).
     """
-    assert forwarder._model_alias_for("claude-opus-4-8") == "opus"
-    assert forwarder._model_alias_for("anthropic/claude-opus-4-7") == "opus"
-    # The default Sonnet (4.6) collapses to the generic "sonnet" alias — the
-    # row it is bound to.
-    assert forwarder._model_alias_for("databricks-claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-haiku-4-5") == "haiku"
-    # Fable (the tier above Opus) collapses to its own alias — a miss
-    # here means a TUI switch to claude-fable-5 never reaches the picker.
-    assert forwarder._model_alias_for("claude-fable-5") == "fable"
-    assert forwarder._model_alias_for("databricks-claude-fable-5") == "fable"
-    # Sonnet 5 routes to its own opt-in picker slot, not the generic "sonnet"
-    # row — both ids contain the substring "sonnet", so a miss here means
-    # a TUI switch to the newer Sonnet generation would wrongly light up
-    # the default-Sonnet row instead.
-    assert forwarder._model_alias_for("anthropic/claude-sonnet-5") == "sonnet_5"
-    assert forwarder._model_alias_for("databricks-claude-sonnet-5") == "sonnet_5"
-    # Unknown family or empty → None (don't surface an unrenderable id).
-    assert forwarder._model_alias_for("gpt-5-4-mini") is None
-    assert forwarder._model_alias_for("") is None
-    assert forwarder._model_alias_for(None) is None
+    assert forwarder._model_alias_for(model) == expected
 
 
 @pytest.mark.asyncio

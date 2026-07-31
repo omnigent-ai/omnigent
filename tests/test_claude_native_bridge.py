@@ -4667,6 +4667,47 @@ def test_read_launch_model_returns_none_for_missing_bridge_dir(
     assert read_launch_model(tmp_path / "nonexistent") is None
 
 
+def test_model_env_round_trips_the_launch_vocabulary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner reads the alias pinning from here, not from its own env."""
+    from omnigent.claude_native_bridge import read_model_env
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+        launch_model="databricks-claude-opus-4-8",
+        launch_env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5",
+            # Unrelated launch env must not be persisted.
+            "ANTHROPIC_BASE_URL": "https://example.invalid",
+        },
+    )
+    assert read_model_env(bridge_dir) == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5",
+    }
+
+
+def test_model_env_is_empty_without_a_ucode_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.claude_native_bridge import read_model_env
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    assert read_model_env(bridge_dir) == {}
+    assert read_model_env(tmp_path / "nonexistent") == {}
+
+
 # ── _hook_record_from_jsonl_record: task/todo event parsing ──────────────────
 
 
