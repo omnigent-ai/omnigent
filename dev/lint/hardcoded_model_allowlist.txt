@@ -1,3 +1,0 @@
-# Curated baseline for dev/lint/lint_no_hardcoded_models.py.
-# Format: <path> <model-id> <allowed-count>
-# Keep counts minimal; new model pins should move behind provider/catalog resolution.

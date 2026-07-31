@@ -4,22 +4,16 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections import Counter
 from pathlib import Path
 
 import pytest
 import yaml
 
 from dev.lint.lint_no_hardcoded_models import (
-    ALLOWLIST_PATH,
     OWNED_FALLBACK_PATH,
     SCAN_ROOTS,
     SOURCE_EXTENSIONS,
-    Hit,
-    _find_new_hits,
-    _find_stale_allowances,
     _iter_scannable_paths,
-    _load_allowlist,
     scan,
 )
 
@@ -126,47 +120,6 @@ def test_scan_ignores_tests(tmp_path: Path) -> None:
     assert scan(test_file) == []
 
 
-def test_find_new_hits_allows_only_curated_count() -> None:
-    path = Path("omnigent/example.py")
-    hits = [
-        Hit(path, 1, "databricks-gpt-5-5"),
-        Hit(path, 2, "databricks-gpt-5-5"),
-    ]
-    allowed = Counter({("omnigent/example.py", "databricks-gpt-5-5"): 1})
-
-    assert _find_new_hits(hits, allowed) == [hits[1]]
-
-
-def test_find_stale_allowances_requires_ratchet_down() -> None:
-    path = Path("omnigent/example.py")
-    hits = [Hit(path, 1, "databricks-gpt-5-5")]
-    allowed = Counter({("omnigent/example.py", "databricks-gpt-5-5"): 2})
-
-    assert _find_stale_allowances(hits, allowed) == Counter(
-        {("omnigent/example.py", "databricks-gpt-5-5"): 1}
-    )
-
-
-def test_load_allowlist_rejects_duplicate_path_model(tmp_path: Path) -> None:
-    allowlist = tmp_path / "allowlist.txt"
-    allowlist.write_text(
-        "omnigent/example.py databricks-gpt-5-5 1\nomnigent/example.py databricks-gpt-5-5 1\n"
-    )
-
-    with pytest.raises(ValueError, match="duplicate baseline entry"):
-        _load_allowlist(allowlist)
-
-
-def test_load_allowlist_reports_malformed_count_location(tmp_path: Path) -> None:
-    allowlist = tmp_path / "allowlist.txt"
-    allowlist.write_text("omnigent/example.py databricks-gpt-5-5 many\n")
-
-    with pytest.raises(ValueError) as error:
-        _load_allowlist(allowlist)
-
-    assert str(error.value) == f"{allowlist}:1: count must be an integer, got 'many'"
-
-
 def test_precommit_trigger_matches_scan_surface() -> None:
     config = yaml.safe_load(Path(".pre-commit-config.yaml").read_text())
     hook = next(
@@ -185,7 +138,7 @@ def test_precommit_trigger_matches_scan_surface() -> None:
         for path in tracked_paths
         if files_pattern.search(path.as_posix()) and not exclude_pattern.search(path.as_posix())
     }
-    scanned_paths = set(_iter_scannable_paths()) | {ALLOWLIST_PATH}
+    scanned_paths = set(_iter_scannable_paths())
 
     assert triggered_paths == scanned_paths
     for root in SCAN_ROOTS:

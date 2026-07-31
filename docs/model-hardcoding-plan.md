@@ -1,42 +1,25 @@
 # Model Hardcoding Plan
 
-## Current Curated Inventory
+## Current Inventory
 
-The current baseline lives in `dev/lint/hardcoded_model_allowlist.txt`. It is
-count-based by `path` and `model-id`, so unrelated line movement does not break
-the hook while net-new pins still fail.
-
-The remaining pins fall into a few buckets:
-
-- **CI automation:** model roles are read from repository variables; mock-only
-  integration jobs use the protocol-level `mock-model` fixture id.
-- **Harness defaults:** native/executor launch paths such as
-  `omnigent/pi_native_credentials.py`, `omnigent/opencode_native_provider.py`,
-  `omnigent/inner/*_executor.py`, and `omnigent/codex_native_app_server.py`
-  still carry fallback model ids.
-- **Static pickers/catalogs:** `omnigent/model_catalog.py` and
-  `omnigent/cursor_native.py` encode static model choices for CLIs that do not
-  expose a directly reusable live listing API.
-- **Policy and sizing logic:** `omnigent/llms/context_window.py`,
-  `omnigent/policies/builtins/routing.py`, and `omnigent/tools/builtins/spawn.py`
-  mention concrete models when mapping windows, routing examples, or dispatch
-  examples.
-- **Examples/onboarding:** `examples/kimi_hello.yaml` and onboarding provider
-  prompts include concrete defaults to make first-run setup work.
+Production model selection uses explicit operator configuration, provider or
+CLI discovery, and normalized catalog metadata. The count-based hardcode
+baseline is gone. The only source-controlled model aliases are the unavoidable
+Claude and Codex records in `omnigent/model_fallbacks.py`; each carries an owner,
+provenance, and the discovery gap that prevents a live listing.
 
 ## Prevention
 
 - `dev/lint/lint_no_hardcoded_models.py` scans non-test Python/config/shell
   files for concrete model ids in model-selection contexts.
-- When a supported file or the baseline changes, `.pre-commit-config.yaml` runs
-  the hook across the full tracked lint surface so both new pins and stale
-  allowlist counts fail.
+- When a supported file changes, `.pre-commit-config.yaml` runs the hook across
+  the full tracked lint surface so any non-owned hardcode fails.
 - Unavoidable static aliases pass only when Python AST analysis proves they are
   confined to complete `StaticModelFallback` records in
   `omnigent/model_fallbacks.py`, including non-empty owner, provenance, and
   discovery-gap metadata.
-- New hardcoded ids fail unless the allowlist count is intentionally updated,
-  while removing a pin requires lowering or deleting its baseline entry.
+- There is no count-based escape hatch. New production aliases must either come
+  from configuration/discovery or satisfy the central owned-fallback contract.
 
 ### Scope and exclusions
 
@@ -60,10 +43,10 @@ These gaps should be closed with syntax-aware scanners rather than broader
 regexes that would make prose false-positive.
 
 The hook intentionally scans the full tracked surface when a supported file
-changes. That bounded cost is what lets it enforce exact global baseline counts
-instead of only checking additions in changed files. Like the existing Ruff
-hooks, local pre-commit execution assumes the repository `.venv` has been
-prepared with `just ensure`; CI is the enforcement backstop.
+changes. That bounded cost is what lets it enforce global absence instead of
+only checking additions in changed files. Like the existing Ruff hooks, local
+pre-commit execution assumes the repository `.venv` has been prepared with
+`just ensure`; CI is the enforcement backstop.
 
 ## Migration Plan
 
@@ -80,11 +63,11 @@ prepared with `just ensure`; CI is the enforcement backstop.
 4. **Centralize static fallback catalogs.** Keep unavoidable static CLI catalogs
    behind one module with provenance, TTL/refresh notes, and a smaller lint
    exception surface.
-5. **Ratchet the baseline down.** Each migration removes the corresponding
-   `dev/lint/hardcoded_model_allowlist.txt` entry; the lint rejects both count
-   increases and stale allowances.
-6. **Document escape hatches.** If a temporary pin is unavoidable, require a
-   short rationale near the call site and the smallest allowlist count.
+5. **Delete the baseline.** With production call sites migrated, reject every
+   non-owned model literal instead of maintaining path/count exceptions.
+6. **Constrain the escape hatch.** Unavoidable static aliases must live in the
+   central fallback registry with literal ownership, provenance, and discovery
+   gap metadata.
 
 ## Resolver Contract
 

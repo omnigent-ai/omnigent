@@ -1,10 +1,7 @@
-"""Flag new hardcoded LLM model ids outside tests and owned fallbacks.
+"""Flag hardcoded LLM model ids outside tests and owned fallbacks.
 
-The codebase still has a curated baseline of model pins that predate this
-check. This hook requires every path/model count to exactly match
-``dev/lint/hardcoded_model_allowlist.txt`` so new pins fail and removed pins
-must ratchet the baseline down. Unavoidable static aliases are accepted only
-inside complete ``StaticModelFallback`` records in the central fallback module.
+Unavoidable static aliases are accepted only inside complete
+``StaticModelFallback`` records in the central fallback module.
 """
 
 from __future__ import annotations
@@ -13,7 +10,6 @@ import ast
 import re
 import subprocess
 import sys
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,7 +53,6 @@ SKIP_PARTS = {
     "node_modules",
     "tests",
 }
-ALLOWLIST_PATH = Path("dev/lint/hardcoded_model_allowlist.txt")
 OWNED_FALLBACK_PATH = Path("omnigent/model_fallbacks.py")
 FALLBACK_METADATA_FIELDS = frozenset({"owner", "provenance", "discovery_gap"})
 
@@ -276,81 +271,21 @@ def _iter_scannable_paths() -> list[Path]:
     ]
 
 
-def _load_allowlist(path: Path = ALLOWLIST_PATH) -> Counter[tuple[str, str]]:
-    """Load allowed ``(path, model)`` occurrence counts."""
-    allowed: Counter[tuple[str, str]] = Counter()
-    if not path.exists():
-        return allowed
-    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) != 3:
-            raise ValueError(f"{path}:{line_number}: expected: <path> <model> <count>")
-        rel_path, model, count_text = parts
-        key = (rel_path, model)
-        if key in allowed:
-            raise ValueError(
-                f"{path}:{line_number}: duplicate baseline entry for {rel_path} {model}"
-            )
-        try:
-            allowed[key] = int(count_text)
-        except ValueError as exc:
-            raise ValueError(
-                f"{path}:{line_number}: count must be an integer, got {count_text!r}"
-            ) from exc
-    return allowed
-
-
-def _find_new_hits(hits: list[Hit], allowed: Counter[tuple[str, str]]) -> list[Hit]:
-    """Return hits whose path/model count exceeds the curated baseline."""
-    seen: Counter[tuple[str, str]] = Counter()
-    new_hits: list[Hit] = []
-    for hit in hits:
-        key = (_repo_relative(hit.path), hit.model)
-        seen[key] += 1
-        if seen[key] > allowed[key]:
-            new_hits.append(hit)
-    return new_hits
-
-
-def _find_stale_allowances(
-    hits: list[Hit],
-    allowed: Counter[tuple[str, str]],
-) -> Counter[tuple[str, str]]:
-    """Return baseline counts that exceed the current scan results."""
-    actual = Counter((_repo_relative(hit.path), hit.model) for hit in hits)
-    return allowed - actual
-
-
 def main() -> int:
-    """Scan the full supported surface and require an exact baseline."""
+    """Scan the full supported surface and reject every non-owned model id."""
     paths = _iter_scannable_paths()
     hits = [hit for path in paths for hit in scan(path)]
-    allowed = _load_allowlist()
-    new_hits = _find_new_hits(hits, allowed)
-    stale_allowances = _find_stale_allowances(hits, allowed)
-    if not new_hits and not stale_allowances:
+    if not hits:
         return 0
 
-    for hit in new_hits:
+    for hit in hits:
         sys.stdout.write(
             f"{hit.path}:{hit.line}: hardcoded model id `{hit.model}`; "
             "resolve from the configured provider/model catalog instead\n"
         )
-    for (path, model), stale_count in sorted(stale_allowances.items()):
-        actual_count = allowed[(path, model)] - stale_count
-        sys.stdout.write(
-            f"{ALLOWLIST_PATH}: stale allowance for `{model}` in {path}: "
-            f"allows {allowed[(path, model)]}, found {actual_count}; "
-            "lower or remove the baseline entry\n"
-        )
     sys.stdout.write(
         "\nAvoid adding hardcoded model names outside tests. Unavoidable static aliases "
-        "belong in complete StaticModelFallback records in omnigent/model_fallbacks.py. "
-        "If this is an intentional temporary pin, document why and update "
-        "dev/lint/hardcoded_model_allowlist.txt with the smallest path/model count.\n"
+        "belong in complete StaticModelFallback records in omnigent/model_fallbacks.py.\n"
     )
     return 1
 
