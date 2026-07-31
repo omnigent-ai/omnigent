@@ -321,7 +321,8 @@ class DatabricksAuthError(OSError):
 
 
 class _DatabricksAuthConfig(Protocol):
-    def authenticate(self) -> dict[str, str]: ...
+    def authenticate(self) -> dict[str, str]:
+        raise NotImplementedError
 
 
 class _DatabricksBearerAuth(httpx.Auth):
