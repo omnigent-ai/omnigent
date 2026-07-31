@@ -251,7 +251,7 @@ def parse_cursor_cli_model_options(output: str) -> list[dict[str, Any]]:
             continue
         display_name = _cursor_base_display_name(match.group("name")) or model_id
         tags = {tag.strip().lower() for tag in (match.group("tags") or "").split(",")}
-        option = options_by_id.setdefault(
+        options_by_id.setdefault(
             model_id,
             {
                 "id": model_id,
