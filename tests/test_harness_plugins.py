@@ -390,6 +390,37 @@ def test_native_provider_for_key_lookup() -> None:
     assert hp.native_provider_for_key("does-not-exist") is None
 
 
+def test_native_agent_catalog_covers_every_native_agent() -> None:
+    """One JSON-serializable row per native agent, keyed 1:1 with the registry."""
+    import json
+
+    rows = hp.native_agent_catalog()
+    assert sorted(r["key"] for r in rows) == sorted(a.key for a in hp.native_agents())
+    # Fully JSON-serializable (values are primitives / dicts, no enums).
+    json.dumps(rows)
+
+
+def test_native_agent_catalog_row_shape_and_capabilities() -> None:
+    """Each row carries identity + fork_history + capabilities from the registry."""
+    rows = {r["key"]: r for r in hp.native_agent_catalog()}
+    claude = rows["claude"]
+    # Identity fields come straight off NativeCodingAgent.
+    assert claude["agent_name"] == "claude-native-ui"
+    assert claude["harness"] == "claude-native"
+    assert claude["wrapper_label"] == "claude-code-native-ui"
+    assert claude["terminal_name"] == "claude"
+    # fork_history + capabilities are pulled from harness_capabilities().
+    assert claude["fork_history"] == "rebuild"
+    assert claude["capabilities"]["integration_mode"] == "native-tui"
+    # cursor uses the preamble fork axis (verifies the axis is per-harness).
+    assert rows["cursor"]["fork_history"] == "preamble"
+    # A native agent whose harness has no capability record still emits a row
+    # with null fork_history/capabilities (defensive — every built-in declares
+    # one, but community natives may not).
+    for row in rows.values():
+        assert "fork_history" in row and "capabilities" in row
+
+
 def test_builtin_native_providers_have_required_hooks() -> None:
     """run_native, auto_create_terminal, and spawn_env_builder are mandatory."""
     for provider in hp.native_providers():
