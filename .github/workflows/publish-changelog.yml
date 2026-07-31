@@ -308,14 +308,18 @@ jobs:
           # PR refs from the raw body's FEATURE sections, per section — the set of
           # PRs the table is allowed to name (bug fixes are dropped from the post,
           # so from the table too), and the fallback grouping when no formatter map.
-          FEATURE = {"major new features", "breaking changes"}
+          # Match a feature section by its heading TEXT at any level (the release
+          # body uses ### here, older ones ##) — startswith, so "Bug fixes &
+          # hardening" is excluded but "Major new features" matches.
+          FEATURE = ("major new features", "breaking changes")
           ref_re = re.compile(r"#(\d+)")
           raw_sections, current, allowed = [], None, set()
           for ln in body.splitlines():
-              h = re.match(r"##\s+(.*\S)", ln)
+              h = re.match(r"#{2,}\s+(.*\S)", ln)
               if h:
                   name = h.group(1).strip()
-                  current = (name, []) if name.lower() in FEATURE else None
+                  low = name.lower()
+                  current = (name, []) if any(low.startswith(f) for f in FEATURE) else None
                   if current:
                       raw_sections.append(current)
                   continue
