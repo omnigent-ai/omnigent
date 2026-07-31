@@ -21,11 +21,14 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
 from omnigent._platform import stable_user_id
+
+if TYPE_CHECKING:
+    from omnigent.cursor_native import CursorModelOption
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"
@@ -838,7 +841,7 @@ def inject_model_command(
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
 
 
-def _live_cursor_model_options() -> list[dict[str, Any]]:
+def _live_cursor_model_options() -> list[CursorModelOption]:
     """Read the same live catalog that supplies Cursor's Web picker."""
     from omnigent.cursor_native import list_cursor_cli_model_options
 
