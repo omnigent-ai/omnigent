@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from omnigent.onboarding.provider_config import CLI_CONFIG_KIND, SUBSCRIPTION_KIND
+
 
 @dataclass(frozen=True)
 class StaticModelFallback:
@@ -27,19 +29,19 @@ _CLAUDE_SUBSCRIPTION_MODELS = (
 _CODEX_MODELS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 
 _STATIC_MODEL_FALLBACKS = {
-    ("subscription", "claude"): StaticModelFallback(
+    (SUBSCRIPTION_KIND, "claude"): StaticModelFallback(
         model_ids=_CLAUDE_SUBSCRIPTION_MODELS,
         owner="Claude subscription adapter",
         provenance="Omnigent's release-curated Claude Code alias catalog",
         discovery_gap="Claude subscription logins expose no model-listing API",
     ),
-    ("subscription", "codex"): StaticModelFallback(
+    (SUBSCRIPTION_KIND, "codex"): StaticModelFallback(
         model_ids=_CODEX_MODELS,
         owner="Codex subscription adapter",
         provenance="Omnigent's release-curated Codex alias catalog",
         discovery_gap="Codex subscription availability is not exposed before launch",
     ),
-    ("cli-config", "codex"): StaticModelFallback(
+    (CLI_CONFIG_KIND, "codex"): StaticModelFallback(
         model_ids=_CODEX_MODELS,
         owner="Codex CLI-config adapter",
         provenance="Omnigent's release-curated Codex alias catalog",
