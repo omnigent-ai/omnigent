@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import stat
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from omnigent.inner.codex_executor import (
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
     _prompt_for_turn,
+    _provider_codex_config_overrides,
     _to_codex_input_items,
 )
 from omnigent.inner.executor import (
@@ -2352,6 +2354,76 @@ def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) ->
     populate_codex_skills_from_bundle(codex_home, bundle, "none")
 
     assert not (codex_home / "skills").exists()
+
+
+@pytest.mark.parametrize(
+    "auth_command",
+    [
+        "printf %s sk-sentinel-do-not-use",
+        "credential-helper --token sk-sentinel-do-not-use",
+    ],
+)
+async def test_embedded_codex_materializes_provider_auth_outside_argv(
+    tmp_path: Path,
+    auth_command: str,
+) -> None:
+    """Embedded Codex keeps provider credentials only in private config."""
+    import tomllib
+
+    captured_argv: list[str] = []
+    captured_env: dict[str, str] = {}
+    process = _FakeProcess()
+
+    async def _fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _FakeProcess:
+        captured_argv.extend(args)
+        captured_env.update(kwargs["env"])
+        return process
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    overrides = _provider_codex_config_overrides(
+        model="test-model",
+        base_url="https://provider.invalid/v1",
+        auth_command=auth_command,
+        wire_api="responses",
+    )
+    session = _CodexAppServerSession(
+        codex_path="/test/codex",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        codex_config_overrides=overrides,
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+
+    with (
+        patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=_fake_create_subprocess_exec,
+        ),
+        patch(
+            "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+            return_value=source_home,
+        ),
+    ):
+        await session.start()
+        codex_home = Path(captured_env["CODEX_HOME"])
+        config_path = codex_home / "config.toml"
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+        assert all("sk-sentinel-do-not-use" not in arg for arg in captured_argv)
+        assert 'model_provider="omnigent_provider"' in captured_argv
+        assert 'model="test-model"' in captured_argv
+        assert config["model_providers"]["omnigent_provider"]["auth"]["args"] == [
+            "-c",
+            auth_command,
+        ]
+        assert config["model_providers"]["omnigent_provider"]["wire_api"] == "responses"
+        assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+        await session.close()
+
+    assert not codex_home.exists()
 
 
 # ---------------------------------------------------------------------------

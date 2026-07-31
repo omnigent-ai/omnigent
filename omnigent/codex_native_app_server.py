@@ -49,6 +49,7 @@ from omnigent.inner.codex_executor import (
     _find_codex_cli,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
+    materialize_codex_provider_config,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 
@@ -715,6 +716,19 @@ async def _wait_for_discovery_listener(
     raise TimeoutError("Timed out waiting for Codex model discovery app-server")
 
 
+def _build_native_codex_app_server_argv(
+    *,
+    tagged_argv0: str,
+    listen_url: str,
+    config_overrides: Sequence[str],
+) -> list[str]:
+    """Build argv for the native Codex app-server subprocess."""
+    argv = [tagged_argv0, "app-server", "--listen", listen_url]
+    for override in config_overrides:
+        argv.extend(["-c", override])
+    return argv
+
+
 @dataclass
 class CodexNativeAppServer:
     """
@@ -808,6 +822,10 @@ class CodexNativeAppServer:
             self.codex_home,
             self.developer_instructions,
         )
+        self.config_overrides = materialize_codex_provider_config(
+            self.codex_home,
+            self.config_overrides,
+        )
         # Native policy enforcement needs codex's hook-trust protocol
         # (``currentHash`` / ``trustStatus`` in ``hooks/list``), added in
         # codex 0.129. Below that the hook can never be trusted, so
@@ -848,14 +866,11 @@ class CodexNativeAppServer:
             f"{Path(self.codex_path).name} "
             f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
         )
-        argv = [
-            tagged_argv0,
-            "app-server",
-            "--listen",
-            resolved_listen,
-        ]
-        for override in self.config_overrides:
-            argv.extend(["-c", override])
+        argv = _build_native_codex_app_server_argv(
+            tagged_argv0=tagged_argv0,
+            listen_url=resolved_listen,
+            config_overrides=self.config_overrides,
+        )
         proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
@@ -2217,6 +2232,10 @@ def build_codex_remote_args(
     """
     override_args: list[str] = []
     for override in config_overrides:
+        if override.lstrip().startswith("model_providers."):
+            raise ValueError(
+                "Codex remote provider definitions must be materialized in CODEX_HOME"
+            )
         override_args.extend(["-c", override])
     if bypass_sandbox:
         # Strip the conflicting granular flags, then prepend one canonical
