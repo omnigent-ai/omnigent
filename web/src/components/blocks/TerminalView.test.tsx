@@ -6,6 +6,8 @@
 // callback directly, while still pinning the pure URL builder contract
 // the server cares about.
 
+import type * as TerminalSessionModule from "./TerminalSession";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,7 +33,7 @@ const terminalSessionMock = vi.hoisted(() => ({
 vi.mock("./TerminalSession", async (importOriginal) => ({
   // Keep the real module (isUnexpectedTerminalClose and friends) —
   // only the session class itself is replaced.
-  ...(await importOriginal<typeof import("./TerminalSession")>()),
+  ...(await importOriginal<typeof TerminalSessionModule>()),
   TerminalSession: class {
     dispose = vi.fn();
     setTheme = vi.fn();

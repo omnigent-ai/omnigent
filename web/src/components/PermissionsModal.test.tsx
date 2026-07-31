@@ -1,3 +1,5 @@
+import type * as HostModule from "@/lib/host";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,7 +26,7 @@ vi.mock("qrcode.react", () => ({
 // Host config is read-once at render to decide plain-input vs combobox and to
 // transform the share link. Mock both getters so we can drive each branch.
 vi.mock("@/lib/host", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/host")>();
+  const actual = await importOriginal<typeof HostModule>();
   return {
     ...actual,
     getOmnigentUserSearch: vi.fn(() => undefined),

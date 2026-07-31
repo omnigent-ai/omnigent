@@ -1,3 +1,7 @@
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSessionModule from "@/hooks/useSession";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
@@ -23,7 +27,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals, EMBEDDED_REPL_TERMINAL_ID)
   // — the REPL rail-inventory tests exercise the real filter; only the
   // network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
 
@@ -35,14 +39,14 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (childSessionsQueryKey, MAX_TREE_DEPTH,
   // cachedTreeContains) — only the hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
 }));
 
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // useRootSessionId stays real — with useSession mocked to a null /
   // top-level session it resolves synchronously without fetching.
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
 

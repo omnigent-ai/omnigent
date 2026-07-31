@@ -1,3 +1,9 @@
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +13,7 @@ import { useChatStore } from "@/store/chatStore";
 // mentions). These slash-command tests don't exercise that, so stub the hook
 // to avoid needing a QueryClientProvider around every bare render.
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
@@ -18,19 +24,19 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: () => ({ data: [] }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: () => undefined,
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",

@@ -1,3 +1,5 @@
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
   BookOpenIcon,
@@ -18,7 +20,7 @@ import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
   // hook itself is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
 }));
 

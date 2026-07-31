@@ -15,6 +15,8 @@
 // Session metadata and item pages are shimmed through `seedSession`
 // helpers so tests can model capped snapshots and full transcripts.
 
+import type * as IdentityModule from "@/lib/identity";
+
 import { type InfiniteData, QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -70,7 +72,7 @@ const realSend = useChatStore.getState().send;
 // per-test `mockReturnValue` works; reset in afterEach so a stubbed
 // identity never leaks across tests.
 vi.mock("@/lib/identity", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/identity")>();
+  const actual = await importOriginal<typeof IdentityModule>();
   return { ...actual, getCurrentAuthorId: vi.fn<() => string | null>(() => null) };
 });
 
