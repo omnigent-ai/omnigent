@@ -852,8 +852,8 @@ def _build_profile(
     if extra_read_paths:
         lines.append("")
         lines.append(";; Helper interpreter visibility (argv[0] parents)")
-        for path in extra_read_paths:
-            lines.append(f"(allow file-read* (subpath {_quote(str(path))}))")
+        for read_path in extra_read_paths:
+            lines.append(f"(allow file-read* (subpath {_quote(str(read_path))}))")
 
     # ----------------------------------------------------------------
     # Exec-chain symlink hops + launcher target. Literal (not subpath)
@@ -864,8 +864,8 @@ def _build_profile(
     if extra_read_literals:
         lines.append("")
         lines.append(";; Exec-chain symlink hops + launcher target (literal reads)")
-        for path in extra_read_literals:
-            lines.append(f"(allow file-read* (literal {_quote(str(path))}))")
+        for read_literal in extra_read_literals:
+            lines.append(f"(allow file-read* (literal {_quote(str(read_literal))}))")
 
     # ----------------------------------------------------------------
     # Scratch tmpdir — always RW; surfaced via $TMPDIR for the helper.
@@ -1049,16 +1049,15 @@ def _build_profile(
     # ----------------------------------------------------------------
     lines.append("")
     lines.append(";; Network policy")
-    egress_active = policy.egress_relay_port is not None and policy.egress_socket_path is not None
-    if egress_active:
+    socket_path = policy.egress_socket_path
+    relay_port = policy.egress_relay_port
+    if socket_path is not None and relay_port is not None:
         # Hard enforcement: deny all network (already covered by
         # (deny default)) except loopback to the relay and the
         # parent's Unix socket. ``allow_network`` is intentionally
         # ignored here — egress mode always overrides it, matching
         # the bwrap behaviour where ``--unshare-net`` is added
         # whenever egress is active regardless of ``allow_network``.
-        socket_path = policy.egress_socket_path
-        relay_port = policy.egress_relay_port
         lines.append(";; Egress active — loopback to relay + Unix socket to parent")
         # SBPL host syntax: ``(remote ip "HOST:PORT")`` and
         # ``(local ip "HOST:PORT")`` require ``HOST`` to be either
@@ -1788,7 +1787,7 @@ def _scan_read_paths_mask_entries(
     safe_roots: list[Path],
     *,
     already_seen: set[str],
-) -> list:  # list[MaskedEntry] — typed loosely to avoid the forward ref dance.
+) -> list[MaskedEntry]:
     """
     Walk every ``read_paths`` root the operator granted and identify
     dotfile / escaping-symlink entries to mask, using the same rules
@@ -1811,9 +1810,7 @@ def _scan_read_paths_mask_entries(
     grant (which is the right answer almost every time — see the
     ``_SENSITIVE_HOME_SUBPATHS_DARWIN`` rationale).
     """
-    from ._cwd_scan import scan_cwd_mask_entries  # local import — avoids module-load order tangles
-
-    entries: list = []
+    entries: list[MaskedEntry] = []
     if not policy.read_roots:
         return entries
     allow_hidden = policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else []
