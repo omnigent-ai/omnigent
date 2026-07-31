@@ -1589,7 +1589,7 @@ function HarnessConfigModal({
 // message, attachments and picker selections survive the unmount that happens
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
-type LandingDraft = {
+interface LandingDraft {
   message: string;
   files: File[];
   pickedAgentId: string | null;
@@ -1608,7 +1608,7 @@ type LandingDraft = {
   pickedModel: string;
   pickedEffort: string;
   costControlMode: CostControlMode;
-};
+}
 
 let landingDraft: LandingDraft | null = null;
 

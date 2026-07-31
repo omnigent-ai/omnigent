@@ -53,10 +53,10 @@ async function flushMicrotasks() {
   });
 }
 
-type ChatStoreState = {
+interface ChatStoreState {
   conversationId: string | null;
   sessionStatus: "idle" | "running" | "waiting" | "failed";
-};
+}
 
 // `useChatStore` is a selector hook: state in, derived value out.
 // Our consumer reads `s.conversationId` and `s.sessionStatus`.

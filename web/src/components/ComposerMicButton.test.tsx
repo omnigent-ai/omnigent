@@ -26,7 +26,10 @@ import { ComposerMicButton } from "./ComposerMicButton";
 // Controllable DictationSession stand-in for the server-mode tests. The
 // factory reads the mutable spies at call time, so each test installs its
 // own behavior in beforeEach.
-type SessionStub = { stop: () => Promise<string>; cancel: () => void };
+interface SessionStub {
+  stop: () => Promise<string>;
+  cancel: () => void;
+}
 let sessionStartMock: Mock<(events: DictationSessionEvents) => Promise<SessionStub>>;
 let sessionStopMock: Mock<() => Promise<string>>;
 let sessionCancelMock: Mock<() => void>;

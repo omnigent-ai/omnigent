@@ -787,7 +787,7 @@ function FileViewerBody({
   // rendered as a single dropdown (a "picker" button inline, a submenu when
   // collapsed) rather than one button per choice. Markdown's view-mode picker
   // (Preview / Edit / Source) uses this so it occupies one toolbar slot.
-  type ToolbarOption = {
+  interface ToolbarOption {
     key: string;
     label: string;
     tooltip?: string;
@@ -801,8 +801,8 @@ function FileViewerBody({
     /** Suppress the active check mark — for toggles whose icon already reflects
      * state (e.g. the whitespace eye flips open/closed). */
     noActiveCheck?: boolean;
-  };
-  type ToolbarAction = {
+  }
+  interface ToolbarAction {
     key: string;
     /** Accessible name for the inline icon button. */
     label: string;
@@ -818,7 +818,7 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
-  };
+  }
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text

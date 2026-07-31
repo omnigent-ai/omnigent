@@ -2351,11 +2351,11 @@ export function LatestTurnSpacer({
  * resize-driven `scrollToBottom({preserveScrollPosition})` — fired on every
  * history prepend — bail instead of yanking the view back to the bottom.
  */
-type ConversationScroller = {
+interface ConversationScroller {
   el: HTMLElement;
   state: { isAtBottom: boolean; escapedFromLock: boolean };
   stopScroll: () => void;
-};
+}
 
 /**
  * Lifts the StickToBottom scroll container (and lock controls) out of the

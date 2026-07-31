@@ -57,7 +57,7 @@ const BAR_BINS: ReadonlyArray<readonly [number, number]> = [
 
 const BAR_BASELINE = 0.2;
 
-export type ComposerMicButtonProps = {
+export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
   /**
    * Streaming partial transcripts (server dictation only): called with the
@@ -79,7 +79,7 @@ export type ComposerMicButtonProps = {
   /** Fired when Esc ends dictation. The parent should restore the text it
    *  snapshotted in {@link onVoiceStart}, discarding what was dictated. */
   onVoiceDiscard?: () => void;
-};
+}
 
 /** getUserMedia permission failures, distinct from transport failures. */
 const isPermissionError = (error: unknown): boolean =>
