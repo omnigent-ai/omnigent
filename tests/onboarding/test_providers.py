@@ -448,17 +448,22 @@ def test_provider_catalog_rejects_incompatible_cache_metadata(
 @pytest.mark.parametrize("schema_version", ["1", "1.0", "1.1", 1])
 def test_provider_catalog_accepts_compatible_schema_versions(schema_version: object) -> None:
     """Compatible major versions tolerate upstream minor and representation changes."""
-    catalog = {"schema_version": schema_version, "models": {}}
+    catalog = {"schema_version": schema_version, "models": {"model": {}}}
 
     assert _providers_mod._valid_catalog_payload(catalog)
 
 
-@pytest.mark.parametrize("schema_version", ["2.0", 2, True, "invalid", None])
+@pytest.mark.parametrize("schema_version", ["2.0", 2, True, "invalid", "².0", None])
 def test_provider_catalog_rejects_incompatible_schema_versions(schema_version: object) -> None:
     """Malformed and unsupported major versions cannot enter the cache."""
-    catalog = {"schema_version": schema_version, "models": {}}
+    catalog = {"schema_version": schema_version, "models": {"model": {}}}
 
     assert not _providers_mod._valid_catalog_payload(catalog)
+
+
+def test_provider_catalog_rejects_empty_model_map() -> None:
+    """An empty upstream result cannot replace useful last-known-good data."""
+    assert not _providers_mod._valid_catalog_payload({"schema_version": "1.0", "models": {}})
 
 
 def test_provider_catalog_rejects_incompatible_live_schema(
@@ -469,11 +474,49 @@ def test_provider_catalog_rejects_incompatible_live_schema(
     monkeypatch.setattr(
         _providers_mod,
         "_download_provider_catalog",
-        lambda _provider: {"schema_version": "2.0", "models": {}},
+        lambda _provider: {"schema_version": "2.0", "models": {"model": {}}},
     )
 
     assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == {}
     assert list(real_catalog_loader.iterdir()) == []
+
+
+def test_empty_live_catalog_preserves_stale_last_known_good(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient empty response falls back without overwriting the disk cache."""
+    fetched_at = 6_500.0
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: fetched_at)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+    _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+    cache_path = real_catalog_loader / "anthropic.json"
+    original_cache = cache_path.read_text()
+    _providers_mod._catalog_cache.clear()
+    monkeypatch.setattr(
+        _providers_mod,
+        "_catalog_now",
+        lambda: fetched_at + _providers_mod._CATALOG_TTL_SECONDS + 1,
+    )
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: {"schema_version": "1.0", "models": {}},
+    )
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["anthropic"]
+    assert cache_path.read_text() == original_cache
+
+
+def test_catalog_source_url_quotes_provider_path_characters() -> None:
+    """Provider input cannot inject release-path or query delimiters."""
+    url = _providers_mod._catalog_source_url("anthropic/../../asset?download=1")
+
+    assert url.endswith("/anthropic%2F..%2F..%2Fasset%3Fdownload%3D1.json")
 
 
 def test_disabled_catalog_lookup_bypasses_memory_disk_and_network(

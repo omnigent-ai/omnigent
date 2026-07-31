@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Collection
 from contextlib import suppress
@@ -152,7 +153,7 @@ _catalog_cache_lock = threading.Lock()
 
 def _catalog_source_url(provider: str) -> str:
     """Return the release-asset URL for one provider catalog."""
-    return _MLFLOW_CATALOG_URL.format(provider=provider)
+    return _MLFLOW_CATALOG_URL.format(provider=urllib.parse.quote(provider, safe=""))
 
 
 def _catalog_now() -> float:
@@ -192,7 +193,7 @@ def _supported_catalog_schema_version(value: object) -> bool:
     components = value.split(".")
     return (
         bool(components)
-        and all(component.isdigit() for component in components)
+        and all(component.isascii() and component.isdigit() for component in components)
         and int(components[0]) == _CATALOG_UPSTREAM_SCHEMA_MAJOR
     )
 
@@ -204,9 +205,13 @@ def _valid_catalog_payload(value: object) -> TypeGuard[dict[str, Any]]:
     if not _supported_catalog_schema_version(value.get("schema_version")):
         return False
     models = value.get("models")
-    return isinstance(models, dict) and all(
-        isinstance(model_id, str) and bool(model_id) and isinstance(entry, dict)
-        for model_id, entry in models.items()
+    return (
+        isinstance(models, dict)
+        and bool(models)
+        and all(
+            isinstance(model_id, str) and bool(model_id) and isinstance(entry, dict)
+            for model_id, entry in models.items()
+        )
     )
 
 
