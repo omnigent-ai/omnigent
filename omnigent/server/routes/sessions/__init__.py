@@ -77,9 +77,6 @@ from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
-from omnigent.policies.types import (
-    PolicyAction,
-)
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
@@ -302,6 +299,7 @@ from omnigent.session_lifecycle import (
 from omnigent.spec.types import (
     FunctionPolicySpec,
     Phase,
+    PolicyAction,
     PolicySpec,
 )
 from omnigent.stores import AgentStore, ConversationStore

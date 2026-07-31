@@ -57,10 +57,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.policies.types import (
-    EvaluationContext,
-    PolicyAction,
-)
+from omnigent.policies.types import EvaluationContext
 from omnigent.reasoning_effort import (
     EFFORT_VALUES,
     validate_effort,
@@ -175,6 +172,7 @@ from omnigent.session_lifecycle import (
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
+    PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore

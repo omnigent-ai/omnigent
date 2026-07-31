@@ -15,9 +15,6 @@ from fastapi.responses import Response
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
-from omnigent.policies.types import (
-    PolicyAction,
-)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -70,6 +67,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.spec.types import (
     Phase,
+    PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
