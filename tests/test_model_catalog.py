@@ -953,25 +953,116 @@ def test_cursor_listing_failure_is_empty_and_retryable(
     first = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
     second = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
 
-    assert first.source == second.source == "none"
+    assert first.source == second.source == "unavailable"
     assert first.models == second.models == ()
     assert calls == 2
+    # A transient failure is NOT a launch verdict — the CLI may well be there.
+    assert "cannot run here" not in first.note
+    assert "may still run" in first.note
 
 
-def test_none_listing_explains_dead_worker(
+def test_cursor_cli_absent_is_the_one_launch_blocking_verdict(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An unresolvable provider yields an empty list with a preflight note.
+    """A missing cursor-agent binary is reported as genuinely unrunnable.
+
+    This is the only condition the catalog can actually prove launch-blocking:
+    the CLI the provider is bound to does not exist, so the spawn cannot start.
+    It must keep saying so — the point of splitting the old blanket ``none``
+    was to stop over-claiming, not to stop reporting real dead workers.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent import cursor_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+
+    def missing_binary() -> list[dict[str, object]]:
+        """Raise what subprocess raises when the executable is not on PATH."""
+        raise FileNotFoundError(2, "No such file or directory: 'cursor-agent'")
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", missing_binary)
+
+    listing = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+    assert listing.source == "unavailable"
+    assert listing.models == ()
+    assert "cursor-agent CLI is not installed" in listing.note
+    assert "cannot run here" in listing.note
+
+
+def test_unconfigured_listing_does_not_claim_the_worker_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider-routed harness with no provider reads ``unconfigured``.
+
+    claude-sdk genuinely needs an Omnigent credential, so an empty config is a
+    real problem — but the note says what is missing rather than asserting a
+    launch verdict the catalog cannot prove (the harness may still find its
+    own credentials at spawn).
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     """
     _isolate_config(monkeypatch, tmp_path, "")
     listing = list_models_for_worker(_worker_spec("claude-native"), "claude-native")
-    assert listing.source == "none"
+    assert listing.source == "unconfigured"
     assert listing.models == ()
-    # The note is the dead-worker preflight signal the orchestrator reads.
-    assert "cannot run here" in listing.note
+    assert "no usable Omnigent model provider resolved" in listing.note
+    assert "cannot run here" not in listing.note
+
+
+@pytest.mark.parametrize("harness", ["goose", "goose-native", "hermes-native", "opencode-native"])
+def test_self_authenticating_harness_reports_self_managed_not_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """Own-auth harnesses read ``self-managed``, never a dead-worker verdict.
+
+    The bug this pins (SIL-1039): these harnesses are absent from
+    ``_PROVIDER_RESOLUTION_HARNESS`` *by design* — their spawn builders wire no
+    credential because the vendor CLI authenticates itself (see
+    ``_build_goose_spawn_env``). Resolution therefore returned ``none`` and the
+    row claimed "dispatches to this worker cannot run here" for workers that
+    dispatch and run perfectly well.
+
+    The row must also not swing the other way: nothing was fetched, so
+    ``verified`` stays False and no model ids may be fabricated.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    :param harness: The self-authenticating harness under test.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+    assert provider.kind == "self-managed"
+    assert "authenticates itself" in provider.detail
+
+    listing = list_models_for_worker(_worker_spec(harness), harness)
+    assert listing.source == "self-managed"
+    assert listing.models == ()
+    assert listing.verified is False
+    assert "cannot run here" not in listing.note
+    # The note must tell a supervisor what to DO with an empty list.
+    assert "omit 'args.model'" in listing.note
+
+
+def test_provider_routed_native_harness_is_not_declared_self_managed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """qwen-native declares OWN_AUTH but IS provider-routed — no short-circuit.
+
+    Its capability record declares own-auth for the unconfigured fallback, yet
+    ``_build_qwen_spawn_env`` really does wire the openai family's provider. A
+    blanket "capability says own-auth → self-managed" rule would mislabel a
+    gateway-routed worker as unenumerable, hiding models it can actually run.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec("qwen-native"), "qwen-native")
+    assert provider.kind != "self-managed"
 
 
 # ── TTL cache + failure behavior ───────────────────────────
@@ -1014,7 +1105,7 @@ def test_listing_cached_within_ttl_and_refetched_after_expiry(
 def test_listing_failure_reported_and_not_cached(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A failed fetch reports source ``none`` and retries on the next call.
+    """A failed fetch reports source ``unavailable`` and retries on the next call.
 
     Caching a failure would pin a transient provider outage for the full
     TTL; the second call here must succeed once the endpoint recovers.
@@ -1038,7 +1129,7 @@ def test_listing_failure_reported_and_not_cached(
     failed = list_models_for_worker(
         _worker_spec("codex-native"), "codex-native", transport=transport
     )
-    assert failed.source == "none"
+    assert failed.source == "unavailable"
     assert failed.models == ()
     # The note names the failure so the orchestrator can report it.
     assert "enumeration failed" in failed.note
@@ -1151,7 +1242,7 @@ def test_failed_auth_command_note_never_leaks_the_command(
     catalog = catalog_for_spec(parent, transport=httpx.MockTransport(_handler))
 
     # The note names the redacted category so the orchestrator can react…
-    assert catalog["worker"]["source"] == "none"
+    assert catalog["worker"]["source"] == "unavailable"
     assert "provider auth command failed" in catalog["worker"]["note"]
     # …and the secret embedded in the failing command never reaches ANY
     # part of the serialized tool payload. If this fails, raw exception
@@ -1169,7 +1260,7 @@ def test_catalog_isolates_per_worker_failures(
 
     The claude worker resolves a subscription (static, no HTTP) while
     the codex worker's gateway listing 503s — the codex row must degrade
-    to ``none`` with the failure note while claude and self stay intact.
+    to ``unavailable`` with the failure note while claude and self stay intact.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
@@ -1215,7 +1306,7 @@ def test_catalog_isolates_per_worker_failures(
     assert next(m["id"] for m in catalog["worker"]["models"]) == "claude-fable-5"
     assert catalog["self"]["source"] == "static"
     # The broken worker degrades informatively instead of crashing the tool.
-    assert catalog["codex"]["source"] == "none"
+    assert catalog["codex"]["source"] == "unavailable"
     assert catalog["codex"]["models"] == []
     assert "enumeration failed" in catalog["codex"]["note"]
 
@@ -1469,7 +1560,7 @@ def test_openai_compatible_listing_mints_bearer_via_auth_command(
 
     Dynamic-credential providers carry no static key at all — the
     enumerator must run the command and send its stdout as the bearer,
-    or every such deployment silently degrades to ``none``.
+    or every such deployment silently degrades to an empty row.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
@@ -1539,6 +1630,8 @@ def test_keychain_credential_ref_degrades_not_crashes(
         _worker_spec("codex-native"), "codex-native", transport=httpx.MockTransport(_handler)
     )
 
-    assert listing.source == "none"
+    # An unresolvable credential fails during provider RESOLUTION, so the row
+    # is "no usable provider" rather than "the listing fetch failed".
+    assert listing.source == "unconfigured"
     assert not listing.models
     assert listing.note, "degraded keychain row must carry an explanatory note"

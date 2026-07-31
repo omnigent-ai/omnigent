@@ -13,7 +13,9 @@ from omnigent.onboarding.provider_config import (
     OPENAI_FAMILY,
     PI_SURFACE,
     default_provider_for_harness,
+    harness_declares_own_auth,
     harness_family,
+    harness_owns_its_credential,
     load_providers,
     provider_families,
     provider_family_for_harness,
@@ -793,6 +795,121 @@ def test_default_provider_for_pi_skips_bedrock_default() -> None:
     }
     assert default_provider_for_harness(config, "pi").name == "oai"
     assert default_provider_for_harness(config, "claude-sdk").name == "bedrock"
+
+
+def test_default_provider_for_pi_reaches_non_default_provider_in_same_family() -> None:
+    """pi falls through an unusable DEFAULT to a usable provider beside it.
+
+    The regression this pins: the fallback iterated one provider per family —
+    that family's ``default: true`` entry — and on hitting an unusable kind
+    moved to the next FAMILY rather than the next PROVIDER. On a machine whose
+    anthropic and openai defaults are both subscription CLI logins (the common
+    ``claude``/``codex`` setup), a perfectly usable OpenRouter key sitting one
+    slot down in the openai family was never reached and pi resolved to
+    ``None`` — which the model catalog then reported as a dead worker.
+    """
+    config = {
+        "providers": {
+            "claude": {"kind": "subscription", "cli": "claude", "default": ANTHROPIC_FAMILY},
+            "codex": {"kind": "subscription", "cli": "codex", "default": OPENAI_FAMILY},
+            "openrouter": {
+                "kind": "key",
+                "openai": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
+            },
+        }
+    }
+    assert default_provider_for_harness(config, "pi").name == "openrouter"
+    # The mapped harnesses still take their own family's explicit default —
+    # widening the pi candidate set must not re-route them.
+    assert default_provider_for_harness(config, "claude-sdk").name == "claude"
+    assert default_provider_for_harness(config, "codex").name == "codex"
+
+
+def test_default_provider_for_pi_prefers_the_family_default_over_its_neighbours() -> None:
+    """A usable default still wins over the other providers in its family.
+
+    The widened candidate set is ordered, not unordered: the user's stated
+    ``default: true`` preference is tried first, and only an unusable kind
+    lets a neighbour through.
+    """
+    config = {
+        "providers": {
+            "chosen": {
+                "kind": "key",
+                "default": OPENAI_FAMILY,
+                "openai": {"base_url": "https://api.openai.com/v1", "api_key": "k"},
+            },
+            "other": {
+                "kind": "key",
+                "openai": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k2"},
+            },
+        }
+    }
+    assert default_provider_for_harness(config, "pi").name == "chosen"
+
+
+def test_default_provider_for_pi_still_skips_unusable_kinds_without_a_default() -> None:
+    """The widened candidate set does not weaken the subscription/bedrock skips.
+
+    Every candidate — default or not — must still pass the kind rules, or pi
+    would be handed a CLI login it cannot wrap and a previously-working run
+    (pi's own auth) would become a hard error.
+    """
+    config = {
+        "providers": {
+            "claude": {"kind": "subscription", "cli": "claude"},
+            "bedrock": {
+                "kind": "bedrock",
+                "anthropic": {
+                    "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                    "api_key": "k",
+                    "models": {"default": "us.anthropic.claude-haiku-4-5-20251001-v1:0"},
+                },
+            },
+        }
+    }
+    assert default_provider_for_harness(config, "pi") is None
+
+
+@pytest.mark.parametrize(
+    ("harness", "declares_own_auth", "owns_its_credential"),
+    [
+        # ACP-backed: both predicates agree (the narrow one's original set).
+        ("goose", True, True),
+        ("acp", True, True),
+        # Native harnesses that copy the user's own vendor config forward.
+        # These are own-auth but NOT ACP, so only the broad predicate holds —
+        # the narrow one still drives the credential readouts unchanged.
+        ("goose-native", True, False),
+        ("hermes-native", True, False),
+        ("opencode-native", True, False),
+        # Provider-routed at spawn via _HARNESS_FAMILY: never own-auth here,
+        # even though qwen-native's capability record declares OWN_AUTH for
+        # its unconfigured fallback.
+        ("qwen-native", False, False),
+        ("claude-sdk", False, False),
+        ("codex", False, False),
+        # Unknown harnesses carry no capability record to declare anything.
+        ("no-such-harness", False, False),
+    ],
+)
+def test_own_auth_predicates_split_broad_from_acp_only(
+    harness: str, declares_own_auth: bool, owns_its_credential: bool
+) -> None:
+    """The broad own-auth predicate covers native harnesses; the narrow one doesn't.
+
+    ``harness_declares_own_auth`` answers "does Omnigent wire a credential for
+    this harness?" — what the model catalog needs to say *self-managed* instead
+    of *no usable provider*. ``harness_owns_its_credential`` keeps its narrower
+    ACP-only contract so the REPL creds line and ``describe_active_credential``
+    behave exactly as before.
+
+    :param harness: The harness under test.
+    :param declares_own_auth: Expected broad-predicate verdict.
+    :param owns_its_credential: Expected narrow-predicate verdict.
+    """
+    assert harness_declares_own_auth(harness) is declares_own_auth
+    assert harness_owns_its_credential(harness) is owns_its_credential
 
 
 def test_default_provider_for_pi_none_when_only_bedrock_default() -> None:

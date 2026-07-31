@@ -131,6 +131,10 @@ def _pin_defaults_after_write(
 
     ``set_default_provider`` rewrites the whole providers block (it clears
     sibling default flags a deep-merge can't reach), so each pin re-reads first.
+
+    Pin 2 deliberately counts the entry pin 1 just wrote: once Pi's resolver
+    reaches it through the family default, Pi is unstuck and a second,
+    explicit pi scope would only duplicate what already routes.
     """
     from omnigent.onboarding.provider_config import (
         PI_SURFACE,
