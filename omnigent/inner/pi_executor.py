@@ -43,7 +43,7 @@ import shutil
 import subprocess
 import tempfile
 from asyncio import Queue, Task
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 from urllib.parse import urlparse as _urlparse
@@ -52,6 +52,13 @@ from omnigent import model_catalog
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.model_metadata import ModelWireAPI
+from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.pi_model_compatibility import SYSTEM_AI_RESPONSES_KEYWORDS
+from omnigent.pi_native_credentials import (
+    _databricks_workspace_url_for_gateway,
+    _is_databricks_ai_gateway_url,
+)
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
@@ -563,7 +570,7 @@ def _find_pi_cli() -> str | None:
 # a static id — in which case _build_models_json's append is skipped, so the
 # capability has to be declared here too or attached images are silently
 # dropped (#515/#516).
-_DATABRICKS_RESPONSES_MODELS = [
+_DATABRICKS_OPENAI_MODELS = [
     {
         "id": "databricks-gpt-5-4-mini",
         "name": "GPT-5.4 Mini",
@@ -710,6 +717,8 @@ def _build_models_json(
     token: str,
     base_urls: dict[str, str] | None = None,
     model: str | None = None,
+    model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
+    openai_wire_api: str | None = None,
 ) -> dict[str, Any]:  # type: ignore[explicit-any]
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
     # see _DATABRICKS_*_MODELS and the compat/authHeader shapes below. The
@@ -736,6 +745,10 @@ def _build_models_json(
         same shape ucode writes) under the provider
         :func:`_pi_provider_for_model` routes it to when absent from the
         static list. ``None`` skips registration (Pi picks its default).
+    :param model_wire_apis: Databricks model ids mapped to catalog-reported
+        wire surfaces. Missing GPT metadata defaults to Responses.
+    :param openai_wire_api: Configured wire for a generic OpenAI-compatible
+        provider. ``None`` defaults generic providers to Chat Completions.
     :returns: Pi ``models.json`` contents.
     """
     h = host.rstrip("/")
@@ -743,18 +756,27 @@ def _build_models_json(
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
     mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
-    # ucode's ``openai`` gateway is the Codex Responses gateway
-    # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
-    # ``/chat/completions`` POST. Re-route only that case to serving-endpoints;
-    # generic providers (no ``/ai-gateway/codex``) pass through.
-    if raw_openai_base_url and "/ai-gateway/codex" in raw_openai_base_url:
+    is_databricks_openai_gateway = bool(
+        raw_openai_base_url
+        and (
+            "/ai-gateway/" in raw_openai_base_url
+            or _is_databricks_ai_gateway_url(raw_openai_base_url)
+        )
+    )
+    # Databricks Codex URLs only accept Responses; Chat uses the workspace.
+    if raw_openai_base_url and is_databricks_openai_gateway:
         openai_base_url = serving_endpoints_url
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
     # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
     # /ai-gateway/* paths don't exist — use the generic base URL for all paths.
-    is_generic_provider = bool(raw_openai_base_url and "/ai-gateway/" not in raw_openai_base_url)
-    if is_generic_provider:
+    is_generic_provider = bool(raw_openai_base_url and not is_databricks_openai_gateway)
+    generic_openai_wire_api = openai_wire_api or CHAT_WIRE_API if is_generic_provider else None
+    wire_catalog = model_wire_apis or {}
+    if is_databricks_openai_gateway:
+        assert raw_openai_base_url is not None
+        codex_gateway_url = raw_openai_base_url
+    elif is_generic_provider:
         codex_gateway_url = openai_base_url
         mlflow_gateway_url = openai_base_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
@@ -778,8 +800,12 @@ def _build_models_json(
                 "compat": _openai_responses_compat,
                 "models": [
                     m
-                    for m in _DATABRICKS_RESPONSES_MODELS
-                    if isinstance(m.get("id"), str) and _pi_needs_responses_api(m["id"])
+                    for m in _DATABRICKS_OPENAI_MODELS
+                    if isinstance((model_id := m.get("id")), str)
+                    and _pi_needs_responses_api(
+                        model_id,
+                        wire_catalog.get(model_id.lower()),
+                    )
                 ],
             },
             # Older GPT models → OpenAI Chat Completions at serving-endpoints.
@@ -790,8 +816,12 @@ def _build_models_json(
                 "compat": _openai_responses_compat,
                 "models": [
                     m
-                    for m in _DATABRICKS_RESPONSES_MODELS
-                    if not (isinstance(m.get("id"), str) and _pi_needs_responses_api(m["id"]))
+                    for m in _DATABRICKS_OPENAI_MODELS
+                    if isinstance((model_id := m.get("id")), str)
+                    and not _pi_needs_responses_api(
+                        model_id,
+                        wire_catalog.get(model_id.lower()),
+                    )
                 ],
             },
             # Claude models → Anthropic Messages API.
@@ -838,7 +868,13 @@ def _build_models_json(
         },
     }
     if model is not None:
-        provider = config["providers"][_pi_provider_for_model(model)]
+        provider = config["providers"][
+            _pi_provider_for_model(
+                model,
+                wire_catalog.get(model.lower()),
+                generic_openai_wire_api=generic_openai_wire_api,
+            )
+        ]
         if not any(entry.get("id") == model for entry in provider["models"]):
             # Rebind (don't append): the static lists are module-level
             # constants shared across builds, so in-place mutation would
@@ -875,36 +911,67 @@ def _pi_model_is_reasoning(model: str) -> bool:
     return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
 
 
-def _pi_needs_responses_api(model: str) -> bool:
-    """Return True when a model requires the Responses API at /ai-gateway/codex/v1.
+def _pi_needs_responses_api(
+    model: str,
+    wire_apis: frozenset[ModelWireAPI] | None = None,
+) -> bool:
+    """Return whether Pi should use the Databricks Responses surface.
 
-    Covers two cases:
-    - Newer GPT models that reject function tools via /chat/completions.
-    - Kimi/inkling/qwen3/glm (system.ai.* ids) that need the Responses API to
-      avoid the missing finish_reason issue on /chat/completions.
+    Catalog metadata is authoritative when available. The system-model family
+    fallback remains for endpoints whose documented chat surface omits the
+    finish reason Pi requires. Unknown GPT metadata fails toward Responses,
+    which is the forward-compatible tool-capable surface.
     """
-    from omnigent.pi_native_credentials import _SYSTEM_AI_MODEL_KEYWORDS, _needs_responses_api
-
     lower = model.lower()
-    # system.ai.* ids: only kimi/inkling/qwen3/glm variants need Responses API.
-    # Claude/llama system.ai.* ids route to their own providers (Anthropic, completions).
-    if lower.startswith("system.ai.") and any(kw in lower for kw in _SYSTEM_AI_MODEL_KEYWORDS):
+    if lower.startswith("system.ai.") and any(
+        keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
+    ):
         return True
-    return _needs_responses_api(lower)
+    if wire_apis is not None:
+        return ModelWireAPI.OPENAI_RESPONSES in wire_apis
+    return "gpt" in lower
 
 
-def _pi_provider_for_model(model: str) -> str:
+def _pi_provider_for_model(
+    model: str,
+    wire_apis: frozenset[ModelWireAPI] | None = None,
+    *,
+    generic_openai_wire_api: str | None = None,
+) -> str:
     """Return the Pi provider name to use for a given Databricks model."""
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
+    if generic_openai_wire_api is not None:
+        if generic_openai_wire_api == RESPONSES_WIRE_API:
+            return "databricks-openai"
+        return "databricks-completions"
     if lower.startswith("system.ai."):
-        # system.ai.* ids never work at serving-endpoints — always use a gateway path.
-        # kimi/inkling/qwen3/glm → Responses API; others (Llama, Gemini, GPT) → mlflow.
-        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks-mlflow"
+        return (
+            "databricks-openai"
+            if _pi_needs_responses_api(model, wire_apis)
+            else "databricks-mlflow"
+        )
     if "gpt" in lower:
-        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
+        return "databricks-openai" if _pi_needs_responses_api(model, wire_apis) else "databricks"
     return "databricks-completions"
+
+
+def _databricks_model_wire_catalog(
+    models: Sequence[model_catalog.ModelEntry],
+) -> dict[str, frozenset[ModelWireAPI]]:
+    """Index UC wire metadata by both system and serving-endpoint aliases."""
+    catalog: dict[str, frozenset[ModelWireAPI]] = {}
+    for model in models:
+        model_id = model.id.lower()
+        aliases = {model_id}
+        if model_id.startswith("system.ai."):
+            aliases.add(f"databricks-{model_id.removeprefix('system.ai.')}")
+        elif model_id.startswith("databricks-"):
+            aliases.add(f"system.ai.{model_id.removeprefix('databricks-')}")
+        for alias in aliases:
+            catalog[alias] = model.metadata.wire_apis
+    return catalog
 
 
 async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # type: ignore[explicit-any]
@@ -1598,6 +1665,7 @@ class PiExecutor(Executor):
         gateway_host: str | None = None,
         base_url_override: str | None = None,
         base_urls_override: dict[str, str] | None = None,
+        openai_wire_api: str | None = None,
         gateway_auth_command: str | None = None,
         retry_policy: RetryPolicy | None = None,
         bundle_dir: pathlib.Path | None = None,
@@ -1633,6 +1701,9 @@ class PiExecutor(Executor):
             the Databricks profile credentials.
         :param base_urls_override: ucode-provided Pi gateway URLs keyed by
             model family, e.g. ``{"claude": "...", "openai": "..."}``.
+        :param openai_wire_api: Configured generic-provider OpenAI wire,
+            ``"responses"`` or ``"chat"``. Databricks ignores this and uses
+            live Unity Catalog metadata.
         :param gateway_auth_command: Shell command that prints a bearer token,
             e.g.
             ``"databricks auth token --host https://example.databricks.com ..."``
@@ -1673,6 +1744,10 @@ class PiExecutor(Executor):
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
         self._base_url_override = base_url_override
         self._base_urls_override = base_urls_override
+        if openai_wire_api not in (None, RESPONSES_WIRE_API, CHAT_WIRE_API):
+            raise ValueError(f"unsupported Pi OpenAI wire API: {openai_wire_api!r}")
+        self._openai_wire_api = openai_wire_api
+        self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
         self._gateway_auth_command = gateway_auth_command
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
         # See ``RetryPolicy.pi.settings()`` for the schema. Pi natively
@@ -1755,6 +1830,9 @@ class PiExecutor(Executor):
         # generic-provider paths the producer resolves a concrete model.
         self._gateway_uses_databricks_profile = bool(
             gateway and self._gateway_host_override is None and base_url_override is None
+        )
+        self._gateway_workspace_url = (
+            self._gateway_model_service_workspace_url() if gateway else None
         )
 
         # Apply sandbox.
@@ -1883,6 +1961,62 @@ class PiExecutor(Executor):
             return resolution.model_id
         return model
 
+    def _generic_openai_wire_api(self) -> str | None:
+        """Return the configured wire only for a non-Databricks gateway."""
+        openai_base_url = (self._base_urls_override or {}).get("openai")
+        if openai_base_url:
+            is_databricks_gateway = (
+                "/ai-gateway/" in openai_base_url or _is_databricks_ai_gateway_url(openai_base_url)
+            )
+            if not is_databricks_gateway:
+                return self._openai_wire_api or CHAT_WIRE_API
+        return None
+
+    def _gateway_model_service_workspace_url(self) -> str | None:
+        """Return the workspace API origin for Databricks catalog discovery."""
+        if self._gateway_uses_databricks_profile:
+            return self._databricks_host
+        candidates = [
+            *(self._base_urls_override or {}).values(),
+            self._base_url_override,
+            self._gateway_host_override,
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            workspace_url = _databricks_workspace_url_for_gateway(
+                candidate,
+                profile=self._databricks_profile,
+            )
+            if workspace_url is not None:
+                return workspace_url
+        return None
+
+    async def _load_gateway_model_wire_apis(self) -> dict[str, frozenset[ModelWireAPI]]:
+        """Fetch Databricks model wire metadata once per executor."""
+        if self._gateway_model_wire_apis is not None:
+            return self._gateway_model_wire_apis
+        workspace_url = self._gateway_workspace_url if self._gateway else None
+        if workspace_url is None:
+            self._gateway_model_wire_apis = {}
+            return self._gateway_model_wire_apis
+        try:
+            models = await run_sync_on_thread(
+                model_catalog.fetch_databricks_model_service_entries,
+                workspace_url,
+                self._databricks_token,
+            )
+        except Exception:  # noqa: BLE001 — catalog outage uses conservative routing
+            logger.warning(
+                "Pi could not fetch Databricks model wire metadata; "
+                "unknown GPT models will use Responses",
+                exc_info=True,
+            )
+            self._gateway_model_wire_apis = {}
+            return self._gateway_model_wire_apis
+        self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
+        return self._gateway_model_wire_apis
+
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
         """Start the TCP tool server if there are Omnigent tools to bridge."""
         if not tools:
@@ -1956,10 +2090,12 @@ class PiExecutor(Executor):
         if self._gateway:
             effective_model = model
             models_json = _build_models_json(
-                self._databricks_host,
+                self._gateway_workspace_url or self._databricks_host,
                 self._databricks_token,
                 self._base_urls_override,
                 model=effective_model,
+                model_wire_apis=self._gateway_model_wire_apis,
+                openai_wire_api=self._openai_wire_api,
             )
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
@@ -2060,6 +2196,8 @@ class PiExecutor(Executor):
         ):
             return state.rpc
 
+        wire_catalog = await self._load_gateway_model_wire_apis()
+
         if state.rpc is not None:
             await state.rpc.close()
 
@@ -2079,7 +2217,11 @@ class PiExecutor(Executor):
         # the model from our custom provider in models.json.
         pi_model: str | None
         if self._gateway and effective_model:
-            provider = _pi_provider_for_model(effective_model)
+            provider = _pi_provider_for_model(
+                effective_model,
+                wire_catalog.get(effective_model.lower()),
+                generic_openai_wire_api=self._generic_openai_wire_api(),
+            )
             pi_model = f"{provider}/{effective_model}"
         else:
             pi_model = effective_model

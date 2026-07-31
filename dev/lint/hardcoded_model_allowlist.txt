@@ -36,9 +36,6 @@ omnigent/inner/pi_executor.py databricks-gpt-5-4 1
 omnigent/inner/pi_executor.py databricks-gpt-5-4-mini 1
 omnigent/inner/pi_executor.py databricks-gpt-5-5 1
 omnigent/inner/pi_executor.py databricks-gpt-5-5-pro 1
-omnigent/llms/context_window.py o1 1
-omnigent/llms/context_window.py o3 1
-omnigent/llms/context_window.py o4 1
 omnigent/model_catalog.py claude-fable-5 1
 omnigent/model_catalog.py claude-haiku-4-5 1
 omnigent/model_catalog.py claude-opus-4-8 1

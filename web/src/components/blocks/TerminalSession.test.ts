@@ -8,7 +8,6 @@
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ConnectionState } from "./TerminalSession";
 import {
   SHIFT_ENTER_CSI_U,
   SYNC_ECHO_MAX_BYTES,
@@ -23,6 +22,7 @@ import {
   shouldEchoSynchronously,
   terminalTheme,
   terminalKeyEventPayload,
+  type ConnectionState,
   wheelReportPayload,
   type WheelMouseState,
   type WheelScreenMetrics,

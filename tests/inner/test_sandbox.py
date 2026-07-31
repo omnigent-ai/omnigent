@@ -254,6 +254,31 @@ def test_sandbox_policy_round_trips_deny_unix_socket_paths() -> None:
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).deny_unix_socket_paths is None
 
 
+def test_sandbox_policy_round_trips_mask_and_recursive_fields() -> None:
+    """``cwd_hidden_scan_recursive`` + ``mask_paths`` survive the wire.
+
+    Both fields cross the parent/helper boundary as JSON. If either
+    dropped out of ``to_jsonable`` / ``from_jsonable`` the helper would
+    decode the recursive flag as ``False`` and the explicit masks as
+    ``None`` — silently weakening the sandbox view.
+    """
+    from pathlib import Path
+
+    policy = _noop_policy()
+    policy.cwd_hidden_scan_recursive = True
+    policy.mask_paths = [Path("/work/config/production.key")]
+
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+
+    assert decoded.cwd_hidden_scan_recursive is True
+    assert decoded.mask_paths == [Path("/work/config/production.key")]
+    # Old payloads (no key) and unset policies must decode to the safe
+    # defaults: non-recursive and no explicit masks.
+    baseline = SandboxPolicy.from_jsonable(_noop_policy().to_jsonable())
+    assert baseline.cwd_hidden_scan_recursive is False
+    assert baseline.mask_paths is None
+
+
 def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:
     """``with_denied_unix_sockets`` resolves + de-duplicates the socket
     paths and never mutates the input policy.

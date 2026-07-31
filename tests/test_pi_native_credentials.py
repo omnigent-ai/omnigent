@@ -78,7 +78,6 @@ def test_databricks_unresolvable_credentials_sets_warning(
     session is worse than a visible notice — so the resolver flags it.
     """
     from omnigent.inner import databricks_executor
-    from omnigent.runtime.credentials import databricks as rt_databricks
 
     monkeypatch.setattr(
         databricks_executor,
@@ -89,7 +88,7 @@ def test_databricks_unresolvable_credentials_sets_warning(
     def _boom(profile: str | None):
         raise OSError("refresh token is invalid")
 
-    monkeypatch.setattr(rt_databricks, "resolve_databricks_workspace", _boom)
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -112,7 +111,7 @@ def test_databricks_model_list_failure_has_no_warning(
         lambda profile: "https://wkspc.example.com/",
     )
     monkeypatch.setattr(
-        rt_databricks,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: rt_databricks.WorkspaceCreds(
             host="https://wkspc.example.com", token="tok"
@@ -719,6 +718,35 @@ def test_is_databricks_ai_gateway_url_rejects_lookalikes(gateway_url: str) -> No
     assert creds._is_databricks_ai_gateway_url(gateway_url) is False
 
 
+def test_workspace_url_for_dedicated_gateway_uses_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dedicated AI Gateway origin is not itself a workspace API host."""
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    def resolve(profile: str | None) -> db_creds_mod.WorkspaceCreds:
+        assert profile == "prod"
+        return db_creds_mod.WorkspaceCreds(
+            host="https://workspace.cloud.databricks.com",
+            token="unused",
+        )
+
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", resolve)
+
+    assert (
+        creds._databricks_workspace_url_for_gateway(
+            "https://123.ai-gateway.cloud.databricks.com/anthropic",
+            profile="prod",
+        )
+        == "https://workspace.cloud.databricks.com"
+    )
+
+
+def test_workspace_url_for_generic_provider_is_none() -> None:
+    """Generic compatible providers are not probed through Databricks APIs."""
+    assert creds._databricks_workspace_url_for_gateway("https://api.anthropic.com/v1") is None
+
+
 def test_anthropic_family_ignores_wire_api() -> None:
     """The Anthropic family always uses anthropic-messages, ignoring wire_api.
 
@@ -913,7 +941,7 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     monkeypatch.setattr(
-        db_creds_mod,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
     )
@@ -963,7 +991,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     monkeypatch.setattr(
-        db_creds_mod,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(
             host="https://dbc-a5d4177a-49dc.cloud.databricks.com", token="sdk-tok"
@@ -1022,6 +1050,8 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
             _make_service(
                 "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
             ),
+            # Future GPT metadata, deliberately Chat-only.
+            _make_service("system.ai.gpt-chat-only", ["mlflow/v1/chat/completions"]),
             # Llama - chat only
             _make_service("system.ai.llama-4-maverick", ["mlflow/v1/chat/completions"]),
             # Kimi - chat only (no Responses API per UC metadata)
@@ -1061,6 +1091,7 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
     # Llama routes to mlflow gateway (system.ai.* ids 404 at serving-endpoints).
     mlflow_ids = [m["id"] for m in _gemini]
     assert "system.ai.llama-4-maverick" in mlflow_ids
+    assert "system.ai.gpt-chat-only" in mlflow_ids
     completions_ids = [m["id"] for m in completions]
     assert not completions_ids  # no completions-only models in this test payload
     # Embedding excluded

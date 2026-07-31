@@ -1,3 +1,5 @@
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,7 +33,7 @@ vi.mock("./SubagentsGraphView", () => ({
 }));
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
 }));
 

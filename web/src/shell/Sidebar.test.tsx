@@ -41,7 +41,9 @@ const {
   // mock derives each folder's rows from this by label, mirroring the server's
   // ?project= filter — so tests that seed project sessions via the global list
   // keep working without a separate per-project fixture.
-  conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  conversationsRef: {
+    current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
+  },
   // Server-authoritative pinned ids. Kept in a ref (not the legacy localStorage
   // key, which the one-time migration clears on mount) so a seeded pin survives
   // the first render. `seedPins` sets it; the toggle mock mutates it.
@@ -111,7 +113,7 @@ vi.mock("@/hooks/useConversations", () => ({
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
+          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
         ));
     return {
       data: enabled

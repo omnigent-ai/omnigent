@@ -31,6 +31,7 @@ from omnigent.harness_plugins import (
     PI_NATIVE_CODING_AGENT,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
     McpServerStartup,
     SandboxStatus,
@@ -453,6 +454,12 @@ _model_options_cache: dict[str, list[dict[str, Any]]] = {}
 _model_options_inflight: dict[str, asyncio.Task[None]] = {}
 
 
+# Sessions whose cached catalog should be re-fetched at the next snapshot
+# that has a live runner. A stale entry still SERVES in the meantime (and
+# whenever no runner is bound) so the model picker survives runner death.
+_model_options_stale: set[str] = set()
+
+
 _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
@@ -665,6 +672,34 @@ def get_server_runner_router() -> RunnerRouter | None:
     return _server_runner_router
 
 
+# Live host-tunnel registry, set once at app startup (see
+# :func:`set_server_host_registry`). Asleep claude-native sessions refill
+# their model catalog from the session's host (the new-session picker's
+# pre-launch source) via a background task that carries no FastAPI request,
+# so it reads the registry from this module-level global.
+_server_host_registry: HostRegistry | None = None
+
+
+def set_server_host_registry(host_registry: HostRegistry | None) -> None:
+    """Stash the live host registry for asleep-session catalog refills.
+
+    Called once from ``create_app`` so ``_load_model_options_from_host``
+    can reach a session's host connection from background contexts that do
+    not carry the request / route closure.
+
+    :param host_registry: The live host-tunnel registry, or ``None`` in
+        setups without host tunnels.
+    :returns: None.
+    """
+    global _server_host_registry
+    _server_host_registry = host_registry
+
+
+def get_server_host_registry() -> HostRegistry | None:
+    """Return the registry stashed by :func:`set_server_host_registry`."""
+    return _server_host_registry
+
+
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
@@ -797,6 +832,7 @@ __all__ = [
     "_managed_launch_tasks",
     "_model_options_cache",
     "_model_options_inflight",
+    "_model_options_stale",
     "_native_ask_gate_locks",
     "_native_popup_forward_tasks",
     "_pending_policy_ask_writes",
@@ -807,6 +843,7 @@ __all__ = [
     "_runner_relay_tasks",
     "_runner_skills_cache",
     "_runner_skills_inflight",
+    "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
     "_session_background_task_count_cache",
@@ -815,7 +852,9 @@ __all__ = [
     "_session_status_cache",
     "_session_terminal_pending_cache",
     "_session_todos_cache",
+    "get_server_host_registry",
     "get_server_runner_router",
+    "set_server_host_registry",
     "set_server_runner_router",
 ]
 

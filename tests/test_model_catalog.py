@@ -497,10 +497,11 @@ def _databricks_transport(
 
     _UC_PAGE = {
         "model_services": [
-            _uc_service("system.ai.claude-sonnet-4-6", ["mlflow/v1/chat/completions"]),
+            _uc_service("system.ai.claude-sonnet-4-6", ["anthropic/v1/messages"]),
             _uc_service(
                 "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
             ),
+            _uc_service("system.ai.gpt-responses-only", ["openai/v1/responses"]),
             _uc_service("system.ai.meta-llama-3-3-70b-instruct", ["mlflow/v1/chat/completions"]),
             _uc_service("system.ai.qwen3-embedding", ["mlflow/v1/embeddings"]),
         ]
@@ -530,10 +531,10 @@ def _stub_workspace_creds(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_databricks_listing_filters_to_chat_llms(
+def test_databricks_listing_filters_to_llm_wire_surfaces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The gateway listing keeps chat LLM endpoints and tags families.
+    """The gateway listing keeps supported LLM wires and tags families.
 
     The embeddings endpoint must be excluded — including it would let an
     orchestrator dispatch a worker onto a non-chat endpoint.
@@ -558,16 +559,20 @@ def test_databricks_listing_filters_to_chat_llms(
     assert set(by_id) == {
         "system.ai.claude-sonnet-4-6",
         "system.ai.gpt-5-4",
+        "system.ai.gpt-responses-only",
         "system.ai.meta-llama-3-3-70b-instruct",
     }
     assert by_id["system.ai.claude-sonnet-4-6"].family == "claude"
     assert by_id["system.ai.gpt-5-4"].family == "openai"
     assert by_id["system.ai.meta-llama-3-3-70b-instruct"].family == "other"
     assert by_id["system.ai.claude-sonnet-4-6"].metadata.wire_apis == frozenset(
-        {ModelWireAPI.OPENAI_CHAT}
+        {ModelWireAPI.ANTHROPIC_MESSAGES}
     )
     assert by_id["system.ai.gpt-5-4"].metadata.wire_apis == frozenset(
         {ModelWireAPI.OPENAI_CHAT, ModelWireAPI.OPENAI_RESPONSES}
+    )
+    assert by_id["system.ai.gpt-responses-only"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_RESPONSES}
     )
 
 
@@ -633,6 +638,7 @@ def test_databricks_listing_skips_explicitly_non_ready_endpoints(
             {
                 "system.ai.claude-sonnet-4-6",
                 "system.ai.gpt-5-4",
+                "system.ai.gpt-responses-only",
                 "system.ai.meta-llama-3-3-70b-instruct",
             },
             id="pi-everything",

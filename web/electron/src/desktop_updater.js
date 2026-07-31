@@ -122,16 +122,13 @@ function createDesktopUpdater({
   function setConfig(patch = {}) {
     const settings = loadSettings();
     const next = { ...settings };
-    if (Object.prototype.hasOwnProperty.call(patch, "mode") && UPDATE_MODES.has(patch.mode)) {
+    if (Object.hasOwn(patch, "mode") && UPDATE_MODES.has(patch.mode)) {
       next.update_mode = patch.mode;
     }
-    if (
-      Object.prototype.hasOwnProperty.call(patch, "autoInstall") &&
-      typeof patch.autoInstall === "boolean"
-    ) {
+    if (Object.hasOwn(patch, "autoInstall") && typeof patch.autoInstall === "boolean") {
       next.update_auto_install = patch.autoInstall;
     }
-    if (Object.prototype.hasOwnProperty.call(patch, "skippedVersion")) {
+    if (Object.hasOwn(patch, "skippedVersion")) {
       next.update_skipped_version =
         typeof patch.skippedVersion === "string" ? patch.skippedVersion : null;
     }

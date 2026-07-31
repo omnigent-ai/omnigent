@@ -9,6 +9,7 @@
   "rules": {
     "react/react-in-jsx-scope": "off",
     "import/no-unassigned-import": "off",
+    "no-promise-executor-return": "error",
     "no-restricted-globals": [
       "error",
       {
@@ -16,6 +17,10 @@
         "message": "Don't call the bare global fetch(). Use hostFetch (@/lib/host) or authenticatedFetch (@/lib/identity) so requests route through the embed host transport. The only allowed bare fetch() is the choke point in src/lib/host.ts."
       }
     ],
+    "no-unreachable-loop": "error",
+    "no-useless-assignment": "error",
+    "react/jsx-no-useless-fragment": "error",
+    "react-hooks/rules-of-hooks": "error",
     "no-restricted-imports": [
       "error",
       {

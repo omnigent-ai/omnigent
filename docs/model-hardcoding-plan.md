@@ -146,6 +146,27 @@ id-only candidate set expected by routing clients. Compatibility post-processing
 uses those catalog facts and treats missing metadata from older runners as
 unknown instead of inferring protocol support from model names.
 
+## Context Window Migration
+
+Context sizing and pricing now share the onboarding/model-resolver MLflow
+catalog cache. Stable family patterns locate a bounded provider catalog, while
+provider-qualified and vendor-namespaced ids route directly to their catalog
+source. Exact catalog metadata wins; family-prefix matches are accepted only
+when every candidate agrees on the requested field.
+
+The stale exact-id Qwen window table and duplicate catalog downloader are gone.
+An explicit Anthropic `[1m]` marker remains self-describing metadata, and an
+uncatalogued/offline model keeps the conservative 128K fallback rather than a
+release-specific guess.
+
+## Pi Wire Routing
+
+Pi gateway configuration consumes the same normalized Unity Catalog model
+service metadata. Databricks GPT models use the Responses or Chat surface the
+catalog advertises, while generic OpenAI-compatible providers honor their
+configured wire. If Databricks discovery is unavailable, an unknown GPT uses
+Responses rather than a release-specific completions allowlist.
+
 ## Kiro Picker Migration
 
 The Kiro Web picker now runs `kiro-cli chat --list-models --format json` on the

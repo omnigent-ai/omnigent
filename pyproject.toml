@@ -164,7 +164,7 @@ islo = ["islo>=0.3.5,<0.4"]
 # NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.
-openshell = ["openshell>=0.0.7,<1"]
+openshell = ["openshell>=0.0.88,<1"]
 # On-demand Kubernetes runner Pod launcher (server-managed
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the

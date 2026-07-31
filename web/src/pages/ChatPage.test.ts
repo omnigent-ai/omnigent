@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { RenderItem } from "@/lib/renderItems";
+import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { ToolExecution } from "@/lib/blocks";
-import type { Bubble } from "@/lib/renderItems";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,

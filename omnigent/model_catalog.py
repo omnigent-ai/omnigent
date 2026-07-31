@@ -67,6 +67,7 @@ from omnigent.onboarding.provider_config import (
     SUBSCRIPTION_KIND,
     ProviderEntry,
 )
+from omnigent.pi_model_compatibility import unsupported_in_pi
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
 if TYPE_CHECKING:
@@ -1134,10 +1135,48 @@ def _fetch_databricks_uc_listing(
     :raises OSError: When the profile resolves no credentials.
     """
     creds = resolve_databricks_workspace(provider.profile)
+    models = tuple(
+        model
+        for model in fetch_databricks_model_service_entries(
+            creds.host,
+            creds.token,
+            transport=transport,
+        )
+        if not unsupported_in_pi(model.id.lower())
+    )
+    return ModelListing(
+        source="gateway",
+        verified=True,
+        models=models,
+        note=(
+            "LLM model services on the Databricks workspace "
+            f"(profile {provider.profile or 'DEFAULT'!r})"
+        ),
+    )
+
+
+def fetch_databricks_model_service_entries(
+    workspace_url: str,
+    token: str,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[ModelEntry, ...]:
+    """Fetch normalized Unity Catalog model-service metadata.
+
+    This is the shared parser for worker model enumeration and Pi gateway
+    configuration. It reports provider wire surfaces without deciding which
+    one a harness should prefer.
+
+    :param workspace_url: Databricks workspace base URL.
+    :param token: Workspace bearer token.
+    :param transport: Optional httpx transport override for tests.
+    :returns: LLM model-service entries with normalized wire metadata.
+    :raises httpx.HTTPError: On transport or HTTP failures.
+    """
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
         resp = client.get(
-            f"{creds.host}/api/2.1/unity-catalog/model-services",
-            headers={"Authorization": f"Bearer {creds.token}"},
+            f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
+            headers={"Authorization": f"Bearer {token}"},
         )
         resp.raise_for_status()
         payload = resp.json()
@@ -1146,7 +1185,9 @@ def _fetch_databricks_uc_listing(
     for service in services if isinstance(services, list) else []:
         if not isinstance(service, dict):
             continue
-        raw_name = service.get("name", "")
+        raw_name = service.get("name")
+        if not isinstance(raw_name, str):
+            continue
         name = (
             raw_name.replace("model-services/", "")
             if raw_name.startswith("model-services/")
@@ -1154,18 +1195,12 @@ def _fetch_databricks_uc_listing(
         )
         if not name:
             continue
-        api_types = service.get("supported_api_types", [])
+        api_types = service.get("supported_api_types")
         normalized_api_types = {
-            api_type.lower() for api_type in api_types if isinstance(api_type, str)
+            api_type.lower()
+            for api_type in (api_types if isinstance(api_types, list) else [])
+            if isinstance(api_type, str)
         }
-        has_chat = any("chat" in api_type for api_type in normalized_api_types)
-        has_embed = any("embed" in api_type for api_type in normalized_api_types)
-        if not has_chat or has_embed:
-            continue
-        from omnigent.pi_native_credentials import _unsupported_in_pi
-
-        if _unsupported_in_pi(name.lower()):
-            continue
         wire_apis: set[ModelWireAPI] = set()
         if any("chat/completions" in api_type for api_type in normalized_api_types):
             wire_apis.add(ModelWireAPI.OPENAI_CHAT)
@@ -1175,6 +1210,8 @@ def _fetch_databricks_uc_listing(
             "anthropic" in api_type and "messages" in api_type for api_type in normalized_api_types
         ):
             wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
+        if not wire_apis:
+            continue
         models.append(
             ModelEntry(
                 id=name,
@@ -1182,15 +1219,7 @@ def _fetch_databricks_uc_listing(
                 metadata=ModelMetadata(wire_apis=frozenset(wire_apis)),
             )
         )
-    return ModelListing(
-        source="gateway",
-        verified=True,
-        models=tuple(models),
-        note=(
-            "LLM model services on the Databricks workspace "
-            f"(profile {provider.profile or 'DEFAULT'!r})"
-        ),
-    )
+    return tuple(models)
 
 
 def _models_url(base_url: str) -> str:

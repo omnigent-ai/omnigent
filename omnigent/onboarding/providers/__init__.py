@@ -42,6 +42,8 @@ class ModelInfo:
     :param max_output_tokens: Maximum output tokens, or ``None``.
     :param input_price: Input price per million tokens, or ``None``.
     :param output_price: Output price per million tokens, or ``None``.
+    :param cache_read_price: Cache-read price per million tokens, or ``None``.
+    :param cache_write_price: Cache-write price per million tokens, or ``None``.
     """
 
     name: str
@@ -55,6 +57,8 @@ class ModelInfo:
     max_output_tokens: int | None = None
     input_price: float | None = None
     output_price: float | None = None
+    cache_read_price: float | None = None
+    cache_write_price: float | None = None
 
 
 @dataclass
@@ -381,10 +385,105 @@ def get_models(provider: str) -> list[ModelInfo]:
                     max_output_tokens=context.get("max_output"),
                     input_price=pricing.get("input_per_million_tokens"),
                     output_price=pricing.get("output_per_million_tokens"),
+                    cache_read_price=pricing.get("cache_read_per_million_tokens"),
+                    cache_write_price=pricing.get("cache_write_per_million_tokens"),
                 )
             )
 
     return models
+
+
+_MODEL_PROVIDER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^claude-", re.IGNORECASE), "anthropic"),
+    (re.compile(r"^(?:gpt-|o\d(?:-|$))", re.IGNORECASE), "openai"),
+    (re.compile(r"^gemini-", re.IGNORECASE), "gemini"),
+    (re.compile(r"^qwen(?:\d|-)", re.IGNORECASE), "dashscope"),
+    (re.compile(r"^llama-", re.IGNORECASE), "meta_llama"),
+    (re.compile(r"^mistral-", re.IGNORECASE), "mistral"),
+)
+
+
+def _inferred_catalog_provider(model: str) -> str | None:
+    """Infer a catalog file from a stable vendor-family prefix."""
+    for pattern, provider in _MODEL_PROVIDER_PATTERNS:
+        if pattern.match(model):
+            return provider
+    return None
+
+
+def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
+    """Return bounded provider/id pairs for a model catalog lookup."""
+    normalized = model.split(":", 1)[0].strip()
+    known_providers = set(get_all_providers())
+    targets: list[tuple[str, str]] = []
+
+    def _add(provider: str | None, model_id: str) -> None:
+        if provider is not None and (provider, model_id) not in targets:
+            targets.append((provider, model_id))
+
+    if "/" in normalized:
+        namespace, bare = normalized.split("/", 1)
+        provider = namespace.lower()
+        if provider in known_providers:
+            _add(provider, bare)
+            if provider == "databricks" and bare.lower().startswith("databricks-"):
+                base = bare[len("databricks-") :]
+                _add(_inferred_catalog_provider(base), base)
+        else:
+            _add("openrouter", normalized)
+            _add(_inferred_catalog_provider(bare), bare)
+        return targets
+
+    if normalized.lower().startswith("databricks-"):
+        _add("databricks", normalized)
+        base = normalized[len("databricks-") :]
+        _add(_inferred_catalog_provider(base), base)
+    else:
+        _add(_inferred_catalog_provider(normalized), normalized)
+    _add("openrouter", normalized)
+    return targets
+
+
+def find_catalog_models(model: str) -> list[ModelInfo]:
+    """Find exact or unambiguous-family candidates in the shared catalog.
+
+    Provider-qualified ids query that provider directly. Vendor-namespaced ids
+    query OpenRouter, while bare ids use stable family-to-provider routing with
+    OpenRouter as a bounded fallback. Exact matches win; otherwise all entries
+    sharing the id without its final hyphen segment are returned so callers can
+    accept a field only when every candidate reports the same value.
+
+    :param model: Provider-local, provider-qualified, or vendor-namespaced id.
+    :returns: One exact match, compatible family-prefix matches, or an empty list.
+    """
+    family_matches: list[ModelInfo] = []
+    for provider, lookup_id in _catalog_lookup_targets(model):
+        models = get_models(provider)
+        lookup_lower = lookup_id.lower()
+        for candidate in models:
+            names = {candidate.name.lower()}
+            if provider == "openrouter":
+                names.add(candidate.name.rsplit("/", 1)[-1].lower())
+            if lookup_lower in names:
+                return [candidate]
+        if "-" not in lookup_id:
+            continue
+        prefixes = {lookup_lower.rsplit("-", 1)[0]}
+        if provider == "openrouter":
+            prefixes.add(lookup_lower.rsplit("/", 1)[-1].rsplit("-", 1)[0])
+        family_matches.extend(
+            candidate
+            for candidate in models
+            if any(
+                candidate_name.startswith(prefix)
+                for prefix in prefixes
+                for candidate_name in (
+                    candidate.name.lower(),
+                    candidate.name.rsplit("/", 1)[-1].lower(),
+                )
+            )
+        )
+    return family_matches
 
 
 def get_chat_models(provider: str) -> list[ModelInfo]:

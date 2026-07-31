@@ -363,7 +363,7 @@ export function BlockRenderer({ items, sessionStatus, canApprove = true }: Block
     previousRenderedItemWasText = item.kind === "text";
   }
 
-  return <>{rendered}</>;
+  return rendered;
 }
 
 /**

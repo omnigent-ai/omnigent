@@ -76,6 +76,12 @@ GATEWAY_ENV_VAR: str = "OPENSHELL_GATEWAY"
 """Gateway name read by the SDK's :meth:`SandboxClient.from_active_cluster`;
 overrides ``~/.config/openshell/active_gateway``."""
 
+WORKSPACE_ENV_VAR: str = "OMNIGENT_OPENSHELL_WORKSPACE"
+"""Workspace name passed to the OpenShell SDK for sandbox lifecycle
+operations (create, get, delete, wait_ready). Defaults to ``"default"``."""
+
+_DEFAULT_WORKSPACE: str = "default"
+
 _READY_TIMEOUT_S = 300
 _EXEC_TIMEOUT_S = 300
 # A foreground host (`omnigent host`) is held open until Ctrl-C, so its
@@ -132,7 +138,7 @@ class _OpenShellClient:
             foreground_exec=True,
         )
 
-    def __init__(self, *, cluster: str | None = None) -> None:
+    def __init__(self, *, cluster: str | None = None, workspace: str = _DEFAULT_WORKSPACE) -> None:
         _ensure_sdk()
         from openshell import SandboxClient, SandboxError
 
@@ -143,6 +149,7 @@ class _OpenShellClient:
                 f"Could not connect to an OpenShell gateway: {exc}. Select one with "
                 "`openshell gateway select <name>` (or set OPENSHELL_GATEWAY)."
             ) from exc
+        self._workspace = workspace
         # Petname (public handle) -> opaque sandbox id, which exec needs.
         self._ids: dict[str, str] = {}
         # Daemon threads holding long-lived exec streams open (see
@@ -163,13 +170,16 @@ class _OpenShellClient:
             template=openshell_pb2.SandboxTemplate(image=image),
             environment=env or {},
         )
+        ws = self._workspace
         ref = self._guard(
             "OpenShell sandbox creation failed",
-            lambda: self._client.create(spec=spec),
+            lambda: self._client.create(workspace=ws, spec=spec),
         )
         ready = self._guard(
             "OpenShell sandbox did not become ready",
-            lambda: self._client.wait_ready(ref.name, timeout_seconds=_READY_TIMEOUT_S),
+            lambda: self._client.wait_ready(
+                ref.name, workspace=ws, timeout_seconds=_READY_TIMEOUT_S
+            ),
         )
         sandbox_name: str = ready.name
         self._ids[sandbox_name] = ready.id
@@ -266,9 +276,10 @@ class _OpenShellClient:
 
     def get_status(self, name: str) -> None:
         """Resolve a sandbox by name (validates access) and cache its id."""
+        ws = self._workspace
         ref = self._guard(
             f"Could not resolve OpenShell sandbox '{name}'",
-            lambda: self._client.get(name),
+            lambda: self._client.get(name, workspace=ws),
         )
         self._ids[name] = ref.id
 
@@ -278,7 +289,7 @@ class _OpenShellClient:
         from openshell import SandboxError
 
         try:
-            self._client.delete(name)
+            self._client.delete(name, workspace=self._workspace)
         except grpc.RpcError as exc:
             if isinstance(exc, grpc.Call) and exc.code() == grpc.StatusCode.NOT_FOUND:
                 self._ids.pop(name, None)
@@ -298,9 +309,10 @@ class _OpenShellClient:
     def _id_for(self, name: str) -> str:
         cached = self._ids.get(name)
         if cached is None:
+            ws = self._workspace
             ref = self._guard(
                 f"Could not resolve OpenShell sandbox '{name}'",
-                lambda: self._client.get(name),
+                lambda: self._client.get(name, workspace=ws),
             )
             cached = ref.id
             self._ids[name] = cached
@@ -335,6 +347,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         image: str | None = None,
         env: Sequence[str] | None = None,
         cluster: str | None = None,
+        workspace: str | None = None,
     ) -> None:
         """
         :param image: Registry image to provision from
@@ -347,10 +360,14 @@ class OpenShellSandboxLauncher(SandboxLauncher):
             (``sandbox.openshell.cluster``); ``None`` lets the SDK
             resolve the active gateway (``$OPENSHELL_GATEWAY`` or
             ``~/.config/openshell/active_gateway``).
+        :param workspace: OpenShell workspace for sandbox lifecycle
+            (``sandbox.openshell.workspace``); ``None`` resolves
+            :data:`WORKSPACE_ENV_VAR` then ``"default"``.
         """
         self._image_ref = image
         self._env_names = tuple(env) if env is not None else None
         self._cluster = cluster
+        self._workspace = workspace or os.environ.get(WORKSPACE_ENV_VAR) or _DEFAULT_WORKSPACE
         self._client: _OpenShellClient | None = None
 
     def prepare(self) -> None:
@@ -487,7 +504,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
 
     def _openshell(self) -> _OpenShellClient:
         if self._client is None:
-            self._client = _OpenShellClient(cluster=self._cluster)
+            self._client = _OpenShellClient(cluster=self._cluster, workspace=self._workspace)
         return self._client
 
     def _resolve_sandbox_env(self) -> dict[str, str]:

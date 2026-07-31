@@ -30,6 +30,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.pi_executor import (
     PiExecutor,
     _build_models_json,
+    _databricks_model_wire_catalog,
     _generate_extension_js,
     _pi_provider_for_model,
     _PiRpcSession,
@@ -39,6 +40,8 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
+from omnigent.model_catalog import ModelEntry
+from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -341,7 +344,41 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
 
 class TestPiProviderForModel(unittest.TestCase):
     def test_gpt_model(self):
-        self.assertEqual(_pi_provider_for_model("databricks-gpt-5-4-mini"), "databricks")
+        self.assertEqual(_pi_provider_for_model("databricks-gpt-5-4-mini"), "databricks-openai")
+
+    def test_catalog_chat_only_gpt_model(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "databricks-gpt-next",
+                frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+            "databricks",
+        )
+
+    def test_catalog_responses_gpt_model(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "databricks-gpt-next",
+                frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+            ),
+            "databricks-openai",
+        )
+
+    def test_generic_provider_uses_configured_wire(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "gpt-next",
+                generic_openai_wire_api="chat",
+            ),
+            "databricks-completions",
+        )
+        self.assertEqual(
+            _pi_provider_for_model(
+                "gpt-next",
+                generic_openai_wire_api="responses",
+            ),
+            "databricks-openai",
+        )
 
     def test_claude_model(self):
         self.assertEqual(
@@ -547,6 +584,44 @@ class TestBuildModelsJson(unittest.TestCase):
         p = result["providers"]
         self.assertEqual(p["databricks"]["baseUrl"], "https://openrouter.ai/api/v1")
         self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
+
+    def test_generic_openai_model_uses_configured_responses_wire(self):
+        result = _build_models_json(
+            "https://unused.example.com",
+            "tok",
+            {"openai": "https://gateway.example.com/v1"},
+            model="vendor/model-next",
+            openai_wire_api="responses",
+        )
+
+        responses = result["providers"]["databricks-openai"]
+        self.assertEqual(responses["baseUrl"], "https://gateway.example.com/v1")
+        self.assertIn("vendor/model-next", [entry["id"] for entry in responses["models"]])
+
+    def test_dedicated_gateway_uses_catalog_wire_and_workspace_chat_url(self):
+        result = _build_models_json(
+            "https://workspace.cloud.databricks.com",
+            "tok",
+            {
+                "openai": "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+            },
+            model="databricks-gpt-next",
+            model_wire_apis={
+                "databricks-gpt-next": frozenset({ModelWireAPI.OPENAI_CHAT}),
+            },
+            openai_wire_api="responses",
+        )
+
+        chat = result["providers"]["databricks"]
+        self.assertEqual(
+            chat["baseUrl"],
+            "https://workspace.cloud.databricks.com/serving-endpoints",
+        )
+        self.assertIn("databricks-gpt-next", [entry["id"] for entry in chat["models"]])
+        self.assertEqual(
+            result["providers"]["databricks-openai"]["baseUrl"],
+            "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+        )
 
     def test_api_key_set(self):
         result = _build_models_json("https://host.example.com", "mytoken")
@@ -2929,6 +3004,108 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
     assert _run(executor._resolve_model(ExecutorConfig(model=None))) == "databricks-gpt-5-4"
 
 
+def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
+    """The inner Pi executor reuses UC metadata for endpoint-style model ids."""
+    responses = frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    entries = (
+        ModelEntry(
+            id="system.ai.gpt-next",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=responses),
+        ),
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            return_value=entries,
+        ) as fetch,
+    ):
+        executor = PiExecutor(gateway=True)
+        first = _run(executor._load_gateway_model_wire_apis())
+        second = _run(executor._load_gateway_model_wire_apis())
+
+    assert first["databricks-gpt-next"] == responses
+    assert second is first
+    fetch.assert_called_once_with("https://h.example.com", "tok")
+
+
+def test_gateway_wire_catalog_failure_is_cached() -> None:
+    """A catalog outage does not delay every later Pi subprocess startup."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            side_effect=OSError("offline"),
+        ) as fetch,
+    ):
+        executor = PiExecutor(gateway=True)
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+
+    fetch.assert_called_once_with("https://h.example.com", "tok")
+
+
+def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
+    """Dedicated gateway hosts resolve their workspace before UC discovery."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            return_value="gateway-token",
+        ),
+        patch(
+            "omnigent.pi_native_credentials.resolve_databricks_workspace",
+            return_value=SimpleNamespace(host="https://workspace.cloud.databricks.com"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            return_value=(),
+        ) as fetch,
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host="https://123.ai-gateway.cloud.databricks.com",
+            base_urls_override={"claude": "https://123.ai-gateway.cloud.databricks.com/anthropic"},
+            gateway_auth_command="printf token",
+        )
+        _run(executor._load_gateway_model_wire_apis())
+
+    fetch.assert_called_once_with(
+        "https://workspace.cloud.databricks.com",
+        "gateway-token",
+    )
+
+
+def test_generic_anthropic_gateway_skips_databricks_wire_catalog() -> None:
+    """A generic provider must not receive Databricks workspace API requests."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            return_value="provider-key",
+        ),
+        patch("omnigent.model_catalog.fetch_databricks_model_service_entries") as fetch,
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host="https://anthropic.example.com",
+            base_urls_override={"claude": "https://anthropic.example.com/v1"},
+            gateway_auth_command="printf token",
+        )
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+
+    fetch.assert_not_called()
+
+
 def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
     """
     On the ucode-cached gateway path (gateway host + auth command supplied
@@ -2977,7 +3154,17 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
     Anthropic passthrough, the llama endpoint 404s) fails at request time
     for anyone who selects it.
     """
-    models = _build_models_json("https://host.example.com", "tok")
+    wire_catalog = {
+        "databricks-gpt-5-4-mini": frozenset({ModelWireAPI.OPENAI_CHAT}),
+        "databricks-gpt-5-4": frozenset({ModelWireAPI.OPENAI_CHAT}),
+        "databricks-gpt-5-5": frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+        "databricks-gpt-5-5-pro": frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+    }
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        model_wire_apis=wire_catalog,
+    )
     providers = models["providers"]
     anthropic_ids = [m["id"] for m in providers["databricks-anthropic"]["models"]]
     assert anthropic_ids == [
@@ -3000,6 +3187,36 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
     # The llama serving endpoint no longer exists; the provider stays as
     # the routing home for future non-Claude/GPT endpoints.
     assert providers["databricks-completions"]["models"] == []
+
+
+def test_models_json_unknown_gpt_metadata_fails_toward_responses() -> None:
+    """An offline catalog never sends a newly released GPT to Chat by guess."""
+    models = _build_models_json("https://host.example.com", "tok")
+
+    assert models["providers"]["databricks"]["models"] == []
+    assert [model["id"] for model in models["providers"]["databricks-openai"]["models"]] == [
+        "databricks-gpt-5-4-mini",
+        "databricks-gpt-5-4",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+    ]
+
+
+def test_databricks_wire_catalog_indexes_system_and_endpoint_aliases() -> None:
+    """UC system ids supply wire metadata for serving-endpoint aliases."""
+    wire_apis = frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    catalog = _databricks_model_wire_catalog(
+        [
+            ModelEntry(
+                id="system.ai.gpt-next",
+                family="openai",
+                metadata=ModelMetadata(wire_apis=wire_apis),
+            )
+        ]
+    )
+
+    assert catalog["system.ai.gpt-next"] == wire_apis
+    assert catalog["databricks-gpt-next"] == wire_apis
 
 
 def test_models_json_uses_oss_verified_gpt_55_caps() -> None:

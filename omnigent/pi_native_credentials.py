@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from omnigent import model_catalog
+from omnigent.model_metadata import ModelWireAPI
 from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
     CHAT_WIRE_API,
@@ -41,6 +44,11 @@ from omnigent.onboarding.provider_config import (
     default_provider_for_harness,
     load_config,
 )
+from omnigent.pi_model_compatibility import (
+    SYSTEM_AI_RESPONSES_KEYWORDS,
+    unsupported_in_pi,
+)
+from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
 if TYPE_CHECKING:
     # Annotation-only import (the runtime import is lazy inside the function,
@@ -67,15 +75,6 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 # work via /chat/completions: Kimi, Llama, GLM, Gemini, older GPT models).
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 _PI_MLFLOW_PROVIDER_ID = "omnigent-mlflow"
-
-# Keyword fragments that identify Databricks serving-endpoint models which
-# require the Responses API. These models don't send finish_reason via
-# /chat/completions but work correctly via /ai-gateway/codex/v1/responses
-# using their system.ai.* alias (derived by stripping "databricks-" prefix).
-# Use specific enough fragments to avoid false-positives (e.g. bare "glm" would
-# match "zai-org-glm-4-7" which has no system.ai.* alias; "glm-" avoids that).
-_SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "glm-")
-
 
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
@@ -145,6 +144,35 @@ def _is_databricks_ai_gateway_url(base_url: str) -> bool:
     return path.startswith("/ai-gateway/")
 
 
+def _databricks_workspace_url_for_gateway(
+    base_url: str,
+    *,
+    profile: str | None = None,
+) -> str | None:
+    """Resolve the workspace API origin behind a Databricks AI Gateway URL.
+
+    Workspace-hosted gateways already expose the workspace hostname. Dedicated
+    ``ai-gateway`` subdomains require the configured Databricks profile because
+    the gateway hostname itself does not serve workspace APIs.
+
+    :param base_url: Gateway protocol URL or origin.
+    :param profile: Optional Databricks profile for dedicated gateway hosts.
+    :returns: Workspace origin, or ``None`` for non-Databricks/unresolved URLs.
+    """
+    if not _is_databricks_ai_gateway_url(base_url):
+        return None
+    parsed = urlparse(base_url)
+    hostname = parsed.hostname
+    if hostname is None:
+        return None
+    if _DATABRICKS_AI_GATEWAY_LABEL not in hostname.lower().split("."):
+        return f"https://{hostname}"
+    try:
+        return resolve_databricks_workspace(profile).host
+    except Exception:  # noqa: BLE001 — absent profile disables optional discovery
+        return None
+
+
 @dataclass(frozen=True)
 class PiProviderConfig:
     """A resolved native-Pi provider, ready to render into ``models.json``.
@@ -201,7 +229,7 @@ class PiProviderConfig:
             if (
                 not any(m.get("id") == self.model for m in models)
                 and not in_additional
-                and not _unsupported_in_pi(self.model.lower())
+                and not unsupported_in_pi(self.model.lower())
             ):
                 models.append({"id": self.model, "input": ["text", "image"]})
         else:
@@ -255,8 +283,6 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     completions_models: list[dict[str, Any]] = []
     gemini_models: list[dict[str, Any]] = []
     try:
-        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-
         creds = resolve_databricks_workspace(entry.profile)
     except Exception:  # noqa: BLE001 — credential failure must not break launch
         _LOGGER.info(
@@ -366,9 +392,6 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
     :returns: Stripped stdout (the token), or ``None`` when the command
         fails, times out, or produces empty output.
     """
-    import shlex
-    import subprocess
-
     try:
         result = subprocess.run(
             shlex.split(auth_command),
@@ -381,59 +404,6 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         return result.stdout.strip() or None
     except Exception:  # noqa: BLE001 — any subprocess failure should just return None
         return None
-
-
-# GPT model versions known to work fine with /chat/completions + function tools.
-# Any GPT model NOT in this set defaults to the Responses API (safer default for
-# newer models we haven't explicitly tested with completions).
-# These token fragments identify GPT models that work fine with
-# /chat/completions + function tools. Any GPT model whose id does NOT contain
-# one of these tokens defaults to the Responses API (safer for new models).
-# Use specific enough tokens so "gpt-5" doesn't match "gpt-5-5".
-_GPT_COMPLETIONS_COMPATIBLE: frozenset[str] = frozenset(
-    {
-        "gpt-5-4",  # gpt-5-4, gpt-5-4-mini, gpt-5-4-nano
-        "gpt-5-2",
-        "gpt-5-1",
-        "gpt-5-mini",
-        "gpt-5-nano",
-        "gpt-oss",
-    }
-)
-
-
-def _needs_responses_api(model_id_lower: str) -> bool:
-    """Return True when a GPT model requires the Responses API for tools.
-
-    Some GPT models reject function tool calls via ``/chat/completions`` with
-    400; they work via the AI Gateway Responses API instead. Rather than
-    maintaining a denylist of newer versions, we maintain an allowlist of models
-    known to work with completions. Any GPT model not in the allowlist defaults
-    to the Responses API — safer for new models we haven't tested.
-
-    Non-GPT models are handled separately (Kimi/inkling/Qwen3 routed via
-    system.ai.* Responses API; Gemini excluded via _unsupported_in_pi).
-
-    Expects a pre-lowercased model id.
-    """
-    if "gpt" not in model_id_lower:
-        return False
-    return not any(token in model_id_lower for token in _GPT_COMPLETIONS_COMPATIBLE)
-
-
-def _unsupported_in_pi(model_id_lower: str) -> bool:
-    """Return True for models Pi can't handle at all.
-
-    - gemini-2-5: returns ``content`` as a typed array with ``thoughtSignature``
-      that Pi's completions handler mangles; Responses API returns 400 for it.
-    - gpt-oss: returns typed-array content that Pi's openai-completions handler
-      can't parse (same ``[object Object]`` issue as gemini-2-5).
-
-    Other Gemini variants route via /ai-gateway/mlflow/v1/chat/completions.
-
-    Expects a pre-lowercased model id.
-    """
-    return "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower
 
 
 def _fetch_pi_model_lists(
@@ -463,16 +433,8 @@ def _fetch_pi_model_lists(
     :returns: ``(claude_models, gpt_responses_models, completions_models, gemini_models)`` —
         Pi model entry dicts ready to write into ``models.json``.
     """
-    import httpx
-
     try:
-        with httpx.Client(timeout=10.0) as client:
-            resp = client.get(
-                f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            resp.raise_for_status()
-            payload = resp.json()
+        models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
     except Exception:  # noqa: BLE001 — HTTP/network failure → empty
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "
@@ -481,46 +443,25 @@ def _fetch_pi_model_lists(
         )
         return [], [], [], []
 
-    services = payload.get("model_services") if isinstance(payload, dict) else None
     claude: list[dict[str, Any]] = []
     gpt_responses: list[dict[str, Any]] = []
     completions: list[dict[str, Any]] = []
     gemini: list[dict[str, Any]] = []
 
-    for service in services if isinstance(services, list) else []:
-        if not isinstance(service, dict):
-            continue
-        raw_name = service.get("name", "")
-        # Name format: "model-services/system.ai.<model>"
-        name = (
-            raw_name.replace("model-services/", "")
-            if raw_name.startswith("model-services/")
-            else raw_name
-        )
-        if not name:
-            continue
+    for model in models:
+        name = model.id
         name_lower = name.lower()
-        # Filter to chat-capable LLM endpoints (exclude embeddings/rerankers).
-        api_types = service.get("supported_api_types", [])
-        has_chat = any("chat" in t for t in api_types)
-        has_embedding = any("embed" in t.lower() for t in api_types)
-        if not has_chat or has_embedding:
-            continue
-        # Models that support the Responses API use it directly.
-        has_responses = "openai/v1/responses" in api_types
         entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
         # DeepSeek streams on reasoning_content; needs reasoning:true so Pi reads
         # from that channel. GLM/kimi/inkling now use Responses API, not needed.
         if "deepseek" in name_lower:
             entry["reasoning"] = True
-        needs_responses = (
-            has_responses
-            or _needs_responses_api(name_lower)
-            or any(kw in name_lower for kw in _SYSTEM_AI_MODEL_KEYWORDS)
+        needs_responses = ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis or any(
+            keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
         )
         if "claude" in name_lower:
             claude.append(entry)
-        elif _unsupported_in_pi(name_lower):
+        elif unsupported_in_pi(name_lower):
             pass  # exclude (e.g. gemini-2-5 thinking models)
         elif needs_responses:
             # Responses API: GPT models that need it + kimi/inkling/qwen3/glm keywords.
@@ -634,7 +575,6 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
         # Try to build a !command using the SDK, same as the databricks-kind path.
         try:
             from omnigent.inner.codex_executor import _databricks_codex_auth_command
-            from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
             ws = resolve_databricks_workspace(None)
             auth_cmd = _databricks_codex_auth_command(ws.host, None)
@@ -716,28 +656,14 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     gpt_models: list[dict[str, Any]] = []
     completions_models: list[dict[str, Any]] = []
     gemini_models: list[dict[str, Any]] = []
-    # Derive the workspace URL for the serving-endpoints API call.
-    # For dedicated-subdomain URLs (ai-gateway.cloud.databricks.com), the
-    # real workspace hostname must come from ~/.databrickscfg. For
-    # workspace-hosted gateway URLs (workspace.cloud.databricks.com/ai-gateway/),
-    # the transport's own hostname IS the workspace.
     parsed_gateway = urlparse(transport.base_url)
     gateway_labels = (parsed_gateway.hostname or "").split(".")
-    if _DATABRICKS_AI_GATEWAY_LABEL in gateway_labels:
-        # Dedicated subdomain: derive workspace from ~/.databrickscfg DEFAULT.
-        real_workspace_url: str | None = None
-        try:
-            from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-
-            real_workspace_url = resolve_databricks_workspace(None).host
-        except Exception:  # noqa: BLE001 — no .databrickscfg → skip listing
-            _LOGGER.info(
-                "pi-native: cli-config path could not resolve workspace URL "
-                "for model listing; Pi will show only the selected model"
-            )
-    else:
-        # Workspace-hosted gateway: the transport hostname is the workspace.
-        real_workspace_url = f"https://{parsed_gateway.hostname}"
+    real_workspace_url = _databricks_workspace_url_for_gateway(transport.base_url)
+    if real_workspace_url is None:
+        _LOGGER.info(
+            "pi-native: cli-config path could not resolve workspace URL "
+            "for model listing; Pi will show only the selected model"
+        )
     if real_workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:

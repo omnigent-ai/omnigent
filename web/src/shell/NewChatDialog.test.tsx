@@ -1,3 +1,8 @@
+import type * as IdentityModule from "@/lib/identity";
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as ChatStoreModule from "@/store/chatStore";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -43,7 +48,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // Only authenticatedFetch is stubbed (the create POST under test);
 // the module's other exports stay real for any other consumer in the tree.
 vi.mock("@/lib/identity", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/identity")>()),
+  ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({
@@ -87,7 +92,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // empty list so it doesn't fire its own authenticatedFetch (which would skew
 // the create-POST call-count / call-order assertions below).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  ...(await importOriginal<typeof UseConversationsModule>()),
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
@@ -95,7 +100,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",
@@ -131,7 +136,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 // tests can assert the prepended attachment marker. Everything else
 // (composerAttachmentKey, useChatStore, …) stays real for the render tree.
 vi.mock("@/store/chatStore", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/store/chatStore")>()),
+  ...(await importOriginal<typeof ChatStoreModule>()),
   setPendingInitialPrompt: vi.fn(),
 }));
 

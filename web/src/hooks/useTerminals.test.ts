@@ -31,6 +31,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(() => undefined),
 }));
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+
 const runnerOnlineMock = vi.mocked(useSessionRunnerOnline);
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {

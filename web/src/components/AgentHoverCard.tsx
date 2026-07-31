@@ -52,7 +52,7 @@ export function AgentHoverCard({
   agent: AvailableAgent;
   children: React.ReactNode;
 }) {
-  if (!agent.description) return <>{children}</>;
+  if (!agent.description) return children;
 
   return (
     // openDelay matches the screenshot's feel — a brief pause before the
@@ -101,7 +101,7 @@ export function AgentRowTooltip({
   agent: AvailableAgent;
   children: React.ReactNode;
 }) {
-  if (!agent.description) return <>{children}</>;
+  if (!agent.description) return children;
 
   return (
     <Tooltip>
