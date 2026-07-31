@@ -8,9 +8,11 @@ conservative 128K fallback.
 
 from __future__ import annotations
 
+import importlib
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 
 from omnigent.onboarding.providers import ModelInfo, find_catalog_models
 
@@ -18,6 +20,10 @@ _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
 _ANTHROPIC_1M_BETA_SUFFIX = "[1m]"
 _ANTHROPIC_1M_BETA_WINDOW = 1_000_000
+
+
+class _LiteLLM(Protocol):
+    def get_model_info(self, model: str) -> Mapping[str, object]: ...
 
 
 def _encoded_context_window(model: str) -> int | None:
@@ -84,14 +90,14 @@ def get_model_context_window(model: str) -> int:
     if catalog_window is not None:
         return catalog_window
     try:
-        import litellm
+        litellm = cast(_LiteLLM, importlib.import_module("litellm"))
     except ImportError:
         return _DEFAULT_CONTEXT_WINDOW
     try:
         info = litellm.get_model_info(model)
         if info:
             limit = info.get("max_input_tokens")
-            if limit:
+            if isinstance(limit, (int, float, str)) and limit:
                 return int(limit)
     except Exception:
         pass
@@ -100,7 +106,7 @@ def get_model_context_window(model: str) -> int:
             info = litellm.get_model_info(f"databricks/{model}")
             if info:
                 limit = info.get("max_input_tokens")
-                if limit:
+                if isinstance(limit, (int, float, str)) and limit:
                     return int(limit)
         except Exception:
             pass

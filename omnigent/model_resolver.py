@@ -19,9 +19,14 @@ from omnigent.model_metadata import (
 class ModelCandidate(Protocol):
     """Catalog entry shape consumed by :func:`resolve_model`."""
 
-    id: str
-    family: str
-    metadata: ModelMetadata
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def family(self) -> str: ...
+
+    @property
+    def metadata(self) -> ModelMetadata: ...
 
 
 class ModelResolutionSource(str, Enum):

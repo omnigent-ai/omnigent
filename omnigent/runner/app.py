@@ -154,6 +154,32 @@ from omnigent.tools.builtins.load_skill import (
 _logger = logging.getLogger(__name__)
 
 
+def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
+    """
+    Log that a sub-agent name did not resolve to a declared child spec.
+
+    Every spec-swap site is guarded by ``if sub_spec is not None`` with no
+    ``else`` and falls back to the already-resolved PARENT spec — so a
+    renamed/removed sub-agent or stale session metadata silently boots the
+    child as a parent clone (parent prompt, tools, harness, workdir). The
+    create route now rejects an undeclared name up front, but stale rows
+    and post-create bundle edits can still reach these sites; a loud log
+    makes the fallback diagnosable instead of invisible.
+
+    :param session_id: The session whose turn is resolving the spec.
+    :param sub_agent_name: The name that failed to resolve in the parent
+        spec tree.
+    """
+    _logger.warning(
+        "Sub-agent %r for session %s did not resolve in the parent spec; "
+        "falling back to the parent spec (child runs with the parent's "
+        "prompt, tools and harness). Likely a renamed/removed sub-agent or "
+        "stale session metadata.",
+        sub_agent_name,
+        session_id,
+    )
+
+
 def __getattr__(name: str) -> Any:
     """Preserve private native-helper imports during the package move."""
     return getattr(_native, name)
@@ -1797,6 +1823,7 @@ def create_runner_app(
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
         str, asyncio.Task[ClaudeNativeUcodeConfig | None]
@@ -2549,6 +2576,8 @@ def create_runner_app(
                         if _resolved_spec_workdir(spec_entry) is not None
                         else spec
                     )
+                else:
+                    _warn_unresolved_sub_agent(session_id, _sa_name_assign)
             harness_name = spec.executor.config.get("harness") or spec.executor.type
             harness_name = canonicalize_harness(harness_name) or harness_name
 
@@ -3099,6 +3128,7 @@ def create_runner_app(
 
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
@@ -3775,7 +3805,10 @@ def create_runner_app(
         )
 
     async def _codex_native_model_options(conv_id: str) -> list[dict[str, Any]]:
-        from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.codex_native_app_server import (
+            client_for_transport,
+            list_codex_model_options,
+        )
 
         state = await _codex_native_bridge_state_for_session(
             conv_id,
@@ -3789,35 +3822,12 @@ def create_runner_app(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
-        options: list[dict[str, Any]] = []
         try:
             await codex_client.connect()
-            cursor: str | None = None
-            while True:
-                params: dict[str, Any] = {"includeHidden": False}
-                if cursor is not None:
-                    params["cursor"] = cursor
-                response = await codex_client.request("model/list", params)
-                result = response.get("result")
-                if not isinstance(result, dict):
-                    raise ValueError("Codex model/list result must be an object")
-                data = result.get("data")
-                if not isinstance(data, list):
-                    raise ValueError("Codex model/list data must be a list")
-                for raw_model in data:
-                    if not isinstance(raw_model, dict):
-                        raise ValueError("Codex model/list item must be an object")
-                    options.append(raw_model)
-                next_cursor = result.get("nextCursor")
-                if next_cursor is None:
-                    break
-                if not isinstance(next_cursor, str) or not next_cursor:
-                    raise ValueError("Codex model/list nextCursor must be a string or null")
-                cursor = next_cursor
+            return await list_codex_model_options(codex_client)
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        return options
 
     async def _handle_pi_native_model_change(
         conv_id: str,
@@ -3970,11 +3980,14 @@ def create_runner_app(
         if model is None or not model.strip():
             return Response(status_code=204)
         bridge_dir = bridge_dir_for_session_id(conv_id)
+        selected_model = model.strip()
+        expected_display_name = _session_cursor_model_names.get(conv_id, {}).get(selected_model)
         try:
             await asyncio.to_thread(
                 inject_model_command,
                 bridge_dir,
-                model=model.strip(),
+                model=selected_model,
+                expected_display_name=expected_display_name,
                 timeout_s=1.0,
             )
         except (RuntimeError, ValueError) as exc:
@@ -4905,6 +4918,7 @@ def create_runner_app(
             )
             _session_spec_cache.pop(conv, None)
             _session_skills_cache.pop(conv, None)
+            _session_cursor_model_names.pop(conv, None)
             _drop_session_claude_launch_config(conv)
             _session_tool_schemas.pop(conv, None)
             _session_snapshot_cache.pop(conv, None)
@@ -4957,6 +4971,8 @@ def create_runner_app(
                     if cached_spec_workdir is not None
                     else cached_spec
                 )
+            else:
+                _warn_unresolved_sub_agent(conv, _sa_name)
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
         if cached_spec is not None:
@@ -7336,6 +7352,8 @@ def create_runner_app(
                             if workdir is not None
                             else sub_spec
                         )
+                    else:
+                        _warn_unresolved_sub_agent(session_id, sub_agent_name)
             _session_spec_cache[session_id] = spec_entry
             return spec_entry
 
@@ -7511,6 +7529,36 @@ def create_runner_app(
                     "detail": _client_safe_error_detail(exc, context="kiro-native model options"),
                 },
             )
+        return JSONResponse(status_code=200, content={"models": models})
+
+    @app.get("/v1/sessions/{session_id}/cursor-model-options")
+    async def get_session_cursor_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "cursor-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.cursor_native import list_cursor_cli_model_options
+
+        try:
+            models = await asyncio.to_thread(list_cursor_cli_model_options)
+        except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+            _logger.warning(
+                "Cursor-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "cursor_native_model_options_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="cursor-native model options"
+                    ),
+                },
+            )
+        _session_cursor_model_names[session_id] = {
+            str(option["id"]): str(option["displayName"])
+            for option in models
+            if option.get("id") and option.get("displayName")
+        }
         return JSONResponse(status_code=200, content={"models": models})
 
     @app.get("/v1/sessions/{session_id}/claude-model-options")
@@ -7758,6 +7806,7 @@ def create_runner_app(
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
@@ -8477,6 +8526,8 @@ async def _resolve_harness_config(
                 sub_spec = _find_spec_by_name(spec, sub_agent_name)
                 if sub_spec is not None:
                     spec = sub_spec
+                else:
+                    _warn_unresolved_sub_agent(session_id, sub_agent_name)
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(

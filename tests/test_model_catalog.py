@@ -31,6 +31,7 @@ from omnigent.model_catalog import (
     resolve_model_provider,
     spec_harness,
 )
+from omnigent.model_fallbacks import static_model_fallback
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -840,6 +841,14 @@ def test_subscription_listing_is_static_and_unverified(
         "claude-haiku-4-5",
     ]
     assert "CLI login" in listing.note
+    assert listing.static_fallback is not None
+    assert listing.static_fallback.owner == "Claude subscription adapter"
+    payload = model_catalog._listing_payload(listing)
+    assert payload["static_fallback"] == {
+        "owner": "Claude subscription adapter",
+        "provenance": "Omnigent's release-curated Claude Code alias catalog",
+        "discovery_gap": "Claude subscription logins expose no model-listing API",
+    }
 
 
 def test_cli_config_listing_is_static_and_unverified(
@@ -859,30 +868,94 @@ def test_cli_config_listing_is_static_and_unverified(
     listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
     assert listing.source == "static"
     assert listing.verified is False
-    assert [m.id for m in listing.models] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+    assert [m.id for m in listing.models] == [
+        "gpt-5-6-sol",
+        "gpt-5-6-luna",
+        "gpt-5-6-terra",
+        "gpt-5-5",
+    ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.
     assert "resolved by the CLI at launch" in listing.note
     assert "cannot run here" not in listing.note
+    assert listing.static_fallback is not None
+    assert listing.static_fallback.owner == "Codex CLI-config adapter"
 
 
-def test_cursor_listing_is_static_with_curated_base_models(
+@pytest.mark.parametrize(
+    ("provider_kind", "cli"),
+    [
+        ("subscription", "claude"),
+        ("subscription", "codex"),
+        ("cli-config", "codex"),
+    ],
+)
+def test_static_model_fallbacks_document_ownership(
+    provider_kind: str,
+    cli: str,
+) -> None:
+    """Every registered fallback explains who owns it and why it exists."""
+    fallback = static_model_fallback(provider_kind, cli)
+
+    assert fallback is not None
+    assert fallback.model_ids
+    assert fallback.owner
+    assert fallback.provenance
+    assert fallback.discovery_gap
+
+
+def test_cursor_listing_uses_live_cli_base_models(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A cursor worker lists the curated cursor-agent base models.
+    """A cursor worker lists base models discovered from cursor-agent.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     """
+    from omnigent import cursor_native
+
     _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.setattr(
+        cursor_native,
+        "list_cursor_cli_model_options",
+        lambda: [
+            {
+                "id": "provider-latest",
+                "displayName": "Provider Latest",
+                "isDefault": True,
+                "isCurrent": False,
+            }
+        ],
+    )
     listing = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
-    assert listing.source == "static"
-    assert listing.verified is False
-    ids = [m.id for m in listing.models]
-    # Spot-check the picker catalog rather than pinning the whole list —
-    # it is regenerated when cursor ships models.
-    assert "composer-2.5" in ids
-    assert "cannot run here" not in listing.note
+    assert listing.source == "cli"
+    assert listing.verified is True
+    assert [m.id for m in listing.models] == ["provider-latest"]
+    assert "live models advertised" in listing.note
+
+
+def test_cursor_listing_failure_is_empty_and_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A transient Cursor CLI failure does not cache an empty catalog."""
+    from omnigent import cursor_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    calls = 0
+
+    def fail() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        raise OSError("cursor unavailable")
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", fail)
+
+    first = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+    second = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+
+    assert first.source == second.source == "none"
+    assert first.models == second.models == ()
+    assert calls == 2
 
 
 def test_none_listing_explains_dead_worker(

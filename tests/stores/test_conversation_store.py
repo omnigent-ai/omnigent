@@ -1092,6 +1092,28 @@ def test_list_items_before_cursor(
     assert [it.id for it in page.data] == [items[i].id for i in range(3)]
 
 
+def test_list_items_cursor_scoped_to_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A cursor id from another conversation resolves to no position.
+
+    The cursor subquery is scoped to conversation_id so it stays a
+    primary-key point lookup. A foreign cursor id therefore matches no
+    row, the scalar subquery is NULL, and the position comparison yields
+    an empty page rather than silently using the other conversation's
+    position as a cutoff.
+    """
+    conv = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+    _make_5_items(conversation_store, conv.id)
+    other_items = _make_5_items(conversation_store, other.id)
+
+    after_page = conversation_store.list_items(conv.id, after=other_items[1].id)
+    assert after_page.data == []
+    before_page = conversation_store.list_items(conv.id, before=other_items[1].id)
+    assert before_page.data == []
+
+
 # ── Conversation ID / response ID lookups ────────────
 
 

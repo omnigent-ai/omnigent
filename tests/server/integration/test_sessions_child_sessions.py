@@ -1357,6 +1357,41 @@ async def test_native_subagent_yolo_args_reject_overlong_spec_value(
     assert "invalid terminal_launch_args in sub-agent spec" in error["message"]
 
 
+async def test_subagent_create_rejects_undeclared_name(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A ``sub_agent_name`` the parent's spec does not declare fails the create.
+
+    The downstream spec-swap sites are all guarded by ``if ... is not None``
+    with no ``else``: a name that resolves to nothing would leave the
+    parent's spec, workdir, harness and instructions in place and boot the
+    child as a full clone of the parent — silently escalating a worker to
+    the orchestrator's capability and instruction surface. The create route
+    must reject the undeclared name up front (404) so nothing is persisted,
+    mirroring normal ``sys_session_send`` dispatch and the AGENTSPEC.md
+    contract that unlisted names are rejected.
+    """
+    parent = await _create_parent_with_subagents(
+        client,
+        name="orch-undeclared-subagent",
+        sub_agents=[{"name": "impl", "harness": "claude-native"}],
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["session_id"],
+            "title": "ghost:task",
+            "sub_agent_name": "does-not-exist",
+        },
+    )
+    assert resp.status_code == 404, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "not_found"
+    assert "does-not-exist" in error["message"]
+
+
 @pytest.mark.parametrize(
     "sub_config,expected_persisted",
     [

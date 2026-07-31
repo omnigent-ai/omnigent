@@ -59,6 +59,69 @@ class TestPromptExtraction(unittest.TestCase):
             "Second question",
         )
 
+    def test_resumed_session_includes_all_trailing_user_messages(self):
+        """Batched buffered steers: all trailing user messages must reach the SDK.
+
+        When the runner collapses several buffered steered messages into one
+        continuation turn, history ends in >1 consecutive user message the SDK
+        has never seen. Sending only the last silently drops the earlier ones
+        (the two-steer "second message ignored" bug). All trailing user
+        messages must be concatenated into the prompt.
+        """
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "steer one"},
+            {"role": "user", "content": "steer two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("steer one", prompt)
+        self.assertIn("steer two", prompt)
+        # Prior turns are SDK-cached on resume — not replayed.
+        self.assertNotIn("First question", prompt)
+
+    def test_resumed_session_trailing_run_stops_at_assistant(self):
+        """Only the trailing run of user messages (after the last non-user) is sent."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "old one"},
+            {"role": "user", "content": "old two"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "new one"},
+            {"role": "user", "content": "new two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("new one", prompt)
+        self.assertIn("new two", prompt)
+        self.assertNotIn("old one", prompt)
+        self.assertNotIn("old two", prompt)
+
+    def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
+        """A multimodal message in the trailing run keeps structured blocks for all."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "describe this"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,aGVsbG8=",
+                    },
+                    {"type": "input_text", "text": "and this too"},
+                ],
+            },
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIsInstance(prompt, list)
+        types = [b.get("type") for b in prompt]
+        self.assertIn("image", types)
+        joined = " ".join(b.get("text", "") for b in prompt if b.get("type") == "text")
+        self.assertIn("describe this", joined)
+        self.assertIn("and this too", joined)
+
     def test_empty_messages(self):
         executor = self._make_executor()
         self.assertEqual(executor._build_prompt([], resume_session=False), "")
@@ -4380,3 +4443,44 @@ def test_find_system_claude_delegates_to_shared_resolver(monkeypatch) -> None:
     monkeypatch.setattr(cse, "resolve_cli_binary", fake_resolve)
     assert cse._find_system_claude() == "/opt/homebrew/bin/claude"
     assert captured == {"name": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
+
+
+def test_claude_sdk_does_not_claim_live_message_queue() -> None:
+    """ClaudeSDKExecutor must not advertise live message queue support.
+
+    query() queues a new turn on stdin rather than injecting into the active
+    turn, so returning True from enqueue_session_message caused a permanent
+    one-turn-behind desync (issue #3472). The executor must return False from
+    both methods so the adapter keeps the message buffered and delivers it as
+    a continuation turn after the active turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    assert executor.supports_live_message_queue() is False
+
+
+@pytest.mark.asyncio
+async def test_enqueue_session_message_returns_false_without_queuing() -> None:
+    """enqueue_session_message must return False and never call query().
+
+    Calling query() while a turn is active queues a new turn, not an
+    in-turn injection, which produces the desync from issue #3472.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    query_called = False
+
+    class _FakeClient:
+        async def query(self, *args, **kwargs):
+            nonlocal query_called
+            query_called = True
+
+    # Inject a fake client state so the session key is known.
+    executor._clients["s1"] = SimpleNamespace(client=_FakeClient())
+
+    result = await executor.enqueue_session_message("s1", "hello")
+
+    assert result is False
+    assert not query_called, "query() must not be called during enqueue"

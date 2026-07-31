@@ -239,7 +239,8 @@ async def _get_anthropic_model_metadata(
     cache_key = (base_url, model, credential_partition)
     with _MODEL_METADATA_CACHE_LOCK:
         if cache_key in _MODEL_METADATA_CACHE:
-            return _MODEL_METADATA_CACHE[cache_key]
+            cached: ModelMetadata = _MODEL_METADATA_CACHE[cache_key]
+            return cached
         task = _MODEL_METADATA_IN_FLIGHT.get(cache_key)
         if task is None:
             task = asyncio.create_task(
