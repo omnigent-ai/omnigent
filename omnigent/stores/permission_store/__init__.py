@@ -81,6 +81,19 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
+    def reassign_user_grants(self, from_user_id: str, to_user_id: str) -> int:
+        """Move one user's grants to another user.
+
+        Existing destination grants win when both users have access to the
+        same session, and the duplicate source grant is removed.
+
+        :param from_user_id: Source grantee whose grants move.
+        :param to_user_id: Destination grantee that receives them.
+        :returns: Number of grants moved to *to_user_id*.
+        """
+        ...
+
+    @abstractmethod
     def list_for_session(
         self,
         conversation_id: str,
