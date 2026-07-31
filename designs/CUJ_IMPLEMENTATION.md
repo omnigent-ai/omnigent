@@ -6,7 +6,13 @@ journeys on `routing-mvp`. Companion documents:
 deltas" — the per-fix narratives this doc expands into full chains),
 `designs/CUJ_STATUS.md` (evidence layer per CUJ and the 14/14 matrix run) and
 `designs/LIVE_MODEL_STATE.md` (codex model-state mechanics in protocol detail).
-Commit shas are cited inline, as in §12.
+Commit shas are cited inline, as in §12. They name the original per-fix commits,
+which is the granularity the narratives need; the branch has since been rebased
+onto `origin/main` and reconciled with main's catalog-routing work, so those shas
+are no longer reachable. The shipped series is `git log --oneline
+origin/main..HEAD` — eleven commits led by `80d3bcc7` "feat(routing):
+session-start smart routing core", which is where the reconciliation lives. Line
+numbers below are HEAD's.
 
 The three journeys:
 
@@ -36,15 +42,15 @@ behaviour all three share.
 ### 1.1 The route-options seam
 
 All knowledge of the router's contract lives in `omnigent/server/smart_routing.py`
-behind one concrete route-options source, `TaskV1RouteOptionSource` (`:859`):
-`build_route_options` (`:886`) turns a harness set plus a catalog into the option
-list the router requires, and `resolve_selection` (`:920`) turns the router's
+behind one concrete route-options source, `TaskV1RouteOptionSource` (`:931`):
+`build_route_options` (`:958`) turns a harness set plus a catalog into the option
+list the router requires, and `resolve_selection` (`:992`) turns the router's
 pick back into a `(harness, servable id)` pair. It injects the frozen task_v1 arm
-menus (`TASK_V1_MENUS`, `:527`) even when the workspace serves no endpoint for
+menus (`TASK_V1_MENUS`, `:599`) even when the workspace serves no endpoint for
 them, because task_v1 400s on a partial menu and two of its arms are unservable
-on eng-ml-inference (plan §1). Callers — `route_session_harness` (`:1354`),
-`route_turn` (`:1525`), and the runner's subagent endpoint — never see router
-vocabulary; they reach the source through `route_option_source` (`:1090`).
+on eng-ml-inference (plan §1). Callers — `route_session_harness` (`:1467`),
+`route_turn` (`:1655`), and the runner's subagent endpoint — never see router
+vocabulary; they reach the source through `route_option_source` (`:1162`).
 
 It was originally a `RouteOptionSource` Protocol with one implementor, and the
 menus were nested one level deeper under a single `router_name` key. Both
@@ -72,11 +78,11 @@ model. So the client now *owns* resolution: `route_session_harness` applies its
 `route_turn` no longer re-resolves at all (`36a17c65`).
 
 **One prefix list, configurable, with an honest empty case.**
-`strip_catalog_prefix` (`:502`) drops a leftover leading separator, because a
+`strip_catalog_prefix` (`:574`) drops a leftover leading separator, because a
 prefix configured without its trailing dot (`system.ai`) produced router ids like
 `.claude-opus-5` (`972dea9d`). The hardcoded `_BARE_ID_PREFIXES` /
 configurable-`model_prefixes` split then collapsed onto one `MODEL_ID_PREFIXES`
-(`:499`), the default for `RoutingSettings`, the seam and `ExternalRoutingClient`
+(`:571`), the default for `RoutingSettings`, the seam and `ExternalRoutingClient`
 alike, so the two ends can no longer disagree (`36a17c65`). Prefix comparisons
 honour `routing.model_prefix` throughout, and an explicit `model_prefix: []` now
 means bare catalog ids rather than silently falling back to the defaults
@@ -88,14 +94,14 @@ list order: an alphabetical live catalog substituted `gpt-5-nano` for the codex
 anchor arm `gpt-5-6-sol`. The first attempt was a ~170-line capability-ranking
 engine (`_capability_key`, `_size_class`, `_version_key`, `_listed_rank`, arm
 tiers) — deleted in `36a17c65` for a reviewable `{arm: (preferred, fallback, …)}`
-table, `_ARM_SUBSTITUTES` (`:539`), read by `substitute_model` (`:711`). The
+table, `_ARM_SUBSTITUTES` (`:611`), read by `substitute_model` (`:783`). The
 ranking engine had a `_listed_rank == -1` hole (a current-generation model absent
 from `MODEL_LISTS` ranked below everything); the table has none. When the chain
 names nothing on offer, `substitute_model` takes the same-family candidate
-*nearest the pick's own cost position* (`_cost_position`, `:685`), biasing
+*nearest the pick's own cost position* (`_cost_position`, `:757`), biasing
 cheaper on a tie — the earlier "most capable same-family" fallback inverted cost
 outright, escalating every SIMPLE pi turn to opus because haiku is barred on pi
-(`46a50556`). Ids compare with dots read as dashes (`_bare_id`, `:660`), so a
+(`46a50556`). Ids compare with dots read as dashes (`_bare_id`, `:732`), so a
 picker's `gpt-5.6-sol` matches the router's `gpt-5-6-sol` instead of missing
 every chain and collapsing onto the priciest row, and the offered menu carries
 one row per model rather than two. With live pre-session catalogs (§1.3) exact
@@ -103,8 +109,8 @@ matches are the common case and substitution is the exception, which is what the
 matrix's "no fallback arrows" bar requires.
 
 **Harness bars were unenforced on the turn path.** `_redirect_incompatible_pick`
-(`:826`) stays in the seam as post-verdict harness correction:
-`_HARNESS_EXCLUDED_MODELS` (`:639`) pairs are *not* pruned from the offered menu
+(`:898`) stays in the seam as post-verdict harness correction:
+`_HARNESS_EXCLUDED_MODELS` (`:711`) pairs are *not* pruned from the offered menu
 when the harness is itself in play (the router needs its full menu or it 400s),
 so an incompatible pick is moved to a harness that can run it instead. Two
 corrections landed in `46a50556`: the redirect now takes the *offered* harness
@@ -113,19 +119,31 @@ restricted to its parent's family can no longer escape onto `codex` or
 `claude-sdk` — and a turn, which cannot change harness at all, prunes the models
 its own gateway bars before offering them and swaps the *model* via
 `substitute_model` when an injected arm comes back barred. `harness_bars_model`
-(`:812`) is the shared predicate. `designs/LIVE_MODEL_STATE.md` documents why
+(`:884`) is the shared predicate. `designs/LIVE_MODEL_STATE.md` documents why
 each `pi` exclusion exists.
+
+Post-verdict harness correction is **two layers, in order**, and only on the
+session path. Ours runs first: `_redirect_incompatible_pick` over the static
+`_HARNESS_EXCLUDED_MODELS` pairs, which is the one that can also swap the model
+rather than the harness. `_redirect_wire_incompatible_pick` (`:1428`) runs second,
+on whatever survived — the catalog-driven companion, reading the `_RunnerModel`
+wire APIs kept off the live catalog (§1.3): a `pi` pick on a Claude-family
+endpoint the catalog reports as not speaking Anthropic Messages moves to
+`claude-sdk`. It carries the same on-offer guard, so a family-restricted child
+cannot escape through it either, and unknown metadata from an older runner is
+never read as incompatible. `route_turn` runs only the first layer, since a turn
+cannot change harness at all.
 
 ### 1.2 RoutingSettings on RuntimeCaps
 
-`RoutingSettings` (`smart_routing.py:581`) is the frozen deployment record, and
+`RoutingSettings` (`smart_routing.py:653`) is the frozen deployment record, and
 it is down to three fields: `router_name`, `selection_model` (passed through as
 `route_selector.config.model` so a deployment can pin an extraction model it has
 query access to) and `model_prefixes`. `scenario_menus` went with the flattened
 menu tables (§1.1), and `subagent_fail_mode` / `subagent_cache_ttl_s` went with
 the knob and the cache they configured (§1.5) — all three in `36a17c65` /
 `6112e6cb`. Everything reads the record through one accessor,
-`routing_settings(caps)` (`:1057`), which returns all-defaults when caps carry
+`routing_settings(caps)` (`:1129`), which returns all-defaults when caps carry
 none — the de-scarring pass collapsed several ad-hoc re-parses into it, and fixed
 routing settings being dropped from Docker's `RuntimeCaps` construction entirely
 (`d181cbd5`).
@@ -133,10 +151,10 @@ routing settings being dropped from Docker's `RuntimeCaps` construction entirely
 The router client itself is chosen at *build* time — `cli.py` constructs exactly
 one client into `RuntimeCaps.routing_client` — so there is no runtime fallback
 chain. A router failure returns `None` with `last_error` set, surfaced through
-`routing_last_error` (`:1077`), and callers proceed unrouted with the reason
+`routing_last_error` (`:1149`), and callers proceed unrouted with the reason
 attached (plan §2). This is what made the task_v1 rollback incident a logged
 degradation rather than an outage. `last_error` is not part of the
-`RoutingClient` Protocol (`:190`) — the accessor was always `getattr`-defensive,
+`RoutingClient` Protocol (`:192`) — the accessor was always `getattr`-defensive,
 so declaring it only implied a contract clients did not have (`36a17c65`).
 
 Two logging-posture corrections belong here. The external router request body
@@ -150,11 +168,14 @@ points log it at DEBUG and keep model/harness at INFO (`46a50556`).
 
 Three catalog sources, in order of preference:
 
-- **Live per-session:** `fetch_runner_models` (`:219`) hits the runner's
-  `/v1/sessions/{id}/models`; `catalog_models_for_harness` (`:122`) extracts the
-  harness's slice.
+- **Live per-session:** `fetch_runner_models` (`:323`) is a thin id-only
+  adapter over `_fetch_runner_catalog` (`:246`), which hits the runner's
+  `/v1/sessions/{id}/models` and keeps each row's wire APIs and cost tier on a
+  `_RunnerModel` (`:222`) — cost-tier ordering with catalog order as tie-break,
+  and the retained wire metadata is what the post-verdict wire check reads.
+  `catalog_models_for_harness` (`:124`) extracts the harness's slice.
 - **Pre-session:** `_pre_session_model_catalog`
-  (`server/routes/_sessions/orchestration.py:5620`) fans out to the host's
+  (`server/routes/_sessions/orchestration.py:5678`) fans out to the host's
   pre-launch model options for each candidate harness. A create has no session,
   so the live catalog is out of reach; the host holds the CLIs and already
   resolves their picker options. Introduced with `158042a3` because create-time
@@ -162,11 +183,14 @@ Three catalog sources, in order of preference:
   session got offered models it could not run. One helper now owns the host
   model-options round trip for both callers, and both readers accept picker rows
   spelled `model` *or* `id` (`3b00d101`).
-- **Static:** `infer_models` (`:87`) as last resort, for harnesses the host
-  cannot answer for.
+- **Static:** `infer_models` (`:89`) as last resort, for harnesses the host
+  cannot answer for. The table behind it (`MODEL_LISTS`, `:39`, plus
+  `_CURRENT_GENERATION_MODELS`, `:68`) is a deliberate fork: main deleted its
+  other uses, and it is kept here because substitution needs a cost ordering on
+  the catalog-less paths.
 
 Whatever the source, the candidate set is family-filtered by `models_in_family`
-(`:105`), and family compatibility for codex is one shared authority:
+(`:107`), and family compatibility for codex is one shared authority:
 `is_codex_compatible_model` (`model_override.py:126`) matches per id segment with
 an optional trailing generation number, so `system.ai.glm-5-2` and
 `kimi-k2-instruct` pass while a lookalike endpoint name (`glmqlfit-eval`) does
@@ -197,11 +221,11 @@ Every routing decision is a transcript item. `RoutingDecisionData` gained
 `harness`, `scope` (`session` | `turn` | `child_session` | `native_subagent`),
 `decision_id`, `raw_model` and `attempted_override`, all defaulted for legacy
 rows (plan §5.2). `_emit_server_routing_decision`
-(`server/routes/_sessions/helpers.py:5451`) writes it — after the decision
+(`server/routes/_sessions/helpers.py:5499`) writes it — after the decision
 validates, not before a parse failure that produces no chip (`3b00d101`) — and
-`_stamp_routing_decision_label` (`orchestration.py:4089`) records the decision id
+`_stamp_routing_decision_label` (`orchestration.py:4131`) records the decision id
 on the session so a persisted `model_override` can be joined back to the decision
-that produced it (`ROUTING_DECISION_LABEL_KEY`, `subagent_routing.py:87`). The
+that produced it (`ROUTING_DECISION_LABEL_KEY`, `subagent_routing.py:88`). The
 `routed_model` field on a child-session row is gated on that label, so a
 user-pinned model no longer reports as routed with a null decision id
 (`3b00d101`).
@@ -220,7 +244,7 @@ different:
 - **The chip renders below the user message it routed.** Native terminal
   sessions persist the decision *before* the message, so order-faithful
   rendering put the chip at the top of the chat. `deferredRoutingChips`
-  (`web/src/lib/renderItems.ts:640`) pairs a session/turn-scoped chip with the
+  (`web/src/lib/renderItems.ts:639`) pairs a session/turn-scoped chip with the
   adjacent user message and defers it below; already-correct orders are
   untouched, subagent chips never move, and streaming rebuilds the pair
   atomically in both arrival orders (`8fa280ea`). On claude only, the injected
@@ -233,8 +257,8 @@ different:
   cache hardcoded two bubbles per region, so it dropped one too few and
   re-emitted the echo bubble on every later frame of any turn past the first
   (duplicate React keys included, until a full rebuild). The region now records
-  `regionBubbleStart` (`:448`) and reports
-  `lastBubbleCount = bubbles.length - regionBubbleStart` (`:484`), with a
+  `regionBubbleStart` (`:467`) and reports
+  `lastBubbleCount = bubbles.length - regionBubbleStart` (`:483`), with a
   frame-by-frame test at a non-zero block offset — where the cache actually
   reuses; every earlier test started at block 0, where reuse bails out
   (`2245f57d`). The fix also split "renders nothing" from "may sit between chip
@@ -249,25 +273,25 @@ Native in-harness spawns never reach the server, so routing them needs a
 runner-local endpoint the harness's own hook subprocess can call.
 `omnigent/runner/subagent_routing.py` serves it:
 
-- `start_subagent_router` (`:797`) binds an HTTP server on `127.0.0.1:0` and
+- `start_subagent_router` (`:803`) binds an HTTP server on `127.0.0.1:0` and
   writes `subagent_router.json` (`{url, token, pid, session_id, updated_at}`)
   into the session's bridge dir — the same advertisement pattern as
   `tool_relay.json`. `SubagentRouter.close` (`:777`) removes it.
-  `ensure_session_router` / `ensure_session_router_quietly` (`:997`, `:1040`)
+  `ensure_session_router` / `ensure_session_router_quietly` (`:1013`, `:1056`)
   install it whenever a server client exists, *not* only for sessions that
   started routed, so a mid-session toggle-on has something to talk to (§5).
-- `resolve_subagent_route` (`:475`) is the policy: it builds the candidate set
-  with `candidate_models` (`:396`), calls the router, and returns a
-  `SubagentRouteDecision` (`:235`) of `allow` / `rewrite` / `redirect` / `deny`
+- `resolve_subagent_route` (`:476`) is the policy: it builds the candidate set
+  with `candidate_models` (`:397`), calls the router, and returns a
+  `SubagentRouteDecision` (`:236`) of `allow` / `rewrite` / `redirect` / `deny`
   with `model`, `harness`, `raw_model`, `rationale`, `decision_id` (plan §5.1).
   Unoffered picks are denied outright — "didn't spawn" beats "wrong model" — and
   that is the *only* remaining `deny`. The enablement gate is read **per call**
   one hop out, by the server relay route
-  (`server/routes/sessions/routes_hooks.py:1246`) and the child-session path
-  (`orchestration.py:680`), both through `subagent_routing_enabled` (`:156`),
+  (`server/routes/sessions/routes_hooks.py:1388`) and the child-session path
+  (`orchestration.py:686`), both through `subagent_routing_enabled` (`:157`),
   which layers the per-session override over the own/parent cost-control state.
-- Family rules live here too: `harness_family` (`:337`), `model_in_family`
-  (`:377`), and `auto_harness_session` (`:354`), which is what allows a
+- Family rules live here too: `harness_family` (`:338`), `model_in_family`
+  (`:378`), and `auto_harness_session` (`:355`), which is what allows a
   cross-family pick *only* under the Smart Routing harness (§4.7).
 
 Two pieces of this layer were built and then deliberately deleted (`6112e6cb`):
@@ -278,7 +302,7 @@ Two pieces of this layer were built and then deliberately deleted (`6112e6cb`):
   router exception, empty verdict, transport error, hook timeout — already fell
   through to allow, so `closed` could not deliver what it promised. The gate is
   documented as **advisory** in the module docstring instead, `_unavailable_decision`
-  (`:455`) is the single allow-and-say-why path, and the knob, its plumbing and
+  (`:456`) is the single allow-and-say-why path, and the knob, its plumbing and
   the deny-on-failure branch are gone.
 - **The per-`(session, task)` decision cache.** It saved a task_v1 extraction
   round-trip on identical spawns, but a cache hit re-emitted a `decision_id` that
@@ -286,10 +310,10 @@ Two pieces of this layer were built and then deliberately deleted (`6112e6cb`):
   telemetry for one decision. Correctness won.
 
 **Hardening.** The advertisement carries a bearer token, so `write_advertisement`
-(`:702`) writes it through `os.open(..., 0o600)` into a temp file and
+(`:703`) writes it through `os.open(..., 0o600)` into a temp file and
 `os.replace`s it into place — never world-readable, not even for the instant
 between a `write_text` and a follow-up `chmod`. The SDK harnesses have no bridge
-dir of their own, so `router_dir_for_session` (`:1120`) gets them a private one
+dir of their own, so `router_dir_for_session` (`:1161`) gets them a private one
 through the shared bridge-dir ancestor check (`ensure_secure_dir`,
 `claude_native_bridge.py:740`) rather than `mkdir(mode=0o700, parents=True)`,
 which applies the mode to the leaf only and trusts pre-existing ancestors on the
@@ -303,16 +327,16 @@ request (`6112e6cb`).
 **Lifecycle.** The router used to leak on two of three launch paths — only
 claude-native tore it down — costing a `ThreadingHTTPServer`, a daemon thread, a
 loopback socket, ledger entries and a live token file per session. Teardown is
-now unconditional and idempotent: `shutdown_session_router` (`:1086`) is called
+now unconditional and idempotent: `shutdown_session_router` (`:1116`) is called
 from both codex-native forwarder exits and the claude-native `finally`
-(`runner/native/orchestration.py:4034`, `:4081`, `:6127`, all via
-`_shutdown_session_router_async` (`:452`) because the close joins the serving
+(`runner/native/orchestration.py:4073`, `:4124`, `:6157`, all via
+`_shutdown_session_router_async` (`:442`) because the close joins the serving
 thread) and from the runner's session-delete path for SDK harnesses
-(`runner/app.py:3484`). `close()` only unlinks advertisements still naming its own
+(`runner/app.py:3111`). `close()` only unlinks advertisements still naming its own
 url — sessions that fork/clear/resume keep the same bridge dir, so a newer router
 may own the file — and every advertised dir is tracked and pruned
 (`c46ef54d`, `6112e6cb`). Router env vars are scoped to the launching harness
-(`session_router_env`, `:1142`), so a codex executor beneath a claude session no
+(`session_router_env`, `:1183`), so a codex executor beneath a claude session no
 longer inherits the parent's session id (`6112e6cb`, `de2acfdb`).
 
 **Timeout budget.** Four hops wait on each other, so each is strictly larger than
@@ -333,7 +357,7 @@ vocabulary out of `bridge.json` (`resolve_parent_model`,
 `resolve_model_vocabulary_env`), builds the request (`build_route_request`),
 calls the endpoint (`request_decision`) and renders the harness's hook output
 (`decision_to_hook_output`, `route_pre_tool_use`). `run_route_subagent_main`
-(`:620`) always exits `0`: routing must never be the reason a spawn fails. Fork
+(`:642`) always exits `0`: routing must never be the reason a spawn fails. Fork
 spawns are exempt in v1 (`FORK_SUBAGENT_TYPES`, `_FORK_SUFFIXES`).
 
 De-scarring collapsed the per-harness duplicates into this one module and fixed
@@ -347,7 +371,7 @@ Hooks that silently do not run are the worst failure mode available: the UI show
 routing on, the spawns are unrouted, and nothing complains. The canary is the
 detector — a `SessionStart` hook writing a file into the bridge dir, plus a
 watcher that posts the session-scoped warning `subagent_routing_unenforced`
-(`runtime/session_warnings.py:31`) when the file is absent. Its arming logic had
+(`runtime/session_warnings.py:34`) when the file is absent. Its arming logic had
 to be inverted before it worked; see §3.7, where it caught both codex apply-layer
 bugs. The warning is retractable as well as postable — see §5.3.
 
@@ -405,10 +429,10 @@ the absence of a pin is what arms it. Evidence for this layer is the
 
 ### 2.3 The turn gate and the routing call
 
-`_forward_event_to_runner` (`server/routes/_sessions/orchestration.py:3641`)
-computes `effective_runner_override` (`:3794` — per-event override, else the
+`_forward_event_to_runner` (`server/routes/_sessions/orchestration.py:3675`)
+computes `effective_runner_override` (`:3833` — per-event override, else the
 persisted column, `is not None` and never `or`, per the no-invented-defaults rule)
-and then the `_should_route` gate (`:3890`): routing enabled, event is a
+and then the `_should_route` gate (`:3929`): routing enabled, event is a
 `message`, the auto-harness block did not already route this turn, and no model is
 pinned. In practice that fires on the **session's first message only** — the
 routed turn persists its pick as `model_override`, which is itself a pin, so turn
@@ -423,7 +447,7 @@ remain live one level down, in `route_turn` itself, where the reason is *not*
 inferable from the caller: no routing client configured, no candidate models for
 the harness, and the harness bars every candidate.
 
-`route_turn` (`smart_routing.py:1525`) scores the raw user text — 4000-char cap,
+`route_turn` (`smart_routing.py:1655`) scores the raw user text — 4000-char cap,
 no wrapper or summary, because `task.prompt` is the entire routing signal
 (plan §1.1) — against the `cc` scenario menu, with candidates filtered to the
 Claude family.
@@ -431,7 +455,7 @@ Claude family.
 ### 2.4 Decision persistence and the chip
 
 "Can this pane actually apply the pick?" is answered *before* anything is
-persisted, by `_routed_turn_model_spelling` (`orchestration.py:3551`). A
+persisted, by `_routed_turn_model_spelling` (`orchestration.py:3580`). A
 mid-session switch on a Claude pane is typed as `/model`, which accepts only that
 session's own picker vocabulary; a routed id outside it is skipped by the executor
 (fail open, the turn runs on the current model). So the server runs the *same*
@@ -448,7 +472,7 @@ because any `model_override` blocks routing (§5.1), one unapplicable pick
 permanently disabled routing for that session and misattributed its usage to a
 model it never ran. `3b00d101` collapsed the marker into this pre-persist check:
 no spelling means no `model_override`, no in-band switch, and
-`_unapplied_routed_verdict` (`:3600`) appends the reason to the rationale and
+`_unapplied_routed_verdict` (`:3629`) appends the reason to the rationale and
 clears `applied`. Honest `applied=false` beats a silent lie, and it is what makes
 the matrix's no-arrows bar meaningful.
 
@@ -462,22 +486,22 @@ This is where nearly all the work was. Four separate problems, in launch order.
 
 **Launch env pins.** claude-native launches its terminal *before* any turn
 decision exists, and `/model` can only reach ids the launch env spells. So when
-`launch_metadata.routing_enabled`, `runner/native/orchestration.py:5895-5898` pins
+`launch_metadata.routing_enabled`, `runner/native/orchestration.py:5941` pins
 the family aliases at the router's frozen arms via
 `claude_config_with_routed_arms_pinned(claude_config, task_v1_claude_arms())` —
 the arm list is read from `_TASK_V1_CLAUDE_ARMS` through that one accessor
-(`smart_routing.py:568`) rather than duplicated. Without this, `/model
+(`task_v1_claude_arms`, `smart_routing.py:640`) rather than duplicated. Without this, `/model
 opus` landed on whatever the workspace's newest opus was (`claude-opus-5`) while
 the chip claimed the routed arm (`claude-opus-4-8`) — the workspace moving ahead
 of the frozen router (`972dea9d`, §12 delta 3).
 
 **The custom picker slot.** Claude Code has exactly one extra picker slot that
 takes an *exact* id. `claude_config_with_launch_model_pinned`
-(`claude_native.py:435`) parks the launch model there when no alias spells it —
+(`claude_native.py:437`) parks the launch model there when no alias spells it —
 the case a Smart Routing create hits, since the harness CUJ resolves an exact
 model before the terminal exists (§4). It also gives the user a picker row to
 return to. Both pin sets are persisted into the bridge config as `model_env`
-(`claude_native_bridge.py:889-895`, keys `MODEL_VOCABULARY_ENV_VARS`, read back by
+(`claude_native_bridge.py:889-895`, keys `MODEL_VOCABULARY_ENV_VARS`, `:891`, read back by
 `read_model_env` at `:1067`) because the executor and the server do not share the
 terminal's environment and both need to know its vocabulary.
 
@@ -541,13 +565,14 @@ MVP because the harness config modal's Model picker already behaves that way
 ### 2.7 Subagent routing
 
 `build_hook_settings` (`claude_native_bridge.py:1188`) registers
-`claude_router_hook` as a `PreToolUse` hook on the `Task|Agent` matcher (`:1425`);
+`claude_router_hook` as a `PreToolUse` hook on the agent-tool matcher (`AGENT_TOOL_MATCHER`,
+`hook_scripts/subagent_router.py:59`, registered at `:1441`);
 settings-level hooks recurse into nested subagents. The hook rewrites
 `tool_input.model` via `hookSpecificOutput.updatedInput` with
 `permissionDecision: "allow"`, or denies. Because the Agent tool's `model` is a
 closed enum, the hook translates through `claude_model_alias` with the vocabulary
 read out of `bridge.json` (`claude_model_translator`,
-`hook_scripts/subagent_router.py:403`) — this is what turned a 7 ms schema failure into a
+`hook_scripts/subagent_router.py:425`) — this is what turned a 7 ms schema failure into a
 spawn that ran to completion on the routed arm (`CUJ_STATUS.md` §4). Candidates
 are family-filtered, so a `cc` session can never spawn a Codex arm. Mid-session
 toggling is §5.2.
@@ -589,7 +614,7 @@ Applying a model to codex has **three writers**, which neither the plan's §2 no
    `/model` writes, and what omnigent's own readers use — the forwarder's mirror
    and the cost-gate hook.
 3. The launch pin `_pin_codex_config_model`
-   (`codex_native_app_server.py:203`) seeds that key, and the TUI is launched
+   (`codex_native_app_server.py:204`) seeds that key, and the TUI is launched
    with the same value as `-c model="…"`.
 
 The observed symptom was that the routed model survived exactly one turn. Turn N
@@ -611,7 +636,7 @@ What shipped (`0fcc313f`, `51801530`):
   the first message, so no re-read timing could help, but every turn re-applies
   `ExecutorConfig.model` and the thread converges on the routed model at turn 1.
 - **A `config.toml` mirror on a successful switch** (`write_codex_config_model`,
-  `codex_native_bridge.py:315`), writing the same key the TUI's `/model` writes, so
+  `codex_native_bridge.py:345`), writing the same key the TUI's `/model` writes, so
   the cost gate and the mirror agree instead of diverging.
 - **Forwarder precedence** (`codex_native_forwarder.py:2737`,
   `_refresh_model_from_config`): the state tracks `settings_model` (last live
@@ -623,7 +648,7 @@ What shipped (`0fcc313f`, `51801530`):
   `external_model_change` only on a real difference, and the server dedupes
   against `conv.model_override`, so no echo loop.
 - **A `session.model` SSE at routing persist time** (`_publish_routed_model`,
-  `orchestration.py:3617`) so the web dropdown tracks live state instead of
+  `orchestration.py:3646`) so the web dropdown tracks live state instead of
   waiting for a reload. It carries the spelling the session's picker uses — a tier
   alias, not a catalog id — because that is what the dropdown matches against, and
   the native path publishes picker vocabulary too (`3b00d101`).
@@ -645,21 +670,21 @@ Codex needs the most machinery of the three, and every piece of it was forced by
 a live failure.
 
 **Hook generation and merge.** `codex_router_hooks_settings`
-(`inner/codex_executor.py:917`) builds the Omnigent half of a `hooks.json`:
+(`inner/codex_executor.py:876`) builds the Omnigent half of a `hooks.json`:
 a `PreToolUse` gate on the spawn tool, a `SessionStart` canary, and a
 `SubagentStart` audit writer. The spawn matcher is the regex `.*spawn_agent`
-(`_CODEX_SPAWN_AGENT_MATCHER`, `:865`) because codex flattens the tool name
-(`collaborationspawn_agent` on 0.145.x). `write_codex_router_hooks_file` (`:1067`)
+(`_CODEX_SPAWN_AGENT_MATCHER`, `:824`) because codex flattens the tool name
+(`collaborationspawn_agent` on 0.145.x). `write_codex_router_hooks_file` (`:1026`)
 merges it with the user's hooks for the SDK executor path; the app-server path
 merges policy + routing + user hooks in `_write_codex_policy_hooks_file`
-(`codex_native_app_server.py:1007`).
+(`codex_native_app_server.py:1008`).
 
 **One writer, one file, and probe the version first.** Arming subagent routing on
 codex < 0.129 used to *delete the user's hooks*: `_populate_codex_home_config`
 dropped the symlink to `~/.codex/hooks.json` because the generated file was going
 to own that name, and only afterwards did the version gate decide not to write one
 — leaving the private `CODEX_HOME` with no `hooks.json` at all. The version is now
-probed before the home is populated (`app_server.py:629-641`), so an unsupported
+probed before the home is populated (`app_server.py:628-631`), so an unsupported
 codex keeps the symlink. The root cause was two divergent `hooks.json` writers,
 whichever ran last erasing the other's contribution; they collapse onto one shared
 `write_codex_hooks_file` taking a *list* of payloads — policy, routing and the
@@ -672,14 +697,15 @@ untrusted and were *silently skipped* while the policy hooks worked — only the
 policy module's hashes had ever been persisted. Both app-server launch paths now
 run a persisted trust handshake for the router hook module: `hooks/list` →
 `config/batchWrite` of `hooks.state.<key>.trusted_hash = currentHash`
-(`_persist_hook_trust`, `:1156`) → re-list to verify
-(`trust_codex_router_hooks`, `:1193`; policy equivalent
-`trust_native_policy_hooks`, `:1256`), both driven immediately after the
-app-server connects (`:773-780`) and filtered by hook module so the trust step
+(`_persist_hook_trust`, `:1157`) → re-list to verify
+(`trust_codex_router_hooks`, `:1194`; policy equivalent
+`trust_native_policy_hooks`, `:1257`), both driven immediately after the
+app-server connects (`:774-781`) and filtered by hook module so the trust step
 never touches hooks the user's own file contributed. It is best-effort and
 isolated, so a routing-trust failure can never disable the policy gate
 (`e32c4925`). The flag itself survives only where it actually works — the
-interactive TUI launch (`runner/native/orchestration.py:3809`) — and nothing on
+interactive TUI launch (`_CODEX_BYPASS_HOOK_TRUST_FLAG`,
+`codex_native_app_server.py:1997`) — and nothing on
 the app-server path relies on it. A codex version we cannot parse is treated as
 *supported* on both paths, so a flaky probe can never wedge a terminal on a prompt
 no subagent can answer (`c46ef54d`).
@@ -690,7 +716,7 @@ with the *session workspace* as cwd, and `python -m` puts cwd first on
 `sys.path` — so a workspace containing an `omnigent/` directory (this repo being
 the single most likely workspace) shadowed the installed package and every
 generated hook died on import, silently: routing gate, canary, spawn audit and
-the policy hook alike. `_codex_router_hook_command` (`:874`) now runs
+the policy hook alike. `_codex_router_hook_command` (`:833`) now runs
 `python -I -m …`, matching the bridge MCP command's posture, with a subprocess
 regression test that runs the real canary from a workspace containing a decoy
 package (`518376ba`).
@@ -706,7 +732,7 @@ first turn (codex fires `sessionStart` at first turn, not thread start), and
 once cwd shadowing proved the second mode existed (`518376ba`), and the watcher
 task is cancelled on teardown so a session that never takes a turn cannot leak it
 (`c46ef54d`). This watcher is what caught both codex bugs;
-`reconcile_spawn_audit` (`codex_executor.py:1194`) additionally compares the
+`reconcile_spawn_audit` (`codex_executor.py:1153`) additionally compares the
 `SubagentStart` audit's actual `model` against the models we routed to — through
 `normalized_model_id`, because codex reports its own spelling and a prefix or case
 difference is not a different model (`c46ef54d`).
@@ -725,8 +751,8 @@ the rewrite in the TUI via a `systemMessage` (`with_system_message`,
 signal-free spawns to allow-with-parent-model, since the `SubagentStart` audit
 proves spawns inherit the routed thread model — keeping both the chip and the audit
 reconciliation truthful. `6112e6cb` then deleted the placeholder task and its
-disclosure marker outright: `_routing_task` (`subagent_routing.py:440`) returns
-`None` when there is no signal, and `_decide` (`:557`) allows the spawn unchanged
+disclosure marker outright: `_routing_task` (`subagent_routing.py:441`) returns
+`None` when there is no signal, and `_decide` (`:533`) allows the spawn unchanged
 on `req.parent_model` with the rationale "No routable signal (encrypted prompt, no
 task name); subagent inherits the session model". Nothing is scored on a synthetic
 prompt any more, so nothing has to be disclosed.
@@ -793,16 +819,16 @@ active so it does not look like a Claude Code pick.
 
 A native session's harness cannot wait for the first message the way the
 bundle-agent auto path does — the terminal launches as soon as the session row
-exists. So `_resolve_native_smart_routing` (`orchestration.py:5649`) routes at
-create: it authorizes the caller's `host_id` (`resolve_host_owner`, `:5684`), reads
-the host, filters `AUTO_NATIVE_ROUTING_HARNESSES` (`smart_routing.py:1341`) to the
-CLIs actually installed (`_installed_native_harnesses`, `:5537`), calls
+exists. So `_resolve_native_smart_routing` (`orchestration.py:5707`) routes at
+create: it authorizes the caller's `host_id` (`resolve_host_owner`, `_host_launch.py:49`, called at `:5752`), reads
+the host, filters `AUTO_NATIVE_ROUTING_HARNESSES` (`smart_routing.py:1413`) to the
+CLIs actually installed (`_installed_native_harnesses`, `:5595`), calls
 `route_session_harness` over the `both` five-arm menu with candidates from
 `_pre_session_model_catalog` (§1.3), and returns the chosen native **wrapper
 agent name**. The caller rebinds `agent` to that wrapper
-(`:5798-5820`), and from there the create is byte-identical to a normal native
+(`:5856-5880`), and from there the create is byte-identical to a normal native
 create, terminal launch and all — nothing is launched twice. The routed model is
-threaded into `validate_session_model_metadata` (`:5841`) as the session's
+threaded into `validate_session_model_metadata` (`:5899`) as the session's
 `model_override`, so it reaches the CLI as a `--model` argv element at launch,
 which is a different (and more permissive) contract than `/model`: `--model`
 takes any string verbatim. That is why the harness CUJ needs the custom picker
@@ -818,7 +844,7 @@ another user's host connection. `resolve_host_owner` runs first now (`3b00d101`)
 wrapper rejects a harness override, and leaving the sentinel behind would make the
 first message re-route an already-running terminal. Auto-ness is instead recorded
 as a durable label, `omnigent.routing.auto_harness`
-(`subagent_routing.py:93`) — the sentinel is consumed at first message, so
+(`AUTO_HARNESS_LABEL_KEY`, `subagent_routing.py:94`) — the sentinel is consumed at first message, so
 nothing else would survive to answer "was this session genuinely Smart Routing?"
 (`0fb7ea95`).
 
@@ -864,9 +890,9 @@ child of a plain codex or claude session got `harness_override: "auto"`, was
 routed over a family-mixed catalog, and inherited the cross-family escape hatch —
 found live as a codex parent with nine forced-auto children, some on
 claude-opus. Now the auto treatment requires the parent to actually be in auto
-mode (`auto_harness_session`, checked at `orchestration.py:5877`), child routing
+mode (`auto_harness_session`, checked at `orchestration.py:5935`), child routing
 passes the parent's family as a candidate filter (`allowed_family`,
-`:3914-3926`), and `route_turn` drops out-of-family models from the self catalog
+`:3951-3965`), and `route_turn` drops out-of-family models from the self catalog
 (`5a397d6f`). `46a50556` closed the last escape: the post-verdict harness redirect
 (§1.1) used to hand back `codex` or `claude-sdk` whether or not they were on offer,
 so a family-restricted child could still land outside its family. It now declines
@@ -906,8 +932,8 @@ for Claude Code, Codex (native and SDK) and Smart Routing sessions, toggleable a
 any time and effective on the next spawn (`0fb7ea95`, web `1d030f22`, sticky
 per-harness default `2a415cf4`).
 
-**"Inherit" is its own option** in that row (`web/src/pages/ChatPage.tsx:5615`,
-`:5778`). It used to collapse onto the effective `on`/`off`, which broke twice over:
+**"Inherit" is its own option** in that row (`web/src/pages/ChatPage.tsx:5673`,
+`:5781`). It used to collapse onto the effective `on`/`off`, which broke twice over:
 Radix fires no `onValueChange` for the value already displayed, so re-picking the
 inherited value silently persisted nothing, and the row labelled it "Default" for
 sessions the spec routes by default (`2245f57d`).
@@ -928,16 +954,21 @@ Once hooks install unconditionally, the canary warning fires on sessions with
 routing *off* — a direct consequence of the previous change. The recorded
 observation stays durable, but visibility is re-derived per session-snapshot
 build using the same effective gate the relay applies (override, else own/parent
-cost-control state) — `orchestration.py:677-689`. So a mid-session toggle-on
+cost-control state) — `orchestration.py:686-696`. So a mid-session toggle-on
 reveals the warning and toggle-off clears it, without re-posting anything
 (`5444a1a4`).
 
 Three follow-ons made the banner behave:
 
-- **Warnings are clearable.** `session_warnings.clear(session_id, code=None)`
-  (`runtime/session_warnings.py:93`) is called when a relayed spawn proves the hook
-  did fire (`routes_hooks.py:1235`), when a publisher posts an empty list
-  (`routes_events.py:742`), and on session delete (`:1688`). Codes are allowlisted
+- **Warnings are clearable.** `session_warnings.clear(session_id, codes=None)`
+  (`runtime/session_warnings.py:123`) is called when a publisher posts an empty
+  list — scoped to `EXTERNAL_WARNING_CODES`, the codes that publisher's own check
+  covers (`routes_events.py:757`) — and unscoped on session delete (`:1704`),
+  where the session is gone so every code goes with it. The relay path does
+  *not* clear: a relayed spawn only proves one hook fired, and the blanket clear
+  there wiped exactly the warnings the publisher had just raised
+  (`routes_hooks.py:1371-1377`), so the canary watcher owns the repair and posts
+  it on its next check. Codes are allowlisted
   and payloads reduced to known string fields, so the index cannot grow arbitrary
   shapes (`3b00d101`, empty-list clearing `c46ef54d`).
 - **The banner can appear without a reload.** Warnings are recorded server-side
