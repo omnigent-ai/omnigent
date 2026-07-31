@@ -184,6 +184,7 @@ vi.mock("./TerminalsPanel", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useTerminals } from "@/hooks/useTerminals";
+
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
 
@@ -191,17 +192,21 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceChangedFiles,
 } from "@/hooks/useWorkspaceChangedFiles";
+
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 
 import { useChildSessions } from "@/hooks/useChildSessions";
+
 const useChildSessionsMock = vi.mocked(useChildSessions);
 
 import { useSession } from "@/hooks/useSession";
+
 const useSessionMock = vi.mocked(useSession);
 
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
+
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 import { AppShell } from "./AppShell";

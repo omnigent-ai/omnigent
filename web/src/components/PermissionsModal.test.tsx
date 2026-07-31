@@ -34,6 +34,7 @@ vi.mock("@/lib/host", async (importOriginal) => {
 
 import * as api from "@/lib/permissionsApi";
 import * as host from "@/lib/host";
+
 const listMock = vi.mocked(api.listPermissions);
 const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);

@@ -41,6 +41,7 @@ import "./pdfViewer.css";
 // path resolving from `node_modules`.
 // oxlint-disable-next-line import/default -- Vite's `?url` import returns the asset URL.
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const MIN_SCALE = 0.5;

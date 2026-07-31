@@ -49,12 +49,13 @@ import { PiIcon } from "@/components/icons/PiIcon";
 import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
-const SubagentsGraphView = lazy(() =>
-  import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
-);
 import { useSession } from "@/hooks/useSession";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+const SubagentsGraphView = lazy(() =>
+  import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
+);
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import {
   activityDotClassName,
