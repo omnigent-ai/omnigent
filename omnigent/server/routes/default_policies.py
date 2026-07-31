@@ -383,28 +383,26 @@ def create_default_policies_router(
             privileges.
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
-        _deleted = store.delete_default(policy_id)
+        store.delete_default(policy_id)
         invalidate_default_policy_specs_cache()
-        if _deleted is not None:
-            try:
-                import hashlib as _hashlib
+        try:
+            import hashlib as _hashlib
 
-                _srv_id = _get_installation_id()
-                _anon: str | None = None
-                if user_id is not None:
-                    _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
-                    _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
-                _tel_emit(
-                    _TelPolicyDeletedEvent(
-                        installation_id=_srv_id,
-                        handler=_deleted.handler,
-                        scope="admin",
-                        session_id=None,
-                        anon_user_id=_anon,
-                    )
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyDeletedEvent(
+                    installation_id=_srv_id,
+                    scope="admin",
+                    session_id=None,
+                    anon_user_id=_anon,
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"deleted": True}
 
     return router

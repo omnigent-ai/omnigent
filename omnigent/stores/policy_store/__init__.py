@@ -121,14 +121,14 @@ class PolicyStore(ABC):
         ...
 
     @abstractmethod
-    def delete(self, policy_id: str, session_id: str) -> Policy | None:
+    def delete(self, policy_id: str, session_id: str) -> bool:
         """
         Delete a policy. Idempotent.
 
         :param policy_id: Opaque policy identifier.
         :param session_id: The owning session.
-        :returns: The deleted :class:`Policy`, or ``None`` if not
-            found or wrong session.
+        :returns: ``True`` if removed; ``False`` if not found
+            or wrong session.
         """
         ...
 
@@ -213,11 +213,11 @@ class PolicyStore(ABC):
         ...
 
     @abstractmethod
-    def delete_default(self, policy_id: str) -> Policy | None:
+    def delete_default(self, policy_id: str) -> bool:
         """
         Delete a default policy. Idempotent.
 
         :param policy_id: Opaque policy identifier.
-        :returns: The deleted :class:`Policy`, or ``None`` if not found.
+        :returns: ``True`` if removed; ``False`` if not found.
         """
         ...

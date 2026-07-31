@@ -117,7 +117,6 @@ class PolicyDeletedEvent:
     and admin-level (``DELETE /v1/policies/{pid}``) deletion.
 
     :param installation_id: Server-side installation ID.
-    :param handler: Registered handler path or URL of the deleted policy.
     :param scope: ``"session"`` for per-session policies, ``"admin"`` for
         server-wide default policies.
     :param session_id: Owning session identifier for scope ``"session"``;
@@ -126,7 +125,6 @@ class PolicyDeletedEvent:
     """
 
     installation_id: str | None
-    handler: str
     scope: str
     session_id: str | None
     anon_user_id: str | None

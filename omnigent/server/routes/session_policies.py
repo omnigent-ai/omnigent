@@ -401,28 +401,26 @@ def create_session_policies_router(
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
-        _deleted = store.delete(policy_id, session_id)
+        store.delete(policy_id, session_id)
         invalidate_session_policy_specs_cache(session_id)
-        if _deleted is not None:
-            try:
-                import hashlib as _hashlib
+        try:
+            import hashlib as _hashlib
 
-                _srv_id = _get_installation_id()
-                _anon: str | None = None
-                if user_id is not None:
-                    _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
-                    _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
-                _tel_emit(
-                    _TelPolicyDeletedEvent(
-                        installation_id=_srv_id,
-                        handler=_deleted.handler,
-                        scope="session",
-                        session_id=session_id,
-                        anon_user_id=_anon,
-                    )
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyDeletedEvent(
+                    installation_id=_srv_id,
+                    scope="session",
+                    session_id=session_id,
+                    anon_user_id=_anon,
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"deleted": True}
 
     return router
