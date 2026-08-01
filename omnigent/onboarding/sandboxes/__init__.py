@@ -14,6 +14,7 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
     SandboxCapabilityError,
+    SandboxHostLauncher,
     SandboxLauncher,
 )
 from omnigent.onboarding.sandboxes.bootstrap import (
@@ -61,6 +62,7 @@ __all__ = [
     "SandboxCommandError",
     "SandboxConfigError",
     "SandboxError",
+    "SandboxHostLauncher",
     "SandboxInfo",
     "SandboxLauncher",
     "SandboxProviderContribution",
@@ -83,7 +85,7 @@ __all__ = [
 ]
 
 
-def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxLauncher:
+def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxHostLauncher:
     """
     Resolve a provider name to a launcher instance.
 
