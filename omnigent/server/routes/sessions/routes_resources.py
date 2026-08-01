@@ -251,11 +251,16 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
+        try:
+            response_payload = resp.json()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned invalid JSON"
+            ) from exc
         if resp.status_code == 404:
-            payload = resp.json()
             message = "Resource not found"
-            if isinstance(payload, dict):
-                error = payload.get("error")
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error")
                 if isinstance(error, dict) and isinstance(error.get("message"), str):
                     message = error["message"]
             raise OmnigentError(
@@ -263,17 +268,15 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
-            try:
-                body = resp.json()
-                error = body.get("error", {})
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
-            except Exception:
+            else:
                 msg = "runner resource endpoint failed"
             raise HTTPException(status_code=502, detail=msg)
-        response_payload = resp.json()
         if not isinstance(response_payload, dict):
             raise HTTPException(
-                status_code=502, detail="runner resource endpoint returned invalid JSON"
+                status_code=502, detail="runner resource endpoint returned non-object JSON"
             )
         return cast(dict[str, Any], response_payload)
 
