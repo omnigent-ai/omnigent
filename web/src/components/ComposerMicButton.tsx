@@ -8,7 +8,7 @@ import { readDictationPreferences } from "@/lib/dictationPreferences";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -59,6 +59,11 @@ const BAR_BINS: readonly (readonly [number, number])[] = [
 const BAR_BASELINE = 0.2;
 
 type MeterSource = { kind: "web-speech" } | { kind: "server"; stream: MediaStream };
+
+type DictationPhase = "idle" | "starting" | "listening" | "stopping";
+
+const STATUS_CLEAR_DELAY_MS = 2_500;
+const STARTUP_TIMEOUT_MS = 45_000;
 
 export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
@@ -115,8 +120,10 @@ export const ComposerMicButton = ({
   // over [Ctor, lang]) see the current probe result.
   const serverAvailableRef = useRef(serverAvailable);
   serverAvailableRef.current = serverAvailable;
-  const [isListening, setIsListening] = useState(false);
+  const [phase, setPhase] = useState<DictationPhase>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [completionStatus, setCompletionStatus] = useState<string | null>(null);
+  const statusId = useId();
   const [meterSource, setMeterSource] = useState<MeterSource | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const sessionRef = useRef<DictationSession | null>(null);
@@ -141,6 +148,9 @@ export const ComposerMicButton = ({
   const disabledRef = useRef(disabled);
   disabledRef.current = disabled;
   const mountedRef = useRef(true);
+  const phaseRef = useRef<DictationPhase>("idle");
+  phaseRef.current = phase;
+  const webTakeActiveRef = useRef(false);
   // Click guard: true between toggle() and the matching start/end event.
   // Prevents rapid double-clicks from calling recognition.start() twice,
   // which throws InvalidStateError in Chrome.
@@ -172,10 +182,18 @@ export const ComposerMicButton = ({
 
     const handleStart = () => {
       if (serverTakeOwnsState()) return;
+      if (!webTakeActiveRef.current || disabledRef.current) {
+        try {
+          recognition.stop();
+        } catch {
+          // A cancelled start may already have stopped the recognizer.
+        }
+        return;
+      }
       transitionRef.current = false;
       discardingRef.current = false;
       setError(null);
-      setIsListening(true);
+      setPhase("listening");
       setMeterSource({ kind: "web-speech" });
       // Snapshot point: let the parent record the text so Esc can revert to it.
       onVoiceStartRef.current?.();
@@ -183,11 +201,16 @@ export const ComposerMicButton = ({
     const handleEnd = () => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
-      setIsListening(false);
+      const wasActive = webTakeActiveRef.current;
+      webTakeActiveRef.current = false;
+      setPhase("idle");
       setMeterSource(null);
+      if (wasActive)
+        setCompletionStatus(discardingRef.current ? "Dictation cancelled" : "Dictation stopped");
     };
     const handleError = (event: Event) => {
       if (serverTakeOwnsState()) return;
+      if (!webTakeActiveRef.current) return;
       transitionRef.current = false;
       setMeterSource(null);
       const err = (event as SpeechRecognitionErrorEventLike).error;
@@ -201,22 +224,26 @@ export const ComposerMicButton = ({
         serverAvailableRef.current &&
         !disabledRef.current
       ) {
-        setIsListening(false);
+        webTakeActiveRef.current = false;
+        setPhase("idle");
         void toggleServerRef.current();
         return;
       }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
       if (err === "not-allowed" || err === "service-not-allowed") {
-        setError("Microphone permission denied");
+        setError("Microphone access denied. Allow access, then try again.");
       } else if (err && err !== "no-speech" && err !== "aborted") {
-        setError("Dictation unavailable");
+        setError("Could not start dictation. Try again.");
+      } else if (webTakeActiveRef.current) {
+        setCompletionStatus(discardingRef.current ? "Dictation cancelled" : "Dictation stopped");
       }
-      setIsListening(false);
+      webTakeActiveRef.current = false;
+      setPhase("idle");
     };
     const handleResult = (event: Event) => {
       // Drop late events that arrive after the composer went disabled, or after
       // an Esc discard the parent has already reverted.
-      if (disabledRef.current || discardingRef.current) return;
+      if (!webTakeActiveRef.current || disabledRef.current || discardingRef.current) return;
       const speechEvent = event as SpeechRecognitionEventLike;
       let finalTranscript = "";
       for (let i = speechEvent.resultIndex; i < speechEvent.results.length; i += 1) {
@@ -245,6 +272,32 @@ export const ComposerMicButton = ({
     };
   }, [Ctor, preferences.path, recognitionLanguage]);
 
+  useEffect(() => {
+    if (!completionStatus) return;
+    const timer = window.setTimeout(() => setCompletionStatus(null), STATUS_CLEAR_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [completionStatus]);
+
+  useEffect(() => {
+    if (phase !== "starting") return;
+    const timer = window.setTimeout(() => {
+      if (pendingServerStartRef.current) {
+        serverTakeIdRef.current += 1;
+        pendingServerStartRef.current.abort();
+      }
+      webTakeActiveRef.current = false;
+      transitionRef.current = false;
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        // The recognizer may have failed without dispatching an event.
+      }
+      setPhase("idle");
+      setError("Could not start dictation. Try again.");
+    }, STARTUP_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [phase]);
+
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
   // events still queued before the end event fires. A server session is
@@ -252,14 +305,20 @@ export const ComposerMicButton = ({
   // composer can't accept text.
   useEffect(() => {
     if (!disabled) return;
-    pendingServerStartRef.current?.abort();
-    if (!isListening) return;
+    if (pendingServerStartRef.current) {
+      serverTakeIdRef.current += 1;
+      pendingServerStartRef.current.abort();
+    }
+    if (phase === "idle") return;
+    webTakeActiveRef.current = false;
+    transitionRef.current = false;
+    setPhase("idle");
+    setCompletionStatus("Dictation cancelled");
     setMeterSource(null);
     if (sessionRef.current) {
       serverTakeIdRef.current += 1;
       sessionRef.current.cancel();
       sessionRef.current = null;
-      setIsListening(false);
       onInterimRef.current?.("");
       return;
     }
@@ -269,7 +328,7 @@ export const ComposerMicButton = ({
       // .stop() on an already-stopped recognizer can throw in some
       // browsers; safe to ignore — the end event will reconcile state.
     }
-  }, [disabled, isListening]);
+  }, [disabled, phase]);
 
   // Release the mic if the component unmounts mid-take (e.g. the
   // new-chat dialog closes while dictating).
@@ -277,6 +336,8 @@ export const ComposerMicButton = ({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      webTakeActiveRef.current = false;
+      transitionRef.current = false;
       pendingServerStartRef.current?.abort();
       serverTakeIdRef.current += 1;
       sessionRef.current?.cancel();
@@ -367,23 +428,34 @@ export const ComposerMicButton = ({
   // handshake are up, so isListening flips exactly when audio flows.
   const toggleServer = useCallback(async () => {
     if (serverBusyRef.current) {
-      pendingServerStartRef.current?.abort();
+      if (pendingServerStartRef.current) {
+        serverTakeIdRef.current += 1;
+        pendingServerStartRef.current.abort();
+        setPhase("idle");
+        setCompletionStatus("Dictation cancelled");
+      }
       return;
     }
     serverBusyRef.current = true;
     const session = sessionRef.current;
     if (session) {
-      serverTakeIdRef.current += 1;
+      setPhase("stopping");
+      const stopTakeId = ++serverTakeIdRef.current;
       sessionRef.current = null;
       setMeterSource(null);
       const tail = (await session.stop()).trim();
+      if (!mountedRef.current || disabledRef.current || serverTakeIdRef.current !== stopTakeId) {
+        serverBusyRef.current = false;
+        return;
+      }
       if (!disabledRef.current) {
         // A non-empty tail supersedes the pending interim via
         // onTranscript; an empty one just clears the interim region.
         if (tail) onTranscriptRef.current(tail);
         else onInterimRef.current?.("");
       }
-      setIsListening(false);
+      setPhase("idle");
+      setCompletionStatus("Dictation stopped");
       serverBusyRef.current = false;
       return;
     }
@@ -391,6 +463,9 @@ export const ComposerMicButton = ({
     const controller = new AbortController();
     pendingServerStartRef.current = controller;
     const takeId = ++serverTakeIdRef.current;
+    setError(null);
+    setCompletionStatus(null);
+    setPhase("starting");
     try {
       // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
@@ -400,45 +475,62 @@ export const ComposerMicButton = ({
           onPartial: (text) => {
             // Drop late partials after an Esc discard — they'd repopulate the
             // composer the parent just reverted.
-            if (!disabledRef.current && !discardingRef.current) onInterimRef.current?.(text);
+            if (
+              serverTakeIdRef.current === takeId &&
+              !disabledRef.current &&
+              !discardingRef.current
+            ) {
+              onInterimRef.current?.(text);
+            }
           },
           onFinal: (text) => {
             const trimmed = text.trim();
-            if (trimmed && !disabledRef.current && !discardingRef.current) {
+            if (
+              serverTakeIdRef.current === takeId &&
+              trimmed &&
+              !disabledRef.current &&
+              !discardingRef.current
+            ) {
               onTranscriptRef.current(trimmed);
             }
           },
           onError: () => {
-            if (serverTakeIdRef.current !== takeId) return;
+            if (!mountedRef.current || serverTakeIdRef.current !== takeId) return;
             serverTakeIdRef.current += 1;
             sessionRef.current = null;
             setMeterSource(null);
-            setError("Dictation unavailable");
-            setIsListening(false);
+            setError("Dictation connection lost. Try again.");
+            setPhase("idle");
             onInterimRef.current?.("");
           },
         },
         { microphoneDeviceId: preferences.microphoneDeviceId, signal: controller.signal },
       );
-      if (!mountedRef.current || disabledRef.current) {
+      if (
+        !mountedRef.current ||
+        disabledRef.current ||
+        controller.signal.aborted ||
+        serverTakeIdRef.current !== takeId
+      ) {
         next.cancel();
         return;
       }
       sessionRef.current = next;
       setMeterSource({ kind: "server", stream: next.captureStream });
       setError(null);
-      setIsListening(true);
+      setPhase("listening");
     } catch (startError) {
       if (startError instanceof DOMException && startError.name === "AbortError") return;
+      if (!mountedRef.current || disabledRef.current || serverTakeIdRef.current !== takeId) return;
       setMeterSource(null);
       setError(
         startError instanceof DictationBusyError
-          ? "Dictation is busy — try again shortly"
+          ? "Dictation is busy. Try again shortly."
           : isPermissionError(startError)
-            ? "Microphone permission denied"
-            : "Dictation unavailable",
+            ? "Microphone access denied. Allow access, then try again."
+            : "Could not connect to dictation. Try again.",
       );
-      setIsListening(false);
+      setPhase("idle");
     } finally {
       if (pendingServerStartRef.current === controller) {
         pendingServerStartRef.current = null;
@@ -474,16 +566,27 @@ export const ComposerMicButton = ({
     if (!recognition) return;
     transitionRef.current = true;
     try {
-      if (isListening) {
+      if (phaseRef.current === "listening") {
+        setPhase("stopping");
         setMeterSource(null);
         recognition.stop();
-      } else recognition.start();
+      } else {
+        webTakeActiveRef.current = true;
+        discardingRef.current = false;
+        setError(null);
+        setCompletionStatus(null);
+        setPhase("starting");
+        recognition.start();
+      }
     } catch {
       // InvalidStateError from a double-call — drop the guard so the
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
+      webTakeActiveRef.current = false;
+      setPhase("idle");
+      setError("Could not start dictation. Try again.");
     }
-  }, [isListening, Ctor, preferences.path, serverAvailable, toggleServer]);
+  }, [Ctor, preferences.path, serverAvailable, toggleServer]);
 
   // ⌘⌥V toggles dictation anywhere in the focused Omnigent window. It isn't an
   // OS-global shortcut. Keep it inert when the selected path cannot run.
@@ -504,9 +607,10 @@ export const ComposerMicButton = ({
     const handler = (e: globalThis.KeyboardEvent): void => {
       if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
       const pendingStart = pendingServerStartRef.current;
-      if (!isListening && !pendingStart) return;
+      const currentPhase = phaseRef.current;
+      if (currentPhase === "idle" && !pendingStart) return;
       if (e.key === "Enter" && !e.shiftKey) {
-        if (!isListening) return;
+        if (currentPhase !== "listening") return;
         // Commit: end the take and keep the text. toggle() routes to the right
         // path — Web Speech stop, or a server stop that flushes the tail.
         e.preventDefault();
@@ -518,8 +622,14 @@ export const ComposerMicButton = ({
         e.preventDefault();
         e.stopPropagation();
         discardingRef.current = true;
-        onVoiceDiscardRef.current?.();
+        if (currentPhase === "listening" || currentPhase === "stopping" || pendingStart) {
+          onVoiceDiscardRef.current?.();
+        }
+        if (currentPhase === "stopping") serverTakeIdRef.current += 1;
+        setCompletionStatus("Dictation cancelled");
+        setPhase("idle");
         if (pendingStart) {
+          serverTakeIdRef.current += 1;
           pendingStart.abort();
           return;
         }
@@ -530,8 +640,9 @@ export const ComposerMicButton = ({
           serverBusyRef.current = false;
           setMeterSource(null);
           session.cancel();
-          setIsListening(false);
         } else {
+          webTakeActiveRef.current = false;
+          transitionRef.current = false;
           setMeterSource(null);
           try {
             recognitionRef.current?.stop();
@@ -543,53 +654,88 @@ export const ComposerMicButton = ({
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [isListening, toggle]);
+  }, [toggle]);
 
-  if (!pathAvailable) return null;
+  const unavailableMessage =
+    preferences.path === "server"
+      ? "Server dictation is unavailable."
+      : preferences.path === "browser"
+        ? "Browser dictation is unavailable."
+        : "Voice dictation is unavailable.";
+  const isCapabilityLoading = serverInfo === "loading" && preferences.path !== "browser";
+  const status =
+    error ??
+    (phase === "starting"
+      ? "Starting dictation..."
+      : phase === "listening"
+        ? "Listening..."
+        : phase === "stopping"
+          ? "Stopping dictation..."
+          : (completionStatus ??
+            (!pathAvailable && !isCapabilityLoading ? unavailableMessage : null)));
+  const isBusy = phase === "starting" || phase === "stopping";
+  const isListening = phase === "listening";
 
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.
   const a11yLabel = "Voice dictation";
-  const tooltip = error ?? a11yLabel;
+  const tooltip =
+    error ?? (!pathAvailable && !isCapabilityLoading ? unavailableMessage : a11yLabel);
 
   return (
-    <Button
-      type="button"
-      size="icon"
-      variant="ghost"
-      disabled={disabled}
-      onClick={toggle}
-      aria-pressed={isListening}
-      aria-label={a11yLabel}
-      title={tooltip}
-      className={cn(
-        "size-9 md:size-8",
-        isListening &&
-          "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
-        error && "text-destructive",
-      )}
-    >
-      {isListening ? (
-        // Bars fade out and stop icon fades in on hover OR keyboard focus,
-        // so keyboard users get the stop affordance without needing hover.
-        <span className="relative flex size-4 items-center justify-center" aria-hidden>
-          <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
-            {BAR_BINS.map(([lo, hi], i) => (
-              <span
-                key={`${lo}-${hi}`}
-                ref={(el) => {
-                  barRefs.current[i] = el;
-                }}
-                className="block h-3 w-[2px] origin-center rounded-full bg-current"
-                style={{ transform: `scaleY(${BAR_BASELINE})` }}
-              />
-            ))}
+    <div className="flex min-w-0 items-center gap-1">
+      <Button
+        type="button"
+        size="icon"
+        variant="ghost"
+        disabled={disabled || !pathAvailable}
+        onClick={toggle}
+        aria-pressed={isListening}
+        aria-busy={isBusy}
+        aria-label={a11yLabel}
+        aria-describedby={status ? statusId : undefined}
+        title={tooltip}
+        className={cn(
+          "size-9 shrink-0 md:size-8",
+          isListening &&
+            "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
+          error && "text-destructive",
+        )}
+      >
+        {isListening ? (
+          // Bars fade out and stop icon fades in on hover OR keyboard focus,
+          // so keyboard users get the stop affordance without needing hover.
+          <span className="relative flex size-4 items-center justify-center" aria-hidden>
+            <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
+              {BAR_BINS.map(([lo, hi], i) => (
+                <span
+                  key={`${lo}-${hi}`}
+                  ref={(el) => {
+                    barRefs.current[i] = el;
+                  }}
+                  className="block h-3 w-[2px] origin-center rounded-full bg-current"
+                  style={{ transform: `scaleY(${BAR_BASELINE})` }}
+                />
+              ))}
+            </span>
+            <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
           </span>
-          <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
-        </span>
-      ) : (
-        <MicIcon className="size-4" data-icon-size="16" />
-      )}
-    </Button>
+        ) : (
+          <MicIcon className="size-4" data-icon-size="16" />
+        )}
+      </Button>
+      <span
+        id={statusId}
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className={cn(
+          "max-w-36 text-xs leading-tight text-muted-foreground sm:max-w-48",
+          (error || (!pathAvailable && !isCapabilityLoading)) && "text-destructive",
+        )}
+      >
+        {status}
+      </span>
+    </div>
   );
 };
