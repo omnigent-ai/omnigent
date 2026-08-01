@@ -7,6 +7,7 @@ itself unless the extra and a model are installed (developer machines).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -321,6 +322,38 @@ def test_sherpa_engine_transcribes_test_wav() -> None:
 
     texts: list[str] = []
     chunk = dictation.SAMPLE_RATE * 2 // 10  # 100 ms
+    for i in range(0, len(pcm), chunk):
+        update = stream.feed_pcm16(pcm[i : i + chunk])
+        if update.finalized:
+            texts.append(update.finalized)
+    tail = stream.finish()
+    if tail:
+        texts.append(tail)
+    transcript = " ".join(texts)
+    assert len(transcript.split()) >= 3, transcript
+
+
+def test_parakeet_mlx_engine_transcribes_test_wav() -> None:
+    """Opt-in real-model smoke for an operator-provided 16 kHz PCM WAV."""
+    wav_path = os.environ.get("OMNIGENT_DICTATION_MLX_TEST_WAV", "").strip()
+    if not wav_path:
+        pytest.skip("set OMNIGENT_DICTATION_MLX_TEST_WAV to run the Parakeet MLX smoke")
+    pytest.importorskip("parakeet_mlx")
+
+    import wave
+
+    engine = dictation.ParakeetMlxDictationEngine(
+        dictation._mlx_model(), dictation._mlx_cache_dir()
+    )
+    stream = engine.create_stream()
+    with wave.open(wav_path) as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        assert wav.getframerate() == dictation.SAMPLE_RATE
+        pcm = wav.readframes(wav.getnframes())
+
+    texts: list[str] = []
+    chunk = dictation.SAMPLE_RATE * 2 // 10
     for i in range(0, len(pcm), chunk):
         update = stream.feed_pcm16(pcm[i : i + chunk])
         if update.finalized:
