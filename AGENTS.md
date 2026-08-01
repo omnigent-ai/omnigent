@@ -9,6 +9,12 @@ Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
 let it run on staged files via `git commit`). Fix any issues it reports so the
 commit lands clean — CI runs the same checks.
 
+## Git hosting
+
+Preserve the forge already used by an existing repository. For a new project
+that does not already exist on GitHub, prefer the user's private GitLab instance
+over creating a new GitHub repository; use `glab` when it is configured.
+
 ## Local development shortcuts
 
 Use `just` for common tasks; run `just --list` for grouped recipes.

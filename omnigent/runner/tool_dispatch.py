@@ -1838,6 +1838,23 @@ async def _execute_subagent_tool(
                     f"Install/upgrade it with: {install} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
+            # Binary presence proves only that the harness can be invoked. A
+            # provider-less CLI still fails immediately (for example Pi asks
+            # for /login), leaving a doomed child session behind. Use the same
+            # provider resolver that backs sys_list_models and reject before
+            # child creation.
+            from omnigent.model_catalog import NONE_KIND, resolve_model_provider
+
+            sub_spec = _find_subagent_spec(str(sub_agent_name), agent_spec)
+            if sub_spec is not None and child_harness in {"pi", "pi-native"}:
+                provider = resolve_model_provider(sub_spec, child_harness)
+                if provider.kind == NONE_KIND:
+                    return (
+                        f"Error: sub-agent {sub_agent_name!r} can't start on this "
+                        f"machine: harness {child_harness!r} has no usable model "
+                        f"provider ({provider.detail}). Configure its provider or "
+                        "choose a worker reported as usable by sys_list_models."
+                    )
         # Create child session on the server (no initial items —
         # those go via a separate POST so the server forwards them
         # to the runner and triggers a turn).

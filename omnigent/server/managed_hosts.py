@@ -838,6 +838,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
                     "resources",
                     "pvc_mounts",
                     "secret_mounts",
+                    "run_as_root",
                 },
                 "sandbox.kubernetes",
             )
@@ -856,6 +857,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             resources=_parse_kubernetes_resources(raw),
             pvc_mounts=pvc_mounts,
             secret_mounts=secret_mounts,
+            run_as_root=_parse_provider_bool(raw, "kubernetes", "run_as_root") or False,
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -2056,6 +2058,7 @@ def _kubernetes_launcher_factory(
     resources: dict[str, object] | None,
     pvc_mounts: list[dict[str, object]] | None,
     secret_mounts: list[dict[str, object]] | None,
+    run_as_root: bool = False,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -2081,6 +2084,8 @@ def _kubernetes_launcher_factory(
         or ``None``.
     :param secret_mounts: Normalized Secret file-mount entries added to every
         runner Pod (rotation-friendly credential volumes), or ``None``.
+    :param run_as_root: Whether runner containers use uid/gid 0 for package
+        installation. The default parser value is ``False``.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -2102,6 +2107,7 @@ def _kubernetes_launcher_factory(
             resources=resources,
             pvc_mounts=pvc_mounts,
             secret_mounts=secret_mounts,
+            run_as_root=run_as_root,
         )
 
     return _build

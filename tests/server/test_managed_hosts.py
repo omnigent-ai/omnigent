@@ -750,6 +750,24 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
     assert fake.pvc_mounts is None
 
 
+def test_parse_kubernetes_run_as_root_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explicit root opt-in is passed to the Kubernetes launcher."""
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    config = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://server",
+            "kubernetes": {"run_as_root": True},
+        }
+    )
+    assert config is not None
+    config.launcher_factory()
+    assert fake.run_as_root is True
+
+
 @pytest.mark.parametrize(
     ("pvc_mounts", "expected_fragment"),
     [

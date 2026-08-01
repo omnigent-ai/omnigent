@@ -364,6 +364,20 @@ def test_build_pod_manifest_is_restricted_and_least_privilege() -> None:
     assert host["securityContext"]["capabilities"] == {"drop": ["ALL"]}
 
 
+def test_build_pod_manifest_root_opt_in_supports_apt_without_extra_capabilities() -> None:
+    """Root mode permits package installs while retaining the other pod defenses."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, run_as_root=True)
+    spec = manifest["spec"]
+    assert spec["securityContext"]["runAsNonRoot"] is False
+    assert spec["securityContext"]["runAsUser"] == 0
+    assert spec["securityContext"]["runAsGroup"] == 0
+    assert spec["securityContext"]["fsGroup"] == 0
+    assert spec["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
+    for container in [*spec["initContainers"], *spec["containers"]]:
+        assert container["securityContext"]["allowPrivilegeEscalation"] is False
+        assert container["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+
+
 @pytest.mark.parametrize(
     ("clone_dir", "repo_url", "repo_branch", "expect_clone", "expect_branch"),
     [

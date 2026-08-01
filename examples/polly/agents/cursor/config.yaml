@@ -37,9 +37,10 @@ prompt: |
   - Co-sign every commit you author: end each commit message with a blank line
     followed by this exact trailer as its final line —
     `Co-authored-by: omnigent <noreply@omnigent.ai>`
-  - When green, push your task branch and open a PR with `gh pr create` (clear
-    title, what changed, how you verified). Never push to a protected branch
-    (e.g. main) or force-push — open a PR and let it be reviewed/merged.
+  - When green, push your task branch and open a PR/MR on the repository's
+    existing forge (`gh` for GitHub, `glab` for GitLab). For a new project that
+    does not already exist on GitHub, prefer the user's private GitLab instance.
+    Never push to a protected branch or force-push.
 
   REVIEW — verify another agent's diff (you are given the diff + the acceptance
   contract):

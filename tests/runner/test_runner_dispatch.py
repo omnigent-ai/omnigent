@@ -3160,6 +3160,67 @@ async def test_sys_session_send_blocks_fresh_dispatch_when_harness_cli_missing(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_send_blocks_fresh_dispatch_without_model_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present harness CLI is not enough when it has no usable provider."""
+    from omnigent.model_catalog import NONE_KIND, ResolvedModelProvider
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda _spec, _harness: ResolvedModelProvider(
+            kind=NONE_KIND,
+            detail="no model provider configured",
+        ),
+    )
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+
+    create_posts = 0
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_posts
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_noprovider/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            return httpx.Response(201, json={"id": "conv_should_not_exist"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "research-models",
+                        "args": {"input": "research the available models"},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_noprovider",
+                agent_spec=_spec_with_subagent_harness("pi"),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_noprovider", None)
+
+    assert output.startswith("Error:")
+    assert "no usable model provider" in output
+    assert "sys_list_models" in output
+    assert create_posts == 0
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_model_rejected_for_existing_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

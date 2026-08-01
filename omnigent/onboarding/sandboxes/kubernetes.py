@@ -35,10 +35,10 @@ Platform notes that shape this launcher:
   PID 1, so the container command is a tiny supervisor that spawns
   ``omnigent host``, reaps any children, and forwards SIGTERM for prompt,
   graceful termination.
-- **Least privilege.** ``automountServiceAccountToken: false`` keeps the runner
-  SA's (absent) rights out of the sandbox, the Pod runs as a non-root user,
-  drops all capabilities, and disables privilege escalation. The root
-  filesystem stays writable (the host writes ``/tmp`` and ``~/.omnigent``).
+- **Least privilege by default.** ``automountServiceAccountToken: false`` keeps
+  the runner SA's (absent) rights out of the sandbox. Pods run as non-root unless
+  the operator explicitly enables root for package installation; both modes
+  drop all capabilities and disable privilege escalation.
 - **No CLI bootstrap / port forward.** Like Modal/Daytona/Islo, the launcher
   exists for server-managed hosts only.
 """
@@ -477,6 +477,7 @@ def build_pod_manifest(
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     secret_mounts: Sequence[Mapping[str, object]] | None = None,
+    run_as_root: bool = False,
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -498,10 +499,10 @@ def build_pod_manifest(
     - The launch token is referenced via ``secretKeyRef`` (never in the spec);
       the host identity rides literal env; harness credentials are projected via
       ``envFrom`` when *harness_secret* is set.
-    - Pod + container ``securityContext`` satisfy Pod Security "restricted"
-      (runAsNonRoot as the image's ``sandbox`` user :data:`_RUN_AS_UID`, drop ALL
-      caps, ``seccompProfile: RuntimeDefault``, no privilege escalation). The
-      root filesystem stays writable (the host writes ``/tmp`` + ``~/.omnigent``).
+    - By default, Pod + container ``securityContext`` satisfy Pod Security
+      "restricted". With *run_as_root*, the Pod uses uid 0 so agents can install
+      OS packages; it still drops ALL capabilities, uses RuntimeDefault seccomp,
+      disables privilege escalation, and mounts no service-account token.
     - ``kubernetes.io/arch: amd64`` is the default; a *node_selector* entry for
       that key overrides it (e.g. ``arm64`` — the host image is multi-arch).
     - Operator *pvc_mounts* become ``persistentVolumeClaim`` volumes mounted on
@@ -549,6 +550,8 @@ def build_pod_manifest(
     :param secret_mounts: Normalized Secret mounts (``{secret_name,
         mount_path}``) added as read-only ``secret`` volumes on the host
         container only, or ``None``.
+    :param run_as_root: Run both containers as uid/gid 0 so package managers can
+        modify the image filesystem. Defaults to ``False``.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -670,6 +673,8 @@ def build_pod_manifest(
     if harness_secret:
         host_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
 
+    run_uid = 0 if run_as_root else _RUN_AS_UID
+    run_gid = 0 if run_as_root else _RUN_AS_GID
     spec: dict[str, object] = {
         "restartPolicy": "Never",
         "automountServiceAccountToken": False,
@@ -679,10 +684,10 @@ def build_pod_manifest(
         # the host image is published multi-arch).
         "nodeSelector": {"kubernetes.io/arch": "amd64", **(node_selector or {})},
         "securityContext": {
-            "runAsNonRoot": True,
-            "runAsUser": _RUN_AS_UID,
-            "runAsGroup": _RUN_AS_GID,
-            "fsGroup": _RUN_AS_GID,
+            "runAsNonRoot": not run_as_root,
+            "runAsUser": run_uid,
+            "runAsGroup": run_gid,
+            "fsGroup": run_gid,
             "fsGroupChangePolicy": "OnRootMismatch",
             "seccompProfile": {"type": "RuntimeDefault"},
         },
@@ -885,6 +890,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
+        run_as_root: bool = False,
     ) -> None:
         """
         Initialize the launcher.
@@ -913,6 +919,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             (validated at parse time), or ``None`` for none.
         :param secret_mounts: Normalized ``sandbox.kubernetes.secret_mounts``
             entries (validated at parse time), or ``None`` for none.
+        :param run_as_root: Run sandbox containers as root so agents can install
+            OS packages. Defaults to ``False``.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -925,6 +933,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
+        self._run_as_root = run_as_root
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
@@ -1222,6 +1231,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     resources=self._resources,
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
+                    run_as_root=self._run_as_root,
                 )
                 # Secret before Pod so the Pod's secretKeyRef resolves
                 # immediately — a Pod referencing a missing Secret would sit in
