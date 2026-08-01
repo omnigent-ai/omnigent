@@ -272,7 +272,7 @@ def create_scheduled_tasks_router(
         )
         return canonical_workspace, validated_model, validated_effort
 
-    def _require_owned(scheduled_task_id: str, owner: str) -> ScheduledTask:
+    def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:
         """Load a task the caller owns, or raise 404.
 
         A task owned by someone else 404s (not 403) so tasks aren't

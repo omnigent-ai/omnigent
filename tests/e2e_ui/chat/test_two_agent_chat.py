@@ -117,8 +117,9 @@ def _expect_dispatch_tool_call_rendered(page: Page) -> None:
     """Assert the `sys_session_send` dispatch shows as a transcript tool call.
 
     A lone call can render directly; completed multi-step turns fold calls
-    into a collapsed "See N steps" group. Expand groups when present. The
-    trigger renders toolTitle.ts's raw-name fallback
+    into a collapsed summary group labeled by formatToolRunLabel (generic
+    "Called N tools" for unrecognized sys_* names). Expand groups when
+    present. The trigger renders toolTitle.ts's raw-name fallback
     ("sys_session_send(...)"), not the friendly "Start child session:"
     verb: sessionTitle() reads `tool`/`session` args while the named
     spawn schema (omnigent/tools/builtins/spawn.py) sends `agent`/`title`,
@@ -133,7 +134,7 @@ def _expect_dispatch_tool_call_rendered(page: Page) -> None:
         expect(direct_call.first).to_be_visible()
         return
 
-    step_groups = page.get_by_text(re.compile(r"^See \d+ steps?$"))
+    step_groups = page.get_by_text(re.compile(r"^Called \d+ tools?$"))
     expect(step_groups.first).to_be_visible()
     for group in step_groups.all():
         group.click()

@@ -1,5 +1,5 @@
-import { type ConnectionState } from "@/components/blocks/TerminalSession";
-import { type TerminalInfo } from "@/hooks/useTerminals";
+import type { ConnectionState } from "@/components/blocks/TerminalSession";
+import type { TerminalInfo } from "@/hooks/useTerminals";
 import { cn } from "@/lib/utils";
 
 /**

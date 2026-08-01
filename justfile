@@ -69,18 +69,18 @@ android-reverse:
 # --- Electron desktop app ---
 
 _ensure-web:
-    cd web && test -d node_modules || npm install --no-audit --no-fund
+    cd web && test -d node_modules || pnpm install
 
 _ensure-electron:
-    cd web/electron && test -d node_modules || npm install --no-audit --no-fund
+    cd web/electron && test -d node_modules || pnpm install
 
 [group('electron')]
 electron-dev: _ensure-web _ensure-electron
-    npm --prefix web/electron run dev
+    pnpm --filter web/electron run dev
 
 [group('electron')]
 electron-build: _ensure-web _ensure-electron
-    npm --prefix web/electron run build
+    pnpm --filter web/electron run build
 
 # --- Lint ---
 
@@ -92,9 +92,13 @@ lint: _ensure-uv
 lint-all: _ensure-uv
     uv run pre-commit run --all-files
 
+[group('lint')]
+lint-ts:
+    pnpm install --frozen-lockfile --filter web
+    pnpm --filter web run lint
+
 # --- Lockfile maintenance ---
 
 [group('lint')]
 normalize-locks: _ensure-uv
-    uv run scripts/normalize_package_lock_registry.py web/package-lock.json web/electron/package-lock.json editors/vscode/package-lock.json || true
     uv run scripts/normalize_uv_lock_registry.py uv.lock || true

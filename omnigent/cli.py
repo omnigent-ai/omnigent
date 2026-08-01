@@ -72,6 +72,7 @@ from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
     from omnigent.update_check import _InstalledWheelInfo
 
 
@@ -88,7 +89,7 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
 
 
 def _parse_model_prefixes(
-    raw: Any,  # type: ignore[explicit-any]  # str | list | None from YAML
+    raw: Any,  # str | list | None from YAML
 ) -> list[str]:
     """Normalize the ``model_prefix`` config into a list of prefixes.
 
@@ -104,8 +105,8 @@ def _parse_model_prefixes(
 
 
 def _build_external_routing_client(
-    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
-) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
+    routing_cfg: Any,  # parsed YAML block
+) -> Any | None:  # ExternalRoutingClient | None
     """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
     Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
@@ -163,8 +164,8 @@ def _build_external_routing_client(
 
 
 def _build_local_llm_routing_client(
-    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
-) -> Any | None:  # type: ignore[explicit-any]  # LLMRoutingClient | None
+    server_llm: Any,  # LLMConfig | None
+) -> Any | None:  # LLMRoutingClient | None
     """Build the built-in :class:`LLMRoutingClient` from the ``llm:`` block.
 
     :param server_llm: The parsed server-level ``LLMConfig``.
@@ -191,7 +192,7 @@ def _server_uvicorn_log_config(
     log_path: Path | None = None,
     *,
     log_to_stderr: bool | None = None,
-) -> dict[str, Any]:  # type: ignore[explicit-any]
+) -> dict[str, Any]:
     """
     Return Uvicorn logging config with request-duration access logs.
 
@@ -850,7 +851,7 @@ def _resolve_auto_open_conversation_from_config(cfg: dict[str, Any]) -> bool:  #
 
 
 def _normalize_harness_scalar_on_write(
-    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    cfg: dict[str, Any],
     path: Path,
 ) -> bool:
     """Migrate a legacy scalar ``harness:`` to the mapping form in *cfg*.
@@ -985,7 +986,7 @@ def _materialize_internal_beta_agents() -> Path:
 
 
 def _save_local_config(
-    settings: dict[str, str | bool | Mapping[str, Any]],  # type: ignore[explicit-any]
+    settings: dict[str, str | bool | Mapping[str, Any]],
     unset_keys: tuple[str, ...] = (),
     deep_merge_keys: tuple[str, ...] = (),
 ) -> None:
@@ -1344,6 +1345,73 @@ def _print_version_callback(ctx: click.Context, _param: click.Parameter, value: 
     ctx.exit()
 
 
+# Visible top-level subcommands that launch an agent harness (or a
+# bundled agent). Grouped under their own "Harnesses" heading in
+# ``omnigent --help`` so the long harness roster doesn't drown out the
+# management commands. Keep in sync with the harness launch commands
+# decorated below.
+_HARNESS_COMMANDS: frozenset[str] = frozenset(
+    {
+        "antigravity",
+        "claude",
+        "codex",
+        "cursor",
+        "debby",
+        "goose",
+        "hermes",
+        "kimi",
+        "kiro",
+        "opencode",
+        "pi",
+        "polly",
+        "qwen",
+    }
+)
+
+
+# Brand accent (Otto's magenta-pink, ``ui.ACCENT`` / ``#F43BA6``) as an
+# RGB triple for :func:`click.style` truecolor. Kept as a literal so
+# help formatting stays import-light (no pull of the rich-backed ui
+# module just to draw ``--help``).
+_ACCENT_RGB = (244, 59, 166)
+
+# Command names that are pure aliases of another command (the same Click
+# object registered under a second name, e.g. ``update`` -> ``upgrade``).
+# Kept runnable/registered but omitted from the ``--help`` listing so the
+# alias isn't shown as a duplicate line.
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"update"})
+
+
+def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
+    """Map extras-gated harness commands to their SDK-installed predicate.
+
+    Harnesses that ride an optional pip extra (lazily imported on first
+    turn) are hidden from ``omnigent --help`` until the extra is
+    importable, so the listing only advertises harnesses ready to launch.
+    The predicates use ``importlib.util.find_spec`` (no heavy import).
+    Commands absent from this map are always listed.
+    """
+    from omnigent.onboarding.antigravity_auth import antigravity_sdk_installed
+    from omnigent.onboarding.cursor_auth import cursor_sdk_installed
+
+    return {
+        "cursor": cursor_sdk_installed,
+        "antigravity": antigravity_sdk_installed,
+    }
+
+
+def _help_style(text: str, **style: object) -> str:
+    """Colorize *text* for help output, honoring ``NO_COLOR``.
+
+    Click's ``echo`` already strips ANSI when the sink is not a TTY, so
+    this only needs to guard the explicit ``NO_COLOR`` opt-out; on an
+    interactive terminal the styled string is emitted as-is.
+    """
+    if os.environ.get("NO_COLOR"):
+        return text
+    return click.style(text, **style)  # type: ignore[arg-type]
+
+
 class _OmnigentCLI(click.Group):
     """Top-level group that prints the brand lockup above its help.
 
@@ -1353,6 +1421,87 @@ class _OmnigentCLI(click.Group):
     clean. Only the top-level group overrides help; subcommand help
     (``omnigent run --help``) is untouched.
     """
+
+    def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Render the usage line with an accent-colored ``Usage:`` prefix."""
+        pieces = self.collect_usage_pieces(ctx)
+        prefix = f"{_help_style('Usage:', fg=_ACCENT_RGB, bold=True)} "
+        formatter.write_usage(ctx.command_path, " ".join(pieces), prefix=prefix)
+
+    def format_options(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Color the ``Options`` heading + flag names, then the commands."""
+        opts = []
+        for param in self.get_params(ctx):
+            rv = param.get_help_record(ctx)
+            if rv is not None:
+                opts.append((_help_style(rv[0], fg="green"), rv[1]))
+        if opts:
+            with formatter.section(_help_style("Options", fg=_ACCENT_RGB, bold=True)):
+                formatter.write_dl(opts)
+        self.format_commands(ctx, formatter)
+
+    def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """List commands under two headings: Harnesses and Commands.
+
+        Mirrors Click's default ``format_commands`` (skipping hidden
+        commands, sharing one column width) but splits the visible
+        subcommands into the harness launchers and everything else, and
+        tints each section: harness names in the brand accent, the rest
+        in cyan.
+        """
+        harness_rows: list[tuple[str, click.Command]] = []
+        other_rows: list[tuple[str, click.Command]] = []
+        any_hidden = False
+        extra_checks = _harness_extra_checks()
+        for subcommand in self.list_commands(ctx):
+            cmd = self.get_command(ctx, subcommand)
+            if cmd is None or cmd.hidden:
+                continue
+            # Skip pure aliases (e.g. ``update`` -> ``upgrade``) so the
+            # listing doesn't show a duplicate line; still runnable.
+            if subcommand in _ALIAS_COMMANDS:
+                continue
+            if subcommand in _HARNESS_COMMANDS:
+                # Hide extras-gated harnesses whose SDK isn't installed;
+                # they remain runnable (running them offers the install).
+                check = extra_checks.get(subcommand)
+                if check is not None and not check():
+                    any_hidden = True
+                    continue
+                harness_rows.append((subcommand, cmd))
+            else:
+                other_rows.append((subcommand, cmd))
+
+        all_names = [name for name, _ in (*harness_rows, *other_rows)]
+        if not all_names:
+            return
+        # Share one help column across both sections so their
+        # descriptions line up. Width is measured on the plain names —
+        # ANSI styling is added afterward and is stripped by Click's
+        # ``term_len`` when it computes alignment.
+        limit = formatter.width - 6 - max(len(name) for name in all_names)
+
+        def _emit(title: str, rows: list[tuple[str, click.Command]], name_fg: object) -> None:
+            if not rows:
+                return
+            with formatter.section(_help_style(title, fg=_ACCENT_RGB, bold=True)):
+                formatter.write_dl(
+                    [
+                        (_help_style(name, fg=name_fg), cmd.get_short_help_str(limit))
+                        for name, cmd in rows
+                    ]
+                )
+
+        _emit("Harnesses", harness_rows, _ACCENT_RGB)
+        if any_hidden:
+            formatter.write_paragraph()
+            formatter.write_text(
+                _help_style(
+                    "Some harnesses need an optional extra — run `omnigent setup` to enable them.",
+                    dim=True,
+                )
+            )
+        _emit("Commands", other_rows, "cyan")
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         from omnigent.inner import ui
@@ -3558,14 +3707,16 @@ def server(
     # Warn loudly when the SPA bundle is absent: the server still boots
     # but serves an API-only JSON landing at "/", so the operator hits
     # http://host:port expecting the web UI and gets JSON with no clue
-    # why. The bundle is npm-build output (not tracked in git); a dev
-    # checkout that never ran `npm run build` has an empty static dir.
+    # why. The bundle is Vite build output (not tracked in git); a dev
+    # checkout that never ran `pnpm --filter web run build` has an empty
+    # static dir.
     from omnigent.server.app import _WEB_UI_DIST
 
     if not (_WEB_UI_DIST / "index.html").is_file():
         click.echo(
             "  ⚠ web UI not built — serving API only. "
-            "Run `cd web && npm install && npm run build`, "
+            "Run `pnpm install --frozen-lockfile --filter web && "
+            "pnpm --filter web run build`, "
             "then restart (or install a release wheel/image).",
             err=True,
         )
@@ -3601,7 +3752,7 @@ def server(
         cleanly within the graceful window.
         """
 
-        async def shutdown(self, sockets=None) -> None:  # type: ignore[override]
+        async def shutdown(self, sockets=None) -> None:
             import asyncio as _asyncio
 
             from omnigent.runtime import session_stream as _session_stream
@@ -3960,7 +4111,7 @@ def uninstall(
     no_backup: bool,
     assume_inferred: bool,
 ) -> None:
-    """Uninstall Omnigent while preserving user data unless --purge is set."""
+    """Uninstall Omnigent from this machine."""
     from omnigent.install_ledger import resolve_uninstall_ledger
 
     ledger = resolve_uninstall_ledger()
@@ -4108,7 +4259,12 @@ def _drain_and_stop_local_server(*, force: bool) -> None:
 
 
 def _upgrade_vcs_install(
-    info: _InstalledWheelInfo, *, check_only: bool, force: bool, pre: bool
+    info: _InstalledWheelInfo,
+    *,
+    check_only: bool,
+    force: bool,
+    pre: bool,
+    extra_overrides: tuple[str, ...],
 ) -> None:
     """Update a git/VCS ``omni`` install by re-pulling its tracked ref.
 
@@ -4125,6 +4281,7 @@ def _upgrade_vcs_install(
         positively confirm the install is behind its tracked ref.
     :param force: Stop in-flight sessions immediately instead of draining.
     :param pre: Pass the installer's allow-pre-releases flag (no-op for git).
+    :param extra_overrides: Extras supplied by ``omni upgrade --extra``.
     """
     from omnigent.update_check import (
         _build_upgrade_suggestion,
@@ -4169,7 +4326,11 @@ def _upgrade_vcs_install(
             "Note: --pre has no effect on a git install; the tracked ref decides the commit."
         )
 
-    suggestion = _build_upgrade_suggestion(info, allow_prerelease=pre)
+    suggestion = _build_upgrade_suggestion(
+        info,
+        allow_prerelease=pre,
+        extra_overrides=extra_overrides,
+    )
     if not suggestion.runnable:
         raise click.ClickException(
             f"No automatic upgrade command is known for this install. {suggestion.command}."
@@ -4234,26 +4395,57 @@ def _upgrade_vcs_install(
     help="Consider pre-releases (e.g. release candidates), and pass the "
     "installer's allow-pre-releases flag. Useful for validating a TestPyPI rc.",
 )
-def upgrade(check_only: bool, force: bool, pre: bool) -> None:
-    """Upgrade the omnigent CLI to the latest release on PyPI.
+@click.option(
+    "--extra",
+    "extra_overrides",
+    multiple=True,
+    help="Extra dependency set(s) to keep or add during the upgrade. "
+    "May be given multiple times. Overrides extras detected from installer metadata.",
+)
+@click.option(
+    "--target-version",
+    help="Upgrade to a specific version instead of the latest release.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the detected install shape and upgrade command, then exit "
+    "without stopping sessions or running the installer.",
+)
+def upgrade(
+    check_only: bool,
+    force: bool,
+    pre: bool,
+    extra_overrides: tuple[str, ...],
+    target_version: str | None,
+    dry_run: bool,
+) -> None:
+    """Upgrade Omnigent to the latest release.
 
-    Detects how omnigent was installed (uv / pip / pipx / poetry), checks
-    the configured index for a newer release and — unless ``--check`` —
-    drains and stops the local background server and host daemon, then runs
-    the matching upgrade command. The next ``omni`` invocation starts a
-    fresh server on the new code automatically (via the version-aware
-    config signature), so no explicit restart is needed.
+    Detects how omnigent was installed (uv tool / pipx), checks the
+    configured index for a newer release and — unless ``--check`` — drains
+    and stops the local background server and host daemon, then runs the
+    matching upgrade command. The next ``omni`` invocation starts a fresh
+    server on the new code automatically, so no explicit restart is needed.
 
     In-flight agent sessions are waited on by default; pass ``--force`` to
     stop them immediately. Pass ``--pre`` to consider pre-releases (rc /
-    beta) — handy for validating a TestPyPI candidate against your
-    configured index. Source checkouts / editable installs are not upgraded
-    here — update those with ``git pull``.
+    beta). Pass ``--extra`` to keep or add extras that the installer did not
+    record. Use ``--target-version`` when validating a specific release.
+
+    Requires the install to have come from a tool that records extras:
+    ``uv tool install`` or ``pipx install``. ``pip`` does not record
+    extras, so ``omni upgrade`` refuses to auto-upgrade it and prints the
+    manual command instead. Source checkouts / editable installs are not
+    upgraded here — update those with ``git pull``.
 
     :param check_only: Only report availability; do not upgrade. Exits
         with status 1 when a newer release exists.
     :param force: Stop in-flight sessions immediately rather than draining.
     :param pre: Consider pre-releases and allow the installer to fetch them.
+    :param extra_overrides: Extras requested via ``--extra``.
+    :param target_version: Pin the upgrade to this version.
+    :param dry_run: Print the command and exit without running it.
     :returns: None.
     """
     import importlib.metadata
@@ -4266,6 +4458,7 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
         _probe_installed_distribution,
         _read_installed_wheel_info,
         _run_upgrade_command,
+        _uv_tool_receipt_path,
         fetch_latest_version,
     )
 
@@ -4294,25 +4487,67 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
     # installs "upgrade" means re-pulling the ref — compared and verified by
     # commit, not by PyPI version.
     if info.vcs_url:
-        _upgrade_vcs_install(info, check_only=check_only, force=force, pre=pre)
+        _upgrade_vcs_install(
+            info,
+            check_only=check_only,
+            force=force,
+            pre=pre,
+            extra_overrides=extra_overrides,
+        )
         return
+
+    # pip / ``uv pip`` do not record which extras were requested for a plain
+    # registry install. Auto-upgrade cannot preserve them safely, so we print
+    # a manual command instead. We still allow ``--check`` because that only
+    # reports availability.
+    if not check_only:
+        if info.detected_installer == "pip":
+            click.echo(
+                "omnigent was installed with pip, and pip does not record which extras "
+                "were requested. `omni upgrade` cannot preserve them safely, so you "
+                "should upgrade manually:\n\n"
+                "    pip install -U omnigent\n"
+                "    # or, if you need extras:\n"
+                "    pip install -U 'omnigent[your,extras,here]'"
+            )
+            raise SystemExit(0)
+        if info.detected_installer == "uv" and _uv_tool_receipt_path() is None:
+            click.echo(
+                "omnigent was installed with `uv pip`, not `uv tool install`. "
+                "`uv pip` does not record which extras were requested, so "
+                "`omni upgrade` cannot preserve them safely. Upgrade manually:\n\n"
+                "    uv pip install -U omnigent\n"
+                "    # or, if you need extras:\n"
+                "    uv pip install -U 'omnigent[your,extras,here]'"
+            )
+            raise SystemExit(0)
 
     current = importlib.metadata.version("omnigent")
-    # User-initiated: a more forgiving timeout + one retry so a momentarily slow
-    # mirror doesn't spuriously report the index as unreachable.
-    latest = fetch_latest_version(
-        include_prereleases=pre, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS, attempts=2
-    )
-    if latest is None:
-        raise click.ClickException(
-            "Couldn't reach the package index to check for a newer release. Check your "
-            "connection (or OMNIGENT_INDEX_URL / your configured index) and try again."
+    if target_version:
+        # A pinned target version means we don't have to ask the index what
+        # "latest" is. Treat the target as the desired release. This is
+        # especially useful for release validation against a specific rc or
+        # testing the upgrade path when the current dev version is already
+        # newer than anything on PyPI.
+        latest = target_version
+        click.echo(f"Targeting v{latest}.")
+    else:
+        # User-initiated: a more forgiving timeout + one retry so a momentarily slow
+        # mirror doesn't spuriously report the index as unreachable.
+        latest = fetch_latest_version(
+            include_prereleases=pre, timeout=_UPGRADE_INDEX_TIMEOUT_SECONDS, attempts=2
         )
-    if not _is_newer(latest, current):
-        click.echo(f"omnigent is up to date (v{current}).")
-        return
+        if latest is None:
+            raise click.ClickException(
+                "Couldn't reach the package index to check for a newer release. Check your "
+                "connection (or OMNIGENT_INDEX_URL / your configured index) and try again."
+            )
+        if not _is_newer(latest, current):
+            click.echo(f"omnigent is up to date (v{current}).")
+            return
 
-    click.echo(f"A new release is available: v{current} → v{latest}.")
+        click.echo(f"A new release is available: v{current} → v{latest}.")
+
     if check_only:
         # Non-zero so scripts/CI can gate on "an upgrade is available".
         # SystemExit (not ctx.exit) because main() runs the group with
@@ -4320,11 +4555,25 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
         # dropped rather than applied — SystemExit propagates correctly.
         raise SystemExit(1)
 
-    suggestion = _build_upgrade_suggestion(info, allow_prerelease=pre)
+    suggestion = _build_upgrade_suggestion(
+        info,
+        allow_prerelease=pre,
+        extra_overrides=extra_overrides,
+        target_version=target_version,
+    )
     if not suggestion.runnable:
         raise click.ClickException(
             f"No automatic upgrade command is known for this install. {suggestion.command}."
         )
+
+    if dry_run:
+        extras = sorted(set(extra_overrides or info.extras))
+        click.echo(
+            f"Detected installer: {info.detected_installer or info.installer}\n"
+            f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
+            f"Would run: {suggestion.command}"
+        )
+        return
 
     _drain_and_stop_local_server(force=force)
 
@@ -4348,6 +4597,7 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
             "Run `omni upgrade --check` to verify."
         )
         return
+    expected_version = target_version or latest
     if _is_newer(new_version, current):
         click.echo(
             f"✓ Upgraded to v{new_version}. Re-run your command — the local "
@@ -4356,10 +4606,10 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
         return
     raise click.ClickException(
         f"The upgrade command ran but omnigent is still v{new_version} (expected "
-        f"v{latest}). The install is likely version-pinned, a cooldown / "
+        f"v{expected_version}). The install is likely version-pinned, a cooldown / "
         "exclude-newer is excluding the new release, or the index cache is stale. "
         "Reinstall it explicitly — e.g. `uv tool upgrade --reinstall omnigent` or "
-        f"`pip install --force-reinstall 'omnigent=={latest}'`."
+        f"`pip install --force-reinstall 'omnigent=={expected_version}'`."
     )
 
 
@@ -4821,11 +5071,17 @@ def resume(
         "local server, or a newly started local server."
     ),
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace a previously imported chat from the same harness session.",
+)
 def import_session_command(
     harness: str,
     source_session_id: str | None,
     recent_session_count: int | None,
     server: str | None,
+    force: bool,
 ) -> None:
     """Import chats from supported local coding harnesses.
 
@@ -4833,7 +5089,8 @@ def import_session_command(
     as a normal session. Qwen, Kiro, and Kimi currently preserve visible
     messages but not native tool activity; OpenCode and Pi preserve exported
     tool activity. Use --session for one chat or --last for a bounded batch. A
-    source session can only be imported once.
+    source session can only be imported once unless --force is used to replace
+    the previous import.
 
     \b
     Examples:
@@ -4842,6 +5099,7 @@ def import_session_command(
       omnigent import --harness opencode --session <session-id>
       omnigent import --harness qwen --session <session-id>
       omnigent import --harness claude --last 10
+      omnigent import --harness claude --session <session-id> --force
     """
     import httpx
 
@@ -4900,6 +5158,7 @@ def import_session_command(
             "source": imported.source,
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
+            "force": force,
             "items": [
                 {
                     "type": item.type,
@@ -5077,7 +5336,7 @@ def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[e
     help="Emit the raw usage report as JSON instead of the table.",
 )
 def usage(limit: int, server: str | None, as_json: bool) -> None:
-    """Show your Omnigent LLM cost for today / the last 7 / 30 days.
+    """Show your Omnigent usage and costs.
 
     The summary is sourced from the per-user daily cost rollup, which
     attributes spend to the UTC calendar day it occurred on — so the
@@ -5466,6 +5725,9 @@ _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
     f"Harness to use: {_HARNESS_CHOICES_HELP}. Without AGENT, launches that harness directly."
 )
+_FROM_OPENCLAW_HELP = (
+    "Launch one agent from the OpenClaw/acpx registry without saving it to Omnigent config."
+)
 _MODEL_HELP = "Model to use for the agent."
 _PROMPT_HELP = "Send this as the first message when the REPL starts."
 _SYSTEM_PROMPT_HELP = "Instructions to use for the agent."
@@ -5543,11 +5805,34 @@ def _default_harness_prompt(harness: str) -> str:
     return _DEFAULT_HARNESS_PROMPTS.get(harness, _DEFAULT_HARNESS_PROMPT)
 
 
+def _resolve_openclaw_run_agent(identifier: str) -> AcpAgentEntry:
+    """Resolve one OpenClaw/acpx agent for an ephemeral ``run`` launch."""
+    from omnigent.onboarding.openclaw_config import (
+        discover_openclaw_agents,
+        openclaw_agents_to_acp_entries,
+        resolve_openclaw_acp_agent,
+    )
+
+    discovery = discover_openclaw_agents()
+    entry = resolve_openclaw_acp_agent(identifier, discovery=discovery)
+    if entry is not None:
+        return entry
+
+    available = openclaw_agents_to_acp_entries(discovery.agents)
+    hint = ", ".join(f"{entry.name} ({entry.slug})" for entry in available)
+    detail = f" Available agents: {hint}." if hint else " No agents were discovered."
+    if discovery.errors:
+        paths = ", ".join(str(error.path) for error in discovery.errors)
+        detail += f" Unreadable config: {paths}."
+    raise click.ClickException(f"OpenClaw/acpx agent {identifier!r} was not found.{detail}")
+
+
 def _materialize_harness_launcher_file(
     *,
     harness: str,
     model: str | None,
     system_prompt: str | None,
+    acp_agent: AcpAgentEntry | None = None,
 ) -> Path:
     """
     Create a temporary standalone Omnigent YAML for no-AGENT ``run``.
@@ -5567,6 +5852,8 @@ def _materialize_harness_launcher_file(
     :param model: Optional model value to bake into ``executor``.
     :param system_prompt: Optional instructions text to use as the
         YAML's top-level ``prompt``.
+    :param acp_agent: Optional one-shot ACP agent embedded in the temporary
+        spec instead of resolved from global config.
     :returns: Path to the generated ``*.yaml`` file.
     :raises click.ClickException: If *harness* is unsupported.
     """
@@ -5589,9 +5876,16 @@ def _materialize_harness_launcher_file(
     tmpdir = Path(tempfile.mkdtemp(prefix="omnigent-harness-launcher-"))
     yaml_path = tmpdir / f"{effective_harness.replace(':', '-')}.yaml"
 
-    executor: dict[str, str] = {"harness": effective_harness}
+    executor: dict[str, object] = {"harness": effective_harness}
     if model is not None:
         executor["model"] = model
+    if acp_agent is not None:
+        if canonical != "acp":
+            raise click.ClickException("An ephemeral ACP agent requires the acp harness.")
+        executor["acp_agent"] = {
+            "name": acp_agent.name,
+            "command": acp_agent.command,
+        }
 
     raw = {
         "name": display_name,
@@ -5728,64 +6022,64 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
     "claude": _NativeTerminalDispatchSpec(
         module="omnigent.claude_native",
         function="run_claude_native",
-        args_param="claude_args",
+        args_param="extra_args",
     ),
     "codex": _NativeTerminalDispatchSpec(
         module="omnigent.codex_native",
         function="run_codex_native",
-        args_param="codex_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "pi": _NativeTerminalDispatchSpec(
         module="omnigent.pi_native",
         function="run_pi_native",
-        args_param="pi_args",
+        args_param="extra_args",
     ),
     "opencode": _NativeTerminalDispatchSpec(
         module="omnigent.opencode_native",
         function="run_opencode_native",
-        args_param="opencode_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "cursor": _NativeTerminalDispatchSpec(
         module="omnigent.cursor_native",
         function="run_cursor_native",
-        args_param="cursor_args",
+        args_param="extra_args",
     ),
     "kimi": _NativeTerminalDispatchSpec(
         module="omnigent.kimi_native",
         function="run_kimi_native",
-        args_param="kimi_args",
+        args_param="extra_args",
     ),
     "kiro": _NativeTerminalDispatchSpec(
         module="omnigent.kiro_native",
         function="run_kiro_native",
-        args_param="kiro_args",
+        args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
     ),
     "goose": _NativeTerminalDispatchSpec(
         module="omnigent.goose_native",
         function="run_goose_native",
-        args_param="goose_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
         module="omnigent.antigravity_native",
         function="run_antigravity_native",
-        args_param="antigravity_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "qwen": _NativeTerminalDispatchSpec(
         module="omnigent.qwen_native",
         function="run_qwen_native",
-        args_param="qwen_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "hermes": _NativeTerminalDispatchSpec(
         module="omnigent.hermes_native",
         function="run_hermes_native",
-        args_param="hermes_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
 }
@@ -5960,6 +6254,7 @@ def _dispatch_run(
     auto_open_conversation: bool = False,
     server_from_cli: bool = False,
     model_from_cli: bool = False,
+    acp_agent: AcpAgentEntry | None = None,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -6004,6 +6299,8 @@ def _dispatch_run(
         mode from a configured default server.
     :param model_from_cli: ``True`` when ``--model`` was explicitly provided
         on the command line rather than loaded from config.
+    :param acp_agent: Optional one-shot ACP agent carried in the generated
+        temporary spec instead of loaded from global config.
     """
     if target is not None and _is_server_url(target):
         raise click.ClickException(
@@ -6121,6 +6418,7 @@ def _dispatch_run(
                 harness=harness,
                 model=model,
                 system_prompt=system_prompt,
+                acp_agent=acp_agent,
             )
         )
         harness = None
@@ -6330,7 +6628,7 @@ def attach(
     tools: str | None,
     debug_events: bool,
 ) -> None:
-    """Attach the REPL to a LIVE session — never starts anything.
+    """Attach the REPL to a live session.
 
     ``attach`` is a thin client: it joins an already-running conversation
     on a server and streams its I/O. It never spawns a server, runner, or
@@ -6388,6 +6686,13 @@ def attach(
     help="Client-side tool set name (e.g. 'coding') for shell access.",
 )
 @click.option("--harness", default=None, help=_RUN_HARNESS_HELP)
+@click.option(
+    "--from-openclaw",
+    "from_openclaw",
+    default=None,
+    metavar="AGENT",
+    help=_FROM_OPENCLAW_HELP,
+)
 @click.option("--model", default=None, help=_MODEL_HELP)
 @click.option("-p", "--prompt", default=None, help=_PROMPT_HELP)
 @click.option("--system-prompt", "system_prompt", default=None, help=_SYSTEM_PROMPT_HELP)
@@ -6442,6 +6747,7 @@ def run(
     target: str | None,
     tools: str | None,
     harness: str | None,
+    from_openclaw: str | None,
     model: str | None,
     prompt: str | None,
     system_prompt: str | None,
@@ -6470,6 +6776,7 @@ def run(
     Examples:
       omnigent run --harness claude-sdk
       omnigent run --harness codex -p "review the last commit"
+      omnigent run --from-openclaw "Gemini CLI" -p "review the last commit"
       omnigent run examples/hello_world.yaml
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
       omnigent run --server http://localhost:6767
@@ -6484,12 +6791,24 @@ def run(
     model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
     harness_from_cli = harness_source is not None and harness_source.name == "COMMANDLINE"
+    acp_agent: AcpAgentEntry | None = None
+    if from_openclaw is not None:
+        if target is not None:
+            raise click.ClickException("--from-openclaw cannot be combined with an AGENT path.")
+        if harness_from_cli:
+            raise click.ClickException("--from-openclaw cannot be combined with --harness.")
+        acp_agent = _resolve_openclaw_run_agent(from_openclaw)
+        harness = f"acp:{acp_agent.slug}"
     direct_server_cli = (
-        target is None and server_from_cli and server is not None and not harness_from_cli
+        target is None
+        and server_from_cli
+        and server is not None
+        and not harness_from_cli
+        and acp_agent is None
     )
 
     _global_cfg = _load_effective_config()
-    if target is None and not direct_server_cli:
+    if target is None and not direct_server_cli and acp_agent is None:
         # Harness-aware default-agent resolution (this branch) under main's
         # direct-`--server` guard: skip the configured default_agent when the
         # invocation is a bare `--server` (no AGENT, no --harness), else pick
@@ -6556,6 +6875,7 @@ def run(
         auto_open_conversation=auto_open_conversation,
         server_from_cli=server_from_cli,
         model_from_cli=model_from_cli,
+        acp_agent=acp_agent,
     )
 
 
@@ -7830,7 +8150,7 @@ def _parse_config_settings(
 
 
 def _harness_deep_merge_keys(
-    parsed: dict[str, str | bool | Mapping[str, Any]],  # type: ignore[explicit-any]
+    parsed: dict[str, str | bool | Mapping[str, Any]],
 ) -> tuple[str, ...]:
     """Rewrite a ``harness=<id>`` setting for deep-merge into the harness mapping.
 
@@ -7876,7 +8196,7 @@ def _validate_unset_keys(unset_keys: tuple[str, ...]) -> list[str]:
 
 
 def _format_harness_for_display(
-    value: object,  # type: ignore[explicit-any]
+    value: object,
 ) -> tuple[str, list[str]]:
     """Render a ``harness`` config value for ``config list``.
 
@@ -7896,7 +8216,7 @@ def _format_harness_for_display(
 
 
 def _resolve_harness_startup_args(
-    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    cfg: dict[str, Any],
     harness: str,
     cli_args: tuple[str, ...],
 ) -> tuple[str, ...]:
@@ -7918,7 +8238,7 @@ def _resolve_harness_startup_args(
 
 
 def _print_config_default_rows(
-    cfg: dict[str, object],  # type: ignore[explicit-any]
+    cfg: dict[str, object],
 ) -> None:
     """Print one ``key=value`` row per config default, handling the ``harness`` key.
 
@@ -8356,7 +8676,7 @@ def setup(internal_beta: bool) -> None:
         # build. Fail loud with a clear message instead of an ImportError deep
         # in the onboarding flow when someone passes --internal-beta there.
         try:
-            import omnigent.onboarding.internal_beta  # noqa: F401
+            import omnigent.onboarding.internal_beta  # type: ignore[import-not-found]  # noqa: F401
         except ImportError:
             raise click.ClickException(
                 "Databricks internal-beta setup is not available in this build. "
@@ -8380,7 +8700,9 @@ def setup(internal_beta: bool) -> None:
         # bootstrap so a fresh machine sees every gap at once.
         _warn_missing_harness_dependencies()
         from omnigent.onboarding.internal_beta import _INTERNAL_BETA_DEFAULT_SERVER
-        from omnigent.onboarding.sandboxes.lakebox import install_demo_databricks_cli
+        from omnigent.onboarding.sandboxes.lakebox import (  # type: ignore[import-not-found]
+            install_demo_databricks_cli,
+        )
         from omnigent.onboarding.setup import run_onboarding
 
         # Install the demo `databricks` CLI (with the `lakebox`
@@ -8445,7 +8767,7 @@ if _sandbox_providers():
 
 @cli.group("debug")
 def debug() -> None:
-    """Internal maintenance commands (advanced — not needed for normal use).
+    """Internal maintenance commands.
 
     Houses operator-only database and accounts maintenance: tracking-DB
     schema upgrades (``db-upgrade``) and the accounts→OIDC identity remap

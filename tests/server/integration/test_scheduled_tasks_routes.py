@@ -16,8 +16,8 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import app as server_app
 from omnigent.server.app import create_app
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -126,7 +126,7 @@ def _create_body(**overrides: object) -> dict[str, object]:
         "name": "nightly triage",
         "prompt": "triage the queue",
         "rrule": _VALID_RRULE,
-        "agent_id": builtin_agent_id(server_app._CLAUDE_NATIVE_AGENT_NAME),
+        "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
         "timezone": "America/Los_Angeles",
         "workspace": "/repo",
         "host_id": "4b653f6031f35d168cc0b37caa1306d1",

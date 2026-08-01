@@ -108,7 +108,13 @@ export function InboxPage() {
   const sources: InboxSource[] = [];
   rows.forEach((row, i) => {
     const snapshot = snapshotQueries[i]?.data;
-    if (snapshot) sources.push({ row, pendingElicitations: snapshot.pendingElicitations ?? [] });
+    if (snapshot) {
+      sources.push({
+        row,
+        pendingElicitations: snapshot.pendingElicitations ?? [],
+        canApprove: snapshot.canApprove ?? true,
+      });
+    }
   });
   const items = collectInboxItems(sources);
 
@@ -133,9 +139,7 @@ export function InboxPage() {
       const pendingIds = new Set(items.map((i) => i.elicitation.elicitationId));
       const stale = Object.keys(prev).filter((id) => pendingIds.has(id));
       if (stale.length === 0) return prev;
-      const next = { ...prev };
-      for (const id of stale) delete next[id];
-      return next;
+      return Object.fromEntries(Object.entries(prev).filter(([id]) => !pendingIds.has(id)));
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snapshotVersionKey]);
@@ -175,9 +179,8 @@ export function InboxPage() {
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {
-            const next = { ...prev };
-            delete next[elicitationId];
-            return next;
+            const { [elicitationId]: _respondedVerdict, ...pendingVerdicts } = prev;
+            return pendingVerdicts;
           });
         },
       );
@@ -327,6 +330,7 @@ export function InboxPage() {
                   codexCommand={item.elicitation.codexCommand}
                   allowAllEdits={item.elicitation.allowAllEdits}
                   rememberScope={item.elicitation.rememberScope}
+                  canApprove={item.canApprove}
                   onSubmit={makeSubmit(item)}
                 />
               )}

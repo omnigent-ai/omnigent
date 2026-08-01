@@ -362,15 +362,15 @@ class RemoteProcess(ABC):
         """
 
 
-class SandboxLauncher(ABC):
+class SandboxLifecycle(ABC):
     """
-    Transport + lifecycle primitives for one sandbox provider.
+    Lifecycle + capability primitives for one sandbox provider.
 
-    Implementations exist per provider (``LakeboxLauncher``, …) and are
-    resolved by name through
-    :func:`omnigent.onboarding.sandboxes.get_launcher`. All methods
-    raise ``click.ClickException`` (with a remediation hint) on failure
-    so CLI callers surface clean errors without extra wrapping.
+    Every provider — exec-model or entrypoint-as-host — implements this
+    base. It carries the provider identity, capability flags, and the
+    provisioning / teardown / resume lifecycle. Transport (``run``, ``put``,
+    …) lives on :class:`SandboxExecTransport`; the default host launch lives
+    on :class:`ExecModelHostLauncher`.
     """
 
     # Short provider name used in CLI ``--provider`` choices and error
@@ -383,38 +383,12 @@ class SandboxLauncher(ABC):
     # Databricks corp network) override this.
     wheel_build_index_url: ClassVar[str | None] = None
 
-    # Whether this provider can bridge a local port into the sandbox
-    # (``ssh -L`` semantics). The in-sandbox App OAuth flow requires it;
-    # the bootstrap checks this flag BEFORE doing any remote work so
-    # providers without the capability (e.g. Modal) fail fast with the
-    # ``--no-auth`` hint instead of erroring mid-flow.
+    # Legacy class vars — kept for backward compat while providers migrate
+    # to explicit ``capabilities`` objects. New providers should override
+    # the ``capabilities`` property directly instead of setting these.
     supports_local_port_forward: ClassVar[bool] = False
-
-    # Whether this provider supports the CLI bootstrap flow
-    # (``omnigent sandbox create`` / ``connect``: wheel shipping via
-    # ``put`` + ``wheel_install_command``, streaming attach via
-    # ``stream_exec`` / ``exec_foreground``). Managed-only providers
-    # (e.g. Daytona) implement just the server-managed subset
-    # (``prepare`` / ``provision`` / ``run`` / ``terminate``); the CLI
-    # checks this flag up front so they fail with a pointer to
-    # ``host_type="managed"`` instead of a mid-flow capability error.
     supports_cli_bootstrap: ClassVar[bool] = True
-
-    # Whether this provider can resume a stopped sandbox IN PLACE
-    # (reattaching its persistent volume) rather than only provisioning a
-    # fresh one. The server's managed-host wake path checks this BEFORE
-    # attempting a resume: providers with a stop/resume lifecycle + a
-    # persistent volume override it to ``True``; providers whose sandboxes
-    # are ephemeral (Modal — no volume to reattach) leave it ``False``, so a
-    # dormant host there stays gone (the user starts a new session) instead
-    # of being silently revived onto an empty workspace.
     can_resume: ClassVar[bool] = False
-
-    # Whether this provider supports the server-managed host flow
-    # (``host_type="managed"`` sessions). The server checks this before
-    # launching a sandbox for a managed session. Most providers support both
-    # CLI bootstrap and managed launch; set this to ``False`` for providers
-    # that are CLI-only (e.g. Lakebox) or staged-but-not-yet-launched.
     supports_managed_launch: ClassVar[bool] = True
 
     @property
@@ -424,9 +398,9 @@ class SandboxLauncher(ABC):
 
         The returned object is derived from the provider's class vars and
         from which optional transport methods it has overridden. It is a
-        transition shim: providers will set an explicit
+        transition shim: providers override this property with an explicit
         :class:`~omnigent.onboarding.sandboxes.types.SandboxCapabilities`
-        object directly once the refactor is complete.
+        object directly.
         """
         return _sandbox_types.SandboxCapabilities(
             cli_bootstrap=self.supports_cli_bootstrap,
@@ -446,7 +420,13 @@ class SandboxLauncher(ABC):
         Used while the refactor is in transition so the capability object
         can reflect overridden methods without provider authors touching it.
         """
-        return getattr(type(self), name) is not getattr(SandboxLauncher, name)
+        self_method = getattr(type(self), name, None)
+        if self_method is None:
+            return False
+        base_method = getattr(ExecModelHostLauncher, name, None)
+        if base_method is None:
+            return False
+        return self_method is not base_method
 
     @abstractmethod
     def prepare(self) -> None:
@@ -477,181 +457,6 @@ class SandboxLauncher(ABC):
             ``"lovable-wattlebird-1530"``.
         :raises click.ClickException: If provisioning fails.
         """
-
-    def start_host(
-        self,
-        sandbox_id: str,
-        *,
-        token: str,
-        host_id: str,
-        host_name: str,
-        server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
-        host_config: dict[str, object] | None = None,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> str:
-        """
-        Start ``omnigent host`` in the sandbox and return the workspace path.
-
-        The default is the EXEC model: probe ``$HOME``, create
-        ``<HOME>/workspace``, optionally materialize the repository into it (via
-        :meth:`materialize_workspace`, which clones by default), merge any
-        *host_config* into ``~/.omnigent/config.yaml``, and start the host
-        detached (``setsid``-backgrounded, identity + token in the process
-        environment) — all driven through :meth:`run` / :meth:`run_background`.
-        It is shared by every provider whose sandbox is a bare box the server
-        execs into (Modal, Daytona, …); entrypoint-as-host providers (e.g.
-        Kubernetes, whose Pod boots running the host) override it. A provider
-        that only needs to change how the repository is obtained (resolve a local
-        checkout instead of cloning) overrides :meth:`materialize_workspace`
-        alone.
-
-        The launch token is registered before this call, so the host
-        authenticates the moment it dials back. The ``repo_*`` arguments arrive
-        as primitives (not the server's ``RepoWorkspace``) so this
-        onboarding-layer method carries no server dependency.
-
-        :param sandbox_id: The sandbox from :meth:`provision`.
-        :param token: The raw launch token the host authenticates with.
-        :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
-        :param host_name: Server-chosen host display name, e.g.
-            ``"managed-a1b2c3d4"``.
-        :param server_url: URL of this server the host dials back to.
-        :param repo_url: Repository clone URL, or ``None`` for an empty
-            workspace.
-        :param repo_branch: Branch to clone, or ``None`` for the default branch.
-        :param repo_name: Directory the clone lands in under the workspace, or
-            ``None`` when *repo_url* is ``None``.
-        :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
-            content (the server's ``sandbox.host_config``) installed into the
-            sandbox's config BEFORE the host starts, or ``None``. On resumable
-            launchers ``None`` still runs the cleanup so entries injected by a
-            since-removed block don't outlive it — see
-            :func:`render_host_config_write_command`.
-        :param on_stage: Progress observer invoked with ``"cloning"`` before the
-            clone (when *repo_url* is set) and ``"starting"`` before the host
-            launches. Runs on this (worker) thread, so it must be thread-safe.
-            ``None`` disables progress reporting.
-        :returns: The absolute in-sandbox workspace path (the cloned repository
-            directory when *repo_url* is set).
-        :raises click.ClickException: If a sandbox command fails, the clone
-            fails, or the sandbox's ``$HOME`` cannot be resolved.
-        """
-        # The image (and the user it runs as) is operator-supplied, so the home
-        # directory isn't knowable statically — ask the sandbox.
-        home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
-        if not home:
-            raise click.ClickException(
-                f"could not resolve $HOME inside sandbox '{sandbox_id}' — "
-                "the configured image must provide a usable shell environment"
-            )
-        workspace = f"{home}/workspace"
-        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
-        if repo_url is not None:
-            workspace = self.materialize_workspace(
-                sandbox_id,
-                workspace=workspace,
-                repo_url=repo_url,
-                repo_branch=repo_branch,
-                repo_name=repo_name,
-                on_stage=on_stage,
-            )
-        # "starting" covers from here through host registration — the caller's
-        # online poll resolves it.
-        if on_stage is not None:
-            on_stage("starting")
-        # Resumable sandboxes keep their filesystem, so even with no
-        # host_config the cleanup must run: an operator who removed the block
-        # expects previously injected entries gone on the next wake. Fresh
-        # sandboxes can't carry a stale marker — skip the extra exec there.
-        if host_config is not None or self.capabilities.resume_stopped:
-            self.run(sandbox_id, render_host_config_write_command(host_config or {}))
-        env_prefix = " ".join(
-            f"{key}={shlex.quote(value)}"
-            for key, value in (
-                (HOST_TOKEN_ENV_VAR, token),
-                (HOST_ID_ENV_VAR, host_id),
-                (HOST_NAME_ENV_VAR, host_name),
-            )
-        )
-        self.run_background(
-            sandbox_id,
-            f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
-        )
-        return workspace
-
-    def materialize_workspace(
-        self,
-        sandbox_id: str,
-        *,
-        workspace: str,
-        repo_url: str,
-        repo_branch: str | None,
-        repo_name: str | None,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> str:
-        """
-        Materialize the requested repository into the sandbox and return the
-        working directory the host should start in.
-
-        Override point for how a repository *identity* becomes an on-disk
-        checkout. The default is the EXEC model — ``git clone`` the URL into
-        ``<workspace>/<repo_name>`` via :meth:`run` — shared by every provider
-        whose sandbox is a bare box with outbound git access (Modal, Daytona,
-        E2B, …). Providers whose sandbox already carries the repository (a
-        pre-provisioned checkout, a local mirror, a cached worktree) override
-        this to *resolve* the identity to that local path instead of cloning,
-        without having to reimplement :meth:`start_host`. Called by
-        :meth:`start_host` only when ``repo_url`` is set, after ``<workspace>``
-        has been created and before the host launches.
-
-        The ``repo_*`` arguments are the same repository identity
-        :meth:`start_host` received (the server's ``RepoWorkspace`` unpacked into
-        primitives, so this onboarding-layer method carries no server
-        dependency). An override is free to interpret ``repo_url`` as an identity
-        to map to a local checkout rather than a URL to fetch.
-
-        :param sandbox_id: The sandbox from :meth:`provision`.
-        :param workspace: The already-created workspace root, e.g.
-            ``"/root/workspace"``.
-        :param repo_url: Repository clone URL (or, for a resolving override, the
-            repository identity), e.g. ``"https://github.com/org/repo"``.
-        :param repo_branch: Branch to check out, or ``None`` for the default
-            branch.
-        :param repo_name: Directory the checkout lands in under *workspace*, or
-            ``None``.
-        :param on_stage: Progress observer; the default invokes it with
-            ``"cloning"`` before the clone. Runs on this (worker) thread, so it
-            must be thread-safe. ``None`` disables progress reporting.
-        :returns: The absolute in-sandbox path the host should start in (the
-            checkout directory).
-        :raises click.ClickException: If materialization fails (e.g. the clone
-            fails).
-        """
-        if on_stage is not None:
-            on_stage("cloning")
-        clone_dir = f"{workspace}/{repo_name}"
-        branch_args = (
-            f"--branch {shlex.quote(repo_branch)} --single-branch "
-            if repo_branch is not None
-            else ""
-        )
-        try:
-            self.run(
-                sandbox_id,
-                f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
-            )
-        except click.ClickException as exc:
-            # Provider boundary: re-raise with the repository named so the
-            # create-session 502 says WHAT failed to clone, not just that a
-            # sandbox command exited non-zero.
-            raise click.ClickException(
-                f"failed to clone repository '{repo_url}'"
-                f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
-            ) from exc
-        return clone_dir
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -686,88 +491,6 @@ class SandboxLauncher(ABC):
             support keep-alive configuration.
         """
         raise self._capability_error("configure keep-alive")
-
-    @abstractmethod
-    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
-        """
-        Run a shell command inside the sandbox and capture its output.
-
-        :param sandbox_id: Target sandbox.
-        :param command: Shell command to execute remotely, e.g.
-            ``"pip install --user /tmp/pkg.whl"``. Quote paths yourself
-            if they must survive the remote shell.
-        :param check: When ``True``, raise on non-zero exit.
-        :returns: The completed command's exit code and output.
-        :raises click.ClickException: If *check* is ``True`` and the
-            command exits non-zero.
-        """
-
-    def run_background(
-        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
-    ) -> RemoteCommandResult:
-        """
-        Start *command* as a detached background process in the sandbox.
-
-        The default wraps the command in ``setsid nohup sh -c '…' & echo
-        launched`` so it survives the exec session ending. The ``sh -c`` wrapper
-        is load-bearing: callers pass env-prefixed commands (e.g.
-        ``"ENV=val omnigent host …"``), and ``nohup`` does NOT honor shell
-        ``VAR=val`` assignment syntax — ``nohup ENV=val cmd`` makes nohup try to
-        exec a program literally named ``ENV=val`` ("No such file or directory").
-        Re-parsing the command under ``sh -c`` lets the inner shell apply the
-        assignments before running the program. Providers where backgrounded
-        processes are reaped on exec return (e.g. OpenShell) override this
-        to hold the exec stream open instead.
-
-        :param sandbox_id: Target sandbox.
-        :param command: Shell command to background, e.g.
-            ``"ENV=val omnigent host --server https://…"``.
-        :param log_path: Where stdout/stderr of the backgrounded process
-            are redirected inside the sandbox.
-        :returns: A synthetic result with ``stdout="launched\\n"`` on success.
-        :raises click.ClickException: If the launch command fails.
-        """
-        return self.run(
-            sandbox_id,
-            f"setsid nohup sh -c {shlex.quote(command)} "
-            f"> {log_path} 2>&1 < /dev/null & echo launched",
-        )
-
-    def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
-        """
-        Copy a local file into the sandbox.
-
-        CLI-bootstrap capability (wheel shipping) — managed-only
-        launchers need not override the raising default.
-
-        :param sandbox_id: Target sandbox.
-        :param local_path: Path on the local machine to read from.
-        :param remote_path: Destination path on the sandbox, e.g.
-            ``"/tmp/oa-wheels.tgz"``.
-        :raises SandboxCapabilityError: When the provider does not
-            support file shipping.
-        :raises click.ClickException: If the transfer fails.
-        """
-        raise self._capability_error("ship files into the sandbox")
-
-    def stream_exec(self, sandbox_id: str, command: str, *, pty: bool = False) -> RemoteProcess:
-        """
-        Spawn a command in the sandbox and stream its output line by
-        line.
-
-        CLI-bootstrap capability (the in-sandbox OAuth login) —
-        managed-only launchers need not override the raising default.
-
-        :param sandbox_id: Target sandbox.
-        :param command: Shell command to execute remotely, e.g.
-            ``"databricks auth login --host https://… --profile oss"``.
-        :param pty: When ``True``, allocate a remote PTY. Required for
-            CLIs that suppress output when not attached to a terminal.
-        :returns: A handle streaming the process's combined output.
-        :raises SandboxCapabilityError: When the provider does not
-            support streaming execs.
-        """
-        raise self._capability_error("stream a remote process")
 
     def forward_capability_error(self) -> SandboxCapabilityError:
         """
@@ -864,6 +587,112 @@ class SandboxLauncher(ABC):
         del sandbox_id
         return None
 
+    def _capability_error(self, action: str) -> SandboxCapabilityError:
+        """
+        Build the error for an optional primitive this provider lacks.
+
+        :param action: Human phrase for the unsupported primitive,
+            e.g. ``"ship files into the sandbox"``.
+        :returns: The capability error to raise.
+        """
+        return SandboxCapabilityError(
+            f"The '{self.provider}' provider does not support the ability to {action}."
+        )
+
+
+class SandboxExecTransport(SandboxLifecycle):
+    """
+    Exec-transport primitives for providers that exec into a running sandbox.
+
+    Providers whose sandbox is a bare box the server execs into (Modal,
+    Daytona, E2B, …) inherit this via :class:`ExecModelHostLauncher`.
+    Entrypoint-as-host providers (e.g. Kubernetes, whose Pod boots running the
+    host) inherit :class:`SandboxHostLauncher` instead and need NOT implement
+    any of these methods.
+    """
+
+    @abstractmethod
+    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
+        """
+        Run a shell command inside the sandbox and capture its output.
+
+        :param sandbox_id: Target sandbox.
+        :param command: Shell command to execute remotely, e.g.
+            ``"pip install --user /tmp/pkg.whl"``. Quote paths yourself
+            if they must survive the remote shell.
+        :param check: When ``True``, raise on non-zero exit.
+        :returns: The completed command's exit code and output.
+        :raises click.ClickException: If *check* is ``True`` and the
+            command exits non-zero.
+        """
+
+    def run_background(
+        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
+    ) -> RemoteCommandResult:
+        """
+        Start *command* as a detached background process in the sandbox.
+
+        The default wraps the command in ``setsid nohup sh -c '…' & echo
+        launched`` so it survives the exec session ending. The ``sh -c`` wrapper
+        is load-bearing: callers pass env-prefixed commands (e.g.
+        ``"ENV=val omnigent host …"``), and ``nohup`` does NOT honor shell
+        ``VAR=val`` assignment syntax — ``nohup ENV=val cmd`` makes nohup try to
+        exec a program literally named ``ENV=val`` ("No such file or directory").
+        Re-parsing the command under ``sh -c`` lets the inner shell apply the
+        assignments before running the program. Providers where backgrounded
+        processes are reaped on exec return (e.g. OpenShell) override this
+        to hold the exec stream open instead.
+
+        :param sandbox_id: Target sandbox.
+        :param command: Shell command to background, e.g.
+            ``"ENV=val omnigent host --server https://…"``.
+        :param log_path: Where stdout/stderr of the backgrounded process
+            are redirected inside the sandbox.
+        :returns: A synthetic result with ``stdout="launched\\n"`` on success.
+        :raises click.ClickException: If the launch command fails.
+        """
+        return self.run(
+            sandbox_id,
+            f"setsid nohup sh -c {shlex.quote(command)} "
+            f"> {log_path} 2>&1 < /dev/null & echo launched",
+        )
+
+    def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
+        """
+        Copy a local file into the sandbox.
+
+        CLI-bootstrap capability (wheel shipping) — managed-only
+        launchers need not override the raising default.
+
+        :param sandbox_id: Target sandbox.
+        :param local_path: Path on the local machine to read from.
+        :param remote_path: Destination path on the sandbox, e.g.
+            ``"/tmp/oa-wheels.tgz"``.
+        :raises SandboxCapabilityError: When the provider does not
+            support file shipping.
+        :raises click.ClickException: If the transfer fails.
+        """
+        raise self._capability_error("ship files into the sandbox")
+
+    def stream_exec(self, sandbox_id: str, command: str, *, pty: bool = False) -> RemoteProcess:
+        """
+        Spawn a command in the sandbox and stream its output line by
+        line.
+
+        CLI-bootstrap capability (the in-sandbox OAuth login) —
+        managed-only launchers need not override the raising default.
+
+        :param sandbox_id: Target sandbox.
+        :param command: Shell command to execute remotely, e.g.
+            ``"databricks auth login --host https://… --profile oss"``.
+        :param pty: When ``True``, allocate a remote PTY. Required for
+            CLIs that suppress output when not attached to a terminal.
+        :returns: A handle streaming the process's combined output.
+        :raises SandboxCapabilityError: When the provider does not
+            support streaming execs.
+        """
+        raise self._capability_error("stream a remote process")
+
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """
         Run a command in the sandbox with stdio inherited from the
@@ -903,14 +732,170 @@ class SandboxLauncher(ABC):
         """
         raise self._capability_error("install shipped wheels")
 
-    def _capability_error(self, action: str) -> SandboxCapabilityError:
-        """
-        Build the error for an optional primitive this provider lacks.
 
-        :param action: Human phrase for the unsupported primitive,
-            e.g. ``"ship files into the sandbox"``.
-        :returns: The capability error to raise.
+class SandboxHostLauncher(SandboxLifecycle):
+    """
+    Lifecycle + host-launch contract for a sandbox provider.
+
+    Every managed-host provider — exec-model or entrypoint-as-host — implements
+    this. :meth:`start_host` is abstract here; the exec-model default lives on
+    :class:`ExecModelHostLauncher`. Entrypoint-as-host providers (e.g.
+    Kubernetes) inherit this class directly and override :meth:`start_host`
+    without needing any exec transport.
+    """
+
+    @abstractmethod
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
         """
-        return SandboxCapabilityError(
-            f"The '{self.provider}' provider does not support the ability to {action}."
+        Start ``omnigent host`` in the sandbox and return the workspace path.
+
+        :param sandbox_id: The sandbox from :meth:`provision`.
+        :param token: The raw launch token the host authenticates with.
+        :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
+        :param host_name: Server-chosen host display name, e.g.
+            ``"managed-a1b2c3d4"``.
+        :param server_url: URL of this server the host dials back to.
+        :param repo_url: Repository clone URL, or ``None`` for an empty
+            workspace.
+        :param repo_branch: Branch to clone, or ``None`` for the default branch.
+        :param repo_name: Directory the clone lands in under the workspace, or
+            ``None`` when *repo_url* is ``None``.
+        :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
+            content installed into the sandbox's config BEFORE the host starts.
+        :param on_stage: Progress observer invoked with ``"cloning"`` and
+            ``"starting"``.
+        :returns: The absolute in-sandbox workspace path.
+        """
+
+
+class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
+    """
+    Default exec-model host launcher for providers that exec into a running
+    sandbox (Modal, Daytona, E2B, Islo, OpenShell, Boxlite, …).
+
+    Provides the default :meth:`start_host`, :meth:`run_background`, and
+    :meth:`materialize_workspace` that compose :meth:`run` into the full
+    managed-host bootstrap. A provider that only needs to change how the
+    repository is obtained overrides :meth:`materialize_workspace` alone.
+
+    Entrypoint-as-host providers (e.g. Kubernetes) inherit
+    :class:`SandboxHostLauncher` directly and do NOT need ``run()`` or any
+    exec transport.
+    """
+
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Start ``omnigent host`` in the sandbox and return the workspace path.
+
+        The default is the EXEC model: probe ``$HOME``, create
+        ``<HOME>/workspace``, optionally materialize the repository into it (via
+        :meth:`materialize_workspace`, which clones by default), merge any
+        *host_config* into ``~/.omnigent/config.yaml``, and start the host
+        detached (``setsid``-backgrounded, identity + token in the process
+        environment) — all driven through :meth:`run` / :meth:`run_background`.
+
+        :returns: The absolute in-sandbox workspace path.
+        """
+        home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
+        if not home:
+            raise click.ClickException(
+                f"could not resolve $HOME inside sandbox '{sandbox_id}' — "
+                "the configured image must provide a usable shell environment"
+            )
+        workspace = f"{home}/workspace"
+        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
+        if repo_url is not None:
+            workspace = self.materialize_workspace(
+                sandbox_id,
+                workspace=workspace,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
+                on_stage=on_stage,
+            )
+        if on_stage is not None:
+            on_stage("starting")
+        if host_config is not None or self.capabilities.resume_stopped:
+            self.run(sandbox_id, render_host_config_write_command(host_config or {}))
+        env_prefix = " ".join(
+            f"{key}={shlex.quote(value)}"
+            for key, value in (
+                (HOST_TOKEN_ENV_VAR, token),
+                (HOST_ID_ENV_VAR, host_id),
+                (HOST_NAME_ENV_VAR, host_name),
+            )
         )
+        self.run_background(
+            sandbox_id,
+            f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+        )
+        return workspace
+
+    def materialize_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        workspace: str,
+        repo_url: str,
+        repo_branch: str | None,
+        repo_name: str | None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Materialize the requested repository into the sandbox and return the
+        working directory the host should start in.
+
+        The default is ``git clone`` into ``<workspace>/<repo_name>``. Override
+        to resolve a local checkout instead of cloning.
+        """
+        if on_stage is not None:
+            on_stage("cloning")
+        clone_dir = f"{workspace}/{repo_name}"
+        branch_args = (
+            f"--branch {shlex.quote(repo_branch)} --single-branch "
+            if repo_branch is not None
+            else ""
+        )
+        try:
+            self.run(
+                sandbox_id,
+                f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
+            )
+        except click.ClickException as exc:
+            raise click.ClickException(
+                f"failed to clone repository '{repo_url}'"
+                f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
+            ) from exc
+        return clone_dir
+
+
+# Backward-compat alias: existing providers inherit ``SandboxLauncher``, which
+# is now ``ExecModelHostLauncher``. Kubernetes and future entrypoint-as-host
+# providers inherit ``SandboxHostLauncher`` directly.
+SandboxLauncher = ExecModelHostLauncher

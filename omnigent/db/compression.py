@@ -84,7 +84,7 @@ def decode(value: bytes | str | memoryview | None) -> str | None:
     return payload.decode("utf-8")
 
 
-class CompressedText(TypeDecorator):
+class CompressedText(TypeDecorator[str]):
     """A ``str`` column stored as a zstd-compressed ``BLOB`` / ``BYTEA``.
 
     Transparent at the ORM boundary: callers read and write ``str`` exactly as

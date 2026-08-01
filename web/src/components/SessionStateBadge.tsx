@@ -41,6 +41,14 @@ function describe(state: SessionState): Visual {
         tooltip: "Session running",
         render: () => <RunningDot className="size-2.5" />,
       };
+    case "starting":
+      // Same spinner as running — the session is coming up, not yet working.
+      return {
+        kind: state.kind,
+        ariaLabel: "Session starting up",
+        tooltip: "Session starting up",
+        render: () => <RunningDot className="size-2.5" />,
+      };
     case "unseen":
       // Solid brand-pink dot — distinguished from the running indicator,
       // which is a grey spinner.

@@ -147,6 +147,16 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 # Session-status edge values (mirror the transcript forwarder's vocabulary).
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+# agy's OWN per-cascade run status, published in every ``GetAllCascadeTrajectories``
+# summary. This is the authoritative "is this turn over" signal — the step-type
+# close detection below only INFERS it, and every agy step type it does not know
+# about is a turn that never closes. Live-verified against agy 1.1.8: RUNNING both
+# while working AND for the whole time a permission gate is parked (75s observed),
+# so IDLE never means "waiting for the human".
+_CASCADE_RUN_STATUS_IDLE = "CASCADE_RUN_STATUS_IDLE"
+# Consecutive idle observations required before the backstop closes a turn. One
+# reading can catch the gap between delivering a turn and agy starting it.
+_QUIESCENT_TICKS_TO_CLOSE = 2
 # Terminal-failure session status (a valid ``external_session_status``; see the
 # ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
 # closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
@@ -404,6 +414,26 @@ def _summary_activity(summary: dict[str, object]) -> datetime | None:
     return _parse_activity_timestamp(
         summary.get("lastUserInputTime")
     ) or _parse_activity_timestamp(summary.get("lastModifiedTime"))
+
+
+def _cascade_is_idle(summaries: dict[str, object], bound_cascade_id: str) -> bool:
+    """
+    Whether agy itself reports the bound cascade as no longer running.
+
+    Reads :data:`_CASCADE_RUN_STATUS_IDLE` from the cascade's own summary rather
+    than inferring the turn's end from step types. Missing or malformed entries
+    are NOT idle: closing a turn on incomplete information would be worse than
+    leaving the step-based close to do it.
+
+    :param summaries: ``trajectorySummaries`` from
+        :func:`~omnigent.antigravity_native_rpc.get_all_cascade_trajectories`.
+    :param bound_cascade_id: The cascade this reader is bound to.
+    :returns: ``True`` only on an explicit idle status for the bound cascade.
+    """
+    summary = summaries.get(bound_cascade_id)
+    if not isinstance(summary, dict):
+        return False
+    return summary.get("status") == _CASCADE_RUN_STATUS_IDLE
 
 
 def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str) -> str | None:
@@ -748,6 +778,7 @@ async def _watch_for_rotation(
     interval_s: float,
     skip_cascade_ids: frozenset[str],
     on_rotation: Callable[[str], None],
+    on_quiescent: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Poll ``GetAllCascadeTrajectories`` for a ``/clear`` rotation, then signal once.
@@ -784,8 +815,15 @@ async def _watch_for_rotation(
     :param skip_cascade_ids: Cascade ids a prior rotation attempt failed to bind;
         never re-signalled.
     :param on_rotation: Called once with the detected new cascade id.
+    :param on_quiescent: Optional turn-close BACKSTOP, awaited once the bound
+        cascade has reported idle on :data:`_QUIESCENT_TICKS_TO_CLOSE`
+        consecutive ticks. Unlike ``on_rotation`` this does NOT end the detector:
+        a session can go idle and busy again many times over its life. It exists
+        so a turn the step-based close missed cannot strand the session forever —
+        the cost of a miss becomes one interval, not a permanent hang.
     :returns: None.
     """
+    idle_ticks = 0
     while True:
         await _sleep(interval_s)
         try:
@@ -816,6 +854,13 @@ async def _watch_for_rotation(
         summaries = body.get("trajectorySummaries")
         if not isinstance(summaries, dict):
             continue
+        if on_quiescent is not None:
+            if _cascade_is_idle(summaries, bound_cascade_id):
+                idle_ticks += 1
+                if idle_ticks == _QUIESCENT_TICKS_TO_CLOSE:
+                    await on_quiescent()
+            else:
+                idle_ticks = 0
         new_cascade_id = _detect_rotated_cascade(summaries, bound_cascade_id)
         if new_cascade_id is None or new_cascade_id in skip_cascade_ids:
             continue
@@ -954,6 +999,23 @@ async def supervise_reader(
             if body_holder:
                 body_holder[0].cancel()
 
+    async def _close_turn_if_stranded() -> None:
+        # Turn-close BACKSTOP. The step-based close (``_is_turn_close_step``) is the
+        # fast path; this fires only when agy itself has reported the cascade idle
+        # and Omnigent still believes a turn is open — i.e. the close was missed.
+        # Reconciliation rather than edge detection, so a missed/unknown/reordered
+        # step costs one detector interval instead of stranding the session.
+        if not state.turn_active:
+            return
+        state.turn_active = False
+        _logger.info(
+            "agy reader closing a turn agy reports finished but Omnigent still had "
+            "open (step-based close was missed): session=%s cascade=%s",
+            session_id,
+            cascade_id,
+        )
+        await _post_event(client, session_id, _status_event(_STATUS_IDLE))
+
     def _body_should_stop() -> bool:
         # The reader body stops either on the caller's stop OR once a rotation was
         # detected (so it does not keep mirroring the now-dead conversation). This
@@ -1012,6 +1074,7 @@ async def supervise_reader(
             interval_s=detect_rotation_interval_s,
             skip_cascade_ids=skip_cascade_ids,
             on_rotation=_on_rotation,
+            on_quiescent=_close_turn_if_stranded,
         ),
         name="antigravity-rotation-detector",
     )
@@ -2667,7 +2730,7 @@ async def run_reader_with_bridge(
     # Lazy import: the interaction bridge pulls server-route handlers; keeping it
     # out of module import keeps the reader importable from the lightweight CLI
     # process without eagerly loading the server stack.
-    from omnigent.antigravity_native_interactions import bridge_interaction
+    from omnigent.antigravity_native_interactions import bridge_interaction, tui_injector_for
 
     # Mutable current session id: rotation advances it, and the elicitation hook
     # closure below reads it through this holder so a post-rotation interaction
@@ -2701,6 +2764,11 @@ async def run_reader_with_bridge(
                 port=port,
                 get_steps=_get_steps,
                 request_elicitation=_request_elicitation,
+                # Bind the injector to THIS reader's bridge dir. The default
+                # resolves it from the harness spawn env, which the runner process
+                # hosting this reader does not carry — that failed every web
+                # approval and left agy's own prompt open in the pane.
+                inject_tui=tui_injector_for(bridge_dir),
             )
 
         # Cascades a prior rotation attempt failed to bind — the detector skips them

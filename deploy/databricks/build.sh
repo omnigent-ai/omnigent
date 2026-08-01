@@ -28,10 +28,8 @@ rm -rf omnigent/server/static/web-ui dist build omnigent.egg-info
 
 if [[ "${SKIP_WEB_UI:-}" != "1" ]]; then
     echo "==> Building web SPA into omnigent/server/static/web-ui/"
-    cd web
-    npm install
-    npm run build
-    cd "${REPO_ROOT}"
+    pnpm install --frozen-lockfile --filter web
+    pnpm --filter web run build
 else
     echo "==> SKIP_WEB_UI=1: skipping web build"
 fi

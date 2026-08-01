@@ -52,6 +52,7 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     SandboxLauncher,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -192,6 +193,19 @@ class BoxliteSandboxLauncher(SandboxLauncher):
     # primitives (put / stream_exec / exec_foreground / wheel_install_command)
     # keep the base class's raising defaults.
     supports_cli_bootstrap: ClassVar[bool] = False
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=False,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=False,
+            streaming_exec=False,
+            foreground_exec=False,
+        )
 
     def __init__(
         self,

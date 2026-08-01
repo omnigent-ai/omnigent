@@ -1,6 +1,5 @@
-import { afterEach } from "vitest";
 import { cleanup } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { isCostRoutingSession, shortModelName } from "./CostRoutingControl";
 
 afterEach(cleanup);

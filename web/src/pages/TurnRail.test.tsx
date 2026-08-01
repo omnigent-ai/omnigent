@@ -129,9 +129,7 @@ describe("TurnRail", () => {
     expect(screen.getByText("prompt number 2")).toBeInTheDocument();
   });
 
-  it("makes the rail interactive only once revealed", () => {
-    // hasMoreHistory=false → the rail latches revealed on mount, so the inner
-    // scroller must be pointer-interactive rather than a dead (or silent) box.
+  it("makes the rail interactive immediately", () => {
     const { container } = render(
       <TurnRail
         turns={makeTurns(3)}
@@ -144,9 +142,7 @@ describe("TurnRail", () => {
     expect(rail).toHaveClass("pointer-events-auto");
   });
 
-  it("keeps the invisible rail non-interactive before reveal", () => {
-    // With more history still pending and a fetch in flight, the rail stays
-    // opacity-0 — it must NOT be a silent click target while hidden.
+  it("stays visible and interactive while older history loads", () => {
     const { container } = render(
       <TurnRail
         turns={makeTurns(3)}
@@ -156,7 +152,7 @@ describe("TurnRail", () => {
       />,
     );
     const rail = container.querySelector(".turn-rail-fade")!;
-    expect(rail).toHaveClass("pointer-events-none");
-    expect(rail).not.toHaveClass("pointer-events-auto");
+    expect(rail).toHaveClass("pointer-events-auto");
+    expect(rail.parentElement).not.toHaveClass("opacity-0");
   });
 });

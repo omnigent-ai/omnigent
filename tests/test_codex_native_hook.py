@@ -478,3 +478,71 @@ def test_post_tool_use_fails_open_on_error(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out == ""
+
+
+def test_pre_tool_use_uses_relay_when_tool_relay_json_has_session_id(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Hook POSTs to relay /policies/evaluate when tool_relay.json has session_id."""
+    from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+
+    relay_token = "relay-tok-abc"
+    relay_url = "http://127.0.0.1:19999"
+    (bridge_dir / _TOOL_RELAY_FILE).write_text(
+        json.dumps({"url": relay_url, "token": relay_token, "session_id": "conv_active"})
+    )
+    _DenyHttpxClient.captured = {}
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    assert exit_code == 0
+    # Route is relay, not direct server.
+    assert _DenyHttpxClient.captured["url"] == f"{relay_url}/policies/evaluate"
+    # Auth is relay token, not a server bearer.
+    assert _DenyHttpxClient.captured["headers"] == {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {relay_token}",
+    }
+    # Verdict still applied.
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_id(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Hook falls back to policy_hook.json when tool_relay.json has no session_id."""
+    from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+
+    # Relay present but no session_id — not policy-capable.
+    (bridge_dir / _TOOL_RELAY_FILE).write_text(
+        json.dumps({"url": "http://127.0.0.1:19999", "token": "tok"})
+    )
+    write_policy_hook_config(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer direct-token"},
+    )
+    _DenyHttpxClient.captured = {}
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
+
+    _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}},
+        monkeypatch,
+    )
+
+    # Falls back to direct server URL.
+    assert _DenyHttpxClient.captured["url"] == (
+        "http://127.0.0.1:8787/v1/sessions/conv_active/policies/evaluate"
+    )
+    assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}

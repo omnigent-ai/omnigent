@@ -12,7 +12,9 @@ import time
 import uuid
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias
+
+_JsonObject: TypeAlias = dict[str, object]
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone
@@ -179,7 +181,7 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
     :returns: Opaque compact id.
     """
     compact_id = f"compact_{uuid.uuid4().hex}"
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "id": compact_id,
         "type": "compact",
         "created_at": time.time(),
@@ -217,7 +219,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     return model_change_id
 
 
-def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
+def _enqueue_payload(bridge_dir: Path, item_id: str, payload: _JsonObject) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Order-preserving filename. The extension polls ``inbox/*.json`` and
@@ -248,7 +250,7 @@ def write_extension_files(
     server_url: str,
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
-    tools: list[dict[str, Any]] | None = None,
+    tools: list[_JsonObject] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -269,7 +271,7 @@ def write_extension_files(
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "sessionId": session_id,
         "serverUrl": server_url.rstrip("/"),
         "conversationUrl": conversation_url,
@@ -325,6 +327,30 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
     return True
 
 
+def inject_relay_into_config(bridge_dir: Path, relay_url: str, relay_token: str) -> bool:
+    """Write ``relayUrl`` and ``relayToken`` into ``config.json``.
+
+    The pi extension reads these on every policy POST via ``relayCredentials()``
+    and routes to the relay instead of the server — eliminating server bearer
+    expiry for policy evaluation.
+
+    :returns: ``True`` when the config was updated.
+    """
+    path = config_path(bridge_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("relayUrl") == relay_url and payload.get("relayToken") == relay_token:
+        return False
+    payload["relayUrl"] = relay_url
+    payload["relayToken"] = relay_token
+    _atomic_json(path, payload)
+    return True
+
+
 def _extension_source() -> str:
     """
     Return the packaged Pi extension source.
@@ -336,7 +362,7 @@ def _extension_source() -> str:
     return resource.read_text(encoding="utf-8")
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(path: Path, payload: _JsonObject) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
