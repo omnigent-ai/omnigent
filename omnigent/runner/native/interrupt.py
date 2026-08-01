@@ -55,13 +55,16 @@ class SubagentDeliveryAck(Protocol):
     """Result of attempting to deliver a terminal sub-agent payload."""
 
     @property
-    def delivered(self) -> bool: ...
+    def delivered(self) -> bool:
+        raise NotImplementedError
 
     @property
-    def entry(self) -> object | None: ...
+    def entry(self) -> object | None:
+        raise NotImplementedError
 
     @property
-    def reason(self) -> str: ...
+    def reason(self) -> str:
+        raise NotImplementedError
 
 
 class MarkSubagentTerminalAndWake(Protocol):
@@ -69,13 +72,15 @@ class MarkSubagentTerminalAndWake(Protocol):
 
     def __call__(
         self, child_session_id: str, *, status: str, output: str | None
-    ) -> SubagentDeliveryAck: ...
+    ) -> SubagentDeliveryAck:
+        raise NotImplementedError
 
 
 class ClientSafeErrorDetail(Protocol):
     """Log an exception and return safe client-facing detail."""
 
-    def __call__(self, exc: BaseException, *, context: str) -> str: ...
+    def __call__(self, exc: BaseException, *, context: str) -> str:
+        raise NotImplementedError
 
 
 class CodexBridgeStateForSession(Protocol):
@@ -87,7 +92,8 @@ class CodexBridgeStateForSession(Protocol):
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> CodexNativeBridgeState | None: ...
+    ) -> CodexNativeBridgeState | None:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
