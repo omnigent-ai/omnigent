@@ -887,6 +887,8 @@ def create_app(
             from omnigent.server.accounts_bootstrap import bootstrap_admin
 
             _accounts_cfg = auth_provider._accounts_config
+            if _accounts_cfg is None:
+                raise ValueError("accounts auth provider requires accounts_config")
             _bootstrap_result = bootstrap_admin(
                 account_store,
                 init_admin_password=_accounts_cfg.init_admin_password,
@@ -1747,16 +1749,17 @@ def create_app(
         # config is wired AND its provider can actually serve a managed
         # launch (staged providers parse but reject at launch — they
         # must not advertise the option).
-        managed_sandboxes_enabled = (
-            sandbox_config is not None and sandbox_config.managed_launch_supported
-        )
         # sandbox_provider names the backing provider (e.g. "modal",
         # "islo") so the web UI can label the option per provider
         # ("Modal Sandbox" / "Islo Sandbox") instead of the
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
-        sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        managed_sandboxes_enabled = False
+        sandbox_provider = None
+        if sandbox_config is not None and sandbox_config.managed_launch_supported:
+            managed_sandboxes_enabled = True
+            sandbox_provider = sandbox_config.provider
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -2356,7 +2359,7 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
-        else:
+        elif isinstance(auth_provider, UnifiedAuthProvider):
             from omnigent.server.routes.auth import create_auth_router
 
             # OIDC invites are opt-in (OMNIGENT_OIDC_ALLOW_INVITES) and
@@ -2385,6 +2388,11 @@ def create_app(
                 ),
                 prefix="/auth",
                 tags=["auth"],
+            )
+        else:
+            _logger.debug(
+                "Skipping built-in auth routes for custom provider %s",
+                type(auth_provider).__name__,
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
@@ -2448,7 +2456,7 @@ def create_app(
     all_extra_routers = list(extra_routers or [])
     all_extra_routers.extend(_load_debug_routers(debug_router_modules))
     for router, prefix, tags in all_extra_routers:
-        app.include_router(router, prefix=prefix, tags=tags)
+        app.include_router(router, prefix=prefix, tags=[*tags])
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
@@ -2506,7 +2514,7 @@ class _SPAStaticFiles(StaticFiles):
             return
         await super().__call__(scope, receive, send)
 
-    async def get_response(self, path: str, scope: Scope) -> Response:  # type: ignore[override]
+    async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
         try:
             response = await super().get_response(path, scope)

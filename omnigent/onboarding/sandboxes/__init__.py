@@ -8,16 +8,13 @@ the ``omnigent.sandbox_providers`` entry point group.
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import warnings
-
 import click
 
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
     SandboxCapabilityError,
+    SandboxHostLauncher,
     SandboxLauncher,
 )
 from omnigent.onboarding.sandboxes.bootstrap import (
@@ -65,6 +62,7 @@ __all__ = [
     "SandboxCommandError",
     "SandboxConfigError",
     "SandboxError",
+    "SandboxHostLauncher",
     "SandboxInfo",
     "SandboxLauncher",
     "SandboxProviderContribution",
@@ -86,29 +84,8 @@ __all__ = [
     "ship_wheels",
 ]
 
-# Legacy registration surface. It is no longer used by the registry, but is kept
-# as a fallback path so any provider not yet loaded through the entrypoint
-# mechanism still resolves for one release cycle.
-_LAUNCHERS: dict[str, str] = {
-    "lakebox": "omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
-    "modal": "omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher",
-    "daytona": "omnigent.onboarding.sandboxes.daytona:DaytonaSandboxLauncher",
-    "boxlite": "omnigent.onboarding.sandboxes.boxlite:BoxliteSandboxLauncher",
-    # CoreWeave Sandbox via the official cwsandbox SDK (the
-    # `omnigent[cwsandbox]` extra), imported lazily like modal/daytona.
-    "cwsandbox": "omnigent.onboarding.sandboxes.cwsandbox:CWSandboxLauncher",
-    "islo": "omnigent.onboarding.sandboxes.islo:IsloSandboxLauncher",
-    # E2B (https://e2b.dev) via the official `e2b` SDK (the
-    # `omnigent[e2b]` extra), imported lazily like modal/daytona.
-    "e2b": "omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
-    "openshell": "omnigent.onboarding.sandboxes.openshell:OpenShellSandboxLauncher",
-    # On-demand Kubernetes runner Pod via the official kubernetes client (the
-    # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
-    "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
-}
 
-
-def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxLauncher:
+def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxHostLauncher:
     """
     Resolve a provider name to a launcher instance.
 
@@ -127,40 +104,12 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
     :raises click.ClickException: If the provider is unknown or its
         launcher module is not present in this build.
     """
-    if provider in plugin_state():
-        try:
-            return instantiate(provider, workspace_host=workspace_host)
-        except SandboxRegistryError as exc:
-            raise click.ClickException(str(exc)) from exc
-
-    # Legacy fallback for any provider not yet loaded by the registry.
-    warnings.warn(
-        f"Sandbox provider '{provider}' was resolved through the legacy "
-        f"_LAUNCHERS registry. Use the SandboxProviderContribution or "
-        f"omnigent.sandbox_providers entrypoints instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    target = _LAUNCHERS.get(provider)
-    if target is None:
+    if provider not in plugin_state():
         offered = ", ".join(available_providers()) or "(none in this build)"
         raise click.ClickException(
             f"Unknown or unavailable sandbox provider '{provider}'. Available: {offered}."
         )
-    module_name = target.partition(":")[0]
-    if importlib.util.find_spec(module_name) is None:
-        offered = ", ".join(available_providers()) or "(none in this build)"
-        raise click.ClickException(
-            f"Unknown or unavailable sandbox provider '{provider}'. Available: {offered}."
-        )
-    if provider == "lakebox" and workspace_host is not None:
-        # Imported here (not at module top) because the lakebox module
-        # may be absent from a distribution; the availability check above
-        # guarantees it exists in this one.
-        from omnigent.onboarding.sandboxes.lakebox import LakeboxLauncher
-
-        return LakeboxLauncher(workspace_host=workspace_host)
-    module_name, _, class_name = target.partition(":")
-    module = importlib.import_module(module_name)
-    launcher_cls: type[SandboxLauncher] = getattr(module, class_name)
-    return launcher_cls()
+    try:
+        return instantiate(provider, workspace_host=workspace_host)
+    except SandboxRegistryError as exc:
+        raise click.ClickException(str(exc)) from exc

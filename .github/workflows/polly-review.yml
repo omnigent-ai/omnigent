@@ -220,7 +220,11 @@ jobs:
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OMNIGENT_OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
+          : "${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}"
+          : "${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}"
           mkdir -p "$HOME/.omnigent"
           # Use python to write the config safely — avoids interpolating
           # secrets/URLs into a heredoc where special chars could break YAML.
@@ -238,13 +242,13 @@ jobs:
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
-                          'models': {'default': 'databricks-claude-opus-4-8'},
+                          'models': {'default': os.environ['OMNIGENT_ANTHROPIC_MODEL']},
                       },
                       'openai': {
                           'base_url': host + '/ai-gateway/codex/v1',
                           'api_key_ref': 'env:LLM_API_KEY',
                           'wire_api': 'responses',
-                          'models': {'default': 'databricks-gpt-5-5'},
+                          'models': {'default': os.environ['OMNIGENT_OPENAI_MODEL']},
                       },
                   }
               }

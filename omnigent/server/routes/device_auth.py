@@ -101,14 +101,15 @@ def _generate_user_code() -> str:
     return f"{chars[:4]}-{chars[4:]}"
 
 
-def _client_id(body: dict) -> str | None:
+def _client_id(body: dict[str, object]) -> str | None:
     """Extract the RFC 8628 ``client_id`` from an authorize body.
 
     A public string naming the requesting application (e.g. Slack passes
     ``"slack"``), the same for every grant that application initiates.
     Display + audit only — never an authorization key.
     """
-    return (body.get("client_id") or "").strip() or None
+    value = body.get("client_id")
+    return value.strip() or None if isinstance(value, str) else None
 
 
 def _mint_refresh_token() -> str:

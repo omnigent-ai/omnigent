@@ -139,6 +139,14 @@ class SandboxPolicy:
         connect) emits an explicit last-match deny for each path.
         ``None`` is treated identically to an empty list, e.g.
         ``[Path("/tmp/omnigent-terminal-ab12/tmux.sock")]``.
+    :param mask_scan_skip_roots: Write roots the dotfile / escaping-symlink
+        mask scan must skip — the framework's own scratch / runtime dirs
+        added post-resolve via :func:`with_additional_write_roots`. These
+        hold sandbox scaffolding (the egress ``.egress.sock``, CA bundle,
+        credential-proxy files), never pre-existing user secrets, so
+        scanning them is both pointless and harmful (masking
+        ``.egress.sock`` breaks the egress relay). ``None`` is treated
+        identically to an empty list.
 
     Historical note: a previous revision carried an
     ``egress_auth_token`` field shared between the parent (embedded
@@ -174,6 +182,19 @@ class SandboxPolicy:
     # non-secret synthetic payload over the config FD, and resolved
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
+    # Parent-side only: write roots the dotfile / escaping-symlink mask
+    # scan must NOT walk. Framework code adds the sandbox's own runtime
+    # scaffolding to ``write_roots`` via
+    # :func:`with_additional_write_roots` (the per-helper scratch tmpdir
+    # holding the egress ``.egress.sock``, the CA bundle, credential-proxy
+    # files, harness state dirs). Those are created fresh by the framework
+    # and never hold pre-existing user secrets, so scanning them is
+    # pointless — and actively harmful: the scan would ``--bind-try
+    # /dev/null`` the dotfile ``.egress.sock``, breaking the egress relay.
+    # Every root recorded here is dropped from the scan set (along with
+    # anything nested under it). Built parent-side during arg emission;
+    # like ``credential_proxy`` it is intentionally NOT serialised.
+    mask_scan_skip_roots: list[Path] | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:
         result: dict[str, JsonValue] = {
@@ -476,6 +497,7 @@ def _clone_policy_with(
     read_roots: list[Path] | None,
     write_roots: list[Path],
     write_files: list[Path],
+    mask_scan_skip_roots: list[Path] | None = None,
 ) -> SandboxPolicy:
     """
     Build a new :class:`SandboxPolicy` with the supplied root/file
@@ -517,6 +539,18 @@ def _clone_policy_with(
         # ``_start_locked``, so dropping it here would silently disable
         # the feature.
         credential_proxy=policy.credential_proxy,
+        # Preserve (or, when a helper is extending it, override) the set
+        # of framework write roots excluded from the mask scan. ``None``
+        # from a caller means "keep whatever the source policy carried".
+        mask_scan_skip_roots=(
+            list(mask_scan_skip_roots)
+            if mask_scan_skip_roots is not None
+            else (
+                list(policy.mask_scan_skip_roots)
+                if policy.mask_scan_skip_roots is not None
+                else None
+            )
+        ),
         # Egress fields are intentionally NOT preserved here — the
         # ``with_additional_*`` helpers run BEFORE the egress proxy
         # starts, so the source policy never carries egress fields.
@@ -530,15 +564,27 @@ def with_additional_write_roots(
     extra_roots: Sequence[Path],
 ) -> SandboxPolicy:
     write_roots = list(policy.write_roots)
+    skip_roots = (
+        list(policy.mask_scan_skip_roots) if policy.mask_scan_skip_roots is not None else []
+    )
     for root in extra_roots:
         resolved = root.resolve(strict=False)
         if all(existing != resolved for existing in write_roots):
             write_roots.append(resolved)
+        # Framework-added write roots hold the sandbox's own runtime
+        # scaffolding (scratch tmpdir with the egress ``.egress.sock``, CA
+        # bundle, credential-proxy files, harness state dirs), never
+        # pre-existing user secrets. Record them so the dotfile mask scan
+        # skips them — otherwise the scan hides ``.egress.sock`` and the
+        # egress relay's connection is reset.
+        if all(existing != resolved for existing in skip_roots):
+            skip_roots.append(resolved)
     return _clone_policy_with(
         policy,
         read_roots=list(policy.read_roots) if policy.read_roots is not None else None,
         write_roots=write_roots,
         write_files=list(policy.write_files),
+        mask_scan_skip_roots=skip_roots,
     )
 
 
@@ -753,14 +799,14 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         # tempdir root, which the profile only granted a subpath of —
         # ``FileNotFoundError: No usable temporary directory`` on
         # seatbelt (bwrap masked it via its ``--tmpfs /tmp`` fallback).
-        tmpdir = create_private_tmpdir()
+        host_tmpdir = create_private_tmpdir()
         try:
-            sandbox = with_additional_write_roots(sandbox, [tmpdir])
-            set_temp_env(os.environ, tmpdir)
+            sandbox = with_additional_write_roots(sandbox, [host_tmpdir])
+            set_temp_env(os.environ, host_tmpdir)
             encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
             # Name the dir for the in-wrap pass: it adopts this exact
             # path (no second mint) and owns the cleanup on exit.
-            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(tmpdir)
+            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(host_tmpdir)
             # Re-invoke run_launcher via an INLINE python -c script
             # rather than re-running the launcher tempfile. Reason:
             # bwrap mounts ``/tmp`` as a fresh tmpfs, so the host's
@@ -805,7 +851,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # ``except`` only fires if the wrap/exec never handed off.
             os.execvp(wrapped[0], wrapped)
         except BaseException:
-            cleanup_private_tmpdir(tmpdir)
+            cleanup_private_tmpdir(host_tmpdir)
             raise
 
     tmpdir: Path | None = None

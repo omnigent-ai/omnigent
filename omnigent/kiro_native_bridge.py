@@ -12,9 +12,22 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias, TypedDict
 
 from omnigent._platform import stable_user_id
+
+_JsonObject: TypeAlias = dict[str, object]
+
+
+class _McpServerEntry(TypedDict):
+    command: str
+    args: list[str]
+    env: dict[str, str]
+
+
+class _KiroMcpConfig(TypedDict):
+    mcpServers: dict[str, _McpServerEntry]
+
 
 KIRO_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_KIRO_NATIVE_BRIDGE_DIR"
 KIRO_ACP_RECORD_PATH_ENV_VAR = "KIRO_ACP_RECORD_PATH"
@@ -136,7 +149,7 @@ def write_mcp_bridge_config(bridge_dir: Path) -> None:
 
 def build_kiro_mcp_config(
     bridge_dir: Path, *, python_executable: str | None = None
-) -> dict[str, Any]:
+) -> _KiroMcpConfig:
     """Build the kiro ``mcpServers`` entry for the Omnigent relay MCP server.
 
     Reuses the shared stdio ``serve-mcp`` server (the same one cursor/claude use)
@@ -182,7 +195,7 @@ def write_kiro_workspace_mcp_config(
     write_mcp_bridge_config(bridge_dir)
     path = workspace / _WORKSPACE_MCP_CONFIG_REL
     path.parent.mkdir(parents=True, exist_ok=True)
-    config: dict[str, Any] = {}
+    config: _JsonObject = {}
     if path.exists():
         with contextlib.suppress(OSError, ValueError):
             loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -231,7 +244,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running Kiro terminal."""
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),
@@ -276,7 +289,7 @@ def write_forwarder_ready(bridge_dir: Path) -> None:
     os.replace(tmp, bridge_dir / _FORWARDER_READY_FILE)
 
 
-def _read_bridge_json(bridge_dir: Path, filename: str) -> dict[str, Any] | None:
+def _read_bridge_json(bridge_dir: Path, filename: str) -> _JsonObject | None:
     try:
         raw = (bridge_dir / filename).read_text(encoding="utf-8")
     except OSError:
@@ -291,7 +304,7 @@ def _read_bridge_json(bridge_dir: Path, filename: str) -> dict[str, Any] | None:
 def _wait_for_forwarder_ready_if_required(
     bridge_dir: Path,
     *,
-    tmux_info: dict[str, Any],
+    tmux_info: _JsonObject,
     timeout_s: float,
 ) -> None:
     if tmux_info.get("requires_forwarder_ready") is not True:

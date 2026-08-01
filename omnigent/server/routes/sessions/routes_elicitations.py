@@ -188,7 +188,8 @@ def register_elicitations_routes(
             return {"status": "resolved"}
 
         _conv_id, event = found
-        params = event.get("params") if isinstance(event.get("params"), dict) else {}
+        params_value = event.get("params")
+        params = params_value if isinstance(params_value, dict) else {}
         return {
             "status": "pending",
             "can_approve": access.can_approve,
