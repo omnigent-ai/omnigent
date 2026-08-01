@@ -207,7 +207,7 @@ def _runtime_badge(row: _ConversationRow) -> str:
         without raising.
     """
     labels = getattr(row, "labels", None)
-    if isinstance(labels, dict):
+    if isinstance(labels, Mapping):
         native_agent = native_coding_agent_for_wrapper_label(
             labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
         )
@@ -1424,7 +1424,7 @@ def _launch_state_for_row(row: _ConversationRow) -> _LaunchState | None:
         or ``None`` when the row has no supported wrapper state.
     """
     labels = getattr(row, "labels", None)
-    if not isinstance(labels, dict):
+    if not isinstance(labels, Mapping):
         return None
     wrapper = labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
