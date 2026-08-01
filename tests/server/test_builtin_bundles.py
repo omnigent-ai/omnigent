@@ -35,9 +35,12 @@ _NATIVE_BUILDERS = [(agent.key, f"{agent.agent_name}.yaml") for agent in _NATIVE
 
 # Shipped-example built-ins keep their hand-written named builders. The bool is
 # whether the source is a shipped example a stripped deployment may omit.
+# copilot's spec is generated inline by its builder (no packaged source), so it
+# is never skipped.
 _EXAMPLE_BUILDERS = [
     ("_build_debby_bundle", "config.yaml", True),
     ("_build_polly_bundle", "config.yaml", True),
+    ("_build_copilot_bundle", "config.yaml", False),
 ]
 
 
