@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeAlias
 
 import click
 
@@ -29,6 +29,8 @@ from omnigent._platform import stable_user_id
 
 if TYPE_CHECKING:
     from omnigent.cursor_native import CursorModelOption
+
+_JsonObject: TypeAlias = dict[str, object]
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"
@@ -252,7 +254,7 @@ def build_mcp_config(
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """Build Cursor's ``.cursor/mcp.json`` for the Omnigent relay server.
 
     Cursor prompts for MCP tool approval before it sends ``tools/call`` to the
@@ -316,9 +318,7 @@ def write_mcp_config(
     return path
 
 
-def build_hooks_config(
-    bridge_dir: Path, *, python_executable: str | None = None
-) -> dict[str, Any]:
+def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None) -> _JsonObject:
     """Build Cursor's ``.cursor/hooks.json`` registering the usage ``stop`` hook.
 
     cursor-agent fires the ``stop`` hook once per completed turn with a JSON
@@ -453,7 +453,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running Cursor terminal."""
     _ensure_dir(bridge_dir)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),
