@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import urllib.parse
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import httpx
 from fastapi import (
@@ -264,7 +264,12 @@ def register_resources_routes(
             except Exception:
                 msg = "runner resource endpoint failed"
             raise HTTPException(status_code=502, detail=msg)
-        return resp.json()
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned invalid JSON"
+            )
+        return cast(dict[str, Any], payload)
 
     async def _fs_get_with_host_fallback(
         session_id: str,
