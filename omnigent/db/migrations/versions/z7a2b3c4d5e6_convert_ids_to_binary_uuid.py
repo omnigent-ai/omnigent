@@ -55,7 +55,6 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Sequence
-from typing import cast
 
 import sqlalchemy as sa
 from alembic import op
@@ -123,7 +122,9 @@ def _bytes_to_id(value: object) -> str:
     """Return the bare 32-char hex form of a stored 16-byte id (downgrade)."""
     if isinstance(value, str):  # already hex (idempotent)
         return value.replace("-", "")[-32:]
-    return bytes(cast(bytes | bytearray | memoryview[int], value)).hex()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    raise TypeError(f"Unsupported binary UUID value: {type(value).__name__}")
 
 
 def _nullability(bind: sa.Connection) -> dict[tuple[str, str], bool]:
