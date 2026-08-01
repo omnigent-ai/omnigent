@@ -171,14 +171,10 @@ function FileScopeSwitch({
   flatView,
   onChange,
   count,
-  additions,
-  deletions,
 }: {
   flatView: boolean;
   onChange: (flatView: boolean) => void;
   count: number;
-  additions: number;
-  deletions: number;
 }) {
   const changedSelected = flatView;
   const allSelected = !flatView;
@@ -202,12 +198,6 @@ function FileScopeSwitch({
         {count > 0 && (
           <span className="shrink-0 font-normal text-[11px] text-muted-foreground tabular-nums">
             {count}
-          </span>
-        )}
-        {(additions > 0 || deletions > 0) && (
-          <span className="flex shrink-0 gap-1 font-mono text-[10px]">
-            <span className="text-green-600 dark:text-green-400">+{additions}</span>
-            <span className="text-destructive">&minus;{deletions}</span>
           </span>
         )}
       </button>
@@ -449,13 +439,7 @@ export function FilesPanel({
           className="shrink-0 flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
           onClick={(e) => e.stopPropagation()}
         >
-          <FileScopeSwitch
-            flatView={flatView}
-            onChange={onFlatViewChange}
-            count={changedCount}
-            additions={lineTotals.additions}
-            deletions={lineTotals.deletions}
-          />
+          <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
               <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
@@ -472,16 +456,20 @@ export function FilesPanel({
           </div>
         </div>
       )}
+      {flatView && (lineTotals.additions > 0 || lineTotals.deletions > 0) && (
+        <div
+          className="flex shrink-0 justify-start gap-1.5 px-4 pb-1 font-mono text-sm md:text-xs"
+          aria-label="Changed line totals"
+        >
+          <span className="text-foreground">Total:</span>
+          <span className="text-green-600 dark:text-green-400">+{lineTotals.additions}</span>
+          <span className="text-destructive">&minus;{lineTotals.deletions}</span>
+        </div>
+      )}
       {!flatView && (
         <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
-            <FileScopeSwitch
-              flatView={flatView}
-              onChange={onFlatViewChange}
-              count={changedCount}
-              additions={lineTotals.additions}
-              deletions={lineTotals.deletions}
-            />
+            <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
             <div className="flex min-w-0 flex-1 items-center gap-2">
               <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
                 <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
