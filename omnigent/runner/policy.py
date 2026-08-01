@@ -38,8 +38,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
-from typing import Literal, cast
+from dataclasses import dataclass, replace
+from typing import Literal
 
 from omnigent.policies import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext, PolicyResult
@@ -243,8 +243,11 @@ class RunnerToolPolicyGate:
         )
         verdict = await self._evaluate_policies(ctx, Phase.TOOL_RESULT)
         if verdict.action == "allow":
-            # If the policy returned transformed output, use it instead.
-            return cast(str, verdict.data) if verdict.data is not None else output
+            if verdict.data is None:
+                return output
+            if not isinstance(verdict.data, str):
+                raise TypeError("TOOL_RESULT policy replacement data must be a string")
+            return verdict.data
         if verdict.action == "deny":
             assert verdict.deny_text is not None
             return verdict.deny_text
@@ -285,8 +288,8 @@ class RunnerToolPolicyGate:
             denied.
         """
         pending_ask: PolicyVerdict | None = None
-        # Last non-None data from any ALLOW-or-ASK result. Last write
-        # wins — callers that need chained transforms compose in one callable.
+        # Sequentially accumulated data. Each transformed payload becomes the
+        # next policy's input, matching the server-side policy engine.
         composed_data: object | None = None
         for gated in self._policies:
             if phase not in gated.phases:
@@ -319,6 +322,7 @@ class RunnerToolPolicyGate:
                 )
             if result.data is not None:
                 composed_data = result.data
+                ctx = replace(ctx, content=composed_data)
             if result.action == PolicyAction.ASK and pending_ask is None:
                 pending_ask = PolicyVerdict(
                     action="ask",
