@@ -139,6 +139,12 @@ import {
 } from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
+  type DictationPath,
+  type DictationPreferences,
+  readDictationPreferences,
+  writeDictationPreferences,
+} from "@/lib/dictationPreferences";
+import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
   writeHideUnconfiguredHarnesses,
@@ -229,6 +235,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
+      {section === "dictation" && <DictationSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
@@ -236,6 +243,128 @@ export function SettingsPage() {
       {section === "cli" && isElectronShell() && <LocalCliSection />}
       {section === "updates" && isElectronShell() && <UpdatesSection />}
     </PageScroll>
+  );
+}
+
+function DictationSection() {
+  const [preferences, setPreferences] = useState(readDictationPreferences);
+  const [microphones, setMicrophones] = useState<MediaDeviceInfo[]>([]);
+
+  const update = useCallback((patch: Partial<DictationPreferences>) => {
+    setPreferences((current) => {
+      const next = { ...current, ...patch };
+      writeDictationPreferences(next);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.enumerateDevices) return;
+    let active = true;
+    const refresh = async () => {
+      try {
+        const devices = await mediaDevices.enumerateDevices();
+        if (active) setMicrophones(devices.filter((device) => device.kind === "audioinput"));
+      } catch {
+        if (active) setMicrophones([]);
+      }
+    };
+    void refresh();
+    mediaDevices.addEventListener?.("devicechange", refresh);
+    return () => {
+      active = false;
+      mediaDevices.removeEventListener?.("devicechange", refresh);
+    };
+  }, []);
+
+  const selectedMicrophoneMissing =
+    preferences.microphoneDeviceId !== null &&
+    !microphones.some((device) => device.deviceId === preferences.microphoneDeviceId);
+
+  return (
+    <Section
+      title="Dictation"
+      description="Choose how voice dictation works on this device. These preferences stay in this browser and are not synced to your account."
+    >
+      <div className="flex flex-col gap-8">
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+          <div className="flex min-w-0 flex-1 flex-col">
+            <span className="text-sm font-medium">Dictation path</span>
+            <span className="text-sm text-muted-foreground">
+              Auto prefers browser recognition and may fall back to the configured server. Browser
+              never sends audio to Omnigent's server. Server streams microphone audio to your
+              configured Omnigent server for transcription; operators may relay it to a private
+              dictation worker.
+            </span>
+          </div>
+          <Select
+            value={preferences.path}
+            onValueChange={(value) => update({ path: value as DictationPath })}
+          >
+            <SelectTrigger className="w-48" data-testid="dictation-path-select">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">Auto</SelectItem>
+              <SelectItem value="server">Server</SelectItem>
+              <SelectItem value="browser">Browser</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+          <div className="flex min-w-0 flex-1 flex-col">
+            <span className="text-sm font-medium">Browser recognition language</span>
+            <span className="text-sm text-muted-foreground">
+              Used only by browser recognition. Availability and whether audio is processed locally
+              or by the browser vendor depend on your browser.
+            </span>
+          </div>
+          <Input
+            value={preferences.browserLanguage}
+            onChange={(event) => update({ browserLanguage: event.target.value || "en-US" })}
+            aria-label="Browser recognition language"
+            className="h-9 w-48 shrink-0"
+            spellCheck={false}
+            maxLength={64}
+          />
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+          <div className="flex min-w-0 flex-1 flex-col">
+            <span className="text-sm font-medium">Microphone</span>
+            <span className="text-sm text-muted-foreground">
+              Used for server dictation only. Browsers do not let Omnigent select the microphone
+              used by Web Speech; change that input in your browser or system settings.
+            </span>
+          </div>
+          <Select
+            value={preferences.microphoneDeviceId ?? "default"}
+            onValueChange={(value) =>
+              update({ microphoneDeviceId: value === "default" ? null : value })
+            }
+          >
+            <SelectTrigger className="w-64" data-testid="dictation-microphone-select">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="default">System default</SelectItem>
+              {selectedMicrophoneMissing && (
+                <SelectItem value={preferences.microphoneDeviceId!}>
+                  Selected microphone unavailable
+                </SelectItem>
+              )}
+              {microphones.map((device, index) => (
+                <SelectItem key={device.deviceId} value={device.deviceId}>
+                  {device.label || `Microphone ${index + 1}`}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+    </Section>
   );
 }
 
