@@ -412,6 +412,14 @@ def test_headless_subagent_purpose_guard_ignores_non_session_tools() -> None:
         ("C:/Windows/System32/x.txt", "DENY"),
         ("c:/temp/x", "DENY"),
         ("//server/share/x", "DENY"),
+        # normpath strips "./" and collapses "a/../", so a drive-letter check
+        # against the raw string would miss these. Pins that it runs on the
+        # normalized path.
+        ("./C:/Windows/System32/x.txt", "DENY"),
+        ("a/../C:/Windows/x", "DENY"),
+        # Only ASCII [A-Za-z] is a Windows drive; a Unicode-aware isalpha()
+        # would reject this ordinary relative dir too.
+        ("Ω:/x", "ALLOW"),
     ],
 )
 def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:

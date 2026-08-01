@@ -580,11 +580,6 @@ def worktree_guard(
         # ``..\\`` past the split-on-'/' traversal check.
         if "\\" in path:
             return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
-        # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
-        # reads as an ordinary relative dir named "C:" to posixpath. UNC
-        # ("//server/share") keeps its leading slashes and trips the check below.
-        if path[:1].isalpha() and path[1:2] == ":":
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
         # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
         # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
         # below inert on a Windows runner (absolute paths would ALLOW there).
@@ -593,6 +588,17 @@ def worktree_guard(
         # escape form (e.g. "a/../../escape" → "../../escape").
         normalized = posixpath.normpath(path)
         if normalized.startswith(("/", "~", "..")):
+            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
+        # reads as an ordinary relative dir named "C:" to posixpath, so the test
+        # above misses it. Checked on the NORMALIZED path, not the raw one:
+        # normpath strips a leading "./" (and collapses "a/../C:/..."), which
+        # would otherwise hide the drive letter from a raw-string check. UNC
+        # ("//server/share") keeps its leading slashes and is caught above.
+        # ASCII-only: Windows drives are [A-Za-z], but str.isalpha() is
+        # Unicode-aware and would also reject a relative dir named e.g. "Ω:".
+        drive = normalized[:1]
+        if drive.isascii() and drive.isalpha() and normalized[1:2] == ":":
             return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
         return _ALLOW
 
