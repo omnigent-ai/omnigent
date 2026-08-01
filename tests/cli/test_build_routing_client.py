@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import click
+import pytest
+
 from omnigent.cli import _build_external_routing_client, _build_local_llm_routing_client
 from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
 
@@ -124,6 +127,17 @@ def test_external_missing_required_fields_disables() -> None:
         _build_external_routing_client({"provider": "external", "base_url": "https://h/v1"})
         is None
     )
+
+
+def test_external_rejects_non_string_config_value() -> None:
+    with pytest.raises(click.ClickException, match=r"routing\.base_url must be a string"):
+        _build_external_routing_client(
+            {
+                "provider": "external",
+                "base_url": 123,
+                "router_name": "task_v0",
+            }
+        )
 
 
 def test_llm_without_server_llm_disables() -> None:

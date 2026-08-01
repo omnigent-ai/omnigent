@@ -111,7 +111,11 @@ def _parse_model_prefixes(
 
 def _routing_config_text(routing_cfg: Mapping[str, object], key: str) -> str:
     value = routing_cfg.get(key)
-    return value.strip() if isinstance(value, str) else ""
+    if isinstance(value, str):
+        return value.strip()
+    if not value:
+        return ""
+    raise click.ClickException(f"routing.{key} must be a string")
 
 
 def _build_external_routing_client(
