@@ -51,15 +51,12 @@ from omnigent.inner.tools import (
 from omnigent.llms.routing import infer_harness_from_model as _infer_harness_from_model
 from omnigent.spec.types import (
     AgentSpec,
-    ApiKeyAuth,
-    DatabricksAuth,
     ExecutorAuth,
     ExecutorSpec,
     GuardrailsSpec,
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
-    ProviderAuth,
     SharePolicy,
     ToolRuntime,
     ToolsConfig,
@@ -1762,7 +1759,7 @@ def _translate_executor_from_def(
     # goes through _translate_executor_from_def(raw_executor=...).
     auth: ExecutorAuth | None = None
     if oa_executor is not None and oa_executor.auth is not None:
-        if not isinstance(oa_executor.auth, ApiKeyAuth | DatabricksAuth | ProviderAuth):
+        if not isinstance(oa_executor.auth, ExecutorAuth):
             raise OmnigentError(
                 "executor auth must be a parsed auth configuration",
                 code=ErrorCode.INVALID_INPUT,

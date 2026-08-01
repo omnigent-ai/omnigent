@@ -119,7 +119,7 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
-    """Best-effort JSON read; ``None`` on missing/unreadable/non-dict."""
+    """Best-effort JSON read; ``None`` unless it is a string-keyed object."""
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
