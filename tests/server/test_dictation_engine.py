@@ -81,6 +81,16 @@ def test_parakeet_mlx_availability_requires_apple_silicon(
     )
 
 
+def test_parakeet_mlx_constructor_rejects_other_platforms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(dictation.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(dictation.platform, "machine", lambda: "x86_64")
+
+    with pytest.raises(RuntimeError, match="Apple Silicon"):
+        dictation.ParakeetMlxDictationEngine("model", tmp_path)
+
+
 def test_parakeet_mlx_availability_checks_extra_and_local_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -160,6 +170,8 @@ def _fake_mlx_engine() -> tuple[dictation.ParakeetMlxDictationEngine, _FakeMlxMo
     model = _FakeMlxModel()
     engine._model = model
     engine._lock = dictation.threading.Lock()
+    engine._hop_length = 160
+    engine._flush_samples = 1280
     return engine, model
 
 
@@ -171,8 +183,23 @@ def test_parakeet_mlx_stream_normalizes_pcm_and_keeps_tokens_partial(
 
     update = stream.feed_pcm16(b"\x00@\x00\xc0")
 
+    assert update == dictation.DictationUpdate(partial="")
+    assert model.streams[0].audio == []
+
+    update = stream.feed_pcm16(b"\x00@" * 158)
+
     assert update == dictation.DictationUpdate(partial="stable draft")
-    assert model.streams[0].audio[0].tolist() == pytest.approx([0.5, -0.5])
+    assert model.streams[0].audio[0].tolist()[:2] == pytest.approx([0.5, -0.5])
+
+
+def test_parakeet_mlx_stream_preserves_split_pcm_sample(fake_mlx: None) -> None:
+    engine, model = _fake_mlx_engine()
+    engine._hop_length = 1
+    stream = engine.create_stream()
+
+    assert stream.feed_pcm16(b"\x00").partial == ""
+    assert stream.feed_pcm16(b"@").partial == "stable draft"
+    assert model.streams[0].audio[0].tolist() == pytest.approx([0.5])
 
 
 def test_parakeet_mlx_stream_finalizes_whole_utterance_after_silence(
@@ -198,7 +225,7 @@ def test_parakeet_mlx_stream_finish_flushes_and_closes(fake_mlx: None) -> None:
 
     assert stream.finish() == "stable draft"
     assert model.streams[0].closed
-    assert len(model.streams[0].audio[-1]) == dictation.SAMPLE_RATE
+    assert len(model.streams[0].audio[-1]) == engine._flush_samples
     assert stream.finish() == ""
     stream.close()
 

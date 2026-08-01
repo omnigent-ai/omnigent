@@ -248,6 +248,7 @@ def test_disconnect_waits_for_in_flight_decode_before_close() -> None:
 
 def test_status_requires_auth_and_sanitizes_remote_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dictation_engine, "_remote_connection_state", "not_attempted")
+    monkeypatch.setattr(dictation_engine, "_sherpa_available", lambda: (False, None))
     monkeypatch.setenv(dictation_engine.ENGINE_ENV, dictation_engine.ENGINE_REMOTE)
     monkeypatch.setenv(
         dictation_engine.REMOTE_URL_ENV,

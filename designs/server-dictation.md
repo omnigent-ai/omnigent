@@ -97,8 +97,11 @@ PCM16 is normalized to a one-dimensional float array before it reaches MLX.
 The upstream decoder's stable and draft tokens form one revisable `partial`;
 they are never emitted as token-sized final events. Omnigent finalizes the
 complete current hypothesis after 1.6 seconds of trailing silence or 30
-seconds of audio. Explicit stop adds one second of silence to flush right
-context, returns the remaining hypothesis once, and closes the MLX stream.
+seconds of audio. A 16-frame right-context window keeps that endpoint pause
+long enough to commit the draft region. Explicit stop pads the configured
+right context, returns the remaining hypothesis once, and closes the MLX
+stream. PCM frames smaller than the model's feature hop are buffered rather
+than passed to the upstream decoder prematurely.
 
 ### Configuration
 
@@ -152,7 +155,10 @@ The first take downloads the configured model into
 `OMNIGENT_DICTATION_MODEL` to another compatible Hugging Face ID or an
 absolute local model directory. Availability requires macOS on arm64, the
 `dictation-mlx` extra, and an existing directory when an absolute local path
-is configured. The authenticated status endpoint reports the model ID, or
+is configured. The dependency marker, availability probe, and engine
+constructor all enforce Apple Silicon so selecting this engine elsewhere
+reports an actionable unavailable state without importing MLX. The
+authenticated status endpoint reports the model ID, or
 `local` for a path so filesystem details are not disclosed.
 
 The `parakeet-mlx` 0.5.x code is Apache-2.0. The default

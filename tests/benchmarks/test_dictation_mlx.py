@@ -47,3 +47,14 @@ def test_run_rejects_incompatible_wav(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="16 kHz mono PCM16"):
         dictation_mlx.run(wav_path)
+
+
+def test_run_rejects_empty_wav(tmp_path: Path) -> None:
+    wav_path = tmp_path / "empty.wav"
+    with wave.open(str(wav_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16_000)
+
+    with pytest.raises(ValueError, match="must contain audio"):
+        dictation_mlx.run(wav_path)

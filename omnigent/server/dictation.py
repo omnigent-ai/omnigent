@@ -143,9 +143,8 @@ _RULE2_MIN_TRAILING_SILENCE_S = 1.6
 _RULE3_MIN_UTTERANCE_LENGTH_S = 30.0
 
 _DEFAULT_MLX_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
-_MLX_CONTEXT_SIZE = (256, 256)
+_MLX_CONTEXT_SIZE = (256, 16)
 _MLX_SPEECH_RMS = 0.01
-_MLX_FLUSH_SILENCE_S = 1.0
 
 _PUNCT_STRIP_RE = re.compile(r"[.,?!:;…]+")
 
@@ -604,10 +603,13 @@ class ParakeetMlxDictationEngine:
     """Apple Silicon streaming transcription through parakeet-mlx."""
 
     def __init__(self, model_id: str, cache_dir: Path) -> None:
+        if platform.system() != "Darwin" or platform.machine() != "arm64":
+            raise RuntimeError("Parakeet MLX dictation requires an Apple Silicon Mac")
         from parakeet_mlx import from_pretrained  # type: ignore[import-not-found]
 
         cache_dir.mkdir(parents=True, exist_ok=True)
-        _logger.info("Loading Parakeet MLX dictation model %s", model_id)
+        model_label = "local model" if Path(model_id).expanduser().is_absolute() else model_id
+        _logger.info("Loading Parakeet MLX dictation model %s", model_label)
         self._model = from_pretrained(model_id, cache_dir=cache_dir)
         sample_rate = int(self._model.preprocessor_config.sample_rate)
         if sample_rate != SAMPLE_RATE:
@@ -615,6 +617,12 @@ class ParakeetMlxDictationEngine:
                 f"Parakeet MLX model sample rate must be {SAMPLE_RATE}, got {sample_rate}"
             )
         self._model.encoder.set_attention_model("rel_pos_local_attn", _MLX_CONTEXT_SIZE)
+        self._hop_length = int(self._model.preprocessor_config.hop_length)
+        self._flush_samples = (
+            _MLX_CONTEXT_SIZE[1]
+            * int(self._model.encoder_config.subsampling_factor)
+            * self._hop_length
+        )
         self._lock = threading.Lock()
 
     def create_stream(self) -> _ParakeetMlxStream:
@@ -631,6 +639,8 @@ class _ParakeetMlxStream:
         self._utterance_samples = 0
         self._silence_samples = 0
         self._speech_seen = False
+        self._pending_pcm = b""
+        self._pending: Any = None
         self._closed = False
         self._open_transcriber()
 
@@ -649,19 +659,32 @@ class _ParakeetMlxStream:
     def _text(self) -> str:
         return str(self._transcriber.result.text).strip()
 
-    def feed_pcm16(self, data: bytes) -> DictationUpdate:
-        """Decode PCM and finalize only at an utterance endpoint."""
+    def _add_audio(self, samples: Any, *, flush: bool = False) -> None:
         import mlx.core as mx  # type: ignore[import-not-found]
         import numpy as np
 
-        usable = len(data) - (len(data) % 2)
+        pending = samples if self._pending is None else np.concatenate((self._pending, samples))
+        usable = (
+            len(pending) if flush else len(pending) - (len(pending) % self._engine._hop_length)
+        )
+        if usable:
+            self._transcriber.add_audio(mx.array(pending[:usable]))
+        self._pending = pending[usable:]
+
+    def feed_pcm16(self, data: bytes) -> DictationUpdate:
+        """Decode PCM and finalize only at an utterance endpoint."""
+        import numpy as np
+
+        pcm = self._pending_pcm + data
+        usable = len(pcm) - (len(pcm) % 2)
+        self._pending_pcm = pcm[usable:]
         if usable <= 0:
             return DictationUpdate(partial=self._text())
-        samples = np.frombuffer(data[:usable], dtype="<i2").astype(np.float32) / 32768.0
+        samples = np.frombuffer(pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
 
         with self._engine._lock:
-            self._transcriber.add_audio(mx.array(samples))
+            self._add_audio(samples)
             self._utterance_samples += int(samples.size)
             if rms >= _MLX_SPEECH_RMS:
                 self._speech_seen = True
@@ -682,19 +705,20 @@ class _ParakeetMlxStream:
             self._utterance_samples = 0
             self._silence_samples = 0
             self._speech_seen = False
+            self._pending_pcm = b""
+            self._pending = None
             return DictationUpdate(partial="", finalized=text or None)
 
     def finish(self) -> str:
         """Flush right context with silence and return one final tail."""
         if self._closed:
             return ""
-        import mlx.core as mx  # type: ignore[import-not-found]
         import numpy as np
 
         with self._engine._lock:
             if self._utterance_samples:
-                silence = np.zeros(int(_MLX_FLUSH_SILENCE_S * SAMPLE_RATE), dtype=np.float32)
-                self._transcriber.add_audio(mx.array(silence))
+                silence = np.zeros(self._engine._flush_samples, dtype=np.float32)
+                self._add_audio(silence, flush=True)
             text = self._text()
             self._close_transcriber()
             self._closed = True

@@ -26,6 +26,8 @@ def run(path: Path, *, chunk_ms: int = 100) -> dict[str, float | str]:
         ):
             raise ValueError("input must be 16 kHz mono PCM16 WAV")
         pcm = wav.readframes(wav.getnframes())
+    if not pcm:
+        raise ValueError("input WAV must contain audio")
 
     load_started = time.perf_counter()
     engine = dictation.ParakeetMlxDictationEngine(
