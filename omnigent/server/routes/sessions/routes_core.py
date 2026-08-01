@@ -1429,7 +1429,10 @@ def register_core_routes(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param body: The validated :class:`UpdateSessionRequest`.
-        :returns: The updated :class:`SessionResponse` snapshot.
+        :returns: The updated :class:`SessionResponse` snapshot, with
+            ``items`` always empty — PATCH callers use only scalar
+            fields, and transcripts are served by
+            ``GET /sessions/{id}/items``.
         :raises OmnigentError: 400 if the runner is not
             registered; 404 if no session exists.
         """
@@ -1847,6 +1850,9 @@ def register_core_routes(
                 conversation_store,
             ),
         )
+        # PATCH callers consume only the snapshot's scalar fields (clients
+        # hydrate transcripts via GET /sessions/{id}/items), so skip the
+        # items read — it dominated this response's size and build time.
         return await _get_session_snapshot(
             conversation_store,
             session_id,
@@ -1855,6 +1861,7 @@ def register_core_routes(
             agent_store,
             agent_cache,
             liveness_lookup=liveness_lookup,
+            include_items=False,
             runner_exit_reports=runner_exit_reports,
             viewer_id=user_id,
         )

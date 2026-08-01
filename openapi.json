@@ -8818,7 +8818,7 @@
         ]
       },
       "patch": {
-        "description": "Update a session's mutable fields. When `runner_id` is\nprovided, this is the mutable affinity primitive for the Alpha\nrunner-state pivot: create-bind, resume-bind, and recover-bind\nall send the currently registered runner id, and the server\natomically replaces `conversations.runner_id` with that\nvalue using last-write-wins semantics. Title, labels, and\nreasoning-effort updates remain supported for existing\nsessions clients.\n\n**Parameters**\n\n- `body` \u2014 The validated `UpdateSessionRequest`.\n\n**Returns:** The updated `SessionResponse` snapshot.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 if the runner is not registered; 404 if no session exists.",
+        "description": "Update a session's mutable fields. When `runner_id` is\nprovided, this is the mutable affinity primitive for the Alpha\nrunner-state pivot: create-bind, resume-bind, and recover-bind\nall send the currently registered runner id, and the server\natomically replaces `conversations.runner_id` with that\nvalue using last-write-wins semantics. Title, labels, and\nreasoning-effort updates remain supported for existing\nsessions clients.\n\n**Parameters**\n\n- `body` \u2014 The validated `UpdateSessionRequest`.\n\n**Returns:** The updated `SessionResponse` snapshot, with `items` always empty \u2014 PATCH callers use only scalar fields, and transcripts are served by `GET /sessions/{id}/items`.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 if the runner is not registered; 404 if no session exists.",
         "operationId": "update_session_v1_sessions__session_id__patch",
         "parameters": [
           {

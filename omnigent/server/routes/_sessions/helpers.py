@@ -139,6 +139,7 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningTextDeltaEvent,
     ResponseObject,
+    RetryErrorDetail,
     SandboxStatus,
     SessionCollaborationModeEvent,
     SessionCreatedEvent,
@@ -1807,8 +1808,16 @@ def _model_usage_bucket(usage: dict[str, Any], model: str) -> dict[str, float]:
         ``"databricks-gpt-5-5"``.
     :returns: The mutable per-model bucket, e.g. ``{"input_tokens": 1200}``.
     """
-    by_model = usage.setdefault("by_model", {})
-    return by_model.setdefault(model, {})
+    raw_by_model = usage.setdefault("by_model", {})
+    if not isinstance(raw_by_model, dict):
+        raw_by_model = {}
+        usage["by_model"] = raw_by_model
+    by_model = cast(dict[str, Any], raw_by_model)
+    raw_bucket = by_model.setdefault(model, {})
+    if not isinstance(raw_bucket, dict):
+        raw_bucket = {}
+        by_model[model] = raw_bucket
+    return cast(dict[str, float], raw_bucket)
 
 
 def _add_model_usage_delta(
@@ -1898,10 +1907,13 @@ def _coerce_cumulative_field(
     value = data.get(key)
     if value is None:
         return None
-    ok = (
-        isinstance(value, (int, float)) if numeric else isinstance(value, int)
-    ) and not isinstance(value, bool)
-    if not ok or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise OmnigentError(
+            f"external_session_usage data.{key} must be a non-negative "
+            f"{'number' if numeric else 'int'}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if (not numeric and not isinstance(value, int)) or value < 0:
         raise OmnigentError(
             f"external_session_usage data.{key} must be a non-negative "
             f"{'number' if numeric else 'int'}",
@@ -3575,15 +3587,16 @@ def _publish_sandbox_status_impl(session_id: str, stage: str, error: str | None 
     # host-bound session and the snapshot carries no launch state.
     # Failures stay cached (mirroring ManagedLaunchTracker retention)
     # so a reload after a dead launch still shows the reason.
-    if stage == "ready":
+    status = SandboxStatus.model_validate({"stage": stage, "error": error})
+    if status.stage == "ready":
         _session_sandbox_status_cache.pop(session_id, None)
     else:
-        _session_sandbox_status_cache[session_id] = SandboxStatus(stage=stage, error=error)
+        _session_sandbox_status_cache[session_id] = status
     event = SessionSandboxStatusEvent(
         type="session.sandbox_status",
         conversation_id=session_id,
-        stage=stage,
-        error=error,
+        stage=status.stage,
+        error=status.error,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -4698,7 +4711,7 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
     event = ErrorEvent(
         type="response.error",
         source=error.source,
-        error={"code": error.code, "message": error.message},
+        error=RetryErrorDetail(code=error.code, message=error.message),
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -6334,11 +6347,12 @@ def _load_agent_spec_for_session_impl(
     agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
-    return (
-        get_agent_cache()
-        .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-        .spec
-    )
+    agent_cache = cast(AgentCache, get_agent_cache())
+    return agent_cache.load(
+        agent.id,
+        agent.bundle_location,
+        expand_env=agent.session_id is None,
+    ).spec
 
 
 def _build_policy_engine_from_spec(*args: Any, **kwargs: Any) -> PolicyEngine:
@@ -6357,14 +6371,17 @@ def _build_policy_engine_from_spec_impl(
     host_connection = (
         caps.policy_llm_connection_factory() if caps.policy_llm_connection_factory else None
     )
-    return build_policy_engine(
-        spec=spec,
-        conversation_id=session_id,
-        conversation_store=conversation_store,
-        default_policies=caps.default_policies,
-        policy_store=get_policy_store(),
-        server_llm=caps.llm,
-        host_connection=host_connection,
+    return cast(
+        PolicyEngine,
+        build_policy_engine(
+            spec=spec,
+            conversation_id=session_id,
+            conversation_store=conversation_store,
+            default_policies=caps.default_policies,
+            policy_store=get_policy_store(),
+            server_llm=caps.llm,
+            host_connection=host_connection,
+        ),
     )
 
 
@@ -6483,7 +6500,8 @@ def _build_evaluation_context(
     # source of truth for an in-TUI ``/model`` selection). When present, this
     # wins over the engine's server-resolved model (see
     # ``PolicyEngine._inject_model``); ``None`` falls back to that resolution.
-    raw_context = event.get("context") or {}
+    raw_context_value = event.get("context")
+    raw_context = raw_context_value if isinstance(raw_context_value, dict) else {}
     supplied_model = raw_context.get("model")
     hook_model = supplied_model if isinstance(supplied_model, str) and supplied_model else None
     # The harness, when a native hook stamped it (e.g. the codex hook), so
@@ -6494,9 +6512,12 @@ def _build_evaluation_context(
     hook_harness = (
         supplied_harness if isinstance(supplied_harness, str) and supplied_harness else None
     )
+    structured_data = data if isinstance(data, dict) else {}
     if phase == Phase.TOOL_CALL:
-        tool_name = data.get("name") or ""
-        args = data.get("arguments") or {}
+        raw_tool_name = structured_data.get("name")
+        tool_name = raw_tool_name if isinstance(raw_tool_name, str) else ""
+        raw_args = structured_data.get("arguments")
+        args = raw_args if isinstance(raw_args, dict) else {}
         return EvaluationContext(
             phase=phase,
             content={"name": tool_name, "arguments": args},
@@ -6506,17 +6527,19 @@ def _build_evaluation_context(
             harness=hook_harness,
         )
     if phase == Phase.TOOL_RESULT:
-        tool_result = data.get("result", "")
-        request_data = event.get("request_data")
-        tool_name = None
-        if isinstance(request_data, dict):
-            tool_name = request_data.get("name")
+        tool_result = structured_data.get("result", "")
+        raw_request_data = event.get("request_data")
+        request_data = raw_request_data if isinstance(raw_request_data, dict) else None
+        result_tool_name = None
+        if request_data is not None:
+            raw_tool_name = request_data.get("name")
+            result_tool_name = raw_tool_name if isinstance(raw_tool_name, str) else None
         return EvaluationContext(
             phase=phase,
             content={
                 "result": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
             },
-            tool_name=tool_name,
+            tool_name=result_tool_name,
             request_data=request_data,
             actor=actor,
             model=hook_model,
@@ -7098,7 +7121,7 @@ def _require_host_conn_for_worktree(host_id: str | None, request: Request) -> Ho
             "git worktree creation requires host_id",
             code=ErrorCode.INVALID_INPUT,
         )
-    host_registry = getattr(request.app.state, "host_registry", None)
+    host_registry = cast(HostRegistry | None, getattr(request.app.state, "host_registry", None))
     if host_registry is None:
         # Server misconfiguration, not bad client input — mirror
         # _validate_session_workspace, which also returns internal_error.

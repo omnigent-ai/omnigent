@@ -70,9 +70,14 @@ from omnigent.onboarding.sandboxes import available_providers as _sandbox_provid
 from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
 
 if TYPE_CHECKING:
+    import socket
+
     import httpx
 
+    from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
+    from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
+    from omnigent.spec.types import LLMConfig
     from omnigent.update_check import _InstalledWheelInfo
 
 
@@ -89,7 +94,7 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
 
 
 def _parse_model_prefixes(
-    raw: Any,  # str | list | None from YAML
+    raw: object,
 ) -> list[str]:
     """Normalize the ``model_prefix`` config into a list of prefixes.
 
@@ -104,9 +109,18 @@ def _parse_model_prefixes(
     return [p.strip() for p in raw if isinstance(p, str) and p.strip()]
 
 
+def _routing_config_text(routing_cfg: Mapping[str, object], key: str) -> str:
+    value = routing_cfg.get(key)
+    if isinstance(value, str):
+        return value.strip()
+    if not value:
+        return ""
+    raise click.ClickException(f"routing.{key} must be a string")
+
+
 def _build_external_routing_client(
-    routing_cfg: Any,  # parsed YAML block
-) -> Any | None:  # ExternalRoutingClient | None
+    routing_cfg: Mapping[str, object],
+) -> ExternalRoutingClient | None:
     """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
     Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
@@ -123,10 +137,10 @@ def _build_external_routing_client(
     :returns: A configured client, or ``None`` when required config is
         missing (a warning is logged; routing stays off rather than raising).
     """
-    base_url = (routing_cfg.get("base_url") or "").strip()
-    router_name = (routing_cfg.get("router_name") or "").strip()
-    api_key = (routing_cfg.get("api_key") or "").strip()
-    profile = (routing_cfg.get("profile") or "").strip()
+    base_url = _routing_config_text(routing_cfg, "base_url")
+    router_name = _routing_config_text(routing_cfg, "router_name")
+    api_key = _routing_config_text(routing_cfg, "api_key")
+    profile = _routing_config_text(routing_cfg, "profile")
     model_prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
 
     if not base_url or not router_name:
@@ -164,8 +178,8 @@ def _build_external_routing_client(
 
 
 def _build_local_llm_routing_client(
-    server_llm: Any,  # LLMConfig | None
-) -> Any | None:  # LLMRoutingClient | None
+    server_llm: LLMConfig | None,
+) -> LLMRoutingClient | None:
     """Build the built-in :class:`LLMRoutingClient` from the ``llm:`` block.
 
     :param server_llm: The parsed server-level ``LLMConfig``.
@@ -192,7 +206,7 @@ def _server_uvicorn_log_config(
     log_path: Path | None = None,
     *,
     log_to_stderr: bool | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """
     Return Uvicorn logging config with request-duration access logs.
 
@@ -220,26 +234,29 @@ def _server_uvicorn_log_config(
         DEFAULT_LOG_PREFIX_FORMAT + '%(client_addr)s - "%(request_line)s" %(status_code)s'
     )
     use_terminal_colors = terminal_supports_color()
-    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
-    log_config["formatters"]["default"] = {
+    log_config = cast(dict[str, object], copy.deepcopy(uvicorn.config.LOGGING_CONFIG))
+    formatters = cast(dict[str, object], log_config["formatters"])
+    handlers = cast(dict[str, object], log_config["handlers"])
+    loggers = cast(dict[str, object], log_config["loggers"])
+    formatters["default"] = {
         "()": "omnigent.process_logging.TerminalLogFormatter",
         "fmt": DEFAULT_LOG_FORMAT,
         "datefmt": DEFAULT_LOG_DATEFMT,
         "use_colors": use_terminal_colors,
     }
-    log_config["formatters"]["access"] = {
+    formatters["access"] = {
         "()": "omnigent.server.performance_metrics.RequestDurationAccessFormatter",
         "fmt": access_log_format,
         "datefmt": DEFAULT_LOG_DATEFMT,
         "use_colors": use_terminal_colors,
     }
-    log_config["formatters"]["default_file"] = {
+    formatters["default_file"] = {
         "()": "omnigent.process_logging.TerminalLogFormatter",
         "fmt": DEFAULT_LOG_FORMAT,
         "datefmt": DEFAULT_LOG_DATEFMT,
         "use_colors": False,
     }
-    log_config["formatters"]["access_file"] = {
+    formatters["access_file"] = {
         "()": "omnigent.server.performance_metrics.RequestDurationAccessFormatter",
         "fmt": access_log_format,
         "datefmt": DEFAULT_LOG_DATEFMT,
@@ -253,13 +270,13 @@ def _server_uvicorn_log_config(
             mirror = should_log_to_stderr() or sys.stderr.isatty()
         else:
             mirror = log_to_stderr
-        log_config["handlers"]["server_file"] = {
+        handlers["server_file"] = {
             "class": "logging.FileHandler",
             "formatter": "default_file",
             "filename": str(log_path),
             "encoding": "utf-8",
         }
-        log_config["handlers"]["server_access_file"] = {
+        handlers["server_access_file"] = {
             "class": "logging.FileHandler",
             "formatter": "access_file",
             "filename": str(log_path),
@@ -268,29 +285,29 @@ def _server_uvicorn_log_config(
         default_handlers: list[str] = []
         access_handlers: list[str] = []
         if mirror:
-            log_config["handlers"]["server_terminal"] = {
+            handlers["server_terminal"] = {
                 "()": "omnigent.process_logging.terminal_stream_handler",
                 "formatter": "default",
                 "level": level_name,
             }
-            log_config["handlers"]["server_access_terminal"] = {
+            handlers["server_access_terminal"] = {
                 "()": "omnigent.process_logging.terminal_stream_handler",
                 "formatter": "access",
                 "level": level_name,
             }
             default_handlers.append("server_terminal")
             access_handlers.append("server_access_terminal")
-        log_config["loggers"]["uvicorn"] = {
+        loggers["uvicorn"] = {
             "handlers": [*default_handlers, "server_file"],
             "level": level_name,
             "propagate": False,
         }
-        log_config["loggers"]["uvicorn.error"] = {
+        loggers["uvicorn.error"] = {
             "handlers": [*default_handlers, "server_file"],
             "level": level_name,
             "propagate": False,
         }
-        log_config["loggers"]["uvicorn.access"] = {
+        loggers["uvicorn.access"] = {
             "handlers": [*access_handlers, "server_access_file"],
             "level": level_name,
             "propagate": False,
@@ -498,6 +515,7 @@ _HostJsonValue: TypeAlias = (
 _HostJsonObject: TypeAlias = dict[str, _HostJsonValue]
 _HostSessionRow: TypeAlias = dict[str, _HostJsonValue]
 _HostPayload: TypeAlias = dict[str, _HostJsonValue]
+_JsonObject: TypeAlias = dict[str, object]
 
 
 def _effective_global_config_path() -> Path:
@@ -851,7 +869,7 @@ def _resolve_auto_open_conversation_from_config(cfg: dict[str, Any]) -> bool:  #
 
 
 def _normalize_harness_scalar_on_write(
-    cfg: dict[str, Any],
+    cfg: dict[str, object],
     path: Path,
 ) -> bool:
     """Migrate a legacy scalar ``harness:`` to the mapping form in *cfg*.
@@ -986,7 +1004,7 @@ def _materialize_internal_beta_agents() -> Path:
 
 
 def _save_local_config(
-    settings: dict[str, str | bool | Mapping[str, Any]],
+    settings: Mapping[str, object],
     unset_keys: tuple[str, ...] = (),
     deep_merge_keys: tuple[str, ...] = (),
 ) -> None:
@@ -3566,6 +3584,7 @@ def server(
     # Stays None when neither is configured. Managed deployments override
     # RuntimeCaps.routing_client with their own implementation.
     routing_cfg = cfg.get("routing")
+    routing_client: ExternalRoutingClient | LLMRoutingClient | None
     if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
         routing_client = _build_external_routing_client(routing_cfg)
     else:
@@ -3752,7 +3771,7 @@ def server(
         cleanly within the graceful window.
         """
 
-        async def shutdown(self, sockets=None) -> None:
+        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
             import asyncio as _asyncio
 
             from omnigent.runtime import session_stream as _session_stream
@@ -3975,7 +3994,7 @@ def _uninstall_script_path() -> Path:
     raise click.ClickException("uninstall script is missing from this installation")
 
 
-def _write_uninstall_manifest(ledger: Any) -> Path:
+def _write_uninstall_manifest(ledger: InstallLedger) -> Path:
     """Write the ledger fields the POSIX uninstaller needs as tab records."""
     fd, manifest_name = tempfile.mkstemp(prefix="omnigent-uninstall-ledger-", suffix=".tsv")
     manifest = Path(manifest_name)
@@ -4523,6 +4542,7 @@ def upgrade(
             raise SystemExit(0)
 
     current = importlib.metadata.version("omnigent")
+    latest: str | None
     if target_version:
         # A pinned target version means we don't have to ask the index what
         # "latest" is. Treat the target as the desired release. This is
@@ -5520,7 +5540,7 @@ def _import_agent_aliased_types() -> frozenset[str]:
     return frozenset(aliased)
 
 
-def _import_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
     """
     Rebuild one exported item into a ``{"type", "data"}`` create payload.
 
@@ -5606,19 +5626,24 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
     if not src_path.is_file():
         raise click.ClickException(f"Import file not found: {input_path}")
 
-    meta: dict[str, Any] | None = None
-    items: list[dict[str, Any]] = []
+    meta: _JsonObject | None = None
+    items: list[_JsonObject] = []
     with src_path.open("r", encoding="utf-8") as fh:
         for line_no, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                record = json.loads(line)
+                record_value: object = json.loads(line)
             except ValueError as exc:
                 raise click.ClickException(
                     f"{input_path}:{line_no}: not valid JSON ({exc})."
                 ) from exc
+            if not isinstance(record_value, dict) or not all(
+                isinstance(key, str) for key in record_value
+            ):
+                raise click.ClickException(f"{input_path}:{line_no}: expected a JSON object.")
+            record = cast(_JsonObject, record_value)
             kind = record.get("record_type")
             if kind == "session_meta":
                 meta = record
@@ -5638,8 +5663,10 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
     # Agent binding: reuse the exported agent_id when it exists on the target
     # server; otherwise fall back to the built-in native agent for the export's
     # harness (mirrors the /v1/imports fallback).
-    exported_agent_id = meta.get("agent_id")
-    harness = meta.get("harness") or meta.get("harness_override")
+    exported_agent_value = meta.get("agent_id")
+    exported_agent_id = exported_agent_value if isinstance(exported_agent_value, str) else None
+    harness_value = meta.get("harness") or meta.get("harness_override")
+    harness = harness_value if isinstance(harness_value, str) else None
     fallback_agent_id: str | None = None
     native_agent = native_coding_agent_for_harness(harness)
     if native_agent is not None:
@@ -5651,10 +5678,15 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
 
-    resolved_title = title if title is not None else meta.get("title")
+    exported_title = meta.get("title")
+    resolved_title = (
+        title
+        if title is not None
+        else (exported_title if isinstance(exported_title, str) else None)
+    )
 
     def _create(agent_id: str, client: httpx.Client) -> httpx.Response:
-        body: dict[str, Any] = {
+        body: dict[str, object] = {
             "agent_id": agent_id,
             "initial_items": initial_items,
             # Explicitly external with no host_id so the server seeds
@@ -5703,7 +5735,12 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
             raise click.ClickException(
                 f"Failed to import session ({resp.status_code}): {resp.text[:500]}"
             )
-        created = resp.json()
+        created_value: object = resp.json()
+        if not isinstance(created_value, dict) or not all(
+            isinstance(key, str) for key in created_value
+        ):
+            raise click.ClickException("Session import returned a malformed response.")
+        created = cast(_JsonObject, created_value)
 
     new_id = created.get("id") or created.get("session_id")
     click.echo(f"Imported {len(initial_items)} item(s) into {new_id}")
@@ -6193,7 +6230,7 @@ def _dispatch_native_terminal_harness(
         "resume_picker": resume_picker,
         "auto_open_conversation": auto_open_conversation,
     }
-    launcher_kwargs = dict(common)
+    launcher_kwargs: dict[str, object] = dict(common)
     if spec.model_strategy == "first_class":
         launcher_kwargs[spec.args_param] = ()
         launcher_kwargs["model"] = model
@@ -8106,7 +8143,7 @@ def _parse_config_settings(
     settings: tuple[str, ...],
     *,
     resolve_paths: bool = False,
-) -> dict[str, str | bool]:
+) -> dict[str, object]:
     """
     Parse and validate ``KEY=VALUE`` pairs from the ``config`` command.
 
@@ -8121,7 +8158,7 @@ def _parse_config_settings(
     :returns: Validated mapping of config key → value, e.g.
         ``{"agent": "examples/hello.yaml", "model": "gpt-5.4-mini"}``.
     """
-    parsed: dict[str, str | bool] = {}
+    parsed: dict[str, object] = {}
     for item in settings:
         if "=" not in item:
             raise click.ClickException(
@@ -8150,7 +8187,7 @@ def _parse_config_settings(
 
 
 def _harness_deep_merge_keys(
-    parsed: dict[str, str | bool | Mapping[str, Any]],
+    parsed: dict[str, object],
 ) -> tuple[str, ...]:
     """Rewrite a ``harness=<id>`` setting for deep-merge into the harness mapping.
 
@@ -8216,7 +8253,7 @@ def _format_harness_for_display(
 
 
 def _resolve_harness_startup_args(
-    cfg: dict[str, Any],
+    cfg: Mapping[str, object],
     harness: str,
     cli_args: tuple[str, ...],
 ) -> tuple[str, ...]:
