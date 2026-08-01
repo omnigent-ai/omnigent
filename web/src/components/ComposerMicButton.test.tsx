@@ -936,20 +936,28 @@ describe("ComposerMicButton (server dictation)", () => {
     // build at runtime with "network". The take must fall back to server
     // dictation so the user's click still lands.
     const onInterim = vi.fn();
+    const onVoiceStart = vi.fn();
     render(
       <CapabilitiesContext.Provider value={DICTATION_INFO}>
-        <ComposerMicButton onTranscript={vi.fn()} onInterim={onInterim} />
+        <ComposerMicButton
+          onTranscript={vi.fn()}
+          onInterim={onInterim}
+          onVoiceStart={onVoiceStart}
+        />
       </CapabilitiesContext.Provider>,
     );
     const button = screen.getByRole("button", { name: "Voice dictation" });
 
     fireEvent.click(button);
     expect(startSpy).toHaveBeenCalledTimes(1);
+    act(() => handlers.start?.({}));
+    expect(onVoiceStart).toHaveBeenCalledOnce();
     await act(async () => handlers.error?.({ error: "network" }));
 
     // The take restarted on the server path, with no error tooltip for
     // the silent switch, and partials flow.
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
+    expect(onVoiceStart).toHaveBeenCalledOnce();
     expect(button).toHaveAttribute("aria-pressed", "true");
     expect(button).toHaveAttribute("title", "Voice dictation");
     act(() => sessionEvents?.onPartial("via server"));
@@ -967,6 +975,21 @@ describe("ComposerMicButton (server dictation)", () => {
     await clickMic(); // next take
     expect(startSpy).toHaveBeenCalledTimes(2);
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("snapshots once when Web Speech falls back before its start event", async () => {
+    const onVoiceStart = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} onVoiceStart={onVoiceStart} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    expect(sessionStartMock).toHaveBeenCalledOnce();
+    expect(onVoiceStart).toHaveBeenCalledOnce();
   });
 
   it("switches from an owned Web Speech meter to the borrowed fallback stream", async () => {

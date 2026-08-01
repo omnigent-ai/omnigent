@@ -94,6 +94,10 @@ const isPermissionError = (error: unknown): boolean =>
   error instanceof DOMException &&
   (error.name === "NotAllowedError" || error.name === "SecurityError");
 
+const isMissingMicrophoneError = (error: unknown): boolean =>
+  error instanceof DOMException &&
+  (error.name === "NotFoundError" || error.name === "OverconstrainedError");
+
 export const ComposerMicButton = ({
   onTranscript,
   onInterim,
@@ -151,6 +155,7 @@ export const ComposerMicButton = ({
   const phaseRef = useRef<DictationPhase>("idle");
   phaseRef.current = phase;
   const webTakeActiveRef = useRef(false);
+  const voiceSnapshotTakenRef = useRef(false);
   // Click guard: true between toggle() and the matching start/end event.
   // Prevents rapid double-clicks from calling recognition.start() twice,
   // which throws InvalidStateError in Chrome.
@@ -161,7 +166,7 @@ export const ComposerMicButton = ({
   const serverBusyRef = useRef(false);
   // Lets the mount-time Web Speech error handler start the fallback take
   // without closing over toggleServer's identity.
-  const toggleServerRef = useRef<() => Promise<void>>(async () => {});
+  const toggleServerRef = useRef<(snapshot?: boolean) => Promise<void>>(async () => {});
 
   // Written via .style.transform from rAF — avoids 60Hz React re-renders.
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
@@ -197,6 +202,7 @@ export const ComposerMicButton = ({
       setMeterSource({ kind: "web-speech" });
       // Snapshot point: let the parent record the text so Esc can revert to it.
       onVoiceStartRef.current?.();
+      voiceSnapshotTakenRef.current = true;
     };
     const handleEnd = () => {
       if (serverTakeOwnsState()) return;
@@ -226,7 +232,7 @@ export const ComposerMicButton = ({
       ) {
         webTakeActiveRef.current = false;
         setPhase("idle");
-        void toggleServerRef.current();
+        void toggleServerRef.current(!voiceSnapshotTakenRef.current);
         return;
       }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
@@ -426,118 +432,127 @@ export const ComposerMicButton = ({
 
   // Server-dictation toggle. Start resolves only once the mic + socket
   // handshake are up, so isListening flips exactly when audio flows.
-  const toggleServer = useCallback(async () => {
-    if (serverBusyRef.current) {
-      if (pendingServerStartRef.current) {
-        serverTakeIdRef.current += 1;
-        pendingServerStartRef.current.abort();
-        setPhase("idle");
-        setCompletionStatus("Dictation cancelled");
+  const toggleServer = useCallback(
+    async (snapshot = true) => {
+      if (serverBusyRef.current) {
+        if (pendingServerStartRef.current) {
+          serverTakeIdRef.current += 1;
+          pendingServerStartRef.current.abort();
+          setPhase("idle");
+          setCompletionStatus("Dictation cancelled");
+        }
+        return;
       }
-      return;
-    }
-    serverBusyRef.current = true;
-    const session = sessionRef.current;
-    if (session) {
-      setPhase("stopping");
-      const stopTakeId = ++serverTakeIdRef.current;
-      sessionRef.current = null;
-      setMeterSource(null);
-      const tail = (await session.stop()).trim();
-      if (!mountedRef.current || disabledRef.current || serverTakeIdRef.current !== stopTakeId) {
+      serverBusyRef.current = true;
+      const session = sessionRef.current;
+      if (session) {
+        setPhase("stopping");
+        const stopTakeId = ++serverTakeIdRef.current;
+        sessionRef.current = null;
+        setMeterSource(null);
+        const tail = (await session.stop()).trim();
+        if (!mountedRef.current || disabledRef.current || serverTakeIdRef.current !== stopTakeId) {
+          serverBusyRef.current = false;
+          return;
+        }
+        if (!disabledRef.current) {
+          // A non-empty tail supersedes the pending interim via
+          // onTranscript; an empty one just clears the interim region.
+          if (tail) onTranscriptRef.current(tail);
+          else onInterimRef.current?.("");
+        }
+        setPhase("idle");
+        setCompletionStatus("Dictation stopped");
         serverBusyRef.current = false;
         return;
       }
-      if (!disabledRef.current) {
-        // A non-empty tail supersedes the pending interim via
-        // onTranscript; an empty one just clears the interim region.
-        if (tail) onTranscriptRef.current(tail);
-        else onInterimRef.current?.("");
-      }
-      setPhase("idle");
-      setCompletionStatus("Dictation stopped");
-      serverBusyRef.current = false;
-      return;
-    }
-    pendingServerStartRef.current?.abort();
-    const controller = new AbortController();
-    pendingServerStartRef.current = controller;
-    const takeId = ++serverTakeIdRef.current;
-    setError(null);
-    setCompletionStatus(null);
-    setPhase("starting");
-    try {
-      // Snapshot point: let the parent record the text so Esc can revert to it.
-      discardingRef.current = false;
-      onVoiceStartRef.current?.();
-      const next = await DictationSession.start(
-        {
-          onPartial: (text) => {
-            // Drop late partials after an Esc discard — they'd repopulate the
-            // composer the parent just reverted.
-            if (
-              serverTakeIdRef.current === takeId &&
-              !disabledRef.current &&
-              !discardingRef.current
-            ) {
-              onInterimRef.current?.(text);
-            }
-          },
-          onFinal: (text) => {
-            const trimmed = text.trim();
-            if (
-              serverTakeIdRef.current === takeId &&
-              trimmed &&
-              !disabledRef.current &&
-              !discardingRef.current
-            ) {
-              onTranscriptRef.current(trimmed);
-            }
-          },
-          onError: () => {
-            if (!mountedRef.current || serverTakeIdRef.current !== takeId) return;
-            serverTakeIdRef.current += 1;
-            sessionRef.current = null;
-            setMeterSource(null);
-            setError("Dictation connection lost. Try again.");
-            setPhase("idle");
-            onInterimRef.current?.("");
-          },
-        },
-        { microphoneDeviceId: preferences.microphoneDeviceId, signal: controller.signal },
-      );
-      if (
-        !mountedRef.current ||
-        disabledRef.current ||
-        controller.signal.aborted ||
-        serverTakeIdRef.current !== takeId
-      ) {
-        next.cancel();
-        return;
-      }
-      sessionRef.current = next;
-      setMeterSource({ kind: "server", stream: next.captureStream });
+      pendingServerStartRef.current?.abort();
+      const controller = new AbortController();
+      pendingServerStartRef.current = controller;
+      const takeId = ++serverTakeIdRef.current;
       setError(null);
-      setPhase("listening");
-    } catch (startError) {
-      if (startError instanceof DOMException && startError.name === "AbortError") return;
-      if (!mountedRef.current || disabledRef.current || serverTakeIdRef.current !== takeId) return;
-      setMeterSource(null);
-      setError(
-        startError instanceof DictationBusyError
-          ? "Dictation is busy. Try again shortly."
-          : isPermissionError(startError)
-            ? "Microphone access denied. Allow access, then try again."
-            : "Could not connect to dictation. Try again.",
-      );
-      setPhase("idle");
-    } finally {
-      if (pendingServerStartRef.current === controller) {
-        pendingServerStartRef.current = null;
+      setCompletionStatus(null);
+      setPhase("starting");
+      try {
+        // Snapshot point: let the parent record the text so Esc can revert to it.
+        discardingRef.current = false;
+        if (snapshot) {
+          onVoiceStartRef.current?.();
+          voiceSnapshotTakenRef.current = true;
+        }
+        const next = await DictationSession.start(
+          {
+            onPartial: (text) => {
+              // Drop late partials after an Esc discard — they'd repopulate the
+              // composer the parent just reverted.
+              if (
+                serverTakeIdRef.current === takeId &&
+                !disabledRef.current &&
+                !discardingRef.current
+              ) {
+                onInterimRef.current?.(text);
+              }
+            },
+            onFinal: (text) => {
+              const trimmed = text.trim();
+              if (
+                serverTakeIdRef.current === takeId &&
+                trimmed &&
+                !disabledRef.current &&
+                !discardingRef.current
+              ) {
+                onTranscriptRef.current(trimmed);
+              }
+            },
+            onError: () => {
+              if (!mountedRef.current || serverTakeIdRef.current !== takeId) return;
+              serverTakeIdRef.current += 1;
+              sessionRef.current = null;
+              setMeterSource(null);
+              setError("Dictation connection lost. Try again.");
+              setPhase("idle");
+              onInterimRef.current?.("");
+            },
+          },
+          { microphoneDeviceId: preferences.microphoneDeviceId, signal: controller.signal },
+        );
+        if (
+          !mountedRef.current ||
+          disabledRef.current ||
+          controller.signal.aborted ||
+          serverTakeIdRef.current !== takeId
+        ) {
+          next.cancel();
+          return;
+        }
+        sessionRef.current = next;
+        setMeterSource({ kind: "server", stream: next.captureStream });
+        setError(null);
+        setPhase("listening");
+      } catch (startError) {
+        if (startError instanceof DOMException && startError.name === "AbortError") return;
+        if (!mountedRef.current || disabledRef.current || serverTakeIdRef.current !== takeId)
+          return;
+        setMeterSource(null);
+        setError(
+          startError instanceof DictationBusyError
+            ? "Dictation is busy. Try again shortly."
+            : isPermissionError(startError)
+              ? "Microphone access denied. Allow access, then try again."
+              : isMissingMicrophoneError(startError)
+                ? "Selected microphone unavailable. Choose another in Settings."
+                : "Could not connect to dictation. Try again.",
+        );
+        setPhase("idle");
+      } finally {
+        if (pendingServerStartRef.current === controller) {
+          pendingServerStartRef.current = null;
+        }
+        serverBusyRef.current = false;
       }
-      serverBusyRef.current = false;
-    }
-  }, [preferences.microphoneDeviceId]);
+    },
+    [preferences.microphoneDeviceId],
+  );
   toggleServerRef.current = toggleServer;
 
   const toggle = useCallback(() => {
@@ -572,6 +587,7 @@ export const ComposerMicButton = ({
         recognition.stop();
       } else {
         webTakeActiveRef.current = true;
+        voiceSnapshotTakenRef.current = false;
         discardingRef.current = false;
         setError(null);
         setCompletionStatus(null);

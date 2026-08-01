@@ -302,7 +302,11 @@ function DictationSection() {
             value={preferences.path}
             onValueChange={(value) => update({ path: value as DictationPath })}
           >
-            <SelectTrigger className="w-48" data-testid="dictation-path-select">
+            <SelectTrigger
+              className="w-48"
+              data-testid="dictation-path-select"
+              aria-label="Dictation path"
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -345,7 +349,11 @@ function DictationSection() {
               update({ microphoneDeviceId: value === "default" ? null : value })
             }
           >
-            <SelectTrigger className="w-64" data-testid="dictation-microphone-select">
+            <SelectTrigger
+              className="w-64"
+              data-testid="dictation-microphone-select"
+              aria-label="Microphone"
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
