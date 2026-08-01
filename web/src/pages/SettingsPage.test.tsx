@@ -297,6 +297,7 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByLabelText("Browser recognition language"), {
       target: { value: " fr-fr " },
     });
+    fireEvent.blur(screen.getByLabelText("Browser recognition language"));
     fireEvent.change(screen.getByTestId("dictation-microphone-select"), {
       target: { value: "mic-1" },
     });
@@ -306,6 +307,81 @@ describe("SettingsPage", () => {
       microphoneDeviceId: "mic-1",
     });
     expect(screen.getByLabelText("Browser recognition language")).toHaveValue("fr-FR");
+  });
+
+  it("keeps partial language input editable and reverts invalid values on blur", () => {
+    renderPage("/settings/dictation");
+    const language = screen.getByLabelText("Browser recognition language");
+
+    fireEvent.change(language, { target: { value: "fr-" } });
+    expect(language).toHaveValue("fr-");
+    expect(localStorage.getItem("omnigent:dictation-preferences")).toBeNull();
+
+    fireEvent.blur(language);
+    expect(language).toHaveValue("en-US");
+    expect(language).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it.each(["fr-FR", "not-a-locale-"])(
+    "cancels the language draft on Escape without persisting %s",
+    (draft) => {
+      renderPage("/settings/dictation");
+      const language = screen.getByLabelText("Browser recognition language");
+
+      fireEvent.change(language, { target: { value: draft } });
+      fireEvent.keyDown(language, { key: "Escape" });
+
+      expect(language).toHaveValue("en-US");
+      expect(language).not.toHaveAttribute("aria-invalid");
+      expect(localStorage.getItem("omnigent:dictation-preferences")).toBeNull();
+    },
+  );
+
+  it("filters empty, duplicate, and default microphone device ids", async () => {
+    enumerateDevices.mockResolvedValue([
+      { kind: "audioinput", deviceId: "", label: "Hidden Mic", groupId: "", toJSON() {} },
+      {
+        kind: "audioinput",
+        deviceId: "default",
+        label: "Browser Default",
+        groupId: "",
+        toJSON() {},
+      },
+      { kind: "audioinput", deviceId: "mic-1", label: "Studio Mic", groupId: "", toJSON() {} },
+      { kind: "audioinput", deviceId: "mic-1", label: "Duplicate Mic", groupId: "", toJSON() {} },
+    ]);
+    renderPage("/settings/dictation");
+
+    expect(await screen.findByText("Studio Mic")).toBeInTheDocument();
+    expect(screen.queryByText("Hidden Mic")).toBeNull();
+    expect(screen.queryByText("Browser Default")).toBeNull();
+    expect(screen.queryByText("Duplicate Mic")).toBeNull();
+    expect(screen.getAllByText("System default")).toHaveLength(1);
+  });
+
+  it("ignores an older device enumeration that resolves after a refresh", async () => {
+    let resolveInitial: ((devices: MediaDeviceInfo[]) => void) | undefined;
+    enumerateDevices
+      .mockReturnValueOnce(
+        new Promise<MediaDeviceInfo[]>((resolve) => {
+          resolveInitial = resolve;
+        }),
+      )
+      .mockResolvedValueOnce([
+        { kind: "audioinput", deviceId: "new", label: "New Mic", groupId: "", toJSON() {} },
+      ]);
+    renderPage("/settings/dictation");
+
+    await act(async () => deviceChangeHandler?.());
+    expect(await screen.findByText("New Mic")).toBeInTheDocument();
+    await act(async () =>
+      resolveInitial?.([
+        { kind: "audioinput", deviceId: "old", label: "Old Mic", groupId: "", toJSON() {} },
+      ]),
+    );
+
+    expect(screen.getByText("New Mic")).toBeInTheDocument();
+    expect(screen.queryByText("Old Mic")).toBeNull();
   });
 
   it("handles failed enumeration and refreshes audio inputs on devicechange", async () => {

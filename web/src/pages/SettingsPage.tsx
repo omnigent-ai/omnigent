@@ -141,6 +141,7 @@ import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchP
 import {
   type DictationPath,
   type DictationPreferences,
+  normalizeDictationLanguage,
   readDictationPreferences,
   writeDictationPreferences,
 } from "@/lib/dictationPreferences";
@@ -248,6 +249,9 @@ export function SettingsPage() {
 
 function DictationSection() {
   const [preferences, setPreferences] = useState(readDictationPreferences);
+  const [languageDraft, setLanguageDraft] = useState(preferences.browserLanguage);
+  const [languageInvalid, setLanguageInvalid] = useState(false);
+  const suppressLanguageBlurRef = useRef(false);
   const [microphones, setMicrophones] = useState<MediaDeviceInfo[]>([]);
 
   const update = useCallback((patch: Partial<DictationPreferences>) => {
@@ -261,12 +265,29 @@ function DictationSection() {
     const mediaDevices = navigator.mediaDevices;
     if (!mediaDevices?.enumerateDevices) return;
     let active = true;
+    let refreshGeneration = 0;
     const refresh = async () => {
+      const generation = ++refreshGeneration;
       try {
         const devices = await mediaDevices.enumerateDevices();
-        if (active) setMicrophones(devices.filter((device) => device.kind === "audioinput"));
+        if (!active || generation !== refreshGeneration) return;
+        const seen = new Set<string>();
+        setMicrophones(
+          devices.filter((device) => {
+            if (
+              device.kind !== "audioinput" ||
+              !device.deviceId ||
+              device.deviceId === "default" ||
+              seen.has(device.deviceId)
+            ) {
+              return false;
+            }
+            seen.add(device.deviceId);
+            return true;
+          }),
+        );
       } catch {
-        if (active) setMicrophones([]);
+        if (active && generation === refreshGeneration) setMicrophones([]);
       }
     };
     void refresh();
@@ -280,6 +301,23 @@ function DictationSection() {
   const selectedMicrophoneMissing =
     preferences.microphoneDeviceId !== null &&
     !microphones.some((device) => device.deviceId === preferences.microphoneDeviceId);
+
+  const commitLanguage = useCallback(() => {
+    if (suppressLanguageBlurRef.current) {
+      suppressLanguageBlurRef.current = false;
+      return;
+    }
+    const normalized = normalizeDictationLanguage(languageDraft);
+    if (normalized === null) {
+      setLanguageDraft(preferences.browserLanguage);
+      setLanguageInvalid(true);
+      return;
+    }
+    const next = writeDictationPreferences({ ...preferences, browserLanguage: normalized });
+    setPreferences(next);
+    setLanguageDraft(next.browserLanguage);
+    setLanguageInvalid(false);
+  }, [languageDraft, preferences]);
 
   return (
     <Section
@@ -302,7 +340,7 @@ function DictationSection() {
             onValueChange={(value) => update({ path: value as DictationPath })}
           >
             <SelectTrigger
-              className="w-48"
+              className="w-full max-w-48 shrink-0"
               data-testid="dictation-path-select"
               aria-label="Dictation path"
             >
@@ -325,10 +363,24 @@ function DictationSection() {
             </span>
           </div>
           <Input
-            value={preferences.browserLanguage}
-            onChange={(event) => update({ browserLanguage: event.target.value || "en-US" })}
+            value={languageDraft}
+            onChange={(event) => {
+              setLanguageDraft(event.target.value);
+              setLanguageInvalid(false);
+            }}
+            onBlur={commitLanguage}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+              if (event.key === "Escape") {
+                suppressLanguageBlurRef.current = true;
+                setLanguageDraft(preferences.browserLanguage);
+                setLanguageInvalid(false);
+                event.currentTarget.blur();
+              }
+            }}
             aria-label="Browser recognition language"
-            className="h-9 w-48 shrink-0"
+            aria-invalid={languageInvalid || undefined}
+            className="h-9 w-full max-w-48 shrink-0"
             spellCheck={false}
             maxLength={64}
           />
@@ -349,7 +401,7 @@ function DictationSection() {
             }
           >
             <SelectTrigger
-              className="w-64"
+              className="w-full max-w-64 shrink-0"
               data-testid="dictation-microphone-select"
               aria-label="Microphone"
             >

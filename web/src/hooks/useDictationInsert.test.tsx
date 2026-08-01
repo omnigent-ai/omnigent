@@ -169,6 +169,15 @@ describe("useDictationInsert", () => {
     expect(result.current.value).toBe("replacement spoken");
   });
 
+  it("rebases the pending selection when the user edits before the first transcript", () => {
+    const { result } = renderDictation("alpha omega");
+    select(result, 6, 11);
+    act(() => result.current.begin());
+    act(() => result.current.edit("note alpha omega"));
+    act(() => result.current.appendFinal("Final."));
+    expect(result.current.value).toBe("note alpha Final.");
+  });
+
   it("is StrictMode-safe", () => {
     const strict = ({ children }: { children: ReactNode }) => <StrictMode>{children}</StrictMode>;
     const { result } = renderDictation("draft end", strict);
