@@ -252,8 +252,14 @@ def register_resources_routes(
                 detail="runner resource endpoint unavailable",
             ) from exc
         if resp.status_code == 404:
+            payload = resp.json()
+            message = "Resource not found"
+            if isinstance(payload, dict):
+                error = payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    message = error["message"]
             raise OmnigentError(
-                resp.json().get("error", {}).get("message", "Resource not found"),
+                message,
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
@@ -264,12 +270,12 @@ def register_resources_routes(
             except Exception:
                 msg = "runner resource endpoint failed"
             raise HTTPException(status_code=502, detail=msg)
-        payload = resp.json()
-        if not isinstance(payload, dict):
+        response_payload = resp.json()
+        if not isinstance(response_payload, dict):
             raise HTTPException(
                 status_code=502, detail="runner resource endpoint returned invalid JSON"
             )
-        return cast(dict[str, Any], payload)
+        return cast(dict[str, Any], response_payload)
 
     async def _fs_get_with_host_fallback(
         session_id: str,

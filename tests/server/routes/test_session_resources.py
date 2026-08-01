@@ -1099,6 +1099,20 @@ async def test_get_resource_by_id_404_from_runner(
     assert resp.json()["error"]["code"] == "not_found"
 
 
+@pytest.mark.asyncio
+async def test_get_resource_by_id_404_with_non_mapping_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """A malformed runner 404 uses the default not-found message."""
+    fake_runner = _FakeRunnerClient(payload=["not", "an", "object"], status_code=404)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/nonexistent")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["message"] == "Resource not found"
+
+
 @pytest.fixture
 def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve the session's agent spec to one declaring a ``bash`` terminal.
