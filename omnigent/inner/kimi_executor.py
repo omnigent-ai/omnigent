@@ -61,7 +61,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 
 from omnigent.harness_startup_config import resolve_harness_path
@@ -335,7 +335,7 @@ class KimiExecutor(Executor):
         argv.extend(["-p", prompt_text])
         return argv
 
-    def _translate_event(self, payload: dict[str, object]) -> list[ExecutorEvent]:
+    def _translate_event(self, payload: Mapping[str, object]) -> list[ExecutorEvent]:
         """Translate one kimi stream-json line into Omnigent events.
 
         Upstream emits whole messages (not deltas). Roles seen:
@@ -600,7 +600,7 @@ async def _create_subprocess_exec(
     stdout: int,
     stderr: int,
     cwd: str | None,
-    env: dict[str, str],
+    env: Mapping[str, str],
     limit: int,
 ) -> asyncio.subprocess.Process:
     """Indirection point so tests can stub subprocess creation.
