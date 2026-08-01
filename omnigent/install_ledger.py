@@ -198,7 +198,13 @@ class InstallLedger:
 
     @classmethod
     def from_dict(cls, data: _JsonObject) -> InstallLedger:
-        entries_data = cast(_JsonObject, data.get("entries") or {})
+        entries_value = data.get("entries")
+        if entries_value is None:
+            entries_data: _JsonObject = {}
+        elif isinstance(entries_value, dict):
+            entries_data = entries_value
+        else:
+            raise ValueError("install ledger entries must be an object")
         entries = LedgerEntries(
             profiles=[
                 ProfileEntry(**item)
@@ -241,8 +247,10 @@ class InstallLedger:
             ),
         )
         schema_version = data.get("schema_version", SCHEMA_VERSION)
-        if not isinstance(schema_version, int | str | bytes | bytearray):
-            schema_version = SCHEMA_VERSION
+        if isinstance(schema_version, bool) or not isinstance(
+            schema_version, int | str | bytes | bytearray
+        ):
+            raise ValueError("install ledger schema_version must be an integer")
         return cls(
             schema_version=int(schema_version),
             ledger_source=str(data.get("ledger_source", "backfill")),
@@ -280,9 +288,15 @@ def load_ledger(path: Path) -> InstallLedger | None:
         return None
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(data, dict):
         return None
-    return InstallLedger.from_dict(data)
+    schema_version = data.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
+        return None
+    try:
+        return InstallLedger.from_dict(data)
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def write_ledger(ledger: InstallLedger, *, path: Path | None = None) -> None:

@@ -36,6 +36,18 @@ def test_load_ledger_rejects_non_object_json(tmp_path: Path) -> None:
     assert install_ledger.load_ledger(path) is None
 
 
+def test_load_ledger_rejects_malformed_nested_shapes(tmp_path: Path) -> None:
+    path = tmp_path / "install_ledger.json"
+    malformed_payloads = [
+        {"schema_version": True},
+        {"schema_version": install_ledger.SCHEMA_VERSION, "entries": []},
+    ]
+
+    for payload in malformed_payloads:
+        path.write_text(json.dumps(payload))
+        assert install_ledger.load_ledger(path) is None
+
+
 def test_backfill_requires_anchor_signal(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
