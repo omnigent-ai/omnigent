@@ -293,6 +293,8 @@ async def test_custom_auth_provider_skips_unified_login_routes(
     tmp_path: Path,
 ) -> None:
     class _CustomAuthProvider(AuthProvider):
+        login_url = "/custom/login"
+
         def get_user_id(self, request: HTTPConnection) -> str | None:
             return "custom@example.com"
 
