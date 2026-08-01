@@ -436,6 +436,43 @@ def _cascade_is_idle(summaries: dict[str, object], bound_cascade_id: str) -> boo
     return summary.get("status") == _CASCADE_RUN_STATUS_IDLE
 
 
+def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) -> bool:
+    """
+    Whether a cascade summary describes a SUBAGENT (child) conversation.
+
+    agy spawns each subagent as its own conversation that reports
+    ``trajectoryType == CORTEX_TRAJECTORY_TYPE_CASCADE`` — byte-identical to a real
+    root — so the type alone cannot tell them apart (live-verified, agy 1.1.9).
+    The distinction lives in ``trajectoryMetadata``, where a child carries a
+    ``parentConversationId`` and a ``rootConversationId`` pointing at its PARENT,
+    while a root's ``rootConversationId`` is its own id::
+
+        root:  {"rootConversationId": "<self>"}
+        child: {"parentConversationId": "<parent>", "rootConversationId": "<parent>",
+                "nestingDepth": 1, "subagentSpec": {...}}
+
+    This matters because a subagent is ALWAYS more recently active than the parent
+    idling while it works, so without this test every spawned subagent looks like a
+    ``/clear`` rotation — promoting a sub-conversation to a new top-level session
+    and dragging the agy pane onto it.
+
+    Fail-open: a summary with no (or malformed) metadata is NOT treated as a child,
+    so a genuine ``/clear`` on an agy build that omits these fields still rotates.
+
+    :param cascade_id: The summary's own key (its conversation id).
+    :param summary: One ``trajectorySummaries`` entry.
+    :returns: ``True`` when the entry is a subagent/child trajectory.
+    """
+    metadata = summary.get("trajectoryMetadata")
+    if not isinstance(metadata, dict):
+        return False
+    parent = metadata.get("parentConversationId")
+    if isinstance(parent, str) and parent:
+        return True
+    root = metadata.get("rootConversationId")
+    return isinstance(root, str) and bool(root) and root != cascade_id
+
+
 def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str) -> str | None:
     """
     Return the id of a newer-active root cascade than the bound one, else ``None``.
@@ -487,7 +524,9 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
         if not isinstance(summary, dict):
             continue
         if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
-            continue  # never rotate to a subagent/child trajectory
+            continue  # never rotate to a non-cascade trajectory
+        if _summary_is_child_trajectory(cascade_id, summary):
+            continue  # a subagent works FOR the bound cascade; it is not a new one
         if cascade_id == bound_cascade_id:
             continue
         activity = _summary_activity(summary)

@@ -2994,6 +2994,114 @@ def test_detect_rotation_older_sibling_returns_none() -> None:
     assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
 
 
+def _child_summary(
+    *,
+    parent_cascade_id: str,
+    last_user_input_time: str = "2026-08-01T10:48:37.887431Z",
+    include_parent_id: bool = True,
+) -> dict[str, Any]:
+    """Build a real agy SUBAGENT summary (live capture, agy 1.1.9).
+
+    Captured from a live ``GetAllCascadeTrajectories`` while agy ran a subagent:
+    the child is typed ``CORTEX_TRAJECTORY_TYPE_CASCADE`` — byte-identical to its
+    parent — and is distinguishable ONLY by ``trajectoryMetadata``, which carries
+    ``parentConversationId`` / a foreign ``rootConversationId`` / ``nestingDepth``
+    / ``subagentSpec``.
+
+    :param parent_cascade_id: The parent (root) conversation id this child hangs off.
+    :param include_parent_id: When ``False``, omit ``parentConversationId`` so the
+        foreign ``rootConversationId`` is the only remaining child signal.
+    """
+    metadata: dict[str, Any] = {
+        "createdAt": "2026-08-01T09:34:51.639408Z",
+        "initializationStateId": "11e484d0-0000-4000-8000-000000000000",
+        "rootConversationId": parent_cascade_id,
+        "nestingDepth": 1,
+        "subagentSpec": {"typeName": "self", "role": "Task 4 Reviewer", "inherit": True},
+    }
+    if include_parent_id:
+        metadata["parentConversationId"] = parent_cascade_id
+    return {
+        "trajectoryId": "82e9fb54-9f16-46eb-88d7-a84fd40deec3",
+        "status": "CASCADE_RUN_STATUS_IDLE",
+        # NOT a distinct type — the same value a real root cascade reports.
+        "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
+        "lastUserInputTime": last_user_input_time,
+        "summary": "MetricsStore Implementation Code Review",
+        "trajectoryMetadata": metadata,
+    }
+
+
+def test_detect_rotation_subagent_child_is_never_a_rotation_target() -> None:
+    """A running agy SUBAGENT must never be rotated onto.
+
+    agy spawns each subagent as a child conversation that reports the SAME
+    ``trajectoryType`` as a real root, and is always more recently active than the
+    parent it is working for. Rotating onto it promotes a sub-conversation to a
+    new top-level Omnigent session (and drags the tmux pane with it), which is
+    what made a single subagent fan-out explode into a session per agent.
+    """
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-08-01T10:49:38.660037Z"),
+        _OTHER_CASCADE: _child_summary(
+            parent_cascade_id=_BOUND_CASCADE,
+            # Strictly newer than the parent — the subagent is mid-turn while the
+            # parent sits idle waiting for it, so activity alone always favours it.
+            last_user_input_time="2026-08-01T10:50:00.000000Z",
+        ),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_child_detected_without_explicit_parent_id() -> None:
+    """A foreign ``rootConversationId`` alone marks a child, with no parent field."""
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-08-01T10:49:38.660037Z"),
+        _OTHER_CASCADE: _child_summary(
+            parent_cascade_id=_BOUND_CASCADE,
+            last_user_input_time="2026-08-01T10:50:00.000000Z",
+            include_parent_id=False,
+        ),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_child_of_a_third_cascade_is_also_excluded() -> None:
+    """A subagent of some OTHER root is still a child — not a rotation target.
+
+    The child test must not degenerate into "is it my own child": a subagent
+    belonging to a different root is equally not the user's top-level conversation.
+    """
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-08-01T10:49:38.660037Z"),
+        _OTHER_CASCADE: _child_summary(
+            parent_cascade_id="ffffffff-1111-4222-8333-444444444444",
+            last_user_input_time="2026-08-01T10:50:00.000000Z",
+        ),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_real_clear_mint_still_rotates_with_self_root_metadata() -> None:
+    """A genuine /clear rotation still fires when metadata is self-referential.
+
+    The live capture shows a real root carries ``rootConversationId == <its own
+    key>``, so the child test must not swallow the /clear case this detector
+    exists for.
+    """
+    other = dict(_summary(last_user_input_time="2026-08-01T10:50:00.000000Z"))
+    other["trajectoryMetadata"] = {
+        "createdAt": "2026-08-01T10:49:34.181600Z",
+        "initializationStateId": "87966e34-057b-4b63-afa2-a437cd67ea9d",
+        "rootConversationId": _OTHER_CASCADE,
+    }
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-08-01T10:49:38.660037Z"),
+        _OTHER_CASCADE: other,
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) == _OTHER_CASCADE
+
+
 def test_detect_rotation_non_cascade_sibling_returns_none() -> None:
     """A newer NON-cascade (subagent) sibling must not be a rotation target.
 
