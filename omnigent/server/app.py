@@ -2389,6 +2389,11 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
+        else:
+            _logger.debug(
+                "Skipping built-in auth routes for custom provider %s",
+                type(auth_provider).__name__,
+            )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
         # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates

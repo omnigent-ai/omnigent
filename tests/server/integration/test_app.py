@@ -317,6 +317,7 @@ async def test_custom_auth_provider_skips_unified_login_routes(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/v1/me")
 
+    assert response.status_code == 200
     assert response.json() == {"user_id": "custom@example.com", "is_admin": False}
 
 
