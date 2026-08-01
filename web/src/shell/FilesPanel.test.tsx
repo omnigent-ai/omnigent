@@ -387,25 +387,55 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
   });
 });
 
-describe("FilesPanel Changed pill", () => {
-  // The Changed pill shows the file count only — no +/− line totals.
+describe("FilesPanel Changed pill line totals", () => {
   function changedPill() {
     return screen.getByRole("radio", { name: /^changed$/i });
   }
 
-  it("shows the file count but no +/− line totals", () => {
+  it("sums additions and deletions independently", () => {
     renderPanel({
-      conversationId: "conv_pill_count",
+      conversationId: "conv_totals_no_netting",
       flatView: true,
       files: [],
       changedFiles: [
-        changedFile("src/a.ts", "modified", 10, 2),
-        changedFile("src/b.ts", "modified", 5, 1),
+        changedFile("src/a.ts", "modified", 10, 8),
+        changedFile("src/b.ts", "modified", 2, 7),
       ],
     });
 
     const pill = changedPill();
-    expect(within(pill).getByText("2")).toBeInTheDocument(); // file count
+    expect(within(pill).getByText("2")).toBeInTheDocument();
+    expect(within(pill).getByText("+12")).toBeInTheDocument();
+    expect(within(pill).getByText("−15")).toBeInTheDocument();
+    expect(within(pill).queryByText("−3")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["addition-only", changedFile("src/new.ts", "created", 12, 0), "+12", "−0"],
+    ["deletion-only", changedFile("src/gone.ts", "deleted", 0, 7), "+0", "−7"],
+  ])("keeps separate counters for %s files", (_, changed, additions, deletions) => {
+    renderPanel({
+      conversationId: "conv_totals_zero_side",
+      flatView: true,
+      files: [],
+      changedFiles: [changed],
+    });
+
+    const pill = changedPill();
+    expect(within(pill).getByText(additions)).toBeInTheDocument();
+    expect(within(pill).getByText(deletions)).toBeInTheDocument();
+  });
+
+  it("omits totals when all line counts are unavailable", () => {
+    renderPanel({
+      conversationId: "conv_totals_unknown",
+      flatView: true,
+      files: [],
+      changedFiles: [changedFile("a.bin"), changedFile("b.bin")],
+    });
+
+    const pill = changedPill();
+    expect(within(pill).getByText("2")).toBeInTheDocument();
     expect(within(pill).queryByText(/^\+/)).not.toBeInTheDocument();
     expect(within(pill).queryByText(/^−/)).not.toBeInTheDocument();
   });

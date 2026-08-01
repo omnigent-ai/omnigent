@@ -1280,17 +1280,40 @@ def test_git_line_counts_modified(tmp_path: Path) -> None:
     assert rec["lines_removed"] == 1, rec
 
 
-def test_git_line_counts_untracked_is_none(tmp_path: Path) -> None:
-    """An untracked new file (absent from `git diff HEAD`) reports no counts.
-
-    Counts come only from numstat; git doesn't diff untracked files, so the UI
-    omits the counter for them — matching VS Code / Cursor's source-control view.
-    """
+def test_git_line_counts_untracked_are_additions(tmp_path: Path) -> None:
+    """An untracked text file reports every line as an addition."""
     _init_git_with_commit(tmp_path, "committed.py", "x\n")
-    (tmp_path / "new.py").write_text("one\ntwo\nthree\n")
+    (tmp_path / "new.py").write_text("one\ntwo\nthree")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
+    assert rec["status"] == "created"
+    assert rec["lines_added"] == 3, rec
+    assert rec["lines_removed"] == 0, rec
+
+
+def test_git_line_counts_untracked_binary_are_unknown(tmp_path: Path) -> None:
+    """An untracked binary file does not get a misleading added-line count."""
+    _init_git_with_commit(tmp_path, "committed.py", "x\n")
+    (tmp_path / "new.bin").write_bytes(b"text\n\x00binary\n")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.bin")
+    assert rec["status"] == "created"
+    assert rec["lines_added"] is None, rec
+    assert rec["lines_removed"] is None, rec
+
+
+def test_git_line_counts_untracked_large_file_are_unknown(tmp_path: Path, monkeypatch) -> None:
+    """An untracked file over the read cap is not loaded for its badge."""
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._MAX_LINE_COUNT_BYTES", 16)
+    _init_git_with_commit(tmp_path, "committed.py", "x\n")
+    (tmp_path / "large.txt").write_text("line\n" * 100)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    rec = next(
+        r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "large.txt"
+    )
     assert rec["status"] == "created"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec

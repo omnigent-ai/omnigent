@@ -50,6 +50,10 @@ _logger = logging.getLogger(__name__)
 # git so the panel surfaces a failure rather than blocking forever.
 _DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
 
+# Avoid reading arbitrarily large untracked files just to render a line-count
+# badge. This matches the file-content read cap used by the runner and host.
+_MAX_LINE_COUNT_BYTES = 10 * 1024 * 1024
+
 
 def _git_timeout_seconds() -> float:
     """Return the git-subprocess timeout, honoring the env override.
@@ -979,9 +983,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
             if first_component in _SKIP_DIRS:
                 continue
-            # Counts come only from `git diff HEAD` (via numstat). Files git
-            # doesn't diff — untracked new files, binaries — get no counter.
-            counts = numstat.get(rel_path, (None, None))
+            counts = self._line_counts(rel_path, operation, numstat)
             records.append(self._make_record(rel_path, operation, counts))
 
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
@@ -1169,6 +1171,36 @@ class GitFilesystemRegistry(FilesystemRegistry):
             "lines_added": added,
             "lines_removed": removed,
         }
+
+    def _line_counts(
+        self,
+        rel_path: str,
+        operation: str,
+        numstat: dict[str, tuple[int | None, int | None]],
+    ) -> tuple[int | None, int | None]:
+        """Return independent added and removed line counts for a changed file.
+
+        Tracked changes come from git numstat. Untracked text files are absent
+        from numstat, so count their lines from disk as additions. Binary,
+        oversized, and unreadable files keep unknown counts.
+        """
+        if rel_path in numstat:
+            return numstat[rel_path]
+        if operation != "created":
+            return (None, None)
+
+        abs_path = self._cwd / rel_path
+        try:
+            if abs_path.stat().st_size > _MAX_LINE_COUNT_BYTES:
+                return (None, None)
+            data = abs_path.read_bytes()
+        except OSError:
+            return (None, None)
+        if b"\x00" in data:
+            return (None, None)
+
+        added = data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+        return (added, 0)
 
     def _run_git_numstat(self) -> dict[str, tuple[int | None, int | None]]:
         """Return per-file line counts from ``git diff --numstat HEAD``.
