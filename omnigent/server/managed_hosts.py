@@ -2272,7 +2272,19 @@ async def _start_sandbox_host(
     host_config: dict[str, object] | None,
     on_stage: Callable[[str], None] | None = None,
 ) -> str:
-    """Start a sandbox host while preserving legacy launcher compatibility."""
+    """Start a host without sending absent optional arguments to legacy launchers."""
+    if host_config is None and on_stage is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+        )
     if host_config is None:
         return await asyncio.to_thread(
             launcher.start_host,
@@ -2285,6 +2297,19 @@ async def _start_sandbox_host(
             repo_branch=repo_branch,
             repo_name=repo_name,
             on_stage=on_stage,
+        )
+    if on_stage is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
         )
     return await asyncio.to_thread(
         launcher.start_host,

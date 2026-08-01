@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
@@ -1689,13 +1688,13 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
     assert not any(cmd.startswith("python3 -c") for cmd in fake.commands)
 
 
-async def test_launch_without_host_config_supports_legacy_start_host_signature(
+async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_host_signature(
     db_uri: str,
 ) -> None:
     """
     A deployment-injected launcher whose ``start_host`` override predates the
-    ``host_config`` parameter keeps launching when no host_config is set —
-    the kwarg is omitted entirely rather than passed as ``None``.
+    optional ``host_config`` and ``on_stage`` parameters keeps launching and
+    resuming when neither value is set.
     """
     host_store = HostStore(db_uri)
 
@@ -1720,7 +1719,6 @@ async def test_launch_without_host_config_supports_legacy_start_host_signature(
             repo_url: str | None = None,
             repo_branch: str | None = None,
             repo_name: str | None = None,
-            on_stage: Callable[[str], None] | None = None,
         ) -> str:
             return super().start_host(
                 sandbox_id,
@@ -1731,17 +1729,17 @@ async def test_launch_without_host_config_supports_legacy_start_host_signature(
                 repo_url=repo_url,
                 repo_branch=repo_branch,
                 repo_name=repo_name,
-                on_stage=on_stage,
             )
 
-    fake = _LegacySignatureLauncher(on_host_start=_register)
+    fake = _LegacySignatureLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
 
-    result = await launch_managed_host(
-        config=_injected_config(fake), owner=_OWNER, host_store=host_store
-    )
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(result.host_id)
+    await resume_managed_host(result.host_id, host_store, config)
 
-    [start] = fake.host_starts
-    assert result.host_id == start.host_id
+    assert [start.host_id for start in fake.host_starts] == [result.host_id, result.host_id]
+    assert fake.resumed == ["sb-fake-1"]
 
 
 async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
