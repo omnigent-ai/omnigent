@@ -701,19 +701,25 @@ Open the Omnigent web UI in Firefox, or another browser with Web Speech unavaila
 On the trusted worker:
 
 ```bash
+export OMNIGENT_DICTATION_WORKER_TOKEN="$(openssl rand -hex 32)"
 OMNIGENT_DICTATION_ENGINE=sherpa \
-uv run python -m omnigent.server.dictation_worker --host 0.0.0.0 --port 8100
+uv run python -m omnigent.server.dictation_worker \
+  --host 0.0.0.0 --port 8100 \
+  --tls-certfile /path/to/worker.crt \
+  --tls-keyfile /path/to/worker.key
 ```
 
 On the main server:
 
 ```bash
 OMNIGENT_DICTATION_ENGINE=remote \
-OMNIGENT_DICTATION_REMOTE_URL=ws://<trusted-worker>:8100/v1/dictation/stream \
+OMNIGENT_DICTATION_REMOTE_URL=wss://<trusted-worker>:8100/v1/dictation/stream \
+OMNIGENT_DICTATION_WORKER_TOKEN="$OMNIGENT_DICTATION_WORKER_TOKEN" \
+OMNIGENT_DICTATION_REMOTE_CA_FILE=/path/to/private-ca.crt \
 uv run omnigent server
 ```
 
-Do not expose port 8100 publicly in the current implementation.
+Keep port 8100 restricted even with token authentication and TLS.
 
 ### Run focused automated tests
 

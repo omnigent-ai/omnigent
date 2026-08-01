@@ -52,24 +52,15 @@ const dictationAudioConstraints = (microphoneDeviceId?: string | null): MediaTra
   ...(microphoneDeviceId ? { deviceId: { exact: microphoneDeviceId } } : {}),
 });
 
-/** Acquire the selected input, retrying a missing exact device once with the system default. */
+/** Acquire the selected input exactly, or the system default when none is selected. */
 export async function getDictationMediaStream(
   microphoneDeviceId?: string | null,
   signal?: AbortSignal,
 ): Promise<MediaStream> {
   throwIfAborted(signal);
-  try {
-    return await navigator.mediaDevices.getUserMedia({
-      audio: dictationAudioConstraints(microphoneDeviceId),
-    });
-  } catch (error) {
-    throwIfAborted(signal);
-    const name = error instanceof DOMException ? error.name : "";
-    if (microphoneDeviceId && (name === "NotFoundError" || name === "OverconstrainedError")) {
-      return navigator.mediaDevices.getUserMedia({ audio: dictationAudioConstraints() });
-    }
-    throw error;
-  }
+  return navigator.mediaDevices.getUserMedia({
+    audio: dictationAudioConstraints(microphoneDeviceId),
+  });
 }
 
 /**
@@ -385,6 +376,9 @@ export class DictationSession {
     this.closed = true;
     this.teardownAudio();
     this.ws.close();
+    const resolve = this.stopResolve;
+    this.stopResolve = null;
+    resolve?.("");
     this.events.onError(message);
   }
 
