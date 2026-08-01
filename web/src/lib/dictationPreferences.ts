@@ -65,10 +65,10 @@ export function readDictationPreferences(): DictationPreferences {
   }
 }
 
-export function writeDictationPreferences(preferences: DictationPreferences): void {
-  if (typeof window === "undefined") return;
+export function writeDictationPreferences(preferences: DictationPreferences): DictationPreferences {
+  const normalized = normalizeDictationPreferences(preferences);
+  if (typeof window === "undefined") return normalized;
   try {
-    const normalized = normalizeDictationPreferences(preferences);
     if (
       normalized.path === DEFAULT_DICTATION_PREFERENCES.path &&
       normalized.browserLanguage === DEFAULT_DICTATION_PREFERENCES.browserLanguage &&
@@ -81,4 +81,5 @@ export function writeDictationPreferences(preferences: DictationPreferences): vo
   } catch {
     // localStorage access errors should not disable dictation.
   }
+  return normalized;
 }

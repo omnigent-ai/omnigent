@@ -253,8 +253,7 @@ function DictationSection() {
   const update = useCallback((patch: Partial<DictationPreferences>) => {
     setPreferences((current) => {
       const next = { ...current, ...patch };
-      writeDictationPreferences(next);
-      return next;
+      return writeDictationPreferences(next);
     });
   }, []);
 
