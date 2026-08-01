@@ -21,6 +21,10 @@ def _clean_engine_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(dictation.MODEL_DIR_ENV, raising=False)
     monkeypatch.delenv(dictation.PUNCT_DIR_ENV, raising=False)
     monkeypatch.delenv(dictation.MAX_STREAMS_ENV, raising=False)
+    monkeypatch.delenv(dictation.MAX_FRAME_BYTES_ENV, raising=False)
+    monkeypatch.delenv(dictation.MAX_TAKE_SECONDS_ENV, raising=False)
+    monkeypatch.delenv(dictation.WORKER_TOKEN_ENV, raising=False)
+    monkeypatch.delenv(dictation.ALLOW_INSECURE_REMOTE_ENV, raising=False)
 
 
 def _touch_asr_files(model_dir: Path) -> None:
