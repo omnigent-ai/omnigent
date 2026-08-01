@@ -20,7 +20,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
-import type { DictationSessionEvents } from "@/lib/dictation";
+import type { DictationSessionEvents, DictationSessionOptions } from "@/lib/dictation";
 import { ComposerMicButton } from "./ComposerMicButton";
 
 // Controllable DictationSession stand-in for the server-mode tests. The
@@ -30,7 +30,9 @@ interface SessionStub {
   stop: () => Promise<string>;
   cancel: () => void;
 }
-let sessionStartMock: Mock<(events: DictationSessionEvents) => Promise<SessionStub>>;
+let sessionStartMock: Mock<
+  (events: DictationSessionEvents, options?: DictationSessionOptions) => Promise<SessionStub>
+>;
 let sessionStopMock: Mock<() => Promise<string>>;
 let sessionCancelMock: Mock<() => void>;
 let sessionEvents: DictationSessionEvents | null;
@@ -40,7 +42,8 @@ vi.mock("@/lib/dictation", () => {
   return {
     DictationBusyError,
     DictationSession: {
-      start: (events: DictationSessionEvents) => sessionStartMock(events),
+      start: (events: DictationSessionEvents, options?: DictationSessionOptions) =>
+        sessionStartMock(events, options),
     },
   };
 });
@@ -59,6 +62,7 @@ function installDictationSession() {
 let handlers: Record<string, (event: unknown) => void>;
 let startSpy: ReturnType<typeof vi.fn>;
 let stopSpy: ReturnType<typeof vi.fn>;
+let recognitionLanguage: string;
 /** Original navigator.mediaDevices descriptor, restored after each test. */
 let originalMediaDevices: PropertyDescriptor | undefined;
 
@@ -71,7 +75,14 @@ function installSpeechRecognition() {
   class FakeRecognition {
     continuous = false;
     interimResults = false;
-    lang = "en-US";
+    private recognitionLang = "en-US";
+    get lang() {
+      return this.recognitionLang;
+    }
+    set lang(value: string) {
+      this.recognitionLang = value;
+      recognitionLanguage = value;
+    }
     start = startSpy;
     stop = stopSpy;
     addEventListener(type: string, handler: (event: unknown) => void) {
@@ -107,6 +118,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  localStorage.clear();
   // Restore navigator.mediaDevices so the stub never leaks to other test files.
   if (originalMediaDevices) {
     Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
@@ -139,6 +151,15 @@ describe("ComposerMicButton", () => {
     // The recognizer's "start" event flips the pressed state.
     act(() => handlers.start?.({}));
     expect(button).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("uses the saved browser recognition language", () => {
+    localStorage.setItem(
+      "omnigent:dictation-preferences",
+      JSON.stringify({ path: "browser", browserLanguage: "de-DE", microphoneDeviceId: null }),
+    );
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    expect(recognitionLanguage).toBe("de-DE");
   });
 
   it("stops recognition on a second click once recording", () => {
@@ -305,6 +326,90 @@ async function clickMic() {
 }
 
 describe("ComposerMicButton (server dictation)", () => {
+  it("cancels a session that resolves after unmount", async () => {
+    let resolveStart: ((session: SessionStub) => void) | undefined;
+    sessionStartMock = vi.fn(
+      () =>
+        new Promise<SessionStub>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const { unmount } = renderServerMode();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    unmount();
+
+    await act(async () => resolveStart?.({ stop: sessionStopMock, cancel: sessionCancelMock }));
+    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a session that resolves after the composer becomes disabled", async () => {
+    let resolveStart: ((session: SessionStub) => void) | undefined;
+    sessionStartMock = vi.fn(
+      () =>
+        new Promise<SessionStub>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const { rerender } = renderServerMode();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    rerender(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} disabled />
+      </CapabilitiesContext.Provider>,
+    );
+
+    await act(async () => resolveStart?.({ stop: sessionStopMock, cancel: sessionCancelMock }));
+    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("server mode bypasses Web Speech and passes the selected microphone", async () => {
+    localStorage.setItem(
+      "omnigent:dictation-preferences",
+      JSON.stringify({ path: "server", browserLanguage: "en-US", microphoneDeviceId: "mic-2" }),
+    );
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    await clickMic();
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(sessionStartMock).toHaveBeenCalledWith(expect.any(Object), {
+      microphoneDeviceId: "mic-2",
+    });
+  });
+
+  it("browser mode never falls back to the server after a network error", async () => {
+    localStorage.setItem(
+      "omnigent:dictation-preferences",
+      JSON.stringify({ path: "browser", browserLanguage: "en-US", microphoneDeviceId: null }),
+    );
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(sessionStartMock).not.toHaveBeenCalled();
+  });
+
+  it("hides strict modes when their selected path is unavailable", () => {
+    localStorage.setItem(
+      "omnigent:dictation-preferences",
+      JSON.stringify({ path: "server", browserLanguage: "en-US", microphoneDeviceId: null }),
+    );
+    const { container } = render(
+      <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it("renders the button when the server advertises dictation", () => {
     renderServerMode();
     expect(screen.getByRole("button", { name: "Voice dictation" })).toBeInTheDocument();
