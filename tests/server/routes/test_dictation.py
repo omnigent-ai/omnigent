@@ -78,7 +78,7 @@ async def test_info_reports_dictation_unavailable(
 ) -> None:
     """Without an engine (no extra or no models) /v1/info advertises false."""
     monkeypatch.setenv(dictation_engine.MODEL_DIR_ENV, str(tmp_path))
-    monkeypatch.delenv(dictation_engine.ENGINE_ENV, raising=False)
+    monkeypatch.setenv(dictation_engine.ENGINE_ENV, dictation_engine.ENGINE_SHERPA)
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     assert resp.json()["dictation_available"] is False
