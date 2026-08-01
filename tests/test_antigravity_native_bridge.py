@@ -1583,6 +1583,93 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
 
 
+def test_seed_isolated_agy_home_exposes_user_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's imported plugins (skills + hooks) are visible under --gemini_dir."""
+    fake_home = tmp_path / "real-home"
+    real_config = fake_home / ".gemini" / "config"
+    (real_config / "plugins" / "superpowers" / "skills").mkdir(parents=True)
+    (real_config / "plugins" / "superpowers" / "skills" / "brainstorming.md").write_text(
+        "# brainstorming", encoding="utf-8"
+    )
+    manifest = json.dumps(
+        {"imports": [{"name": "superpowers", "components": ["skills", "hooks"]}]}
+    )
+    (real_config / "import_manifest.json").write_text(manifest, encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_config = agy_gemini_dir(bridge_dir) / "config"
+    # agy resolves plugins relative to --gemini_dir, so both the manifest and the
+    # plugin payload must be reachable there or the session lists zero skills.
+    assert json.loads((iso_config / "import_manifest.json").read_text(encoding="utf-8")) == (
+        json.loads(manifest)
+    )
+    seeded_skill = iso_config / "plugins" / "superpowers" / "skills" / "brainstorming.md"
+    assert seeded_skill.read_text(encoding="utf-8") == "# brainstorming"
+
+
+def test_seed_isolated_agy_home_does_not_copy_plugin_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugins are linked, not copied, so plugin updates are picked up live."""
+    fake_home = tmp_path / "real-home"
+    real_plugins = fake_home / ".gemini" / "config" / "plugins"
+    (real_plugins / "superpowers").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_plugins = agy_gemini_dir(bridge_dir) / "config" / "plugins"
+    assert iso_plugins.is_symlink()
+    assert iso_plugins.resolve() == real_plugins.resolve()
+    # A plugin installed/updated after the session started is still visible.
+    (real_plugins / "later").mkdir()
+    assert (iso_plugins / "later").is_dir()
+
+
+def test_seed_isolated_agy_home_plugin_seed_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-seeding an existing bridge dir does not fail on the existing link."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "config" / "plugins").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_plugins = agy_gemini_dir(bridge_dir) / "config" / "plugins"
+    assert iso_plugins.is_symlink()
+
+
+def test_seed_isolated_agy_home_tolerates_absent_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no imported plugins seeds cleanly — no link, no manifest."""
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_config = agy_gemini_dir(bridge_dir) / "config"
+    assert not (iso_config / "plugins").exists()
+    assert not (iso_config / "import_manifest.json").exists()
+    # The rest of the seed still landed.
+    assert (iso_config / ".migrated").is_file()
+
+
 def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:
     """The isolated state parent is a child of the per-session bridge dir."""
     bridge_dir = tmp_path / "bridge"
