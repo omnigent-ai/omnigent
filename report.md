@@ -4,6 +4,19 @@ Assessment date: 2026-08-01
 
 Repository state reviewed: commit `86d2ab87` (`refactor: narrow session helper boundaries (#3851)`). The checkout contains the Omnigent 0.7.0 changelog dated 2026-07-27, including the dictation release items.
 
+## Phase 1 branch update
+
+The baseline assessment below describes the repository before this branch. `feat/dictation-phase-one` now implements the Phase 1 hardening work:
+
+- Device-local path, browser language, and microphone preferences with explicit privacy guidance.
+- Authenticated remote workers, verified TLS/private CA support, health/readiness and warmup, sanitized diagnostics, resource limits, and OpenTelemetry metrics.
+- Focused-window shortcut wording instead of implying an OS-global shortcut.
+- Caret- and selection-aware insertion with safe interim ownership and Escape restoration.
+- One microphone capture in server mode, reused by the input meter with abortable startup.
+- Visible and announced starting, listening, stopping, completion, and actionable error states.
+
+Apple MLX, Whisper, NVIDIA engine adapters, and repository-aware token resolution remain later phases.
+
 ## Executive summary
 
 Omnigent already implements the main server-backed voice input flow described in the question:
@@ -71,7 +84,7 @@ Yes. Configure the main server with the `remote` engine. The browser connects on
 browser -> main Omnigent server -> dictation worker -> main server -> browser
 ```
 
-The worker serves the same PCM/transcript protocol (`omnigent/server/routes/dictation.py:12-32`, `omnigent/server/dictation_worker.py:43-47`). It is currently unauthenticated, so it must be restricted to a trusted LAN or VPN (`omnigent/server/dictation_worker.py:26-29`). Use `wss://` or a private encrypted network when audio crosses machines.
+The worker serves the same PCM/transcript protocol (`omnigent/server/routes/dictation.py`, `omnigent/server/dictation_worker.py`). On this branch it requires a shared bearer token and supports verified TLS; non-loopback plaintext requires an explicit insecure override.
 
 ### Is transcription local or cloud-based?
 
@@ -221,16 +234,15 @@ Relevant suites:
 - Request-time hotword or phrase boosting.
 - Word timestamps, confidence, or detected-language events.
 - Repository filename, symbol, command, or technical-vocabulary correction.
-- Insertion at the current caret or replacement of selected composer text.
+- Repository-aware correction after insertion.
 - OS-global Electron shortcut.
 - Terminal REPL dictation.
 - Voice commands, wake words, hands-free turn submission, TTS responses, or voice conversations.
 - Audio-file transcription endpoint.
 - Speaker diarization.
 - Persistent transcript or audio history.
-- Dictation settings page, microphone selector, engine status, model manager, or language picker.
-- Forced private/server recognition in Chrome and Safari.
-- Auth or TLS enforcement on the standalone worker.
+- Model manager or server-model language picker. The browser language preference does not change a fixed server model.
+- Account-synchronized dictation preferences. Phase 1 preferences are intentionally device-local.
 - Native Electron, iOS, or Android ASR. These wrappers use the shared web path.
 
 ## Engine integration assessment
@@ -453,7 +465,7 @@ New-chat resolution is a separate phase because no session exists yet. Add an ow
 
 Repository resolution should happen on the authorized main server, runner, or connected host after acoustic transcription.
 
-Do not send the repository catalog to the existing remote dictation worker by default. The worker is unauthenticated and should remain an acoustic service. If engine-level hotwords are enabled, send only a bounded per-take term list over an authenticated and encrypted worker protocol.
+Do not send the repository catalog to the remote dictation worker by default. It should remain an acoustic service even though Phase 1 authenticates and encrypts its transport. If engine-level hotwords are enabled, send only a bounded per-take term list.
 
 Requirements:
 
@@ -607,21 +619,17 @@ Do not put session IDs, workspace roots, or complete repository catalogs into th
 
 ## Risks and correctness issues to address
 
-- The remote worker is unauthenticated and examples use plaintext `ws://`.
-- Remote availability only checks that a URL is present.
-- No maximum take duration or inbound frame-size limit is enforced by dictation code.
+- Shared worker tokens remain valid until rotation and do not identify individual main servers.
 - The capacity semaphore is per process.
 - Sherpa decode is serialized even when two streams are admitted.
 - A remote worker failure mid-take has no current-take fallback.
 - The remote relay can expose stale state because transcript events arrive on a reader thread after `feed_pcm16()` returns.
-- A late remote `final` may race with stop because `finish()` returns only the worker tail, not queued finals.
 - Model presence checks can report available before a corrupt/incompatible model is loaded.
 - The model fetch script does not verify a checksum or signature.
 - Chrome/Safari can use browser cloud speech without a force-server privacy control.
-- Errors are mostly tooltip-only and are not announced through an `aria-live` status.
-- The server capture and visualizer open separate microphone streams.
+- Browser Web Speech still requires a separate visualization capture because it does not expose its audio stream.
 
-The late-final relay concern is inferred from `omnigent/server/dictation.py:562-608` and should be covered by a regression test before protocol enrichment.
+Phase 1 added a regression test that preserves remote `final` events arriving immediately before `stopped`.
 
 ## Evaluation plan
 
