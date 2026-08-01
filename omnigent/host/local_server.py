@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import click
-import psutil
+import psutil  # type: ignore[import-untyped]
 
 from omnigent.config import global_config_path
 from omnigent.inner import _proc
