@@ -1,101 +1,182 @@
-// Tests for useDictationInsert — the replaceable trailing interim region
-// that lets server dictation stream live text into a plain-string draft.
-//
-// Invariant under test throughout: dictation must never delete text it
-// didn't write. The interim region is stripped only when the draft still
-// ends with the exact text the hook inserted.
-
 import { act, renderHook } from "@testing-library/react";
-import { StrictMode, useState, type ReactNode } from "react";
+import { createRef, StrictMode, useState, type ReactNode } from "react";
 import { describe, expect, it } from "vitest";
 import { useDictationInsert } from "./useDictationInsert";
 
-/** Harness pairing the hook with the same useState shape the composers use. */
 function renderDictation(
   initial = "",
   wrapper?: ({ children }: { children: ReactNode }) => ReactNode,
 ) {
-  return renderHook(
+  const textarea = document.createElement("textarea");
+  textarea.value = initial;
+  const textareaRef = createRef<HTMLTextAreaElement>();
+  textareaRef.current = textarea;
+
+  const hook = renderHook(
     () => {
       const [value, setValue] = useState(initial);
-      const dictation = useDictationInsert(setValue);
-      return { value, setRaw: (next: string) => setValue(() => next), ...dictation };
+      textarea.value = value;
+      const dictation = useDictationInsert(value, setValue, textareaRef);
+      return {
+        value,
+        textarea,
+        setRaw: (next: string) => {
+          dictation.reset();
+          setValue(() => next);
+        },
+        setRawUnsafe: (next: string) => setValue(() => next),
+        edit: (next: string) => {
+          dictation.reconcileUserEdit(next);
+          setValue(() => next);
+        },
+        ...dictation,
+      };
     },
     wrapper ? { wrapper } : undefined,
   );
+  return hook;
+}
+
+function select(result: ReturnType<typeof renderDictation>["result"], start: number, end = start) {
+  result.current.textarea.setSelectionRange(start, end);
 }
 
 describe("useDictationInsert", () => {
-  it("streams interim text as a replaceable trailing region", () => {
-    const { result } = renderDictation();
-    act(() => result.current.replaceInterim("hello"));
-    expect(result.current.value).toBe("hello");
-    act(() => result.current.replaceInterim("hello world"));
-    expect(result.current.value).toBe("hello world");
-    // Partials are revisable — a shorter rewrite replaces, never appends.
-    act(() => result.current.replaceInterim("help"));
-    expect(result.current.value).toBe("help");
+  it("captures a clamped selection and replaces it with the first interim", () => {
+    const { result } = renderDictation("hello cruel world");
+    select(result, 6, 11);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("kind"));
+    expect(result.current.value).toBe("hello kind world");
   });
 
-  it("finalizing replaces the interim and pins the text", () => {
-    const { result } = renderDictation();
-    act(() => result.current.replaceInterim("hello wor"));
-    act(() => result.current.appendFinal("Hello, world."));
-    expect(result.current.value).toBe("Hello, world.");
-    // The finalized text is no longer part of any interim region.
-    act(() => result.current.replaceInterim("next"));
-    expect(result.current.value).toBe("Hello, world. next");
+  it("revises its exact interim region in the middle of a draft", () => {
+    const { result } = renderDictation("alpha omega");
+    select(result, 5);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("bravo"));
+    expect(result.current.value).toBe("alpha bravo omega");
+    act(() => result.current.replaceInterim("bravo charlie"));
+    expect(result.current.value).toBe("alpha bravo charlie omega");
+    act(() => result.current.replaceInterim("b"));
+    expect(result.current.value).toBe("alpha b omega");
   });
 
-  it("space-separates from an existing draft without doubling spaces", () => {
-    const { result } = renderDictation("draft");
-    act(() => result.current.replaceInterim("spoken"));
-    expect(result.current.value).toBe("draft spoken");
-    act(() => result.current.appendFinal("Spoken."));
-    expect(result.current.value).toBe("draft Spoken.");
-
-    const trailing = renderDictation("draft ");
-    act(() => trailing.result.current.appendFinal("Spoken."));
-    expect(trailing.result.current.value).toBe("draft Spoken.");
+  it("final replaces the exact interim and later finals continue at its caret", () => {
+    const { result } = renderDictation("start finish");
+    select(result, 5);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("one tw"));
+    act(() => result.current.appendFinal("One two."));
+    act(() => result.current.appendFinal("Three."));
+    expect(result.current.value).toBe("start One two. Three. finish");
   });
 
-  it("clearing the interim restores the base draft", () => {
-    const { result } = renderDictation("draft");
-    act(() => result.current.replaceInterim("partial words"));
+  it("uses the caret when begin was not called and avoids doubled separators", () => {
+    const { result } = renderDictation("left  right");
+    select(result, 5);
+    act(() => result.current.appendFinal("middle"));
+    expect(result.current.value).toBe("left middle right");
+  });
+
+  it("restores the original selection and whitespace when an interim clears", () => {
+    const { result } = renderDictation("left  old  right");
+    select(result, 6, 9);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("new"));
+    expect(result.current.value).toBe("left  new  right");
     act(() => result.current.replaceInterim(""));
-    expect(result.current.value).toBe("draft");
+    expect(result.current.value).toBe("left  old  right");
   });
 
-  it("survives the draft shrinking underneath a pending interim", () => {
-    const { result } = renderDictation();
-    act(() => result.current.replaceInterim("some long partial"));
-    // Send clears the draft out from under the pending interim region.
-    act(() => result.current.setRaw(""));
-    // A late update must not slice into (or resurrect) stale text.
-    act(() => result.current.replaceInterim("after"));
-    expect(result.current.value).toBe("after");
-    act(() => result.current.appendFinal("After."));
-    expect(result.current.value).toBe("After.");
+  it("removes only separators it inserted when clearing a caret interim", () => {
+    const { result } = renderDictation("left right");
+    select(result, 4);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("middle"));
+    expect(result.current.value).toBe("left middle right");
+    act(() => result.current.replaceInterim(""));
+    expect(result.current.value).toBe("left right");
   });
 
-  it("never deletes text the user typed after the interim", () => {
-    const { result } = renderDictation();
-    act(() => result.current.replaceInterim("hello wor"));
-    // The user clicks into the composer and types after the interim.
-    act(() => result.current.setRaw("hello wor, urgent"));
-    // The draft no longer ends with the tracked interim → nothing is
-    // stripped; the update appends instead of slicing typed text away.
-    act(() => result.current.appendFinal("Hello world."));
-    expect(result.current.value).toBe("hello wor, urgent Hello world.");
+  it("never deletes user text when the owned region changed", () => {
+    const { result } = renderDictation("alpha omega");
+    select(result, 5);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("partial"));
+    act(() => {
+      result.current.textarea.setSelectionRange(
+        result.current.value.length,
+        result.current.value.length,
+      );
+      result.current.setRawUnsafe("alpha user-edited omega");
+    });
+    act(() => result.current.appendFinal("Final."));
+    expect(result.current.value).toBe("alpha user-edited omega Final.");
   });
 
-  it("is StrictMode-safe (updaters are pure; double-invoke is a no-op)", () => {
+  it("rebases ownership when the user edits before the interim", () => {
+    const { result } = renderDictation("alpha omega");
+    select(result, 5);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("partial"));
+    act(() => result.current.edit(`note ${result.current.value}`));
+    act(() => result.current.appendFinal("Final."));
+    expect(result.current.value).toBe("note alpha Final. omega");
+  });
+
+  it("keeps ownership when the user edits after the interim", () => {
+    const { result } = renderDictation("alpha omega");
+    select(result, 5);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("partial"));
+    act(() => result.current.edit(`${result.current.value} note`));
+    act(() => result.current.appendFinal("Final."));
+    expect(result.current.value).toBe("alpha Final. omega note");
+  });
+
+  it("keeps ownership when the user types at the displayed interim caret", async () => {
+    const { result } = renderDictation("alpha omega");
+    select(result, 5);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("partial"));
+    await act(async () => Promise.resolve());
+    const caret = result.current.textarea.selectionStart;
+    const next = result.current.value.slice(0, caret) + " note" + result.current.value.slice(caret);
+    act(() => result.current.edit(next));
+    act(() => result.current.appendFinal("Final."));
+    expect(result.current.value).toBe("alpha Final. note omega");
+  });
+
+  it("invalidates ownership when the user edits inside the interim", () => {
+    const { result } = renderDictation("alpha omega");
+    select(result, 5);
+    act(() => result.current.begin());
+    act(() => result.current.replaceInterim("partial"));
+    act(() => result.current.edit("alpha user-edited omega"));
+    select(result, result.current.value.length);
+    act(() => result.current.appendFinal("Final."));
+    expect(result.current.value).toBe("alpha user-edited omega Final.");
+  });
+
+  it("reset prevents stale selection from affecting an external replacement", () => {
+    const { result } = renderDictation("old draft");
+    select(result, 0, 3);
+    act(() => result.current.begin());
+    act(() => result.current.setRaw("replacement"));
+    select(result, 11);
+    act(() => result.current.appendFinal("spoken"));
+    expect(result.current.value).toBe("replacement spoken");
+  });
+
+  it("is StrictMode-safe", () => {
     const strict = ({ children }: { children: ReactNode }) => <StrictMode>{children}</StrictMode>;
-    const { result } = renderDictation("draft", strict);
+    const { result } = renderDictation("draft end", strict);
+    select(result, 5);
+    act(() => result.current.begin());
     act(() => result.current.replaceInterim("one"));
     act(() => result.current.replaceInterim("one two"));
-    expect(result.current.value).toBe("draft one two");
     act(() => result.current.appendFinal("One, two."));
-    expect(result.current.value).toBe("draft One, two.");
+    expect(result.current.value).toBe("draft One, two. end");
   });
 });
