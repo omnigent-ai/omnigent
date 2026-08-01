@@ -36,9 +36,11 @@ class BackgroundTitleProcessManager(Protocol):
         harness_name: str,
         *,
         env: dict[str, str] | None = None,
-    ) -> httpx.AsyncClient: ...
+    ) -> httpx.AsyncClient:
+        pass
 
-    async def release(self, conversation_id: str) -> None: ...
+    async def release(self, conversation_id: str) -> None:
+        pass
 
 
 @dataclass(frozen=True)
