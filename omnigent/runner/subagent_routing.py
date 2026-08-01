@@ -418,7 +418,11 @@ def candidate_models(
         catalog has no row for.
     :returns: Harness → model ids, cheapest first, empty entries dropped.
     """
-    from omnigent.server.smart_routing import catalog_models_for_harness, infer_models
+    from omnigent.server.smart_routing import (
+        apply_servable_alias,
+        catalog_models_for_harness,
+        infer_models,
+    )
 
     offered = (harness, _COUNTERPART_HARNESS.get(harness)) if cross_harness else (harness,)
     result: dict[str, list[str]] = {}
@@ -433,8 +437,12 @@ def candidate_models(
         # ``model_family_mismatch`` at dispatch.
         family = harness_family(candidate)
         models = [m for m in models if model_in_family(family, m)]
+        # Offer each model under the spelling the gateway serves, so the
+        # spawn's model matches what routing resolves to; dedupe when the
+        # catalog carries both spellings.
+        models = list(dict.fromkeys(apply_servable_alias(m) for m in models))
         if models:
-            result[candidate] = list(models)
+            result[candidate] = models
     return result
 
 

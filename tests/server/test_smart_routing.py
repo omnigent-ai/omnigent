@@ -1797,12 +1797,13 @@ _CLAUDE_TIERS = (
         ("gpt-5-6-luna", ("gpt-5-nano",), "codex", "gpt-5-nano"),
         # glm-5-2 has no local endpoint, and its chain escalates like sol's.
         ("glm-5-2", _UCODE_CODEX_CATALOG, "codex", "gpt-5-5"),
-        # A workspace that serves GLM resolves the glm arm to that endpoint.
+        # A workspace that serves GLM resolves the glm arm to that endpoint,
+        # under the gateway's own model-route spelling.
         (
             "glm-5-2",
             (*_UCODE_CODEX_CATALOG, "databricks-glm-5-2"),
             "codex",
-            "databricks-glm-5-2",
+            "system.ai.glm-5-2",
         ),
         # The prefix-restore path is untouched: a servable arm is applied as-is.
         (
@@ -1870,6 +1871,43 @@ def test_unservable_arm_substitutes_from_its_own_chain(
 ) -> None:
     """An arm the workspace can't serve resolves down its substitution chain."""
     assert _substitute(arm, catalog, harness) == expected
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [
+        ("databricks-gpt-5-5", "databricks-glm-5-2"),
+        ("databricks-gpt-5-5", "system.ai.glm-5-2"),
+        ("databricks-gpt-5-5", "databricks-glm-5-2", "system.ai.glm-5-2"),
+        # The picker's dotted spelling still keys to the dashed arm.
+        ("databricks-gpt-5-5", "databricks-glm-5.2"),
+    ],
+)
+def test_glm_arm_applies_the_gateway_model_route_spelling(catalog: Sequence[str]) -> None:
+    """The glm arm applies as ``system.ai.glm-5-2`` whatever the catalog spells."""
+    assert _substitute("glm-5-2", catalog) == "system.ai.glm-5-2"
+
+
+def test_servable_alias_leaves_other_arms_alone() -> None:
+    from omnigent.server.smart_routing import apply_servable_alias
+
+    for model in ("databricks-gpt-5-5", "system.ai.claude-opus-4-8", "databricks-kimi-k2-6"):
+        assert apply_servable_alias(model) == model
+
+
+def test_aliased_glm_pick_reports_no_substitution() -> None:
+    """The alias is a spelling, so the decision must not show a swap arrow."""
+    from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource, _bare_id
+
+    source = TaskV1RouteOptionSource(model_prefixes=["databricks-", "system.ai."])
+    resolved = source.resolve_selection(
+        RoutePick(model="glm-5-2"),
+        ["codex"],
+        {"codex": ["databricks-gpt-5-5", "databricks-glm-5-2"]},
+    )
+    assert resolved is not None
+    assert resolved.model == "system.ai.glm-5-2"
+    assert _bare_id(resolved.model) == _bare_id(resolved.raw_model) == "glm-5-2"
 
 
 def test_substitution_is_independent_of_catalog_order() -> None:

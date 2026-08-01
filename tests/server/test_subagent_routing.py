@@ -43,6 +43,8 @@ from tests.server.helpers import FakeCaps, FakeRoutingClient
 CLAUDE_MODEL = "databricks-claude-opus-4-8"
 GPT_MODEL = "databricks-gpt-5-5"
 GLM_MODEL = "databricks-glm-5-2"
+# The spelling the gateway actually serves GLM under; see ``_SERVABLE_ALIASES``.
+GLM_SERVABLE = "system.ai.glm-5-2"
 KIMI_MODEL = "databricks-kimi-k2-6"
 PARENT_MODEL = "databricks-claude-sonnet-4-6"
 
@@ -116,9 +118,21 @@ def test_candidate_models_applies_the_family_constraint_to_catalog_rows() -> Non
     """
     catalog = {"self": [GPT_MODEL, GLM_MODEL, KIMI_MODEL, CLAUDE_MODEL]}
     candidates = candidate_models("codex-native", catalog=catalog)
-    assert candidates == {"codex-native": [GPT_MODEL, GLM_MODEL, KIMI_MODEL]}
+    assert candidates == {"codex-native": [GPT_MODEL, GLM_SERVABLE, KIMI_MODEL]}
     assert model_in_family(harness_family("codex-native"), GLM_MODEL) is True
     assert model_in_family(harness_family("claude-native"), GLM_MODEL) is False
+
+
+def test_candidate_models_offers_glm_under_its_servable_alias() -> None:
+    """Both catalog spellings collapse to the one the gateway serves.
+
+    The offered id is what a rewrite spawns with, so it has to match the id
+    routing resolves the ``glm-5-2`` arm to.
+    """
+    catalog = {"self": [GPT_MODEL, GLM_MODEL, GLM_SERVABLE]}
+    assert candidate_models("codex-native", catalog=catalog) == {
+        "codex-native": [GPT_MODEL, GLM_SERVABLE]
+    }
 
 
 def test_candidate_models_drops_a_harness_with_nothing_servable() -> None:

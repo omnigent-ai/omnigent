@@ -637,6 +637,28 @@ _ARM_SUBSTITUTES: Mapping[str, tuple[str, ...]] = MappingProxyType(
     }
 )
 
+# Per-model overrides for the id a resolved arm is actually applied under, when
+# the catalog's spelling is not the one the gateway serves. Bare id → exact id
+# to apply. Not a general prefix rule: each entry is a probed fact about one
+# model.
+#
+# ``glm-5-2``: probed 2026-08-01 on staging and prod — the gateway serves GLM on
+# the Responses API only as the model route ``system.ai.glm-5-2``. The serving
+# endpoint ``databricks-glm-5-2`` the catalog offers advertises chat-completions
+# only and 400s on ``/codex/v1``, and GLM appears in no discovery listing, so the
+# working spelling has to be named here.
+_SERVABLE_ALIASES: Mapping[str, str] = MappingProxyType({"glm-5-2": "system.ai.glm-5-2"})
+
+
+def apply_servable_alias(model: str, prefixes: Sequence[str] | None = None) -> str:
+    """Map a resolved model id onto the spelling this gateway actually serves.
+
+    :param model: A servable catalog id, in either vocabulary.
+    :param prefixes: Catalog prefixes to strip before comparing ids.
+    :returns: The aliased id, or *model* unchanged when no alias applies.
+    """
+    return _SERVABLE_ALIASES.get(_bare_id(model, prefixes), model)
+
 
 def task_v1_claude_arms() -> tuple[str, ...]:
     """Return the frozen Claude-family arms task_v1 may select.
@@ -800,7 +822,8 @@ def substitute_model(
     :param prefixes: Catalog prefixes to strip before comparing ids; ``None``
         uses this deployment's configured ones.
     :param barred: Bare ids to skip, e.g. models the harness's gateway 400s on.
-    :returns: A servable candidate id, or ``None`` when nothing fits.
+    :returns: A servable candidate id (through :func:`apply_servable_alias`),
+        or ``None`` when nothing fits.
     """
     local: dict[str, str] = {}
     for candidate in candidates:
@@ -810,7 +833,7 @@ def substitute_model(
         if substitute in skip:
             continue
         if substitute in local:
-            return local[substitute]
+            return apply_servable_alias(local[substitute], prefixes)
     family = _model_family(model)
     ranked = [
         (index, candidate)
@@ -822,8 +845,9 @@ def substitute_model(
     target = _cost_position(model, candidates, prefixes)
     if target is None:
         # Nothing places the pick on the cost curve; stay at the cheap end.
-        return ranked[0][1]
-    return min(ranked, key=lambda entry: (abs(entry[0] - target), entry[0]))[1]
+        return apply_servable_alias(ranked[0][1], prefixes)
+    nearest = min(ranked, key=lambda entry: (abs(entry[0] - target), entry[0]))[1]
+    return apply_servable_alias(nearest, prefixes)
 
 
 def natural_harness_for_model(
@@ -1029,7 +1053,11 @@ class TaskV1RouteOptionSource:
             local = substitute_model(raw, pool, prefixes=self._model_prefixes)
         if local is None:
             return None
-        return ResolvedRoute(model=local, harness=harness, raw_model=raw)
+        return ResolvedRoute(
+            model=apply_servable_alias(local, self._model_prefixes),
+            harness=harness,
+            raw_model=raw,
+        )
 
     def _is_menu_arm(
         self,

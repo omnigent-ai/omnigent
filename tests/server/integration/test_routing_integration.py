@@ -34,6 +34,8 @@ ROUTED_MODEL = "databricks-claude-opus-4-8"
 LLM_PICKED_MODEL = "databricks-claude-sonnet-4-6"
 GPT_MODEL = "databricks-gpt-5-5"
 GLM_MODEL = "databricks-glm-5-2"
+# The spelling the gateway serves GLM under; see ``_SERVABLE_ALIASES``.
+GLM_SERVABLE = "system.ai.glm-5-2"
 
 pytestmark = pytest.mark.asyncio
 
@@ -475,7 +477,9 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
 
     GLM serves on the same Responses wire codex speaks, so the live catalog
     row must reach the router and the resulting pick must pass the dispatch
-    family gate a real spawn goes through.
+    family gate a real spawn goes through. The row is offered — and the pick
+    applied — under the gateway's own ``system.ai.glm-5-2`` model route, which
+    is the only name that serves.
     """
     from omnigent.model_override import model_family_mismatch
     from omnigent.server import smart_routing as smart_routing_module
@@ -487,7 +491,7 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
         subagent_routing="on",
     )
     routing_client = FakeRoutingClient(
-        RoutingResult(model=GLM_MODEL, rationale="delegate arm", harness="codex")
+        RoutingResult(model=GLM_SERVABLE, rationale="delegate arm", harness="codex")
     )
     live_catalog = {"self": [GPT_MODEL, GLM_MODEL]}
 
@@ -509,12 +513,12 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
 
     assert resp.status_code == 200, resp.text
     # The GLM row reached the router as a codex candidate.
-    assert routing_client.offered[0] == {"codex-native": [GPT_MODEL, GLM_MODEL]}
+    assert routing_client.offered[0] == {"codex-native": [GPT_MODEL, GLM_SERVABLE]}
     body = resp.json()
     assert body["action"] == "rewrite"
-    assert body["model"] == GLM_MODEL
+    assert body["model"] == GLM_SERVABLE
     # And the applied pick is one the dispatch gate accepts on codex.
-    assert model_family_mismatch("codex-native", GLM_MODEL) is None
+    assert model_family_mismatch("codex-native", GLM_SERVABLE) is None
 
 
 async def test_auto_session_and_its_children_keep_cross_harness_picks(
