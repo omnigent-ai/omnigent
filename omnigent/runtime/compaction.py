@@ -465,7 +465,14 @@ async def _summarize_via_runner_uncached(
         payload["session_id"] = conversation_id
     resp = await runner_client.post("/v1/summarize", json=payload, timeout=120.0)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("runner summarize response was not an object")
+    text = data.get("text")
+    token_count = data.get("token_count")
+    if not isinstance(text, str) or not isinstance(token_count, int):
+        raise RuntimeError("runner summarize response had invalid summary fields")
+    return {"text": text, "token_count": token_count}
 
 
 def compaction_to_history_items(

@@ -915,6 +915,55 @@ async def test_summarize_history_returns_text_and_token_count() -> None:
 
 
 @pytest.mark.asyncio
+async def test_summarize_history_validates_runner_response() -> None:
+    """Runner summarization accepts the documented object shape only."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> object:
+            return {"text": "Runner summary", "token_count": 3}
+
+    class _RunnerClient:
+        async def post(self, *_args: object, **_kwargs: object) -> _Response:
+            return _Response()
+
+    result = await summarize_history(
+        [{"role": "user", "content": "prior conversation"}],
+        _RaisesIfCalled(),
+        "openai/gpt-4o",
+        runner_client=_RunnerClient(),
+    )
+
+    assert result == {"text": "Runner summary", "token_count": 3}
+
+
+@pytest.mark.asyncio
+async def test_summarize_history_rejects_malformed_runner_response() -> None:
+    """Runner summarization fails clearly when required fields are malformed."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> object:
+            return {"text": 12, "token_count": "three"}
+
+    class _RunnerClient:
+        async def post(self, *_args: object, **_kwargs: object) -> _Response:
+            return _Response()
+
+    with pytest.raises(RuntimeError, match="invalid summary fields"):
+        await summarize_history(
+            [{"role": "user", "content": "prior conversation"}],
+            _RaisesIfCalled(),
+            "openai/gpt-4o",
+            runner_client=_RunnerClient(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_summarize_history_recursive_prompt_includes_continuation_prefix() -> None:
     """
     When history starts with a prior summary, the summarization prompt
