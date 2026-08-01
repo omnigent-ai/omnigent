@@ -137,6 +137,7 @@ from omnigent.server.schemas import (
     ElicitationRequestParams,
     ElicitationResult,
     ErrorDetail,
+    NativeModelOption,
     SessionCreateMetadata,
     SessionCreateRequest,
     SessionEventInput,
@@ -275,8 +276,9 @@ async def _publish_and_wait_for_harness_elicitation(
         resolved_elsewhere_task = asyncio.create_task(parked.resolved_elsewhere.wait())
         race_tasks = (disconnect_task, resolved_elsewhere_task)
         try:
+            waiters: set[asyncio.Future[Any]] = {future, *race_tasks}
             done, _pending = await asyncio.wait(
-                {future, *race_tasks},
+                waiters,
                 timeout=timeout_s,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -822,7 +824,9 @@ def _build_session_response(
         # non-claude-native sessions or before the first poll tick.
         todos=_session_todos_cache.get(conv.id, []),
         skills=skills or [],
-        model_options=model_options or [],
+        model_options=[
+            NativeModelOption.model_validate(option) for option in (model_options or [])
+        ],
         # Replay terminal spin-up state so a client connecting while the
         # runner is still creating a terminal-first session's terminal
         # sees the Terminal-pill spinner. Populated by the runner SSE
@@ -920,7 +924,6 @@ def _accumulate_session_usage(
     priced = False
     # Prefer an authoritative harness-reported cost over the catalog estimate.
     provider_cost = usage_obj.get("cost_usd")
-    has_provider_cost = isinstance(provider_cost, (int, float))
     usage_model = usage_obj.get("model")
     llm_model = (
         usage_model
@@ -928,7 +931,7 @@ def _accumulate_session_usage(
         else (conv.model_override if conv and conv.model_override else _resolve_llm_model(conv))
     )
     if llm_model:
-        if has_provider_cost:
+        if isinstance(provider_cost, (int, float)):
             cost_delta = float(provider_cost)
             priced = True
         else:
@@ -2515,8 +2518,8 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
-    host_registry = getattr(app_state, "host_registry", None)
-    tunnel_registry = getattr(app_state, "tunnel_registry", None)
+    host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
+    tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
     host_tunnel_stale = (
         host_conn is not None
@@ -2528,7 +2531,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         else None
     )
     runner_tunnel_stale = False
-    if runner_session is not None and hasattr(tunnel_registry, "seconds_since_last_frame"):
+    if runner_session is not None and tunnel_registry is not None:
         runner_idle_s = tunnel_registry.seconds_since_last_frame(runner_session)
         runner_tunnel_stale = (
             runner_idle_s is not None and runner_idle_s >= _MANAGED_RESUMABLE_TUNNEL_STALE_S
@@ -2769,17 +2772,23 @@ async def _run_managed_wake(
     from omnigent.server.managed_hosts import resume_managed_host
     from omnigent.server.routes import sessions as _facade
 
+    host_id = conv.host_id
+    if host_id is None:
+        reason = "managed session has no host binding"
+        tracker.fail(session_id, reason)
+        _publish_sandbox_status(session_id, "failed", reason)
+        return
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
-        await resume_managed_host(conv.host_id, host_store, sandbox_config, force=True)
+        await resume_managed_host(host_id, host_store, sandbox_config, force=True)
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:
             tracker.fail(session_id, "session not found after wake")
             return
         runner_id: str | None = None
-        host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+        host_conn = host_registry.get(host_id) if host_registry is not None else None
         if host_registry is not None and host_conn is None:
             # resume_managed_host waits on cross-replica host-store liveness, not
             # this replica's in-memory tunnel registry — the woken host's tunnel
@@ -2791,7 +2800,7 @@ async def _run_managed_wake(
             )
             while host_conn is None and time.monotonic() < _host_reconnect_deadline:
                 await asyncio.sleep(0.5)
-                host_conn = host_registry.get(conv.host_id)
+                host_conn = host_registry.get(host_id)
             if host_conn is None:
                 tracker.fail(session_id, "managed host did not reconnect after wake")
                 _publish_sandbox_status(
@@ -4333,6 +4342,7 @@ async def _relay_runner_stream(
                     _item = _raw_item if isinstance(_raw_item, dict) else {}
                     _item_type = _item.get("type")
                     _item_call_id = _item.get("call_id")
+                    _persist_rid: str | None
                     if (
                         _item_type == "function_call"
                         and _item.get("status") == "completed"
@@ -4705,11 +4715,14 @@ def _ensure_runner_relay(
     else:
         _logger.info("Relay: creating new for session=%s runner=%s", session_id, runner_id)
     ready = asyncio.Event()
+    # Runtime callers always supply a store. ``None`` is retained for
+    # heartbeat-only relay readiness tests that never emit persistable frames.
+    relay_store = cast(ConversationStore, conversation_store)
     task = asyncio.create_task(
         _relay_runner_stream(
             session_id,
             runner_client,
-            conversation_store,
+            relay_store,
             ready,
         ),
         name=f"runner-relay-{session_id}",
@@ -4996,8 +5009,13 @@ async def _evaluate_input_policy(
     # text — those ``input_file`` blocks are decoded below and must not be skipped
     # here. ``content`` being a list is the cheap precondition for that; the
     # actual (blocking) decode is deferred until after the policy-skip check.
-    content_blocks = body.data.get("content")
-    has_content_blocks = isinstance(content_blocks, list) and len(content_blocks) > 0
+    raw_content_blocks = body.data.get("content")
+    content_blocks = (
+        [block for block in raw_content_blocks if isinstance(block, dict)]
+        if isinstance(raw_content_blocks, list)
+        else []
+    )
+    has_content_blocks = bool(content_blocks)
     if not user_text and not has_content_blocks:
         return None
 
@@ -5413,6 +5431,7 @@ async def _create_session_from_existing_agent(
     # --harness fail-loud rules.
     # "auto" defers harness + model selection to the first-message routing
     # path; validate executor type now but store the sentinel unchanged.
+    harness_override: str | None
     if _force_auto_for_child or body.harness_override == "auto":
         await asyncio.to_thread(_validated_harness_override_executor_type, agent)
         harness_override = "auto"
@@ -5615,7 +5634,13 @@ async def _create_session_from_existing_agent(
         _native_labels = dict(body.labels) if body.labels else {}
         _native_labels.update(native_agent.presentation_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _native_labels)
-        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if updated_conv is None:
+            raise OmnigentError(
+                f"Session {conv.id!r} disappeared while setting native labels",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        conv = updated_conv
     elif (
         body.sub_agent_name
         and sub_spec is not None
@@ -5631,7 +5656,13 @@ async def _create_session_from_existing_agent(
         _merged = dict(body.labels) if body.labels else {}
         _merged.update(_sa_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
-        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if updated_conv is None:
+            raise OmnigentError(
+                f"Session {conv.id!r} disappeared while setting sub-agent labels",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        conv = updated_conv
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
 
@@ -5669,13 +5700,15 @@ async def _create_session_from_existing_agent(
                 _tel_harness = native_agent.harness
             elif conv.harness_override:
                 _tel_harness = conv.harness_override
-            else:
+            elif agent_cache is not None:
                 _tel_loaded = agent_cache.load(
                     agent.id,
                     agent.bundle_location,
                     expand_env=agent.session_id is None,
                 )
                 _tel_harness = _spec_harness(_tel_loaded.spec)
+            else:
+                _tel_harness = None
             # Only log agent name for known built-in orchestrators to avoid
             # leaking user-defined agent names.
             _NAMED_AGENTS = {"polly", "debby"}
@@ -5709,12 +5742,7 @@ async def _create_session_from_existing_agent(
             # synthetic ``"seed"`` response id. The runner overwrites
             # this on first turn via a normal append path.
             new_items = [
-                NewConversationItem(
-                    type=item.type,
-                    response_id="seed",
-                    data=item.data,
-                    created_by=_attribution_user(user_id),
-                )
+                _build_new_item(item, "seed", created_by=_attribution_user(user_id))
                 for item in body.initial_items
             ]
             await asyncio.to_thread(conversation_store.append, conv.id, new_items)
@@ -6194,7 +6222,7 @@ async def _handle_mcp_tools_call(
         mcp_request_state: str = mcp_input_required.get("requestState", "")
 
         # Gather user responses for each inputRequest.
-        input_responses: dict[str, Any] = {}
+        elicitation_responses: dict[str, Any] = {}
         for eid, req_entry in input_requests.items():
             req_params = req_entry.get("params", {}) if isinstance(req_entry, dict) else {}
             elicit_params = ElicitationRequestParams(
@@ -6210,12 +6238,12 @@ async def _handle_mcp_tools_call(
                 conversation_store=conversation_store,
             )
             if elicit_result is None:
-                input_responses[eid] = {"action": "decline"}
+                elicitation_responses[eid] = {"action": "decline"}
             else:
                 resp_entry: dict[str, Any] = {"action": elicit_result.action}
                 if elicit_result.content is not None:
                     resp_entry["content"] = elicit_result.content
-                input_responses[eid] = resp_entry
+                elicitation_responses[eid] = resp_entry
 
         # Retry on the runner with the user's inputResponses.
         try:
@@ -6226,7 +6254,7 @@ async def _handle_mcp_tools_call(
                     "params": {
                         "name": namespaced_name,
                         "arguments": arguments,
-                        "inputResponses": input_responses,
+                        "inputResponses": elicitation_responses,
                         "requestState": mcp_request_state,
                     },
                 },
@@ -6338,7 +6366,11 @@ async def _fetch_runner_skills(
     if session_id not in _runner_skills_inflight:
         task = asyncio.create_task(_load_runner_skills(runner_client, session_id))
         _runner_skills_inflight[session_id] = task
-        task.add_done_callback(lambda _t, sid=session_id: _runner_skills_inflight.pop(sid, None))
+
+        def _clear_skills_inflight(_task: asyncio.Task[None]) -> None:
+            _runner_skills_inflight.pop(session_id, None)
+
+        task.add_done_callback(_clear_skills_inflight)
     return []
 
 
@@ -6402,9 +6434,11 @@ async def _fetch_model_options(
         ):
             task = asyncio.create_task(_load_model_options_from_host(session_id, conv.host_id))
             _model_options_inflight[session_id] = task
-            task.add_done_callback(
-                lambda _t, sid=session_id: _model_options_inflight.pop(sid, None)
-            )
+
+            def _clear_host_options_inflight(_task: asyncio.Task[None]) -> None:
+                _model_options_inflight.pop(session_id, None)
+
+            task.add_done_callback(_clear_host_options_inflight)
         return []
     if cached is not None and session_id not in _model_options_stale:
         return cached
@@ -6412,7 +6446,11 @@ async def _fetch_model_options(
         path = f"/v1/sessions/{session_id}/{endpoint}"
         task = asyncio.create_task(_load_model_options(runner_client, session_id, path))
         _model_options_inflight[session_id] = task
-        task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
+
+        def _clear_runner_options_inflight(_task: asyncio.Task[None]) -> None:
+            _model_options_inflight.pop(session_id, None)
+
+        task.add_done_callback(_clear_runner_options_inflight)
     # A stale catalog serves while the re-fetch runs; success publishes
     # ``session.model_options`` so open clients re-read the snapshot.
     return cached or []
