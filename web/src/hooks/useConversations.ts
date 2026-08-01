@@ -63,6 +63,23 @@ export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
 }
 
+export class BulkConversationMutationError extends Error {
+  readonly failed: string[];
+  readonly succeeded: string[];
+  readonly total: number;
+
+  constructor(
+    action: string,
+    { failed, succeeded = [], total }: { failed: string[]; succeeded?: string[]; total: number },
+  ) {
+    super(`Failed to ${action} ${failed.length} of ${total} conversations`);
+    this.name = "BulkConversationMutationError";
+    this.failed = failed;
+    this.succeeded = succeeded;
+    this.total = total;
+  }
+}
+
 /** Mirrors the server's `SessionListItem` / `ConversationObject` shape. */
 export interface Conversation {
   id: string;
@@ -72,6 +89,8 @@ export interface Conversation {
   updated_at: number;
   labels: Record<string, string>;
   permission_level: number | null;
+  /** Whether this viewer may accept privileged actions for the session. */
+  can_approve?: boolean | null;
   owner?: string | null;
   runner_id?: string | null;
   /** Host that launched the runner for this session, e.g. ``"host_a1b2"``. */
@@ -200,6 +219,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
+    can_approve: wire.can_approve ?? null,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
@@ -268,8 +288,8 @@ async function fetchConversationsPage({
  * the Archived settings view's project filter.
  */
 export function useConversations(
-  searchQuery: string = "",
-  includeArchived: boolean = false,
+  searchQuery = "",
+  includeArchived = false,
   options: UseConversationsOptions = {},
   project?: string,
 ) {
@@ -584,6 +604,13 @@ export function useStopAndDeleteConversation() {
       }
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
+      // The Pinned section reads a separate, sibling cache that the
+      // ["conversations"] sweep above deliberately skips, so a deleted pinned
+      // row lingers there until a reload unless we drop it explicitly. Patched
+      // (not invalidated) for the same reindex-lag reason as the list.
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !ids.has(c.id)) } : old,
+      );
       // Deleting the last member of a project empties it, so refresh the
       // project list to drop the now-empty folder. Unlike the conversations
       // list, /v1/sessions/projects reads the DB directly (no search-index
@@ -642,7 +669,9 @@ export function useBulkArchiveConversations() {
             (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
           );
       }
-      if (failed.length > 0) throw { failed, total: ids.length };
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("archive", { failed, total: ids.length });
+      }
       return results
         .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
         .map((r) => r.value);
@@ -683,7 +712,13 @@ export function useBulkDeleteConversations() {
         if (results[i].status === "fulfilled") succeeded.push(ids[i]);
         else failed.push(ids[i]);
       }
-      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("delete", {
+          failed,
+          succeeded,
+          total: ids.length,
+        });
+      }
       return { succeeded, failed };
     },
     onSuccess: (_data, ids) => {
@@ -703,14 +738,18 @@ export function useBulkDeleteConversations() {
         queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
         queryClient.removeQueries({ queryKey: ["session", id] });
       }
+      // Drop deleted rows from the sibling Pinned cache the sweep above skips.
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !idSet.has(c.id)) } : old,
+      );
       // Refresh the project list so a project emptied by these deletes drops
       // its now-empty folder (DB-direct read, no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
-    onError: (err: any) => {
-      if (err?.succeeded) {
-        const idSet = new Set(err.succeeded as string[]);
+    onError: (error) => {
+      if (error instanceof BulkConversationMutationError && error.succeeded.length > 0) {
+        const idSet = new Set(error.succeeded);
         for (const queryKey of [["conversations"], ["project-sessions"]]) {
           for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
             queryKey,
@@ -719,10 +758,14 @@ export function useBulkDeleteConversations() {
             if (removed) queryClient.setQueryData(key, next);
           }
         }
-        for (const id of err.succeeded) {
+        for (const id of error.succeeded) {
           queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
+        // Drop the successfully-deleted rows from the sibling Pinned cache too.
+        queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+          old ? { ...old, conversations: old.conversations.filter((c) => !idSet.has(c.id)) } : old,
+        );
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
         void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
       }
@@ -747,7 +790,13 @@ export function useBulkStopSessions() {
         if (results[i].status === "fulfilled") succeeded.push(ids[i]);
         else failed.push(ids[i]);
       }
-      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("stop", {
+          failed,
+          succeeded,
+          total: ids.length,
+        });
+      }
       return { succeeded, failed };
     },
     onSettled: () => {
@@ -1316,8 +1365,8 @@ async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
  * archived, so they leave the sidebar but keep their history. Accepts the
  * folder's `{ id, name }`: `name` drives the member sweep (dual-read
  * `?project=`), `id` deletes the container (skipped for a label-only folder,
- * which has none). Throws `{ failed, succeeded, total }` if any member failed
- * (e.g. a shared session the user can't modify), leaving those in place.
+ * which has none). Throws a `BulkConversationMutationError` if any member
+ * failed (e.g. a shared session the user can't modify), leaving those in place.
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
@@ -1338,7 +1387,13 @@ export function useDeleteProject() {
           failed.push(ids[i]);
         }
       }
-      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("archive and unfile", {
+          failed,
+          succeeded,
+          total: ids.length,
+        });
+      }
       // All members detached — remove the first-class container if present.
       // (A label-only folder has no row; clearing the labels above already
       // makes it vanish from the project list.)

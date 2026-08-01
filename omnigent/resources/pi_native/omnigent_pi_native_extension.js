@@ -99,6 +99,22 @@ function freshAuthHeaders(fallback) {
   return fallback || {};
 }
 
+// Return the relay URL and token from config.json when available. The runner
+// writes relayUrl + relayToken into config.json after the tool relay starts,
+// so policy POSTs can use the relay's non-expiring local token instead of a
+// baked server bearer.
+function relayCredentials() {
+  const cfg = readConfig();
+  if (
+    cfg &&
+    typeof cfg.relayUrl === "string" &&
+    typeof cfg.relayToken === "string"
+  ) {
+    return { url: cfg.relayUrl, token: cfg.relayToken };
+  }
+  return null;
+}
+
 /**
  * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
@@ -153,7 +169,11 @@ async function evalNativePolicyHttp(config, toolName, args) {
     typeof fetch !== "function"
   )
     return null;
-  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+  // Prefer relay (non-expiring local token); fall back to direct server call.
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/policies/evaluate`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
   // Mint one stable re-attach id for this tool call. Every (re)POST carries
   // it so a re-park lands on the SAME elicitation — no duplicate approval
   // card. Kept for the whole call, across both the park loop and any
@@ -168,10 +188,15 @@ async function evalNativePolicyHttp(config, toolName, args) {
     },
     _omnigent_elicitation_id: elicitationId,
   });
-  const reqHeaders = {
-    "content-type": "application/json",
-    ...freshAuthHeaders(config.authHeaders),
-  };
+  const reqHeaders = relay
+    ? {
+        "content-type": "application/json",
+        authorization: `Bearer ${relay.token}`,
+      }
+    : {
+        "content-type": "application/json",
+        ...freshAuthHeaders(config.authHeaders),
+      };
 
   const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
   // Independent transient-error budget so a server that is actually down

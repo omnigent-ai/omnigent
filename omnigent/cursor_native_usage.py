@@ -37,6 +37,12 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from httpx import Auth as HttpxAuth
+else:
+    HttpxAuth = object
 
 _logger = logging.getLogger(__name__)
 
@@ -70,8 +76,10 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 
 def _coerce_int(value: object) -> int:
     """Coerce a hook token field to a non-negative int (0 on anything odd)."""
+    if not isinstance(value, (str, bytes, bytearray, int, float)):
+        return 0
     try:
-        out = int(value)  # type: ignore[arg-type]
+        out = int(value)
     except (TypeError, ValueError):
         return 0
     return out if out >= 0 else 0
@@ -276,7 +284,7 @@ async def forward_cursor_usage_to_session(
     session_id: str,
     bridge_dir: Path,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
-    auth: object | None = None,
+    auth: HttpxAuth | None = None,
 ) -> None:
     """Tail ``cursor_usage.jsonl`` and POST cumulative usage to the AP session.
 
@@ -349,7 +357,7 @@ async def supervise_cursor_usage_forwarder(
     session_id: str,
     bridge_dir: Path,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
-    auth: object | None = None,
+    auth: HttpxAuth | None = None,
 ) -> None:
     """Run :func:`forward_cursor_usage_to_session` under a restart supervisor.
 

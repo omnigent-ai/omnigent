@@ -57,12 +57,13 @@ import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { initialWindowComplete } from "@/lib/sessionsApi";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
-import { validateAttachments } from "@/lib/attachments";
+import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
   isIOSShell,
@@ -954,6 +955,7 @@ export function ChatPage() {
         ...activeConv,
         permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
         host_resumable: activeSession?.hostResumable ?? false,
+        kind: activeSession?.kind,
       }
     : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
@@ -1075,6 +1077,7 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
+  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
@@ -1129,6 +1132,7 @@ export function ChatPage() {
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
+      canApprove={canApprove}
       readOnlyReason={readOnlyReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
@@ -1353,6 +1357,8 @@ interface MainAgentSurfaceProps {
   /** Whether a load-more fetch is currently in flight. */
   loadingMoreHistory: boolean;
   permissionLevel: number | null;
+  /** Whether this viewer may accept privileged actions. */
+  canApprove: boolean;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
   effortLevels: readonly string[];
@@ -1434,6 +1440,7 @@ function MainAgentSurface({
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
+  canApprove,
   readOnlyReason,
   effortLevels,
   showEffort,
@@ -1450,8 +1457,7 @@ function MainAgentSurface({
   const terminalFirst = useTerminalFirst();
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
   // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
-  // mobile never runs its eager history backfill (up to 2000 items/open) for a
-  // rail the user can't see.
+  // mobile never mounts observers and history listeners for a rail it can't see.
   const isMobileViewport = useIsMobileViewport();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
@@ -1492,8 +1498,8 @@ function MainAgentSurface({
   // One rail tick per real user turn, paired with a preview of the reply that
   // followed. Walk bubbles in order: each non-system user bubble opens a turn,
   // and the first assistant text after it (before the next user bubble) is the
-  // preview. Same first-page window as the transcript, so a fresh load shows
-  // ≤20 ticks and older ones page in on scroll-up.
+  // preview. It mirrors the transcript's loaded window and grows lazily as
+  // older pages arrive.
   const turns = useMemo<Turn[]>(() => {
     const out: Turn[] = [];
     for (let i = 0; i < bubbles.length; i++) {
@@ -1559,7 +1565,8 @@ function MainAgentSurface({
   }, [nav]);
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
-  const [replyQuotes, setReplyQuotes] = useState<string[]>([]);
+  const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
+  const nextReplyQuoteId = useRef(0);
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1701,7 +1708,9 @@ function MainAgentSurface({
               md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
               the message column so the ticks don't butt against the text; the
               rail is hidden on mobile, so the extra left padding is md-only. */}
+          {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
           <ConversationContent
+            scrollClassName="[overflow-anchor:none]"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
               CHAT_COLUMN_WIDTH,
@@ -1711,10 +1720,7 @@ function MainAgentSurface({
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <PreserveScrollDistanceOnResize />
             <ConversationScrollRefBridge onScroller={setScroller} />
-            <HistoryAutoLoader
-              hasMoreHistory={hasMoreHistory}
-              loadingMoreHistory={loadingMoreHistory}
-            />
+            <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
             {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
               // Cold launch: a centered spinner instead of the "ready to
               // type" empty state (the create-then-send path uses the
@@ -1742,8 +1748,10 @@ function MainAgentSurface({
               )
             ) : (
               <>
+                {/* Older pages prepend here while their request is in flight. */}
+                {loadingMoreHistory && <HistoryLoadingIndicator />}
                 {streamBubbles.map((bubble) => (
-                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
+                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
                 ))}
                 {/* Pending elicitation cards, floated to the bottom of the
                     chat so an outstanding question stays in view (stick-to-
@@ -1762,7 +1770,7 @@ function MainAgentSurface({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
+                      <ElicitationCard item={item} canApprove={canApprove} />
                     </MessageContent>
                   </Message>
                 ))}
@@ -1788,6 +1796,12 @@ function MainAgentSurface({
                 <McpStartupIndicator />
               </>
             )}
+            {/* Frames the initially loaded turn at the top of the viewport and
+                keeps the pane scrollable so older history stays reachable.
+                Always mounted — including for an empty new conversation — so
+                a fast first send cannot become the captured initial anchor.
+                Last child so it measures everything above it. */}
+            <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
           </ConversationContent>
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
@@ -1813,8 +1827,7 @@ function MainAgentSurface({
         {/* Left-edge minimap: one tick per turn, scrolls independently, pages
             in older history on scroll-up. Sibling of Conversation for the same
             reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
-            Desktop-only: not mounted on mobile so its eager backfill never
-            runs where the rail is hidden. */}
+            Desktop-only: not mounted on mobile where the rail is hidden. */}
         {!isMobileViewport && (
           <TurnRail
             turns={turns}
@@ -1827,7 +1840,12 @@ function MainAgentSurface({
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
         containerRef={conversationRef}
-        onReply={(text) => setReplyQuotes((prev) => [...prev, text])}
+        onReply={(text) =>
+          setReplyQuotes((prev) => [
+            ...prev,
+            { id: `reply-quote-${nextReplyQuoteId.current++}`, text },
+          ])
+        }
       />
 
       <Composer
@@ -1861,7 +1879,6 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
-        sessionLive={liveness.kind === "online"}
         hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
         onShowReconnectHelp={onShowReconnectHelp}
         costRoutingEligible={costRoutingEligible}
@@ -2092,100 +2109,239 @@ function PreserveScrollDistanceOnResize() {
   return null;
 }
 
-/**
- * Headless older-history loader. Pages older session items in two ways
- * with no visible control:
- *
- * 1. Near-top scroll trigger — fetches as the user scrolls toward the top.
- * 2. Viewport-fill guard — when the loaded window is too short to produce a
- *    scrollbar (so the scroll trigger can never fire), keeps paging until
- *    the content overflows or history runs out, keeping older messages
- *    reachable without a button.
- *
- * Must be rendered inside a `StickToBottom` tree to access `scrollRef`.
- *
- * @param hasMoreHistory - Whether older messages exist before the loaded window.
- * @param loadingMoreHistory - Whether an older-history page is currently loading.
- */
+function HistoryLoadingIndicator() {
+  return (
+    <div
+      role="status"
+      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm"
+    >
+      <Loader2Icon className="size-4 animate-spin" aria-hidden />
+      Loading earlier messages…
+    </div>
+  );
+}
+
+/** Builds the initial history window, then keeps loading near the top. */
+const HISTORY_LOAD_TOP_THRESHOLD_PX = 500;
+
 export function HistoryAutoLoader({
-  hasMoreHistory,
-  loadingMoreHistory,
+  scrollElement,
 }: {
-  hasMoreHistory: boolean;
-  loadingMoreHistory: boolean;
-}) {
+  scrollElement?: HTMLElement | null;
+} = {}) {
   // useStickToBottomContext exposes scrollRef (the actual scroll container
   // element) in the runtime context even though the public TS types only
   // declare isAtBottom and scrollToBottom. Cast to access it.
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
+  const historyGeneration = useChatStore((s) => s.historyGeneration);
+  const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
+  // A successful page updates this cursor in the same store transaction that
+  // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
+  // still changes when many fetched tool calls collapse into one visual row.
+  const oldestItemId = useChatStore((s) => s.oldestItemId);
+  const pagesFetchedRef = useRef(1);
+  const generationRef = useRef(historyGeneration);
+  const [scrollRevision, setScrollRevision] = useState(0);
+  const handledScrollRevisionRef = useRef(scrollRevision);
+  const oldestItemIdRef = useRef(oldestItemId);
+  const loadingMoreHistoryRef = useRef(loadingMoreHistory);
 
-  // Preserve scroll position when items are prepended after a scroll-up
-  // fetch. Snapshot scrollHeight before the call; restore the offset in a
-  // layout effect so the visible content doesn't jump.
+  // Preserve the latest user position across skeleton insertion/removal and
+  // the intervening prepend. Native overflow anchoring is disabled above so
+  // this correction is the single source of truth across browsers.
   const prevScrollHeightRef = useRef<number | null>(null);
-  const loadOlderPreservingOffset = useCallback(() => {
-    if (!hasMoreHistory || loadingMoreHistory) return;
-    const el = ctx.scrollRef?.current;
-    if (el) prevScrollHeightRef.current = el.scrollHeight;
-    void useChatStore.getState().loadMoreHistory();
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory]);
+  const prevScrollTopRef = useRef(0);
 
+  // Register before sibling layout effects can resize the transcript and make
+  // StickToBottom adjust scrollTop; otherwise that first scroll can be missed.
   useLayoutEffect(() => {
-    const el = ctx.scrollRef?.current;
-    // Wait until loadingMoreHistory is false — the prepend render that grows
-    // scrollHeight is the one to correct. Consuming the snapshot earlier
-    // would null the ref before the prepend lands, causing a scroll jump.
-    if (!el || prevScrollHeightRef.current === null || loadingMoreHistory) return;
-    const delta = el.scrollHeight - prevScrollHeightRef.current;
-    if (delta > 0) el.scrollTop += delta;
-    prevScrollHeightRef.current = null;
-  });
-
-  useEffect(() => {
-    const el = ctx.scrollRef?.current;
+    const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
     const handleScroll = () => {
-      if (el.scrollTop < 300 && hasMoreHistory && !loadingMoreHistory) {
-        loadOlderPreservingOffset();
-      }
+      prevScrollHeightRef.current = el.scrollHeight;
+      prevScrollTopRef.current = el.scrollTop;
+      setScrollRevision((revision) => revision + 1);
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, loadOlderPreservingOffset]);
+  }, [ctx.scrollRef, scrollElement]);
 
-  // Viewport-fill guard. When the loaded window is too short to overflow, page
-  // again so older history stays reachable without a scrollbar to scroll up.
-  // No offset snapshot here: with a short window the user sits at the bottom
-  // and use-stick-to-bottom keeps them pinned as older items prepend.
-  const maybeFillViewport = useCallback(() => {
-    const el = ctx.scrollRef?.current;
-    if (!el || !hasMoreHistory || loadingMoreHistory) return;
-    if (el.scrollHeight <= el.clientHeight) {
-      void useChatStore.getState().loadMoreHistory();
+  // This is the single paging effect. Fetches are driven by user scrolls or a
+  // changed oldest item, including a visually height-neutral prepend.
+  useLayoutEffect(() => {
+    const el = scrollElement ?? ctx.scrollRef?.current;
+    if (!el) return;
+
+    const generationChanged = generationRef.current !== historyGeneration;
+    const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
+    const loadingChanged =
+      !generationChanged && loadingMoreHistoryRef.current !== loadingMoreHistory;
+    const scrollPositionChanged =
+      !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
+    oldestItemIdRef.current = oldestItemId;
+    loadingMoreHistoryRef.current = loadingMoreHistory;
+    handledScrollRevisionRef.current = scrollRevision;
+
+    if (generationChanged) {
+      generationRef.current = historyGeneration;
+      pagesFetchedRef.current = 1;
+      prevScrollHeightRef.current = null;
     }
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory]);
 
-  // Re-check on mount and whenever a fetch settles (loadingMoreHistory flips
-  // back to false): if content still doesn't overflow, the callback pages again.
-  useEffect(() => {
-    maybeFillViewport();
-  }, [maybeFillViewport]);
+    const state = useChatStore.getState();
+    const userPromptCount = state.blocks.reduce(
+      (count, block) =>
+        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
+      0,
+    );
+    const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
-  // Re-check when the viewport grows (window resize, side panel close): a
-  // previously-scrollable window can stop overflowing, removing the scrollbar
-  // and stranding older history with nothing left to trigger a fetch.
-  useEffect(() => {
-    const el = ctx.scrollRef?.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => maybeFillViewport());
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [ctx.scrollRef, maybeFillViewport]);
+    if ((itemsChanged || loadingChanged) && prevScrollHeightRef.current !== null) {
+      const nextScrollTop = Math.max(
+        0,
+        el.scrollHeight - prevScrollHeightRef.current + prevScrollTopRef.current,
+      );
+      if (el.scrollTop !== nextScrollTop) el.scrollTop = nextScrollTop;
+    }
+    prevScrollHeightRef.current = el.scrollHeight;
+    prevScrollTopRef.current = el.scrollTop;
 
-  // No visible control — history loads purely on scroll-up / viewport fill.
+    if (
+      !state.oldestItemId ||
+      !state.hasMoreHistory ||
+      state.loadingMoreHistory ||
+      (!buildingInitialWindow &&
+        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX))
+    ) {
+      return;
+    }
+
+    if (buildingInitialWindow) pagesFetchedRef.current += 1;
+    void state.loadMoreHistory();
+  }, [
+    ctx.scrollRef,
+    historyGeneration,
+    loadingMoreHistory,
+    oldestItemId,
+    scrollElement,
+    scrollRevision,
+  ]);
+
+  // No visible control — history loads purely on scroll-up / the initial-window
+  // build above.
   return null;
+}
+
+/** Top inset for a pinned anchor: 16px beyond the fade's fully opaque edge. */
+const PINNED_ANCHOR_TOP_GAP_PX = 96;
+
+/**
+ * Trailing spacer that pins the initially loaded turn's anchor to the top of
+ * the viewport — the newest committed user prompt, or (on a page deep in a
+ * long tool chain with no prompt yet) the newest assistant text output. The
+ * anchor is captured once when the hydrated chat surface mounts. Live sends
+ * therefore consume the reserved space instead of becoming a new anchor and
+ * jumping to the top before the harness starts processing them.
+ *
+ * As a side effect it keeps the transcript taller than its scroll container
+ * whenever any content sits above the anchor, so older history stays reachable
+ * by scroll-up without a viewport-fill loop.
+ *
+ * Height = clientHeight − (anchor-top → content-bottom) − top gap, clamped to
+ * ≥ 0: a short reply leaves empty space below (anchor stays pinned at top);
+ * once the reply alone exceeds the viewport the spacer collapses to 0 and
+ * normal stick-to-bottom following resumes. The "content-bottom" edge is the
+ * spacer's own top, whose position is fixed by the content above it and so is
+ * independent of the height we set — the measurement can't feed back on itself.
+ */
+export function LatestTurnSpacer({
+  scrollElement,
+}: {
+  scrollElement?: HTMLElement | null;
+} = {}) {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef: React.RefObject<HTMLElement>;
+  };
+  // Block changes remeasure the frozen anchor; streaming growth is covered by
+  // the ResizeObserver. The hydration gate remounts this component on a
+  // conversation switch, which captures that conversation's initial anchor.
+  const blockCount = useChatStore((s) => s.blocks.length);
+  const spacerRef = useRef<HTMLDivElement>(null);
+  // `undefined` means capture has not run; `null` is a completed capture with
+  // no suitable initial anchor (for example a brand-new empty conversation).
+  const initialAnchorRef = useRef<HTMLElement | null | undefined>(undefined);
+  const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
+  if (initialCommittedUserIdsRef.current === null) {
+    const ids = new Set<string>();
+    for (const block of useChatStore.getState().blocks) {
+      if (
+        block.type === "user_message" &&
+        !isSystemUserContent(block.content) &&
+        block.ctx.itemId !== null
+      ) {
+        ids.add(block.ctx.itemId);
+      }
+    }
+    initialCommittedUserIdsRef.current = ids;
+  }
+
+  const measure = useCallback(() => {
+    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
+    const spacerEl = spacerRef.current;
+    if (!scrollEl || !spacerEl) return;
+    if (initialAnchorRef.current === undefined) {
+      // Match DOM bubbles against committed blocks so an optimistic pending
+      // send visible during this first layout can never become the anchor.
+      const users = scrollEl.querySelectorAll<HTMLElement>(
+        '[data-role="user"][data-user-message-id]',
+      );
+      let initialUser: HTMLElement | null = null;
+      for (let index = users.length - 1; index >= 0; index -= 1) {
+        const candidate = users[index]!;
+        const itemId = candidate.dataset.userMessageId;
+        if (itemId !== undefined && initialCommittedUserIdsRef.current!.has(itemId)) {
+          initialUser = candidate;
+          break;
+        }
+      }
+      const texts = scrollEl.querySelectorAll<HTMLElement>(
+        '[data-testid="assistant-text-section"]',
+      );
+      initialAnchorRef.current = initialUser ?? texts[texts.length - 1] ?? null;
+    }
+    const anchor = initialAnchorRef.current;
+    if (!anchor) {
+      // Do not let the always-mounted sentinel become a zero-height flex item:
+      // the content column's gap would otherwise shift an empty-state layout.
+      spacerEl.style.display = "none";
+      return;
+    }
+    // rect diffs are scroll-invariant (both edges shift together), and the
+    // spacer's top is fixed by the content above it, so this is stable across
+    // the height we're about to set — it converges in one pass.
+    const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
+    const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
+    const current = Number.parseFloat(spacerEl.style.height) || 0;
+    if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
+  }, [ctx.scrollRef, scrollElement]);
+
+  useLayoutEffect(() => {
+    measure();
+  }, [measure, blockCount]);
+
+  useLayoutEffect(() => {
+    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
+    const contentEl = spacerRef.current?.parentElement;
+    if (!scrollEl || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(scrollEl); // viewport (clientHeight) changes
+    if (contentEl) observer.observe(contentEl); // streaming / reflow growth
+    return () => observer.disconnect();
+  }, [ctx.scrollRef, measure, scrollElement]);
+
+  return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
 }
 
 /**
@@ -2195,11 +2351,11 @@ export function HistoryAutoLoader({
  * resize-driven `scrollToBottom({preserveScrollPosition})` — fired on every
  * history prepend — bail instead of yanking the view back to the bottom.
  */
-type ConversationScroller = {
+interface ConversationScroller {
   el: HTMLElement;
   state: { isAtBottom: boolean; escapedFromLock: boolean };
   stopScroll: () => void;
-};
+}
 
 /**
  * Lifts the StickToBottom scroll container (and lock controls) out of the
@@ -2327,7 +2483,10 @@ export function JumpToTopButton({
   const jumpToTop = useCallback(async () => {
     if (!scroller) return;
     const { el, state, stopScroll } = scroller;
-    const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const nextFrame = () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
     setJumping(true);
     try {
       // Release StickToBottom's bottom-lock. Without this, every history prepend
@@ -2346,6 +2505,7 @@ export function JumpToTopButton({
       // history or on error. The rAF wait yields a frame for the prepend to
       // commit and for the in-flight flag to settle between pages. The
       // iteration cap is a backstop against a server that never reports done.
+      /* oxlint-disable no-await-in-loop */
       for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
         await useChatStore.getState().loadMoreHistory();
         // Keep the lock released — a prepend that briefly lands us near the
@@ -2367,6 +2527,7 @@ export function JumpToTopButton({
         }
         await nextFrame();
       }
+      /* oxlint-enable no-await-in-loop */
     } finally {
       setJumping(false);
     }
@@ -3019,7 +3180,7 @@ function CompactionLoadingIndicator() {
 // markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
 // the user-bubble markdown render tests.
 export const BubbleView = memo(
-  function BubbleView({ bubble }: { bubble: Bubble }) {
+  function BubbleView({ bubble, canApprove = true }: { bubble: Bubble; canApprove?: boolean }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator />;
@@ -3035,9 +3196,9 @@ export const BubbleView = memo(
         />
       );
     }
-    return <AssistantBubble bubble={bubble} />;
+    return <AssistantBubble bubble={bubble} canApprove={canApprove} />;
   },
-  (prev, next) => bubblesEqual(prev.bubble, next.bubble),
+  (prev, next) => prev.canApprove === next.canApprove && bubblesEqual(prev.bubble, next.bubble),
 );
 
 /**
@@ -3107,6 +3268,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // markers (no input_file block), so surface them as chips — otherwise the
   // marker is stripped and the user can't see what they attached.
   const mentionedChips = extractAttachedPaths(bubble.content);
+  // Equality selector so Zustand only re-renders the matching bubble.
+  const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
+  const { isCopied, handleCopy } = useCopyMessage(() => text);
   // Runtime-injected `[System: ...]` notifications (task completion,
   // timer firings, terminal idle) ride in on role=user. When the content
   // is a pure system marker — no attached images or files — swap the
@@ -3119,9 +3283,6 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // circle + author-tinted bubble, not an email label.
   const author = bubble.createdBy;
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
-  // Equality selector so Zustand only re-renders the matching bubble.
-  const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
-  const { isCopied, handleCopy } = useCopyMessage(() => text);
 
   return (
     <Message
@@ -3165,11 +3326,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {/* Inline image previews */}
           {images.length > 0 && (
             <div className="mb-1.5 flex flex-wrap gap-2">
-              {images.map((img, i) =>
+              {images.map((img) =>
                 img.file_id.startsWith("pending:") ? (
                   // Upload in-flight — show a chip placeholder
                   <span
-                    key={i}
+                    key={img.file_id}
                     className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                   >
                     <ImageIcon className="size-3 shrink-0" />
@@ -3180,7 +3341,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 ) : (
                   // Uploaded — render the actual image
                   <SessionImage
-                    key={i}
+                    key={img.file_id}
                     path={
                       sessionId
                         ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
@@ -3196,9 +3357,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {/* Non-image file chips */}
           {fileChips.length > 0 && (
             <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {fileChips.map((att, i) => (
+              {fileChips.map((att) => (
                 <span
-                  key={i}
+                  key={att.file_id}
                   className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                 >
                   <FileTextIcon className="size-3 shrink-0" />
@@ -3253,7 +3414,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   );
 }
 
-function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistant" }> }) {
+function AssistantBubble({
+  bubble,
+  canApprove,
+}: {
+  bubble: Extract<Bubble, { kind: "assistant" }>;
+  canApprove: boolean;
+}) {
   // The walker only emits an assistant bubble when at least one
   // assistant-side block exists, so `items` is non-empty here in the
   // common case. The "Working…" shimmer for the empty-items / streaming
@@ -3284,7 +3451,11 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
         className={isWide ? "max-w-full" : "max-w-3xl"}
       >
         <MessageContent className={isWide ? "w-full" : undefined}>
-          <BlockRenderer items={bubble.items} sessionStatus={sessionStatus} />
+          <BlockRenderer
+            items={bubble.items}
+            sessionStatus={sessionStatus}
+            canApprove={canApprove}
+          />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
           <p
@@ -3324,6 +3495,11 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   );
 }
 
+interface ReplyQuote {
+  id: string;
+  text: string;
+}
+
 interface ComposerProps {
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. */
@@ -3354,7 +3530,7 @@ interface ComposerProps {
    */
   readOnlyReason: string | null;
   /** Quoted texts to prepend to the next message (one per "Reply ↵" click). */
-  replyQuotes: string[];
+  replyQuotes: ReplyQuote[];
   /** Removes the quote at the given index without submitting. */
   onRemoveQuote: (index: number) => void;
   /** Clears all quotes (called after submit). */
@@ -3419,16 +3595,6 @@ interface ComposerProps {
    * `onReconnect`), replacing the separate banner below the composer.
    */
   hostOffline?: boolean;
-  /**
-   * The session's runner tunnel is live (`liveness.kind === "online"`). Only
-   * a live runner can accept a config change — unlike a message, a model/
-   * effort/routing POST can't wake an asleep, stranded, or not-yet-observed
-   * runner, and those states also never load the model catalog. So the config
-   * gear is inert whenever this is false, which is stricter than `unreachable`
-   * (the composer stays open on asleep/unknown because a message wakes them).
-   * Defaults to `true` so tests that don't wire liveness keep the gear live.
-   */
-  sessionLive?: boolean;
   /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
   onShowReconnectHelp?: () => void;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
@@ -3458,10 +3624,10 @@ interface ComposerProps {
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
-  skills: ReadonlyArray<{ name: string; description: string }>,
+  skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
-  showCompact: boolean = true,
+  showCompact = true,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -3492,7 +3658,7 @@ export function buildSlashCommandMap(
  * :returns: A ``Set`` of slash-prefixed names.
  */
 export function buildSlashCommandWithArgsSet(
-  skills: ReadonlyArray<{ name: string; description: string }>,
+  skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
 ): Set<string> {
@@ -3851,7 +4017,6 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
-  sessionLive = true,
   hostOffline = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
@@ -4470,8 +4635,8 @@ export function Composer({
     const quotePreamble =
       replyQuotes.length > 0
         ? replyQuotes
-            .map((q) =>
-              q
+            .map((quote) =>
+              quote.text
                 .split("\n")
                 .map((line) => `> ${line}`)
                 .join("\n"),
@@ -4727,10 +4892,10 @@ export function Composer({
         {replyQuotes.length > 0 && (
           <div className="flex flex-col gap-1.5 px-4 pt-3 pb-0">
             {replyQuotes.map((quote, i) => (
-              <div key={i} className="flex items-start gap-2">
+              <div key={quote.id} className="flex items-start gap-2">
                 <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-xs text-muted-foreground">
                   <span className="block truncate">
-                    {quote.length > 120 ? `${quote.slice(0, 120)}…` : quote}
+                    {quote.text.length > 120 ? `${quote.text.slice(0, 120)}…` : quote.text}
                   </span>
                 </div>
                 <button
@@ -4850,7 +5015,7 @@ export function Composer({
           <div className="flex flex-wrap gap-1.5 px-4 pb-2">
             {files.map((file, i) => (
               <span
-                key={i}
+                key={attachmentKey(file)}
                 className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
               >
                 {file.type.startsWith("image/") ? (
@@ -5036,12 +5201,12 @@ export function Composer({
               modelPickerKind={modelPickerKind}
               codexModelOptions={codexModelOptions}
               costRoutingEligible={costRoutingEligible}
-              // Only a live runner can accept a config change — a model/effort/
-              // routing POST can't wake an asleep, stranded, or not-yet-observed
-              // runner, and those states never load the model catalog either. So
-              // the gear is inert whenever the session isn't online, alongside
-              // the read-only cases.
-              disabled={isReadOnly || !sessionLive}
+              // Config changes persist server-side and apply on the next
+              // wake/turn (the runner forward is best-effort), so the gear
+              // stays live wherever a message could be sent — including
+              // asleep/starting/unknown. Only read-only viewers and sessions
+              // no message can wake (unreachable) get an inert gear.
+              disabled={isReadOnly || unreachable}
               openNonce={pickerOpenNonce}
             />
             <Button
@@ -5721,7 +5886,7 @@ function ComposerConfigGear({
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     // Consume the nonce even when disabled so a later enable doesn't replay a
     // stale open request; skip opening while the gear is inert (read-only /
-    // not-live), matching the click guard.
+    // unreachable), matching the click guard.
     appliedOpenNonce.current = openNonce;
     if (disabled) return;
     setOpen(true);
@@ -5867,7 +6032,7 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode";
-  const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
+  const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
     usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 

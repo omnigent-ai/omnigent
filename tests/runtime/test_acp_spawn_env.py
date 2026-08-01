@@ -24,6 +24,7 @@ _AGENTS = [
     {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
     {"name": "Goose", "command": "goose acp", "model": "gpt-5.3", "session_id_mode": "client"},
 ]
+_MISSING = object()
 
 
 @pytest.fixture(autouse=True)
@@ -39,10 +40,17 @@ def _write_acp_config(tmp_path: Path, agents: list[dict] | None = None) -> None:
     )
 
 
-def _make_spec(*, harness: str, model: str | None = None) -> AgentSpec:
+def _make_spec(
+    *,
+    harness: str,
+    model: str | None = None,
+    acp_agent: object = _MISSING,
+) -> AgentSpec:
     config: dict[str, object] = {"harness": harness}
     if model is not None:
         config["model"] = model
+    if acp_agent is not _MISSING:
+        config["acp_agent"] = acp_agent
     return AgentSpec(
         spec_version=1,
         name="test-acp",
@@ -110,3 +118,12 @@ def test_send_model_flag_forwarded(_isolate_config: Path) -> None:
     )
     env = _build_acp_spawn_env(_make_spec(harness="acp:qwen"))
     assert env["HARNESS_ACP_SEND_MODEL"] == "1"
+
+
+@pytest.mark.parametrize(
+    "acp_agent",
+    [None, "not-a-mapping", {}, {"name": "Helper"}, {"name": "Helper", "command": " "}],
+)
+def test_malformed_embedded_agent_fails_loudly(acp_agent: object) -> None:
+    with pytest.raises(ValueError, match="executor acp_agent"):
+        _build_acp_spawn_env(_make_spec(harness="acp:helper", acp_agent=acp_agent))

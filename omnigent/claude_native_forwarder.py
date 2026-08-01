@@ -13,7 +13,6 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import httpx
 
@@ -134,7 +133,7 @@ def _hold_monotonic() -> float:
     return time.monotonic()
 
 
-def _item_output_text(data: dict[str, Any]) -> str | None:
+def _item_output_text(data: dict[str, object]) -> str | None:
     """
     Join the ``output_text`` blocks of a message item's content.
 
@@ -1211,7 +1210,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
     :returns: None.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: dict[str, object] = {
         "subagents": {
             entry.subagent_id: {
                 "child_conversation_id": entry.child_conversation_id,
@@ -1241,7 +1240,7 @@ async def _write_subagent_forward_state_async(
     await asyncio.to_thread(_write_subagent_forward_state, bridge_dir, state)
 
 
-def _parse_json_response(resp: httpx.Response, *, context: str) -> Any:
+def _parse_json_response(resp: httpx.Response, *, context: str) -> dict[str, object]:
     """
     Parse an Omnigent JSON response, failing loudly on a non-JSON body.
 
@@ -1259,11 +1258,11 @@ def _parse_json_response(resp: httpx.Response, *, context: str) -> Any:
     :param resp: HTTP response whose body is expected to be JSON.
     :param context: Short request description for the error message,
         e.g. ``"session conv_abc123 snapshot"``.
-    :returns: The parsed JSON value (object, array, or scalar).
-    :raises RuntimeError: If the response body is not valid JSON.
+    :returns: The parsed JSON object.
+    :raises RuntimeError: If the response body is not valid JSON or is not an object.
     """
     try:
-        return resp.json()
+        payload: object = resp.json()
     except ValueError as exc:
         content_type = resp.headers.get("content-type") or "<unknown>"
         snippet = " ".join(resp.text[:200].split())
@@ -1273,6 +1272,9 @@ def _parse_json_response(resp: httpx.Response, *, context: str) -> Any:
             f"instead of the API response (e.g. an expired login session). "
             f"Body starts with: {snippet!r}"
         ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{context} returned JSON that was not an object")
+    return {str(key): value for key, value in payload.items()}
 
 
 async def _post_external_subagent_start(
@@ -1321,7 +1323,10 @@ async def _post_external_subagent_start(
     )
     resp.raise_for_status()
     body = _parse_json_response(resp, context=f"sub-agent start for {parent_session_id!r}")
-    return body["child_session_id"]
+    child_session_id = body.get("child_session_id")
+    if not isinstance(child_session_id, str) or not child_session_id:
+        raise KeyError("child_session_id")
+    return child_session_id
 
 
 def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
@@ -1735,7 +1740,7 @@ async def _forward_available_subagents(
     return updated
 
 
-def _cumulative_cost_from_status_state(state: dict[str, Any] | None) -> float | None:
+def _cumulative_cost_from_status_state(state: dict[str, object] | None) -> float | None:
     """
     Extract Claude Code's cumulative session cost from a statusLine snapshot.
 
@@ -2244,8 +2249,12 @@ async def _create_clear_replacement_session(
     if not isinstance(agent_id, str) or not agent_id:
         raise RuntimeError(f"session {old_session_id!r} has no agent_id")
     runner_id = old.get("runner_id")
-    labels = old.get("labels") if isinstance(old.get("labels"), dict) else {}
-    labels = {str(key): str(value) for key, value in labels.items()}
+    raw_labels = old.get("labels")
+    labels = (
+        {str(key): str(value) for key, value in raw_labels.items()}
+        if isinstance(raw_labels, dict)
+        else {}
+    )
     labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
 
     create_resp = await client.post(
@@ -2505,7 +2514,7 @@ def _is_fork_hook_record(record: ClaudeHookRecord) -> bool:
 async def _fetch_session_snapshot(
     client: httpx.AsyncClient,
     session_id: str,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """
     Fetch one Omnigent session snapshot.
 
@@ -2517,10 +2526,7 @@ async def _fetch_session_snapshot(
     """
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     resp.raise_for_status()
-    payload = _parse_json_response(resp, context=f"session {session_id!r} snapshot")
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"session {session_id!r} snapshot was not an object")
-    return payload
+    return _parse_json_response(resp, context=f"session {session_id!r} snapshot")
 
 
 async def _maybe_mirror_external_session_id(
@@ -2947,7 +2953,7 @@ async def _forward_available_status_events(
             # Forward todo updates from PostToolUse/TodoWrite hook events.
             # Best-effort: log and advance the cursor on failure so a
             # single failed post doesn't stall hook processing.
-            todos_to_post: list[dict[str, Any]] | None = None
+            todos_to_post: list[dict[str, object]] | None = None
             if record.todos is not None:
                 todos_to_post = record.todos
             elif native_todos_changed and task_order:
@@ -3140,11 +3146,13 @@ def _compact_summary_text(item: ClaudeTranscriptItem) -> str | None:
     content = item.data.get("content")
     if not isinstance(content, list):
         return None
-    parts = [
-        block.get("text")
-        for block in content
-        if isinstance(block, dict) and isinstance(block.get("text"), str) and block.get("text")
-    ]
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
     return "\n".join(parts) if parts else None
 
 
@@ -3558,7 +3566,9 @@ async def _forward_available_items(
     usage_from_status = (
         _usage_from_status_state(status_state) if status_state is not None else None
     )
-    posted_usage = usage_from_status if usage_from_status is not None else result.latest_usage
+    posted_usage: dict[str, float] | None = usage_from_status
+    if posted_usage is None and result.latest_usage is not None:
+        posted_usage = dict(result.latest_usage)
     # Cost (``cumulative_cost_usd``) is POSTed separately by
     # ``_forward_session_cost``, which reconciles the statusLine total with the
     # forwarder's real-time sub-agent transcript estimate via max(). Strip it
@@ -4124,7 +4134,7 @@ async def _post_external_session_usage(
         leave the server's persisted value untouched.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    payload: dict[str, Any] = {}
+    payload: dict[str, object] = {}
     if usage is not None:
         payload.update(usage)
     if context_window is not None:
@@ -4375,7 +4385,7 @@ async def _persist_native_compaction_item(
 
     # Read the post-compaction session messages so session resume can
     # reconstruct context in ephemeral environments.
-    compacted_messages: list[dict[str, Any]] | None = None
+    compacted_messages: list[dict[str, object]] | None = None
     try:
         from claude_agent_sdk import get_session_messages
 
@@ -4398,7 +4408,7 @@ async def _persist_native_compaction_item(
         if summary_override
         else "[Claude Code compaction — context was compacted in the terminal]"
     )
-    event_data: dict[str, Any] = {
+    event_data: dict[str, object] = {
         "summary": summary,
         "last_item_id": last_item_id,
         "model": "unknown",
@@ -4536,7 +4546,7 @@ async def _post_external_session_todos(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    todos: list[dict[str, Any]],
+    todos: list[dict[str, object]],
 ) -> None:
     """
     Post one ``external_session_todos`` event to the Sessions API.
@@ -4644,7 +4654,7 @@ def _write_hook_state(bridge_dir: Path, state: HookForwardState) -> None:
     :returns: None.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: dict[str, object] = {
         "event_cursor": state.event_cursor,
         "updated_at": time.time(),
     }
@@ -4727,7 +4737,7 @@ def _write_compaction_state(bridge_dir: Path, state: CompactionForwardState) -> 
     :returns: None.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: dict[str, object] = {
         "last_seq": state.last_seq,
         "persisted_seqs": list(state.persisted_seqs),
         "last_precompact_cursor": state.last_precompact_cursor,
@@ -4736,7 +4746,7 @@ def _write_compaction_state(bridge_dir: Path, state: CompactionForwardState) -> 
         "updated_at": time.time(),
     }
     if state.pending is not None:
-        pending_payload: dict[str, Any] = {"seq": state.pending.seq}
+        pending_payload: dict[str, object] = {"seq": state.pending.seq}
         if state.pending.claude_session_id is not None:
             pending_payload["claude_session_id"] = state.pending.claude_session_id
         if state.pending.transcript_path is not None:
@@ -5080,7 +5090,7 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
     return await asyncio.to_thread(_mutate)
 
 
-def _usage_from_status_state(state: dict[str, Any]) -> dict[str, float] | None:
+def _usage_from_status_state(state: dict[str, object]) -> dict[str, float] | None:
     """
     Convert statusLine ``current_usage`` (+ cost) into the Omnigent usage shape.
 
@@ -5191,7 +5201,7 @@ def _write_forward_state(bridge_dir: Path, state: TranscriptForwardState) -> Non
     :returns: None.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: dict[str, object] = {
         "transcript_path": str(state.transcript_path),
         "line_cursor": state.line_cursor,
         "current_response_id": state.current_response_id,
@@ -5351,7 +5361,7 @@ def _jsonl_cursor_fingerprint(path: Path, byte_offset: int) -> str | None:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     """
     Write JSON to *path* via a same-directory temporary file.
 

@@ -38,11 +38,12 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.errors import ErrorCode
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
+from omnigent.server.schemas import CreateResponseRequest
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -123,6 +124,17 @@ def _make_side_client(socket_path: str) -> httpx.AsyncClient:
         transport=httpx.AsyncHTTPTransport(uds=socket_path),
         base_url="http://harness.local",
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_continuation_without_model_is_rejected() -> None:
+    request = CreateResponseRequest(
+        input="continue",
+        previous_response_id="resp_stale",
+    )
+
+    with pytest.raises(OmnigentError, match="model is required"):
+        await HarnessApp()._start_or_inject_turn(request)
 
 
 @pytest.mark.asyncio

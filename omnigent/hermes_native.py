@@ -24,13 +24,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import TypeAlias
 
 import click
 import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_cold_resume_hint, echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import HERMES_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -53,7 +54,12 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
+
+_JsonObject: TypeAlias = dict[str, object]
 
 _DEFAULT_HERMES_COMMAND = "hermes"
 _HERMES_PATH_ENV = "OMNIGENT_HERMES_PATH"
@@ -125,7 +131,7 @@ def resolve_hermes_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_hermes_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         install_url = "https://hermes-agent.nousresearch.com/install.sh"
         raise click.ClickException(
@@ -152,7 +158,8 @@ def run_hermes_native(
     *,
     server: str | None,
     session_id: str | None,
-    hermes_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    hermes_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -167,6 +174,9 @@ def run_hermes_native(
         URL after launch.
     :returns: None after the terminal attach session ends.
     """
+    hermes_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=hermes_args, legacy_param="hermes_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -193,7 +203,7 @@ def _materialize_hermes_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "hermes-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Hermes is running in the session terminal. The user drives the hermes TUI directly."
@@ -396,7 +406,7 @@ async def _create_hermes_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first hermes-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -416,7 +426,7 @@ async def _create_hermes_session(
     return new_session_id
 
 
-async def _fetch_hermes_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_hermes_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

@@ -413,6 +413,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -516,9 +517,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     published_events: list[dict[str, Any]] = []
     forward_calls: list[dict[str, Any]] = []
-    preload_calls: list[tuple[str, str]] = []
+    preload_calls: list[tuple[str, str, list[str] | None]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """
         Record preloading of the known Codex thread.
 
@@ -530,7 +536,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "stale bridge state must be cleared until the new app-server has "
             "loaded the resume thread"
         )
-        preload_calls.append((transport, loaded_thread_id))
+        preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
         """
@@ -583,20 +589,27 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
-    assert launched.args[:3] == [
+    assert launched.args[0] == "--dangerously-bypass-hook-trust"
+    assert launched.args[1:4] == [
         "--config",
         "approval_policy=on-request",
         "resume",
     ]
-    assert launched.args[3] == "--remote"
-    assert launched.args[4].startswith("ws://127.0.0.1:")
-    assert launched.args[5] == thread_id
+    assert launched.args[4] == "--remote"
+    assert launched.args[5].startswith("ws://127.0.0.1:")
+    assert launched.args[6] == thread_id
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
-    assert preload_calls == [(app_server.listen_url, thread_id)]
+    assert preload_calls == [
+        (
+            app_server.listen_url,
+            thread_id,
+            ["--config", "approval_policy=on-request"],
+        )
+    ]
     assert published_events[0]["type"] == "session.resource.created"
     assert forward_calls == [
         {
@@ -721,6 +734,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -805,7 +819,12 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """
         Record preloading of the cloned Codex thread.
 
@@ -816,6 +835,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
             "fork-resume must not expose stale bridge state before preload"
         )
+        assert terminal_launch_args is None
         preload_calls.append((transport, loaded_thread_id))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -994,6 +1014,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1069,8 +1090,14 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
+        assert terminal_launch_args is None
         preload_calls.append((transport, loaded_thread_id))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -1220,6 +1247,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1442,6 +1470,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         """Minimal app-server object."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -2703,6 +2732,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
             event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
@@ -2765,6 +2795,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
             event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)

@@ -135,6 +135,17 @@ executor:
   model: gpt-4o-mini
   harness: openai-agents
 
+# ``researcher`` sub-agent declared inline so the sub-agent create tests
+# (mobile workflow, subagent tab title) can spawn a child named
+# "researcher"; the create route rejects an undeclared sub_agent_name.
+tools:
+  researcher:
+    type: agent
+    prompt: You research questions and report findings.
+    executor:
+      model: gpt-4o-mini
+      harness: openai-agents
+
 # Required for PUT /filesystem/{path} seeding in UI tests (e.g. markdown
 # editor comments) — the runner returns 404 when os_env is absent.
 os_env:
@@ -668,9 +679,7 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     pytest sessions or worktrees would clobber each other. A
     cross-process file lock at ``web/.build.lock`` serializes
     builds; the second caller waits for the first to finish and
-    then no-ops past its own build (npm is idempotent enough that
-    double-building is harmless, but the lock keeps the static
-    output consistent during the window the FastAPI app reads it).
+    then no-ops past its own build.
 
     :param request: pytest request — reads ``--ui-base-url`` /
         ``--ui-skip-build``.
@@ -684,17 +693,15 @@ def built_spa(request: pytest.FixtureRequest) -> None:
 
     lock_path = _WEB_DIR / ".build.lock"
     with filelock.FileLock(str(lock_path), timeout=600):
-        # --legacy-peer-deps: package-lock.json already pins the tree;
-        # without this flag npm spends the full job re-resolving the
-        # @emoji-mart/react / React 19 peer conflict. This matches the
-        # workflow-side fix for parity with local runs and the case
-        # where conftest installs override CI's build.
+        # pnpm frozen-lockfile uses the root workspace lockfile, which
+        # keeps the pinned tree matching CI and avoids re-resolving the
+        # React peer conflicts that used to require --legacy-peer-deps.
         subprocess.run(
-            ["npm", "ci", "--legacy-peer-deps", "--no-audit", "--no-fund"],
-            cwd=_WEB_DIR,
+            ["pnpm", "install", "--frozen-lockfile", "--filter", "web"],
+            cwd=_REPO_ROOT,
             check=True,
         )
-        subprocess.run(["npm", "run", "build"], cwd=_WEB_DIR, check=True)
+        subprocess.run(["pnpm", "--filter", "web", "run", "build"], cwd=_REPO_ROOT, check=True)
 
     _assert_pwa_build(_BUILD_OUTPUT)
 
@@ -1875,6 +1882,101 @@ def approval_session(
                 respawned_runner.wait(timeout=5)
 
 
+# ---------------------------------------------------------------------------
+# Tool-run fold probe: an ``os_env`` agent whose mock LLM queue emits a
+# deterministic sys_os_shell("ls") → sys_os_read("README.md") tool sequence,
+# then a short text reply. Used to assert the chat view's collapsed tool-run
+# summary carries the semantic action label ("Listed 1 directory, read 1
+# file") rather than a generic step count. Same registration/bind contract
+# as :func:`approval_session`, minus the guardrails block (nothing gated).
+# ---------------------------------------------------------------------------
+
+_TOOL_FOLD_AGENT_NAME = "tool_fold_probe"
+_TOOL_FOLD_AGENT_YAML = """\
+spec_version: 1
+name: {name}
+prompt: |
+  You are a deterministic tool-run assistant. When the user asks you to
+  inspect the workspace, you MUST do exactly this and nothing else:
+
+  1. Call sys_os_shell with command set to exactly: ls
+  2. Call sys_os_read with path set to exactly: README.md
+  3. Reply with one short sentence.
+
+executor:
+  model: {model}
+  config:
+    harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+"""
+
+
+@pytest.fixture
+def tool_fold_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session whose turn runs a shell + read tool pair.
+
+    The mock queue is keyed by a per-fixture unique model name (same
+    isolation rationale as :func:`approval_session`): two tool-call
+    responses, then a text fallback for the wrap-up LLM call.
+
+    :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``. Send any turn to run the
+        deterministic ls → read → reply sequence.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    model = f"tool-fold-probe-{_uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ls",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "ls"}),
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "sys_os_read",
+                        "arguments": _json.dumps({"path": "README.md"}),
+                    }
+                ]
+            },
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(mock_llm_server_url, model, "Workspace inspected.")
+
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    yaml_text = _TOOL_FOLD_AGENT_YAML.format(name=_TOOL_FOLD_AGENT_NAME, model=model)
+    session_id = _create_bundled_session(live_server, runner_id, yaml_text)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
 @pytest.fixture(autouse=True)
 def _ui_defaults() -> None:
     """
@@ -2227,7 +2329,8 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     auto-bootstrap: it launches Codex in the session terminal, derives the
     gateway auth from its own credentials, and pre-accepts the first-run
     trust/onboarding prompts — no CLI client required. ``model=None`` lets the
-    configured provider's default model win (matching ``_build_codex_native_bundle``).
+    configured provider's default model win (matching the seeded codex bundle
+    built via ``_build_native_bundle``).
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.

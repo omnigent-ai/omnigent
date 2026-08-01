@@ -28,6 +28,16 @@ from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.spec import load
 
 
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
+
+
 def _write_codex_auth(path: Path, payload: object) -> None:
     """Write a test Codex auth.json payload."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -64,6 +74,14 @@ def _point_codex_auth_check_at(
         "_find_codex_cli",
         lambda: "/tmp/codex" if binary_present else None,
     )
+    if binary_present:
+        # The auth check now also validates the installed version. Treat a
+        # present binary as satisfying the version check so the tests focus
+        # on the auth-path decision.
+        monkeypatch.setattr(
+            "omnigent.onboarding.harness_install.harness_cli_installed",
+            lambda _key: True,
+        )
 
 
 def test_codex_auth_unavailable_reason_binary_missing(
@@ -414,6 +432,14 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
         codex_native_app_server.preload_codex_thread_for_resume(
             "ws://127.0.0.1:1234",
             "019e96aa-0be2-7343-8d3b-6f914d60936b",
+            terminal_launch_args=[
+                "-c",
+                'default_permissions=":danger-full-access"',
+                "-c",
+                'approval_policy="never"',
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
         )
     )
 
@@ -424,10 +450,52 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
             {
                 "threadId": "019e96aa-0be2-7343-8d3b-6f914d60936b",
                 "excludeTurns": True,
+                "permissions": ":danger-full-access",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "auto_review",
             },
         )
     ]
     assert fake_client.closed is True
+
+
+def test_codex_resume_permission_params_parse_legacy_flags() -> None:
+    """Legacy approval and sandbox flags become preload overrides."""
+    assert codex_native_app_server._codex_resume_permission_params(
+        ["-a", "on-failure", "-s=read-only"]
+    ) == {
+        "approvalPolicy": "on-failure",
+        "sandbox": "read-only",
+    }
+
+
+def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> None:
+    """An incomplete stored Full Access profile resumes as the matching preset."""
+    args = [
+        "-c",
+        'default_permissions=":danger-full-access"',
+        "-c",
+        'approvals_reviewer="user"',
+    ]
+
+    assert codex_native_app_server._codex_resume_permission_params(args) == {
+        "permissions": ":danger-full-access",
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+    }
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=tuple(args),
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+    ) == [
+        *args,
+        "-c",
+        'approval_policy="never"',
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_x",
+    ]
 
 
 def _started_event(turn_id: str) -> dict[str, Any]:
@@ -783,7 +851,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
             None,
             [
                 "-c",
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
                 "--remote",
@@ -796,7 +864,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
             "thread_host",
             [
                 "-c",
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
                 "resume",
@@ -832,7 +900,7 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
             thread_id=thread_id,
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 'model_provider="omnigent_databricks"',
             ),
         )
@@ -988,6 +1056,47 @@ def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
         )
         == expected
     )
+
+
+def test_build_codex_remote_args_bypass_hook_trust_prepends_flag() -> None:
+    """``bypass_hook_trust=True`` prepends ``--dangerously-bypass-hook-trust``.
+
+    Runner-owned headless sessions pass this flag so the TUI skips the
+    interactive "Hooks need review" prompt that can never be answered without
+    a live terminal user.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        bypass_hook_trust=True,
+    )
+    assert args[0] == "--dangerously-bypass-hook-trust"
+    assert "--remote" in args
+    assert "ws://127.0.0.1:9876" in args
+
+
+def test_build_codex_remote_args_bypass_hook_trust_with_resume() -> None:
+    """``bypass_hook_trust=True`` flag precedes the ``resume`` subcommand."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id="thread-abc",
+        remote_url="ws://127.0.0.1:9876",
+        bypass_hook_trust=True,
+    )
+    assert args[0] == "--dangerously-bypass-hook-trust"
+    assert "resume" in args
+    assert args.index("--dangerously-bypass-hook-trust") < args.index("resume")
+
+
+def test_build_codex_remote_args_bypass_hook_trust_default_false() -> None:
+    """``bypass_hook_trust`` defaults to ``False``; flag is absent."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+    assert "--dangerously-bypass-hook-trust" not in args
 
 
 def test_codex_app_server_client_uses_codex_remote_handshake(
@@ -5207,15 +5316,8 @@ def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> No
     assert fake_client.requests == []
 
 
-def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
-    """
-    Codex ``turn/plan/updated`` notifications are visible in Omnigent web.
-
-    Plan mode emits plan state through a dedicated app-server
-    notification rather than assistant text. If the forwarder ignores
-    it, the terminal shows the plan while the web transcript appears to
-    skip straight to the final prompt.
-    """
+def test_forwarder_posts_codex_turn_plan_update_only_to_tasks(tmp_path: Path) -> None:
+    """Codex ``turn/plan/updated`` notifications update only the Tasks tab."""
     posted: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -5250,57 +5352,14 @@ def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
                         "threadId": "thread_123",
                         "turnId": "turn_123",
                         "explanation": None,
-                        "plan": [
-                            {"step": "Inspect Codex plan events", "status": "completed"},
-                            {"step": "Mirror plans to web", "status": "inProgress"},
-                            {"step": "Run checks", "status": "pending"},
-                        ],
+                        "plan": [{"step": "Inspect Codex plan events", "status": "pending"}],
                     },
                 },
             )
 
     asyncio.run(run())
 
-    # The plan is mirrored to the todo panel and inline in the transcript.
-    assert len(posted) == 2
-    todos_post = next(p for p in posted if p["type"] == "external_session_todos")
-    assert todos_post["data"]["todos"] == [
-        {
-            "content": "Inspect Codex plan events",
-            "status": "completed",
-            "activeForm": "Inspect Codex plan events",
-        },
-        {
-            "content": "Mirror plans to web",
-            "status": "in_progress",
-            "activeForm": "Mirror plans to web",
-        },
-        {
-            "content": "Run checks",
-            "status": "pending",
-            "activeForm": "Run checks",
-        },
-    ]
-
-    message_post = next(p for p in posted if p["type"] == "external_conversation_item")
-    data = message_post["data"]
-    assert data["item_type"] == "message"
-    assert data["response_id"] == "codex_turn_123"
-    assert data["item_data"] == {
-        "role": "assistant",
-        "agent": "codex-native-ui",
-        "content": [
-            {
-                "type": "output_text",
-                "text": (
-                    "Plan:\n"
-                    "- [x] Inspect Codex plan events\n"
-                    "- [~] Mirror plans to web\n"
-                    "- [ ] Run checks"
-                ),
-            }
-        ],
-    }
+    assert [event["type"] for event in posted] == ["external_session_todos"]
 
 
 def test_plan_todos_from_update_maps_steps_and_statuses() -> None:
@@ -9933,3 +9992,124 @@ def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> Non
     )
     types = [r["type"] for r in records]
     assert "compacted" not in types
+
+
+@pytest.mark.parametrize(
+    "terminal_launch_args",
+    [
+        ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+        ["-c", 'default_permissions=":danger-full-access"'],
+    ],
+)
+def test_rollout_records_use_terminal_launch_permission_args(
+    terminal_launch_args: list[str],
+) -> None:
+    """Cold-resume turn_context preserves the persisted Codex permission mode."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "response_id": "resp_1",
+            }
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+        terminal_launch_args=terminal_launch_args,
+    )
+
+    turn_context = next(r for r in records if r["type"] == "turn_context")["payload"]
+    assert turn_context["approval_policy"] == "never"
+    assert turn_context["sandbox_policy"] == {"type": "danger-full-access"}
+
+
+# --- #2745: routing summary surfaced in the startup-timeout error ---
+
+
+def test_native_codex_launch_summary_defaults_empty() -> None:
+    """The new summary field defaults to empty so existing call sites stay valid."""
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=[], model=None, profile=None
+    )
+    assert launch.summary == ""
+
+
+def test_resolve_native_codex_launch_no_provider_sets_login_fallback_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No configured provider -> summary names the login fallback (#2745)."""
+    from omnigent.onboarding import detected, provider_config
+    from omnigent.runtime import workflow
+
+    monkeypatch.setattr(provider_config, "load_config", dict)
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda cfg: False)
+    monkeypatch.setattr(detected, "effective_config_with_detected", lambda cfg: {})
+    monkeypatch.setattr(provider_config, "default_provider_for_harness", lambda cfg, harness: None)
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
+
+    launch = codex_native_app_server.resolve_native_codex_launch(model=None)
+
+    assert launch.profile is None
+    assert "no provider configured" in launch.summary
+    assert "sign-in" in launch.summary
+
+
+def test_resolve_native_codex_launch_databricks_provider_sets_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Databricks provider default -> summary names the ucode profile (#2745)."""
+    from omnigent.onboarding import detected, provider_config
+
+    entry = SimpleNamespace(kind=provider_config.DATABRICKS_KIND, profile="my-profile")
+    monkeypatch.setattr(provider_config, "load_config", dict)
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda cfg: False)
+    monkeypatch.setattr(
+        provider_config, "default_provider_for_harness", lambda cfg, harness: entry
+    )
+
+    launch = codex_native_app_server.resolve_native_codex_launch(model="gpt-5.5")
+
+    assert launch.profile == "my-profile"
+    assert launch.summary == "Databricks ucode profile 'my-profile'"
+
+
+def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A startup timeout records the launch routing summary in the bridge error (#2745)."""
+    from omnigent import codex_native_forwarder as _fwd
+    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    async def _timeout(_client: object) -> str:
+        raise TimeoutError("no thread event")
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _timeout)
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            event_client=_FakeClient(),
+            routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
+        )
+    )
+
+    err = read_bridge_startup_error(bridge_dir)
+    assert err is not None
+    assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in err
+    assert "startup timed out" in err

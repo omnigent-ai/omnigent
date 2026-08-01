@@ -57,10 +57,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.policies.types import (
-    EvaluationContext,
-    PolicyAction,
-)
+from omnigent.policies.types import EvaluationContext
 from omnigent.reasoning_effort import (
     EFFORT_VALUES,
     validate_effort,
@@ -78,6 +75,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.prompt import model_author_prefix
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
@@ -174,6 +172,7 @@ from omnigent.session_lifecycle import (
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
+    PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -997,6 +996,20 @@ def _permission_level_from_grants(
     if public_grant is not None:
         return public_grant.level
     return None
+
+
+def _approval_access_from_grants(
+    user_id: str | None,
+    grants: list[SessionPermission],
+    is_admin: bool,
+) -> bool | None:
+    """Derive effective approval authority from pre-fetched grants."""
+    if user_id is None:
+        return None
+    if is_admin:
+        return True
+    user_grant = next((grant for grant in grants if grant.user_id == user_id), None)
+    return user_grant is not None and (user_grant.level >= LEVEL_OWNER or user_grant.can_approve)
 
 
 def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
@@ -2131,6 +2144,82 @@ async def _persist_external_codex_collaboration_mode_change(
     _publish_collaboration_mode(session_id, mode)
 
 
+async def _persist_external_codex_approval_mode_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Merge Codex's terminal-observed permission launch args."""
+    raw_args = body.data.get("terminal_launch_args")
+    if not isinstance(raw_args, list):
+        raise OmnigentError(
+            "external_codex_approval_mode_change requires data.terminal_launch_args list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        permission_args = _validate_terminal_launch_args(raw_args)
+        terminal_launch_args = _validate_terminal_launch_args(
+            _merge_codex_permission_launch_args(conv.terminal_launch_args, permission_args or [])
+        )
+    except ValueError as exc:
+        raise OmnigentError(
+            f"invalid terminal_launch_args: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    if conv.terminal_launch_args == terminal_launch_args:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        terminal_launch_args=terminal_launch_args,
+    )
+
+
+def _merge_codex_permission_launch_args(
+    existing_args: Sequence[str] | None,
+    permission_args: Sequence[str],
+) -> list[str]:
+    """Replace Codex permission arguments while preserving other launch args."""
+    config_keys = {
+        "approval_policy",
+        "approvals_reviewer",
+        "default_permissions",
+        "sandbox_mode",
+    }
+    value_options = {"--ask-for-approval", "-a", "--sandbox", "-s"}
+    merged: list[str] = []
+    args = list(existing_args or ())
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            index += 1
+            continue
+        if arg in value_options:
+            index += 2
+            continue
+        if arg.startswith(("--ask-for-approval=", "-a=", "--sandbox=", "-s=")):
+            index += 1
+            continue
+        if arg in {"--config", "-c"} and index + 1 < len(args):
+            key = args[index + 1].partition("=")[0].strip()
+            if key in config_keys:
+                index += 2
+                continue
+            merged.extend(args[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith(("--config=", "-c=")):
+            key = arg.split("=", 1)[1].partition("=")[0].strip()
+            if key in config_keys:
+                index += 1
+                continue
+        merged.append(arg)
+        index += 1
+    return [*merged, *permission_args]
+
+
 def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,
@@ -3054,6 +3143,27 @@ def _merge_pending_file_blocks(
     return item.model_copy(update={"data": merged_data})
 
 
+def _strip_pending_author_prefix(
+    item: NewConversationItem,
+    pending_content: list[dict[str, Any]],
+    created_by: str | None,
+) -> NewConversationItem:
+    """Remove a runner-added author prefix from mirrored native text."""
+    if not isinstance(item.data, MessageData) or not created_by:
+        return item
+    original_text = _message_text(pending_content)
+    mirrored_text = _message_text(item.data.content)
+    prefix = model_author_prefix(created_by)
+    if original_text is None or mirrored_text != prefix + original_text:
+        return item
+    content = [dict(block) for block in item.data.content]
+    for block in content:
+        if block.get("type") == "input_text" and isinstance(block.get("text"), str):
+            block["text"] = block["text"][len(prefix) :]
+            break
+    return item.model_copy(update={"data": item.data.model_copy(update={"content": content})})
+
+
 def _message_text(content: list[dict[str, Any]]) -> str | None:
     """
     Extract joined text from message content blocks.
@@ -3556,28 +3666,40 @@ def _invalidate_runner_backed_snapshot_state(
     session_id: str,
     *,
     cancel_inflight: bool,
+    drop_model_options: bool,
 ) -> None:
     """
     Drop runner-derived session snapshot overlays for one session.
 
-    These fields are discovered from the bound runner (skills and the
-    codex-native ``model/list`` catalog), so browser reloads can ask the
-    next snapshot to refresh them from the live session instead of serving
-    stale AP-process memory. Runner teardown additionally cancels any
-    in-flight fetch so a dead runner cannot land a late stale value.
+    Skills are discovered from the bound runner, so they are dropped and
+    re-fetched at the next snapshot. The native model catalog is instead
+    marked stale by default: it must outlive runner death so the model
+    picker stays populated (and offline model/effort changes stay possible)
+    while the session is asleep — a stale catalog keeps serving until a
+    live-runner re-fetch replaces it. Runner teardown additionally cancels
+    any in-flight fetch so a dead runner cannot land a late stale value.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param cancel_inflight: Whether to cancel currently-running fetches.
         Use ``True`` when a runner disconnects; use ``False`` for browser
         refreshes so concurrent page-load callers do not cancel each other.
+    :param drop_model_options: Drop the cached catalog outright instead of
+        marking it stale. Pass ``True`` only when it can be re-fetched
+        right away (refresh with a live runner) or no longer belongs to
+        the session (agent switch); ``False`` keeps it serving while the
+        session has no runner.
     """
     _runner_skills_cache.pop(session_id, None)
     if cancel_inflight:
         inflight = _runner_skills_inflight.pop(session_id, None)
         if inflight is not None:
             inflight.cancel()
-    _model_options_cache.pop(session_id, None)
+    if drop_model_options:
+        _model_options_cache.pop(session_id, None)
+        _model_options_stale.discard(session_id)
+    else:
+        _model_options_stale.add(session_id)
     if cancel_inflight:
         codex_inflight = _model_options_inflight.pop(session_id, None)
         if codex_inflight is not None:
@@ -6421,9 +6543,18 @@ def _build_evaluation_context(
         text = data.get("text") or data.get("content") or str(data)
     else:
         text = str(data)
+    text_str = text if isinstance(text, str) else json.dumps(text)
+    # REQUEST content is the structured dict ({"user_content", "attachments"}) so
+    # every request reaches policies in one shape, whatever the entry point. This
+    # native/terminal path carries no uploads, so ``attachments`` is always empty;
+    # the web input gate (_evaluate_input_policy) is what populates it. RESPONSE
+    # stays a plain string — attachments are an input-only concern.
+    request_or_response_content: Any = (
+        {"user_content": text_str, "attachments": []} if phase == Phase.REQUEST else text_str
+    )
     return EvaluationContext(
         phase=phase,
-        content=text if isinstance(text, str) else json.dumps(text),
+        content=request_or_response_content,
         actor=actor,
         model=hook_model,
         harness=hook_harness,
@@ -7160,6 +7291,58 @@ def _resolve_subagent_spec(
     return _find_spec_by_name(parent_spec, sub_agent_name)
 
 
+def _require_declared_subagent(
+    *,
+    agent: Agent,
+    sub_agent_name: str,
+    agent_cache: AgentCache | None,
+) -> None:
+    """
+    Reject a ``sub_agent_name`` the parent's spec does not declare.
+
+    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and every
+    downstream site that swaps in the resolved child spec is guarded by
+    ``if ... is not None`` with no ``else`` — so a name that resolves to
+    nothing leaves the parent's spec, workdir, harness and instructions in
+    place and the child silently boots as a full clone of the parent
+    (runaway recursion for an orchestrator). This gate fails the create
+    loud instead, mirroring normal dispatch (``tool_dispatch`` rejects an
+    undeclared ``agent``) and the ``AGENTSPEC.md`` contract that unlisted
+    names are rejected.
+
+    Only rejects when the bundle loads AND the name is positively absent:
+    a load failure or absent cache cannot prove the negative, so it is
+    left to fail-loud downstream rather than blocking a create we cannot
+    adjudicate here.
+
+    :param agent: The parent agent row whose bundle declares the
+        sub-agents.
+    :param sub_agent_name: The requested sub-agent name to validate.
+    :param agent_cache: Cache for loading the parsed parent bundle.
+        ``None`` skips the check (cannot resolve the tree).
+    :raises OmnigentError: 404 ``NOT_FOUND`` when the bundle loads and
+        declares no sub-agent named ``sub_agent_name``.
+    """
+    if agent_cache is None:
+        return
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    try:
+        parent_spec = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        ).spec
+    except Exception:  # noqa: BLE001
+        # Can't load the bundle -> can't prove the name is undeclared.
+        # Leave it to the runner's fail-loud resolution rather than
+        # rejecting a create we cannot adjudicate.
+        return
+    if _find_spec_by_name(parent_spec, sub_agent_name) is None:
+        raise OmnigentError(
+            f"Sub-agent not declared in parent spec: {sub_agent_name!r}",
+            code=ErrorCode.NOT_FOUND,
+        )
+
+
 def _spec_harness(spec: AgentSpec) -> str:
     """
     Return the canonical harness identifier for a resolved spec.
@@ -7892,13 +8075,12 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import fetch_runner_models, infer_models
+    from omnigent.server.smart_routing import fetch_runner_models
 
     # Fetch live model catalog from the runner once; used below to populate
     # per-agent model lists when the caller omits explicit models.
     # Keys are worker names ("self", "claude_code", etc.) as returned by
-    # catalog_for_spec.  None when runner is unreachable — falls back to
-    # infer_models static table.
+    # catalog_for_spec. None when runner discovery is unavailable.
     _runner_catalog: dict[str, list[str]] | None = None
     if session_id is not None and runner_router is not None:
         _runner_client = await _get_runner_client(session_id, runner_router)
@@ -7973,12 +8155,10 @@ async def _handle_advise_models_mcp(
                 candidates = explicit_models
             else:
                 harness_key = _resolve_harness_for_worker(agent) or agent
-                # Prefer live runner catalog (worker name or harness key);
-                # fall back to static infer_models table.
+                # Prefer the worker name, then its normalized harness key.
                 candidates = (
                     (_runner_catalog or {}).get(agent)
                     or (_runner_catalog or {}).get(harness_key)
-                    or infer_models(harness_key)
                     or []
                 )
             if candidates:
@@ -8357,8 +8537,76 @@ async def _load_model_options(
                 continue
             return
         _model_options_cache[session_id] = options
+        _model_options_stale.discard(session_id)
         _publish_model_options(session_id)
         return
+
+
+async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]] | None:
+    """
+    Resolve a host's pre-launch claude catalog over its live tunnel.
+
+    Session-side reuse of the new-session picker's source
+    (``get_host_model_options`` in ``routes/hosts.py``): the host resolves
+    the catalog locally, so no runner is needed.
+
+    :param host_id: Host identifier, e.g. ``"host_a1b2c3"``.
+    :returns: Raw model rows, or ``None`` when the host is not connected,
+        rejects the request, or times out.
+    """
+    registry = get_server_host_registry()
+    if registry is None:
+        return None
+    conn = registry.get(host_id)
+    if conn is None:
+        return None
+    # Local import: keeps routes.hosts out of this module's import graph.
+    from omnigent.server.routes.hosts import _proxy_model_options
+
+    try:
+        result = await _proxy_model_options(
+            host_registry=registry,
+            host_conn=conn,
+            harness="claude-native",
+        )
+    except HTTPException:
+        return None
+    if result.get("status") != "ok":
+        return None
+    models = result.get("models")
+    return models if isinstance(models, list) else None
+
+
+async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
+    """
+    Background catalog fill for an asleep claude-native session.
+
+    With no runner bound and a cold cache (e.g. the server restarted while
+    the session slept), the session's host can still resolve the claude
+    catalog — the same pre-launch source the new-session picker uses. Fills
+    the cache stale-marked so the next live runner replaces it with its
+    launch-exact snapshot, and publishes ``session.model_options`` so open
+    tabs re-read.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param host_id: The session's bound host, e.g. ``"host_a1b2c3"``.
+    """
+    # Read through the facade so tests patching
+    # ``sessions._host_model_options_via_registry`` reach this impl.
+    import omnigent.server.routes.sessions as _facade
+
+    raw = await _facade._host_model_options_via_registry(host_id)
+    if not raw:
+        return
+    try:
+        options = _model_options_from_wire(raw)
+    except ValueError:
+        return
+    if not options:
+        return
+    _model_options_cache[session_id] = options
+    _model_options_stale.add(session_id)
+    _publish_model_options(session_id)
 
 
 __all__ = [
@@ -8380,6 +8628,7 @@ __all__ = [
     "_announce_session_added",
     "_apply_liveness_to_items",
     "_apply_pending_policy_ask_writes",
+    "_approval_access_from_grants",
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
@@ -8427,6 +8676,7 @@ __all__ = [
     "_handle_advise_models_mcp",
     "_handle_external_session_todos",
     "_handle_mcp_tools_list",
+    "_host_model_options_via_registry",
     "_invalidate_runner_backed_snapshot_state",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
@@ -8436,6 +8686,7 @@ __all__ = [
     "_launch_runner_on_host",
     "_load_agent_spec_for_session",
     "_load_model_options",
+    "_load_model_options_from_host",
     "_load_runner_skills",
     "_mcp_error_response",
     "_mcp_input_required_response",
@@ -8462,6 +8713,7 @@ __all__ = [
     "_pending_elicitation_snapshot_for_session",
     "_permission_level_from_grants",
     "_persist_external_assistant_message",
+    "_persist_external_codex_approval_mode_change",
     "_persist_external_codex_collaboration_mode_change",
     "_persist_external_model_change",
     "_persist_external_model_options",
@@ -8521,6 +8773,7 @@ __all__ = [
     "_replace_text_in_message_body",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",
+    "_require_declared_subagent",
     "_require_external_status_forward",
     "_require_host_conn_for_worktree",
     "_reset_runner_resources_after_switch",
@@ -8547,6 +8800,7 @@ __all__ = [
     "_stop_session_via_runner",
     "_stored_file_to_resource",
     "_stream_live_events",
+    "_strip_pending_author_prefix",
     "_structured_ask_user_question",
     "_subagent_delivery_status",
     "_targeted_elicitation_event",

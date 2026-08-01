@@ -388,10 +388,12 @@ def test_sessions_tool_call_approval_allows_tool(
 
 
 def _write_simple_agent_yaml(directory: Path) -> Path:
-    """Write a minimal agent YAML with no policies (no approval)."""
+    """Write a simple agent YAML with no policies (no approval)."""
     yaml_path = directory / "simple_hello.yaml"
     yaml_path.write_text(
         "name: simple_hello\n"
+        "executor:\n"
+        "  model: gpt-4o\n"
         "prompt: >-\n"
         "  You are a friendly assistant. Respond in exactly one short sentence.\n",
     )

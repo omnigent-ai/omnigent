@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent import model_catalog
+
 if TYPE_CHECKING:
     from omnigent.spec.types import MCPServerConfig
 
@@ -39,8 +41,6 @@ DATABRICKS_GATEWAY_PROVIDER_ID = "databricks-gateway"
 DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
-# Fallback chat model when neither the spec nor config names one.
-DEFAULT_DATABRICKS_GATEWAY_MODEL = "databricks-claude-sonnet-4-6"
 
 
 @dataclass(frozen=True)
@@ -254,9 +254,8 @@ def resolve_databricks_gateway(
 
     :param profile: A ``~/.databrickscfg`` profile name, e.g. ``"oss"``;
         ``None`` short-circuits.
-    :param model_id: Endpoint/model id to pin; defaults to
-        :data:`DEFAULT_DATABRICKS_GATEWAY_MODEL` (a ``databricks-*`` chat
-        endpoint the gateway routes).
+    :param model_id: Endpoint/model id to pin. When omitted or incompatible,
+        the Databricks Claude catalog supplies the endpoint.
     :returns: A resolution, or ``None`` when the gateway can't be resolved.
     """
     if not profile:
@@ -277,7 +276,11 @@ def resolve_databricks_gateway(
         _logger.info("opencode Databricks gateway resolve failed for %r: %r", profile, exc)
         return None
 
-    resolved_model = _gateway_endpoint_for_model(model_id) or DEFAULT_DATABRICKS_GATEWAY_MODEL
+    resolved_model = _gateway_endpoint_for_model(model_id)
+    if resolved_model is None:
+        resolved_model = model_catalog.resolve_catalog_model(
+            "databricks", family="claude"
+        ).model_id
     return OpenCodeGatewayResolution(
         base_url=f"{host}/{_SERVING_ENDPOINTS_PATH}",
         api_key=token,

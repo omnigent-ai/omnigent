@@ -112,34 +112,23 @@ def test_right_panel_terminals_and_file_viewer(
         terminal_row = rail.get_by_role("button").filter(has_text="zsh").filter(has_text="main")
         expect(terminal_row.first).to_be_visible(timeout=60_000)
 
-        # Clicking a shell row replaces the main session view with that
-        # shell — terminal-first sessions (every runner-hosted SDK
-        # session) render it inline in the main pane via
-        # MainTerminalView; the rail never mounts an xterm of its own.
-        # The view must focus the CLICKED shell: a ``tui`` active key
-        # here means the explicit key was dropped and the view fell
-        # back to the agent's embedded REPL terminal.
+        # Clicking a shell row opens it as a tab in the rail's top strip;
+        # its xterm renders inside the rail's content slot and the chat
+        # page is left undisturbed (no main-column takeover). The shell tab
+        # is labeled "zsh · main" and carries a "Close zsh · main" x.
         terminal_row.first.click()
-        main_terminal = page.get_by_test_id("main-terminal-view")
-        expect(main_terminal).to_be_visible()
-        expect(main_terminal).to_have_attribute(
-            "data-active-terminal", "terminal:terminal_zsh_main"
-        )
-        expect(main_terminal).to_contain_text("zsh")
-        # The shell's xterm mounts in the main pane and connects.
-        terminal_view = page.get_by_test_id("terminal-view")
+        close_tab = rail.get_by_role("button", name="Close zsh · main", exact=True)
+        expect(close_tab).to_be_visible(timeout=20_000)
+        # The shell's xterm mounts in the rail and connects; the chat main
+        # column is not replaced.
+        terminal_view = rail.get_by_test_id("terminal-view")
         expect(terminal_view.last).to_be_visible(timeout=20_000)
         expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=20_000)
-        # Chrome-free shell view: the Chat/Terminal pill is hidden (a
-        # "Chat" option under a shell misreads as the shell being the
-        # agent) and no agent tab renders next to the shell. A visible
-        # pill or "tui" text means the isShellView gate regressed.
-        expect(page.get_by_role("button", name="Chat", exact=True)).to_have_count(0)
-        expect(main_terminal).not_to_contain_text("tui")
-        # The header's close X is the way back to the conversation
-        # surface for the Files steps below.
-        page.get_by_role("button", name="Close shell").click()
-        expect(main_terminal).to_have_count(0)
+        expect(page.get_by_test_id("main-terminal-view")).to_have_count(0)
+        # The tab's x closes the shell — its xterm unmounts and the rail
+        # falls back to the Shells list for the Files steps below.
+        close_tab.click()
+        expect(terminal_view).to_have_count(0)
 
         # Switch to the Files tab and open the seeded file. The
         # changed-file row renders two buttons carrying the filename: the

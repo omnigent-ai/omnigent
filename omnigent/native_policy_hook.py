@@ -26,7 +26,8 @@ import secrets
 import shlex
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import NotRequired, TypedDict
 
 import httpx
 
@@ -73,6 +74,52 @@ _EVAL_UNAVAILABLE_REQUEST_REASON = (
 # resolved in-process — the same reason ``ap_auth_headers`` is baked for the
 # claude/codex/kimi hooks.
 _AUTH_HEADERS_ENV = "_OMNIGENT_AUTH_HEADERS"
+
+# Relay env vars for harnesses that deliver auth via env (hermes, cursor).
+_RELAY_URL_ENV = "_OMNIGENT_RELAY_URL"
+_RELAY_TOKEN_ENV = "_OMNIGENT_RELAY_TOKEN"
+
+_TOOL_RELAY_FILE = "tool_relay.json"
+
+
+class _EvaluationEvent(TypedDict):
+    type: str
+    target: str
+    data: dict[str, object]
+    context: dict[str, object]
+    request_data: NotRequired[dict[str, object]]
+
+
+class PolicyHookEvaluationRequest(TypedDict):
+    event: _EvaluationEvent
+
+
+def read_relay_policy_config(
+    bridge_dir: os.PathLike[str],
+) -> tuple[str, str, str] | None:
+    """Return ``(relay_url, relay_token, session_id)`` from ``tool_relay.json``.
+
+    Returns ``None`` when the relay file is absent or incomplete so callers
+    can fall back to the direct-server path.
+    """
+    from pathlib import Path
+
+    path = Path(bridge_dir) / _TOOL_RELAY_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    url = data.get("url")
+    token = data.get("token")
+    sid = data.get("session_id")
+    if not isinstance(url, str) or not isinstance(token, str) or not isinstance(sid, str):
+        return None
+    return url, token, sid
+
+
+def relay_policy_evaluate_url(relay_url: str) -> str:
+    """Return the relay's ``/policies/evaluate`` endpoint URL."""
+    return f"{relay_url.rstrip('/')}/policies/evaluate"
 
 
 def policy_hook_request_headers() -> dict[str, str]:
@@ -226,7 +273,7 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
 def hook_payload_to_evaluation_request(
     hook_event: str,
     payload: dict[str, object],
-) -> dict[str, object] | None:
+) -> PolicyHookEvaluationRequest | None:
     """
     Convert a native-harness tool-hook payload into a proto ``EvaluationRequest``.
 
@@ -476,7 +523,7 @@ def fail_closed_hook_output(
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],
-    eval_request: dict[str, object],
+    eval_request: Mapping[str, object],
     read_timeout: float,
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,

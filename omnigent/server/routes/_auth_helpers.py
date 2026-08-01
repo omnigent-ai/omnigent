@@ -32,7 +32,9 @@ from omnigent.server.auth import (
 )
 from omnigent.server.permissions import (
     check_session_access,
+    check_session_approval_access,
     resolved_allows,
+    resolved_can_approve,
     resolved_level,
 )
 from omnigent.stores import ConversationStore
@@ -180,6 +182,78 @@ async def require_access(
     )
 
 
+def _require_approval_access_sync(
+    user_id: str | None,
+    conversation_id: str,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> None:
+    """Synchronous core of :func:`require_approval_access`."""
+    if permission_store is None:
+        return
+    if user_id is None:
+        raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
+    if check_session_approval_access(
+        user_id, conversation_id, permission_store, conversation_store
+    ):
+        return
+    if check_session_access(user_id, conversation_id, 1, permission_store, conversation_store):
+        raise OmnigentError(
+            f"{user_id!r} needs delegated approval permission on session {conversation_id!r}",
+            code=ErrorCode.FORBIDDEN,
+        )
+    raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+
+
+async def require_approval_access(
+    user_id: str | None,
+    conversation_id: str,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> None:
+    """Require owner or explicitly delegated approval authority."""
+    await asyncio.to_thread(
+        _require_approval_access_sync,
+        user_id,
+        conversation_id,
+        permission_store,
+        conversation_store,
+    )
+
+
+def _get_approval_access_sync(
+    user_id: str | None,
+    conversation_id: str,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> bool | None:
+    """Return effective approval authority without raising."""
+    if permission_store is None or user_id is None:
+        return None
+    return check_session_approval_access(
+        user_id,
+        conversation_id,
+        permission_store,
+        conversation_store,
+    )
+
+
+async def get_approval_access(
+    user_id: str | None,
+    conversation_id: str,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> bool | None:
+    """Return whether the user may accept privileged session actions."""
+    return await asyncio.to_thread(
+        _get_approval_access_sync,
+        user_id,
+        conversation_id,
+        permission_store,
+        conversation_store,
+    )
+
+
 def _get_permission_level_sync(
     user_id: str | None,
     conversation_id: str,
@@ -244,10 +318,13 @@ class SessionAccess:
         when permissions are disabled (no lookup happened) or for admins
         (who bypass the conversation lookup) — callers fall back to their
         own fetch in those cases.
+    :param can_approve: Whether the caller may accept privileged actions,
+        or ``None`` when permissions are disabled.
     """
 
     level: int | None
     conversation: Conversation | None
+    can_approve: bool | None
 
 
 def _require_access_and_level_sync(
@@ -283,7 +360,7 @@ def _require_access_and_level_sync(
         404 no access at all / conversation not found.
     """
     if permission_store is None:
-        return SessionAccess(level=None, conversation=None)
+        return SessionAccess(level=None, conversation=None, can_approve=None)
     if user_id is None:
         raise OmnigentError(
             "Authentication required",
@@ -301,7 +378,7 @@ def _require_access_and_level_sync(
     # conversation). A missing conversation is left for the snapshot builder
     # to 404 on, exactly as today.
     if access.is_admin:
-        return SessionAccess(level=level, conversation=None)
+        return SessionAccess(level=level, conversation=None, can_approve=True)
 
     conv = conversation_store.get_conversation(conversation_id)
     if conv is None:
@@ -326,7 +403,17 @@ def _require_access_and_level_sync(
             conversation_store,
         )
     if allowed:
-        return SessionAccess(level=level, conversation=conv)
+        can_approve = (
+            resolved_can_approve(access)
+            if conv.parent_conversation_id is None
+            else check_session_approval_access(
+                user_id,
+                conv.parent_conversation_id,
+                permission_store,
+                conversation_store,
+            )
+        )
+        return SessionAccess(level=level, conversation=conv, can_approve=can_approve)
 
     # Denied — distinguish "has some access but not enough" (403) from
     # "no access at all" (404, to avoid leaking session existence).

@@ -81,12 +81,14 @@ export function ScheduleFields({
   const hourColumnRef = useRef<HTMLDivElement | null>(null);
   const minuteColumnRef = useRef<HTMLDivElement | null>(null);
   const periodColumnRef = useRef<HTMLDivElement | null>(null);
-  const [timeText, setTimeText] = useState(() => formatInputValue(model, isHourly));
+  const [timeText, setTimeText] = useState(() =>
+    formatInputValue(model.hour, model.minute, isHourly),
+  );
   const [timePickerOpen, setTimePickerOpen] = useState(false);
 
   useEffect(() => {
     if (document.activeElement === inputRef.current) return;
-    setTimeText(formatInputValue(model, isHourly));
+    setTimeText(formatInputValue(model.hour, model.minute, isHourly));
   }, [isHourly, model.hour, model.minute]);
 
   const pickerParts = toPickerParts(getPickerTime());
@@ -363,10 +365,10 @@ function pad(n: number): string {
   return n.toString().padStart(2, "0");
 }
 
-function formatInputValue(model: ScheduleModel, isHourly: boolean): string {
-  if (isHourly) return formatMinuteInput(model.minute);
-  if (!Number.isInteger(model.hour) || !Number.isInteger(model.minute)) return "";
-  return formatTimeInput(model.hour, model.minute);
+function formatInputValue(hour: number, minute: number, isHourly: boolean): string {
+  if (isHourly) return formatMinuteInput(minute);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return "";
+  return formatTimeInput(hour, minute);
 }
 
 function formatMinuteInput(minute: number): string {

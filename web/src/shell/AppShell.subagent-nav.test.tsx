@@ -19,6 +19,10 @@
 // mock used by AppShell.test.tsx) so we can drive a real ``<Link>``
 // click through the router and observe the resulting rail-tab state.
 
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSessionModule from "@/hooks/useSession";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -34,7 +38,7 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals etc.) — only the
   // network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -52,7 +56,7 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
   // cachedTreeContains (which reads the query cache seeded below) stay
   // genuine; only the hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -60,7 +64,7 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // top-level session it resolves without fetching, and during the
   // navigation race (parentSessionId undefined) it stays null, which
   // is exactly the production behavior the sticky root rides out.
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
 vi.mock("@/hooks/useAgents", () => ({

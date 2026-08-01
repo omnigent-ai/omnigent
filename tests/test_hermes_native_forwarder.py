@@ -126,6 +126,81 @@ def test_discover_child_session_returns_newest_child(tmp_path: Path) -> None:
     assert f._discover_child_session(db, "child_new") is None
 
 
+# Newer Hermes (schema_version >= 11) dropped ``sessions.cwd`` and
+# ``messages.active`` / ``messages.compacted``. The forwarder must introspect
+# the live schema and adapt its SELECTs rather than raising ``no such column``
+# (which silently aborts discovery/mirroring — the exact "hermes doesn't work"
+# symptom on the shared CoDA host).
+_SCHEMA_V11 = """
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    parent_session_id TEXT
+);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    tool_name TEXT
+);
+"""
+
+
+def _seed_db_v11(path: Path, *, started_at: float, session_id: str = "20260710_1") -> None:
+    """Seed a schema-11 Hermes DB (no cwd / active / compacted columns)."""
+    con = sqlite3.connect(path)
+    con.executescript(_SCHEMA_V11)
+    con.execute("INSERT INTO schema_version(version) VALUES (11)")
+    con.execute(
+        "INSERT INTO sessions(id, source, started_at) VALUES (?,?,?)",
+        (session_id, "cli", started_at),
+    )
+    con.executemany(
+        "INSERT INTO messages(session_id, role, content, tool_call_id, tool_calls, tool_name)"
+        " VALUES (?,?,?,?,?,?)",
+        [
+            (session_id, "user", "ping", None, None, None),
+            (session_id, "assistant", "PONG_4242", None, None, None),
+        ],
+    )
+    con.commit()
+    con.close()
+
+
+def test_discover_session_id_v11_no_cwd_binds_lone_session(tmp_path: Path) -> None:
+    """Schema-11 DB has no cwd column; discovery binds the lone since-launch row."""
+    db = tmp_path / "state.db"
+    _seed_db_v11(db, started_at=1000.0)
+    # cwd is unknown/irrelevant on this schema; any workspace resolves the lone row.
+    assert f._discover_session_id(db, str(tmp_path), 1000.0) == "20260710_1"
+    # Floor still applies: a session started before launch is not bound.
+    assert f._discover_session_id(db, str(tmp_path), 2000.0) is None
+
+
+def test_read_new_items_v11_no_active_column(tmp_path: Path) -> None:
+    """Message read must not require the dropped ``active`` column (schema 11)."""
+    db = tmp_path / "state.db"
+    _seed_db_v11(db, started_at=1000.0)
+    items = f._read_new_items(db, "20260710_1", 0, "hermes-native-ui")
+    posted = [i for i in items if i.item_type]
+    assert len(posted) == 2
+    assert posted[0].item_data["role"] == "user"
+    assert posted[1].item_data["role"] == "assistant"
+    assert posted[1].item_data["content"] == [{"type": "output_text", "text": "PONG_4242"}]
+
+
+def test_has_new_compaction_v11_no_compacted_column(tmp_path: Path) -> None:
+    """Compaction detection returns False (no boundary) when the column is gone."""
+    db = tmp_path / "state.db"
+    _seed_db_v11(db, started_at=1000.0)
+    assert f._has_new_compaction(db, "20260710_1") is False
+
+
 def test_read_new_items_maps_roles_and_strips_attachments(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     _seed_db(db, cwd=str(tmp_path), started_at=1000.0)

@@ -31,7 +31,7 @@ from omnigent.version import VERSION
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from omnigent.runner.app import ResolvedSpec
+    from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
@@ -512,11 +512,11 @@ def _make_auth_token_factory(
     # credential at rest and no fixed session-length cap.
     if _allow_delegated_mint and resolved_server_url:
         try:
-            binding_token = _runner_tunnel_binding_token_from_env()
+            fallback_binding_token = _runner_tunnel_binding_token_from_env()
         except RuntimeError:
-            binding_token = None
-        if binding_token is not None:
-            return _make_managed_mint_factory(resolved_server_url, binding_token)
+            fallback_binding_token = None
+        if fallback_binding_token is not None:
+            return _make_managed_mint_factory(resolved_server_url, fallback_binding_token)
     return None
 
 
@@ -913,7 +913,7 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404.
     """
-    from omnigent.runner.app import ResolvedSpec
+    from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
     if session_id is None:
@@ -979,6 +979,7 @@ def create_app(
         OMNIGENT_SESSION_ENV_VALUE,
         OMNIGENT_SESSION_ENV_VAR,
         RUNNER_ID_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
         get_stable_runner_id,
     )
     from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
@@ -1017,6 +1018,7 @@ def create_app(
     # token cache); otherwise build our own.
     if auth_token_factory is None:
         auth_token_factory = _make_auth_token_factory()
+    binding_token = _runner_tunnel_binding_token_from_env()
     server_client = httpx.AsyncClient(
         base_url=server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
@@ -1029,7 +1031,11 @@ def create_app(
         #
         # The workspace-routing header (empty unless a ?o= selector was
         # recorded for this server) routes these callbacks to the workspace.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_request_headers(server_url)},
+        headers={
+            "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+            **({RUNNER_TUNNEL_TOKEN_HEADER: binding_token} if binding_token is not None else {}),
+            **databricks_request_headers(server_url),
+        },
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
@@ -1108,7 +1114,7 @@ def create_app(
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
     # CLI launcher and this runner process via env var.
-    runner_auth_token = _runner_tunnel_binding_token_from_env()
+    runner_auth_token = binding_token
 
     app = create_runner_app(
         process_manager=pm,
