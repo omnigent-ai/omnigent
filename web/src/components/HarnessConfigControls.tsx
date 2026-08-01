@@ -119,6 +119,17 @@ export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
+// The reasoning-effort levels the GitHub Copilot SDK accepts (its session
+// literal has no "max"; mirrors COPILOT_EFFORTS server-side). Per-model
+// support is enforced by the Copilot backend — an unsupported pick is
+// dropped with a warning at run time rather than failing the turn.
+export const COPILOT_EFFORTS: { value: string; label: string }[] = [
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "xHigh" },
+];
+
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,
  * the control on the right. Mirrors the "Configure …" modal layout.

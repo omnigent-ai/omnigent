@@ -7,6 +7,7 @@ export const UI_MODE_TERMINAL_VALUE = "terminal";
 export type NativeCodingAgentIconKind =
   | "claude"
   | "codex"
+  | "copilot"
   | "opencode"
   | "pi"
   | "cursor"
@@ -16,13 +17,15 @@ export type NativeCodingAgentIconKind =
   | "antigravity"
   | "kimi"
   | "hermes";
-export type NativeCodingAgentCapability = "permissionMode" | "approvalMode" | "cursorMode";
+export type NativeCodingAgentCapability =
+  "permissionMode" | "approvalMode" | "cursorMode" | "modelPicker";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
   agentName: string;
   harness: string;
-  wrapperLabel: string;
+  /** Absent for chat-mode entries, which never carry terminal wrapper labels. */
+  wrapperLabel?: string;
   /**
    * `omnigent.wrapper` value stamped on the children this vendor spawns
    * inside its own CLI (Claude's Task tool, Codex collab threads). Mirrors
@@ -33,6 +36,14 @@ export interface NativeCodingAgentSpec {
   displayName: string;
   iconKind: NativeCodingAgentIconKind;
   sortRank: number;
+  /**
+   * How sessions created from this entry run. "terminal" (the default) is
+   * the native-CLI-in-a-terminal wrapper every classic entry uses; "chat" is
+   * an SDK-in-process harness that gets a first-class row in the picker's
+   * Harnesses section but creates plain chat sessions: no wrapper labels,
+   * excluded from harness-keyed terminal-session classification.
+   */
+  sessionMode?: "terminal" | "chat";
   capabilities?: readonly NativeCodingAgentCapability[];
   /**
    * A fully supported harness — the integration we maintain and test end to
@@ -66,6 +77,24 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 20,
     capabilities: ["approvalMode"],
     fullySupported: true,
+  },
+  {
+    // GitHub Copilot is the one chat-mode entry: the harness is
+    // SDK-in-process (no native TUI to wrap), so sessions created from this
+    // row are plain chat sessions. The row binds to the server-seeded
+    // `copilot` built-in agent by NAME only; chat entries are excluded from
+    // the harness-keyed lookup below, so user-created agents on the copilot
+    // harness stay ordinary picker agents instead of being folded into this
+    // row, and copilot sessions are never classified as terminal sessions.
+    // Readiness (token or Copilot CLI login) gates the row like any other.
+    key: "copilot",
+    agentName: "copilot",
+    harness: "copilot",
+    displayName: "Copilot",
+    iconKind: "copilot",
+    sortRank: 22,
+    sessionMode: "chat",
+    capabilities: ["modelPicker"],
   },
   {
     key: "opencode",
@@ -178,11 +207,20 @@ export const NATIVE_CODING_AGENTS = [
 const BY_AGENT_NAME = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.agentName, agent]),
 );
+// Terminal entries only: a chat-mode entry must not claim every agent bound
+// to its harness (a user-created copilot agent stays an ordinary agent) and
+// must never classify sessions as terminal sessions. The callbacks widen to
+// the interface: the const literal union drops the optional fields an entry
+// omits, so `sessionMode`/`wrapperLabel` only exist on the widened type.
 const BY_HARNESS = new Map<string, NativeCodingAgentSpec>(
-  NATIVE_CODING_AGENTS.map((agent) => [agent.harness, agent]),
+  NATIVE_CODING_AGENTS.filter(
+    (agent: NativeCodingAgentSpec) => (agent.sessionMode ?? "terminal") === "terminal",
+  ).map((agent) => [agent.harness, agent]),
 );
 const BY_WRAPPER = new Map<string, NativeCodingAgentSpec>(
-  NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
+  NATIVE_CODING_AGENTS.flatMap((agent: NativeCodingAgentSpec) =>
+    agent.wrapperLabel == null ? [] : [[agent.wrapperLabel, agent] as const],
+  ),
 );
 // Kept out of BY_WRAPPER: a sub-agent child is NOT a native-terminal session
 // (it owns no PTY and takes no input), so `isNativeWrapper` must keep
@@ -306,7 +344,8 @@ export function nativeWrapperLabelsForAgent(
   agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
 ): Record<string, string> | undefined {
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-  if (nativeAgent === undefined) return undefined;
+  // Chat-mode entries create plain chat sessions: no terminal UI, no wrapper.
+  if (nativeAgent === undefined || nativeAgent.wrapperLabel == null) return undefined;
   return {
     [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
     [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel,

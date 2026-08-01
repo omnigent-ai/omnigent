@@ -48,6 +48,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   CLAUDE_NATIVE_EFFORTS,
+  COPILOT_EFFORTS,
   ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
@@ -1361,6 +1362,8 @@ function HarnessConfigModal({
   claudeModelsLoading,
   codexModelOptions,
   codexModelsLoading,
+  copilotModelOptions,
+  copilotModelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1389,6 +1392,8 @@ function HarnessConfigModal({
   claudeModelsLoading: boolean;
   codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   codexModelsLoading: boolean;
+  copilotModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  copilotModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1408,9 +1413,18 @@ function HarnessConfigModal({
   const hasPermission = nativeAgentHasCapability(agent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
+  const hasModelPicker = nativeAgentHasCapability(agent, "modelPicker");
   const isCodex = entryHarness === "codex-native";
-  const modelOptions = isCodex ? codexModelOptions : claudeModelOptions;
-  const modelsLoading = isCodex ? codexModelsLoading : claudeModelsLoading;
+  const modelOptions = hasModelPicker
+    ? copilotModelOptions
+    : isCodex
+      ? codexModelOptions
+      : claudeModelOptions;
+  const modelsLoading = hasModelPicker
+    ? copilotModelsLoading
+    : isCodex
+      ? codexModelsLoading
+      : claudeModelsLoading;
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
@@ -1518,6 +1532,11 @@ function HarnessConfigModal({
     } else if (hasCursor) {
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
+    } else if (hasModelPicker) {
+      setPickedModel(draftModel);
+      setPickedEffort(draftEffort);
+      if (entryHarness)
+        writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (brainDefault) {
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
@@ -1711,10 +1730,78 @@ function HarnessConfigModal({
             </ConfigRow>
           )}
 
+          {/* Model + effort for the chat-mode Copilot entry. The catalog comes
+          from the host's model-options probe (the Copilot backend's own list
+          for the signed-in seat); efforts are the SDK's fixed literal. */}
+          {hasModelPicker && (
+            <>
+              <ConfigRow label="Model" description="Underlying LLM">
+                <Select value={modelValue} onValueChange={onModelChange}>
+                  <SelectTrigger
+                    className="w-full"
+                    data-testid="new-chat-landing-config-model"
+                    aria-label="Model"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="[&_[data-slot=select-item]]:pl-2.5"
+                  >
+                    <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+                    {modelOptions.map((m) => (
+                      <SelectItem key={m.id} value={m.id}>
+                        {m.displayName ?? m.id}
+                      </SelectItem>
+                    ))}
+                    {modelsLoading && (
+                      <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                        Loading models…
+                      </div>
+                    )}
+                    {!modelsLoading && modelOptions.length === 0 && (
+                      <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                        Models unavailable
+                      </div>
+                    )}
+                  </SelectContent>
+                </Select>
+              </ConfigRow>
+
+              <ConfigRow label="Effort" description="Reasoning depth vs. speed">
+                <Select
+                  value={draftEffort || EFFORT_SELECT_NONE}
+                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                >
+                  <SelectTrigger
+                    className="w-full"
+                    data-testid="new-chat-landing-config-effort"
+                    aria-label="Reasoning effort"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="[&_[data-slot=select-item]]:pl-2.5"
+                  >
+                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                    {COPILOT_EFFORTS.map((e) => (
+                      <SelectItem key={e.value} value={e.value}>
+                        {e.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </ConfigRow>
+            </>
+          )}
+
           {/* Stays rendered while Smart Routing is the pick: it is the control
           that selected it, so hiding it would strand the choice with no way to
           read it back or switch away without cancelling. */}
-          {!hasPermission && !hasApproval && !hasCursor && brainDefault && (
+          {!hasPermission && !hasApproval && !hasCursor && !hasModelPicker && brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
               <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
                 <SelectTrigger
@@ -2539,6 +2626,17 @@ export function NewChatLandingScreen() {
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
+  const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
+  // Copilot's catalog is resolved by the host from the Copilot backend itself
+  // (one short-lived CLI probe, cached 30s by the query layer), so unlike the
+  // always-on claude/codex fetches above it is gated on the entry actually
+  // being selected.
+  const { data: hostCopilotModelOptions, isLoading: hostCopilotModelsLoading } =
+    useHostModelOptions(selectedHostId, "copilot", !sandboxSelected && supportsModelPicker);
+  const copilotModelOptions = useMemo(
+    () => (sandboxSelected ? [] : (hostCopilotModelOptions ?? [])),
+    [hostCopilotModelOptions, sandboxSelected],
+  );
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
@@ -2580,6 +2678,7 @@ export function NewChatLandingScreen() {
     supportsPermissionMode ||
     supportsApprovalMode ||
     supportsCursorMode ||
+    supportsModelPicker ||
     smartRoutingEligible ||
     (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
   // Label/value pairs summarizing the selected agent's current run-config, for
@@ -2631,6 +2730,20 @@ export function NewChatLandingScreen() {
     const routingRow: { label: string; value: string }[] = routingOn
       ? [{ label: "Model", value: SMART_ROUTING_LABEL }]
       : [];
+    // Copilot is a chat entry and never a Smart Routing arm, so it reports its
+    // own Model/Effort pair without the routing row.
+    if (supportsModelPicker) {
+      const modelValue =
+        copilotModelOptions.find((m) => m.id === pickedModel)?.displayName ??
+        (pickedModel || "Default");
+      const effortValue = pickedEffort
+        ? (COPILOT_EFFORTS.find((e) => e.value === pickedEffort)?.label ?? pickedEffort)
+        : "Default";
+      return [
+        { label: "Model", value: modelValue },
+        { label: "Effort", value: effortValue },
+      ];
+    }
     if (supportsApprovalMode) {
       const isCodex = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness === "codex-native";
       // Bypass is the most-permissive Approval choice, not a separate knob — so
@@ -2673,12 +2786,14 @@ export function NewChatLandingScreen() {
     supportsPermissionMode,
     supportsApprovalMode,
     supportsCursorMode,
+    supportsModelPicker,
     selectedAgent,
     brainHarnessLabelsAll,
     routingOn,
     pickedModel,
     claudeModelOptions,
     codexModelOptions,
+    copilotModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -3457,6 +3572,7 @@ export function NewChatLandingScreen() {
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
+      const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is
@@ -3621,19 +3737,23 @@ export function NewChatLandingScreen() {
                     : undefined,
             // Model + reasoning effort, persisted on the session row before
             // the runner launches. Claude and Codex read model_override at
-            // terminal launch; an unselected ("") knob is omitted so the
-            // harness keeps its own configured/default model.
+            // terminal launch; the SDK copilot harness reads it as its
+            // spawn-env model override and the effort per turn. An unselected
+            // ("") knob is omitted so the harness keeps its own
+            // configured/default model.
             model_override:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              (agentSupportsPermissionMode || nativeAgent?.harness === "codex-native") &&
+              (agentSupportsPermissionMode ||
+                agentSupportsModelPicker ||
+                nativeAgent?.harness === "codex-native") &&
               pickedModel
                 ? pickedModel
                 : undefined,
             reasoning_effort:
               !smartRoutingHarnessSelected &&
               !routingOwnsModel &&
-              agentSupportsPermissionMode &&
+              (agentSupportsPermissionMode || agentSupportsModelPicker) &&
               pickedEffort
                 ? pickedEffort
                 : undefined,
@@ -4180,6 +4300,10 @@ export function NewChatLandingScreen() {
                     codexModelOptions={codexModelOptions}
                     codexModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
+                    }
+                    copilotModelOptions={copilotModelOptions}
+                    copilotModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostCopilotModelsLoading
                     }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}
