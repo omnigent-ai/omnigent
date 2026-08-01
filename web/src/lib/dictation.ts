@@ -35,6 +35,7 @@ export interface DictationSessionEvents {
 
 export interface DictationSessionOptions {
   microphoneDeviceId?: string | null;
+  signal?: AbortSignal;
 }
 
 /**
@@ -54,12 +55,15 @@ const dictationAudioConstraints = (microphoneDeviceId?: string | null): MediaTra
 /** Acquire the selected input, retrying a missing exact device once with the system default. */
 export async function getDictationMediaStream(
   microphoneDeviceId?: string | null,
+  signal?: AbortSignal,
 ): Promise<MediaStream> {
+  throwIfAborted(signal);
   try {
     return await navigator.mediaDevices.getUserMedia({
       audio: dictationAudioConstraints(microphoneDeviceId),
     });
   } catch (error) {
+    throwIfAborted(signal);
     const name = error instanceof DOMException ? error.name : "";
     if (microphoneDeviceId && (name === "NotFoundError" || name === "OverconstrainedError")) {
       return navigator.mediaDevices.getUserMedia({ audio: dictationAudioConstraints() });
@@ -224,6 +228,7 @@ export class DictationSession {
       if (ws.readyState === WebSocket.OPEN) ws.send(msg.data.buffer);
     };
     ws.onmessage = (msg) => {
+      if (this.closed) return;
       if (typeof msg.data !== "string") return;
       const event = parseDictationEvent(msg.data);
       if (event === null) return;
@@ -240,6 +245,11 @@ export class DictationSession {
     };
   }
 
+  /** The live capture stream, exposed for read-only consumers such as metering. */
+  get captureStream(): MediaStream {
+    return this.mediaStream;
+  }
+
   /**
    * Acquire the mic, open the socket, and wait for the server's ready
    * handshake. Rejects (with everything torn down) when the mic is
@@ -250,14 +260,35 @@ export class DictationSession {
     events: DictationSessionEvents,
     options: DictationSessionOptions = {},
   ): Promise<DictationSession> {
-    const mediaStream = await getDictationMediaStream(options.microphoneDeviceId);
-
+    const { signal } = options;
+    let mediaStream: MediaStream | null = null;
     let ws: WebSocket | null = null;
     let audioContext: AudioContext | null = null;
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      if (mediaStream) {
+        for (const track of mediaStream.getTracks()) track.stop();
+      }
+      if (audioContext && audioContext.state !== "closed") void audioContext.close();
+      ws?.close();
+    };
+    signal?.addEventListener("abort", cleanup, { once: true });
     try {
+      const mediaPromise = getDictationMediaStream(options.microphoneDeviceId, signal);
+      void mediaPromise.then(
+        (stream) => {
+          if (signal?.aborted) {
+            for (const track of stream.getTracks()) track.stop();
+          }
+        },
+        () => {},
+      );
+      mediaStream = await abortable(mediaPromise, signal);
       ws = new WebSocket(resolveWebSocketUrl("/v1/dictation/stream"));
       ws.binaryType = "arraybuffer";
-      await waitForReady(ws);
+      await waitForReady(ws, signal);
       // Detect a close during the async audio-graph setup below: the
       // handler-swap in the constructor would otherwise never see it and
       // start() would resolve a dead session that silently drops audio.
@@ -275,7 +306,8 @@ export class DictationSession {
       } catch {
         audioContext = new AudioContext();
       }
-      await audioContext.audioWorklet.addModule(workletUrl());
+      await abortable(audioContext.audioWorklet.addModule(workletUrl()), signal);
+      throwIfAborted(signal);
       const source = audioContext.createMediaStreamSource(mediaStream);
       const node = new AudioWorkletNode(audioContext, "omnigent-pcm16-downsampler");
       // The worklet only renders while it reaches the destination; route
@@ -290,11 +322,12 @@ export class DictationSession {
       if (closedDuringSetup || ws.readyState !== WebSocket.OPEN) {
         throw new Error("dictation connection closed during setup");
       }
+      signal?.removeEventListener("abort", cleanup);
       return new DictationSession(events, ws, mediaStream, audioContext, node);
     } catch (error) {
-      for (const track of mediaStream.getTracks()) track.stop();
-      if (audioContext && audioContext.state !== "closed") void audioContext.close();
-      ws?.close();
+      cleanup();
+      signal?.removeEventListener("abort", cleanup);
+      if (signal?.aborted) throw abortError();
       throw error;
     }
   }
@@ -366,35 +399,68 @@ export class DictationSession {
  * close (typed {@link DictationBusyError} for the 1013 at-capacity close),
  * or timeout.
  */
-function waitForReady(ws: WebSocket): Promise<void> {
+function waitForReady(ws: WebSocket, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
+    const settle = (callback: () => void) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", handleAbort);
+      callback();
+    };
+    const handleAbort = () => settle(() => reject(abortError()));
     const timer = setTimeout(() => {
-      reject(new Error("dictation server did not become ready"));
+      settle(() => reject(new Error("dictation server did not become ready")));
     }, READY_TIMEOUT_MS);
+    signal?.addEventListener("abort", handleAbort, { once: true });
     ws.onmessage = (msg) => {
       if (typeof msg.data !== "string") return;
       const event = parseDictationEvent(msg.data);
       if (event?.type === "ready") {
-        clearTimeout(timer);
-        resolve();
+        settle(resolve);
       } else if (event?.type === "error") {
         // The engine failed to initialize; surface its message rather
         // than the generic close that follows.
-        clearTimeout(timer);
-        reject(new Error(event.message));
+        settle(() => reject(new Error(event.message)));
       }
     };
     ws.onerror = () => {
-      clearTimeout(timer);
-      reject(new Error("dictation connection failed"));
+      settle(() => reject(new Error("dictation connection failed")));
     };
     ws.onclose = (event) => {
-      clearTimeout(timer);
-      reject(
-        event.code === WS_CLOSE_TRY_AGAIN_LATER
-          ? new DictationBusyError("dictation is at capacity")
-          : new Error("dictation connection closed"),
+      settle(() =>
+        reject(
+          event.code === WS_CLOSE_TRY_AGAIN_LATER
+            ? new DictationBusyError("dictation is at capacity")
+            : new Error("dictation connection closed"),
+        ),
       );
     };
+    if (signal?.aborted) handleAbort();
+  });
+}
+
+function abortError(): DOMException {
+  return new DOMException("Dictation start aborted", "AbortError");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const handleAbort = () => reject(abortError());
+    signal.addEventListener("abort", handleAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", handleAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", handleAbort);
+        reject(error);
+      },
+    );
   });
 }

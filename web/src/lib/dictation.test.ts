@@ -5,7 +5,7 @@
 // against the server's fake engine.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getDictationMediaStream, parseDictationEvent } from "./dictation";
+import { DictationSession, getDictationMediaStream, parseDictationEvent } from "./dictation";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -100,4 +100,131 @@ describe("getDictationMediaStream", () => {
       expect(getUserMedia).toHaveBeenCalledTimes(1);
     },
   );
+});
+
+describe("DictationSession.start", () => {
+  const events = { onPartial: vi.fn(), onFinal: vi.fn(), onError: vi.fn() };
+
+  it("aborts while waiting for ready and closes the socket and capture", async () => {
+    const stop = vi.fn();
+    installMediaDevices(
+      vi.fn().mockResolvedValue({ getTracks: () => [{ stop }] } as unknown as MediaStream),
+    );
+    const close = vi.fn();
+    const constructed = vi.fn();
+    class FakeWebSocket {
+      static OPEN = 1;
+      readyState = 0;
+      binaryType = "";
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      close = close;
+      constructor() {
+        constructed();
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const controller = new AbortController();
+
+    const starting = DictationSession.start(events, { signal: controller.signal });
+    await vi.waitFor(() => expect(constructed).toHaveBeenCalledOnce());
+    controller.abort();
+
+    await expect(starting).rejects.toMatchObject({ name: "AbortError" });
+    expect(close).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it("stops capture that resolves after an abort during media acquisition", async () => {
+    const stop = vi.fn();
+    let resolveCapture: ((stream: MediaStream) => void) | undefined;
+    installMediaDevices(
+      vi.fn(
+        () =>
+          new Promise<MediaStream>((resolve) => {
+            resolveCapture = resolve;
+          }),
+      ),
+    );
+    const controller = new AbortController();
+
+    const starting = DictationSession.start(events, { signal: controller.signal });
+    controller.abort();
+    await expect(starting).rejects.toMatchObject({ name: "AbortError" });
+    resolveCapture?.({ getTracks: () => [{ stop }] } as unknown as MediaStream);
+    await vi.waitFor(() => expect(stop).toHaveBeenCalledOnce());
+
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it("aborts during worklet setup and closes all acquired resources", async () => {
+    const stop = vi.fn();
+    installMediaDevices(
+      vi.fn().mockResolvedValue({ getTracks: () => [{ stop }] } as unknown as MediaStream),
+    );
+    const wsClose = vi.fn();
+    class FakeWebSocket {
+      static OPEN = 1;
+      readyState = FakeWebSocket.OPEN;
+      binaryType = "";
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      close = wsClose;
+      addEventListener() {}
+      removeEventListener() {}
+      constructor() {
+        queueMicrotask(() => this.onmessage?.({ data: '{"type":"ready"}' } as MessageEvent));
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const contextClose = vi.fn(function (this: { state: AudioContextState }) {
+      this.state = "closed";
+      return Promise.resolve();
+    });
+    const addModule = vi.fn(() => new Promise<void>(() => {}));
+    class FakeAudioContext {
+      state: AudioContextState = "running";
+      close = contextClose;
+      audioWorklet = { addModule };
+    }
+    vi.stubGlobal("AudioContext", FakeAudioContext);
+    const controller = new AbortController();
+
+    const starting = DictationSession.start(events, { signal: controller.signal });
+    await vi.waitFor(() => expect(addModule).toHaveBeenCalledOnce());
+    controller.abort();
+
+    await expect(starting).rejects.toMatchObject({ name: "AbortError" });
+    expect(wsClose).toHaveBeenCalledOnce();
+    expect(contextClose).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+});
+
+describe("DictationSession lifecycle", () => {
+  it("ignores socket events after cancel", () => {
+    const events = { onPartial: vi.fn(), onFinal: vi.fn(), onError: vi.fn() };
+    const ws = {
+      readyState: WebSocket.OPEN,
+      close: vi.fn(),
+      send: vi.fn(),
+      onmessage: null,
+      onclose: null,
+    } as unknown as WebSocket;
+    const stream = { getTracks: () => [] } as unknown as MediaStream;
+    const context = { state: "running", close: vi.fn() } as unknown as AudioContext;
+    const worklet = { port: { onmessage: null } } as unknown as AudioWorkletNode;
+    const session = Reflect.construct(DictationSession, [events, ws, stream, context, worklet]) as {
+      cancel: () => void;
+    };
+
+    session.cancel();
+    (ws.onmessage as ((event: MessageEvent) => void) | null)?.({
+      data: '{"type":"error","message":"late"}',
+    } as MessageEvent);
+
+    expect(events.onError).not.toHaveBeenCalled();
+  });
 });
