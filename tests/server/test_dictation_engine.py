@@ -8,6 +8,7 @@ itself unless the extra and a model are installed (developer machines).
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,8 @@ def _clean_engine_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(dictation.ENGINE_ENV, raising=False)
     monkeypatch.delenv(dictation.MODEL_DIR_ENV, raising=False)
     monkeypatch.delenv(dictation.PUNCT_DIR_ENV, raising=False)
+    monkeypatch.delenv(dictation.MODEL_ENV, raising=False)
+    monkeypatch.delenv(dictation.MODEL_CACHE_DIR_ENV, raising=False)
     monkeypatch.delenv(dictation.MAX_STREAMS_ENV, raising=False)
     monkeypatch.delenv(dictation.MAX_FRAME_BYTES_ENV, raising=False)
     monkeypatch.delenv(dictation.MAX_TAKE_SECONDS_ENV, raising=False)
@@ -63,6 +66,140 @@ def test_availability_with_models(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     _touch_asr_files(tmp_path)
     monkeypatch.setenv(dictation.MODEL_DIR_ENV, str(tmp_path))
     assert dictation.engine_availability() == (True, None)
+
+
+def test_parakeet_mlx_availability_requires_apple_silicon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(dictation.ENGINE_ENV, dictation.ENGINE_PARAKEET_MLX)
+    monkeypatch.setattr(dictation.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(dictation.platform, "machine", lambda: "x86_64")
+    assert dictation.engine_availability() == (
+        False,
+        dictation.REASON_UNSUPPORTED_PLATFORM,
+    )
+
+
+def test_parakeet_mlx_availability_checks_extra_and_local_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(dictation.ENGINE_ENV, dictation.ENGINE_PARAKEET_MLX)
+    monkeypatch.setattr(dictation.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(dictation.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: None)
+    assert dictation.engine_availability() == (
+        False,
+        dictation.REASON_EXTRA_NOT_INSTALLED,
+    )
+
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setenv(dictation.MODEL_ENV, str(tmp_path / "missing"))
+    assert dictation.engine_availability() == (False, dictation.REASON_MODELS_MISSING)
+    monkeypatch.setenv(dictation.MODEL_ENV, "mlx-community/parakeet-tdt-0.6b-v3")
+    assert dictation.engine_availability() == (True, None)
+
+
+def test_parakeet_mlx_status_sanitizes_local_model_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(dictation.ENGINE_ENV, dictation.ENGINE_PARAKEET_MLX)
+    monkeypatch.setenv(dictation.MODEL_ENV, str(tmp_path))
+    monkeypatch.setattr(dictation.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(dictation.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
+
+    status = dictation.engine_status()
+
+    assert status["model"] == "local"
+    assert str(tmp_path) not in str(status)
+
+
+class _FakeMlxTranscriber:
+    def __init__(self) -> None:
+        self.result = SimpleNamespace(text="")
+        self.audio: list[object] = []
+        self.closed = False
+
+    def __enter__(self) -> _FakeMlxTranscriber:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.closed = True
+
+    def add_audio(self, audio: object) -> None:
+        self.audio.append(audio)
+        self.result.text = "stable draft"
+
+
+class _FakeMlxModel:
+    def __init__(self) -> None:
+        self.streams: list[_FakeMlxTranscriber] = []
+
+    def transcribe_stream(self, **kwargs: object) -> _FakeMlxTranscriber:
+        assert kwargs == {
+            "context_size": dictation._MLX_CONTEXT_SIZE,
+            "keep_original_attention": True,
+        }
+        stream = _FakeMlxTranscriber()
+        self.streams.append(stream)
+        return stream
+
+
+@pytest.fixture
+def fake_mlx(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    mlx_core = SimpleNamespace(array=lambda value: value)
+    monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=mlx_core))
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
+
+
+def _fake_mlx_engine() -> tuple[dictation.ParakeetMlxDictationEngine, _FakeMlxModel]:
+    engine = object.__new__(dictation.ParakeetMlxDictationEngine)
+    model = _FakeMlxModel()
+    engine._model = model
+    engine._lock = dictation.threading.Lock()
+    return engine, model
+
+
+def test_parakeet_mlx_stream_normalizes_pcm_and_keeps_tokens_partial(
+    fake_mlx: None,
+) -> None:
+    engine, model = _fake_mlx_engine()
+    stream = engine.create_stream()
+
+    update = stream.feed_pcm16(b"\x00@\x00\xc0")
+
+    assert update == dictation.DictationUpdate(partial="stable draft")
+    assert model.streams[0].audio[0].tolist() == pytest.approx([0.5, -0.5])
+
+
+def test_parakeet_mlx_stream_finalizes_whole_utterance_after_silence(
+    fake_mlx: None,
+) -> None:
+    engine, model = _fake_mlx_engine()
+    stream = engine.create_stream()
+    speech = b"\xff\x7f" * dictation.SAMPLE_RATE
+    silence = b"\x00\x00" * int(dictation._RULE2_MIN_TRAILING_SILENCE_S * dictation.SAMPLE_RATE)
+
+    assert stream.feed_pcm16(speech).finalized is None
+    update = stream.feed_pcm16(silence)
+
+    assert update == dictation.DictationUpdate(partial="", finalized="stable draft")
+    assert model.streams[0].closed
+    assert len(model.streams) == 2
+
+
+def test_parakeet_mlx_stream_finish_flushes_and_closes(fake_mlx: None) -> None:
+    engine, model = _fake_mlx_engine()
+    stream = engine.create_stream()
+    stream.feed_pcm16(b"\xff\x7f" * dictation.SAMPLE_RATE)
+
+    assert stream.finish() == "stable draft"
+    assert model.streams[0].closed
+    assert len(model.streams[0].audio[-1]) == dictation.SAMPLE_RATE
+    assert stream.finish() == ""
+    stream.close()
 
 
 def test_pick_model_file_prefers_int8(tmp_path: Path) -> None:
