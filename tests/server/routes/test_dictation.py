@@ -10,6 +10,7 @@ transcript by the number of PCM bytes they send.
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 import httpx
@@ -40,6 +41,15 @@ class _IdentityAuthProvider:
     def get_user_id(self, request: object) -> str:
         del request
         return "test-user"
+
+
+class _PermissionStore:
+    def __init__(self, *, admin: bool) -> None:
+        self.admin = admin
+
+    def is_admin(self, user_id: str) -> bool:
+        assert user_id == "test-user"
+        return self.admin
 
 
 def _fake_app(**router_kwargs: object) -> FastAPI:
@@ -193,6 +203,49 @@ def test_stream_rejects_excess_audio_duration(monkeypatch: pytest.MonkeyPatch) -
         assert excinfo.value.code == 1008
 
 
+def test_disconnect_waits_for_in_flight_decode_before_close() -> None:
+    decode_started = threading.Event()
+    release_decode = threading.Event()
+
+    class _Stream:
+        closed_during_decode = False
+        decoding = False
+
+        def feed_pcm16(self, data: bytes) -> dictation_engine.DictationUpdate:
+            del data
+            self.decoding = True
+            decode_started.set()
+            release_decode.wait(timeout=5)
+            self.decoding = False
+            return dictation_engine.DictationUpdate(partial="")
+
+        def finish(self) -> str:
+            return ""
+
+        def close(self) -> None:
+            self.closed_during_decode = self.decoding
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.stream = _Stream()
+
+        def create_stream(self) -> _Stream:
+            return self.stream
+
+    engine = _Engine()
+    with TestClient(_fake_app(engine_provider=lambda: engine)) as tc:
+        with tc.websocket_connect("/v1/dictation/stream") as ws:
+            assert json.loads(ws.receive_text())["type"] == "ready"
+            ws.send_bytes(_WORD_BYTES)
+            assert decode_started.wait(timeout=5)
+            threading.Timer(0.05, release_decode.set).start()
+            tc.close()
+            deadline = time.monotonic() + 5
+            while engine.stream.decoding and time.monotonic() < deadline:
+                time.sleep(0.01)
+    assert not engine.stream.closed_during_decode
+
+
 def test_status_requires_auth_and_sanitizes_remote_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dictation_engine, "_remote_connection_state", "not_attempted")
     monkeypatch.setenv(dictation_engine.ENGINE_ENV, dictation_engine.ENGINE_REMOTE)
@@ -221,3 +274,21 @@ def test_status_requires_auth_and_sanitizes_remote_url(monkeypatch: pytest.Monke
         }
         assert "password" not in response.text
         assert "worker-secret" not in response.text
+
+
+def test_status_requires_admin_in_multi_user_mode() -> None:
+    with TestClient(
+        _fake_app(
+            auth_provider=_IdentityAuthProvider(),
+            permission_store=_PermissionStore(admin=False),
+        )
+    ) as tc:
+        assert tc.get("/v1/dictation/status").status_code == 403
+
+    with TestClient(
+        _fake_app(
+            auth_provider=_IdentityAuthProvider(),
+            permission_store=_PermissionStore(admin=True),
+        )
+    ) as tc:
+        assert tc.get("/v1/dictation/status").status_code == 200

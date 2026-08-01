@@ -59,7 +59,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from typing import Final
+from typing import Final, TypeVar
 
 import anyio
 from fastapi import (
@@ -83,6 +83,7 @@ from omnigent.server.dictation import (
     max_take_seconds,
 )
 from omnigent.server.dictation_metrics import metrics
+from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
 
@@ -99,6 +100,7 @@ _PARTIAL_INTERVAL_S: Final[float] = 0.15
 def create_dictation_router(
     *,
     auth_provider: AuthProvider | None = None,
+    permission_store: PermissionStore | None = None,
     engine_provider: Callable[[], DictationEngine] | None = None,
     shared_token: str | None = None,
 ) -> APIRouter:
@@ -133,6 +135,18 @@ def create_dictation_router(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
             )
+        if permission_store is not None:
+            user_id = auth_provider.get_user_id(request) if auth_provider is not None else None
+            if user_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required",
+                )
+            if not await asyncio.to_thread(permission_store.is_admin, user_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Admin privileges required for dictation diagnostics",
+                )
         diagnostics = engine_status()
         diagnostics["capacity"] = {
             "max_streams": stream_limit,
@@ -300,7 +314,7 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
                         reason="dictation take exceeds configured duration",
                     )
                     return "duration_limit"
-                update = await asyncio.to_thread(handle.feed_pcm16, data)
+                update = await _run_handle_call(handle.feed_pcm16, data)
                 if update.finalized:
                     await websocket.send_text(
                         json.dumps({"type": "final", "text": update.finalized})
@@ -327,7 +341,7 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
             except ValueError:
                 continue
             if isinstance(control, dict) and control.get("type") == "stop":
-                tail = await asyncio.to_thread(handle.finish)
+                tail = await _run_handle_call(handle.finish)
                 await websocket.send_text(json.dumps({"type": "stopped", "text": tail}))
                 await websocket.close()
                 return "stopped"
@@ -340,3 +354,17 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
             await websocket.send_text(json.dumps({"type": "error", "message": "dictation failed"}))
             await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
         return "failed"
+
+
+_T = TypeVar("_T")
+
+
+async def _run_handle_call(call: Callable[..., _T], *args: object) -> _T:
+    """Finish a non-cancellable thread call before stream cleanup runs."""
+    task = asyncio.create_task(asyncio.to_thread(call, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            await task
+        raise

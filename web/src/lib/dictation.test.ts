@@ -65,26 +65,21 @@ describe("getDictationMediaStream", () => {
   });
 
   it.each(["NotFoundError", "OverconstrainedError"])(
-    "retries a missing exact device once with the default after %s",
+    "does not silently replace a missing selected microphone after %s",
     async (name) => {
-      const stream = {} as MediaStream;
-      const getUserMedia = vi
-        .fn()
-        .mockRejectedValueOnce(new DOMException("missing", name))
-        .mockResolvedValueOnce(stream);
+      const error = new DOMException("missing", name);
+      const getUserMedia = vi.fn().mockRejectedValue(error);
       installMediaDevices(getUserMedia);
 
-      await expect(getDictationMediaStream("mic-2")).resolves.toBe(stream);
-      expect(getUserMedia).toHaveBeenNthCalledWith(1, {
+      await expect(getDictationMediaStream("mic-2")).rejects.toBe(error);
+      expect(getUserMedia).toHaveBeenCalledOnce();
+      expect(getUserMedia).toHaveBeenCalledWith({
         audio: {
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
           deviceId: { exact: "mic-2" },
         },
-      });
-      expect(getUserMedia).toHaveBeenNthCalledWith(2, {
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
     },
   );
@@ -226,5 +221,37 @@ describe("DictationSession lifecycle", () => {
     } as MessageEvent);
 
     expect(events.onError).not.toHaveBeenCalled();
+  });
+
+  it("resolves a pending stop immediately when the server reports an error", async () => {
+    const events = { onPartial: vi.fn(), onFinal: vi.fn(), onError: vi.fn() };
+    const ws = {
+      readyState: WebSocket.OPEN,
+      close: vi.fn(),
+      send: vi.fn(),
+      onmessage: null,
+      onclose: null,
+    } as unknown as WebSocket;
+    const stream = { getTracks: () => [] } as unknown as MediaStream;
+    const context = { state: "running", close: vi.fn() } as unknown as AudioContext;
+    const port = {
+      onmessage: null as ((event: MessageEvent<Int16Array<ArrayBuffer> | null>) => void) | null,
+      postMessage: vi.fn(() =>
+        queueMicrotask(() => port.onmessage?.({ data: null } as MessageEvent)),
+      ),
+    };
+    const worklet = { port } as unknown as AudioWorkletNode;
+    const session = Reflect.construct(DictationSession, [events, ws, stream, context, worklet]) as {
+      stop: () => Promise<string>;
+    };
+
+    const stopping = session.stop();
+    await vi.waitFor(() => expect(ws.send).toHaveBeenCalled());
+    (ws.onmessage as ((event: MessageEvent) => void) | null)?.({
+      data: '{"type":"error","message":"worker failed"}',
+    } as MessageEvent);
+
+    await expect(stopping).resolves.toBe("");
+    expect(events.onError).toHaveBeenCalledWith("worker failed");
   });
 });
