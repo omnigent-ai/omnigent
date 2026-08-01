@@ -1738,10 +1738,10 @@ export function NewChatLandingScreen() {
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
-  const dictation = useDictationInsert(setMessage);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
-  const voiceSnapshotRef = useRef("");
+  const voiceSnapshotRef = useRef({ text: "", start: 0, end: 0 });
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useDictationInsert(message, setMessage, textareaRef);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
@@ -2700,6 +2700,7 @@ export function NewChatLandingScreen() {
   // argument — skills never auto-execute from the menu.
   function applySlashSelection(cmd: string) {
     setSlashMenuIndex(-1);
+    dictation.reset();
     setMessage(cmd + " ");
     textareaRef.current?.focus();
   }
@@ -2711,6 +2712,7 @@ export function NewChatLandingScreen() {
 
   // Pills only render over an empty draft, so there's never args to preserve.
   function applySkillPill(name: string) {
+    dictation.reset();
     setMessage(`/${name} `);
     textareaRef.current?.focus();
   }
@@ -2793,7 +2795,10 @@ export function NewChatLandingScreen() {
     setMention,
     mentionEntries,
     text: message,
-    setText: setMessage,
+    setText: (next) => {
+      dictation.reset();
+      setMessage(next);
+    },
     textareaRef,
   });
 
@@ -2929,6 +2934,7 @@ export function NewChatLandingScreen() {
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
     if (!canSubmit) return;
+    dictation.reset();
     setCreating(true);
     setCreateError(null);
     try {
@@ -3252,6 +3258,7 @@ export function NewChatLandingScreen() {
               ref={textareaRef}
               value={message}
               onChange={(e) => {
+                dictation.reconcileUserEdit(e.target.value);
                 setMessage(e.target.value);
                 // Recompute the active "@"-mention from the caret each keystroke
                 // (native terminal agents with a workspace — ``mentionEnabled``).
@@ -3312,6 +3319,7 @@ export function NewChatLandingScreen() {
                     e.preventDefault();
                     // Dismiss the menu by clearing the draft so the user can
                     // start fresh.
+                    dictation.reset();
                     setMessage("");
                     setSlashMenuIndex(-1);
                     return;
@@ -3460,11 +3468,26 @@ export function NewChatLandingScreen() {
                   enableHotkey
                   disabled={creating}
                   onVoiceStart={() => {
-                    voiceSnapshotRef.current = message;
+                    const selection = dictation.begin();
+                    voiceSnapshotRef.current = { text: message, ...selection };
                   }}
-                  onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
-                  onTranscript={dictation.appendFinal}
-                  onInterim={dictation.replaceInterim}
+                  onVoiceDiscard={() => {
+                    const snapshot = voiceSnapshotRef.current;
+                    dictation.reset();
+                    setMessage(snapshot.text);
+                    queueMicrotask(() => {
+                      textareaRef.current?.focus();
+                      textareaRef.current?.setSelectionRange(snapshot.start, snapshot.end);
+                    });
+                  }}
+                  onTranscript={(text) => {
+                    dismissMention();
+                    dictation.appendFinal(text);
+                  }}
+                  onInterim={(text) => {
+                    dismissMention();
+                    dictation.replaceInterim(text);
+                  }}
                 />
               </div>
               <div className="flex items-center gap-0.5 md:gap-2">
