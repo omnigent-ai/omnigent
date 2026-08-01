@@ -36,6 +36,12 @@ class _NoIdentityAuthProvider:
         return
 
 
+class _IdentityAuthProvider:
+    def get_user_id(self, request: object) -> str:
+        del request
+        return "test-user"
+
+
 def _fake_app(**router_kwargs: object) -> FastAPI:
     """Bare app carrying only the dictation router with a fake engine."""
     app = FastAPI()
@@ -153,3 +159,65 @@ def test_stream_capacity_cap(monkeypatch: pytest.MonkeyPatch) -> None:
                 with pytest.raises(WebSocketDisconnect) as excinfo:
                     second.receive_text()
                 assert excinfo.value.code == 1013
+
+
+def test_worker_shared_token_is_required_before_accept() -> None:
+    app = _fake_app(shared_token="secret")
+    with TestClient(app) as tc:
+        with pytest.raises(WebSocketDisconnect):
+            with tc.websocket_connect("/v1/dictation/stream") as ws:
+                ws.receive_text()
+        with tc.websocket_connect(
+            "/v1/dictation/stream", headers={"Authorization": "Bearer secret"}
+        ) as ws:
+            assert json.loads(ws.receive_text()) == {"type": "ready"}
+
+
+def test_stream_rejects_oversized_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(dictation_engine.MAX_FRAME_BYTES_ENV, "8")
+    with TestClient(_fake_app()) as tc, tc.websocket_connect("/v1/dictation/stream") as ws:
+        assert json.loads(ws.receive_text())["type"] == "ready"
+        ws.send_bytes(b"x" * 9)
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            ws.receive_text()
+        assert excinfo.value.code == 1009
+
+
+def test_stream_rejects_excess_audio_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(dictation_engine.MAX_TAKE_SECONDS_ENV, "0.001")
+    with TestClient(_fake_app()) as tc, tc.websocket_connect("/v1/dictation/stream") as ws:
+        assert json.loads(ws.receive_text())["type"] == "ready"
+        ws.send_bytes(b"x" * 64)
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            ws.receive_text()
+        assert excinfo.value.code == 1008
+
+
+def test_status_requires_auth_and_sanitizes_remote_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dictation_engine, "_remote_connection_state", "not_attempted")
+    monkeypatch.setenv(dictation_engine.ENGINE_ENV, dictation_engine.ENGINE_REMOTE)
+    monkeypatch.setenv(
+        dictation_engine.REMOTE_URL_ENV,
+        "wss://user:password@worker.example/v1/dictation/stream?token=secret",
+    )
+    monkeypatch.setenv(dictation_engine.WORKER_TOKEN_ENV, "worker-secret")
+    with TestClient(_fake_app(auth_provider=_NoIdentityAuthProvider())) as tc:
+        assert tc.get("/v1/dictation/status").status_code == 401
+    with TestClient(_fake_app(auth_provider=_IdentityAuthProvider())) as tc:
+        response = tc.get("/v1/dictation/status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["remote"] == {
+            "configured": True,
+            "secure": True,
+            "token_configured": True,
+            "fallback_available": False,
+            "connection_state": "not_attempted",
+        }
+        assert body["capacity"] == {
+            "max_streams": 2,
+            "active_streams": 0,
+            "available_streams": 2,
+        }
+        assert "password" not in response.text
+        assert "worker-secret" not in response.text
