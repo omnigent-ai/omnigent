@@ -9,7 +9,7 @@ The evaluators run runner-side at tool dispatch
 
 from __future__ import annotations
 
-import os
+import posixpath
 import re
 import shlex
 from collections.abc import Callable, Collection
@@ -580,10 +580,18 @@ def worktree_guard(
         # ``..\\`` past the split-on-'/' traversal check.
         if "\\" in path:
             return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
+        # reads as an ordinary relative dir named "C:" to posixpath. UNC
+        # ("//server/share") keeps its leading slashes and trips the check below.
+        if path[:1].isalpha() and path[1:2] == ":":
+            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
+        # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
+        # below inert on a Windows runner (absolute paths would ALLOW there).
         # normpath collapses ``..``/``.``/repeated slashes and pushes every
         # upward traversal to the front, so a single startswith catches every
         # escape form (e.g. "a/../../escape" → "../../escape").
-        normalized = os.path.normpath(path)
+        normalized = posixpath.normpath(path)
         if normalized.startswith(("/", "~", "..")):
             return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
         return _ALLOW
