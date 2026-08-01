@@ -50,7 +50,7 @@ import re
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
@@ -291,7 +291,7 @@ def block_working_dir_changes(
     shell_tool_names = (
         frozenset(shell_tools) if shell_tools is not None else frozenset(_DEFAULT_SHELL_TOOLS)
     )
-    result_kind = "DENY" if action == "deny" else "ASK"
+    result_kind: Literal["DENY", "ASK"] = "DENY" if action == "deny" else "ASK"
 
     def _violation(reason: str) -> PolicyResponse:
         """
