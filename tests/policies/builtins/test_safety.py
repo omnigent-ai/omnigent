@@ -54,10 +54,16 @@ def test_ask_on_os_tools_asks_for_sys_os_tools(tool: str) -> None:
         ("Read", {"path": "/etc/passwd"}, "/etc/passwd"),
         ("Write", {"path": "/tmp/out.txt"}, "/tmp/out.txt"),
         ("Edit", {"path": "main.py"}, "main.py"),
+        # MultiEdit is what Claude Code reaches for on multi-hunk edits (the
+        # common case) and NotebookEdit is its .ipynb writer, which carries the
+        # path under ``notebook_path``. Both must ASK or most writes go
+        # un-approved under an approval policy.
+        ("MultiEdit", {"file_path": "main.py", "edits": []}, "main.py"),
+        ("NotebookEdit", {"notebook_path": "nb.ipynb"}, "nb.ipynb"),
         ("Glob", {"pattern": "**/*.py"}, "**/*.py"),
         ("Grep", {"pattern": "secret"}, "secret"),
     ],
-    ids=["Bash", "Read", "Write", "Edit", "Glob", "Grep"],
+    ids=["Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep"],
 )
 def test_ask_on_os_tools_asks_for_native_tools(
     tool: str,
@@ -82,6 +88,17 @@ def test_ask_on_os_tools_asks_for_native_tools(
     # The preview should contain the relevant argument value so the
     # user can make an informed approval decision.
     assert expected_preview in result["reason"]
+
+
+def test_ask_on_os_tools_handles_non_string_code() -> None:
+    """A non-string ``code`` payload must still ASK, not raise.
+
+    ``None[:80]`` raises TypeError, which the engine turns into a
+    ``policy '<name>' failed`` DENY — a confusing failure instead of the
+    approval prompt the user attached the policy for.
+    """
+    result = ask_on_os_tools(tc("execute_code", {"code": None}))
+    assert result["result"] == "ASK"
 
 
 # ── ask_on_os_tools: Pi native tools (lowercase) ──────────────────────────
