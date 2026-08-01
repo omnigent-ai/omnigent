@@ -58,6 +58,8 @@ const BAR_BINS: readonly (readonly [number, number])[] = [
 
 const BAR_BASELINE = 0.2;
 
+type MeterSource = { kind: "web-speech" } | { kind: "server"; stream: MediaStream };
+
 export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
   /**
@@ -115,8 +117,11 @@ export const ComposerMicButton = ({
   serverAvailableRef.current = serverAvailable;
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [meterSource, setMeterSource] = useState<MeterSource | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const sessionRef = useRef<DictationSession | null>(null);
+  const pendingServerStartRef = useRef<AbortController | null>(null);
+  const serverTakeIdRef = useRef(0);
   // Refs so handlers aren't re-attached on every parent re-render.
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
@@ -171,6 +176,7 @@ export const ComposerMicButton = ({
       discardingRef.current = false;
       setError(null);
       setIsListening(true);
+      setMeterSource({ kind: "web-speech" });
       // Snapshot point: let the parent record the text so Esc can revert to it.
       onVoiceStartRef.current?.();
     };
@@ -178,10 +184,12 @@ export const ComposerMicButton = ({
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       setIsListening(false);
+      setMeterSource(null);
     };
     const handleError = (event: Event) => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
+      setMeterSource(null);
       const err = (event as SpeechRecognitionErrorEventLike).error;
       // "network" means the recognizer's cloud backend refused us —
       // always the case in Electron/plain Chromium, occasionally a
@@ -243,8 +251,12 @@ export const ComposerMicButton = ({
   // cancelled outright (no tail flush) — the take is moot once the
   // composer can't accept text.
   useEffect(() => {
-    if (!(disabled && isListening)) return;
+    if (!disabled) return;
+    pendingServerStartRef.current?.abort();
+    if (!isListening) return;
+    setMeterSource(null);
     if (sessionRef.current) {
+      serverTakeIdRef.current += 1;
       sessionRef.current.cancel();
       sessionRef.current = null;
       setIsListening(false);
@@ -265,17 +277,21 @@ export const ComposerMicButton = ({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      pendingServerStartRef.current?.abort();
+      serverTakeIdRef.current += 1;
       sessionRef.current?.cancel();
       sessionRef.current = null;
     };
   }, []);
 
-  // Second getUserMedia stream just for visualization — Web Speech API
-  // hides its audio buffer. Chrome batches the permission to one prompt.
+  // Web Speech hides its audio buffer, so it owns a separate visualizer
+  // capture. Server dictation lends the meter its existing capture stream.
   useEffect(() => {
-    if (!isListening) return;
+    if (!meterSource) return;
+    const sourceSpec = meterSource;
     let cancelled = false;
     let stream: MediaStream | null = null;
+    let ownsStream = false;
     let audioCtx: AudioContext | null = null;
     let rafId: number | null = null;
     // Snapshot so cleanup doesn't read a stale .current (exhaustive-deps).
@@ -283,41 +299,50 @@ export const ComposerMicButton = ({
 
     const start = async () => {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch {
-        // Mic permission denied just for the visualization stream — leave
-        // the bars at baseline. The speech recognition error handler will
-        // surface the user-facing message if it also fails.
-        return;
-      }
-      if (cancelled) {
-        for (const track of stream.getTracks()) track.stop();
-        return;
-      }
-      audioCtx = new AudioContext();
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 64;
-      // Built-in temporal smoothing so bars don't jitter frame-to-frame.
-      analyser.smoothingTimeConstant = 0.75;
-      source.connect(analyser);
-      const data = new Uint8Array(analyser.frequencyBinCount);
-
-      const tick = () => {
-        analyser.getByteFrequencyData(data);
-        for (let i = 0; i < BAR_BINS.length; i += 1) {
-          const [lo, hi] = BAR_BINS[i];
-          let sum = 0;
-          for (let j = lo; j < hi; j += 1) sum += data[j];
-          const avg = sum / (hi - lo) / 255;
-          // 1.6× headroom for quiet speech; clamp at 1 to fit the button.
-          const scale = Math.max(BAR_BASELINE, Math.min(1, avg * 1.6));
-          const el = bars[i];
-          if (el) el.style.transform = `scaleY(${scale})`;
+        ownsStream = sourceSpec.kind === "web-speech";
+        const nextStream =
+          sourceSpec.kind === "web-speech"
+            ? await navigator.mediaDevices.getUserMedia({ audio: true })
+            : sourceSpec.stream;
+        if (cancelled) {
+          if (ownsStream) {
+            for (const track of nextStream.getTracks()) track.stop();
+          }
+          return;
         }
+        stream = nextStream;
+        audioCtx = new AudioContext();
+        const source = audioCtx.createMediaStreamSource(nextStream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 64;
+        // Built-in temporal smoothing so bars don't jitter frame-to-frame.
+        analyser.smoothingTimeConstant = 0.75;
+        source.connect(analyser);
+        const data = new Uint8Array(analyser.frequencyBinCount);
+
+        const tick = () => {
+          analyser.getByteFrequencyData(data);
+          for (let i = 0; i < BAR_BINS.length; i += 1) {
+            const [lo, hi] = BAR_BINS[i];
+            let sum = 0;
+            for (let j = lo; j < hi; j += 1) sum += data[j];
+            const avg = sum / (hi - lo) / 255;
+            // 1.6× headroom for quiet speech; clamp at 1 to fit the button.
+            const scale = Math.max(BAR_BASELINE, Math.min(1, avg * 1.6));
+            const el = bars[i];
+            if (el) el.style.transform = `scaleY(${scale})`;
+          }
+          rafId = requestAnimationFrame(tick);
+        };
         rafId = requestAnimationFrame(tick);
-      };
-      rafId = requestAnimationFrame(tick);
+      } catch {
+        if (stream && ownsStream) {
+          for (const track of stream.getTracks()) track.stop();
+          stream = null;
+        }
+        if (audioCtx && audioCtx.state !== "closed") void audioCtx.close();
+        audioCtx = null;
+      }
     };
 
     start();
@@ -325,7 +350,7 @@ export const ComposerMicButton = ({
     return () => {
       cancelled = true;
       if (rafId !== null) cancelAnimationFrame(rafId);
-      if (stream) {
+      if (stream && ownsStream) {
         for (const track of stream.getTracks()) track.stop();
       }
       if (audioCtx && audioCtx.state !== "closed") {
@@ -336,16 +361,21 @@ export const ComposerMicButton = ({
         if (el) el.style.transform = `scaleY(${BAR_BASELINE})`;
       }
     };
-  }, [isListening]);
+  }, [meterSource]);
 
   // Server-dictation toggle. Start resolves only once the mic + socket
   // handshake are up, so isListening flips exactly when audio flows.
   const toggleServer = useCallback(async () => {
-    if (serverBusyRef.current) return;
+    if (serverBusyRef.current) {
+      pendingServerStartRef.current?.abort();
+      return;
+    }
     serverBusyRef.current = true;
     const session = sessionRef.current;
     if (session) {
+      serverTakeIdRef.current += 1;
       sessionRef.current = null;
+      setMeterSource(null);
       const tail = (await session.stop()).trim();
       if (!disabledRef.current) {
         // A non-empty tail supersedes the pending interim via
@@ -357,6 +387,10 @@ export const ComposerMicButton = ({
       serverBusyRef.current = false;
       return;
     }
+    pendingServerStartRef.current?.abort();
+    const controller = new AbortController();
+    pendingServerStartRef.current = controller;
+    const takeId = ++serverTakeIdRef.current;
     try {
       // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
@@ -375,22 +409,28 @@ export const ComposerMicButton = ({
             }
           },
           onError: () => {
+            if (serverTakeIdRef.current !== takeId) return;
+            serverTakeIdRef.current += 1;
             sessionRef.current = null;
+            setMeterSource(null);
             setError("Dictation unavailable");
             setIsListening(false);
             onInterimRef.current?.("");
           },
         },
-        { microphoneDeviceId: preferences.microphoneDeviceId },
+        { microphoneDeviceId: preferences.microphoneDeviceId, signal: controller.signal },
       );
       if (!mountedRef.current || disabledRef.current) {
         next.cancel();
         return;
       }
       sessionRef.current = next;
+      setMeterSource({ kind: "server", stream: next.captureStream });
       setError(null);
       setIsListening(true);
     } catch (startError) {
+      if (startError instanceof DOMException && startError.name === "AbortError") return;
+      setMeterSource(null);
       setError(
         startError instanceof DictationBusyError
           ? "Dictation is busy — try again shortly"
@@ -399,8 +439,12 @@ export const ComposerMicButton = ({
             : "Dictation unavailable",
       );
       setIsListening(false);
+    } finally {
+      if (pendingServerStartRef.current === controller) {
+        pendingServerStartRef.current = null;
+      }
+      serverBusyRef.current = false;
     }
-    serverBusyRef.current = false;
   }, [preferences.microphoneDeviceId]);
   toggleServerRef.current = toggleServer;
 
@@ -430,8 +474,10 @@ export const ComposerMicButton = ({
     if (!recognition) return;
     transitionRef.current = true;
     try {
-      if (isListening) recognition.stop();
-      else recognition.start();
+      if (isListening) {
+        setMeterSource(null);
+        recognition.stop();
+      } else recognition.start();
     } catch {
       // InvalidStateError from a double-call — drop the guard so the
       // user can try again, and let the next event reconcile state.
@@ -455,10 +501,12 @@ export const ComposerMicButton = ({
   // Path-aware: a live server take is torn down via the DictationSession, a Web
   // Speech take via the recognizer.
   useEffect(() => {
-    if (!isListening) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
       if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+      const pendingStart = pendingServerStartRef.current;
+      if (!isListening && !pendingStart) return;
       if (e.key === "Enter" && !e.shiftKey) {
+        if (!isListening) return;
         // Commit: end the take and keep the text. toggle() routes to the right
         // path — Web Speech stop, or a server stop that flushes the tail.
         e.preventDefault();
@@ -471,13 +519,20 @@ export const ComposerMicButton = ({
         e.stopPropagation();
         discardingRef.current = true;
         onVoiceDiscardRef.current?.();
+        if (pendingStart) {
+          pendingStart.abort();
+          return;
+        }
         const session = sessionRef.current;
         if (session) {
+          serverTakeIdRef.current += 1;
           sessionRef.current = null;
           serverBusyRef.current = false;
+          setMeterSource(null);
           session.cancel();
           setIsListening(false);
         } else {
+          setMeterSource(null);
           try {
             recognitionRef.current?.stop();
           } catch {

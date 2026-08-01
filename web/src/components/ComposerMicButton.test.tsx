@@ -27,6 +27,7 @@ import { ComposerMicButton } from "./ComposerMicButton";
 // factory reads the mutable spies at call time, so each test installs its
 // own behavior in beforeEach.
 interface SessionStub {
+  captureStream: MediaStream;
   stop: () => Promise<string>;
   cancel: () => void;
 }
@@ -36,6 +37,7 @@ let sessionStartMock: Mock<
 let sessionStopMock: Mock<() => Promise<string>>;
 let sessionCancelMock: Mock<() => void>;
 let sessionEvents: DictationSessionEvents | null;
+let sessionStream: MediaStream;
 
 vi.mock("@/lib/dictation", () => {
   class DictationBusyError extends Error {}
@@ -52,9 +54,10 @@ function installDictationSession() {
   sessionEvents = null;
   sessionStopMock = vi.fn(async () => "");
   sessionCancelMock = vi.fn();
+  sessionStream = { getTracks: () => [] } as unknown as MediaStream;
   sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
     sessionEvents = events;
-    return { stop: sessionStopMock, cancel: sessionCancelMock };
+    return { captureStream: sessionStream, stop: sessionStopMock, cancel: sessionCancelMock };
   });
 }
 
@@ -63,8 +66,50 @@ let handlers: Record<string, (event: unknown) => void>;
 let startSpy: ReturnType<typeof vi.fn>;
 let stopSpy: ReturnType<typeof vi.fn>;
 let recognitionLanguage: string;
+let getUserMediaMock: Mock;
 /** Original navigator.mediaDevices descriptor, restored after each test. */
 let originalMediaDevices: PropertyDescriptor | undefined;
+
+interface MeterMocks {
+  close: Mock;
+  createMediaStreamSource: Mock;
+  cancelAnimationFrame: Mock;
+}
+
+function installMeterAudio(): MeterMocks {
+  const close = vi.fn(function (this: { state: AudioContextState }) {
+    this.state = "closed";
+    return Promise.resolve();
+  });
+  const createMediaStreamSource = vi.fn(() => ({ connect: vi.fn() }));
+  const createAnalyser = vi.fn(() => ({
+    fftSize: 0,
+    smoothingTimeConstant: 0,
+    frequencyBinCount: 32,
+    getByteFrequencyData: vi.fn(),
+  }));
+  class FakeAudioContext {
+    state: AudioContextState = "running";
+    close = close;
+    createMediaStreamSource = createMediaStreamSource;
+    createAnalyser = createAnalyser;
+  }
+  const cancelAnimationFrame = vi.fn();
+  vi.stubGlobal("AudioContext", FakeAudioContext);
+  vi.stubGlobal(
+    "requestAnimationFrame",
+    vi.fn(() => 1),
+  );
+  vi.stubGlobal("cancelAnimationFrame", cancelAnimationFrame);
+  return { close, createMediaStreamSource, cancelAnimationFrame };
+}
+
+function mediaStream(stop = vi.fn()): { stream: MediaStream; stop: Mock } {
+  return {
+    stream: { getTracks: () => [{ stop }] } as unknown as MediaStream,
+    stop,
+  };
+}
 
 function installSpeechRecognition() {
   handlers = {};
@@ -108,9 +153,10 @@ beforeEach(() => {
   // (unavailable in jsdom) is ever constructed. Capture the original descriptor
   // first so afterEach can restore it — otherwise this navigator stub leaks.
   originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+  getUserMediaMock = vi.fn().mockRejectedValue(new Error("no mic"));
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
-    value: { getUserMedia: vi.fn().mockRejectedValue(new Error("no mic")) },
+    value: { getUserMedia: getUserMediaMock },
   });
 });
 
@@ -151,6 +197,90 @@ describe("ComposerMicButton", () => {
     // The recognizer's "start" event flips the pressed state.
     act(() => handlers.start?.({}));
     expect(button).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("captures a separate owned stream for the Web Speech meter", async () => {
+    const meter = installMeterAudio();
+    const owned = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.start?.({}));
+
+    expect(getUserMediaMock).toHaveBeenCalledOnce();
+    expect(meter.createMediaStreamSource).toHaveBeenCalledWith(owned.stream);
+    expect(owned.stop).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["stop", () => handlers.end?.({})],
+    ["error", () => handlers.error?.({ error: "network" })],
+    [
+      "Escape",
+      () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })),
+    ],
+  ])("cleans up the owned Web Speech meter on %s", async (_name, finish) => {
+    const meter = installMeterAudio();
+    const owned = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.start?.({}));
+
+    act(finish);
+
+    expect(owned.stop).toHaveBeenCalledOnce();
+    expect(meter.close).toHaveBeenCalledOnce();
+    expect(meter.cancelAnimationFrame).toHaveBeenCalledWith(1);
+  });
+
+  it("cleans up the owned Web Speech meter when disabled", async () => {
+    const meter = installMeterAudio();
+    const owned = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    const { rerender } = render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.start?.({}));
+
+    rerender(<ComposerMicButton onTranscript={vi.fn()} disabled />);
+
+    expect(owned.stop).toHaveBeenCalledOnce();
+    expect(meter.close).toHaveBeenCalledOnce();
+  });
+
+  it("stops a late Web Speech meter capture after unmount", async () => {
+    installMeterAudio();
+    const owned = mediaStream();
+    let resolveCapture: ((stream: MediaStream) => void) | undefined;
+    getUserMediaMock.mockReturnValue(
+      new Promise<MediaStream>((resolve) => {
+        resolveCapture = resolve;
+      }),
+    );
+    const { unmount } = render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    unmount();
+    await act(async () => resolveCapture?.(owned.stream));
+
+    expect(owned.stop).toHaveBeenCalledOnce();
+  });
+
+  it("stops its owned stream when meter setup fails", async () => {
+    const owned = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    function BrokenAudioContext() {
+      throw new Error("audio context failed");
+    }
+    vi.stubGlobal("AudioContext", BrokenAudioContext);
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+
+    await act(async () => handlers.start?.({}));
+
+    expect(owned.stop).toHaveBeenCalledOnce();
   });
 
   it("uses the saved browser recognition language", () => {
@@ -326,6 +456,54 @@ async function clickMic() {
 }
 
 describe("ComposerMicButton (server dictation)", () => {
+  it("borrows the direct server capture for metering without another capture", async () => {
+    const meter = installMeterAudio();
+    const borrowed = mediaStream();
+    getUserMediaMock.mockResolvedValue(borrowed.stream);
+    sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
+      sessionEvents = events;
+      const captureStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      return { captureStream, stop: sessionStopMock, cancel: sessionCancelMock };
+    });
+    renderServerMode();
+
+    await clickMic();
+
+    expect(sessionStartMock).toHaveBeenCalledOnce();
+    expect(getUserMediaMock).toHaveBeenCalledOnce();
+    expect(meter.createMediaStreamSource).toHaveBeenCalledWith(borrowed.stream);
+    expect(borrowed.stop).not.toHaveBeenCalled();
+  });
+
+  it.each(["stop", "error", "disable", "Escape", "unmount"])(
+    "cleans up but never stops the borrowed server stream on %s",
+    async (finish) => {
+      const meter = installMeterAudio();
+      const borrowed = mediaStream();
+      sessionStream = borrowed.stream;
+      const view = renderServerMode();
+      await clickMic();
+
+      if (finish === "stop") await clickMic();
+      else if (finish === "error") act(() => sessionEvents?.onError("failed"));
+      else if (finish === "disable") {
+        view.rerender(
+          <CapabilitiesContext.Provider value={DICTATION_INFO}>
+            <ComposerMicButton onTranscript={vi.fn()} disabled />
+          </CapabilitiesContext.Provider>,
+        );
+      } else if (finish === "Escape") {
+        act(() =>
+          window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })),
+        );
+      } else view.unmount();
+
+      expect(borrowed.stop).not.toHaveBeenCalled();
+      expect(meter.close).toHaveBeenCalledOnce();
+      expect(meter.cancelAnimationFrame).toHaveBeenCalledWith(1);
+    },
+  );
+
   it("cancels a session that resolves after unmount", async () => {
     let resolveStart: ((session: SessionStub) => void) | undefined;
     sessionStartMock = vi.fn(
@@ -338,9 +516,58 @@ describe("ComposerMicButton (server dictation)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
     unmount();
 
-    await act(async () => resolveStart?.({ stop: sessionStopMock, cancel: sessionCancelMock }));
+    await act(async () =>
+      resolveStart?.({
+        captureStream: sessionStream,
+        stop: sessionStopMock,
+        cancel: sessionCancelMock,
+      }),
+    );
     expect(sessionCancelMock).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["unmount", "disable", "toggle", "Escape"])(
+    "aborts a pending server start on %s without showing an error",
+    async (cancel) => {
+      let rejectStart: ((error: unknown) => void) | undefined;
+      sessionStartMock = vi.fn(
+        (_events, options) =>
+          new Promise<SessionStub>((_resolve, reject) => {
+            rejectStart = reject;
+            options?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError")),
+            );
+          }),
+      );
+      const view = renderServerMode();
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+      fireEvent.click(button);
+      const signal = sessionStartMock.mock.calls[0]?.[1]?.signal;
+
+      if (cancel === "unmount") view.unmount();
+      else if (cancel === "disable") {
+        view.rerender(
+          <CapabilitiesContext.Provider value={DICTATION_INFO}>
+            <ComposerMicButton onTranscript={vi.fn()} disabled />
+          </CapabilitiesContext.Provider>,
+        );
+      } else if (cancel === "toggle") fireEvent.click(button);
+      else {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      }
+      await act(async () => {
+        if (!signal?.aborted) rejectStart?.(new Error("start was not aborted"));
+      });
+
+      expect(signal?.aborted).toBe(true);
+      if (cancel !== "unmount") {
+        expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+          "title",
+          "Voice dictation",
+        );
+      }
+    },
+  );
 
   it("cancels a session that resolves after the composer becomes disabled", async () => {
     let resolveStart: ((session: SessionStub) => void) | undefined;
@@ -358,7 +585,13 @@ describe("ComposerMicButton (server dictation)", () => {
       </CapabilitiesContext.Provider>,
     );
 
-    await act(async () => resolveStart?.({ stop: sessionStopMock, cancel: sessionCancelMock }));
+    await act(async () =>
+      resolveStart?.({
+        captureStream: sessionStream,
+        stop: sessionStopMock,
+        cancel: sessionCancelMock,
+      }),
+    );
     expect(sessionCancelMock).toHaveBeenCalledTimes(1);
   });
 
@@ -377,6 +610,7 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(startSpy).not.toHaveBeenCalled();
     expect(sessionStartMock).toHaveBeenCalledWith(expect.any(Object), {
       microphoneDeviceId: "mic-2",
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -531,6 +765,29 @@ describe("ComposerMicButton (server dictation)", () => {
     await clickMic(); // next take
     expect(startSpy).toHaveBeenCalledTimes(2);
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches from an owned Web Speech meter to the borrowed fallback stream", async () => {
+    const meter = installMeterAudio();
+    const owned = mediaStream();
+    const borrowed = mediaStream();
+    getUserMediaMock.mockResolvedValue(owned.stream);
+    sessionStream = borrowed.stream;
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    await act(async () => handlers.start?.({}));
+
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    expect(getUserMediaMock).toHaveBeenCalledOnce();
+    expect(owned.stop).toHaveBeenCalledOnce();
+    expect(borrowed.stop).not.toHaveBeenCalled();
+    expect(meter.createMediaStreamSource).toHaveBeenNthCalledWith(1, owned.stream);
+    expect(meter.createMediaStreamSource).toHaveBeenNthCalledWith(2, borrowed.stream);
   });
 
   it("reports a busy server distinctly from a broken one", async () => {
