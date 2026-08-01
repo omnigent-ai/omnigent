@@ -72,6 +72,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from omnigent.policies.schema import (
+    PROJECT_MONTHLY_ASK_APPROVED_STATE_KEY,
     SESSION_COST_ASK_APPROVED_STATE_KEY,
     SESSION_COST_UNPRICED_APPROVED_KEY,
     USER_DAILY_ASK_APPROVED_STATE_KEY,
@@ -741,6 +742,192 @@ def user_daily_cost_budget(
         return _ALLOW
 
     return evaluate
+
+
+def _project_monthly_cost_usd(event: PolicyEvent) -> float:
+    """Read the session's project's accumulated cost this UTC month (USD).
+
+    Mirrors :func:`_user_daily_cost_usd` one level up.
+
+    :param event: Policy event dict.
+    :returns: ``event["context"]["project_monthly_cost"]["cost_usd"]`` as a
+        float, or ``0.0`` when absent (engine didn't inject it — e.g. no
+        project / not priced), so the gate never trips on missing data.
+    """
+    context = event.get("context") or {}
+    monthly = context.get("project_monthly_cost") or {}
+    raw = monthly.get("cost_usd", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _project_monthly_ask_approved_usd(event: PolicyEvent) -> float:
+    """Read the highest soft checkpoint the project approved this month (USD).
+
+    Mirrors :func:`_user_daily_ask_approved_usd` one level up.
+
+    :param event: Policy event dict.
+    :returns: ``event["context"]["project_monthly_cost"]["ask_approved_usd"]``
+        as a float, or ``0.0`` when absent / none approved yet.
+    """
+    context = event.get("context") or {}
+    monthly = context.get("project_monthly_cost") or {}
+    raw = monthly.get("ask_approved_usd", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def project_monthly_cost_budget(
+    max_cost_usd: float,
+    ask_thresholds_usd: list[float] | None = None,
+    expensive_models: list[str] | None = None,
+) -> PolicyCallable:
+    """Factory: gate on the session's PROJECT's per-UTC-month LLM spend (USD).
+
+    Identical gating logic to :func:`user_daily_cost_budget`, but scoped to
+    the session's **project** (the whole project's cumulative spend this
+    UTC calendar month) instead of its owning user's day. It reads
+    ``event["context"]["project_monthly_cost"]`` (``cost_usd`` /
+    ``ask_approved_usd``), which the policy engine injects — at
+    engine-build time — only when this policy is configured (from the
+    ``project_monthly_cost`` store, attributed to the session's project;
+    a sub-agent session falls back to its spawn-tree root's project). The
+    hard limit and the soft warning checkpoints both gate the ``request``
+    phase (before the LLM turn) and the ``tool_call`` phase (see
+    :func:`cost_budget`).
+
+    Unlike the other budgets in this module, this policy is not normally
+    hand-declared in an agent's YAML: :func:`~omnigent.runtime.policies.builder.build_policy_engine`
+    synthesizes it automatically for any session filed into a project
+    whose ``budget_config`` has a positive ``limit_usd`` (see
+    ``_load_project_budget_policy_specs`` there) — closing #1662. It can
+    still be declared explicitly, the same as any other function policy.
+
+    - **Soft (`ask_thresholds_usd`)**: the first time the project's
+      month-to-date spend crosses a checkpoint, the turn (request phase) or
+      tool call (tool-call phase) is parked for approval (ASK). The approval
+      is recorded **per project+month** (in
+      ``project_monthly_cost.ask_approved_usd`` via a reserved
+      ``state_updates`` key the engine routes to that store), so an approved
+      checkpoint won't re-prompt again this month — including from a
+      different session filed into the same project. A decline blocks that
+      one turn / tool call and re-asks next time.
+    - **Hard (`max_cost_usd`)**: once the project's month-to-date spend
+      reaches the limit, DENY every tool call while the session is on an
+      ``expensive_models`` model (a ``/model`` downgrade gate, not a stop);
+      ALLOW once on a cheaper model. The limit is re-checked live against
+      the project's *current* ``budget_config.limit_usd`` on every turn
+      (the synthesized spec is rebuilt fresh each time the engine is
+      constructed), so a project owner raising the limit unblocks the very
+      next turn — no separate "retry" mechanism is needed.
+
+    Abstains (ALLOW) on every other phase, and whenever the monthly cost
+    is ``0.0`` (no spend recorded, no project, or pricing unavailable).
+
+    :param max_cost_usd: Hard monthly limit in USD. Must be ``> 0``.
+    :param ask_thresholds_usd: Optional soft monthly warning checkpoints
+        in USD, e.g. ``[10.0, 40.0]``. Each value must be ``> 0`` and
+        ``< max_cost_usd``. ``None`` / ``[]`` disables the soft gate.
+    :param expensive_models: Optional case-insensitive substring tokens
+        for the model tiers blocked once over the monthly limit. ``None``
+        (the default) or ``[]`` makes the hard cap a true hard stop —
+        all models are blocked once the limit is reached. Pass an
+        explicit non-empty list for a downgrade gate that only blocks the
+        named tiers.
+    :returns: A policy callable implementing the project monthly budget.
+    :raises ValueError: Same validation as :func:`cost_budget`.
+    """
+    if max_cost_usd <= 0:
+        raise ValueError(f"max_cost_usd must be > 0, got {max_cost_usd!r}")
+    thresholds = sorted({float(t) for t in (ask_thresholds_usd or [])})
+    for t in thresholds:
+        if not (0 < t < max_cost_usd):
+            raise ValueError(
+                f"each ask_thresholds_usd value must be in "
+                f"(0, max_cost_usd={max_cost_usd}), got {t!r}"
+            )
+    cfg = _resolve_expensive_models(expensive_models)
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate the project monthly cost budget for a request or tool call.
+
+        Mirrors :func:`user_daily_cost_budget`'s ``evaluate`` exactly,
+        reading the project's monthly spend / approval instead of the
+        owner's daily spend, and recording an approved checkpoint to the
+        project+month store (reserved ``state_updates`` key) rather than
+        the user+day store.
+
+        :param event: Policy event dict.
+        :returns: DENY when over the monthly budget on an expensive model;
+            ASK when a new monthly soft checkpoint is newly crossed; ALLOW
+            otherwise.
+        """
+        phase = event.get("type")
+        if phase not in _GATED_PHASES:
+            return _ALLOW
+        context = event.get("context") or {}
+        if _usage_is_unpriced(context.get("usage") or {}):
+            if not (event.get("session_state") or {}).get(_UNPRICED_APPROVED_KEY):
+                return _UNPRICED_ASK
+            return _ALLOW
+        cost = _project_monthly_cost_usd(event)
+        if cfg.hard_cap_enabled and cost >= max_cost_usd:
+            if _model_blocked_over_budget(
+                _current_model(event),
+                cfg.expensive_tokens,
+                cfg.exclude_tokens,
+                block_all=cfg.block_all_models,
+            ):
+                return {
+                    "result": "DENY",
+                    "reason": _over_budget_deny_reason(
+                        cost,
+                        max_cost_usd,
+                        cfg.expensive_tokens,
+                        _current_harness(event),
+                        phase=phase,
+                        policy_label="project monthly cost-budget",
+                        budget_label="project's monthly cost budget",
+                        subject_user="This project",
+                        block_all=cfg.block_all_models,
+                    ),
+                }
+            return _ALLOW
+        # Soft ASK fires on both gated phases — each has a server-side
+        # approval round-trip that persists the checkpoint on accept (see
+        # cost_budget.evaluate).
+        if thresholds:
+            crossed = max((t for t in thresholds if cost >= t), default=None)
+            if crossed is not None:
+                approved_up_to = _project_monthly_ask_approved_usd(event)
+                if crossed > approved_up_to:
+                    return {
+                        "result": "ASK",
+                        "reason": (
+                            f"This project's spend this month ${cost:.2f} passed the "
+                            f"${crossed:.2f} monthly warning threshold (monthly limit "
+                            f"${max_cost_usd:.2f}). Continue?"
+                        ),
+                        # Reserved key — the engine routes this to
+                        # project_monthly_cost.ask_approved_usd (per
+                        # project+month), applied only on approve, so it
+                        # won't re-prompt this month across the project's
+                        # sessions.
+                        "state_updates": [
+                            {
+                                "key": PROJECT_MONTHLY_ASK_APPROVED_STATE_KEY,
+                                "action": "set",
+                                "value": crossed,
+                            },
+                        ],
+                    }
+        return _ALLOW
+
+    return evaluate  # type: ignore[return-value]
 
 
 # session_state key recording the highest ``ask_thresholds_usd`` checkpoint

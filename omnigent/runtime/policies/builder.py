@@ -47,6 +47,7 @@ from omnigent.spec.types import (
 )
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
@@ -61,6 +62,17 @@ _USER_DAILY_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_daily_cost_
 # seeded with the subtree-scoped usage ONLY when a policy set includes
 # this handler — otherwise the subtree usage lookup is skipped.
 _SUBAGENT_COST_POLICY_PATH = "omnigent.policies.builtins.cost.subagent_cost_budget"
+
+# Dotted path of the project monthly cost-budget factory. The engine is
+# seeded with the project's monthly-cost rollup ONLY when a policy set
+# includes this handler — mirrors _USER_DAILY_COST_POLICY_PATH one level
+# up. See PLAN.md, closes #1662.
+_PROJECT_MONTHLY_COST_POLICY_PATH = "omnigent.policies.builtins.cost.project_monthly_cost_budget"
+
+# Synthesized policy name for the project-configured monthly budget (see
+# _load_project_budget_policy_specs). A fixed, reserved name — a project
+# has at most one budget, so there's never a naming collision to avoid.
+_PROJECT_MONTHLY_COST_POLICY_NAME = "__project_monthly_cost_budget"
 
 # Hardcoded policy that always ASKs before sys_add_policy executes.
 # Injected unconditionally into every engine so agents cannot add
@@ -118,6 +130,31 @@ def _needs_user_daily_cost(specs: list[PolicySpec]) -> bool:
         isinstance(s, FunctionPolicySpec)
         and s.function is not None
         and s.function.path == _USER_DAILY_COST_POLICY_PATH
+        for s in specs
+    )
+
+
+def _needs_project_monthly_cost(specs: list[PolicySpec]) -> bool:
+    """
+    Return whether any policy in *specs* is the project monthly cost-budget.
+
+    Mirrors :func:`_needs_user_daily_cost` one level up. Drives the
+    conditional injection: only when this returns ``True`` does
+    :func:`build_policy_engine` resolve the session's project and read
+    its monthly-cost rollup. By the time this runs, *specs* already
+    includes any policy synthesized by
+    :func:`_load_project_budget_policy_specs`, so a project with a
+    configured budget always makes this ``True`` without the caller
+    having to declare the policy explicitly in the agent spec.
+
+    :param specs: The merged policy specs for the engine.
+    :returns: ``True`` when a :class:`FunctionPolicySpec` references the
+        ``project_monthly_cost_budget`` factory.
+    """
+    return any(
+        isinstance(s, FunctionPolicySpec)
+        and s.function is not None
+        and s.function.path == _PROJECT_MONTHLY_COST_POLICY_PATH
         for s in specs
     )
 
@@ -234,12 +271,146 @@ def _load_user_daily_cost(
     return state
 
 
+def _resolve_project_id_for_policy(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """
+    Resolve the project a session's turn should be attributed/gated to.
+
+    Mirrors ``_resolve_project_id`` in
+    ``omnigent.server.routes._sessions.helpers`` (the turn-boundary cost
+    write path — see ``PLAN.md``, closes #1662): a session's own
+    ``project_id`` wins; a sub-agent conversation never carries one
+    itself, so it falls back to its spawn-tree root's ``project_id``.
+    Duplicated locally (rather than imported) because ``omnigent.runtime``
+    is a lower layer than ``omnigent.server.routes`` and must not depend
+    on it.
+
+    :param conversation_id: The session to resolve, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store for the conversation lookup(s).
+    :returns: The project id to attribute/gate this turn to, or ``None``
+        when the session (and its root, if a sub-agent) is unfiled.
+    """
+    conv = conversation_store.get_conversation(conversation_id)
+    if conv is None:
+        return None
+    if conv.project_id is not None:
+        return conv.project_id
+    if conv.root_conversation_id == conv.id:
+        return None
+    root = conversation_store.get_conversation(conv.root_conversation_id)
+    return root.project_id if root is not None else None
+
+
+def _load_project_monthly_cost(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+) -> dict[str, float | str]:
+    """
+    Read the session's project's per-UTC-month cost rollup as the engine seed.
+
+    Resolves the project (with sub-agent root fallback — see
+    :func:`_resolve_project_id_for_policy`) and reads
+    ``{cost_usd, ask_approved_usd}`` for the current UTC month, tagged
+    with ``project_id`` so the budget policy can name which project
+    tripped the gate and so a later ASK approval
+    (:meth:`PolicyEngine._record_project_monthly_ask_approved`) writes
+    back to the same row this seed read from. Mirrors
+    :func:`_load_user_daily_cost` one level up. When the session (and
+    its root) isn't filed into a project, returns zeros with no
+    ``project_id`` so the budget never trips — consistent with the
+    write path, which also no-ops without a resolvable project.
+
+    :param conversation_id: The session, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store for the project + monthly-cost
+        lookups.
+    :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>,
+        "project_id": <id>}``; ``project_id`` omitted when unfiled.
+    """
+    from omnigent.db.utils import now_epoch, utc_month
+
+    project_id = _resolve_project_id_for_policy(conversation_id, conversation_store)
+    if project_id is None:
+        return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
+    state: dict[str, float | str] = dict(
+        conversation_store.get_project_monthly_cost_state(project_id, utc_month(now_epoch()))
+    )
+    state["project_id"] = project_id
+    return state
+
+
+def _load_project_budget_policy_specs(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    project_store: ProjectStore | None,
+) -> list[PolicySpec]:
+    """
+    Synthesize a ``project_monthly_cost_budget`` policy spec, when applicable.
+
+    A project's monthly budget (``Project.budget_config``) is configured
+    through the projects API, not declared in any agent's YAML — so
+    unlike every other policy source merged in :func:`build_policy_engine`,
+    there is nothing in ``spec.guardrails.policies`` /
+    ``policy_store`` / *default_policies* for a budgeted project to
+    attach through. This is that attachment point: when the session (or
+    its spawn-tree root, for a sub-agent) is filed into a project that
+    has a positive ``budget_config["limit_usd"]``, this synthesizes the
+    equivalent of a hand-written
+    ``FunctionPolicySpec(function=FunctionRef(path=".project_monthly_cost_budget", ...))``
+    on the fly, using the project's stored ``limit_usd`` /
+    ``ask_thresholds_usd`` as its arguments. Every session filed into
+    that project — including ones a different, non-owner member creates,
+    if/when project sharing ships (see ``PLAN-2.md``) — picks this up
+    automatically, with no per-session configuration.
+
+    :param conversation_id: The session this workflow is running on.
+    :param conversation_store: Store for resolving the session's project
+        (with sub-agent root fallback).
+    :param project_store: Store for reading the resolved project's
+        ``budget_config``. ``None`` (not every deployment/call site
+        wires one — see ``PLAN.md``'s dependency on PR #3102 for the
+        Docker/Kubernetes entrypoint) skips this entirely: no project
+        lookup, no synthesized policy, existing behavior unchanged.
+    :returns: A single-element list with the synthesized spec, or ``[]``
+        when there's no project, no store, or no positive budget
+        configured.
+    """
+    if project_store is None:
+        return []
+    project_id = _resolve_project_id_for_policy(conversation_id, conversation_store)
+    if project_id is None:
+        return []
+    project = project_store.get_by_id(project_id)
+    if project is None:
+        return []
+    limit_usd = project.budget_config.get("limit_usd")
+    if not isinstance(limit_usd, int | float) or isinstance(limit_usd, bool) or limit_usd <= 0:
+        return []
+    arguments: dict[str, Any] = {"max_cost_usd": float(limit_usd)}
+    thresholds = project.budget_config.get("ask_thresholds_usd")
+    if isinstance(thresholds, list) and thresholds:
+        arguments["ask_thresholds_usd"] = thresholds
+    return [
+        FunctionPolicySpec(
+            name=_PROJECT_MONTHLY_COST_POLICY_NAME,
+            on=None,
+            function=FunctionRef(
+                path=_PROJECT_MONTHLY_COST_POLICY_PATH,
+                arguments=arguments,
+            ),
+        )
+    ]
+
+
 def any_policies_apply(
     *,
     spec: AgentSpec,
     conversation_id: str,
     default_policies: list[PolicySpec] | None,
     policy_store: PolicyStore | None,
+    conversation_store: ConversationStore | None = None,
+    project_store: ProjectStore | None = None,
     phase: Phase | None = None,
     tool_name: str | None = None,
 ) -> bool:
@@ -258,6 +429,20 @@ def any_policies_apply(
     :param default_policies: Server-wide policies from ``RuntimeCaps``.
     :param policy_store: Session-scoped policy store; ``None`` means no DB
         policies are configured.
+    :param conversation_store: Store for resolving the session's project
+        (with sub-agent root fallback), needed only to check for a
+        project-synthesized budget policy. ``None`` skips that check
+        (matching *project_store* ``None``) — callers that don't pass a
+        conversation_store just don't get the project-budget fast path,
+        they still see it once the full engine is built.
+    :param project_store: Project store; when both this and
+        *conversation_store* are given, checks whether the session's
+        project has a configured monthly budget (see
+        :func:`_load_project_budget_policy_specs`) — a project's budget
+        has no entry in *spec* / *policy_store* / *default_policies* to
+        be found by the other checks below, so without this a budgeted
+        project with no other policies would be wrongly fast-pathed past
+        the engine build and never enforced.
     :param phase: The evaluation phase, if known.
     :param tool_name: The tool being called (for ``PHASE_TOOL_CALL`` events).
     :returns: ``False`` when the engine would have an empty policy list and
@@ -278,6 +463,10 @@ def any_policies_apply(
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
         return True
+    if conversation_store is not None and _load_project_budget_policy_specs(
+        conversation_id, conversation_store, project_store
+    ):
+        return True
     return False
 
 
@@ -289,6 +478,7 @@ def build_policy_engine(
     connection_override: dict[str, str] | None = None,
     default_policies: list[PolicySpec] | None = None,
     policy_store: PolicyStore | None = None,
+    project_store: ProjectStore | None = None,
     server_llm: LLMConfig | None = None,
     host_connection: dict[str, str] | None = None,
 ) -> PolicyEngine:
@@ -341,6 +531,12 @@ def build_policy_engine(
         provided, enabled policies for ``conversation_id`` are
         loaded and inserted between agent and admin policies in
         the evaluation order.
+    :param project_store: Project store used to resolve the session's
+        project (with sub-agent root fallback) and, when that project
+        has a configured monthly budget, synthesize a
+        ``project_monthly_cost_budget`` policy spec automatically — see
+        :func:`_load_project_budget_policy_specs`. ``None`` (the
+        default) skips this: no project lookup, no synthesized policy.
     :param server_llm: Server-level LLM configuration from
         ``RuntimeCaps.llm``. When provided, a
         :class:`~omnigent.policies.types.PolicyLLMClient` is
@@ -376,7 +572,18 @@ def build_policy_engine(
         root_policy_specs = [p for p in root_policy_specs if p.name not in child_names]
         session_policy_specs = root_policy_specs + session_policy_specs
     db_default_policy_specs = _load_default_policy_specs(policy_store)
-    admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
+    # A project's monthly budget is configured through the projects API, not
+    # declared anywhere in the agent spec / policy stores above — this is its
+    # attachment point (see _load_project_budget_policy_specs). Treated like
+    # an admin-controlled default: it runs after session/agent policies and
+    # applies automatically to every session filed into the budgeted project,
+    # with no per-session configuration.
+    project_budget_policy_specs = _load_project_budget_policy_specs(
+        conversation_id, conversation_store, project_store
+    )
+    admin_policy_specs: list[PolicySpec] = (
+        db_default_policy_specs + list(default_policies or []) + project_budget_policy_specs
+    )
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
 
     # Always require user approval before sys_add_policy executes.
@@ -427,6 +634,15 @@ def build_policy_engine(
         if _needs_user_daily_cost(all_policy_specs)
         else None
     )
+    # Conditional injection: only pay the project + monthly-cost lookups
+    # when a project monthly cost-budget policy is actually present (either
+    # declared explicitly, or synthesized above from the project's
+    # budget_config).
+    initial_project_monthly_cost = (
+        _load_project_monthly_cost(conversation_id, conversation_store)
+        if _needs_project_monthly_cost(all_policy_specs)
+        else None
+    )
     initial_model = _resolve_session_model(conversation_id, conversation_store, spec)
     # Pass the full ModelPricing so the engine can price cache-read and
     # cache-write tokens at their own rates via compute_llm_cost().
@@ -458,6 +674,7 @@ def build_policy_engine(
         initial_usage=initial_usage,
         initial_subtree_usage=initial_subtree_usage,
         initial_user_daily_cost=initial_user_daily_cost,
+        initial_project_monthly_cost=initial_project_monthly_cost,
         token_pricing=token_pricing,
         initial_model=initial_model,
         conversation_store=conversation_store,

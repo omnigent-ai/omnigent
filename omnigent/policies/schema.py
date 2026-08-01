@@ -88,6 +88,14 @@ class UsageContext(TypedDict, total=False):
 # sessions, not just the one conversation.
 USER_DAILY_ASK_APPROVED_STATE_KEY = "_policy_user_daily_ask_approved_usd"
 
+# Reserved ``state_updates`` key the project monthly cost-budget policy
+# emits on an ASK so the engine routes the approved checkpoint to the
+# ``project_monthly_cost.ask_approved_usd`` store column (per project+month)
+# instead of the per-conversation ``session_state``. Mirrors
+# USER_DAILY_ASK_APPROVED_STATE_KEY exactly, one level up (project instead
+# of user). See PLAN.md, closes #1662.
+PROJECT_MONTHLY_ASK_APPROVED_STATE_KEY = "_policy_project_monthly_ask_approved_usd"
+
 # Reserved ``state_updates`` key the per-session cost-budget policy emits on
 # an ASK to record the highest soft checkpoint approved. The cost budget is
 # per-SESSION (the whole spawn tree), but a sub-agent runs as its own
@@ -132,6 +140,33 @@ class UserDailyCostContext(TypedDict, total=False):
     user_id: str
 
 
+class ProjectMonthlyCostContext(TypedDict, total=False):
+    """The session's project's per-UTC-calendar-month LLM cost rollup.
+
+    Injected into the event context only when a policy needs it (the
+    project monthly cost-budget policy is configured); absent / empty
+    otherwise. Read via ``event["context"]["project_monthly_cost"]``.
+    Mirrors :class:`UserDailyCostContext`, one level up (project instead
+    of user, month instead of day). See PLAN.md, closes #1662.
+
+    :param cost_usd: The project's accumulated LLM spend (USD) for the
+        current UTC month, as of this turn's start, e.g. ``12.40``.
+        ``0.0`` when nothing recorded yet / pricing unavailable.
+    :param ask_approved_usd: Highest soft warning checkpoint (USD) the
+        project owner has already approved continuing past this month,
+        so an approved checkpoint does not re-prompt across the
+        project's sessions. ``0.0`` when none approved.
+    :param project_id: The project the rollup belongs to, e.g. a
+        32-char hex id — surfaced so the budget policy can name which
+        project tripped the gate. Absent when the session (and its
+        spawn-tree root) isn't filed into a project.
+    """
+
+    cost_usd: float
+    ask_approved_usd: float
+    project_id: str
+
+
 class EventContext(TypedDict, total=False):
     """Context metadata attached to every policy event.
 
@@ -143,6 +178,11 @@ class EventContext(TypedDict, total=False):
         rollup (``cost_usd`` / ``ask_approved_usd``). Present only when
         the per-user daily cost-budget policy is configured; read via
         ``event["context"]["user_daily_cost"]``.
+    :param project_monthly_cost: The session's project's per-UTC-month
+        cost rollup (``cost_usd`` / ``ask_approved_usd`` /
+        ``project_id``). Present only when the project monthly
+        cost-budget policy is configured; read via
+        ``event["context"]["project_monthly_cost"]``.
     :param model: The model the session is currently using —
         the conversation's ``model_override`` when set (e.g. via a
         mid-session ``/model`` change), else the agent spec's
@@ -167,6 +207,7 @@ class EventContext(TypedDict, total=False):
     usage: UsageContext
     subtree_usage: UsageContext
     user_daily_cost: UserDailyCostContext
+    project_monthly_cost: ProjectMonthlyCostContext
     # ``str | None`` (not ``str``): the value is ``ctx.model``, which is
     # ``None`` when the engine could not determine a model — the dict carries
     # ``None``, it is not merely absent. Cost policies treat ``None`` as an
@@ -404,6 +445,7 @@ def request_attachments(data: object) -> list[dict[str, object]]:
 
 
 __all__ = [
+    "PROJECT_MONTHLY_ASK_APPROVED_STATE_KEY",
     "USER_DAILY_ASK_APPROVED_STATE_KEY",
     "ActorContext",
     "EventContext",
@@ -411,6 +453,7 @@ __all__ = [
     "PolicyCallableWithConfig",
     "PolicyEvent",
     "PolicyResponse",
+    "ProjectMonthlyCostContext",
     "StateUpdateEntry",
     "UsageContext",
     "UserDailyCostContext",

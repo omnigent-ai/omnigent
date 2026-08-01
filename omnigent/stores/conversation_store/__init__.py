@@ -1125,6 +1125,70 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def add_project_monthly_cost(self, project_id: str, month_utc: str, delta_usd: float) -> None:
+        """
+        Atomically add *delta_usd* to a project's spend for one UTC month.
+
+        UPSERTs the ``project_monthly_cost`` row keyed by
+        ``(project_id, month_utc)``: inserts ``delta_usd`` when no row
+        exists, otherwise increments the existing ``cost_usd`` by
+        ``delta_usd`` in a single atomic statement — mirrors
+        :meth:`add_daily_cost`. Powers the project monthly cost-budget
+        policy's project spend reads. Callers gate this on the turn's
+        session resolving a ``project_id`` (directly, or via the
+        spawn-tree root for sub-agent sessions), so the table is
+        untouched for sessions unfiled from a project.
+
+        :param project_id: The project the cost is attributed to,
+            e.g. ``"a1b2c3d4e5f6..."``.
+        :param month_utc: UTC calendar month as ``"YYYY-MM"``, e.g.
+            ``"2026-07"``.
+        :param delta_usd: USD amount to add. A no-op when ``<= 0`` so a
+            zero-cost turn never creates a row.
+        """
+        ...
+
+    @abstractmethod
+    def get_project_monthly_cost_state(self, project_id: str, month_utc: str) -> dict[str, float]:
+        """
+        Return a project's monthly cost rollup state for one UTC month.
+
+        Reads both the accumulated spend and the highest soft
+        checkpoint already approved that month, in one lookup — what
+        the project monthly cost-budget policy needs. Mirrors
+        :meth:`get_daily_cost_state`.
+
+        :param project_id: The project to read.
+        :param month_utc: UTC calendar month as ``"YYYY-MM"``, e.g.
+            ``"2026-07"``.
+        :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>}``;
+            both ``0.0`` when no row exists for ``(project_id, month_utc)``.
+        """
+        ...
+
+    @abstractmethod
+    def set_project_monthly_ask_approved(
+        self, project_id: str, month_utc: str, ask_approved_usd: float
+    ) -> None:
+        """
+        Record the highest approved soft checkpoint for a project+month.
+
+        Sets ``ask_approved_usd`` without altering ``cost_usd`` (insert
+        with ``cost_usd = 0`` when no row exists, else update only the
+        approval field). Called when a project monthly cost-budget ASK
+        is approved, so an approved checkpoint does not re-prompt for
+        that project again the same month — including from other
+        sessions filed into it. Mirrors :meth:`set_daily_ask_approved`.
+
+        :param project_id: The project the approval is for.
+        :param month_utc: UTC calendar month as ``"YYYY-MM"``, e.g.
+            ``"2026-07"``.
+        :param ask_approved_usd: The crossed checkpoint value (USD) the
+            project owner approved continuing past, e.g. ``50.0``.
+        """
+        ...
+
+    @abstractmethod
     def get_session_owner(self, conversation_id: str) -> str | None:
         """
         Return the user id that owns a session (its creator).

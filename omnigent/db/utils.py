@@ -1047,3 +1047,18 @@ def utc_day(epoch_seconds: int) -> str:
     :returns: The UTC date as ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
     """
     return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).date().isoformat()
+
+
+def utc_month(epoch_seconds: int) -> str:
+    """
+    Return the UTC calendar month for a Unix epoch timestamp.
+
+    The month key used to bucket per-project monthly cost, mirroring
+    :func:`utc_day` one level up: a session spanning a month boundary
+    (UTC) splits its spend across both months. Always UTC so the bucket
+    is unambiguous across deployments.
+
+    :param epoch_seconds: Unix epoch seconds, e.g. ``1749081600``.
+    :returns: The UTC month as ``"YYYY-MM"``, e.g. ``"2026-06"``.
+    """
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime("%Y-%m")

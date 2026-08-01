@@ -71,15 +71,19 @@ def _single_user_app(db_uri: str) -> FastAPI:
         )
 
     project_store = SqlAlchemyProjectStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
     app.include_router(
         create_sessions_router(
-            conversation_store=SqlAlchemyConversationStore(db_uri),
+            conversation_store=conversation_store,
             agent_store=SqlAlchemyAgentStore(db_uri),
             project_store=project_store,
         ),
         prefix="/v1",
     )
-    app.include_router(create_projects_router(project_store=project_store), prefix="/v1")
+    app.include_router(
+        create_projects_router(project_store=project_store, conversation_store=conversation_store),
+        prefix="/v1",
+    )
     return app
 
 
@@ -212,9 +216,10 @@ def _multi_user_app(db_uri: str) -> FastAPI:
 
     auth = UnifiedAuthProvider(source="header")
     project_store = SqlAlchemyProjectStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
     app.include_router(
         create_sessions_router(
-            conversation_store=SqlAlchemyConversationStore(db_uri),
+            conversation_store=conversation_store,
             agent_store=SqlAlchemyAgentStore(db_uri),
             auth_provider=auth,
             permission_store=SqlAlchemyPermissionStore(db_uri),
@@ -223,7 +228,11 @@ def _multi_user_app(db_uri: str) -> FastAPI:
         prefix="/v1",
     )
     app.include_router(
-        create_projects_router(project_store=project_store, auth_provider=auth),
+        create_projects_router(
+            project_store=project_store,
+            conversation_store=conversation_store,
+            auth_provider=auth,
+        ),
         prefix="/v1",
     )
     return app

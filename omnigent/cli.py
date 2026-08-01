@@ -3437,6 +3437,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        project_store=project_store,
         caps=caps,
     )
 

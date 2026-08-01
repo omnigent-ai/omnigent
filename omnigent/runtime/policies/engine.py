@@ -113,6 +113,7 @@ class PolicyEngine:
         initial_usage: dict[str, float] | None = None,
         initial_subtree_usage: dict[str, float] | None = None,
         initial_user_daily_cost: dict[str, float | str] | None = None,
+        initial_project_monthly_cost: dict[str, float | str] | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
@@ -158,6 +159,12 @@ class PolicyEngine:
         # ``None`` → not needed → never injected, so no owner/daily lookup
         # cost for sessions that don't use the daily policy.
         self._user_daily_cost = initial_user_daily_cost
+        # The session's project's per-UTC-month cost rollup
+        # ({"cost_usd", "ask_approved_usd", "project_id"}), seeded at build
+        # time ONLY when a policy needs it (project monthly cost-budget
+        # configured). ``None`` → not needed → never injected, mirroring
+        # ``_user_daily_cost`` one level up (project instead of user).
+        self._project_monthly_cost = initial_project_monthly_cost
         self._token_pricing = token_pricing
         self._model = initial_model
         self._store = conversation_store
@@ -344,6 +351,7 @@ class PolicyEngine:
         ctx = self._inject_usage(ctx)
         ctx = self._inject_subtree_usage(ctx)
         ctx = self._inject_user_daily_cost(ctx)
+        ctx = self._inject_project_monthly_cost(ctx)
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
         ctx = self._inject_llm_client(ctx)
@@ -533,22 +541,26 @@ class PolicyEngine:
         if not updates:
             return
         from omnigent.policies.schema import (
+            PROJECT_MONTHLY_ASK_APPROVED_STATE_KEY,
             SESSION_COST_ASK_APPROVED_STATE_KEY,
             SESSION_COST_UNPRICED_APPROVED_KEY,
             USER_DAILY_ASK_APPROVED_STATE_KEY,
         )
 
-        # Two reserved keys are routed off this conversation's session_state:
-        # the per-user daily approval goes to the user+day store column (so it
-        # persists across the user's sessions), and the per-SESSION cost
-        # approval goes to the ROOT conversation (so approving once covers the
-        # whole spawn tree — a sub-agent runs as its own conversation, and
+        # Reserved keys routed off this conversation's session_state: the
+        # per-user daily approval goes to the user+day store column, the
+        # project monthly approval goes to the project+month store column
+        # (mirrors the daily one), and the per-SESSION cost approval goes to
+        # the ROOT conversation (so approving once covers the whole spawn
+        # tree — a sub-agent runs as its own conversation, and
         # build_policy_engine seeds the approval from the root). Every other
         # update lands in this conversation's session_state as usual.
         session_ops = []
         for op in updates:
             if op.key == USER_DAILY_ASK_APPROVED_STATE_KEY:
                 self._record_user_daily_ask_approved(op.value)
+            elif op.key == PROJECT_MONTHLY_ASK_APPROVED_STATE_KEY:
+                self._record_project_monthly_ask_approved(op.value)
             elif (
                 op.key in (SESSION_COST_ASK_APPROVED_STATE_KEY, SESSION_COST_UNPRICED_APPROVED_KEY)
                 and self._root_conversation_id != self._conversation_id
@@ -617,6 +629,43 @@ class PolicyEngine:
         # approval stays current via _apply_one(self._session_state, ...).
         if self._user_daily_cost is not None:
             self._user_daily_cost["ask_approved_usd"] = approved
+
+    def _record_project_monthly_ask_approved(self, value: Any) -> None:
+        """
+        Persist a project monthly cost-budget ASK approval.
+
+        Writes the approved soft-checkpoint value to the project's
+        ``project_monthly_cost.ask_approved_usd`` for the current UTC
+        month, so the same checkpoint won't re-prompt for that project
+        again this month (including from other sessions filed into it).
+        Mirrors :meth:`_record_user_daily_ask_approved`, but resolves the
+        target project from ``self._project_monthly_cost["project_id"]``
+        (set at build time by ``_load_project_monthly_cost``, which
+        already applied the sub-agent root-conversation fallback) rather
+        than re-resolving here — so a sub-agent's approval lands on the
+        same project row its threshold check read from. A no-op when the
+        engine wasn't seeded with a project (unfiled session) or *value*
+        is not numeric.
+
+        :param value: The crossed checkpoint value (USD) the project
+            owner approved, e.g. ``50.0``.
+        """
+        if value is None or self._project_monthly_cost is None:
+            return
+        project_id = self._project_monthly_cost.get("project_id")
+        if not isinstance(project_id, str) or not project_id:
+            return
+        try:
+            approved = float(value)
+        except (TypeError, ValueError):
+            return
+        from omnigent.db.utils import now_epoch, utc_month
+
+        self._store.set_project_monthly_ask_approved(project_id, utc_month(now_epoch()), approved)
+        # Keep the in-memory snapshot current so any later evaluate() on
+        # this engine sees the approval and doesn't re-ASK the checkpoint
+        # just approved — mirroring the daily-cost counterpart above.
+        self._project_monthly_cost["ask_approved_usd"] = approved
 
     def record_usage(
         self,
@@ -735,6 +784,26 @@ class PolicyEngine:
         if self._user_daily_cost is None:
             return ctx
         return replace(ctx, user_daily_cost=dict(self._user_daily_cost))
+
+    def _inject_project_monthly_cost(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``project_monthly_cost`` populated, when seeded.
+
+        Injects the session's project's per-UTC-month cost rollup (read once
+        at engine-build time) so the project monthly cost-budget policy can
+        read it via ``event["context"]["project_monthly_cost"]`` without
+        re-querying the store. Mirrors :meth:`_inject_user_daily_cost` one
+        level up. When the engine was built without it (``None`` — no
+        policy needs it, or the session isn't filed into a project), *ctx*
+        is returned unchanged.
+
+        :param ctx: Original :class:`EvaluationContext` from the caller.
+        :returns: *ctx* unchanged when no project monthly cost was seeded,
+            else a copy with ``project_monthly_cost`` set to a defensive copy.
+        """
+        if self._project_monthly_cost is None:
+            return ctx
+        return replace(ctx, project_monthly_cost=dict(self._project_monthly_cost))
 
     def _inject_model(self, ctx: EvaluationContext) -> EvaluationContext:
         """

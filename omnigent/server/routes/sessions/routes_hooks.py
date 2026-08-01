@@ -20,6 +20,7 @@ from omnigent.runtime import (
     get_agent_cache,
     get_caps,
     get_policy_store,
+    get_project_store,
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -695,6 +696,8 @@ def register_hooks_routes(
             conversation_id=session_id,
             default_policies=_caps.default_policies,
             policy_store=get_policy_store(),
+            conversation_store=conversation_store,
+            project_store=get_project_store(),
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
         ):
@@ -725,6 +728,7 @@ def register_hooks_routes(
                 conversation_store=conversation_store,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
+                project_store=get_project_store(),
                 server_llm=_caps.llm,
                 host_connection=_host_conn,
             )

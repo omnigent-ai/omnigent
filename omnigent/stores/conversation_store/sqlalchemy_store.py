@@ -35,6 +35,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlPolicy,
     SqlProject,
+    SqlProjectMonthlyCost,
     SqlSessionPermission,
     SqlUserDailyCost,
     current_workspace_id,
@@ -1614,6 +1615,149 @@ class SqlAlchemyConversationStore(ConversationStore):
             else:
                 existing.ask_approved_usd = ask_approved_usd
                 existing.updated_at = now
+
+    def add_project_monthly_cost(self, project_id: str, month_utc: str, delta_usd: float) -> None:
+        """
+        Atomically add *delta_usd* to a project's spend for one UTC month.
+
+        Mirrors :meth:`add_daily_cost`, keyed by
+        ``(workspace_id, project_id, month_utc)`` instead of
+        ``(workspace_id, user_id, day_utc)``.
+
+        :param project_id: The project the cost is attributed to.
+        :param month_utc: UTC month as ``"YYYY-MM"``, e.g. ``"2026-07"``.
+        :param delta_usd: USD amount to add; ``<= 0`` is a no-op.
+        """
+        if delta_usd <= 0:
+            return
+        now = now_epoch()
+        with self._session() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if dialect in ("sqlite", "postgresql"):
+                stmt: Any
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                    stmt = sqlite_insert(SqlProjectMonthlyCost)
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    stmt = pg_insert(SqlProjectMonthlyCost)
+                stmt = stmt.values(
+                    project_id=project_id,
+                    month_utc=month_utc,
+                    cost_usd=delta_usd,
+                    updated_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["workspace_id", "project_id", "month_utc"],
+                    set_={
+                        "cost_usd": SqlProjectMonthlyCost.cost_usd + stmt.excluded.cost_usd,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+                session.execute(stmt)
+                return
+            # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
+            # transaction.
+            existing = session.get(
+                SqlProjectMonthlyCost, (current_workspace_id(), project_id, month_utc)
+            )
+            if existing is None:
+                session.add(
+                    SqlProjectMonthlyCost(
+                        project_id=project_id,
+                        month_utc=month_utc,
+                        cost_usd=delta_usd,
+                        updated_at=now,
+                    )
+                )
+            else:
+                existing.cost_usd = existing.cost_usd + delta_usd  # type: ignore[assignment]
+                existing.updated_at = now  # type: ignore[assignment]
+
+    def get_project_monthly_cost_state(self, project_id: str, month_utc: str) -> dict[str, float]:
+        """
+        Return a project's monthly cost rollup state for one UTC month.
+
+        Mirrors :meth:`get_daily_cost_state`.
+
+        :param project_id: The project to read.
+        :param month_utc: UTC month as ``"YYYY-MM"``, e.g. ``"2026-07"``.
+        :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>}``;
+            both ``0.0`` when no row exists for ``(project_id, month_utc)``.
+        """
+        with self._session() as session:
+            row = session.get(
+                SqlProjectMonthlyCost, (current_workspace_id(), project_id, month_utc)
+            )
+            if row is None:
+                return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
+            return {
+                "cost_usd": float(row.cost_usd),
+                "ask_approved_usd": float(row.ask_approved_usd or 0.0),
+            }
+
+    def set_project_monthly_ask_approved(
+        self, project_id: str, month_utc: str, ask_approved_usd: float
+    ) -> None:
+        """
+        Record the highest approved soft checkpoint for a project+month.
+
+        Mirrors :meth:`set_daily_ask_approved`: UPSERT that sets
+        ``ask_approved_usd`` without touching ``cost_usd``.
+
+        :param project_id: The project the approval is for.
+        :param month_utc: UTC month as ``"YYYY-MM"``, e.g. ``"2026-07"``.
+        :param ask_approved_usd: The crossed checkpoint value (USD) the
+            project owner approved continuing past.
+        """
+        now = now_epoch()
+        with self._session() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if dialect in ("sqlite", "postgresql"):
+                stmt: Any
+                if dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                    stmt = sqlite_insert(SqlProjectMonthlyCost)
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    stmt = pg_insert(SqlProjectMonthlyCost)
+                stmt = stmt.values(
+                    project_id=project_id,
+                    month_utc=month_utc,
+                    cost_usd=0.0,
+                    ask_approved_usd=ask_approved_usd,
+                    updated_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["workspace_id", "project_id", "month_utc"],
+                    set_={
+                        "ask_approved_usd": stmt.excluded.ask_approved_usd,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+                session.execute(stmt)
+                return
+            # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
+            existing = session.get(
+                SqlProjectMonthlyCost, (current_workspace_id(), project_id, month_utc)
+            )
+            if existing is None:
+                session.add(
+                    SqlProjectMonthlyCost(
+                        project_id=project_id,
+                        month_utc=month_utc,
+                        cost_usd=0.0,
+                        ask_approved_usd=ask_approved_usd,
+                        updated_at=now,
+                    )
+                )
+            else:
+                existing.ask_approved_usd = ask_approved_usd  # type: ignore[assignment]
+                existing.updated_at = now  # type: ignore[assignment]
 
     def get_session_owner(self, conversation_id: str) -> str | None:
         """

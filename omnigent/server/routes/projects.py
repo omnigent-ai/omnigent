@@ -28,6 +28,7 @@ from omnigent.server.schemas import (
     CreateProjectRequest,
     UpdateProjectRequest,
 )
+from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.project_store import ProjectStore
 
 
@@ -44,16 +45,22 @@ def _to_response(project: Project) -> dict[str, Any]:
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         "config": project.config,
+        "budget_config": project.budget_config,
     }
 
 
 def create_projects_router(
     project_store: ProjectStore,
+    conversation_store: ConversationStore,
     auth_provider: AuthProvider | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
     :param project_store: The store backing project persistence.
+    :param conversation_store: The store backing the project monthly
+        cost-budget rollup (``project_monthly_cost``), read by
+        ``GET /projects/{project_id}/budget``. See ``PLAN.md``, closes
+        #1662.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` in single-user mode (owner scope is ``None``).
     :returns: A configured :class:`APIRouter`.
@@ -80,6 +87,7 @@ def create_projects_router(
             body.name,
             user_id,
             body.config,
+            body.budget_config,
         )
         return _to_response(project)
 
@@ -134,10 +142,47 @@ def create_projects_router(
             owner_user_id=user_id,
             name=body.name,
             config=body.config,
+            budget_config=body.budget_config,
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return _to_response(project)
+
+    @router.get("/projects/{project_id}/budget")
+    async def get_project_budget(request: Request, project_id: str) -> dict[str, Any]:
+        """Return the caller's project's budget config and current spend.
+
+        Reports the project's month-to-date spend against its configured
+        monthly limit (see ``PLAN.md``, closes #1662). A project with no
+        ``budget_config`` reports ``limit_usd: None`` (unlimited); spend is
+        still reported so the owner can see month-to-date cost even without
+        a configured cap.
+
+        :param request: The incoming request, used to identify the user.
+        :param project_id: The project to report on.
+        :returns: ``{"object": "project.budget", "limit_usd": <float|None>,
+            "ask_thresholds_usd": [...], "spend_usd": <float>,
+            "month_utc": "YYYY-MM"}``.
+        :raises OmnigentError: 401 if unauthenticated, 404 if not found / not
+            owned by the caller.
+        """
+        from omnigent.db.utils import now_epoch, utc_month
+
+        user_id = require_user(request, auth_provider)
+        project = await asyncio.to_thread(project_store.get, project_id, owner_user_id=user_id)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        month_utc = utc_month(now_epoch())
+        state = await asyncio.to_thread(
+            conversation_store.get_project_monthly_cost_state, project_id, month_utc
+        )
+        return {
+            "object": "project.budget",
+            "limit_usd": project.budget_config.get("limit_usd"),
+            "ask_thresholds_usd": project.budget_config.get("ask_thresholds_usd") or [],
+            "spend_usd": state["cost_usd"],
+            "month_utc": month_utc,
+        }
 
     @router.delete("/projects/{project_id}")
     async def delete_project(request: Request, project_id: str) -> dict[str, Any]:

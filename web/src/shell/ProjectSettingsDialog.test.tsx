@@ -3,11 +3,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
-import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import {
+  getProject,
+  getProjectBudget,
+  updateProjectConfig,
+  updateProjectBudget,
+  createProject,
+} from "@/lib/projectsApi";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
+  getProjectBudget: vi.fn(),
   updateProjectConfig: vi.fn(),
+  updateProjectBudget: vi.fn(),
   createProject: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({
@@ -47,23 +55,46 @@ vi.mock("./WorkspacePicker", () => ({
 }));
 
 const getProjectMock = vi.mocked(getProject);
+const getBudgetMock = vi.mocked(getProjectBudget);
 const updateMock = vi.mocked(updateProjectConfig);
+const updateBudgetMock = vi.mocked(updateProjectBudget);
 const createMock = vi.mocked(createProject);
 
 function renderDialog(projectId: string | null = "p_1") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={client}>
-      <ProjectSettingsDialog open onOpenChange={vi.fn()} projectId={projectId} projectName="Work" />
-    </QueryClientProvider>,
-  );
+  const onOpenChange = vi.fn();
+  return {
+    ...render(
+      <QueryClientProvider client={client}>
+        <ProjectSettingsDialog
+          open
+          onOpenChange={onOpenChange}
+          projectId={projectId}
+          projectName="Work"
+        />
+      </QueryClientProvider>,
+    ),
+    onOpenChange,
+  };
 }
 
 beforeEach(() => {
   getProjectMock.mockReset();
+  getBudgetMock.mockReset();
   updateMock.mockReset();
+  updateBudgetMock.mockReset();
   createMock.mockReset();
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+  // Default: no budget configured, nothing spent — matches an unconfigured
+  // project so pre-existing config-only tests don't need to know about
+  // budget at all.
+  getBudgetMock.mockResolvedValue({
+    limit_usd: null,
+    ask_thresholds_usd: [],
+    spend_usd: 0,
+    month_utc: "2026-07",
+  });
+  updateBudgetMock.mockResolvedValue({ id: "p_1", name: "Work", config: {}, budget_config: {} });
 });
 
 afterEach(cleanup);
@@ -212,5 +243,173 @@ describe("ProjectSettingsDialog", () => {
     // Even if a submit is forced, onSubmit bails — no clearing PATCH is sent.
     fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
     expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  describe("budget (PLAN.md, closes #1662)", () => {
+    it("seeds the limit and warning fields from the stored budget", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      getBudgetMock.mockResolvedValue({
+        limit_usd: 50,
+        ask_thresholds_usd: [25],
+        spend_usd: 12.5,
+        month_utc: "2026-07",
+      });
+      renderDialog();
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-budget-limit")).toHaveValue(50),
+      );
+      expect(screen.getByTestId("project-settings-budget-threshold")).toHaveValue(25);
+    });
+
+    it("shows month-to-date spend against the limit as a progress bar", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      getBudgetMock.mockResolvedValue({
+        limit_usd: 50,
+        ask_thresholds_usd: [],
+        spend_usd: 12.5,
+        month_utc: "2026-07",
+      });
+      renderDialog();
+      const report = await screen.findByTestId("project-settings-budget-report");
+      expect(report).toHaveTextContent("$12.50 / $50.00");
+    });
+
+    it("reports spend even when unlimited, with no progress bar", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      getBudgetMock.mockResolvedValue({
+        limit_usd: null,
+        ask_thresholds_usd: [],
+        spend_usd: 3.0,
+        month_utc: "2026-07",
+      });
+      renderDialog();
+      const report = await screen.findByTestId("project-settings-budget-report");
+      expect(report).toHaveTextContent("$3.00");
+      expect(report).not.toHaveTextContent("/");
+    });
+
+    it("hides the warning-threshold field until a limit is entered", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      renderDialog();
+      await waitFor(() =>
+        expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+          false,
+        ),
+      );
+      expect(screen.queryByTestId("project-settings-budget-threshold")).not.toBeInTheDocument();
+
+      fireEvent.change(screen.getByTestId("project-settings-budget-limit"), {
+        target: { value: "50" },
+      });
+      expect(screen.getByTestId("project-settings-budget-threshold")).toBeInTheDocument();
+    });
+
+    it("saves the entered limit and threshold, after the config save resolves", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      renderDialog();
+      await waitFor(() =>
+        expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+          false,
+        ),
+      );
+
+      fireEvent.change(screen.getByTestId("project-settings-budget-limit"), {
+        target: { value: "50" },
+      });
+      fireEvent.change(screen.getByTestId("project-settings-budget-threshold"), {
+        target: { value: "25" },
+      });
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+
+      await waitFor(() =>
+        expect(updateBudgetMock).toHaveBeenCalledWith("p_1", {
+          limit_usd: 50,
+          ask_thresholds_usd: [25],
+        }),
+      );
+      // Sequenced, not parallel — config must have resolved before budget saves
+      // (both independently promote a label-only folder; see ProjectSettingsDialog's
+      // onSubmit comment on why parallel mutations would race two creates).
+      expect(updateMock).toHaveBeenCalled();
+    });
+
+    it("clears the budget when the limit field is emptied", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      getBudgetMock.mockResolvedValue({
+        limit_usd: 50,
+        ask_thresholds_usd: [25],
+        spend_usd: 0,
+        month_utc: "2026-07",
+      });
+      const { onOpenChange } = renderDialog();
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-budget-limit")).toHaveValue(50),
+      );
+
+      fireEvent.change(screen.getByTestId("project-settings-budget-limit"), {
+        target: { value: "" },
+      });
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+
+      // Wait for the full mutation chain — config, then budget, then the
+      // dialog-close callback — to settle before the test ends, so its
+      // pending promises can't resolve mid-flight during a LATER test.
+      await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+      expect(updateBudgetMock).toHaveBeenCalledWith("p_1", {});
+    });
+
+    it("rejects a non-positive limit client-side without calling the API", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      renderDialog();
+      await waitFor(() =>
+        expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+          false,
+        ),
+      );
+
+      fireEvent.change(screen.getByTestId("project-settings-budget-limit"), {
+        target: { value: "-5" },
+      });
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+
+      await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/positive number/i));
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(updateBudgetMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects a warning threshold at or above the limit client-side", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      renderDialog();
+      await waitFor(() =>
+        expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+          false,
+        ),
+      );
+
+      fireEvent.change(screen.getByTestId("project-settings-budget-limit"), {
+        target: { value: "50" },
+      });
+      fireEvent.change(screen.getByTestId("project-settings-budget-threshold"), {
+        target: { value: "50" },
+      });
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+
+      await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/below the limit/i));
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(updateBudgetMock).not.toHaveBeenCalled();
+    });
+
+    it("blocks Save when the budget report fails to load", async () => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      getBudgetMock.mockRejectedValue(new Error("500 Server Error"));
+      renderDialog();
+
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-budget-load-error")).toBeInTheDocument(),
+      );
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        true,
+      );
+    });
   });
 });

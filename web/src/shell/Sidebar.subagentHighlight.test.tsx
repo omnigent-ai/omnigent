@@ -49,6 +49,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useProjectConfig: () => ({ data: undefined, isLoading: false }),
   useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectBudget: () => ({ data: undefined, isLoading: false, isError: false }),
+  useUpdateProjectBudget: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));

@@ -42,6 +42,7 @@ class ProjectStore(ABC):
         name: str,
         owner_user_id: str | None,
         config: dict[str, Any] | None = None,
+        budget_config: dict[str, Any] | None = None,
     ) -> Project:
         """
         Insert a new, empty project.
@@ -52,6 +53,8 @@ class ProjectStore(ABC):
         :param owner_user_id: Owning user, or ``None`` in single-user mode.
         :param config: Optional default session settings (opaque JSON object);
             ``None`` or empty stores no defaults.
+        :param budget_config: Optional monthly spend budget (opaque JSON
+            object); ``None`` or empty means no budget configured (unlimited).
         :returns: The newly created :class:`Project`.
         :raises OmnigentError: ``ALREADY_EXISTS`` if the owner already has a
             project with this name.
@@ -67,6 +70,26 @@ class ProjectStore(ABC):
         :param owner_user_id: The requesting owner; a project owned by someone
             else is treated as not found.
         :returns: The :class:`Project` if found and owned, else ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def get_by_id(self, project_id: str) -> Project | None:
+        """
+        Return a project by id with no owner check, or ``None`` if not found.
+
+        Internal/system lookup for code paths that don't run in a
+        request-scoped user context — currently the policy engine builder,
+        which resolves a session's project (via ``conversation.project_id``)
+        to read its ``budget_config`` and has no authenticated caller to
+        scope the read to. Unlike :meth:`get`, this is **not** an
+        authorization boundary — callers on a user-facing path must keep
+        using :meth:`get`/:meth:`list`, never this method, since it returns
+        another user's project data with no ownership check.
+
+        :param project_id: Opaque project identifier.
+        :returns: The :class:`Project` if found, else ``None`` — regardless
+            of who owns it.
         """
         ...
 
@@ -88,6 +111,7 @@ class ProjectStore(ABC):
         owner_user_id: str | None,
         name: str | None = None,
         config: dict[str, Any] | None = None,
+        budget_config: dict[str, Any] | None = None,
     ) -> Project | None:
         """
         Update mutable fields of an owned project.
@@ -101,6 +125,9 @@ class ProjectStore(ABC):
             non-empty, unique among the owner's projects.
         :param config: New config object to replace the stored one, or ``None``
             to leave it unchanged. An empty dict clears the stored defaults.
+        :param budget_config: New budget config to replace the stored one, or
+            ``None`` to leave it unchanged. An empty dict clears the budget
+            (unlimited).
         :returns: The updated :class:`Project`, or ``None`` if not found.
         :raises OmnigentError: ``ALREADY_EXISTS`` if the new name collides with
             another of the owner's projects.

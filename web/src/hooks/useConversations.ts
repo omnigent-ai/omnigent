@@ -34,9 +34,13 @@ import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
   getProject as apiGetProject,
+  getProjectBudget as apiGetProjectBudget,
   listProjects as apiListProjects,
+  type ProjectBudgetConfig,
+  type ProjectBudgetReport,
   type ProjectConfig,
   renameProject as apiRenameProject,
+  updateProjectBudget as apiUpdateProjectBudget,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -1547,6 +1551,59 @@ export function useUpdateProjectConfig() {
           : [...prev, summary];
       });
       void queryClient.invalidateQueries({ queryKey: ["project-config"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+}
+
+/**
+ * Fetch a project's monthly budget config + current month-to-date spend
+ * (`GET /v1/projects/{id}/budget`). See `ProjectSettingsDialog`'s budget
+ * section and `PLAN.md`, closes #1662.
+ */
+export function useProjectBudget(id: string | null) {
+  return useQuery<ProjectBudgetReport>({
+    queryKey: ["project-budget", id],
+    queryFn: async () => apiGetProjectBudget(id as string),
+    enabled: id !== null,
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * Replace a project's stored `budget_config` (`PATCH /v1/projects/{id}`). A
+ * label-only folder (`id === null`) is promoted on demand, mirroring
+ * `useUpdateProjectConfig`. Passing `budget_config: {}` clears the budget
+ * (unlimited).
+ */
+export function useUpdateProjectBudget() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      id,
+      name,
+      budgetConfig,
+    }: {
+      id: string | null;
+      name: string;
+      budgetConfig: ProjectBudgetConfig;
+    }) => {
+      const projectId = id ?? (await apiCreateProject(name)).id;
+      return apiUpdateProjectBudget(projectId, budgetConfig);
+    },
+    onSuccess: (project) => {
+      // Invalidate rather than seed: unlike config (a pure client-side
+      // prefill), the budget report also carries server-computed spend_usd,
+      // which this mutation response doesn't include — a stale seed would
+      // show the pre-edit spend until the next 30s refetch.
+      void queryClient.invalidateQueries({ queryKey: ["project-budget", project.id] });
+      queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
+        if (!prev) return prev;
+        const summary = { id: project.id, name: project.name };
+        return prev.some((p) => p.name === project.name)
+          ? prev.map((p) => (p.name === project.name ? summary : p))
+          : [...prev, summary];
+      });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });
