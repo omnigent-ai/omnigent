@@ -282,7 +282,7 @@ describe("SettingsPage", () => {
 
     fireEvent.change(screen.getByTestId("dictation-path-select"), { target: { value: "server" } });
     fireEvent.change(screen.getByLabelText("Browser recognition language"), {
-      target: { value: "fr-FR" },
+      target: { value: " fr-fr " },
     });
     fireEvent.change(screen.getByTestId("dictation-microphone-select"), {
       target: { value: "mic-1" },
@@ -292,6 +292,7 @@ describe("SettingsPage", () => {
       browserLanguage: "fr-FR",
       microphoneDeviceId: "mic-1",
     });
+    expect(screen.getByLabelText("Browser recognition language")).toHaveValue("fr-FR");
   });
 
   it("handles failed enumeration and refreshes audio inputs on devicechange", async () => {
