@@ -35,10 +35,10 @@ import httpx
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.native_coding_agents import (
-    CLAUDE_NATIVE_AGENT_NAME,
-    native_coding_agent_for_harness,
-)
+from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+from omnigent.native_coding_agents import native_coding_agent_for_harness
+
+CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
 
 #: Sentinel ``harness_override`` that asks the server to route the harness too.
 AUTO_HARNESS = "auto"
