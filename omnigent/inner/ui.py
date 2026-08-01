@@ -79,8 +79,8 @@ def show_banner(*, isatty: bool | None = None, env: dict[str, str] | None = None
         isatty = sys.stderr.isatty()
     if not isatty:
         return False
-    env = os.environ if env is None else env
-    raw = str(env.get(NO_BANNER_ENV_VAR, "")).strip().lower()
+    effective_env = os.environ if env is None else env
+    raw = str(effective_env.get(NO_BANNER_ENV_VAR, "")).strip().lower()
     return raw not in {"1", "true", "yes", "on"}
 
 
