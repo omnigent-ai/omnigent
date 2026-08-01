@@ -69,7 +69,7 @@ register_engine("sherpa", lambda: SherpaDictationEngine(...), available=_sherpa_
 register_engine("fake", FakeDictationEngine)
 ```
 
-Adding an engine (Whisper, Parakeet, a hosted API) is one `register_engine`
+Adding an engine (Whisper, a hosted API) is one `register_engine`
 call with a factory and an optional availability probe — no edits to
 `get_engine` or `engine_availability`. Third-party engines register
 themselves on import. The default (unset env var) is `sherpa`.
@@ -90,6 +90,16 @@ a per-engine `threading.Lock` (sherpa recognizer streams are not documented
 thread-safe), with a module-level semaphore capping concurrent dictation
 connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 
+`ParakeetMlxDictationEngine` is an Apple Silicon alternative selected with
+`OMNIGENT_DICTATION_ENGINE=parakeet_mlx`. It loads one process-wide
+`parakeet-mlx` model and creates one streaming decoder per take. Incoming
+PCM16 is normalized to a one-dimensional float array before it reaches MLX.
+The upstream decoder's stable and draft tokens form one revisable `partial`;
+they are never emitted as token-sized final events. Omnigent finalizes the
+complete current hypothesis after 1.6 seconds of trailing silence or 30
+seconds of audio. Explicit stop adds one second of silence to flush right
+context, returns the remaining hypothesis once, and closes the MLX stream.
+
 ### Configuration
 
 | Env var | Default | Meaning |
@@ -100,6 +110,8 @@ connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 | `OMNIGENT_DICTATION_MAX_FRAME_BYTES` | `262144` | maximum binary PCM frame size; larger frames close with WebSocket code 1009 |
 | `OMNIGENT_DICTATION_MAX_TAKE_SECONDS` | `300` | maximum wall-clock or PCM-audio duration per take |
 | `OMNIGENT_DICTATION_ENGINE` | unset (`sherpa`) | engine to use by registered name (`sherpa`, `remote`, `fake`) |
+| `OMNIGENT_DICTATION_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | Hugging Face model ID or absolute local model directory for `parakeet_mlx` |
+| `OMNIGENT_DICTATION_MODEL_CACHE_DIR` | `~/.omnigent/models/dictation/parakeet-mlx` | download/cache directory for `parakeet_mlx` models |
 | `OMNIGENT_DICTATION_REMOTE_URL` | unset | worker stream URL for the `remote` engine, e.g. `ws://venus:8100/v1/dictation/stream` |
 | `OMNIGENT_DICTATION_WORKER_TOKEN` | unset | shared bearer token required by the worker and sent by the main relay |
 | `OMNIGENT_DICTATION_REMOTE_CA_FILE` | unset | optional PEM CA bundle for a private worker CA; normal hostname and certificate verification remain enabled |
@@ -124,6 +136,30 @@ chunks):
 On N100/N95-class mini-PC servers, use the mid-size zipformer (accuracy held
 up in spot checks; the 20 M model audibly degrades) and consider
 `OMNIGENT_DICTATION_MAX_STREAMS=1`.
+
+### Apple Silicon MLX engine
+
+Install the platform-specific extra on an Apple Silicon Mac and select the
+engine:
+
+```
+uv sync --extra dictation-mlx --extra dev
+OMNIGENT_DICTATION_ENGINE=parakeet_mlx uv run omnigent server
+```
+
+The first take downloads the configured model into
+`OMNIGENT_DICTATION_MODEL_CACHE_DIR`; later loads reuse that cache. Set
+`OMNIGENT_DICTATION_MODEL` to another compatible Hugging Face ID or an
+absolute local model directory. Availability requires macOS on arm64, the
+`dictation-mlx` extra, and an existing directory when an absolute local path
+is configured. The authenticated status endpoint reports the model ID, or
+`local` for a path so filesystem details are not disclosed.
+
+The `parakeet-mlx` 0.5.x code is Apache-2.0. The default
+`mlx-community/parakeet-tdt-0.6b-v3` weights are converted from NVIDIA's
+model and are CC BY 4.0. Operators distributing the weights or output must
+review and satisfy the model license, including its attribution requirement.
+Changing `OMNIGENT_DICTATION_MODEL` may change the governing model license.
 
 **Other languages.** The engine is language-agnostic — dictation speaks
 whatever language the installed model was trained on. The
@@ -304,6 +340,24 @@ mode), behavior is exactly today's.
   stream-cap rejection.
 - **Engine unit tests** skip unless sherpa-onnx and models are present
   (developer machines), keeping CI hermetic.
+- **Parakeet MLX unit tests** mock the optional native package and cover PCM
+  normalization, partial/final boundaries, finish, cleanup, configuration,
+  availability, and status path sanitization. A real-model smoke test runs
+  only when `OMNIGENT_DICTATION_MLX_TEST_WAV` names a consented 16 kHz mono
+  PCM16 WAV:
+
+  ```
+  OMNIGENT_DICTATION_MLX_TEST_WAV=/path/to/sample.wav \
+    uv run --extra dictation-mlx pytest \
+    tests/server/test_dictation_engine.py::test_parakeet_mlx_engine_transcribes_test_wav
+  ```
+- **Latency benchmark** drives the same adapter in 100 ms chunks and reports
+  model load time, decode time, audio duration, transcript, and real-time
+  factor:
+
+  ```
+  uv run --extra dictation-mlx dev/benchmarks/dictation_mlx.py /path/to/sample.wav
+  ```
 - **Web (Vitest, `ComposerMicButton.test.tsx` + `dictation.test.ts`)**:
   mode selection, partial/final callback flow against a mocked WebSocket and
   mocked AudioWorklet capture.
