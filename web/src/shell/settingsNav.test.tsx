@@ -75,6 +75,11 @@ describe("settingsNavGroups", () => {
     }
   });
 
+  it("includes device-local Dictation settings in General", () => {
+    const general = settingsNavGroups(false, false).find((group) => group.title === "General");
+    expect(general?.items.map((item) => item.id)).toContain("dictation");
+  });
+
   it("includes Account (leading) whenever a login session exists (accounts OR OIDC)", () => {
     // First arg is hasAuthSession (login_url != null), not accounts-specific.
     // Header single-user (no session) → no Account section.
@@ -304,6 +309,10 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/updates")).toEqual({
       inSettings: true,
       section: "updates",
+    });
+    expect(routeHook("/settings/dictation")).toEqual({
+      inSettings: true,
+      section: "dictation",
     });
     // Bare /settings: in-settings, defaulting to Appearance in header mode
     // (no login session — loginUrl null per beforeEach).

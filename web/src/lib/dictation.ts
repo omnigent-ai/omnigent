@@ -33,12 +33,40 @@ export interface DictationSessionEvents {
   onError: (message: string) => void;
 }
 
+export interface DictationSessionOptions {
+  microphoneDeviceId?: string | null;
+}
+
 /**
  * The server was reachable but at its concurrent-take cap (WS close 1013).
  * Transient by definition — callers should message "busy, try again",
  * not "unavailable".
  */
 export class DictationBusyError extends Error {}
+
+const dictationAudioConstraints = (microphoneDeviceId?: string | null): MediaTrackConstraints => ({
+  channelCount: 1,
+  echoCancellation: true,
+  noiseSuppression: true,
+  ...(microphoneDeviceId ? { deviceId: { exact: microphoneDeviceId } } : {}),
+});
+
+/** Acquire the selected input, retrying a missing exact device once with the system default. */
+export async function getDictationMediaStream(
+  microphoneDeviceId?: string | null,
+): Promise<MediaStream> {
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: dictationAudioConstraints(microphoneDeviceId),
+    });
+  } catch (error) {
+    const name = error instanceof DOMException ? error.name : "";
+    if (microphoneDeviceId && (name === "NotFoundError" || name === "OverconstrainedError")) {
+      return navigator.mediaDevices.getUserMedia({ audio: dictationAudioConstraints() });
+    }
+    throw error;
+  }
+}
 
 /**
  * Parse one text frame from the dictation socket into a typed event.
@@ -218,10 +246,11 @@ export class DictationSession {
    * denied, the socket fails, the server is at capacity
    * ({@link DictationBusyError}), or the engine never comes up.
    */
-  static async start(events: DictationSessionEvents): Promise<DictationSession> {
-    const mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-    });
+  static async start(
+    events: DictationSessionEvents,
+    options: DictationSessionOptions = {},
+  ): Promise<DictationSession> {
+    const mediaStream = await getDictationMediaStream(options.microphoneDeviceId);
 
     let ws: WebSocket | null = null;
     let audioContext: AudioContext | null = null;

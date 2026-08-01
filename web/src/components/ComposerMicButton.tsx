@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
+import { readDictationPreferences } from "@/lib/dictationPreferences";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
@@ -90,11 +91,13 @@ export const ComposerMicButton = ({
   onTranscript,
   onInterim,
   disabled,
-  lang = "en-US",
+  lang,
   enableHotkey = false,
   onVoiceStart,
   onVoiceDiscard,
 }: ComposerMicButtonProps) => {
+  const [preferences] = useState(readDictationPreferences);
+  const recognitionLanguage = lang ?? preferences.browserLanguage;
   // Web Speech is primary whenever the browser has the constructor
   // (Chrome/Safari, unchanged behavior); with no constructor at all
   // (Firefox) takes use server dictation when GET /v1/info advertises it.
@@ -132,6 +135,7 @@ export const ComposerMicButton = ({
   // disabled mid-utterance.
   const disabledRef = useRef(disabled);
   disabledRef.current = disabled;
+  const mountedRef = useRef(true);
   // Click guard: true between toggle() and the matching start/end event.
   // Prevents rapid double-clicks from calling recognition.start() twice,
   // which throws InvalidStateError in Chrome.
@@ -154,7 +158,7 @@ export const ComposerMicButton = ({
     // Keep listening until the user clicks stop — no auto-stop on silence.
     recognition.continuous = true;
     recognition.interimResults = false;
-    recognition.lang = lang;
+    recognition.lang = recognitionLanguage;
 
     // A dead recognizer keeps firing start/end/error after the take has
     // fallen back to the server; those stale events must not clobber the
@@ -183,7 +187,12 @@ export const ComposerMicButton = ({
       // always the case in Electron/plain Chromium, occasionally a
       // transient blip in real Chrome. Serve THIS take from the server
       // instead; the next take tries Web Speech again.
-      if (err === "network" && serverAvailableRef.current && !disabledRef.current) {
+      if (
+        err === "network" &&
+        preferences.path === "auto" &&
+        serverAvailableRef.current &&
+        !disabledRef.current
+      ) {
         setIsListening(false);
         void toggleServerRef.current();
         return;
@@ -226,7 +235,7 @@ export const ComposerMicButton = ({
       recognition.stop();
       recognitionRef.current = null;
     };
-  }, [Ctor, lang]);
+  }, [Ctor, preferences.path, recognitionLanguage]);
 
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
@@ -252,13 +261,14 @@ export const ComposerMicButton = ({
 
   // Release the mic if the component unmounts mid-take (e.g. the
   // new-chat dialog closes while dictating).
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
       sessionRef.current?.cancel();
       sessionRef.current = null;
-    },
-    [],
-  );
+    };
+  }, []);
 
   // Second getUserMedia stream just for visualization — Web Speech API
   // hides its audio buffer. Chrome batches the permission to one prompt.
@@ -351,25 +361,32 @@ export const ComposerMicButton = ({
       // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
       onVoiceStartRef.current?.();
-      const next = await DictationSession.start({
-        onPartial: (text) => {
-          // Drop late partials after an Esc discard — they'd repopulate the
-          // composer the parent just reverted.
-          if (!disabledRef.current && !discardingRef.current) onInterimRef.current?.(text);
+      const next = await DictationSession.start(
+        {
+          onPartial: (text) => {
+            // Drop late partials after an Esc discard — they'd repopulate the
+            // composer the parent just reverted.
+            if (!disabledRef.current && !discardingRef.current) onInterimRef.current?.(text);
+          },
+          onFinal: (text) => {
+            const trimmed = text.trim();
+            if (trimmed && !disabledRef.current && !discardingRef.current) {
+              onTranscriptRef.current(trimmed);
+            }
+          },
+          onError: () => {
+            sessionRef.current = null;
+            setError("Dictation unavailable");
+            setIsListening(false);
+            onInterimRef.current?.("");
+          },
         },
-        onFinal: (text) => {
-          const trimmed = text.trim();
-          if (trimmed && !disabledRef.current && !discardingRef.current) {
-            onTranscriptRef.current(trimmed);
-          }
-        },
-        onError: () => {
-          sessionRef.current = null;
-          setError("Dictation unavailable");
-          setIsListening(false);
-          onInterimRef.current?.("");
-        },
-      });
+        { microphoneDeviceId: preferences.microphoneDeviceId },
+      );
+      if (!mountedRef.current || disabledRef.current) {
+        next.cancel();
+        return;
+      }
       sessionRef.current = next;
       setError(null);
       setIsListening(true);
@@ -384,7 +401,7 @@ export const ComposerMicButton = ({
       setIsListening(false);
     }
     serverBusyRef.current = false;
-  }, []);
+  }, [preferences.microphoneDeviceId]);
   toggleServerRef.current = toggleServer;
 
   const toggle = useCallback(() => {
@@ -399,7 +416,11 @@ export const ComposerMicButton = ({
     // to the server — a visible ~1s "fail then recover" on every first take.
     // When the server can serve, go straight to it and skip the doomed attempt.
     // (Real browsers keep Web Speech primary; it genuinely works there.)
-    if (!Ctor || (serverAvailable && isElectronShell())) {
+    if (preferences.path === "server") {
+      if (serverAvailable) void toggleServer();
+      return;
+    }
+    if (preferences.path === "auto" && (!Ctor || (serverAvailable && isElectronShell()))) {
       if (serverAvailable) void toggleServer();
       return;
     }
@@ -416,12 +437,18 @@ export const ComposerMicButton = ({
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
     }
-  }, [isListening, Ctor, serverAvailable, toggleServer]);
+  }, [isListening, Ctor, preferences.path, serverAvailable, toggleServer]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
   // whenever dictation could run (Web Speech OR the server path) and the
   // composer isn't disabled, so the chord is inert when it can't do anything.
-  useVoiceDictationHotkey(toggle, enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled);
+  const pathAvailable =
+    preferences.path === "server"
+      ? serverAvailable
+      : preferences.path === "browser"
+        ? Boolean(Ctor)
+        : Boolean(Ctor) || serverAvailable;
+  useVoiceDictationHotkey(toggle, enableHotkey && pathAvailable && !disabled);
 
   // While listening, Enter commits (end the take, keep the text) and Esc
   // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
@@ -464,7 +491,7 @@ export const ComposerMicButton = ({
     return () => window.removeEventListener("keydown", handler, true);
   }, [isListening, toggle]);
 
-  if (!Ctor && !serverAvailable) return null;
+  if (!pathAvailable) return null;
 
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.
