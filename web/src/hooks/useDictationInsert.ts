@@ -113,13 +113,6 @@ export function useDictationInsert(
     const previous = draftRef.current;
     const owned = ownedRef.current;
     draftRef.current = next;
-    if (!ownsRegion(previous, owned)) {
-      ownedRef.current = null;
-      initialSelectionRef.current = null;
-      caretRef.current = null;
-      return;
-    }
-
     let prefix = 0;
     const shared = Math.min(previous.length, next.length);
     while (prefix < shared && previous[prefix] === next[prefix]) prefix += 1;
@@ -131,8 +124,28 @@ export function useDictationInsert(
     ) {
       suffix += 1;
     }
-
     const oldEditEnd = previous.length - suffix;
+
+    if (!ownsRegion(previous, owned)) {
+      ownedRef.current = null;
+      const initial = initialSelectionRef.current;
+      if (initial) {
+        if (oldEditEnd <= initial.start) {
+          const delta = next.length - previous.length;
+          initialSelectionRef.current = {
+            start: initial.start + delta,
+            end: initial.end + delta,
+          };
+          caretRef.current = initial.end + delta;
+        } else if (prefix < initial.end) {
+          initialSelectionRef.current = null;
+          caretRef.current = null;
+        }
+      } else {
+        caretRef.current = null;
+      }
+      return;
+    }
     const caret = caretRef.current;
     const insertedAtCaret =
       caret !== null && prefix === caret && oldEditEnd === caret && next.length > previous.length;

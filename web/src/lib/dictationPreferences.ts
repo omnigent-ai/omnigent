@@ -19,16 +19,14 @@ const MAX_DEVICE_ID_LENGTH = 1024;
 const isDictationPath = (value: unknown): value is DictationPath =>
   value === "auto" || value === "server" || value === "browser";
 
-function normalizeLanguage(value: unknown): string {
-  if (typeof value !== "string") return DEFAULT_DICTATION_PREFERENCES.browserLanguage;
+export function normalizeDictationLanguage(value: unknown): string | null {
+  if (typeof value !== "string") return null;
   const trimmed = value.trim();
-  if (!trimmed || trimmed.length > MAX_LANGUAGE_LENGTH) {
-    return DEFAULT_DICTATION_PREFERENCES.browserLanguage;
-  }
+  if (!trimmed || trimmed.length > MAX_LANGUAGE_LENGTH) return null;
   try {
     return new Intl.Locale(trimmed).toString();
   } catch {
-    return DEFAULT_DICTATION_PREFERENCES.browserLanguage;
+    return null;
   }
 }
 
@@ -40,7 +38,9 @@ function normalizeDeviceId(value: unknown): string | null {
 function normalizeDictationPreferences(value: DictationPreferences): DictationPreferences {
   return {
     path: isDictationPath(value.path) ? value.path : DEFAULT_DICTATION_PREFERENCES.path,
-    browserLanguage: normalizeLanguage(value.browserLanguage),
+    browserLanguage:
+      normalizeDictationLanguage(value.browserLanguage) ??
+      DEFAULT_DICTATION_PREFERENCES.browserLanguage,
     microphoneDeviceId: normalizeDeviceId(value.microphoneDeviceId),
   };
 }
@@ -57,7 +57,9 @@ export function readDictationPreferences(): DictationPreferences {
     const value = parsed as Record<string, unknown>;
     return {
       path: isDictationPath(value.path) ? value.path : DEFAULT_DICTATION_PREFERENCES.path,
-      browserLanguage: normalizeLanguage(value.browserLanguage),
+      browserLanguage:
+        normalizeDictationLanguage(value.browserLanguage) ??
+        DEFAULT_DICTATION_PREFERENCES.browserLanguage,
       microphoneDeviceId: normalizeDeviceId(value.microphoneDeviceId),
     };
   } catch {
