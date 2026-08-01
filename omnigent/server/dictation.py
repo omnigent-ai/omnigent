@@ -105,13 +105,12 @@ WORKER_TOKEN_ENV = "OMNIGENT_DICTATION_WORKER_TOKEN"
 REMOTE_CA_FILE_ENV = "OMNIGENT_DICTATION_REMOTE_CA_FILE"
 ALLOW_INSECURE_REMOTE_ENV = "OMNIGENT_DICTATION_ALLOW_INSECURE_REMOTE"
 
-#: Built-in engine names. The default (empty ``OMNIGENT_DICTATION_ENGINE``)
-#: resolves to the sherpa engine.
+#: Built-in engine names. An empty ``OMNIGENT_DICTATION_ENGINE`` prefers
+#: Parakeet MLX when installed on Apple Silicon, then falls back to sherpa.
 ENGINE_SHERPA = "sherpa"
 ENGINE_PARAKEET_MLX = "parakeet_mlx"
 ENGINE_FAKE = "fake"
 ENGINE_REMOTE = "remote"
-_DEFAULT_ENGINE = ENGINE_SHERPA
 
 #: Worker handshake budget: covers a cold model load on the worker side.
 _REMOTE_READY_TIMEOUT_S = 30.0
@@ -353,8 +352,17 @@ def _parakeet_mlx_available() -> tuple[bool, str | None]:
 
 
 def _selected_engine_name() -> str:
-    """Resolve the configured engine name (default: sherpa)."""
-    return os.environ.get(ENGINE_ENV, "").strip() or _DEFAULT_ENGINE
+    """Resolve an explicit engine or the best installed local default."""
+    configured = os.environ.get(ENGINE_ENV, "").strip()
+    if configured:
+        return configured
+    if (
+        platform.system() == "Darwin"
+        and platform.machine() == "arm64"
+        and importlib.util.find_spec("parakeet_mlx") is not None
+    ):
+        return ENGINE_PARAKEET_MLX
+    return ENGINE_SHERPA
 
 
 def engine_availability() -> tuple[bool, str | None]:

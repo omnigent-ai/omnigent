@@ -42,6 +42,37 @@ def test_availability_fake_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dictation.engine_availability() == (True, None)
 
 
+def test_default_engine_prefers_installed_mlx_on_apple_silicon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dictation.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(dictation.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
+
+    assert dictation._selected_engine_name() == dictation.ENGINE_PARAKEET_MLX
+
+
+def test_default_engine_falls_back_to_sherpa_without_mlx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dictation.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(dictation.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: None)
+
+    assert dictation._selected_engine_name() == dictation.ENGINE_SHERPA
+
+
+def test_explicit_engine_overrides_apple_silicon_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(dictation.ENGINE_ENV, dictation.ENGINE_SHERPA)
+    monkeypatch.setattr(dictation.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(dictation.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
+
+    assert dictation._selected_engine_name() == dictation.ENGINE_SHERPA
+
+
 def test_availability_extra_not_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without the sherpa-onnx package the probe says extra_not_installed."""
     monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: None)
@@ -53,6 +84,7 @@ def test_availability_extra_not_installed(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_availability_models_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """With the package but an empty model dir the probe says models_missing."""
+    monkeypatch.setenv(dictation.ENGINE_ENV, dictation.ENGINE_SHERPA)
     monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
     monkeypatch.setenv(dictation.MODEL_DIR_ENV, str(tmp_path))
     assert dictation.engine_availability() == (
@@ -63,6 +95,7 @@ def test_availability_models_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
 def test_availability_with_models(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A populated model dir plus the package reports available."""
+    monkeypatch.setenv(dictation.ENGINE_ENV, dictation.ENGINE_SHERPA)
     monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
     _touch_asr_files(tmp_path)
     monkeypatch.setenv(dictation.MODEL_DIR_ENV, str(tmp_path))
@@ -293,6 +326,7 @@ def test_get_engine_is_a_singleton_and_failure_caches_nothing(
     """One engine per process; a failed load leaves the slot empty for retry."""
     monkeypatch.setattr(dictation, "_engine", None)
     # Unavailable (empty model dir) → raises and caches nothing.
+    monkeypatch.setenv(dictation.ENGINE_ENV, dictation.ENGINE_SHERPA)
     monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
     monkeypatch.setenv(dictation.MODEL_DIR_ENV, str(tmp_path))
     with pytest.raises(RuntimeError):

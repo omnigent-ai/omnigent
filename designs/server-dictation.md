@@ -114,7 +114,7 @@ detection uses fixed 100 ms windows, independent of WebSocket frame sizes.
 | `OMNIGENT_DICTATION_MAX_STREAMS` | `2` | concurrent dictation WebSockets |
 | `OMNIGENT_DICTATION_MAX_FRAME_BYTES` | `262144` | maximum binary PCM frame size; larger frames close with WebSocket code 1009 |
 | `OMNIGENT_DICTATION_MAX_TAKE_SECONDS` | `300` | maximum wall-clock or PCM-audio duration per take |
-| `OMNIGENT_DICTATION_ENGINE` | unset (`sherpa`) | engine to use by registered name (`sherpa`, `remote`, `fake`) |
+| `OMNIGENT_DICTATION_ENGINE` | unset (auto) | engine by registered name; auto prefers installed `parakeet_mlx` on Apple Silicon, otherwise `sherpa` |
 | `OMNIGENT_DICTATION_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | Hugging Face model ID or absolute local model directory for `parakeet_mlx` |
 | `OMNIGENT_DICTATION_MODEL_CACHE_DIR` | `~/.omnigent/models/dictation/parakeet-mlx` | download/cache directory for `parakeet_mlx` models |
 | `OMNIGENT_DICTATION_REMOTE_URL` | unset | worker stream URL for the `remote` engine, e.g. `ws://venus:8100/v1/dictation/stream` |
@@ -151,6 +151,10 @@ engine:
 uv sync --extra dictation-mlx --extra dev
 OMNIGENT_DICTATION_ENGINE=parakeet_mlx uv run omnigent server
 ```
+
+After installing the extra, leaving `OMNIGENT_DICTATION_ENGINE` unset selects
+`parakeet_mlx` automatically on Apple Silicon. Set it explicitly to `sherpa`
+to retain the portable CPU engine on the same machine.
 
 The first take downloads the configured model into
 `OMNIGENT_DICTATION_MODEL_CACHE_DIR`; later loads reuse that cache. Set
