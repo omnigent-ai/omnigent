@@ -29,6 +29,8 @@ _PROVIDER_ENV_VARS = [
     "OMNIGENT_OPENAI_BASE_URL",
     "OPENROUTER_API_KEY",
     "OMNIGENT_OPENROUTER_API_KEY",
+    "ORCAROUTER_API_KEY",
+    "OMNIGENT_ORCAROUTER_API_KEY",
     "GEMINI_API_KEY",
     "OMNIGENT_GEMINI_API_KEY",
     "CLAUDE_CODE_USE_VERTEX",
@@ -91,6 +93,12 @@ def test_no_credentials_detected(clean_env) -> None:
             "OPENROUTER_API_KEY",
             DetectedProvider(
                 name="openrouter", kind="key", family="openai", source="$OPENROUTER_API_KEY"
+            ),
+        ),
+        (
+            "ORCAROUTER_API_KEY",
+            DetectedProvider(
+                name="orcarouter", kind="key", family="openai", source="$ORCAROUTER_API_KEY"
             ),
         ),
         (

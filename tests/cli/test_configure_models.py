@@ -87,6 +87,7 @@ def isolated_config(tmp_path, monkeypatch):
         "GEMINI_API_KEY",
         "ANTIGRAVITY_API_KEY",
         "OPENROUTER_API_KEY",
+        "ORCAROUTER_API_KEY",
         "DATABRICKS_TOKEN",
         "CURSOR_API_KEY",
     ):
@@ -572,12 +573,13 @@ def test_add_menu_options_ordering() -> None:
     Proves the user-requested ordering, in both the full menu and each
     family-scoped subset (the menu actually shown after drilling into a
     harness): the first-party API key(s) and subscription(s) lead, the
-    cross-vendor extras follow alphabetically (Gateway before OpenRouter),
-    and Databricks sits just above the catch-all "Other". A regression to
-    the old interleaved order (or Other above Databricks) fails here.
+    cross-vendor extras follow alphabetically (Gateway, OpenRouter,
+    OrcaRouter), and Databricks sits just above the catch-all "Other". A
+    regression to the old interleaved order (or Other above Databricks)
+    fails here.
     """
     # Full menu: first-party keys (OpenAI, Anthropic, Gemini), then
-    # subscriptions, then Gateway, OpenRouter, Databricks, Other.
+    # subscriptions, then Gateway, OpenRouter, OrcaRouter, Databricks, Other.
     full = [o.label.split(None, 1)[1] for o in add_menu_options()]
     assert full == [
         "OpenAI — API key",
@@ -587,6 +589,7 @@ def test_add_menu_options_ordering() -> None:
         "Claude — subscription (Pro/Max)",
         "Gateway — custom base URL + key",
         "OpenRouter — API key",
+        "OrcaRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
         # Bedrock is appended last so it never shifts the established order.
@@ -594,13 +597,14 @@ def test_add_menu_options_ordering() -> None:
     ]
 
     # Codex (openai) scoped: API key, subscription, Gateway, OpenRouter,
-    # Databricks, Other — Databricks immediately above Other.
+    # OrcaRouter, Databricks, Other — Databricks immediately above Other.
     codex = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(OPENAI_FAMILY)]
     assert codex == [
         "OpenAI — API key",
         "ChatGPT — subscription",
         "Gateway — custom base URL + key",
         "OpenRouter — API key",
+        "OrcaRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
     ]
@@ -1193,11 +1197,11 @@ def test_configure_models_add_other_provider_prompts_for_name(
     # env var so detection doesn't add a "use the detected key?" prompt.
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     # "Other" is openai-family, so it lives in the Codex add menu. L1 2=Codex
-    # → L2 1=+Add → openai menu 6="Other provider — API key" (order: OpenAI
-    # key, ChatGPT sub, Gateway, OpenRouter, Databricks, Other) → which
-    # provider → xAI(1) → NAME "my-xai" → key → default model blank → L2
-    # q=back → L1 q=exit.
-    stdin = "\n".join(["2", "1", "6", "1", "my-xai", "sk-xai-test", "", "q", "q"]) + "\n"
+    # → L2 1=+Add → openai menu 7="Other provider — API key" (order: OpenAI
+    # key, ChatGPT sub, Gateway, OpenRouter, OrcaRouter, Databricks, Other) →
+    # which provider → xAI(1) → NAME "my-xai" → key → default model blank →
+    # L2 q=back → L1 q=exit.
+    stdin = "\n".join(["2", "1", "7", "1", "my-xai", "sk-xai-test", "", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -1301,6 +1305,33 @@ def test_configure_models_add_openrouter_key_uses_vendor_endpoint_and_chat_wire(
     entry = _config_yaml(isolated_config)["providers"]["openrouter"]["openai"]
     assert entry["base_url"] == "https://openrouter.ai/api/v1"  # NOT api.openai.com
     assert entry["wire_api"] == "chat"  # OpenRouter is Chat-Completions-only
+
+
+def test_configure_models_add_orcarouter_key_uses_vendor_endpoint_and_chat_wire(
+    isolated_config, monkeypatch
+) -> None:
+    """Adding the OrcaRouter *key* preset points at api.orcarouter.ai + Chat wire.
+
+    OrcaRouter is an OpenAI-compatible gateway, so the same rule as OpenRouter
+    applies: its key must reach the vendor's OWN base_url on the Chat
+    Completions wire. The openai-family default (api.openai.com) plus the
+    Responses wire would 401 on every request.
+    """
+    monkeypatch.delenv("ORCAROUTER_API_KEY", raising=False)
+    # OrcaRouter key is openai-family → Codex add menu. L1 2=Codex → L2
+    # 1=+Add → openai menu 5="OrcaRouter — API key" (order: OpenAI key,
+    # ChatGPT sub, Gateway, OpenRouter, OrcaRouter, Databricks, Other) → key
+    # → default model typed → L2 q=back → L1 q=exit.
+    stdin = (
+        "\n".join(["2", "1", "5", "sk-orca-test", "anthropic/claude-sonnet-4.6", "q", "q"]) + "\n"
+    )
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    entry = _config_yaml(isolated_config)["providers"]["orcarouter"]["openai"]
+    assert entry["base_url"] == "https://api.orcarouter.ai/v1"  # NOT api.openai.com
+    assert entry["wire_api"] == "chat"  # OrcaRouter is Chat-Completions-only
+    assert entry["models"]["default"] == "anthropic/claude-sonnet-4.6"
 
 
 def test_promote_global_auth_backfills_databricks_for_existing_configs(isolated_config) -> None:
