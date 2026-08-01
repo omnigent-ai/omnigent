@@ -20,7 +20,7 @@
 
 **2c** CUJ C (routed subagent spawns): hook scripts + loopback relay + server policy (`resolve_subagent_route`), family constraints, per-session override with the Inherit row, codex hooks.json generation + trust handshake + `python -I`.
 
-**2d** CLI (the new workstream, must survive the rewrite): `smart_routing_cli.py`, the `--smart-routing`/`-p` flags, the glm gateway-route fix (`907f8886`), and whatever tier-2/3 commits merge from the CLI worktree before we start.
+**2d** CLI (the new workstream, must survive the rewrite): `smart_routing_cli.py`, the `--smart-routing`/`-p` flags, the glm gateway-route fix (`907f8886`), and the tier-2/3 commits, which have now merged: `8f3c0c60` (merge `6f2893d9`) is the server half — create-time MODEL routing for a create pinned to one *fixed* native harness, which the turn gate can never reach because a TUI's turns originate in the pane; `8d7c9cb2` is the CLI half (flags, `smart_routing_cli.py`, the dispatch-spec `prompt_param`, both dispatch tiers); `b10a7239` fixes the `CLAUDE_NATIVE_AGENT_NAME` import against this branch's `harness_plugins` layout. Mechanics: `CUJ_IMPLEMENTATION.md` §6; registry rows: `CUJ_STATUS.md` §2.10.
 
 ## 3. Cut list — each with size, what is lost, and my recommendation
 
@@ -56,9 +56,9 @@
 
 ## 5. CLI fixes integration
 
-**5a** Sequencing rule: the CLI worktree merges into `routing-mvp` FIRST (Bryan's other session owns that merge), the matrix re-runs on the merged tree, and only then does the rewrite assembly start — the rewrite must never race an inbound merge. `907f8886` is already in; the `-p`/`--smart-routing` tiers are pending.
+**5a** Sequencing rule: the CLI worktree merges into `routing-mvp` FIRST (Bryan's other session owns that merge), the matrix re-runs on the merged tree, and only then does the rewrite assembly start — the rewrite must never race an inbound merge. **Both halves are now in** (`907f8886`, then `8f3c0c60`/`6f2893d9` + `8d7c9cb2` + `b10a7239`), so nothing further is inbound from that worktree. What is still owed is the *verification*: the CLI surface is unit-verified only, so the re-run must add the `CUJ_STATUS.md` §2.10 rows (recipe **R10**) alongside the 15-row matrix.
 
-**5b** In the rewrite, CLI lands as commit 8 (4b) — it sits on top of the create-time model-routing extension from tier 2, which itself belongs in commit 3's territory; the assembler must check whether tier 2 changed `_resolve_native_smart_routing` and keep those changes in commit 3, not commit 8.
+**5b** In the rewrite, CLI lands as commit 8 (4b) — and the tier-2 server half is already a **separate** commit, so the split is mechanical rather than a hand-untangling job. `8f3c0c60` touches only `orchestration.py` plus its test and goes into commit 3 verbatim; `8d7c9cb2` touches **no** server file and goes into commit 8 verbatim. It also did **not** extend `_resolve_native_smart_routing`: the fixed-harness route is a parallel path (`_fixed_native_routing_harness` + `_resolve_fixed_native_model_routing`), and the only edit to the auto path is a refactor that lifts its authorize-first host lookup into the shared `_routing_host_for_create` — which the assembler must keep, because both create paths now call it and dropping it un-does the §4.3d authorization-order fix.
 
 ## 6. Execution and verification
 

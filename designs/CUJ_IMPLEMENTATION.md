@@ -10,7 +10,7 @@
 - `designs/CUJ_STATUS.md` — the evidence layer per CUJ, and the 14/14 matrix run.
 - `designs/LIVE_MODEL_STATE.md` — the codex model-state mechanics in protocol detail.
 
-**0c** This document cites commit shas inline, as §12 does. Most of those shas name the original per-fix commits, which is the granularity that the narratives need. We since rebased the branch onto `origin/main` and reconciled it with main's catalog-routing work, so those pre-rebase shas are no longer reachable. The shipped series is `git log --oneline origin/main..HEAD`. That series holds twenty-one commits. `80d3bcc7` "feat(routing): session-start smart routing core" leads the series and holds the reconciliation. Four shas that this document cites landed *after* the rebase and are therefore reachable in the series: `c393842d` (the gateway-backed availability gate), `3ccf86e3` (the claude turn-catalog staleness fix and the beta-flag fix), `e1592902` (the subagent `raw_model` compare), and `60b39177` (the floating warning banner). HEAD is `60b39177`. Every line number below is a line number in HEAD.
+**0c** This document cites commit shas inline, as §12 does. Most of those shas name the original per-fix commits, which is the granularity that the narratives need. We since rebased the branch onto `origin/main` and reconciled it with main's catalog-routing work, so those pre-rebase shas are no longer reachable. The shipped series is `git log --oneline origin/main..HEAD`. That series holds thirty-one commits. `80d3bcc7` "feat(routing): session-start smart routing core" leads the series and holds the reconciliation. Several shas that this document cites landed *after* the rebase and are therefore reachable in the series: `c393842d` (the gateway-backed availability gate), `3ccf86e3` (the claude turn-catalog staleness fix and the beta-flag fix), `e1592902` (the subagent `raw_model` compare), `60b39177` (the floating warning banner), `907f8886` (the GLM gateway route), and the CLI workstream of §6 (`8f3c0c60`, `8d7c9cb2`, `b10a7239`). HEAD is `cd9fdccb`. Every line number below is a line number in HEAD.
 
 **0d** This document uses six domain terms:
 
@@ -39,6 +39,7 @@
 - §2 and §3 describe the two apply layers. Nearly all the real work was there.
 - §4 is mostly create-time composition of §1 to §3, plus its own permission rules and persistence rules.
 - §5 collects the run-time behaviour that all three CUJs share.
+- §6 is the fourth surface: the CLI entry points. It adds no apply layer of its own, so it composes §1 to §5 and records only what is new — flag parsing, preflight, the create it drives itself, and the wrapper launch.
 
 **0j** Every product decision appears in the section where it bites, with its rationale. `designs/INTELLIGENT_ROUTING_PLAN.md` §10 holds the decision records themselves. This index maps each one to its section, so a reader can audit the trail:
 
@@ -529,9 +530,136 @@
 
 ---
 
-## 6. Known-open items
+## 6. CLI entry points, end to end
 
-**6a:**
+**6a** Smart Routing shipped web-only. A CLI user who wanted the server to pick a model had to start the session in a browser, because a native TUI's turns originate in the pane: the server never sees the first message before inference, so the turn gate of §2.3 — the gate that routes a plain claude or codex session — never fires for a CLI-driven one. §6 is the fourth surface, and it routes **before** anything starts. The harness pick is physical (a session *is* a live `claude` or `codex` process) and the model is applied as a launch flag, so there is nothing left to change after the fact.
+
+**6b** Three commits hold the surface, and they split cleanly:
+
+**6c:**
+
+- `8f3c0c60` (merged as `6f2893d9`) is the **server half**: create-time MODEL routing for a create already pinned to one native harness. This is the genuinely new server behaviour, and §6.4 holds it. It touches `orchestration.py` and its test, and nothing else.
+- `8d7c9cb2` is the **CLI half**: the flags, `omnigent/smart_routing_cli.py`, the prompt parameter, and the two dispatch paths. It touches **no** server file, and it did **not** extend `_resolve_native_smart_routing`.
+- `b10a7239` fixes one import in `smart_routing_cli.py`; §6.8 holds it.
+
+**6d** Two rules shape the whole surface, and the module docstring of `smart_routing_cli.py` (`:16-23`) states both. **Preflight is a hard error**: routing the server cannot do, or a host whose inference is not AI-Gateway-backed, means the pick could not be applied, so the CLI says so and stops (plan §10 decision 9, §1.8). **Routing itself fails open**: once preflight passes, any router or create failure returns a decision with one notice line and no pick, and the launch always happens (§5.4).
+
+### 6.1 Commands, flags and tiers
+
+**6.1a** Three commands take `--smart-routing`, and they form three tiers. Tier 1 is the web UI, which §2 to §4 already describe.
+
+**6.1b:**
+
+| Invocation | Tier | Routes |
+| --- | --- | --- |
+| `omnigent claude --smart-routing -p "…"` | 2 | the model; harness stays claude-native |
+| `omnigent codex --smart-routing -p "…"` | 2 | the model; harness stays codex-native |
+| `omnigent run --harness <native> --smart-routing -p "…"` | 2 | the model; harness stays as pinned |
+| `omnigent run --smart-routing -p "…"` (no `--harness`, or `--harness auto`) | 3 | the harness **and** the model |
+
+**6.1c** `omnigent claude` also gains `-p/--prompt` (`cli_native.py:162-167`). `omnigent codex` already had one. The `--smart-routing` flag is declared three times, once per command surface (`cli_native.py:168-174`, `:344-350`, `cli.py:6896-6902`, help text `_SMART_ROUTING_HELP` at `:5629`).
+
+**6.1d** `run --harness claude-native -p …` and `run --harness codex-native -p …` are now **accepted** rather than rejected. `_NativeTerminalDispatchSpec` gained a `prompt_param` field (`cli.py:5910`), and the claude and codex specs set it (`:5918`, `:5925`); kiro-native already had one (`:5953`). `_dispatch_native_terminal_harness` rejects `-p` only for a spec that names no prompt parameter (`:6040`), and it forwards the text otherwise (`:6098-6099`).
+
+### 6.2 How the prompt travels
+
+**6.2a** The prompt is **routed, not dispatched**: the router scores it, and the TUI then delivers it as its own first input. Each wrapper keeps the delivery it already had.
+
+**6.2b:**
+
+- **claude-native — argv.** Claude Code takes the initial prompt as a trailing positional argument, so `run_claude_native` appends it to the launch args after the resume args are stripped (`claude_native.py:722-727`). One argv entry keeps newlines, blank lines, and quotes intact, and it is persisted for the runner on the remote path. Never a tmux paste. `tests/test_native_initial_prompt.py` pins all five cases, including a multi-line prompt.
+- **codex-native — its existing first-turn delivery.** The remote path posts the text to `POST /v1/sessions/{id}/events` as a `message` event (`_post_initial_prompt`, `codex_native.py:968`); the local app-server path starts the turn directly (`_start_initial_turn`, `:2426`). The CLI adds nothing here.
+
+**6.2c** The codex path therefore *does* send the first message through the server. It still produces exactly one decision, because the create already wrote `model_override` and any pin closes the turn gate (§5.1). That is the same mechanism that stops turn 2 of a web session from re-routing.
+
+**6.2d** Only a prompt-capable native harness is routable. `_smart_routing_capable_harness` (`cli.py:6118`) is the predicate: it resolves the harness to its native coding agent and requires that agent's dispatch spec to carry a `prompt_param`. Bare `claude` canonicalizes to the SDK harness and is therefore not routable here.
+
+### 6.3 Preflight
+
+**6.3a** `check_smart_routing_available` (`smart_routing_cli.py:95`) runs two config-level gates, and no liveness probe (§1.8k):
+
+**6.3b:**
+
+1. **The server can route.** `GET /v1/info` must report `smart_routing_enabled: true`. Otherwise the error names the server and points at `--model`.
+2. **This host's inference is gateway-backed.** `GET /v1/hosts` carries the `gateway_inference` map of §1.8. Each harness family the route may pick must not be an explicit `false`. The error names the harness, quotes the host's own reason string, and points at `omnigent configure harnesses`.
+
+**6.3c** `smart_routing_families` (`:77`) decides which families to check, and it mirrors the web's per-surface gating exactly (§1.8h): a fixed harness needs only its own family, and the auto route needs **both** `claude-native` and `codex-native`, because it picks across the five-arm `both` menu. `_gateway_state` (`:318`) keys off the canonical harness spelling and falls back to the caller's spelling, because the map is keyed by wire spellings and never by a bare family name.
+
+**6.3d** Unknown never gates, exactly as it does on the web (§1.8g). An absent map, an absent entry, an unknown host, or an unreadable response all mean "could not tell", and `_get_json` (`:350`) returns `{}` for any failure rather than raising.
+
+**6.3e** The host id is resolved before preflight, and it is resolved defensively. `_smart_routing_decision` (`cli.py:6193`) calls `_ensure_host_daemon` first — the server builds the router's candidate catalog from the bound host's model-options frames, so the daemon has to be connected before the create — and then passes the local identity through `known_host_id` (`smart_routing_cli.py:273`), which returns it only when it appears in `GET /v1/hosts`. Binding a session to a host the server has never seen would 4xx the create and cost the verdict, so an unregistered host degrades to a hostless route. A missing identity file degrades the same way.
+
+### 6.4 Create-time model routing for a fixed harness (the server half)
+
+**6.4a** Tier 2 needed new server behaviour, and `8f3c0c60` added it as a **parallel** path rather than an extension of `_resolve_native_smart_routing` (`:5904`, which is still the auto path of §4.3). The auto path routes harness *and* model. Tier 2's harness is the caller's own choice, so only the model is routed.
+
+**6.4b** `_fixed_native_routing_harness` (`orchestration.py:5818`) is the gate. It returns `"claude-native"` or `"codex-native"` — the `AUTO_NATIVE_ROUTING_HARNESSES` pair (`smart_routing.py:1441`) — only when every condition holds: `cost_control_mode_override == "on"`, a non-empty `smart_routing_message`, `harness_override != "auto"`, no `parent_session_id` and no `sub_agent_name`, and no client-pinned `model_override`. `_create_resolved_harness` (`:5785`) resolves the harness before any row exists, from the wrapper agent name, else `harness_override`, else the agent spec.
+
+**6.4c** Everything else keeps routing where it already did: an SDK harness on its first turn through the server (§2.3), the auto path on its own create branch (§4.3), and a child or sub-agent session on the spawn path, which knows the parent's family (§1.5).
+
+**6.4d** `_resolve_fixed_native_model_routing` (`:5857`) does the routing. Candidates come from `_pre_session_model_catalog` for that one harness (§1.3) — no runner exists yet — and `route_session_harness` is offered that single harness, so the seam can only change the model. Two fail-open exits, both of which pin nothing and put the reason on the card: the router returned no model, or the pick fails `models_in_family`. The second guard is not redundant: with one harness on offer the seam has nothing to redirect an out-of-family pick onto, and the launch would then pass a `--model` the CLI cannot run.
+
+**6.4e** The host authorization is shared, and the order still matters for the reason §4.3d gives. `8f3c0c60` lifted the auto path's authorize-first block into `_routing_host_for_create` (`:5754`), and both create paths now call it. It resolves ownership through `resolve_host_owner` before anything is read from the host or landed in its owner's connection.
+
+**6.4f** The caller runs the branch at `:6064-6084` and wires its result in two places. `validate_session_model_metadata` receives the routed model as the row's `model_override`, so the model reaches the CLI as a launch flag (`:6103-6113`); and the create emits the decision — `_emit_server_routing_decision(scope="session", harness=…)` plus `_stamp_routing_decision_label` on success, or an `applied=false` card carrying the reason when routing produced nothing (`:6424-6446`). Session-start cadence is unchanged: the pin closes the per-turn gate exactly as the auto path's create pin does (§5.1).
+
+### 6.5 The create the CLI drives
+
+**6.5a** The CLI creates the session itself, through the standard JSON `POST /v1/sessions`, and the wrapper then **attaches** to it. One session, routed at create. Nothing is created twice and nothing is deleted, so the row the server wrote already carries the agent binding, the wrapper's presentation labels, the routed model, and the decision card — which is how a routed CLI launch gets the same chip and provenance the web UI gets.
+
+**6.5b** `create_smart_routing_session` (`smart_routing_cli.py:144`) sends the routing contract: `cost_control_mode_override: "on"`, `smart_routing_message: <prompt>`, `host_type: "external"`, the provenance label `omnigent.smart_routing: "cli-route"` (`ROUTING_SESSION_LABELS`, `:48`), and — on the auto route only — `harness_override: "auto"` (`AUTO_HARNESS`, `:44`). A fixed harness needs no override: it comes from the bound wrapper agent, which is what §6.4b resolves. `host_id` rides along with `workspace` (the launch cwd), because the server stats that path on the host to validate the agent's cwd boundary and rejects a `host_id` without one.
+
+**6.5c** `_routing_agent_id` (`:256`) picks the built-in agent to bind. The bound agent only has to exist, because the verdict rides on the session row: a fixed harness uses its own `*-native-ui` built-in, and the auto route uses the claude-native built-in as the placeholder — the same placeholder the web client binds (§4.2).
+
+**6.5d** The verdict is read back off the create response. The resolved harness is `SessionResponse.harness`, **not** `harness_override`: a native row leaves the override null on purpose (§4.3e). The model is `model_override`. When either is missing the code re-reads the session snapshot once (`:214-217`), and `_clean_str` (`:387`) normalizes both.
+
+**6.5e** The function never raises. A rejected create, an unreachable server, or a response with no session id returns `_unavailable` (`:238`) — no session, no model, and one notice line — and the caller launches a plain wrapper session instead. A create that lands but picks no model keeps the session and carries the softer "launching on the harness default" notice. `_dispatch_smart_routing` prints whichever line applies, and prints `omnigent: Smart Routing picked <harness> on <model>.` when the router answered (`cli.py:6249-6257`).
+
+### 6.6 Rejected combinations
+
+**6.6a** `--smart-routing` requires `-p`. Routing needs text, and the degraded route-on-turn-2 mode is not shipping, so an empty invocation is a `click.UsageError` that points at the two surfaces that do work: `-p`, or the web UI (`_SMART_ROUTING_NEEDS_PROMPT`, `cli.py:6110`; `_require_smart_routing_prompt`, `:6141`). Both subcommands validate it **before** any side effect — no daemon spawn, no server discovery — so a missing prompt fails instantly (`cli_native.py:209-212`, `:382-385`).
+
+**6.6b** Three more rejections, all of them loud:
+
+**6.6c:**
+
+1. **A resume.** `--resume <id>`, a bare `--resume` picker, `--continue`, and the deprecated `--session` are all refused, because routing is a create-time decision and a routed launch is therefore always a new session (`_reject_smart_routing_resume`, `cli.py:6154`; the subcommand call sites at `cli_native.py:240-245`, `:392-397`).
+2. **An AGENT** on `run`. A routed session is a native TUI, where an agent spec's prompt and tools are never consulted. The error offers both alternatives: drop the AGENT to route the harness too, or pass `--harness claude-native` to route the model only (`:6394-6399`).
+3. **The REPL-only options** `--system-prompt`, `--tools`, `--log`, `--debug-events`, `--fork`, and `--no-session`. These are the same options the plain native dispatch rejects, for the same reason: a routed launch is still a TUI attach, so they would be silently dropped (`:6375-6391`).
+
+**6.6d** A `--harness` that is native and prompt-capable but *not* in `AUTO_NATIVE_ROUTING_HARNESSES` — kiro-native today — passes the CLI's own routability check and then routes nothing, because §6.4b's gate only fires for claude-native and codex-native. The launch still happens, behind the "did not pick a model" notice. §7 records it.
+
+### 6.7 Launch with the routed model
+
+**6.7a** Each surface applies the routed model the way its wrapper takes one:
+
+**6.7b:**
+
+- **claude-native** appends `--model <routed>` to the wrapper's pass-through args (`_with_routed_model_arg`, `cli.py:6175`, called at `cli_native.py:286`). A `--model` the user typed themselves wins, in either the `--model x` or `--model=x` spelling: they asked for that model explicitly, and routing is a default-filling service.
+- **codex-native** takes the model first-class, so the routed value is assigned to the `model` parameter — but only when the user passed no `--model` of their own (`cli_native.py:425-435`).
+- **`run` (both tiers)** goes through `_dispatch_native_terminal_harness` with `model_from_cli=True` whenever a routed model exists (`cli.py:6304-6325`), so a wrapper that only forwards a model the user asked for still receives this one.
+
+**6.7c** `--model` is the permissive contract of §4.3c: it takes any string verbatim, which is why a routed create can boot on an exact catalog id that no alias spells. The claude launch env then puts that id in the custom picker slot (§2.5d), so the pane has a row to return to. A GLM pick arrives as the gateway's own model-route spelling, not the catalog's (§3.5h).
+
+**6.7d** Tier 3 chooses the wrapper from the harness the server bound. `_dispatch_smart_routing` (`:6261`) reads `decision.harness` through `_smart_routing_capable_harness`, and falls back to `_SMART_ROUTING_FALLBACK_HARNESS` (`:6115`, `claude-native`) behind a notice when the create resolved nothing, or resolved a harness the CLI cannot hand a prompt to. Either way the launch happens.
+
+**6.7e** In every case the wrapper attaches to `decision.session_id`, and `None` (the create failed) lets the wrapper start its own session as it always did.
+
+### 6.8 Decision persistence, and the agent-name fix
+
+**6.8a** The CLI persists **nothing of its own**. Every routed CLI launch produces the same records the web UI produces, because the server writes them on the same create: one session-scope `RoutingDecisionData` conversation item, the `omnigent.routing.decision` label joining the row's `model_override` back to it, and — on the auto route — the `omnigent.routing.auto_harness` label (§1.4, §4.3e, §5.1d). Tier 2's records come from §6.4f; tier 3's come from the auto path of §4.3, unchanged. The only CLI-specific record is the session label `omnigent.smart_routing: "cli-route"` of §6.5b, which is provenance and not a decision.
+
+**6.8b** `b10a7239` fixes an import that would have crashed the whole surface on this branch. `8d7c9cb2` was authored against a tree where `omnigent/native_coding_agents.py` exported `CLAUDE_NATIVE_AGENT_NAME`. On `routing-mvp` the native-agent records live in `omnigent/harness_plugins.py`, and that module holds no such constant, so importing `smart_routing_cli` raised `ImportError` — which is the first thing any `--smart-routing` invocation does. The module now imports `CLAUDE_NATIVE_CODING_AGENT` from `harness_plugins` and derives the name from its `agent_name` field (`smart_routing_cli.py:38-41`), which is the pattern the server already uses (`server/app.py:169`). The value is unchanged: `claude-native-ui`.
+
+### 6.9 What is verified, and what is not
+
+**6.9a** `tests/cli/test_smart_routing_cli.py` (54 cases) and `tests/test_native_initial_prompt.py` (7 cases) cover the CLI half against a mocked server: the preflight matrix in both directions, the create contract per tier, the fail-open branches, the two dispatch tiers, the tier-3 fallback, the rejected combinations, and argv prompt delivery. `tests/server/routes/test_native_smart_routing_create.py` (39 cases) covers the server half. All 100 pass at HEAD. None of it is a live launch — no routed CLI session has been driven end to end against a real pane yet, and `CUJ_STATUS.md` §2.10 holds the recipe and the pending rows.
+
+---
+
+## 7. Known-open items
+
+**7a:**
 
 - **Codex spawn naming rarely reaches the hooks.** Most codex spawns therefore carry no routable signal at all, and the gate allows them through on the parent's model rather than routes them (matrix row C-sub). The routing gate is real on those spawns, but it has nothing to score.
 - **task_v1 prices a well-written prompt at opus.** P-OPUS escalates because it is clear, contained, and code-referencing. Under the `both` scenario the GLM-shaped case escalates too, rather than delegates. The recipe does what it says. The recipe is frozen, so this item is task_v2 feedback for the AIGW team, and not a client-side change.
@@ -541,5 +669,7 @@
 - **No routing-availability liveness probe.** §1.8 gates on config-level availability only, so a gateway that is configured but *down* still offers Smart Routing. Plan §8 records the probe as a follow-up, not as MVP.
 - **`gateway_inference` absent still means "offer everything".** That is deliberate for the rollout, and it is meant to be tightened once hosts have rolled forward (plan §10 decision 9).
 - **GLM's served name is pinned, not discovered.** `_SERVABLE_ALIASES` names `system.ai.glm-5-2` because no listing does (§3.5h). A gateway that later serves GLM under another name, or lists it at last, makes that entry wrong rather than merely redundant. The ask on the AIGW owners stays: advertise `openai/v1/responses` on the `databricks-glm-5-2` endpoint, or list the model route. Then the entry goes.
+- **The CLI surface has no live verification yet.** §6 is unit-verified only. No routed `omnigent claude` / `omnigent codex` / `omnigent run` launch has been driven against a real pane end to end. `CUJ_STATUS.md` §2.10 holds the recipe and the pending rows.
+- **A prompt-capable native harness outside the routed pair routes nothing.** `--smart-routing --harness kiro-native` passes the CLI's routability check and its preflight (kiro has no `gateway_inference` entry, and unknown never gates), and then the server's create-time gate declines it, because that gate only fires for claude-native and codex-native. The launch proceeds behind the "did not pick a model" notice (§6.6d). Either widen the server pair or narrow the CLI predicate.
 - **Move the `routes:select` call host-side.** Availability is already host-derived (§1.8), so the router call should run where the inference config lives, and its auth and workspace would then always match the host that we gated on (plan §8).
 
