@@ -1345,6 +1345,67 @@ def _print_version_callback(ctx: click.Context, _param: click.Parameter, value: 
     ctx.exit()
 
 
+# Visible top-level subcommands that launch an agent harness (or a
+# bundled agent). Grouped under their own "Harnesses" heading in
+# ``omnigent --help`` so the long harness roster doesn't drown out the
+# management commands. Keep in sync with the harness launch commands
+# decorated below.
+_HARNESS_COMMANDS: frozenset[str] = frozenset(
+    {
+        "antigravity",
+        "claude",
+        "codex",
+        "cursor",
+        "debby",
+        "goose",
+        "hermes",
+        "kimi",
+        "kiro",
+        "opencode",
+        "pi",
+        "polly",
+        "qwen",
+    }
+)
+
+
+# Brand accent (Otto's magenta-pink, ``ui.ACCENT`` / ``#F43BA6``) as an
+# RGB triple for :func:`click.style` truecolor. Kept as a literal so
+# help formatting stays import-light (no pull of the rich-backed ui
+# module just to draw ``--help``).
+_ACCENT_RGB = (244, 59, 166)
+
+
+def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
+    """Map extras-gated harness commands to their SDK-installed predicate.
+
+    Harnesses that ride an optional pip extra (lazily imported on first
+    turn) are hidden from ``omnigent --help`` until the extra is
+    importable, so the listing only advertises harnesses ready to launch.
+    The predicates use ``importlib.util.find_spec`` (no heavy import).
+    Commands absent from this map are always listed.
+    """
+    from omnigent.onboarding.antigravity_auth import antigravity_sdk_installed
+    from omnigent.onboarding.cursor_auth import cursor_sdk_installed
+
+    return {
+        "cursor": cursor_sdk_installed,
+        "antigravity": antigravity_sdk_installed,
+    }
+
+
+def _help_style(text: str, **style: object) -> str:
+    """Colorize *text* for help output, honoring ``NO_COLOR``.
+
+    Click's ``echo`` already strips ANSI when the sink is not a TTY, so
+    this only needs to guard the explicit ``NO_COLOR`` opt-out; on an
+    interactive terminal the styled string is emitted as-is.
+    """
+    if os.environ.get("NO_COLOR"):
+        return text
+    return click.style(text, **style)  # type: ignore[arg-type]
+
+
 class _OmnigentCLI(click.Group):
     """Top-level group that prints the brand lockup above its help.
 
@@ -1354,6 +1415,83 @@ class _OmnigentCLI(click.Group):
     clean. Only the top-level group overrides help; subcommand help
     (``omnigent run --help``) is untouched.
     """
+
+    def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Render the usage line with an accent-colored ``Usage:`` prefix."""
+        pieces = self.collect_usage_pieces(ctx)
+        prefix = f"{_help_style('Usage:', fg=_ACCENT_RGB, bold=True)} "
+        formatter.write_usage(ctx.command_path, " ".join(pieces), prefix=prefix)
+
+    def format_options(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Color the ``Options`` heading + flag names, then the commands."""
+        opts = []
+        for param in self.get_params(ctx):
+            rv = param.get_help_record(ctx)
+            if rv is not None:
+                opts.append((_help_style(rv[0], fg="green"), rv[1]))
+        if opts:
+            with formatter.section(_help_style("Options", fg=_ACCENT_RGB, bold=True)):
+                formatter.write_dl(opts)
+        self.format_commands(ctx, formatter)
+
+    def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """List commands under two headings: Harnesses and Commands.
+
+        Mirrors Click's default ``format_commands`` (skipping hidden
+        commands, sharing one column width) but splits the visible
+        subcommands into the harness launchers and everything else, and
+        tints each section: harness names in the brand accent, the rest
+        in cyan.
+        """
+        harness_rows: list[tuple[str, click.Command]] = []
+        other_rows: list[tuple[str, click.Command]] = []
+        any_hidden = False
+        extra_checks = _harness_extra_checks()
+        for subcommand in self.list_commands(ctx):
+            cmd = self.get_command(ctx, subcommand)
+            if cmd is None or cmd.hidden:
+                continue
+            if subcommand in _HARNESS_COMMANDS:
+                # Hide extras-gated harnesses whose SDK isn't installed;
+                # they remain runnable (running them offers the install).
+                check = extra_checks.get(subcommand)
+                if check is not None and not check():
+                    any_hidden = True
+                    continue
+                harness_rows.append((subcommand, cmd))
+            else:
+                other_rows.append((subcommand, cmd))
+
+        all_names = [name for name, _ in (*harness_rows, *other_rows)]
+        if not all_names:
+            return
+        # Share one help column across both sections so their
+        # descriptions line up. Width is measured on the plain names —
+        # ANSI styling is added afterward and is stripped by Click's
+        # ``term_len`` when it computes alignment.
+        limit = formatter.width - 6 - max(len(name) for name in all_names)
+
+        def _emit(title: str, rows: list[tuple[str, click.Command]], name_fg: object) -> None:
+            if not rows:
+                return
+            with formatter.section(_help_style(title, fg=_ACCENT_RGB, bold=True)):
+                formatter.write_dl(
+                    [
+                        (_help_style(name, fg=name_fg), cmd.get_short_help_str(limit))
+                        for name, cmd in rows
+                    ]
+                )
+
+        _emit("Harnesses", harness_rows, _ACCENT_RGB)
+        if any_hidden:
+            formatter.write_paragraph()
+            formatter.write_text(
+                _help_style(
+                    "Some harnesses need an optional extra — run `omnigent setup` to enable them.",
+                    dim=True,
+                )
+            )
+        _emit("Commands", other_rows, "cyan")
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         from omnigent.inner import ui
