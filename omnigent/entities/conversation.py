@@ -760,10 +760,18 @@ class ConversationItem(BaseModel):
         :func:`_to_api_item`) and the ``check_task`` tool
         (via :func:`_get_recent_activity_for_task`) consume it.
 
+        ``created_at`` is always present. It is required on the
+        entity and it is the only per-item timestamp, so a client
+        that reads history through this flat shape has no other way
+        to order or age an item; the nested rendering
+        (``SessionResponse.items``, which serialises the entity
+        directly) already carries it.
+
         :returns: Flat dict, e.g. for an assistant message::
 
             {"id": "msg_abc", "response_id": "resp_xyz",
              "type": "message", "status": "completed",
+             "created_at": 1735689600,
              "role": "assistant",
              "content": [{"type": "output_text", "text": "hi"}],
              "model": "databricks-gpt-5-4"}
@@ -773,6 +781,7 @@ class ConversationItem(BaseModel):
             "response_id": self.response_id,
             "type": self.type,
             "status": self.status,
+            "created_at": self.created_at,
             **self.data.model_dump(exclude_none=True, by_alias=True),
             # created_by is present only for human-authored items;
             # omitted (not null) for agent/tool/system messages so the

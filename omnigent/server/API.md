@@ -314,8 +314,9 @@ Query parameters:
 ```
 
 Items include all input and output messages, function calls, and function call
-outputs accumulated across all responses in this conversation. Each item carries
-a `response_id` linking it to the response that produced it. Model-produced items
+outputs accumulated across all responses in this conversation. Every item carries
+`created_at` (Unix epoch seconds) — omitted from the examples above for brevity —
+and a `response_id` linking it to the response that produced it. Model-produced items
 (assistant messages, function calls, reasoning) include a `model` field identifying
 the agent. User messages and function call outputs do not have `model` — the agent
 is always recoverable from `response_id` if needed. To continue a conversation,

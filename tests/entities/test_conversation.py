@@ -39,6 +39,37 @@ def test_to_api_dict_omits_created_by_when_none() -> None:
     assert "created_by" not in api
 
 
+def test_to_api_dict_exposes_created_at() -> None:
+    """The flat API shape carries the item's own timestamp."""
+    item = ConversationItem(
+        id="msg_ts",
+        type="message",
+        status="completed",
+        response_id="resp_1",
+        created_at=1_735_689_600,
+        data=MessageData(
+            role="assistant",
+            agent="my-agent",
+            content=[{"type": "output_text", "text": "hi"}],
+        ),
+    )
+
+    assert item.to_api_dict()["created_at"] == 1_735_689_600
+
+
+def test_to_api_dict_created_at_matches_the_nested_rendering() -> None:
+    """Flat and nested renderings of one item agree on ``created_at``.
+
+    ``SessionResponse.items`` serialises the entity directly while
+    ``GET /v1/sessions/{id}/items`` goes through :meth:`to_api_dict`,
+    so a client must not get a different answer depending on which
+    endpoint it read the same item from.
+    """
+    item = _message_item(None).model_copy(update={"created_at": 1_700_000_000})
+
+    assert item.to_api_dict()["created_at"] == item.model_dump()["created_at"]
+
+
 def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
     """Interrupted assistant items surface the reload marker in API shape."""
     item = ConversationItem(
