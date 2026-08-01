@@ -41,7 +41,8 @@ repos:
         language: system
         entry: .venv/bin/python dev/lint/lint_no_hardcoded_models.py
         pass_filenames: false
-        files: ^((omnigent|scripts|examples|\.github|dev/lint)/.*\.(py|ya?ml|json|toml|sh)|dev/lint/hardcoded_model_allowlist\.txt)$
+        files: \.(py|ya?ml|json|toml|sh)$
+        exclude: (^|/)tests/|^openapi\.json$
 
       - id: web-prettier
         name: web prettier

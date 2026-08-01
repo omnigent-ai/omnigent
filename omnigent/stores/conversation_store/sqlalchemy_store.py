@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
@@ -20,7 +20,7 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.orm import QueryableAttribute, Session, aliased
+from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -94,6 +94,11 @@ from omnigent.stores.conversation_store import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+class _RowCountResult(Protocol):
+    rowcount: int
+
 
 # Per-session config overrides packed into the ``conversations.session_overrides``
 # JSON blob. Order is fixed so the encoded object is stable across writes.
@@ -478,12 +483,16 @@ def _fetch_labels(
     :returns: Mapping from label key to value (string-typed).
         Empty dict when no rows match.
     """
-    rows = session.execute(
-        select(SqlConversationLabel.key, SqlConversationLabel.value).where(
-            SqlConversationLabel.workspace_id == current_workspace_id(),
-            SqlConversationLabel.conversation_id == conversation_id,
+    rows = (
+        session.execute(
+            select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+            )
         )
-    ).all()
+        .tuples()
+        .all()
+    )
     return dict(rows)
 
 
@@ -737,10 +746,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         # same-timestamp collisions in practice. Other dialects fall back to
         # the string id column (non-deterministic for ties; proper fix: add a
         # BIGSERIAL seq col).
-        self._tiebreaker_col = (
+        self._tiebreaker_col: ColumnElement[Any] = (
             literal_column("conversations.rowid")
             if self._conv_engine.dialect.name == "sqlite"
-            else SqlConversation.id
+            else cast(ColumnElement[Any], SqlConversation.id)
         )
         ensure_fts_table(self._conv_engine)
 
@@ -1151,11 +1160,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             # too — _to_conversation reads ORM columns, which would raise
             # DetachedInstanceError once the session closes.
             labels_by_conv = _fetch_labels_bulk(session, [row.id for row in rows])
-        meta_rows = []
+        meta_rows: list[SqlConversationMetadata] = []
         if rows:
             row_ids = [r.id for r in rows]
             with self._session() as meta_sess:
-                meta_rows = (
+                meta_rows = list(
                     meta_sess.execute(
                         select(SqlConversationMetadata).where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
@@ -1325,13 +1334,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation has no metadata row.
         """
         with self._session() as session:
-            result = session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
-                )
-                .values(project_id=project_id)
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                    .values(project_id=project_id)
+                ),
             )
             return result.rowcount > 0
 
@@ -1427,10 +1439,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
             else:
-                # mypy sees the Mapped[...] descriptor types; at runtime
-                # these are plain attributes accepting the Python value.
-                existing.cost_usd = existing.cost_usd + delta_usd  # type: ignore[assignment]
-                existing.updated_at = now  # type: ignore[assignment]
+                existing.cost_usd = existing.cost_usd + delta_usd
+                existing.updated_at = now
 
     def _upsert_daily_cost_dialect(
         self,
@@ -1602,8 +1612,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
             else:
-                existing.ask_approved_usd = ask_approved_usd  # type: ignore[assignment]
-                existing.updated_at = now  # type: ignore[assignment]
+                existing.ask_approved_usd = ask_approved_usd
+                existing.updated_at = now
 
     def get_session_owner(self, conversation_id: str) -> str | None:
         """
@@ -1768,17 +1778,40 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._conv_session() as session:
             is_asc = order == "asc"
             sort_fn = asc if is_asc else desc
-            stmt = select(SqlConversationItem).where(
-                SqlConversationItem.workspace_id == current_workspace_id(),
-                SqlConversationItem.conversation_id == conversation_id,
+            # Load only the columns _to_item reads. search_text is a wide Text
+            # column (roughly mirrors the message body) that this read path never
+            # touches; on Postgres it is TOAST-ed, so omitting it skips a detoast
+            # and roughly halves the bytes pulled per row on a chatty conversation.
+            stmt = (
+                select(SqlConversationItem)
+                .options(
+                    load_only(
+                        SqlConversationItem.id,
+                        SqlConversationItem.type,
+                        SqlConversationItem.status,
+                        SqlConversationItem.response_id,
+                        SqlConversationItem.created_at,
+                        SqlConversationItem.data,
+                        SqlConversationItem.created_by,
+                    )
+                )
+                .where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                )
             )
             if type is not None:
                 stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
             if after:
+                # Scope the cursor lookup to conversation_id so it lands on the
+                # (workspace_id, conversation_id, id) primary key as a point
+                # lookup. Without it, (workspace_id, id) leads no index and the
+                # subquery degrades to a workspace-wide scan every paginated page.
                 sub = (
                     select(SqlConversationItem.position)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
                         SqlConversationItem.id == after,
                     )
                     .scalar_subquery()
@@ -1794,6 +1827,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     select(SqlConversationItem.position)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
                         SqlConversationItem.id == before,
                     )
                     .scalar_subquery()
@@ -2697,17 +2731,20 @@ class SqlAlchemyConversationStore(ConversationStore):
     ) -> Conversation | None:
         """Rename a conversation with an atomic title compare-and-swap."""
         with self._conv_session() as session:
-            result = session.execute(
-                update(SqlConversation)
-                .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.id == conversation_id,
-                    SqlConversation.title == expected_title,
-                )
-                .values(
-                    title=title,
-                    updated_at=now_epoch(),
-                )
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.title == expected_title,
+                    )
+                    .values(
+                        title=title,
+                        updated_at=now_epoch(),
+                    )
+                ),
             )
             if result.rowcount != 1:
                 return None
@@ -2747,7 +2784,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlConversationMetadata.runner_id.is_(None))
                 .values(runner_id=runner_id)
             )
-            result = session.execute(stmt)
+            result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:

@@ -178,7 +178,7 @@ export async function isRunnerUnavailable503(res: Response): Promise<boolean> {
 
 interface ChangedFilesResponse {
   object: "list";
-  data: Array<{
+  data: {
     path: string;
     name: string;
     status: "created" | "modified" | "deleted";
@@ -186,7 +186,7 @@ interface ChangedFilesResponse {
     modified_at: number | null;
     lines_added: number | null;
     lines_removed: number | null;
-  }>;
+  }[];
   has_more: boolean;
 }
 
@@ -290,14 +290,14 @@ export interface WorkspaceAllFilesResult {
 
 interface FilesystemListResponse {
   object: "list";
-  data: Array<{
+  data: {
     id: string;
     name: string;
     path: string;
     type: string;
     bytes: number | null;
     modified_at: number | null;
-  }>;
+  }[];
   has_more: boolean;
 }
 

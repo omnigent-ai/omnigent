@@ -37,6 +37,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Protocol
 
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -341,12 +342,10 @@ class TunnelRegistry:
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:
         for state in list(session.in_flight.values()):
-            _call_soon_threadsafe(state, lambda state=state: _abort_request_state(state, error))
+            _call_soon_threadsafe(state, partial(_abort_request_state, state, error))
         session.in_flight.clear()
         for channel in list(session.ws_channels.values()):
-            _call_channel_soon_threadsafe(
-                channel, lambda ch=channel: ch.inbound_queue.put_nowait(None)
-            )
+            _call_channel_soon_threadsafe(channel, partial(channel.inbound_queue.put_nowait, None))
         session.ws_channels.clear()
 
     def get(self, runner_id: str) -> RunnerSession | None:

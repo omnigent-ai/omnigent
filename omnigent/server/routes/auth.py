@@ -16,6 +16,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlencode
 
 import httpx
@@ -49,6 +50,9 @@ _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
 _OIDC_INVITE_TTL_SECONDS = 72 * 3600
+
+if TYPE_CHECKING:
+    from omnigent.server.oidc import OIDCConfig
 
 
 @dataclass
@@ -101,9 +105,12 @@ def create_auth_router(
     """
     router = APIRouter()
     config = auth_provider._oidc_config
+    if config is None:
+        raise ValueError("OIDC auth router requires an OIDC-configured auth provider")
 
     # Invites are opt-in AND require the token store. Both must hold.
-    _invites_enabled = config.allow_invites and account_store is not None
+    invite_store = account_store if config.allow_invites else None
+    _invites_enabled = invite_store is not None
 
     # Admission policy: domain allowlist (env ∪ runtime-editable file)
     # with admin-list and (when enabled) invite bypasses. One place
@@ -112,7 +119,7 @@ def create_auth_router(
         env_allowed_domains=config.allowed_domains,
         domains_file_path=resolve_allowed_domains_path(),
         admin_list=admin_list,
-        invited_lookup=account_store if _invites_enabled else None,
+        invited_lookup=invite_store,
         config_allowed_domains=allowed_domains,
     )
 
@@ -279,11 +286,21 @@ def create_auth_router(
                     content={"error": "Token exchange failed"},
                 )
 
-            token_json = token_resp.json()
+            token_json = _json_object(_response_json(token_resp))
+            if token_json is None:
+                _logger.error("Token exchange returned a non-object JSON response")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Token exchange returned an invalid response"},
+                )
 
             # Extract user email.
             if config.provider_type == "github":
-                email = await _resolve_github_email(client, token_json.get("access_token", ""))
+                access_token = token_json.get("access_token")
+                email = await _resolve_github_email(
+                    client,
+                    access_token if isinstance(access_token, str) else "",
+                )
             else:
                 email = _resolve_oidc_email(token_json, config)
 
@@ -303,10 +320,10 @@ def create_auth_router(
         # account_tokens row, which doubles as the durable pre-auth that
         # admits the email on subsequent logins. Reserved-name emails are
         # rejected below regardless, so binding one here is harmless.
-        if _invites_enabled:
+        if invite_store is not None:
             invite_token = state_payload.get("invite")
             if invite_token:
-                account_store.redeem_oidc_invite(
+                invite_store.redeem_oidc_invite(
                     str(invite_token), email, now_epoch_seconds=int(time.time())
                 )
 
@@ -407,7 +424,7 @@ def create_auth_router(
         )
         return response
 
-    if _invites_enabled:
+    if invite_store is not None:
 
         @router.post("/invite")
         async def oidc_invite(request: Request) -> Response:
@@ -440,7 +457,7 @@ def create_auth_router(
 
             token_id = secrets.token_urlsafe(32)
             now = int(time.time())
-            account_store.create_token(
+            invite_store.create_token(
                 token_id,
                 kind="invite",
                 user_id=None,
@@ -711,9 +728,17 @@ async def _resolve_github_email(
         timeout=10.0,
     )
     if emails_resp.status_code == 200:
-        for entry in emails_resp.json():
+        payload = _response_json(emails_resp)
+        if not isinstance(payload, list):
+            return None
+        for raw_entry in payload:
+            entry = _json_object(raw_entry)
+            if entry is None:
+                continue
             if entry.get("primary") and entry.get("verified"):
-                return entry.get("email")
+                email = entry.get("email")
+                if isinstance(email, str) and email:
+                    return email
 
     # No primary, verified address. Deliberately do NOT fall back to the
     # ``/user.email`` profile field: it is unverified and attacker-settable,
@@ -743,7 +768,7 @@ def _claim_is_verified_true(value: object) -> bool:
 
 
 def _resolve_oidc_email(
-    token_json: dict,
+    token_json: dict[str, object],
     config: OIDCConfig,
 ) -> str | None:
     """Extract the verified email from the OIDC ``id_token``.
@@ -781,7 +806,10 @@ def _resolve_oidc_email(
         skipped via config).
     """
     id_token = token_json.get("id_token")
-    if not id_token:
+    if not isinstance(id_token, str) or not id_token:
+        return None
+    if config.jwks_uri is None:
+        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
         return None
 
     try:
@@ -856,6 +884,17 @@ def _resolve_oidc_email(
     return email
 
 
-# Forward ref for type annotation.
-if False:  # TYPE_CHECKING
-    from omnigent.server.oidc import OIDCConfig
+def _json_object(value: object) -> dict[str, object] | None:
+    """Return a string-keyed JSON object, or ``None`` for other shapes."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("dict[str, object]", value)
+
+
+def _response_json(response: httpx.Response) -> object | None:
+    """Decode a JSON response, returning ``None`` when decoding fails."""
+    try:
+        value: object = response.json()
+    except ValueError:
+        return None
+    return value

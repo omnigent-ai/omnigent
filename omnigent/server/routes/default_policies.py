@@ -37,6 +37,10 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import FunctionPolicySpec
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import PolicyDeletedEvent as _TelPolicyDeletedEvent
+from omnigent.telemetry.events import PolicyRegisteredEvent as _TelPolicyRegisteredEvent
+from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 
 
 def _generate_default_policy_id() -> str:
@@ -221,6 +225,26 @@ def create_default_policies_router(
                 code=ErrorCode.CONFLICT,
             ) from exc
         invalidate_default_policy_specs_cache()
+        try:
+            import hashlib as _hashlib
+
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyRegisteredEvent(
+                    installation_id=_srv_id,
+                    handler=policy.handler,
+                    policy_type=policy.type,
+                    scope="admin",
+                    session_id=None,
+                    anon_user_id=_anon,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return _entity_to_response(policy)
 
     @router.get("/policies")
@@ -358,9 +382,27 @@ def create_default_policies_router(
         :raises OmnigentError: 401/403 if the user lacks admin
             privileges.
         """
-        await _require_admin(request, auth_provider, permission_store)
+        user_id = await _require_admin(request, auth_provider, permission_store)
         store.delete_default(policy_id)
         invalidate_default_policy_specs_cache()
+        try:
+            import hashlib as _hashlib
+
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyDeletedEvent(
+                    installation_id=_srv_id,
+                    scope="admin",
+                    session_id=None,
+                    anon_user_id=_anon,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"deleted": True}
 
     return router

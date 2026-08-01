@@ -233,6 +233,8 @@ def create_accounts_auth_router(
     if auth_provider._source != "accounts":
         raise RuntimeError("create_accounts_auth_router called with non-accounts provider")
     config = auth_provider._accounts_config
+    if config is None:
+        raise RuntimeError("accounts auth provider has no accounts configuration")
     router = APIRouter()
 
     _secure = config.secure_cookies

@@ -7,6 +7,7 @@ import logging
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -96,6 +97,412 @@ async def test_handle_model_options_uses_host_claude_configuration(
                 "displayName": "Sonnet 4.6",
             }
         ],
+    )
+
+
+async def test_handle_model_options_uses_codex_provider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Codex launch picker comes from the host's resolved provider catalog."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    def _fake_list_models_for_worker(spec: object, harness: str) -> ModelListing:
+        assert harness == "codex-native"
+        assert spec.executor.config["profile"] == "oss"
+        return ModelListing(
+            source="static",
+            verified=False,
+            models=(
+                ModelEntry(id="gpt-live-default", family="openai"),
+                ModelEntry(id="gpt-live-fast", family="openai"),
+            ),
+            note="test catalog",
+        )
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        _fake_list_models_for_worker,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model="gpt-live-fast",
+            profile="oss",
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[
+            {"id": "gpt-live-default", "displayName": "gpt-live-default"},
+            {"id": "gpt-live-fast", "displayName": "gpt-live-fast", "isDefault": True},
+        ],
+    )
+
+
+async def test_handle_model_options_does_not_invent_codex_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog entry is not a default unless Codex resolves it as one."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="static",
+            verified=False,
+            models=(ModelEntry(id="gpt-live", family="openai"),),
+            note="test catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [{"id": "gpt-live", "displayName": "gpt-live"}]
+
+
+async def test_handle_model_options_uses_databricks_catalog_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Databricks profile path labels its effective catalog default."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="gateway",
+            verified=True,
+            models=(
+                ModelEntry(id="databricks-gpt-default", family="openai"),
+                ModelEntry(id="databricks-gpt-fast", family="openai"),
+            ),
+            note="test catalog",
+        ),
+    )
+
+    def _fake_resolve_catalog_model(provider: str, *, family: str) -> SimpleNamespace:
+        assert provider == "databricks"
+        assert family == "openai"
+        return SimpleNamespace(model_id="databricks-gpt-default")
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        _fake_resolve_catalog_model,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile="oss",
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {
+            "id": "databricks-gpt-default",
+            "displayName": "databricks-gpt-default",
+            "isDefault": True,
+        },
+        {"id": "databricks-gpt-fast", "displayName": "databricks-gpt-fast"},
+    ]
+
+
+async def test_handle_model_options_filters_direct_openai_through_codex_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct OpenAI availability is intersected with Codex compatibility."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=tuple(
+                ModelEntry(id=model_id, family="openai")
+                for model_id in (
+                    "coding-compatible",
+                    "audio-preview",
+                    "realtime-preview",
+                    "image-preview",
+                    "embedding-preview",
+                    "moderation-preview",
+                )
+            ),
+            note="test OpenAI catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="key",
+            family="openai",
+            base_url="https://api.openai.com",
+            detail="test OpenAI key",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+
+    async def _fake_codex_options() -> list[dict[str, object]]:
+        return [
+            {
+                "id": "coding-compatible",
+                "model": "coding-compatible",
+                "displayName": "Coding Compatible",
+                "isDefault": True,
+            },
+            {
+                "id": "coding-unavailable",
+                "model": "coding-unavailable",
+                "displayName": "Coding Unavailable",
+                "isDefault": False,
+            },
+        ]
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _fake_codex_options,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {
+            "id": "coding-compatible",
+            "displayName": "Coding Compatible",
+            "isDefault": True,
+        }
+    ]
+
+
+async def test_handle_model_options_tolerates_codex_discovery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery failures keep the implicit default without unsafe model rows."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(ModelEntry(id="unverified-model", family="openai"),),
+            note="test OpenAI catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="key",
+            family="openai",
+            base_url="https://api.openai.com",
+            detail="test OpenAI key",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+
+    async def _failed_codex_options() -> list[dict[str, object]]:
+        raise TimeoutError("test discovery timeout")
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _failed_codex_options,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[],
+    )
+
+
+async def test_handle_model_options_marks_only_first_codex_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed Codex catalogs cannot mark multiple picker rows as default."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    model_ids = ("coding-first", "coding-second")
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=tuple(ModelEntry(id=model_id, family="openai") for model_id in model_ids),
+            note="test OpenAI catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="key",
+            family="openai",
+            base_url="https://api.openai.com",
+            detail="test OpenAI key",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+
+    async def _multiple_codex_defaults() -> list[dict[str, object]]:
+        return [
+            {"model": model_id, "displayName": model_id, "isDefault": True}
+            for model_id in model_ids
+        ]
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _multiple_codex_defaults,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {"id": "coding-first", "displayName": "coding-first", "isDefault": True},
+        {"id": "coding-second", "displayName": "coding-second"},
+    ]
+
+
+async def test_handle_model_options_keeps_custom_gateway_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom gateway ids remain selectable without Codex alias filtering."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(ModelEntry(id="gateway-coding-model", family="openai"),),
+            note="test gateway catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="gateway",
+            family="openai",
+            base_url="https://gateway.example/v1",
+            detail="test gateway",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model="gateway-coding-model",
+            profile=None,
+        ),
+    )
+
+    async def _unexpected_codex_options() -> list[dict[str, object]]:
+        raise AssertionError("custom gateways must not use the OpenAI compatibility filter")
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _unexpected_codex_options,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {
+            "id": "gateway-coding-model",
+            "displayName": "gateway-coding-model",
+            "isDefault": True,
+        }
+    ]
+
+
+async def test_handle_model_options_rejects_unsupported_harness() -> None:
+    """Only launch paths with host-resolved model catalogs are accepted."""
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="cursor-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="failed",
+        error="model options are unsupported for harness 'cursor-native'",
     )
 
 
@@ -1225,6 +1632,25 @@ def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> N
             assert host._owned_subprocess_ops == 1
             raise RuntimeError("worktree op blew up")
     assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
+
+
+def test_reap_orphans_is_noop_without_wnohang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows (no ``os.WNOHANG``) the reaper is a clean no-op, not a crash.
+
+    Windows has no child reparenting to a subreaper and no
+    ``waitpid(-1, WNOHANG)``; touching ``os.WNOHANG`` there raises
+    ``AttributeError``. The final drain runs unguarded in ``run``'s
+    ``finally``, so an unguarded sweep would crash shutdown. Simulate the
+    platform by deleting ``os.WNOHANG`` and assert a quiet ``0``.
+    """
+    import os
+
+    monkeypatch.delattr(os, "WNOHANG", raising=False)
+
+    host = _make_host_process()
+    assert host._reap_orphans_once() == 0
 
 
 def test_install_child_subreaper_is_safe_to_call() -> None:

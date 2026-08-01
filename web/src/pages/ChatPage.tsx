@@ -1879,7 +1879,6 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
-        sessionLive={liveness.kind === "online"}
         hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
         onShowReconnectHelp={onShowReconnectHelp}
         costRoutingEligible={costRoutingEligible}
@@ -2352,11 +2351,11 @@ export function LatestTurnSpacer({
  * resize-driven `scrollToBottom({preserveScrollPosition})` — fired on every
  * history prepend — bail instead of yanking the view back to the bottom.
  */
-type ConversationScroller = {
+interface ConversationScroller {
   el: HTMLElement;
   state: { isAtBottom: boolean; escapedFromLock: boolean };
   stopScroll: () => void;
-};
+}
 
 /**
  * Lifts the StickToBottom scroll container (and lock controls) out of the
@@ -2484,7 +2483,10 @@ export function JumpToTopButton({
   const jumpToTop = useCallback(async () => {
     if (!scroller) return;
     const { el, state, stopScroll } = scroller;
-    const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const nextFrame = () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
     setJumping(true);
     try {
       // Release StickToBottom's bottom-lock. Without this, every history prepend
@@ -3593,16 +3595,6 @@ interface ComposerProps {
    * `onReconnect`), replacing the separate banner below the composer.
    */
   hostOffline?: boolean;
-  /**
-   * The session's runner tunnel is live (`liveness.kind === "online"`). Only
-   * a live runner can accept a config change — unlike a message, a model/
-   * effort/routing POST can't wake an asleep, stranded, or not-yet-observed
-   * runner, and those states also never load the model catalog. So the config
-   * gear is inert whenever this is false, which is stricter than `unreachable`
-   * (the composer stays open on asleep/unknown because a message wakes them).
-   * Defaults to `true` so tests that don't wire liveness keep the gear live.
-   */
-  sessionLive?: boolean;
   /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
   onShowReconnectHelp?: () => void;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
@@ -3632,10 +3624,10 @@ interface ComposerProps {
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
-  skills: ReadonlyArray<{ name: string; description: string }>,
+  skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
-  showCompact: boolean = true,
+  showCompact = true,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -3666,7 +3658,7 @@ export function buildSlashCommandMap(
  * :returns: A ``Set`` of slash-prefixed names.
  */
 export function buildSlashCommandWithArgsSet(
-  skills: ReadonlyArray<{ name: string; description: string }>,
+  skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
 ): Set<string> {
@@ -4025,7 +4017,6 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
-  sessionLive = true,
   hostOffline = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
@@ -5210,12 +5201,12 @@ export function Composer({
               modelPickerKind={modelPickerKind}
               codexModelOptions={codexModelOptions}
               costRoutingEligible={costRoutingEligible}
-              // Only a live runner can accept a config change — a model/effort/
-              // routing POST can't wake an asleep, stranded, or not-yet-observed
-              // runner, and those states never load the model catalog either. So
-              // the gear is inert whenever the session isn't online, alongside
-              // the read-only cases.
-              disabled={isReadOnly || !sessionLive}
+              // Config changes persist server-side and apply on the next
+              // wake/turn (the runner forward is best-effort), so the gear
+              // stays live wherever a message could be sent — including
+              // asleep/starting/unknown. Only read-only viewers and sessions
+              // no message can wake (unreachable) get an inert gear.
+              disabled={isReadOnly || unreachable}
               openNonce={pickerOpenNonce}
             />
             <Button
@@ -5895,7 +5886,7 @@ function ComposerConfigGear({
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     // Consume the nonce even when disabled so a later enable doesn't replay a
     // stale open request; skip opening while the gear is inert (read-only /
-    // not-live), matching the click guard.
+    // unreachable), matching the click guard.
     appliedOpenNonce.current = openNonce;
     if (disabled) return;
     setOpen(true);
@@ -6041,7 +6032,7 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode";
-  const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
+  const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
     usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 

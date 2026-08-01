@@ -40,9 +40,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias
 
 from omnigent._platform import stable_user_id
+
+_JsonObject: TypeAlias = dict[str, object]
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_QWEN_NATIVE_BRIDGE_DIR"
@@ -200,13 +202,13 @@ def _qwen_text_from_api_content(content: object, api_type: str) -> str:
 
 
 def qwen_session_records_from_session_items(
-    items: list[dict[str, Any]],
+    items: list[_JsonObject],
     *,
     qwen_session_id: str,
     cwd: Path | str,
     model: str = "",
     timestamp: str | None = None,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """Convert Omnigent session items into qwen chat-recording JSONL records.
 
     qwen's recording is a linked list chained by ``uuid`` / ``parentUuid``. We
@@ -246,7 +248,7 @@ def qwen_session_records_from_session_items(
         and isinstance(item.get("response_id"), str)
         and item.get("response_id")
     }
-    records: list[dict[str, Any]] = []
+    records: list[_JsonObject] = []
     parent_uuid: str | None = None
     for index, item in enumerate(items):
         if item.get("type") != "message":
@@ -312,7 +314,7 @@ def qwen_session_records_from_session_items(
 def write_qwen_session_recording(
     qwen_session_id: str,
     workspace: Path | str,
-    records: list[dict[str, Any]],
+    records: list[_JsonObject],
     *,
     timestamp: str | None = None,
 ) -> Path:
@@ -499,7 +501,7 @@ def build_mcp_server_entry(
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """Build qwen's ``mcpServers.omnigent`` entry for the Omnigent relay.
 
     ``trust: true`` auto-approves the qwen-side MCP tool gate so the TUI doesn't
@@ -571,7 +573,7 @@ def write_mcp_config(
     return path
 
 
-def _append_command(bridge_dir: Path, command: dict[str, Any]) -> None:
+def _append_command(bridge_dir: Path, command: _JsonObject) -> None:
     """Append one JSONL command line to the input file qwen watches.
 
     A single ``write`` of one ``\\n``-terminated line is atomic enough for qwen's
@@ -698,7 +700,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running qwen terminal."""
     _ensure_dir(bridge_dir)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),

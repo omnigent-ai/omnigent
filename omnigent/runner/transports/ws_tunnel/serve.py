@@ -19,9 +19,10 @@ import contextlib
 import logging
 import random
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from starlette.types import ASGIApp, Message, Scope
 from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
 
 from omnigent.runner.identity import (
@@ -54,15 +55,7 @@ from omnigent.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
 
-# ASGI app type — async callable with the standard 3-arg shape.
-_ASGIApp = Callable[
-    [
-        dict[str, Any],
-        Callable[[], Awaitable[dict[str, Any]]],
-        Callable[[dict[str, Any]], Awaitable[None]],
-    ],
-    Awaitable[None],
-]
+_ASGIApp: TypeAlias = ASGIApp
 
 # Reconnect backoff: 0.5 s initial, 10 s cap, ±50% jitter. The
 # jitter spreads simultaneous reconnects from many runners across
@@ -147,7 +140,7 @@ async def dispatch_via_asgi(
     """
     body_bytes = decode_body(frame.body, frame.encoding) if frame.body is not None else b""
 
-    scope = {
+    scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
@@ -167,7 +160,7 @@ async def dispatch_via_asgi(
     response_headers_raw: list[tuple[bytes, bytes]] = []
     head_sent_to_ws: bool = False
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         nonlocal body_sent
         if not body_sent:
             body_sent = True
@@ -183,10 +176,10 @@ async def dispatch_via_asgi(
         # can proxy harness SSE chunks. A real tunnel disconnect or
         # request.cancel frame cancels the dispatch task, which also
         # cancels this receive wait.
-        disconnect: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        disconnect: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
         return await disconnect
 
-    async def send(event: dict[str, Any]) -> None:
+    async def send(event: Message) -> None:
         nonlocal head_sent_to_ws
         ev_type = event.get("type")
         if ev_type == "http.response.start":
@@ -903,28 +896,28 @@ async def _handle_tunnel_frame(
     elif isinstance(frame, RequestCancelFrame):
         if on_activity is not None:
             on_activity()
-        task = dispatch_tasks.get(frame.id)
-        if task is not None:
-            task.cancel()
+        dispatch_task = dispatch_tasks.get(frame.id)
+        if dispatch_task is not None:
+            dispatch_task.cancel()
     elif isinstance(frame, WSOpenFrame):
         if on_activity is not None:
             on_activity()
-        channel = _RunnerWSChannel(ch_id=frame.ch_id, send_text=send_text)
-        ws_channels[frame.ch_id] = channel
-        channel.task = asyncio.create_task(
-            _dispatch_ws_via_asgi(app, frame, channel),
+        opened_channel = _RunnerWSChannel(ch_id=frame.ch_id, send_text=send_text)
+        ws_channels[frame.ch_id] = opened_channel
+        opened_channel.task = asyncio.create_task(
+            _dispatch_ws_via_asgi(app, frame, opened_channel),
             name=f"ws-tunnel-attach:{frame.ch_id}",
         )
-        channel.task.add_done_callback(_forget_ws_channel(ws_channels, frame.ch_id))
+        opened_channel.task.add_done_callback(_forget_ws_channel(ws_channels, frame.ch_id))
     elif isinstance(frame, WSFrame):
         if on_activity is not None:
             on_activity()
-        channel = ws_channels.get(frame.ch_id)
-        if channel is None:
+        active_channel = ws_channels.get(frame.ch_id)
+        if active_channel is None:
             _logger.debug("runner: dropping ws.frame for unknown ch_id %r", frame.ch_id)
             return
         if frame.encoding == "utf-8":
-            channel.inbound.put_nowait(("text", frame.data))
+            active_channel.inbound.put_nowait(("text", frame.data))
         elif frame.encoding == "base64":
             try:
                 decoded = base64.b64decode(frame.data, validate=True)
@@ -934,16 +927,16 @@ async def _handle_tunnel_frame(
                     frame.ch_id,
                 )
                 return
-            channel.inbound.put_nowait(("bytes", decoded))
+            active_channel.inbound.put_nowait(("bytes", decoded))
         else:
             _logger.warning("runner: dropping ws.frame with unknown encoding %r", frame.encoding)
     elif isinstance(frame, WSCloseFrame):
         if on_activity is not None:
             on_activity()
-        channel = ws_channels.get(frame.ch_id)
-        if channel is None:
+        closing_channel = ws_channels.get(frame.ch_id)
+        if closing_channel is None:
             return
-        channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
+        closing_channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
 
 
 async def _cancel_dispatch_tasks(dispatch_tasks: dict[str, asyncio.Task[None]]) -> None:
@@ -1001,7 +994,7 @@ async def _dispatch_ws_via_asgi(
     :param frame: The ``ws.open`` that triggered this dispatch.
     :param channel: Per-channel state for the receive side.
     """
-    scope: dict[str, Any] = {
+    scope: Scope = {
         "type": "websocket",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
@@ -1020,7 +1013,7 @@ async def _dispatch_ws_via_asgi(
     connect_event_consumed = False
     close_seen: tuple[int, str] | None = None
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         nonlocal connect_event_consumed, close_seen
         if not connect_event_consumed:
             connect_event_consumed = True
@@ -1046,7 +1039,7 @@ async def _dispatch_ws_via_asgi(
             return {"type": "websocket.receive", "bytes": bytes(bytes_payload)}
         raise RuntimeError(f"runner ws-channel {channel.ch_id!r}: unknown tag {tag!r}")
 
-    async def send(event: dict[str, Any]) -> None:
+    async def send(event: Message) -> None:
         ev_type = event.get("type")
         if ev_type == "websocket.accept":
             channel.accepted = True

@@ -21,7 +21,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TypeAlias
 
 import httpx
 
@@ -33,6 +33,9 @@ OPENCODE_MIN_VERSION = "1.17.7"
 OPENCODE_MAX_VERSION_EXCLUSIVE = "1.18.0"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+_JsonObject: TypeAlias = dict[str, object]
+_JsonMapping: TypeAlias = Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -51,10 +54,10 @@ class OpenCodeSession:
     title: str | None = None
     parent_id: str | None = None
     directory: str | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: _JsonObject = field(default_factory=dict)
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> OpenCodeSession:
+    def from_payload(cls, payload: _JsonMapping) -> OpenCodeSession:
         """
         Build an :class:`OpenCodeSession` from a raw server payload.
 
@@ -91,12 +94,12 @@ class OpenCodeEvent:
 
     id: str | None
     type: str
-    properties: dict[str, Any]
-    raw: dict[str, Any]
+    properties: _JsonObject
+    raw: _JsonObject
 
     @classmethod
     def from_envelope(
-        cls, envelope: Mapping[str, Any], *, event_id: str | None = None
+        cls, envelope: _JsonMapping, *, event_id: str | None = None
     ) -> OpenCodeEvent:
         """
         Build an :class:`OpenCodeEvent` from a decoded SSE data object.
@@ -108,8 +111,9 @@ class OpenCodeEvent:
         """
         type_value = envelope.get("type")
         props = envelope.get("properties")
+        envelope_id = envelope.get("id")
         return cls(
-            id=envelope.get("id") if isinstance(envelope.get("id"), str) else event_id,
+            id=envelope_id if isinstance(envelope_id, str) else event_id,
             type=type_value if isinstance(type_value, str) else "",
             properties=props if isinstance(props, dict) else {},
             raw=dict(envelope),
@@ -176,7 +180,13 @@ class OpenCodeClient:
 
     # --- helpers ---------------------------------------------------------
 
-    async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: _JsonMapping | None = None,
+    ) -> object:
         """
         Issue a request and return decoded JSON, raising on HTTP errors.
 
@@ -186,7 +196,10 @@ class OpenCodeClient:
             empty body.
         :raises OpenCodeClientError: On a non-2xx status.
         """
-        response = await self._client.request(method, path, **kwargs)
+        if json_body is None:
+            response = await self._client.request(method, path)
+        else:
+            response = await self._client.request(method, path, json=dict(json_body))
         if response.status_code >= 400:
             raise OpenCodeClientError(
                 f"OpenCode {method} {path} failed: {response.status_code} {response.text[:500]}"
@@ -194,13 +207,14 @@ class OpenCodeClient:
         if not response.content:
             return None
         try:
-            return response.json()
+            decoded: object = response.json()
+            return decoded
         except json.JSONDecodeError:
             return None
 
     # --- sessions --------------------------------------------------------
 
-    async def create_session(self, payload: Mapping[str, Any] | None = None) -> OpenCodeSession:
+    async def create_session(self, payload: _JsonMapping | None = None) -> OpenCodeSession:
         """
         Create an OpenCode session (``POST /session``).
 
@@ -211,7 +225,7 @@ class OpenCodeClient:
             :func:`omnigent.opencode_http_transport.build_prompt_payload`.
         :returns: The created session.
         """
-        data = await self._request_json("POST", "/session", json=dict(payload or {}))
+        data = await self._request_json("POST", "/session", json_body=payload or {})
         if not isinstance(data, Mapping):
             raise OpenCodeClientError("OpenCode create_session returned a non-object body")
         return OpenCodeSession.from_payload(data)
@@ -235,7 +249,7 @@ class OpenCodeClient:
             return None
         return OpenCodeSession.from_payload(data)
 
-    async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
+    async def list_messages(self, session_id: str) -> list[_JsonObject]:
         """
         List a session's messages (``GET /session/{id}/message``).
 
@@ -248,7 +262,7 @@ class OpenCodeClient:
             return [item for item in data if isinstance(item, dict)]
         return []
 
-    async def get_message(self, session_id: str, message_id: str) -> dict[str, Any]:
+    async def get_message(self, session_id: str, message_id: str) -> _JsonObject:
         """
         Fetch one message (``GET /session/{id}/message/{messageID}``).
 
@@ -259,7 +273,7 @@ class OpenCodeClient:
         data = await self._request_json("GET", f"/session/{session_id}/message/{message_id}")
         return data if isinstance(data, dict) else {}
 
-    async def list_models(self) -> list[dict[str, Any]]:
+    async def list_models(self) -> list[_JsonObject]:
         """
         List available models (``GET /api/model``).
 
@@ -273,7 +287,7 @@ class OpenCodeClient:
                 return [m for m in models if isinstance(m, dict)]
         return []
 
-    async def prompt(self, session_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    async def prompt(self, session_id: str, payload: _JsonMapping) -> _JsonObject:
         """
         Send a (blocking) prompt (``POST /session/{id}/message``).
 
@@ -282,11 +296,11 @@ class OpenCodeClient:
         :returns: The server response object (often the assistant message).
         """
         data = await self._request_json(
-            "POST", f"/session/{session_id}/message", json=dict(payload)
+            "POST", f"/session/{session_id}/message", json_body=payload
         )
         return data if isinstance(data, dict) else {}
 
-    async def prompt_async(self, session_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    async def prompt_async(self, session_id: str, payload: _JsonMapping) -> _JsonObject:
         """
         Admit a prompt without blocking (``POST /session/{id}/prompt_async``).
 
@@ -298,7 +312,7 @@ class OpenCodeClient:
         :returns: The server response object (may be empty).
         """
         data = await self._request_json(
-            "POST", f"/session/{session_id}/prompt_async", json=dict(payload)
+            "POST", f"/session/{session_id}/prompt_async", json_body=payload
         )
         return data if isinstance(data, dict) else {}
 
@@ -334,7 +348,7 @@ class OpenCodeClient:
         await self._request_json(
             "POST",
             f"/session/{session_id}/summarize",
-            json={"providerID": provider_id, "modelID": model_id},
+            json_body={"providerID": provider_id, "modelID": model_id},
         )
         return True
 
@@ -361,10 +375,10 @@ class OpenCodeClient:
         :returns: ``True`` once opencode has accepted the message.
         :raises OpenCodeClientError: On a non-2xx status.
         """
-        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}], "noReply": True}
+        body: _JsonObject = {"parts": [{"type": "text", "text": text}], "noReply": True}
         if provider_id and model_id:
             body["model"] = {"providerID": provider_id, "modelID": model_id}
-        await self._request_json("POST", f"/session/{session_id}/message", json=body)
+        await self._request_json("POST", f"/session/{session_id}/message", json_body=body)
         return True
 
     async def reply_question(self, request_id: str, answers: list[list[str]]) -> bool:
@@ -384,7 +398,7 @@ class OpenCodeClient:
         :raises OpenCodeClientError: On a non-2xx status.
         """
         await self._request_json(
-            "POST", f"/question/{request_id}/reply", json={"answers": answers}
+            "POST", f"/question/{request_id}/reply", json_body={"answers": answers}
         )
         return True
 
@@ -402,9 +416,7 @@ class OpenCodeClient:
         await self._request_json("POST", f"/question/{request_id}/reject")
         return True
 
-    async def fork(
-        self, session_id: str, payload: Mapping[str, Any] | None = None
-    ) -> OpenCodeSession:
+    async def fork(self, session_id: str, payload: _JsonMapping | None = None) -> OpenCodeSession:
         """
         Fork a session (``POST /session/{id}/fork``).
 
@@ -413,7 +425,7 @@ class OpenCodeClient:
         :returns: The new forked session.
         """
         data = await self._request_json(
-            "POST", f"/session/{session_id}/fork", json=dict(payload or {})
+            "POST", f"/session/{session_id}/fork", json_body=payload or {}
         )
         if not isinstance(data, Mapping):
             raise OpenCodeClientError("OpenCode fork returned a non-object body")
@@ -421,7 +433,7 @@ class OpenCodeClient:
 
     # --- permissions -----------------------------------------------------
 
-    async def list_permissions(self) -> list[dict[str, Any]]:
+    async def list_permissions(self) -> list[_JsonObject]:
         """
         List pending permission requests (``GET /permission``).
 
@@ -432,7 +444,7 @@ class OpenCodeClient:
             return [item for item in data if isinstance(item, dict)]
         return []
 
-    async def reply_permission(self, request_id: str, reply: Mapping[str, Any]) -> bool:
+    async def reply_permission(self, request_id: str, reply: _JsonMapping) -> bool:
         """
         Reply to a permission request (``POST /permission/{id}/reply``).
 

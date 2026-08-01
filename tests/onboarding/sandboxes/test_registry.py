@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -274,12 +273,11 @@ def test_get_launcher_uses_registry() -> None:
 def test_get_launcher_unknown_raises_click_exception() -> None:
     """An unknown provider still surfaces as a click.ClickException."""
     reset_plugin_state_for_tests()
-    with contextlib.suppress(DeprecationWarning):
-        with pytest.raises(
-            click.ClickException,
-            match="Unknown or unavailable sandbox provider",
-        ):
-            get_launcher("definitely-not-real")
+    with pytest.raises(
+        click.ClickException,
+        match="Unknown or unavailable sandbox provider",
+    ):
+        get_launcher("definitely-not-real")
 
 
 def test_instantiate_rejects_non_launcher_class(

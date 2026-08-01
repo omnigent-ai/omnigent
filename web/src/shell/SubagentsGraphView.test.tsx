@@ -1,3 +1,5 @@
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,7 +33,7 @@ vi.mock("./SubagentsGraphView", () => ({
 }));
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
 }));
 
@@ -247,7 +249,7 @@ describe("activityDotClassName (shared list/graph palette)", () => {
   // color the dot from the same ``activityDotClassName``, so the rendered dot
   // is identical in both views.
   it("classifies list and graph identically for each status", () => {
-    const cases: Array<{ child: ChildSessionInfo; expected: string }> = [
+    const cases: { child: ChildSessionInfo; expected: string }[] = [
       {
         child: childInfo({ id: "launching", current_task_status: "launching" }),
         expected: "bg-session-active/70",

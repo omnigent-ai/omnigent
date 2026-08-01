@@ -12,7 +12,6 @@
 
 import { createPortal } from "react-dom";
 import {
-  Children,
   isValidElement,
   lazy,
   Suspense,
@@ -45,11 +44,11 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import { mermaid } from "@streamdown/mermaid";
 import { Streamdown } from "streamdown";
-import { type Comment } from "@/hooks/useComments";
+import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
   fileContentToBlob,
-  useFileContent,
+  type useFileContent,
 } from "@/hooks/useFileContent";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
@@ -159,7 +158,7 @@ function MermaidPreview({ source }: { source: string }) {
 // adds no attack surface. Only literal integer pixel values are forwarded.
 const MARKDOWN_COMPONENTS: Components = {
   pre({ children, ...props }) {
-    const child = Children.count(children) === 1 && isValidElement(children) ? children : null;
+    const child = isValidElement(children) ? children : null;
     if (
       isValidElement<{ className?: string; children?: ReactNode }>(child) &&
       child.props.className?.split(/\s+/).includes("language-mermaid")

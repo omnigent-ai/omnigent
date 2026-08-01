@@ -57,10 +57,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.policies.types import (
-    EvaluationContext,
-    PolicyAction,
-)
+from omnigent.policies.types import EvaluationContext
 from omnigent.reasoning_effort import (
     EFFORT_VALUES,
     validate_effort,
@@ -175,6 +172,7 @@ from omnigent.session_lifecycle import (
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
+    PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -3668,28 +3666,40 @@ def _invalidate_runner_backed_snapshot_state(
     session_id: str,
     *,
     cancel_inflight: bool,
+    drop_model_options: bool,
 ) -> None:
     """
     Drop runner-derived session snapshot overlays for one session.
 
-    These fields are discovered from the bound runner (skills and the
-    codex-native ``model/list`` catalog), so browser reloads can ask the
-    next snapshot to refresh them from the live session instead of serving
-    stale AP-process memory. Runner teardown additionally cancels any
-    in-flight fetch so a dead runner cannot land a late stale value.
+    Skills are discovered from the bound runner, so they are dropped and
+    re-fetched at the next snapshot. The native model catalog is instead
+    marked stale by default: it must outlive runner death so the model
+    picker stays populated (and offline model/effort changes stay possible)
+    while the session is asleep — a stale catalog keeps serving until a
+    live-runner re-fetch replaces it. Runner teardown additionally cancels
+    any in-flight fetch so a dead runner cannot land a late stale value.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param cancel_inflight: Whether to cancel currently-running fetches.
         Use ``True`` when a runner disconnects; use ``False`` for browser
         refreshes so concurrent page-load callers do not cancel each other.
+    :param drop_model_options: Drop the cached catalog outright instead of
+        marking it stale. Pass ``True`` only when it can be re-fetched
+        right away (refresh with a live runner) or no longer belongs to
+        the session (agent switch); ``False`` keeps it serving while the
+        session has no runner.
     """
     _runner_skills_cache.pop(session_id, None)
     if cancel_inflight:
         inflight = _runner_skills_inflight.pop(session_id, None)
         if inflight is not None:
             inflight.cancel()
-    _model_options_cache.pop(session_id, None)
+    if drop_model_options:
+        _model_options_cache.pop(session_id, None)
+        _model_options_stale.discard(session_id)
+    else:
+        _model_options_stale.add(session_id)
     if cancel_inflight:
         codex_inflight = _model_options_inflight.pop(session_id, None)
         if codex_inflight is not None:
@@ -7281,6 +7291,58 @@ def _resolve_subagent_spec(
     return _find_spec_by_name(parent_spec, sub_agent_name)
 
 
+def _require_declared_subagent(
+    *,
+    agent: Agent,
+    sub_agent_name: str,
+    agent_cache: AgentCache | None,
+) -> None:
+    """
+    Reject a ``sub_agent_name`` the parent's spec does not declare.
+
+    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and every
+    downstream site that swaps in the resolved child spec is guarded by
+    ``if ... is not None`` with no ``else`` — so a name that resolves to
+    nothing leaves the parent's spec, workdir, harness and instructions in
+    place and the child silently boots as a full clone of the parent
+    (runaway recursion for an orchestrator). This gate fails the create
+    loud instead, mirroring normal dispatch (``tool_dispatch`` rejects an
+    undeclared ``agent``) and the ``AGENTSPEC.md`` contract that unlisted
+    names are rejected.
+
+    Only rejects when the bundle loads AND the name is positively absent:
+    a load failure or absent cache cannot prove the negative, so it is
+    left to fail-loud downstream rather than blocking a create we cannot
+    adjudicate here.
+
+    :param agent: The parent agent row whose bundle declares the
+        sub-agents.
+    :param sub_agent_name: The requested sub-agent name to validate.
+    :param agent_cache: Cache for loading the parsed parent bundle.
+        ``None`` skips the check (cannot resolve the tree).
+    :raises OmnigentError: 404 ``NOT_FOUND`` when the bundle loads and
+        declares no sub-agent named ``sub_agent_name``.
+    """
+    if agent_cache is None:
+        return
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    try:
+        parent_spec = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        ).spec
+    except Exception:  # noqa: BLE001
+        # Can't load the bundle -> can't prove the name is undeclared.
+        # Leave it to the runner's fail-loud resolution rather than
+        # rejecting a create we cannot adjudicate.
+        return
+    if _find_spec_by_name(parent_spec, sub_agent_name) is None:
+        raise OmnigentError(
+            f"Sub-agent not declared in parent spec: {sub_agent_name!r}",
+            code=ErrorCode.NOT_FOUND,
+        )
+
+
 def _spec_harness(spec: AgentSpec) -> str:
     """
     Return the canonical harness identifier for a resolved spec.
@@ -8475,8 +8537,76 @@ async def _load_model_options(
                 continue
             return
         _model_options_cache[session_id] = options
+        _model_options_stale.discard(session_id)
         _publish_model_options(session_id)
         return
+
+
+async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]] | None:
+    """
+    Resolve a host's pre-launch claude catalog over its live tunnel.
+
+    Session-side reuse of the new-session picker's source
+    (``get_host_model_options`` in ``routes/hosts.py``): the host resolves
+    the catalog locally, so no runner is needed.
+
+    :param host_id: Host identifier, e.g. ``"host_a1b2c3"``.
+    :returns: Raw model rows, or ``None`` when the host is not connected,
+        rejects the request, or times out.
+    """
+    registry = get_server_host_registry()
+    if registry is None:
+        return None
+    conn = registry.get(host_id)
+    if conn is None:
+        return None
+    # Local import: keeps routes.hosts out of this module's import graph.
+    from omnigent.server.routes.hosts import _proxy_model_options
+
+    try:
+        result = await _proxy_model_options(
+            host_registry=registry,
+            host_conn=conn,
+            harness="claude-native",
+        )
+    except HTTPException:
+        return None
+    if result.get("status") != "ok":
+        return None
+    models = result.get("models")
+    return models if isinstance(models, list) else None
+
+
+async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
+    """
+    Background catalog fill for an asleep claude-native session.
+
+    With no runner bound and a cold cache (e.g. the server restarted while
+    the session slept), the session's host can still resolve the claude
+    catalog — the same pre-launch source the new-session picker uses. Fills
+    the cache stale-marked so the next live runner replaces it with its
+    launch-exact snapshot, and publishes ``session.model_options`` so open
+    tabs re-read.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param host_id: The session's bound host, e.g. ``"host_a1b2c3"``.
+    """
+    # Read through the facade so tests patching
+    # ``sessions._host_model_options_via_registry`` reach this impl.
+    import omnigent.server.routes.sessions as _facade
+
+    raw = await _facade._host_model_options_via_registry(host_id)
+    if not raw:
+        return
+    try:
+        options = _model_options_from_wire(raw)
+    except ValueError:
+        return
+    if not options:
+        return
+    _model_options_cache[session_id] = options
+    _model_options_stale.add(session_id)
+    _publish_model_options(session_id)
 
 
 __all__ = [
@@ -8546,6 +8676,7 @@ __all__ = [
     "_handle_advise_models_mcp",
     "_handle_external_session_todos",
     "_handle_mcp_tools_list",
+    "_host_model_options_via_registry",
     "_invalidate_runner_backed_snapshot_state",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
@@ -8555,6 +8686,7 @@ __all__ = [
     "_launch_runner_on_host",
     "_load_agent_spec_for_session",
     "_load_model_options",
+    "_load_model_options_from_host",
     "_load_runner_skills",
     "_mcp_error_response",
     "_mcp_input_required_response",
@@ -8641,6 +8773,7 @@ __all__ = [
     "_replace_text_in_message_body",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",
+    "_require_declared_subagent",
     "_require_external_status_forward",
     "_require_host_conn_for_worktree",
     "_reset_runner_resources_after_switch",

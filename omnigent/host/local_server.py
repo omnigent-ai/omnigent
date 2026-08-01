@@ -146,7 +146,7 @@ def _pid_alive(pid: int) -> bool:
     :returns: ``True`` if the process exists and is not a zombie.
     """
     try:
-        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        return bool(psutil.Process(pid).status() != psutil.STATUS_ZOMBIE)
     except psutil.NoSuchProcess:
         # Includes psutil.ZombieProcess (a NoSuchProcess subclass), raised
         # on platforms where a zombie's status cannot be queried at all.

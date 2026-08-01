@@ -64,8 +64,8 @@ export interface ErrorItem extends BaseItem {
 export interface ReasoningItem extends BaseItem {
   type: "reasoning";
   model: string;
-  summary: Array<{ type: string; text: string }>;
-  content?: Array<{ type: string; text: string }>;
+  summary: { type: string; text: string }[];
+  content?: { type: string; text: string }[];
 }
 
 /** The provider-native tool item types the runtime persists today. */

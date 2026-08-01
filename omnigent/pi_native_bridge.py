@@ -12,7 +12,9 @@ import time
 import uuid
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias
+
+_JsonObject: TypeAlias = dict[str, object]
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone
@@ -179,7 +181,7 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
     :returns: Opaque compact id.
     """
     compact_id = f"compact_{uuid.uuid4().hex}"
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "id": compact_id,
         "type": "compact",
         "created_at": time.time(),
@@ -217,7 +219,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     return model_change_id
 
 
-def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
+def _enqueue_payload(bridge_dir: Path, item_id: str, payload: _JsonObject) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Order-preserving filename. The extension polls ``inbox/*.json`` and
@@ -248,7 +250,7 @@ def write_extension_files(
     server_url: str,
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
-    tools: list[dict[str, Any]] | None = None,
+    tools: list[_JsonObject] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -269,7 +271,7 @@ def write_extension_files(
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "sessionId": session_id,
         "serverUrl": server_url.rstrip("/"),
         "conversationUrl": conversation_url,
@@ -360,7 +362,7 @@ def _extension_source() -> str:
     return resource.read_text(encoding="utf-8")
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(path: Path, payload: _JsonObject) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
