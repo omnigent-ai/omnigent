@@ -692,12 +692,17 @@ class _ParakeetMlxStream:
             elif self._speech_seen:
                 self._silence_samples += int(samples.size)
 
-            endpoint = (
-                self._speech_seen
-                and self._silence_samples >= int(_RULE2_MIN_TRAILING_SILENCE_S * SAMPLE_RATE)
-            ) or self._utterance_samples >= int(_RULE3_MIN_UTTERANCE_LENGTH_S * SAMPLE_RATE)
+            silence_endpoint = self._speech_seen and self._silence_samples >= int(
+                _RULE2_MIN_TRAILING_SILENCE_S * SAMPLE_RATE
+            )
+            duration_endpoint = self._utterance_samples >= int(
+                _RULE3_MIN_UTTERANCE_LENGTH_S * SAMPLE_RATE
+            )
+            if duration_endpoint and not silence_endpoint:
+                silence = np.zeros(self._engine._flush_samples, dtype=np.float32)
+                self._add_audio(silence, flush=True)
             text = self._text()
-            if not endpoint:
+            if not silence_endpoint and not duration_endpoint:
                 return DictationUpdate(partial=text)
 
             self._close_transcriber()

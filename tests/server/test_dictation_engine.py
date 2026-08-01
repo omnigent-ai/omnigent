@@ -218,6 +218,18 @@ def test_parakeet_mlx_stream_finalizes_whole_utterance_after_silence(
     assert len(model.streams) == 2
 
 
+def test_parakeet_mlx_stream_flushes_before_duration_endpoint(fake_mlx: None) -> None:
+    engine, model = _fake_mlx_engine()
+    stream = engine.create_stream()
+    speech = b"\xff\x7f" * int(dictation._RULE3_MIN_UTTERANCE_LENGTH_S * dictation.SAMPLE_RATE)
+
+    update = stream.feed_pcm16(speech)
+
+    assert update.finalized == "stable draft"
+    assert len(model.streams[0].audio[-1]) == engine._flush_samples
+    assert model.streams[0].closed
+
+
 def test_parakeet_mlx_stream_finish_flushes_and_closes(fake_mlx: None) -> None:
     engine, model = _fake_mlx_engine()
     stream = engine.create_stream()
