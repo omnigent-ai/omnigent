@@ -3596,7 +3596,7 @@ def _publish_sandbox_status_impl(session_id: str, stage: str, error: str | None 
         type="session.sandbox_status",
         conversation_id=session_id,
         stage=status.stage,
-        error=error,
+        error=status.error,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -6514,8 +6514,10 @@ def _build_evaluation_context(
     )
     structured_data = data if isinstance(data, dict) else {}
     if phase == Phase.TOOL_CALL:
-        tool_name = structured_data.get("name") or ""
-        args = structured_data.get("arguments") or {}
+        raw_tool_name = structured_data.get("name")
+        tool_name = raw_tool_name if isinstance(raw_tool_name, str) else ""
+        raw_args = structured_data.get("arguments")
+        args = raw_args if isinstance(raw_args, dict) else {}
         return EvaluationContext(
             phase=phase,
             content={"name": tool_name, "arguments": args},
@@ -6528,16 +6530,16 @@ def _build_evaluation_context(
         tool_result = structured_data.get("result", "")
         raw_request_data = event.get("request_data")
         request_data = raw_request_data if isinstance(raw_request_data, dict) else None
-        tool_name = None
+        result_tool_name = None
         if request_data is not None:
             raw_tool_name = request_data.get("name")
-            tool_name = raw_tool_name if isinstance(raw_tool_name, str) else None
+            result_tool_name = raw_tool_name if isinstance(raw_tool_name, str) else None
         return EvaluationContext(
             phase=phase,
             content={
                 "result": tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
             },
-            tool_name=tool_name,
+            tool_name=result_tool_name,
             request_data=request_data,
             actor=actor,
             model=hook_model,
