@@ -67,9 +67,10 @@ def _as_uuid_bytes(value: object) -> bytes | None:
 
     Accepts whatever the driver returns for the source column, regardless of
     its declared type: ``None``; 16 raw bytes / ``memoryview`` (binary column);
-    or a 32-char hex string, optionally dashed / legacy-prefixed, possibly
-    delivered as ``bytes`` (varchar column). This lets the copy target a binary
-    column on every dialect without relying on implicit type coercion.
+    a ``uuid.UUID``; or a 32-char hex string, optionally dashed /
+    legacy-prefixed, possibly delivered as ``bytes`` (varchar column). This
+    lets the copy target a binary column on every dialect without relying on
+    implicit type coercion.
     """
     if value is None:
         return None
