@@ -940,7 +940,17 @@ async def test_summarize_history_validates_runner_response() -> None:
 
 
 @pytest.mark.asyncio
-async def test_summarize_history_rejects_malformed_runner_response() -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"text": 12, "token_count": 3},
+        {"text": "Runner summary", "token_count": "three"},
+        {"text": "Runner summary", "token_count": True},
+    ],
+)
+async def test_summarize_history_rejects_malformed_runner_response(
+    payload: object,
+) -> None:
     """Runner summarization fails clearly when required fields are malformed."""
 
     class _Response:
@@ -948,7 +958,7 @@ async def test_summarize_history_rejects_malformed_runner_response() -> None:
             pass
 
         def json(self) -> object:
-            return {"text": 12, "token_count": "three"}
+            return payload
 
     class _RunnerClient:
         async def post(self, *_args: object, **_kwargs: object) -> _Response:

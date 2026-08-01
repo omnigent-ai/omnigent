@@ -457,6 +457,7 @@ async def _summarize_via_runner_uncached(
     :returns: Dict with ``"text"`` (summary) and ``"token_count"``
         (approximate tiktoken estimate) keys.
     :raises httpx.HTTPStatusError: On non-2xx responses from the runner.
+    :raises RuntimeError: If the runner returns a malformed summary payload.
     """
     payload: dict[str, Any] = {"messages": messages_to_summarize, "model": model}
     if connection:
@@ -470,7 +471,11 @@ async def _summarize_via_runner_uncached(
         raise RuntimeError("runner summarize response was not an object")
     text = data.get("text")
     token_count = data.get("token_count")
-    if not isinstance(text, str) or not isinstance(token_count, int):
+    if (
+        not isinstance(text, str)
+        or not isinstance(token_count, int)
+        or isinstance(token_count, bool)
+    ):
         raise RuntimeError("runner summarize response had invalid summary fields")
     return {"text": text, "token_count": token_count}
 
