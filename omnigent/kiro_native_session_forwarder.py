@@ -662,9 +662,11 @@ def _connect_kiro_db_ro(db_path: Path) -> sqlite3.Connection | None:
     window where ``-shm`` is momentarily absent. Only SELECTs are issued.
     Mirrors :func:`omnigent.goose_native_forwarder._connect_ro`.
     """
-    for uri, kw in ((f"file:{db_path}?mode=ro", {"uri": True}), (str(db_path), {})):
+    for uri, use_uri in ((f"file:{db_path}?mode=ro", True), (str(db_path), False)):
         try:
-            return sqlite3.connect(uri, timeout=5.0, **kw)
+            if use_uri:
+                return sqlite3.connect(uri, timeout=5.0, uri=True)
+            return sqlite3.connect(uri, timeout=5.0)
         except sqlite3.Error:
             continue
     return None
