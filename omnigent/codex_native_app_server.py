@@ -28,6 +28,7 @@ from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
+    from omnigent.spec.types import AgentSpec
 
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
@@ -2151,13 +2152,26 @@ def _resolve_subscription_launch(
     )
 
 
-def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
+def resolve_native_codex_launch(
+    *, model: str | None, spec: AgentSpec | None = None
+) -> NativeCodexLaunch:
     """Resolve the native Codex launch config across all offerings.
 
     Mirrors the in-process codex harness routing precedence
     (:func:`omnigent.runtime.workflow._resolve_provider_for_build`) for the
     ``openai`` surface, so ``omnigent codex`` and a host-spawned native
     Codex session route through ``omnigent setup``:
+
+    0. (with *spec*) a spec-level credential — ``executor.auth`` naming a
+       provider (:class:`~omnigent.spec.types.ProviderAuth`, fails loud when
+       undeclared), a spec :class:`~omnigent.spec.types.DatabricksAuth`, or a
+       legacy ``executor.profile`` / ``executor.config.profile`` — resolved
+       through :func:`~omnigent.runtime.workflow._resolve_provider_for_build`
+       itself, the same resolver the in-process harness uses, so a spec that
+       routes in-process routes natively too (a spec ``ApiKeyAuth`` resolves
+       to ``None`` for every harness — the resolver leaves bare keys to the
+       claude-sdk / openai-agents builders — so codex-native falls through
+       exactly as in-process codex does);
 
     1. an explicit per-family default provider →
        - ``key`` / ``gateway`` / ``local`` → provider ``-c`` overrides
@@ -2172,12 +2186,16 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
     3. else an ambient-detected provider (first run without configure);
     4. else the codex CLI's own login.
 
-    Credentials are controlled exclusively by ``omnigent setup``
-    provider config (or the legacy global ``auth:`` block) — there is
-    no CLI/env profile override.
+    Without a *spec* (or when the spec carries no spec-level credential),
+    credentials are controlled by ``omnigent setup`` provider config (or the
+    legacy global ``auth:`` block) exactly as before — there is no CLI/env
+    profile override, and machine-level flows are unchanged.
 
     :param model: An explicit/session model override that wins over the
         provider's default model, or ``None``.
+    :param spec: The custom agent spec launching this session, when there is
+        one, so its ``executor.auth`` / legacy profile win over machine-level
+        config (issue #2744 — parity with the in-process codex harness).
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     from omnigent.onboarding.detected import (
@@ -2189,7 +2207,7 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         default_provider_for_harness,
         load_config,
     )
-    from omnigent.runtime.workflow import _load_global_auth
+    from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
     from omnigent.spec.types import DatabricksAuth
 
     explicit = load_config()
@@ -2201,6 +2219,65 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
     no_provider_overrides = (
         ['model_provider="openai"'] if codex_config_provider_dismissed(explicit) else []
     )
+    if spec is not None and (
+        spec.executor.auth is not None
+        or spec.executor.profile
+        or spec.executor.config.get("profile")
+    ):
+        # Spec-level credential (issue #2744): resolve it through the same
+        # resolver the in-process codex harness uses, so switching a working
+        # spec from ``harness: codex`` to ``codex-native`` keeps its auth
+        # working. A named provider that is undeclared raises loud here
+        # instead of parking the TUI on the sign-in screen for a 30s timeout.
+        # A spec ``ApiKeyAuth`` resolves to ``None`` for every harness (the
+        # shared resolver leaves bare keys to the claude-sdk / openai-agents
+        # builders; the in-process codex builder has no ApiKeyAuth branch
+        # either), so codex-native falls through to the machine-level chain
+        # below exactly as in-process codex does — as does a spec credential
+        # that cannot route openai.
+        spec_entry = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
+        if spec_entry is not None:
+            if spec_entry.kind == SUBSCRIPTION_KIND:
+                # A spec-named subscription defers to Codex's own login,
+                # logged in or not. The machine-default path would substitute
+                # the first OTHER routable provider on a logged-out Codex
+                # (:func:`_resolve_subscription_launch`) — never do that for
+                # an explicit spec declaration: silently running a credential
+                # the spec did not name is worse than the login screen.
+                from omnigent.onboarding.ambient import codex_auth_has_credential
+
+                if codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json"):
+                    state = "Codex is logged in"
+                else:
+                    state = (
+                        "Codex is not logged in — the TUI likely renders the "
+                        "sign-in screen and never starts a thread"
+                    )
+                return NativeCodexLaunch(
+                    config_overrides=['model_provider="openai"'],
+                    model=model,
+                    profile=None,
+                    summary=f"Codex CLI login (spec provider {spec_entry.name!r}; {state})",
+                )
+            launch = _codex_provider_launch(spec_entry, model)
+            if launch is not None:
+                if launch.profile is not None:
+                    _logger.info(
+                        "native-codex routing: Databricks ucode profile %r (spec auth)",
+                        launch.profile,
+                    )
+                else:
+                    _logger.info(
+                        "native-codex routing: provider %r (spec auth, model=%s)",
+                        spec_entry.name,
+                        launch.model,
+                    )
+                return launch
+            _logger.warning(
+                "native-codex: spec-level provider %r has no usable openai credential — "
+                "falling back to machine-level resolution.",
+                spec_entry.name,
+            )
     entry = default_provider_for_harness(explicit, "codex")
     if entry is None:
         # No explicit provider default: global auth wins over ambient

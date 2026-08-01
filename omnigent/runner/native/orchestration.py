@@ -3722,7 +3722,10 @@ async def _auto_create_codex_terminal(
     # synthesis can stamp session_meta.model_provider with the provider
     # this launch actually routes through.
     default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
-    _codex_launch = resolve_native_codex_launch(model=default_model)
+    # Thread the spec so its executor.auth / legacy profile win over
+    # machine-level config, parity with the in-process harness (#2744).
+    _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     from omnigent.inner.codex_executor import _find_codex_cli
 
