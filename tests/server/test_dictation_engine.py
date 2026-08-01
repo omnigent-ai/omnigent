@@ -186,7 +186,7 @@ def test_parakeet_mlx_stream_normalizes_pcm_and_keeps_tokens_partial(
     assert update == dictation.DictationUpdate(partial="")
     assert model.streams[0].audio == []
 
-    update = stream.feed_pcm16(b"\x00@" * 158)
+    update = stream.feed_pcm16(b"\x00@" * (dictation._MLX_VAD_WINDOW_SAMPLES - 2))
 
     assert update == dictation.DictationUpdate(partial="stable draft")
     assert model.streams[0].audio[0].tolist()[:2] == pytest.approx([0.5, -0.5])
@@ -198,8 +198,12 @@ def test_parakeet_mlx_stream_preserves_split_pcm_sample(fake_mlx: None) -> None:
     stream = engine.create_stream()
 
     assert stream.feed_pcm16(b"\x00").partial == ""
-    assert stream.feed_pcm16(b"@").partial == "stable draft"
-    assert model.streams[0].audio[0].tolist() == pytest.approx([0.5])
+    assert stream.feed_pcm16(b"@").partial == ""
+    assert (
+        stream.feed_pcm16(b"\x00@" * (dictation._MLX_VAD_WINDOW_SAMPLES - 1)).partial
+        == "stable draft"
+    )
+    assert model.streams[0].audio[0].tolist()[0] == pytest.approx(0.5)
 
 
 def test_parakeet_mlx_stream_finalizes_whole_utterance_after_silence(
@@ -216,6 +220,28 @@ def test_parakeet_mlx_stream_finalizes_whole_utterance_after_silence(
     assert update == dictation.DictationUpdate(partial="", finalized="stable draft")
     assert model.streams[0].closed
     assert len(model.streams) == 2
+
+
+def test_parakeet_mlx_endpoint_is_frame_segmentation_invariant(fake_mlx: None) -> None:
+    speech = b"\xff\x7f" * dictation.SAMPLE_RATE
+    silence = b"\x00\x00" * int(dictation._RULE2_MIN_TRAILING_SILENCE_S * dictation.SAMPLE_RATE)
+    resumed = b"\xff\x7f" * dictation._MLX_VAD_WINDOW_SAMPLES
+    audio = speech + silence + resumed
+
+    combined_engine, _ = _fake_mlx_engine()
+    combined = combined_engine.create_stream().feed_pcm16(audio)
+
+    split_engine, _ = _fake_mlx_engine()
+    split_stream = split_engine.create_stream()
+    split_finals: list[str] = []
+    for offset in range(0, len(audio), 317):
+        update = split_stream.feed_pcm16(audio[offset : offset + 317])
+        if update.finalized:
+            split_finals.append(update.finalized)
+
+    assert combined.finalized == "stable draft"
+    assert " ".join(split_finals) == combined.finalized
+    assert split_stream._text() == combined.partial
 
 
 def test_parakeet_mlx_stream_flushes_before_duration_endpoint(fake_mlx: None) -> None:

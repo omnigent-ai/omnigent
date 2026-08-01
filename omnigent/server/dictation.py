@@ -145,6 +145,7 @@ _RULE3_MIN_UTTERANCE_LENGTH_S = 30.0
 _DEFAULT_MLX_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 _MLX_CONTEXT_SIZE = (256, 16)
 _MLX_SPEECH_RMS = 0.01
+_MLX_VAD_WINDOW_SAMPLES = SAMPLE_RATE // 10
 
 _PUNCT_STRIP_RE = re.compile(r"[.,?!:;…]+")
 
@@ -641,6 +642,7 @@ class _ParakeetMlxStream:
         self._speech_seen = False
         self._pending_pcm = b""
         self._pending: Any = None
+        self._vad_pending: Any = None
         self._closed = False
         self._open_transcriber()
 
@@ -671,6 +673,38 @@ class _ParakeetMlxStream:
             self._transcriber.add_audio(mx.array(pending[:usable]))
         self._pending = pending[usable:]
 
+    def _feed_window(self, samples: Any) -> str | None:
+        import numpy as np
+
+        self._add_audio(samples)
+        self._utterance_samples += int(samples.size)
+        rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+        if rms >= _MLX_SPEECH_RMS:
+            self._speech_seen = True
+            self._silence_samples = 0
+        elif self._speech_seen:
+            self._silence_samples += int(samples.size)
+
+        silence_endpoint = self._speech_seen and self._silence_samples >= int(
+            _RULE2_MIN_TRAILING_SILENCE_S * SAMPLE_RATE
+        )
+        duration_endpoint = self._utterance_samples >= int(
+            _RULE3_MIN_UTTERANCE_LENGTH_S * SAMPLE_RATE
+        )
+        if not silence_endpoint and not duration_endpoint:
+            return None
+        if duration_endpoint and not silence_endpoint:
+            silence = np.zeros(self._engine._flush_samples, dtype=np.float32)
+            self._add_audio(silence, flush=True)
+        text = self._text()
+        self._close_transcriber()
+        self._open_transcriber()
+        self._utterance_samples = 0
+        self._silence_samples = 0
+        self._speech_seen = False
+        self._pending = None
+        return text or None
+
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
         """Decode PCM and finalize only at an utterance endpoint."""
         import numpy as np
@@ -681,38 +715,25 @@ class _ParakeetMlxStream:
         if usable <= 0:
             return DictationUpdate(partial=self._text())
         samples = np.frombuffer(pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0
-        rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
 
         with self._engine._lock:
-            self._add_audio(samples)
-            self._utterance_samples += int(samples.size)
-            if rms >= _MLX_SPEECH_RMS:
-                self._speech_seen = True
-                self._silence_samples = 0
-            elif self._speech_seen:
-                self._silence_samples += int(samples.size)
-
-            silence_endpoint = self._speech_seen and self._silence_samples >= int(
-                _RULE2_MIN_TRAILING_SILENCE_S * SAMPLE_RATE
+            pending = (
+                samples
+                if self._vad_pending is None
+                else np.concatenate((self._vad_pending, samples))
             )
-            duration_endpoint = self._utterance_samples >= int(
-                _RULE3_MIN_UTTERANCE_LENGTH_S * SAMPLE_RATE
+            finals: list[str] = []
+            offset = 0
+            while len(pending) - offset >= _MLX_VAD_WINDOW_SAMPLES:
+                finalized = self._feed_window(pending[offset : offset + _MLX_VAD_WINDOW_SAMPLES])
+                if finalized:
+                    finals.append(finalized)
+                offset += _MLX_VAD_WINDOW_SAMPLES
+            self._vad_pending = pending[offset:]
+            return DictationUpdate(
+                partial=self._text(),
+                finalized=" ".join(finals).strip() or None,
             )
-            if duration_endpoint and not silence_endpoint:
-                silence = np.zeros(self._engine._flush_samples, dtype=np.float32)
-                self._add_audio(silence, flush=True)
-            text = self._text()
-            if not silence_endpoint and not duration_endpoint:
-                return DictationUpdate(partial=text)
-
-            self._close_transcriber()
-            self._open_transcriber()
-            self._utterance_samples = 0
-            self._silence_samples = 0
-            self._speech_seen = False
-            self._pending_pcm = b""
-            self._pending = None
-            return DictationUpdate(partial="", finalized=text or None)
 
     def finish(self) -> str:
         """Flush right context with silence and return one final tail."""
@@ -721,6 +742,10 @@ class _ParakeetMlxStream:
         import numpy as np
 
         with self._engine._lock:
+            if self._vad_pending is not None and len(self._vad_pending):
+                self._add_audio(self._vad_pending)
+                self._utterance_samples += len(self._vad_pending)
+                self._vad_pending = None
             if self._utterance_samples:
                 silence = np.zeros(self._engine._flush_samples, dtype=np.float32)
                 self._add_audio(silence, flush=True)

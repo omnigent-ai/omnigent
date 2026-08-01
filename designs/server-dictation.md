@@ -102,7 +102,8 @@ long enough to commit the draft region. Explicit stop pads the configured
 right context, returns the remaining hypothesis once, and closes the MLX
 stream. PCM frames smaller than the model's feature hop are buffered rather
 than passed to the upstream decoder prematurely. The 30-second hard endpoint
-also pads right context before it finalizes continuous speech.
+also pads right context before it finalizes continuous speech. Silence
+detection uses fixed 100 ms windows, independent of WebSocket frame sizes.
 
 ### Configuration
 
