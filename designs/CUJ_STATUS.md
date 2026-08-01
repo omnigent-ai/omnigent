@@ -63,12 +63,15 @@ Rows in §2 reference these instead of repeating commands.
 
 ## 2. Test inventory
 
-### 2.1 Canonical CUJ matrix (plan §11) — 15/15 exact (C1 on its tracked note)
+### 2.1 Canonical CUJ matrix (plan §11) — 15/15 exact (C1's gateway blocker now cleared)
 
 Definition, prompts (P-OPUS / P-GLM / P-SOL / P-TRIVIAL) and per-row verify
 handles: **plan §11.1–§11.4**. The bar is `raw_model == applied_model`; a
-substitution arrow is a failure, C1 excepted. Run headless via **R7**, or by
-hand on the same **R0** stack.
+substitution arrow is a failure. Run headless via **R7**, or by hand on the same
+**R0** stack. C1's applied id reads `system.ai.glm-5-2` rather than the catalog's
+`databricks-glm-5-2`: that is the gateway's own spelling of the same arm, so it
+stamps no `raw_model` and is an exact pass (`907f8886`, `CUJ_IMPLEMENTATION.md`
+§3.5h).
 
 Results as of **2026-07-31 / 3ccf86e3** — A1–A4, B2, B3, C1–C3, C-sub, C-tog
 carried verbatim from the `c0b08f68` full re-run (their code paths are untouched
@@ -92,7 +95,11 @@ Blocker status:
   and nothing was added), so the staging gateway's beta allowlist is what moved.
   Treat it as an external dependency that can regress: if it returns, B-sub /
   B-tog / A-sub go dark again and the tell is the pane 400, not any routing log.
-- **C1's glm gateway 400**, unchanged and pre-existing (see the C1 note).
+- **C1's glm gateway 400 — ✅ resolved (ours), verified live 2026-08-01 /
+  `907f8886`.** The arm now applies under the gateway's model route
+  `system.ai.glm-5-2`, which is the only name that serves GLM on the Responses
+  API. Session `80fb6d1f` ran clean: zero `BAD_REQUEST`, and a turn completed
+  with an answer. See the C1 note.
 
 | Row   | Surface / prompt                  | Session    | Decision (raw → applied)                                                                                          | Process truth (R2/R3)                                                                                | Bar                                                                                                       |
 | ----- | --------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
@@ -105,7 +112,7 @@ Blocker status:
 | B3    | Claude Code / P-TRIVIAL           | `a55e01bd` | turn-scope, `databricks-claude-sonnet-5`, applied=true                                                              | pane `/model sonnet` → `Set model to Sonnet 5`; status bar `Sonnet 5`                                 | ✅ exact                                                                                                  |
 | B-sub | Claude Task spawns                | `cb35efd1` | 2 `native_subagent` rows, one per spawn, both `applied=true`, both `harness=claude-native`: `general-purpose` → `databricks-claude-opus-4-8` (conjunction all-holds), `Explore` → `databricks-claude-sonnet-5` (rule-0). No cross-family arm | turn 1 pane `/model sonnet` → `Set model to Sonnet 5`, `hi` answered; both spawns **ran** (sub-agents panel `Explore` + `general-purpose  Plan dry-run flag for deploy CLI  44s`); 2 × `POST …/hooks/route-subagent 200` in **R4** | ✅ **exact, class-differentiated** — the routed arm tracks the *Task prompt*, not the session model (parent on sonnet, opus spawn still issued). Both rows carry a prefix-only `raw_model` (`claude-opus-4-8` / `claude-sonnet-5`) — cosmetic, see the note below |
 | B-tog | Toggle off → on mid-session       | `cb35efd1` | off (`PATCH {"subagent_routing_override":"off"}`): decisions **3→3**, hookcalls 2→3, spawn still landed. on: decisions **3→4** on the very next spawn — a new `Explore` → `databricks-claude-sonnet-5` `native_subagent` row, hookcalls 3→4 | `route-subagent: subagent routing disabled for session=cb35efd1322a4ea984bbd32272134ccd harness=claude-native` at 13:41:37 (**R4**); the off-spawn's Explore still ran (2 s) on the harness default | ✅ **per-call gate, immediate both ways on claude** — matches the codex half (C-tog) exactly: the declined spawn still reaches the hook and still executes |
-| C1    | Codex / P-GLM                     | `addfe5c0` | turn-scope, `databricks-glm-5-2`, applied=true, no `raw_model`                                                       | `config.toml` `model = "databricks-glm-5-2"`; rollout `turn_context model=databricks-glm-5-2`         | ✅ exact at the routing+apply layer — **blocker resolved: gateway model-route alias, pending live re-run.** The arm now applies as `system.ai.glm-5-2` (the only name the gateway serves GLM on the Responses API; probed 2026-08-01). See the C1 note below |
+| C1    | Codex / P-GLM                     | `addfe5c0` | turn-scope, `databricks-glm-5-2`, applied=true, no `raw_model`                                                       | `config.toml` `model = "databricks-glm-5-2"`; rollout `turn_context model=databricks-glm-5-2`         | ✅ **end-to-end** — live re-run 2026-08-01 / 907f8886, session `80fb6d1f`: decision `system.ai.glm-5-2` applied (no raw_model), `config.toml` + all rollout turn contexts on `system.ai.glm-5-2`, zero BAD_REQUEST, real generation on both turns. The P-GLM turn reached the model and then aborted on gateway capacity (`exceeded retry limit, last status: 429 Too Many Requests`); turn 2 on the same thread completed in 3.9 s ("ok"). The 400 is gone; the 429 is load, not routing. See the C1 note below |
 | C2    | Codex / P-SOL                     | `6055d8a9` | turn-scope, `databricks-gpt-5-6-sol`, applied=true                                                                  | `config.toml` + rollout `turn_context` = sol; agent replied                                           | ✅ exact                                                                                                  |
 | C3    | Codex / P-TRIVIAL                 | `12fa70be` | turn-scope, `databricks-gpt-5-6-luna`, applied=true                                                                 | `config.toml` + rollout `turn_context` = luna; agent replied                                          | ✅ exact                                                                                                  |
 | C-sub | Codex spawns                       | `12fa70be` | 2 `native_subagent` rows, `applied=false`, `model=databricks-gpt-5-6-luna`, rationale `No routable signal (encrypted prompt, no task name); subagent inherits the session model` | `subagent_spawn_audit.jsonl` entry `model=databricks-gpt-5-6-luna, task_name=null`; 2 × `POST …/hooks/route-subagent 200` | ✅ w/ note — the router is **skipped** (not fed a placeholder) per `a95105c9`, superseding plan §11 C5; `task_name` still missing (follow-up) |
@@ -180,30 +187,48 @@ Last full A/B: 2026-07-30 / de2acfdb (identical trivial `Explore` prompt →
 `claude-sonnet-5` from the `cc` session `453f7da0`, `gpt-5-6-luna` from the auto
 session `75379db2`).
 
-> **C1 gateway blocker (unchanged, re-observed).** Routing and apply are exact —
-> the codex process is configured for and requests `databricks-glm-5-2`. The
-> turn then **errors at the gateway**: `{"error_code":"BAD_REQUEST","message":"API type 'openai/v1/responses' is not supported by 'databricks-glm-5-2'. Supported API types: [mlflow/v1/chat/completions]."}`
-> (this round's rollout:
+> **C1 gateway blocker, as it stood through 2026-07-31.** Routing and apply were
+> exact — the codex process was configured for and requested
+> `databricks-glm-5-2`. The turn then **errored at the gateway**: `{"error_code":"BAD_REQUEST","message":"API type 'openai/v1/responses' is not supported by 'databricks-glm-5-2'. Supported API types: [mlflow/v1/chat/completions]."}`
+> (that round's rollout:
 > `~/.omnigent/codex-native/0a65921baffdebc31113db9ef843816a/codex-home/sessions/2026/07/31/rollout-2026-07-31T12-25-13-019fb9a3-48ed-7db1-9376-3138a53252af.jsonl`,
-> `task_complete.error` at 19:25:46Z). Present in the 2026-07-29 and 2026-07-30
-> glm rollouts too, so pre-existing and external. GLM routes and applies; it
-> cannot yet *serve* codex.
+> `task_complete.error` at 19:25:46Z). It was present in the 2026-07-29 and
+> 2026-07-30 glm rollouts too, so pre-existing and external. GLM routed and
+> applied; it could not *serve* codex.
 >
-> **Resolved 2026-08-01 (pending live re-run): gateway model-route alias.** Live
-> probes on both staging (`eng-ml-agent-platform`) and the prod org gateway show
-> the Responses API *does* serve GLM — but only under the model-route name
-> `system.ai.glm-5-2` (200 with real generation). The serving endpoint
-> `databricks-glm-5-2` still 400s on `/codex/v1` (`api_types` =
+> **✅ Resolved 2026-08-01 / `907f8886`: gateway model-route alias. Verified
+> live.** Probes on both staging (`eng-ml-agent-platform`) and the prod org
+> gateway show the Responses API *does* serve GLM — but only under the
+> model-route name `system.ai.glm-5-2` (200 with real generation). The serving
+> endpoint `databricks-glm-5-2` still 400s on `/codex/v1` (`api_types` =
 > chat-completions only) and `system.ai.databricks-glm-5-2` 404s. GLM appears in
 > no discovery listing (neither foundation-models nor UC model-services), so the
-> working name is only knowable a priori — it is now pinned in
-> `_SERVABLE_ALIASES` in `omnigent/server/smart_routing.py`, consulted when the
-> `glm-5-2` arm is resolved to a servable id. The router arm id is unchanged.
-> The C1 re-run must check: codex-home `config.toml` carries
-> `model = "system.ai.glm-5-2"`, the rollout `.jsonl` has no `BAD_REQUEST`
-> (no `task_complete.error`), and the turn completes with an answer. Note the
-> probe's response payload reports `"model":"/mosaicml/local_model"` — nothing
-> on our side reads the response model field, so labels stay on the decision id.
+> working name is only knowable a priori. `907f8886` pins it in
+> `_SERVABLE_ALIASES` (`omnigent/server/smart_routing.py:649`) and applies it
+> through `apply_servable_alias` (`:652`) whenever the `glm-5-2` arm resolves to
+> a servable id; `candidate_models`
+> (`omnigent/runner/subagent_routing.py:443`) offers spawns the same spelling.
+> The router arm id is unchanged, and the alias strips to the same bare id, so
+> the decision stamps no `raw_model` (`CUJ_IMPLEMENTATION.md` §3.5h).
+> **Live evidence, session `80fb6d1f`** (bridge dir
+> `~/.omnigent/codex-native/9f3b154ff6a94b8e83fc0a42f5b2dd22/`): codex-home
+> `config.toml` `model = "system.ai.glm-5-2"`, all four rollout `turn_context`
+> entries on `system.ai.glm-5-2`, **zero** `BAD_REQUEST` in the rollout, and two
+> `agent_message` items. The P-GLM turn itself aborted on gateway capacity
+> (`task_complete.error` = `exceeded retry limit, last status: 429 Too Many
+> Requests`) after the model had already answered; turn 2 completed in 3.9 s.
+> Note the probe's response payload reports `"model":"/mosaicml/local_model"` —
+> nothing on our side reads the response model field, so labels stay on the
+> decision id.
+>
+> **How to re-run C1** (R7 + R3, on the R0 stack): create a codex-native session
+> with `cost_control_mode_override: "on"` and no model pin, send the P-GLM prompt
+> from `/tmp/p_glm.txt` verbatim, and expect the turn to complete. Score with
+> **R3** — codex-home `config.toml` `model = "system.ai.glm-5-2"`, the newest
+> rollout `.jsonl` free of `BAD_REQUEST`, a `task_complete` with a
+> `last_agent_message` — plus the pane, whose bottom status bar tracks the live
+> thread model. A 429 there is gateway load: send a short prompt on the same
+> thread and read the second turn.
 
 **Routing cadence: session-start only.** Product decision (plan §10 decision 4)
 — the router runs once, on the session's first message, and the routed model
@@ -242,7 +267,7 @@ Root cause history for the apply layer: `model_override` was dropped in
 | Smart Routing selectable in Configure Codex          | R0, open Configure Codex                                           | UI dropdown state                                                                                                                                                           | ✅ user                                                    | not recorded                         |
 | Smart Routing hidden in Configure Codex when the host's codex provider is not AIGW-backed (plan §10 decision 9) | R9, codex half                                                     | host `gateway_inference["codex-native"] = false` on `GET /v1/hosts`; the Codex Model row disappears entirely (it is the only choice there), and a `false` **claude** entry must NOT hide it here | ✅ **signal evidence** — R9 codex flip run live: after the flip + host-only restart, `GET /v1/hosts` reported `{'claude-native': True, 'native-claude': True, 'codex': False, 'codex-native': False, 'native-codex': False}` — the codex family flipped and **claude stayed `True`**, proving per-family independence. Config restored byte-exactly (md5 `4be2c560a20fad68c51defaeed93410e` before and after) and the host re-reported all-`True`. The UI-hidden check stays for Bryan. | 2026-07-31 / c0b08f68 |
 | Router decision + chip                               | R7 + R1                                                            | matrix C1/C2/C3 + A3/A4 this round: glm / sol / luna, all exact servable matches (no `raw_model` on any row)                                                                 | ✅ evidence                                                | 2026-07-31 / c0b08f68                |
-| **Process runs the routed model**                    | R3 (bridge-dir codex-home `config.toml` + newest rollout `.jsonl`) | 6 sessions this round (A3, A4, C1, C2, C3, `63dbaf02`): runner log `received model_override=databricks-<pick> (forwarding to harness)`, codex-home `config.toml` `model = "databricks-<pick>"`, rollout `turn_context model=databricks-<pick>` — glm, sol, luna. Codex is **0 divergences, 0 blockers** apart from glm's serving gap | ✅ evidence                                                | 2026-07-31 / c0b08f68                |
+| **Process runs the routed model**                    | R3 (bridge-dir codex-home `config.toml` + newest rollout `.jsonl`) | 6 sessions this round (A3, A4, C1, C2, C3, `63dbaf02`): runner log `received model_override=databricks-<pick> (forwarding to harness)`, codex-home `config.toml` `model = "databricks-<pick>"`, rollout `turn_context model=databricks-<pick>` — glm, sol, luna. Codex is **0 divergences, 0 blockers** apart from glm's serving gap, which closed on 2026-08-01 / `907f8886` — C1 session `80fb6d1f` mirrors `system.ai.glm-5-2` on both surfaces and serves the turn (the rest of this row is carried from `c0b08f68`, not re-run) | ✅ evidence                                                | 2026-07-31 / c0b08f68 (glm half 2026-08-01 / 907f8886) |
 | Codex TUI reflects the live model                    | R0 + watch the TUI status bar                                      | thread-level push (`thread/settings/update`) live-updates the status bar (probed); `/model` picker highlight is upstream codex behavior — see `designs/LIVE_MODEL_STATE.md` | 🟡 not exercised this round: no mid-session model change to push (see below), and the TUI status bar was not eyeballed | 51801530                             |
 | Post-launch model push (re-route / lost launch race) | R0, force a re-route after launch, then R3                         | first-turn push + config mirror re-verified (row above). A **forced re-route** is unreachable **by design**: routing is session-start only (plan §10 decision 4), gated on `effective_runner_override is None` (orchestration.py:3890-3897), and the routed turn's own `model_override` is the pin — a P-SOL turn sent to the luna session `0aec2b51` produced no decision and left `config.toml` on luna | 🟡 half-verified — mirror/push yes; re-route path unreachable by design, not a gap | 2026-07-30 / de2acfdb (mirror half)  |
 
@@ -319,7 +344,7 @@ flag (persisted trust handshake added) and cwd shadowing killed hook imports
 | All UI labels renamed to "Smart Routing"                                                          | ✅ user-directed, shipped e5c8a160                                                                                                                                                                                                                                                                                                                         |
 | Top-level Smart Routing harness in the landing dropdown (agentless auto over native claude/codex) | ✅ shipped; dropdown group landed 76749e03. Functional half re-verified headless at c0b08f68 (matrix A1–A4)                                                                                                                                                                                                                                                 |
 | Claude Code CLI 2.1.220 vs the staging gateway's beta allowlist                                   | ✅ **fixed / cleared externally, verified live 2026-07-31 / 3ccf86e3.** Claude-native turns execute again: `cb35efd1` answered `hi`, ran two parallel Task spawns plus two more, and `c9ce897d` completed a full P-OPUS turn on Opus 4.8 — which unblocked B-sub / B-tog / A-sub. **No omnigent change**: the launch env is byte-identical (`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` still present, nothing added), so the gateway's allowlist is what moved. Not ours to hold: it can regress at any time, and the only tell is the pane 400 — re-check the pane before any demo. `omnigent/inner/claude_gateway_shim.py` still documents the 2.1.168 round of this fight |
-| GLM absent from codex model list (eng-ml-agent-platform)                                          | ✅ **resolved 2026-08-01: gateway model-route alias, pending live re-run.** Probes on staging and prod show the Responses API serves GLM under the model-route name `system.ai.glm-5-2` (200, real generation); the serving endpoint `databricks-glm-5-2` still 400s on `/codex/v1` (`api_types` = chat-completions only) and `system.ai.databricks-glm-5-2` 404s. GLM is in **no** discovery listing (not foundation-models, not UC model-services), so the name is only knowable a priori — pinned in `_SERVABLE_ALIASES` (`omnigent/server/smart_routing.py`) and applied when the `glm-5-2` arm resolves to a servable id. The router arm id is unchanged. Re-run C1 to confirm: `config.toml` `model = "system.ai.glm-5-2"`, rollout `.jsonl` free of `BAD_REQUEST`, turn completes |
+| GLM absent from codex model list (eng-ml-agent-platform)                                          | ✅ **resolved 2026-08-01 / `907f8886`: gateway model-route alias, verified live.** Probes on staging and prod show the Responses API serves GLM under the model-route name `system.ai.glm-5-2` (200, real generation); the serving endpoint `databricks-glm-5-2` still 400s on `/codex/v1` (`api_types` = chat-completions only) and `system.ai.databricks-glm-5-2` 404s. GLM is in **no** discovery listing (not foundation-models, not UC model-services), so the name is only knowable a priori — pinned in `_SERVABLE_ALIASES` (`omnigent/server/smart_routing.py:649`), applied by `apply_servable_alias` (`:652`) when the `glm-5-2` arm resolves to a servable id, and offered to spawns by `candidate_models` (`omnigent/runner/subagent_routing.py:443`). The router arm id is unchanged, so no `raw_model` is stamped. **Live**: C1 session `80fb6d1f` — `config.toml` `model = "system.ai.glm-5-2"`, all rollout turn contexts the same, zero `BAD_REQUEST`, real generation. The only error left on that thread is a gateway-capacity 429 on the P-GLM turn, which is load and not routing. Re-run recipe: the C1 note under §2.1 |
 | task_v1 escalates clear+contained prompts to opus (well-written spawn prompts always pay opus)    | 📝 recipe feedback for Ivan — frozen router, needs task_v2                                                                                                                                                                                                                                                                                                 |
 
 ### 2.9 Automated suites
@@ -391,8 +416,12 @@ rows that had never been exercised live.
    only remaining browser/TUI work.
 5. Decide whether "armed + audited spawns + zero relayed decisions" should warn
    (§2.5 blind spot).
-6. Take the glm serving gap (responses API vs chat/completions) back to the
-   AIGW/ucode owners.
+6. ~~Take the glm serving gap (responses API vs chat/completions) back to the
+   AIGW/ucode owners~~ — **worked around client-side 2026-08-01 / `907f8886`**:
+   the arm applies under the gateway model route `system.ai.glm-5-2` and C1
+   completes. The ask still stands, and it is now cosmetic rather than blocking:
+   advertise `openai/v1/responses` on the `databricks-glm-5-2` endpoint, or list
+   the model route, and the pinned alias can go.
 
 ## 4. Where we stand
 
@@ -414,10 +443,14 @@ B-tog and A-sub** run live and pass. Remaining claude-side nit: `native_subagent
 decisions still record a prefix-only `raw_model`, so subagent chips draw a false
 substitution arrow (§2.1 note).
 
+The **glm serving gap is closed** as of 2026-08-01 / `907f8886`. GLM serves codex
+under the gateway model route `system.ai.glm-5-2`, the arm applies under that
+name, and C1 ran end to end on session `80fb6d1f` with zero `BAD_REQUEST`. One
+residual: that name is pinned in code, because no listing carries it.
+
 Also open: the UI/TUI visual layer (§2.6 + codex status bar), fork routing
 policy, telemetry against a real ingestion endpoint, the `~/.omnigent`
-codex-bridge isolation leak, the enforcement blind spot in §2.5, and the glm
-serving gap.
+codex-bridge isolation leak, and the enforcement blind spot in §2.5.
 
 ---
 
