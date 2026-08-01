@@ -97,8 +97,13 @@ connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 | `OMNIGENT_DICTATION_MODEL_DIR` | `~/.omnigent/models/dictation/asr` | dir containing `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx`, `tokens.txt` |
 | `OMNIGENT_DICTATION_PUNCT_DIR` | `~/.omnigent/models/dictation/punct` | optional online-punctuation model dir (`model*.onnx` + `bpe.vocab`) |
 | `OMNIGENT_DICTATION_MAX_STREAMS` | `2` | concurrent dictation WebSockets |
+| `OMNIGENT_DICTATION_MAX_FRAME_BYTES` | `262144` | maximum binary PCM frame size; larger frames close with WebSocket code 1009 |
+| `OMNIGENT_DICTATION_MAX_TAKE_SECONDS` | `300` | maximum wall-clock or PCM-audio duration per take |
 | `OMNIGENT_DICTATION_ENGINE` | unset (`sherpa`) | engine to use by registered name (`sherpa`, `remote`, `fake`) |
 | `OMNIGENT_DICTATION_REMOTE_URL` | unset | worker stream URL for the `remote` engine, e.g. `ws://venus:8100/v1/dictation/stream` |
+| `OMNIGENT_DICTATION_WORKER_TOKEN` | unset | shared bearer token required by the worker and sent by the main relay |
+| `OMNIGENT_DICTATION_REMOTE_CA_FILE` | unset | optional PEM CA bundle for a private worker CA; normal hostname and certificate verification remain enabled |
+| `OMNIGENT_DICTATION_ALLOW_INSECURE_REMOTE` | unset | set to `1` only to permit plaintext `ws://` to a non-loopback worker |
 
 `scripts/fetch-dictation-models.sh` downloads a known-good pair (streaming
 Nemotron 0.6 B int8 + English online punctuation, both Apache-2.0 upstream)
@@ -143,22 +148,54 @@ transcript events down), so no new protocol or code path was needed. The
 browser never talks to the worker; the main server authenticates the user on
 its own route, then relays over a `websockets` client.
 
-Run the worker wherever the models live (it is **unauthenticated** — bind it
-to a trusted LAN/VPN only):
+Run the worker wherever the models live. Generate a high-entropy token and
+configure the same value on the worker and main server. The token is checked
+in constant time before the WebSocket is accepted:
 
 ```
 pip install omnigent[dictation] && scripts/fetch-dictation-models.sh
-python -m omnigent.server.dictation_worker --host 0.0.0.0 --port 8100
+export OMNIGENT_DICTATION_WORKER_TOKEN="$(openssl rand -hex 32)"
+python -m omnigent.server.dictation_worker \
+  --host 0.0.0.0 --port 8100 \
+  --tls-certfile /etc/omnigent/worker.crt \
+  --tls-keyfile /etc/omnigent/worker.key
 ```
 
-Then select the `remote` engine on the main server via env vars — no CLI
-integration is required:
+Then select the `remote` engine on the main server. For a certificate signed
+by a private CA, set `OMNIGENT_DICTATION_REMOTE_CA_FILE`; the relay builds a
+verified `SSLContext`, including hostname verification. There is no
+disable-verification mode:
 
 ```
 OMNIGENT_DICTATION_ENGINE=remote \
-OMNIGENT_DICTATION_REMOTE_URL=ws://<worker-host>:8100/v1/dictation/stream \
+OMNIGENT_DICTATION_REMOTE_URL=wss://<worker-host>:8100/v1/dictation/stream \
+OMNIGENT_DICTATION_WORKER_TOKEN="$OMNIGENT_DICTATION_WORKER_TOKEN" \
+OMNIGENT_DICTATION_REMOTE_CA_FILE=/etc/omnigent/private-ca.crt \
 omnigent server ...
 ```
+
+Plaintext `ws://` remains convenient for `localhost`, `127.0.0.0/8`, and
+`::1`. A non-loopback plaintext URL is rejected unless
+`OMNIGENT_DICTATION_ALLOW_INSECURE_REMOTE=1` is explicitly set; use that only
+inside a network whose confidentiality and integrity are provided elsewhere.
+The worker still authenticates plaintext connections with the shared token.
+
+Worker probes:
+
+- `GET /health` is public liveness and returns immediately, including during
+  model loading.
+- `GET /ready` requires `Authorization: Bearer <worker token>`. Model warmup
+  starts asynchronously at worker startup; readiness returns `503` with only
+  `warming` or `failed` until the engine is usable, without model paths or
+  exception details.
+
+Use `curl -f http://127.0.0.1:8100/health` for liveness and
+`curl -f -H "Authorization: Bearer $OMNIGENT_DICTATION_WORKER_TOKEN"
+https://worker.example:8100/ready` for readiness (add `--cacert` for a private
+CA). The main server exposes authenticated `GET /v1/dictation/status` for
+stable engine, capacity, limit, remote transport, token-presence, fallback,
+reason, and remediation diagnostics. It never returns tokens, URL credentials,
+query strings, filesystem paths, or exception text.
 
 `RemoteDictationEngine` registers by name like every other engine (no changes
 to the route, protocol, or selection logic). `_RemoteStream` bridges the
@@ -168,6 +205,9 @@ Fallback is per take: if the worker is unreachable and local models are
 installed, a lazily-built local sherpa engine serves the take instead (its
 weights cost no RAM until the worker actually goes down); each new take
 retries the worker first.
+
+The relay uses the `websockets` 14 client API (`additional_headers` for the
+bearer token and `SSLContext` for TLS), so the package minimum is 14.
 
 Client timeouts (`web/src/lib/dictation.ts`) are widened to exceed the
 worker's cold-load budget (`_REMOTE_READY_TIMEOUT_S` / `_REMOTE_STOP_TIMEOUT_S`
@@ -187,6 +227,11 @@ Availability rides the existing boot-time capability probe —
 `dictation_available` on **`GET /v1/info`** — rather than a dedicated
 endpoint; the UI needs one boolean, once per page load.
 
+Authenticated operators can query **`GET /v1/dictation/status`** for
+actionable, sanitized diagnostics. This endpoint follows the main server's
+identity auth policy and is not consumed by the browser settings UI in this
+phase.
+
 - **`WS /v1/dictation/stream`** — wire protocol (documented in the module
   docstring, mirroring `terminal_attach.py`):
   - **Client → server, binary frames**: raw 16 kHz mono s16le PCM.
@@ -205,6 +250,10 @@ endpoint; the UI needs one boolean, once per page load.
     - `{"type": "error", "message": ...}` — fatal; server closes.
 
 The route holds no session state; a connection is one dictation take.
+Binary frame size and take duration are bounded by the configuration above.
+OpenTelemetry exports low-cardinality counters/gauges/histograms for takes
+started/completed/rejected/active, audio bytes, model warmup, remote connection
+outcomes, and local fallback use under `omnigent.server.dictation.*`.
 
 ## Web
 

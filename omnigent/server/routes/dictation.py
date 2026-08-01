@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import time
@@ -61,21 +62,34 @@ from collections.abc import Callable
 from typing import Final
 
 import anyio
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketException
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+)
 from starlette import status
 
 from omnigent.server.auth import AuthProvider
 from omnigent.server.dictation import (
     DictationEngine,
     DictationStreamHandle,
+    engine_status,
     get_engine,
+    max_frame_bytes,
     max_streams,
+    max_take_seconds,
 )
+from omnigent.server.dictation_metrics import metrics
 
 _logger = logging.getLogger(__name__)
 
 _WS_CLOSE_TRY_AGAIN_LATER: Final[int] = 1013
 _WS_CLOSE_INTERNAL_ERROR: Final[int] = 1011
+_WS_CLOSE_MESSAGE_TOO_BIG: Final[int] = 1009
+_WS_CLOSE_POLICY_VIOLATION: Final[int] = 1008
 
 #: Minimum interval between partial-transcript pushes. Keeps the socket
 #: chatty enough for live text without a frame per audio chunk.
@@ -86,6 +100,7 @@ def create_dictation_router(
     *,
     auth_provider: AuthProvider | None = None,
     engine_provider: Callable[[], DictationEngine] | None = None,
+    shared_token: str | None = None,
 ) -> APIRouter:
     """Build the router carrying the dictation stream route.
 
@@ -103,12 +118,41 @@ def create_dictation_router(
     router = APIRouter()
     resolve_engine = engine_provider or get_engine
     # Router-scoped so each app (and each test app) gets its own cap.
-    slots = asyncio.Semaphore(max_streams())
+    stream_limit = max_streams()
+    slots = asyncio.Semaphore(stream_limit)
+    active_streams = 0
+
+    @router.get("/dictation/status")
+    async def dictation_status(request: Request) -> dict[str, object]:
+        """Return authenticated, sanitized operator diagnostics."""
+        if shared_token is not None and not _valid_http_bearer_token(request, shared_token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
+            )
+        if auth_provider is not None and auth_provider.get_user_id(request) is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
+            )
+        diagnostics = engine_status()
+        diagnostics["capacity"] = {
+            "max_streams": stream_limit,
+            "active_streams": active_streams,
+            "available_streams": max(0, stream_limit - active_streams),
+        }
+        return diagnostics
 
     @router.websocket("/dictation/stream")
     async def dictation_stream(websocket: WebSocket) -> None:
         """Transcribe one dictation take (see module docstring)."""
+        nonlocal active_streams
+        if shared_token is not None and not _valid_bearer_token(websocket, shared_token):
+            metrics.rejected("authentication")
+            raise WebSocketException(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason="authentication required",
+            )
         if auth_provider is not None and auth_provider.get_user_id(websocket) is None:
+            metrics.rejected("authentication")
             raise WebSocketException(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason="authentication required",
@@ -116,6 +160,7 @@ def create_dictation_router(
         await websocket.accept()
 
         if slots.locked():
+            metrics.rejected("capacity")
             await websocket.close(
                 code=_WS_CLOSE_TRY_AGAIN_LATER,
                 reason="dictation is at capacity; try again shortly",
@@ -123,18 +168,36 @@ def create_dictation_router(
             return
 
         async with slots:
+            active_streams += 1
+            metrics.started()
+            outcome = "disconnected"
             # Engine construction loads model weights — seconds on first
             # use. Run it off-loop; later takes reuse the shared engine.
             try:
                 engine = await asyncio.to_thread(resolve_engine)
-                handle: DictationStreamHandle = await asyncio.to_thread(engine.create_stream)
+                create_task = asyncio.create_task(asyncio.to_thread(engine.create_stream))
+                try:
+                    handle: DictationStreamHandle = await asyncio.shield(create_task)
+                except asyncio.CancelledError:
+                    # The worker thread cannot be cancelled. Recover and close
+                    # its result so a remote stream never leaks a worker slot.
+                    handle = await create_task
+                    await asyncio.to_thread(handle.close)
+                    raise
+            except asyncio.CancelledError:
+                metrics.completed("cancelled")
+                active_streams -= 1
+                raise
             except Exception:
+                outcome = "engine_unavailable"
                 _logger.exception("dictation engine failed to initialize")
                 with contextlib.suppress(RuntimeError):
                     await websocket.send_text(
                         json.dumps({"type": "error", "message": "dictation engine unavailable"})
                     )
                     await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
+                metrics.completed(outcome)
+                active_streams -= 1
                 return
             # Release the take on every exit — normal stop, abrupt browser
             # disconnect, or a crash mid-send. For the in-process engines
@@ -142,7 +205,11 @@ def create_dictation_router(
             # close on the way out is enough.
             try:
                 await websocket.send_text(json.dumps({"type": "ready"}))
-                await _pump_dictation(websocket, handle)
+                try:
+                    outcome = await _pump_dictation(websocket, handle)
+                except asyncio.CancelledError:
+                    outcome = "cancelled"
+                    raise
             finally:
                 # An abrupt disconnect tears the ASGI task down via
                 # cancellation, which would cancel this close mid-await and
@@ -159,11 +226,27 @@ def create_dictation_router(
                         # engine, so fall back to a direct call on the loop.
                         with contextlib.suppress(Exception):
                             handle.close()
+                metrics.completed(outcome)
+                active_streams -= 1
 
     return router
 
 
-async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -> None:
+def _valid_bearer_token(websocket: WebSocket, expected: str) -> bool:
+    return _valid_authorization(websocket.headers.get("authorization", ""), expected)
+
+
+def _valid_http_bearer_token(request: Request, expected: str) -> bool:
+    return _valid_authorization(request.headers.get("authorization", ""), expected)
+
+
+def _valid_authorization(authorization: str, expected: str) -> bool:
+    prefix = "Bearer "
+    provided = authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+    return bool(expected) and hmac.compare_digest(provided.encode(), expected.encode())
+
+
+async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -> str:
     """Shuttle audio in and transcript events out until stop/disconnect.
 
     :param websocket: The accepted browser-facing WebSocket.
@@ -171,14 +254,52 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
     """
     last_partial_sent = ""
     last_partial_at = 0.0
+    started_at = time.monotonic()
+    audio_bytes = 0
     try:
         while True:
-            message = await websocket.receive()
+            remaining = max_take_seconds() - (time.monotonic() - started_at)
+            if remaining <= 0:
+                metrics.rejected("take_too_long")
+                await websocket.close(
+                    code=_WS_CLOSE_POLICY_VIOLATION,
+                    reason="dictation take exceeds configured duration",
+                )
+                return "duration_limit"
+            try:
+                async with asyncio.timeout(remaining):
+                    message = await websocket.receive()
+            except TimeoutError:
+                metrics.rejected("take_too_long")
+                await websocket.close(
+                    code=_WS_CLOSE_POLICY_VIOLATION,
+                    reason="dictation take exceeds configured duration",
+                )
+                return "duration_limit"
             if message.get("type") == "websocket.disconnect":
-                return
+                return "disconnected"
 
             data = message.get("bytes")
             if data is not None:
+                if len(data) > max_frame_bytes():
+                    metrics.rejected("frame_too_large")
+                    await websocket.close(
+                        code=_WS_CLOSE_MESSAGE_TOO_BIG,
+                        reason="dictation audio frame exceeds configured limit",
+                    )
+                    return "frame_limit"
+                audio_bytes += len(data)
+                metrics.audio_bytes(len(data))
+                if (
+                    time.monotonic() - started_at > max_take_seconds()
+                    or audio_bytes / 32000 > max_take_seconds()
+                ):
+                    metrics.rejected("take_too_long")
+                    await websocket.close(
+                        code=_WS_CLOSE_POLICY_VIOLATION,
+                        reason="dictation take exceeds configured duration",
+                    )
+                    return "duration_limit"
                 update = await asyncio.to_thread(handle.feed_pcm16, data)
                 if update.finalized:
                     await websocket.send_text(
@@ -209,12 +330,13 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
                 tail = await asyncio.to_thread(handle.finish)
                 await websocket.send_text(json.dumps({"type": "stopped", "text": tail}))
                 await websocket.close()
-                return
+                return "stopped"
             # Unknown control messages are ignored for forward compat.
     except WebSocketDisconnect:
-        return
+        return "disconnected"
     except Exception:
         _logger.exception("dictation stream failed")
         with contextlib.suppress(RuntimeError):
             await websocket.send_text(json.dumps({"type": "error", "message": "dictation failed"}))
             await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
+        return "failed"

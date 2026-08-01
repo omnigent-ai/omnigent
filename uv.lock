@@ -3155,7 +3155,7 @@ requires-dist = [
     { name = "tomlkit", specifier = ">=0.12,<1" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
-    { name = "websockets", specifier = ">=10.4,<15" },
+    { name = "websockets", specifier = ">=14,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
 provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "memory", "slack", "databricks", "dev"]
