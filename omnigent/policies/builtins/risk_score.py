@@ -235,9 +235,11 @@ def _current_score(event: PolicyEvent, cfg: _RiskCfg) -> int:
     :returns: The effective integer score (≥ the actor's offset).
     """
     state = event.get("session_state") or {}
-    accumulated = int(state.get(cfg.state_key, 0))
-    actor = (event.get("context") or {}).get("actor") or {}
-    run_as = actor.get("run_as") or ""
+    accumulated_value = state.get(cfg.state_key, 0)
+    accumulated = int(accumulated_value) if isinstance(accumulated_value, int | float | str) else 0
+    context = event.get("context")
+    actor = context.get("actor") if context is not None else None
+    run_as = actor.get("run_as", "") if actor is not None else ""
     actor_offset = cfg.initial_scores_by_actor.get(run_as, 0)
     return actor_offset + accumulated
 

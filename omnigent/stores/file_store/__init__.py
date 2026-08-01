@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
 
 from omnigent.entities import PagedList, StoredFile
@@ -77,30 +78,26 @@ class FileStore(ABC):
     @abstractmethod
     def list(
         self,
+        session_id: str,
         limit: int = 20,
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-        session_id: str | None = None,
         include_unscoped: bool = False,
     ) -> PagedList[StoredFile]:
         """
-        List files with cursor-based pagination.
+        List a session's files with cursor-based pagination.
 
-        When ``session_id`` is set, only files owned by that
-        session are returned. When ``None``, all files are listed
-        (legacy global behavior).
+        Always scoped to a session — there is no cross-session
+        listing (files are only ever surfaced per session).
 
+        :param session_id: Owning session whose files to list.
         :param limit: Maximum number of files to return.
         :param after: Cursor file ID for forward pagination.
         :param before: Cursor file ID for backward pagination.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param session_id: Filter to files owned by this session.
-            ``None`` lists all files.
-        :param include_unscoped: When ``True`` **and** ``session_id``
-            is set, also return files with ``session_id IS NULL``
-            (global/unscoped files). Ignored when ``session_id``
-            is ``None``.
+        :param include_unscoped: When ``True``, also return files
+            with ``session_id IS NULL`` (global/unscoped files).
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         ...
@@ -126,7 +123,7 @@ class FileStore(ABC):
         ...
 
     @abstractmethod
-    def delete_all_for_session(self, session_id: str) -> list[str]:
+    def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
         """
         Delete all file metadata for a session.
 

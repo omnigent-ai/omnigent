@@ -12,7 +12,7 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
+import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
   onFileSelect: (path: string) => void;
@@ -360,6 +361,18 @@ export function FilesPanel({
   // Highlight the filters toggle when include/exclude carry a value.
   const treeFiltersActive = treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
 
+  // Persist/restore the list's scroll position across conversation and view
+  // switches. Keyed per conversation + view (Changed vs All) since the two
+  // lists have independent heights. Readiness is data presence rather than
+  // `isLoading` — the files queries are disabled (not loading) until the
+  // environment query resolves.
+  const scrollRef = useRef<HTMLElement>(null);
+  const scrollKey = conversationId
+    ? `files:${conversationId}:${flatView ? "changed" : "all"}`
+    : null;
+  const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
+  const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
+
   return (
     <div
       className={cn(
@@ -492,11 +505,13 @@ export function FilesPanel({
         </div>
       )}
       <section
+        ref={scrollRef}
         className={cn(
           "overflow-y-auto px-2 pb-2",
           flatView ? "pt-1" : "pt-2",
           fillHeight ? "min-h-0 flex-1" : "max-h-72",
         )}
+        onScroll={handleScroll}
       >
         {flatView ? (
           <FlatFileList

@@ -75,6 +75,8 @@ def _make_policy(
     read_roots: list[Path] | None = None,
     egress_relay_port: int | None = None,
     egress_socket_path: str | None = None,
+    cwd_hidden_scan_recursive: bool | None = None,
+    mask_paths: list[Path] | None = None,
 ) -> SandboxPolicy:
     """
     Build a :class:`SandboxPolicy` directly without going through the
@@ -98,20 +100,30 @@ def _make_policy(
         Unix-socket allow rules.
     :param egress_socket_path: Filesystem path of the parent-side
         Unix socket the relay forwards to.
+    :param cwd_hidden_scan_recursive: Override for the recursive-walk
+        flag; ``None`` keeps the dataclass default (``False``,
+        top-level only).
+    :param mask_paths: Explicit absolute paths to mask; ``None`` keeps
+        the dataclass default (no explicit masks).
     :returns: A populated :class:`SandboxPolicy`.
     """
     del cwd
-    return SandboxPolicy(
-        backend_type="darwin_seatbelt",
-        active=True,
-        read_roots=read_roots,
-        write_roots=write_roots if write_roots is not None else [],
-        write_files=[],
-        allow_network=allow_network,
-        cwd_allow_hidden=allow_hidden,
-        egress_relay_port=egress_relay_port,
-        egress_socket_path=egress_socket_path,
-    )
+    kwargs: dict[str, object] = {
+        "backend_type": "darwin_seatbelt",
+        "active": True,
+        "read_roots": read_roots,
+        "write_roots": write_roots if write_roots is not None else [],
+        "write_files": [],
+        "allow_network": allow_network,
+        "cwd_allow_hidden": allow_hidden,
+        "egress_relay_port": egress_relay_port,
+        "egress_socket_path": egress_socket_path,
+    }
+    if cwd_hidden_scan_recursive is not None:
+        kwargs["cwd_hidden_scan_recursive"] = cwd_hidden_scan_recursive
+    if mask_paths is not None:
+        kwargs["mask_paths"] = mask_paths
+    return SandboxPolicy(**kwargs)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +769,73 @@ def test_profile_dotfile_mask_uses_deny_rules(tmp_path: Path) -> None:
     )
 
 
+def test_profile_dotfile_mask_non_recursive_default(tmp_path: Path) -> None:
+    """
+    With the production default (``cwd_hidden_scan_recursive=False``)
+    the SBPL profile denies top-level dotfiles but does NOT emit a
+    deny for a dotfile nested below the top level.
+    """
+    (tmp_path / ".env").write_text("TOP=1")
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=1")
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"])
+    profile = _build_profile(policy, cwd)
+
+    top_deny = f'(deny file-read* file-write* (literal "{cwd / ".env"}"))'
+    nested_deny = f'(deny file-read* file-write* (literal "{cwd / "services" / "api" / ".env"}"))'
+    assert top_deny in profile, "Top-level .env must still be denied in non-recursive mode."
+    assert nested_deny not in profile, (
+        "Non-recursive default must not descend into subdirectories; "
+        "nested .env must stay visible."
+    )
+
+
+def test_profile_dotfile_mask_recursive_opt_in(tmp_path: Path) -> None:
+    """
+    Opting into ``cwd_hidden_scan_recursive=True`` restores the deep
+    walk: a nested dotfile gets its own literal deny.
+    """
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=1")
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"], cwd_hidden_scan_recursive=True)
+    profile = _build_profile(policy, cwd)
+
+    nested_deny = f'(deny file-read* file-write* (literal "{cwd / "services" / "api" / ".env"}"))'
+    assert nested_deny in profile, "Recursive opt-in should deny the nested .env."
+
+
+def test_profile_mask_paths_denies_explicit_file_and_dir(tmp_path: Path) -> None:
+    """
+    Explicit ``mask_paths`` entries produce denies regardless of name
+    or depth: a plain file gets a ``(literal ...)`` deny and a
+    directory gets a ``(subpath ...)`` deny.
+    """
+    secret_file = tmp_path / "config" / "production.key"
+    secret_file.parent.mkdir(parents=True)
+    secret_file.write_text("KEY")
+    secret_dir = tmp_path / "private"
+    secret_dir.mkdir()
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(
+        tmp_path,
+        allow_hidden=[".venv"],
+        mask_paths=[secret_file.resolve(strict=False), secret_dir.resolve(strict=False)],
+    )
+    profile = _build_profile(policy, cwd)
+
+    file_deny = f'(deny file-read* file-write* (literal "{secret_file.resolve(strict=False)}"))'
+    dir_deny = f'(deny file-read* file-write* (subpath "{secret_dir.resolve(strict=False)}"))'
+    assert file_deny in profile, "Explicit mask_paths file must get a literal deny."
+    assert dir_deny in profile, "Explicit mask_paths directory must get a subpath deny."
+
+
 # ---------------------------------------------------------------------------
 # Ancestor traversal (realpath() / lstat() walks)
 #
@@ -1150,6 +1229,77 @@ def test_helper_boots_when_interpreter_lives_under_home_uv_layout(
         _shutil.rmtree(fake_install_root, ignore_errors=True)
 
 
+def test_ensure_executable_visible_two_hop_proxy_finds_cpython_install_root(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression for uv tool-install two-hop symlink layout (issue #3237).
+
+    ``uv tool install omnigent`` creates:
+      ~/.local/share/uv/tools/omnigent/bin/python  →  (proxy symlink)
+          ~/.local/share/uv/python/cpython-3.12.X-.../bin/python3.12
+
+    The LITERAL path grandparent (``tools/omnigent/``) has no CPython
+    ``lib/`` markers.  The RESOLVED target grandparent
+    (``cpython-3.12.X-.../``) does.  Pre-fix, ``_interpreter_install_root``
+    was called only on the literal path, returned ``None``, and
+    ``_add_topmost`` raised OSError.  Post-fix, the resolved path is retried
+    as a fallback, and the narrow CPython install root is returned.
+
+    This test uses ``_ensure_executable_visible`` directly (not the full
+    wrap) so we can construct a fully fake three-layer layout under
+    ``tmp_path`` without touching the real ``sys.executable``.
+    """
+    import uuid
+
+    home = Path.home()
+
+    # Layer 1 — CPython install root (the real target).  Lives under HOME
+    # so topmost ancestor is in _UNSAFE_WIDEN_ANCESTORS and the narrow-
+    # fallback path is exercised.
+    cpython_root = home / f".omnigent-test-cpython-{uuid.uuid4().hex}"
+    (cpython_root / "bin").mkdir(parents=True)
+    py_major_minor = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    (cpython_root / "lib" / py_major_minor).mkdir(parents=True)
+
+    # Layer 2 — tool-venv proxy root (no CPython markers — this is the
+    # layout that causes the literal-path check to return None).
+    tool_root = home / f".omnigent-test-tool-{uuid.uuid4().hex}"
+    (tool_root / "bin").mkdir(parents=True)
+    # Deliberately no lib/python* here.
+
+    import shutil as _shutil
+
+    try:
+        # Fake interpreter binary in the CPython install root.
+        cpython_exe = cpython_root / "bin" / "python3"
+        cpython_exe.touch()
+
+        # Proxy symlink: tool_root/bin/python → cpython_root/bin/python3
+        tool_exe = tool_root / "bin" / "python"
+        tool_exe.symlink_to(cpython_exe)
+
+        cwd = tmp_path
+        argv = [str(tool_exe), "-c", "pass"]
+        extras = _ensure_executable_visible(argv, cwd.resolve(strict=False))
+
+        cpython_resolved = cpython_root.resolve(strict=False)
+        assert cpython_resolved in extras, (
+            f"Expected the CPython install root {cpython_resolved!r} in extras "
+            f"({extras!r}). The two-hop proxy fallback did not resolve to the "
+            "real CPython install root; without this grant the kernel EPERMs "
+            "the exec inside the sandbox."
+        )
+        for extra in extras:
+            assert str(extra) not in _UNSAFE_WIDEN_ANCESTORS, (
+                f"_ensure_executable_visible granted an unsafe broad ancestor "
+                f"{extra!r} instead of the narrow CPython install root."
+            )
+    finally:
+        _shutil.rmtree(cpython_root, ignore_errors=True)
+        _shutil.rmtree(tool_root, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Security hardening regression tests
 #
@@ -1498,7 +1648,7 @@ def test_ensure_executable_visible_still_raises_for_non_python_home_layouts(
             _ensure_executable_visible(argv, cwd)
 
     msg = str(exc.value)
-    assert "Auto-detection of a narrow Python install root" in msg, (
+    assert "Auto-detection of a narrow CPython install root" in msg, (
         f"OSError should explain that the install-root fallback was "
         f"attempted; got message: {msg!r}. Without this hint, an "
         "operator hitting a near-miss layout (e.g. they forgot to "
@@ -2081,6 +2231,146 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
         ".env masked more than once — the dedup that skips "
         "read_paths roots at-or-under cwd regressed."
     )
+
+
+def test_write_paths_dotfile_masking_masks_external_write_root(tmp_path: Path) -> None:
+    """
+    A ``write_paths`` root outside cwd is dotfile-masked just like a
+    ``read_paths`` root: its top-level ``.env`` gets a ``(literal ...)``
+    deny and its ``.aws/`` a ``(subpath ...)`` deny, even though the
+    grant is for writing. Without scanning write roots the helper could
+    read (and clobber) secrets in a writable directory outside cwd.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    (external / ".aws").mkdir()
+    (external / ".aws" / "credentials").write_text("[default]")
+    (external / "notes.txt").write_text("ok")  # non-dotfile stays visible
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+
+    policy = _make_policy(
+        cwd,
+        write_roots=[external.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    ext = external.resolve(strict=False)
+    env_deny = f'(deny file-read* file-write* (literal "{ext / ".env"}"))'
+    aws_deny = f'(deny file-read* file-write* (subpath "{ext / ".aws"}"))'
+    notes_deny = f'(deny file-read* file-write* (literal "{ext / "notes.txt"}"))'
+    assert env_deny in profile, (
+        ".env under a write_paths root must be masked — write grants are scanned too."
+    )
+    assert aws_deny in profile, ".aws/ under a write_paths root must get a (subpath ...) deny."
+    assert notes_deny not in profile, "Non-dotfiles under a write_paths root must stay visible."
+
+
+def test_read_write_overlap_masked_once(tmp_path: Path) -> None:
+    """
+    A path granted as BOTH a read and a write root is walked once —
+    ``merge_scan_roots`` dedupes the grant lists, so its ``.env`` deny
+    lands a single time, not once per grant list.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    ext = external.resolve(strict=False)
+
+    policy = _make_policy(
+        cwd,
+        read_roots=[ext],
+        write_roots=[ext],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    env_deny = f'(deny file-read* file-write* (literal "{ext / ".env"}"))'
+    assert profile.count(env_deny) == 1, (
+        f"Expected a single .env deny across overlapping read+write grants, "
+        f"got {profile.count(env_deny)}."
+    )
+
+
+def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` grant nested below a ``read_paths``
+    root must still have its top-level dotfiles denied in the default
+    (non-recursive) mode. A non-recursive walk of the parent masks only
+    the parent's immediate children, so the nested grant must be walked
+    in its own right rather than dropped as "subsumed".
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    (a / "deep" / "nested").mkdir(parents=True)
+    (a / ".env").write_text("SECRET_A")
+    (a / "deep" / "nested" / ".env").write_text("SECRET_NESTED")
+
+    policy = _make_policy(
+        cwd,
+        read_roots=[a.resolve(strict=False)],
+        write_roots=[(a / "deep" / "nested").resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    top_env = f'(deny file-read* file-write* (literal "{a.resolve(strict=False) / ".env"}"))'
+    nested_env = (
+        "(deny file-read* file-write* (literal "
+        f'"{(a / "deep" / "nested").resolve(strict=False) / ".env"}"))'
+    )
+    assert top_env in profile, "Top-level .env of the read_paths root must be denied."
+    assert nested_env in profile, (
+        "Nested write_paths grant's .env must be denied in non-recursive mode; "
+        "dropping the nested root as subsumed would leak it."
+    )
+
+
+def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
+    """
+    Regression: a framework write root added via
+    ``with_additional_write_roots`` (the per-helper scratch tmpdir) is
+    excluded from the dotfile scan, so the egress ``.egress.sock`` in it
+    gets NO deny rule. Denying that socket cut off the relay endpoint and
+    reset every egress connection. A genuine user write root is still
+    scanned.
+    """
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    scratch = tmp_path / "scratch"  # framework runtime dir
+    scratch.mkdir()
+    (scratch / ".egress.sock").write_text("")  # dotfile the sandbox needs
+    user_root = tmp_path / "shared"  # real user write grant
+    user_root.mkdir()
+    (user_root / ".env").write_text("SECRET=1")
+
+    policy = _make_policy(
+        cwd,
+        write_roots=[user_root.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    # Mirror the real launch: the parent folds the scratch tmpdir in as a
+    # framework write root just before building the profile.
+    policy = with_additional_write_roots(policy, [scratch])
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    sock = scratch.resolve(strict=False) / ".egress.sock"
+    sock_deny = f'(deny file-read* file-write* (literal "{sock}"))'
+    assert sock_deny not in profile, (
+        "The framework scratch tmpdir must be excluded from the dotfile scan; "
+        "denying .egress.sock breaks the egress relay."
+    )
+    user_env = (
+        f'(deny file-read* file-write* (literal "{user_root.resolve(strict=False) / ".env"}"))'
+    )
+    assert user_env in profile, "A genuine user write root must still have its dotfiles denied."
 
 
 # ---------------------------------------------------------------------------

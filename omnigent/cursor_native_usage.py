@@ -71,7 +71,7 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 def _coerce_int(value: object) -> int:
     """Coerce a hook token field to a non-negative int (0 on anything odd)."""
     try:
-        out = int(value)  # type: ignore[arg-type]
+        out = int(value)
     except (TypeError, ValueError):
         return 0
     return out if out >= 0 else 0

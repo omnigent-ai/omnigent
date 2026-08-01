@@ -71,24 +71,21 @@ jobs:
         with:
           enable-cache: false
 
-      - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "20"
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
 
       # 1. Build the web UI FIRST into the package tree, clean. Ordering is
       #    load-bearing: the wheel packages on-disk files, so the bundle must
       #    exist before `uv build`. `rm -rf` backstops Vite's emptyOutDir
-      #    against stale bundles; `npm ci` installs the exact locked deps.
-      #    `--legacy-peer-deps` matches how web's lockfile is generated and
-      #    validated everywhere else (lint, e2e-ui, web-tests, the regen
-      #    jobs) — required for the React 19 peer conflict; without it `npm ci`
-      #    rejects the lockfile ("Missing: yaml@1.10.3 from lock file").
+      #    against stale bundles; `pnpm install --frozen-lockfile --filter web`
+      #    installs the exact locked deps for the web workspace package.
       - name: Build web UI (clean, fresh)
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           rm -rf omnigent/server/static/web-ui
-          npm --prefix web ci --legacy-peer-deps
-          npm --prefix web run build # Vite outDir -> omnigent/server/static/web-ui
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build # Vite outDir -> omnigent/server/static/web-ui
 
       # 2. Tag-driven: the tag must match the version in all three pyprojects
       #    and the core package's `==` sibling-SDK pins, so the lockstep

@@ -2,6 +2,8 @@
 build/
 dist/
 node_modules/
+.pnpm-store/
+.pnpm-debug.log*
 reviews/
 
 # Generated artifact; never committed.

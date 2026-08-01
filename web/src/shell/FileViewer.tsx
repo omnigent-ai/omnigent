@@ -89,11 +89,13 @@ import {
   type SaveStatus,
   detectLang,
   isImageFile,
+  isModelFile,
   isNotebookPath,
   isPdfFile,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
@@ -627,9 +629,16 @@ function FileViewerBody({
   // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
   const isPdf = isPdfFile(path, fileQuery.data?.content_type);
+  // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
+  // they have no meaningful source/diff/preview text representation, so diff is
+  // suppressed and they always resolve to the (viewer-owning) source surface.
+  const isModel = isModelFile(path, fileQuery.data?.content_type);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
-    !isImage && !isPdf && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+    !isImage &&
+    !isPdf &&
+    !isModel &&
+    (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
@@ -707,6 +716,18 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+  // Persist where the reader was in the content area (markdown source, plain
+  // text). The view mode is part of the key because each mode renders a
+  // different height, so sharing one offset across modes would drop the reader
+  // at an unrelated place after a toggle; the namespace is separate from the
+  // `viewer:` keys Monaco writes for its own internal scroller.
+  const contentScrollKey =
+    conversationId && path ? `viewer-content:${conversationId}:${viewMode}:${path}` : null;
+  const handleContentScroll = useScrollRestore(
+    contentAreaRef,
+    contentScrollKey,
+    fileQuery.data !== undefined,
+  );
   // Measure the content area so the split toggle can hide when there isn't
   // enough room for side-by-side. Only observe while the diff is shown — the
   // ref element only exists then, and it's the only mode that cares.
@@ -766,7 +787,7 @@ function FileViewerBody({
   // rendered as a single dropdown (a "picker" button inline, a submenu when
   // collapsed) rather than one button per choice. Markdown's view-mode picker
   // (Preview / Edit / Source) uses this so it occupies one toolbar slot.
-  type ToolbarOption = {
+  interface ToolbarOption {
     key: string;
     label: string;
     tooltip?: string;
@@ -780,8 +801,8 @@ function FileViewerBody({
     /** Suppress the active check mark — for toggles whose icon already reflects
      * state (e.g. the whitespace eye flips open/closed). */
     noActiveCheck?: boolean;
-  };
-  type ToolbarAction = {
+  }
+  interface ToolbarAction {
     key: string;
     /** Accessible name for the inline icon button. */
     label: string;
@@ -797,7 +818,7 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
-  };
+  }
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
@@ -1320,7 +1341,11 @@ function FileViewerBody({
       </div>
 
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
-        <div ref={contentAreaRef} className="flex-1 overflow-y-auto min-w-0">
+        <div
+          ref={contentAreaRef}
+          onScroll={handleContentScroll}
+          className="flex-1 overflow-y-auto min-w-0"
+        >
           {isDeletedFile && viewMode !== "diff" ? (
             <div className="flex flex-col items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
               <Trash2Icon className="size-5 opacity-40" />
@@ -1460,8 +1485,8 @@ function FileViewerBody({
       </div>
       <Dialog
         open={pendingAction !== null}
-        onOpenChange={(open) => {
-          if (!open) setPendingAction(null);
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setPendingAction(null);
         }}
       >
         <DialogContent showCloseButton={false}>

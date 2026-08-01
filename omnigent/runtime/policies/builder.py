@@ -194,7 +194,7 @@ def _resolve_session_owner_cached(
     :returns: The owner user id, or ``None`` when the session has no
         owner grant (single-user mode).
     """
-    owner = _SESSION_OWNER_CACHE.get(conversation_id)
+    owner: str | None = _SESSION_OWNER_CACHE.get(conversation_id)
     if owner is not None:
         return owner
     owner = conversation_store.get_session_owner(conversation_id)
@@ -271,6 +271,8 @@ def any_policies_apply(
     if spec.guardrails and spec.guardrails.policies:
         return True
     if default_policies:
+        return True
+    if _load_default_policy_specs(policy_store):
         return True
     # Session policies are LRU-cached per (workspace_id, conversation_id) —
     # this is a cache hit on any call after the first for this session.
@@ -1062,7 +1064,7 @@ def _load_default_policy_specs(
     from omnigent.db.db_models import current_workspace_id
 
     workspace_id = current_workspace_id()
-    cached = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
+    cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
     if cached is not None:
         return cached
     specs: list[PolicySpec] = []
@@ -1152,7 +1154,7 @@ def _load_session_policy_specs(
     from omnigent.db.db_models import current_workspace_id
 
     key = (current_workspace_id(), conversation_id)
-    cached = _SESSION_POLICY_SPECS_CACHE.get(key)
+    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(key)
     if cached is not None:
         return cached
     stored = policy_store.list_for_session(conversation_id)

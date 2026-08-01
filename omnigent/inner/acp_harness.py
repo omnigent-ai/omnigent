@@ -26,6 +26,8 @@ Env vars read at startup:
 - ``HARNESS_ACP_SEND_MODEL``: ``"1"`` to send the model in ``session/new``.
 - ``HARNESS_ACP_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
   back to ``caller_process`` + ``sandbox=none``.
+- ``HARNESS_ACP_PROMPT_TIMEOUT_S``: optional idle (time-without-progress) deadline in
+  seconds for a prompt turn (default 300); must be positive and finite or the child aborts.
 """
 
 from __future__ import annotations

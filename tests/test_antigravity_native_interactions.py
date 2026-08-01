@@ -708,3 +708,39 @@ def test_elicitation_id_is_deterministic_and_index_sensitive() -> None:
     assert a == b
     assert a != c
     assert a.startswith("elicit_agy_")
+
+
+# ---------------------------------------------------------------------------
+# TUI injector binding (runner-hosted reader)
+# ---------------------------------------------------------------------------
+
+
+def test_tui_injector_for_binds_an_explicit_bridge_dir(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The injector takes its bridge dir as an argument, not from the spawn env.
+
+    The reader runs INSIDE the runner process, which never carries
+    ``HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR`` — that variable is set only for the
+    harness subprocess. Resolving it from the env therefore failed every single
+    web approval with "... is required", leaving agy's own permission prompt open
+    in the pane while the backend step had already been answered.
+    """
+    import asyncio
+
+    import omnigent.antigravity_native_bridge as bridge_mod
+    from omnigent.antigravity_native_interactions import tui_injector_for
+
+    monkeypatch.delenv("HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR", raising=False)
+    calls: list[tuple[Any, tuple[str, ...]]] = []
+    monkeypatch.setattr(
+        bridge_mod,
+        "send_interaction_keys_via_tui",
+        lambda bridge_dir, *keys: calls.append((bridge_dir, keys)),
+    )
+
+    bridge_dir = tmp_path / "bridge"
+    asyncio.run(tui_injector_for(bridge_dir)(["1", "Enter"]))
+
+    assert calls == [(bridge_dir, ("1", "Enter"))]

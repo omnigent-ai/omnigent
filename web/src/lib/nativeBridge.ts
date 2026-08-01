@@ -59,6 +59,8 @@ interface NativeShellApi {
    * ignore it.
    */
   setBadgeCount: (count: number, activation?: BadgeActivation) => void;
+  /** Tell the shell which theme source the user selected. */
+  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
   // Optional: a shell older than this SPA may lack notification-click routing,
@@ -115,6 +117,8 @@ interface NativeShellApi {
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
 }
 
+export type ThemeSource = "light" | "dark" | "system";
+
 /** Footprints (CSS px) of the native floating bars, reported by the shell. */
 export interface NativeInsets {
   /** Server switcher pill height + its top padding. */
@@ -143,7 +147,14 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
-  /** Desktop auto-update bridge, absent on shells older than the updater work. */
+  /**
+   * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
+   * notifications are shell-owned (native corner overlay + Server menu); this
+   * bridge is used for update preferences (mode, auto-install) + check. The
+   * shell delivers it "banner-safe": status values that would trigger the
+   * in-page UpdateBanner (available/downloaded/error-security) are collapsed to
+   * idle, so the web never shows a (duplicate) banner. Absent on older shells.
+   */
   updates?: ElectronUpdateBridge;
   /** Current server origin + recent servers, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
@@ -272,6 +283,18 @@ function nativeApi(): NativeShellApi | undefined {
   const api = (window as unknown as { omnigentNative?: NativeShellApi }).omnigentNative;
   if (api?.kind === "ios" || api?.kind === "android" || api?.kind === "electron") return api;
   return electronApi();
+}
+
+function callSetColorScheme(scheme: ThemeSource): boolean {
+  const native = nativeApi();
+  if (!native?.setColorScheme) return false;
+  try {
+    native.setColorScheme(scheme);
+  } catch (err) {
+    console.warn("[nativeBridge] setColorScheme failed:", err);
+    return false;
+  }
+  return true;
 }
 
 /** True when running inside the Electron desktop shell. */
@@ -453,6 +476,15 @@ export function onNativeSidebarDrag(
  * tray notification: it makes that notification open a target and show
  * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
+/**
+ * Tell the native shell which theme source the user selected. The shell drives
+ * its own OS-level night mode so that native chrome and the WebView agree.
+ * No-op outside supported shells. Fire-and-forget.
+ */
+export function setThemeSource(themeSource: ThemeSource): void {
+  callSetColorScheme(themeSource);
+}
+
 export async function setBadgeCount(count: number, activation?: BadgeActivation): Promise<void> {
   const native = nativeApi();
   if (!native) return;

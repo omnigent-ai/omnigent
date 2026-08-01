@@ -7,6 +7,7 @@ import logging
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -25,11 +26,18 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -37,11 +45,15 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -49,6 +61,449 @@ from omnigent.runner.identity import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_handle_model_options_uses_host_claude_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch picker is resolved on the host that will start Claude."""
+    from omnigent import claude_native
+
+    monkeypatch.setattr(claude_native, "resolve_native_claude_config", lambda *, spec: None)
+    monkeypatch.setattr(
+        claude_native,
+        "claude_native_model_options",
+        lambda config: [
+            {
+                "id": "sonnet",
+                "model": "system.ai.claude-sonnet-4-6[1m]",
+                "displayName": "Sonnet 4.6",
+            }
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[
+            {
+                "id": "sonnet",
+                "model": "system.ai.claude-sonnet-4-6[1m]",
+                "displayName": "Sonnet 4.6",
+            }
+        ],
+    )
+
+
+async def test_handle_model_options_uses_codex_provider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Codex launch picker comes from the host's resolved provider catalog."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    def _fake_list_models_for_worker(spec: object, harness: str) -> ModelListing:
+        assert harness == "codex-native"
+        assert spec.executor.config["profile"] == "oss"
+        return ModelListing(
+            source="static",
+            verified=False,
+            models=(
+                ModelEntry(id="gpt-live-default", family="openai"),
+                ModelEntry(id="gpt-live-fast", family="openai"),
+            ),
+            note="test catalog",
+        )
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        _fake_list_models_for_worker,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model="gpt-live-fast",
+            profile="oss",
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[
+            {"id": "gpt-live-default", "displayName": "gpt-live-default"},
+            {"id": "gpt-live-fast", "displayName": "gpt-live-fast", "isDefault": True},
+        ],
+    )
+
+
+async def test_handle_model_options_does_not_invent_codex_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog entry is not a default unless Codex resolves it as one."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="static",
+            verified=False,
+            models=(ModelEntry(id="gpt-live", family="openai"),),
+            note="test catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [{"id": "gpt-live", "displayName": "gpt-live"}]
+
+
+async def test_handle_model_options_uses_databricks_catalog_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Databricks profile path labels its effective catalog default."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="gateway",
+            verified=True,
+            models=(
+                ModelEntry(id="databricks-gpt-default", family="openai"),
+                ModelEntry(id="databricks-gpt-fast", family="openai"),
+            ),
+            note="test catalog",
+        ),
+    )
+
+    def _fake_resolve_catalog_model(provider: str, *, family: str) -> SimpleNamespace:
+        assert provider == "databricks"
+        assert family == "openai"
+        return SimpleNamespace(model_id="databricks-gpt-default")
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        _fake_resolve_catalog_model,
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile="oss",
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {
+            "id": "databricks-gpt-default",
+            "displayName": "databricks-gpt-default",
+            "isDefault": True,
+        },
+        {"id": "databricks-gpt-fast", "displayName": "databricks-gpt-fast"},
+    ]
+
+
+async def test_handle_model_options_filters_direct_openai_through_codex_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct OpenAI availability is intersected with Codex compatibility."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=tuple(
+                ModelEntry(id=model_id, family="openai")
+                for model_id in (
+                    "coding-compatible",
+                    "audio-preview",
+                    "realtime-preview",
+                    "image-preview",
+                    "embedding-preview",
+                    "moderation-preview",
+                )
+            ),
+            note="test OpenAI catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="key",
+            family="openai",
+            base_url="https://api.openai.com",
+            detail="test OpenAI key",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+
+    async def _fake_codex_options() -> list[dict[str, object]]:
+        return [
+            {
+                "id": "coding-compatible",
+                "model": "coding-compatible",
+                "displayName": "Coding Compatible",
+                "isDefault": True,
+            },
+            {
+                "id": "coding-unavailable",
+                "model": "coding-unavailable",
+                "displayName": "Coding Unavailable",
+                "isDefault": False,
+            },
+        ]
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _fake_codex_options,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {
+            "id": "coding-compatible",
+            "displayName": "Coding Compatible",
+            "isDefault": True,
+        }
+    ]
+
+
+async def test_handle_model_options_tolerates_codex_discovery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery failures keep the implicit default without unsafe model rows."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(ModelEntry(id="unverified-model", family="openai"),),
+            note="test OpenAI catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="key",
+            family="openai",
+            base_url="https://api.openai.com",
+            detail="test OpenAI key",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+
+    async def _failed_codex_options() -> list[dict[str, object]]:
+        raise TimeoutError("test discovery timeout")
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _failed_codex_options,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[],
+    )
+
+
+async def test_handle_model_options_marks_only_first_codex_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed Codex catalogs cannot mark multiple picker rows as default."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    model_ids = ("coding-first", "coding-second")
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=tuple(ModelEntry(id=model_id, family="openai") for model_id in model_ids),
+            note="test OpenAI catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="key",
+            family="openai",
+            base_url="https://api.openai.com",
+            detail="test OpenAI key",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model=None,
+            profile=None,
+        ),
+    )
+
+    async def _multiple_codex_defaults() -> list[dict[str, object]]:
+        return [
+            {"model": model_id, "displayName": model_id, "isDefault": True}
+            for model_id in model_ids
+        ]
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _multiple_codex_defaults,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {"id": "coding-first", "displayName": "coding-first", "isDefault": True},
+        {"id": "coding-second", "displayName": "coding-second"},
+    ]
+
+
+async def test_handle_model_options_keeps_custom_gateway_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom gateway ids remain selectable without Codex alias filtering."""
+    from omnigent import codex_native_app_server
+    from omnigent.model_catalog import ModelEntry, ModelListing, ResolvedModelProvider
+
+    monkeypatch.setattr(
+        "omnigent.model_catalog.list_models_for_worker",
+        lambda spec, harness: ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(ModelEntry(id="gateway-coding-model", family="openai"),),
+            note="test gateway catalog",
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_model_provider",
+        lambda spec, harness: ResolvedModelProvider(
+            kind="gateway",
+            family="openai",
+            base_url="https://gateway.example/v1",
+            detail="test gateway",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "resolve_native_codex_launch",
+        lambda *, model: codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[],
+            model="gateway-coding-model",
+            profile=None,
+        ),
+    )
+
+    async def _unexpected_codex_options() -> list[dict[str, object]]:
+        raise AssertionError("custom gateways must not use the OpenAI compatibility filter")
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "discover_codex_model_options",
+        _unexpected_codex_options,
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="codex-native"),
+    )
+
+    assert result.models == [
+        {
+            "id": "gateway-coding-model",
+            "displayName": "gateway-coding-model",
+            "isDefault": True,
+        }
+    ]
+
+
+async def test_handle_model_options_rejects_unsupported_harness() -> None:
+    """Only launch paths with host-resolved model catalogs are accepted."""
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="cursor-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="failed",
+        error="model options are unsupported for harness 'cursor-native'",
+    )
 
 
 def _make_host_process() -> HostProcess:
@@ -92,6 +547,8 @@ async def test_handle_launch_spawns_subprocess(
     failed or the result frame construction is wrong.
     """
     host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
     workspace.mkdir()
 
@@ -141,6 +598,7 @@ async def test_handle_launch_spawns_subprocess(
     # Verify env vars passed to the subprocess.
     assert spawned_env.get("RUNNER_SERVER_URL") == "http://localhost:8000"
     assert spawned_env.get("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN") == "test_token_abc"
+    assert spawned_env.get(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR) == "host-bootstrap-bearer"
     assert spawned_env.get("OMNIGENT_RUNNER_WORKSPACE") == str(workspace)
 
     # Runners must get a clean /dev/null stdin, not the daemon's inherited fd:
@@ -188,7 +646,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
     not configured, with the structured error_code and a message that
-    names the harness, the host, and the `omnigent setup` fix.
+    names the harness, the host, and the `omni setup` fix.
 
     If this regresses, an unconfigured launch spawns a runner whose
     first turn dies inside the executor — the exact dead-session UX
@@ -221,7 +679,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
     # harness, the host, and the remediation command.
     assert "'codex'" in (result.error or "")
     assert "test-laptop" in (result.error or "")
-    assert "omnigent setup" in (result.error or "")
+    assert "omni setup" in (result.error or "")
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
@@ -233,7 +691,7 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
 ) -> None:
     """
     A native-Cursor refusal must name the ``cursor-agent`` installer and
-    login, not ``omnigent setup`` — which only configures the SDK ``cursor``
+    login, not ``omni setup`` — which only configures the SDK ``cursor``
     harness and never installs the ``cursor-agent`` CLI ``omni cursor`` boots.
 
     Here ``harness_setup_hint`` is the real function (only the readiness check
@@ -262,7 +720,7 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     assert "test-laptop" in message
     assert "cursor.com/install" in message
     assert "cursor-agent login" in message
-    assert "omnigent setup" not in message
+    assert "omni setup" not in message
     assert host._runners == {}
 
 
@@ -464,6 +922,102 @@ class _FakeTunnel:
         raise ConnectionError("test disconnect")
 
 
+class _ReadinessChangingTunnel(_FakeTunnel):
+    """Trigger one idle refresh before disconnecting the fake tunnel."""
+
+    def __init__(self) -> None:
+        """Initialize the frame log and receive counter."""
+        super().__init__()
+        self.recv_count = 0
+
+    async def recv(self) -> str:
+        """Simulate one idle interval followed by a disconnect."""
+        self.recv_count += 1
+        if self.recv_count == 1:
+            await asyncio.Future()
+        raise ConnectionError("test disconnect")
+
+
+async def test_live_host_refreshes_harness_readiness_without_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A setup completed after connect must replace the advertised readiness."""
+    readiness = iter(({"pi": False}, {"pi": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: harness == "pi",
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    hello = decode_host_frame(tunnel.sent[0])
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == {"pi": False}
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"pi": True}
+
+
+async def test_live_host_full_refresh_detects_auth_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full-refresh fallback catches readiness changes beyond binary installs."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+
+
+async def test_live_host_does_not_repeat_unchanged_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A periodic full refresh sends nothing when the readiness map is unchanged."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": "needs-auth"}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 1
+    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+
+
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -641,6 +1195,66 @@ async def test_watch_runner_silent_on_intentional_stop(
 
     # No runner_exited report and nothing parked for a reconnect —
     # either would mark a clean stop as a crash.
+    assert tunnel.sent == []
+    assert host._unreported_exits == {}
+
+
+async def test_watch_runner_silent_on_clean_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that exits cleanly (code 0) is NOT reported as a crash.
+
+    The runner-level idle reaper shuts an inactive runner down with a graceful
+    (exit-code-0) self-exit while it is still tracked in ``self._runners``
+    (unlike a ``host.stop_runner``, which pops the handle first). The watcher
+    must treat a zero exit code as a clean shutdown and send nothing — a false
+    ``host.runner_exited`` here would attach a scary "runner process exited"
+    error to a session the user only has to message to reactivate. A non-zero
+    exit is still a crash and is covered by
+    ``test_watch_runner_reports_unexpected_exit``.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that lives briefly, then exits 0 (graceful).
+
+        The initial sleep keeps ``poll()`` None at launch time so the launch
+        succeeds; the process then exits cleanly, mimicking an idle-reaper
+        shutdown while the handle is still tracked.
+
+        :param args: Command args (ignored).
+        :param kwargs: Popen kwargs from production, including log handles.
+        :returns: A live subprocess handle.
+        """
+        return original_popen(
+            ["sh", "-c", "sleep 0.2; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_clean",
+        binding_token="tok_clean",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+
+    # Let the watcher observe the clean exit and finish.
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    # A clean (code 0) exit is graceful, not a crash: no report, nothing parked.
     assert tunnel.sent == []
     assert host._unreported_exits == {}
 
@@ -1020,6 +1634,25 @@ def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> N
     assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
 
 
+def test_reap_orphans_is_noop_without_wnohang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows (no ``os.WNOHANG``) the reaper is a clean no-op, not a crash.
+
+    Windows has no child reparenting to a subreaper and no
+    ``waitpid(-1, WNOHANG)``; touching ``os.WNOHANG`` there raises
+    ``AttributeError``. The final drain runs unguarded in ``run``'s
+    ``finally``, so an unguarded sweep would crash shutdown. Simulate the
+    platform by deleting ``os.WNOHANG`` and assert a quiet ``0``.
+    """
+    import os
+
+    monkeypatch.delattr(os, "WNOHANG", raising=False)
+
+    host = _make_host_process()
+    assert host._reap_orphans_once() == 0
+
+
 def test_install_child_subreaper_is_safe_to_call() -> None:
     """``_install_child_subreaper`` never raises and reports a bool.
 
@@ -1321,6 +1954,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         binding_token="tok",
         workspace="/ws",
         parent_pid=42,
+        initial_auth_token="host-bootstrap-bearer",
     )
 
     # Process essentials + the locale family pass through.
@@ -1375,6 +2009,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["RUNNER_SERVER_URL"] == "http://server"
     assert env[RUNNER_ID_ENV_VAR] == "runner_abc"
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
+    assert env[RUNNER_DELEGATED_AUTH_ENV_VAR] == "1"
+    assert env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] == "host-bootstrap-bearer"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
 
@@ -1938,6 +2574,360 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     assert result.path == str(tmp_path / "scratch")
 
 
+# ── host.install_harness handler ────────────────────────
+
+
+def test_handle_install_harness_success_returns_refreshed_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A successful install returns ``ok`` and the recomputed readiness map.
+
+    The server flips the UI badge off this map, so the handler must run the
+    installer and then re-probe readiness, returning the fresh result.
+    """
+    import omnigent.host.connect as connect
+
+    # Not yet installed, so the handler runs the installer.
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
+    monkeypatch.setattr(
+        connect,
+        "configured_harness_map",
+        lambda: {"claude-native": True, "codex-native": "needs-auth"},
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i1", harness="claude")
+    )
+
+    assert isinstance(result, HostInstallHarnessResultFrame)
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.configured_harnesses == {"claude-native": True, "codex-native": "needs-auth"}
+
+
+def test_handle_install_harness_already_installed_skips_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An already-installed harness returns fresh readiness without running npm.
+
+    ``npm install -g`` re-resolves over the network and can take minutes even
+    when the binary is already present, so a re-request must short-circuit —
+    otherwise a user clicking Install on an installed harness waits pointlessly
+    (and can hit the request timeout).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: True)
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer ran despite the harness already being installed")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i0", harness="opencode")
+    )
+
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"opencode-native": True}
+
+
+def test_handle_install_harness_failure_surfaces_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed install returns ``failed`` with the installer's reason and no
+    readiness map (the server keeps its prior view).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(
+        connect,
+        "try_install_harness_cli",
+        lambda key: (False, "npm is not available on the host"),
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i2", harness="codex")
+    )
+
+    assert result.status == "failed"
+    assert result.error == "npm is not available on the host"
+    assert result.configured_harnesses is None
+
+
+def test_handle_install_harness_rejects_non_allowlisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-UI-installable harness is refused without invoking the installer.
+
+    Defence in depth: even if a stray frame reaches the daemon, a harness
+    whose installer is a ``curl | bash`` (e.g. hermes) must never run.
+    """
+    import omnigent.host.connect as connect
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer reached for a non-allowlisted harness")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i3", harness="hermes")
+    )
+
+    assert result.status == "failed"
+    assert result.error is not None and "hermes" in result.error
+    assert result.configured_harnesses is None
+
+
+def test_handle_store_secret_key_writes_and_returns_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key store-secret request calls the core and returns fresh readiness.
+
+    The handler is a thin wrapper: resolve family, call the non-interactive
+    core, then recompute readiness so the server flips the badge (yellow →
+    green) without a reconnect.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    calls: list[dict[str, object]] = []
+
+    def _store(**kwargs: object) -> StoreCredentialResult:
+        calls.append(kwargs)
+        return StoreCredentialResult(True, "anthropic", None)
+
+    monkeypatch.setattr(connect, "store_harness_credential", _store)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"claude-native": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c1",
+            harness="claude",
+            kind="key",
+            secret_value="sk-ant-x",
+            default_model="claude-sonnet-4-6",
+        )
+    )
+    assert isinstance(result, HostStoreSecretResultFrame)
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"claude-native": True}
+    # The core was called with the resolved family + the frame's fields.
+    assert calls == [
+        {
+            "family": "anthropic",
+            "kind": "key",
+            "secret": "sk-ant-x",
+            "base_url": None,
+            "default_model": "claude-sonnet-4-6",
+            "wire_api": None,
+        }
+    ]
+
+
+def test_handle_store_secret_pi_maps_to_anthropic_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi (which consumes both families) writes to its preferred anthropic family."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _store(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "anthropic", None)
+
+    monkeypatch.setattr(connect, "store_harness_credential", _store)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c2", harness="pi", kind="key", secret_value="sk-x")
+    )
+    assert result.status == "ok"
+    assert seen["family"] == "anthropic"
+
+
+def test_handle_store_secret_adopt_calls_adopt_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An adopt request references an env var via the adopt core."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential, StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _adopt(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "openai", None)
+
+    monkeypatch.setattr(connect, "adopt_env_credential", _adopt)
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
+        ],
+    )
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"codex-native": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c3", harness="codex", kind="adopt", env_var="OPENAI_API_KEY"
+        )
+    )
+    assert result.status == "ok"
+    assert seen == {"family": "openai", "env_var": "OPENAI_API_KEY"}
+
+
+def test_handle_store_secret_pi_adopt_uses_detected_family_not_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopting an OpenAI env var for pi writes it under the OPENAI family.
+
+    pi consumes both anthropic + openai, so the UI can offer $OPENAI_API_KEY as
+    adoptable for pi. The harness-derived family for pi is anthropic; adopting
+    under it would write an anthropic provider pointing at an OpenAI key
+    (mis-routed, fails at run time). The daemon must use the env var's OWN
+    detected family instead.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential, StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _adopt(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "openai", None)
+
+    monkeypatch.setattr(connect, "adopt_env_credential", _adopt)
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
+        ],
+    )
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c4", harness="pi", kind="adopt", env_var="OPENAI_API_KEY")
+    )
+    assert result.status == "ok"
+    # openai (the env var's family), NOT anthropic (pi's harness-derived default).
+    assert seen == {"family": "openai", "env_var": "OPENAI_API_KEY"}
+
+
+def test_handle_store_secret_adopt_refuses_undetected_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopt refuses an env var the host didn't detect, without writing.
+
+    The server is owner-authz'd but doesn't otherwise validate env_var, so the
+    handler must enforce the adopt boundary: only a var present in
+    detect_adoptable_credentials() may be adopted. Otherwise a caller could name
+    an arbitrary set env var (a DB password, an unrelated secret) and have it
+    persisted as a provider credential and sent to the vendor endpoint as auth.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential
+
+    def _must_not_write(**kwargs: object) -> object:
+        raise AssertionError("adopt core reached for an undetected env var")
+
+    monkeypatch.setattr(connect, "adopt_env_credential", _must_not_write)
+    # Detect surfaces only ANTHROPIC_API_KEY; the request names a different var.
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(
+                family="anthropic", source="$ANTHROPIC_API_KEY", env_var="ANTHROPIC_API_KEY"
+            )
+        ],
+    )
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c6", harness="pi", kind="adopt", env_var="DATABASE_PASSWORD"
+        )
+    )
+    assert result.status == "failed"
+    assert result.error is not None and "DATABASE_PASSWORD" in result.error
+    assert result.configured_harnesses is None
+
+
+def test_handle_store_secret_rejects_non_ui_harness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A harness outside the UI-auth families is refused without a write."""
+    import omnigent.host.connect as connect
+
+    def _must_not_write(**kwargs: object) -> object:
+        raise AssertionError("credential core reached for a non-UI-auth harness")
+
+    monkeypatch.setattr(connect, "store_harness_credential", _must_not_write)
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c4", harness="cursor", kind="key", secret_value="x")
+    )
+    assert result.status == "failed"
+    assert result.error is not None and "cursor" in result.error
+
+
+def test_handle_store_secret_surfaces_core_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A core write failure surfaces its non-secret reason as ``failed``."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    monkeypatch.setattr(
+        connect,
+        "store_harness_credential",
+        lambda **k: StoreCredentialResult(False, None, "a gateway requires a base_url"),
+    )
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c5", harness="codex", kind="gateway", secret_value="x")
+    )
+    assert result.status == "failed"
+    assert result.error == "a gateway requires a base_url"
+    assert result.configured_harnesses is None
+
+
+def test_handle_detect_credentials_returns_non_secret_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The detect handler returns the core's descriptors as plain dicts."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential
+
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [DetectedCredential("anthropic", "$ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")],
+    )
+    host = _make_host_process()
+    result = host._handle_detect_credentials(HostDetectCredentialsFrame(request_id="d1"))
+    assert isinstance(result, HostDetectCredentialsResultFrame)
+    assert result.credentials == [
+        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+    ]
+
+
 # --- Fail-loud on permanent tunnel failures ----------------------------
 #
 # Before the fix, HostProcess.run() caught every connection exception and
@@ -2141,6 +3131,38 @@ def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) 
     headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
 
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+def test_build_connect_headers_retains_auth_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host reconnects and runner launches share one warm auth factory."""
+    import omnigent.runner._entry as entry_mod
+
+    factory_builds: list[str | None] = []
+    token_calls: list[int] = []
+
+    def _factory() -> str:
+        token_calls.append(1)
+        return "warm-host-token"
+
+    def _make_factory(*, server_url: str | None = None) -> object:
+        factory_builds.append(server_url)
+        return _factory
+
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
+
+    host = _host("https://app.example.databricksapps.com")
+    first = host._build_connect_headers()
+    second = host._build_connect_headers()
+    launch_token = host._current_auth_token(initialize=False)
+
+    assert first["Authorization"] == "Bearer warm-host-token"
+    assert second["Authorization"] == "Bearer warm-host-token"
+    assert launch_token == "warm-host-token"
+    assert factory_builds == ["https://app.example.databricksapps.com"]
+    assert token_calls == [1, 1, 1]
 
 
 async def test_run_retries_on_login_redirect(

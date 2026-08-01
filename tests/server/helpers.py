@@ -211,6 +211,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.kubeconfig: str | None = None
         self.in_cluster: bool | None = None
         self.resources: dict[str, object] | None = None
+        self.pvc_mounts: list[dict[str, object]] | None = None
+        self.secret_mounts: list[dict[str, object]] | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -499,11 +501,13 @@ def install_fake_openshell_launcher(
         image: str | None = None,
         env: list[str] | None = None,
         cluster: str | None = None,
+        workspace: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
         fake.env = env
         fake.cluster = cluster
+        fake.workspace = workspace
         return fake
 
     monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
@@ -518,7 +522,7 @@ def install_fake_kubernetes_launcher(
 
     The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
-    kubeconfig=…, in_cluster=…, resources=…)``; the shim records those
+    kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…)``; the shim records those
     constructor args on the fake and hands it back, so production code runs
     unmodified against it.
 
@@ -538,6 +542,8 @@ def install_fake_kubernetes_launcher(
         kubeconfig: str | None = None,
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
+        pvc_mounts: list[dict[str, object]] | None = None,
+        secret_mounts: list[dict[str, object]] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -549,6 +555,8 @@ def install_fake_kubernetes_launcher(
         fake.kubeconfig = kubeconfig
         fake.in_cluster = in_cluster
         fake.resources = resources
+        fake.pvc_mounts = pvc_mounts
+        fake.secret_mounts = secret_mounts
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
@@ -734,6 +742,12 @@ def build_agent_bundle(
                     "model": sa["name"],
                     "connection": {"api_key": "test-key"},
                 },
+                # A ``config.yaml`` sub-agent goes through the strict
+                # spec_version:1 parser, which requires an explicit
+                # harness for an omnigent executor. Default to the same
+                # harness the parent uses; callers may override via
+                # ``sa["executor"]``.
+                "executor": sa.get("executor", {"config": {"harness": "claude-sdk"}}),
             }
             if "description" in sa:
                 sa_config["description"] = sa["description"]
@@ -775,6 +789,7 @@ async def create_test_agent(
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
     include_llm: bool = True,
+    sub_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Create an agent via multipart session create and return the agent JSON.
@@ -802,6 +817,11 @@ async def create_test_agent(
         :func:`build_agent_bundle`. ``None`` omits guardrails.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
+    :param sub_agents: Optional sub-agent config dicts declared in the
+        bundle, each with at least a ``"name"`` key, e.g.
+        ``[{"name": "worker"}]``. Required for tests that create a child
+        session with a ``sub_agent_name`` — the create route rejects an
+        undeclared name.
     :returns: Parsed agent response body from the session agent
         endpoint, with an extra ``_session_id`` key for the owning
         session.
@@ -814,6 +834,7 @@ async def create_test_agent(
         skills=skills,
         guardrails=guardrails,
         include_llm=include_llm,
+        sub_agents=sub_agents,
     )
     metadata: dict[str, Any] = {}
     headers: dict[str, str] = {}

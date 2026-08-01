@@ -96,7 +96,7 @@ export interface Response {
   /** "queued" | "in_progress" | "completed" | "failed" | "incomplete" | "cancelled". */
   status: string;
   model: string;
-  output?: Array<Record<string, unknown>>;
+  output?: Record<string, unknown>[];
   createdAt?: number;
   completedAt?: number | null;
   previousResponseId?: string | null;
@@ -353,7 +353,7 @@ export interface Session {
    * raw SSE shape so the existing `sse.ts` parser can fold them
    * back into the block stream.
    */
-  pendingElicitations?: Array<Record<string, unknown>>;
+  pendingElicitations?: Record<string, unknown>[];
   /**
    * Un-consumed web-composer user messages on native-terminal
    * sessions at snapshot time. Replayed so a client that posted then
@@ -372,6 +372,8 @@ export interface Session {
    * permissively, so that's fine for unblocking interaction.
    */
   permissionLevel: number | null;
+  /** Whether this viewer may accept privileged actions for the session. */
+  canApprove?: boolean | null;
   /**
    * Parent conversation id when this session is a sub-agent (child),
    * e.g. ``"conv_parent987"``. ``null`` for top-level sessions.
@@ -391,16 +393,22 @@ export interface Session {
    */
   subAgentName: string | null;
   /**
+   * Conversation kind: ``"sub_agent"`` for child sessions spawned by a
+   * parent agent (they have no host binding and recover via their parent's
+   * runner), ``"default"`` for all other sessions.
+   */
+  kind: "default" | "sub_agent";
+  /**
    * Current Claude Code todo list for `omnigent claude` sessions.
    * Sourced from the server's `_session_todos_cache` at snapshot
    * build time so the panel survives page refresh. Empty array for
    * non-claude-native sessions or before the first turn creates todos.
    */
-  todos?: Array<{
+  todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
   /**
    * Skills the bound agent has access to (bundled + host-discovered,
    * subject to the spec's ``skills_filter``). Populated by the
@@ -409,13 +417,8 @@ export interface Session {
    * users can fire ``/skill-name``.
    */
   skills?: SkillSummary[];
-  /**
-   * Codex app-server model options for codex-native sessions. Each option
-   * comes from Codex ``model/list`` and carries the model-specific reasoning
-   * efforts the picker should offer. Empty for non-codex-native sessions or
-   * while the runner has not answered yet.
-   */
-  codexModelOptions?: CodexModelOption[];
+  /** Runner-owned model picker rows for the active native session. */
+  codexModelOptions?: NativeModelOption[];
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced
@@ -460,12 +463,7 @@ export interface Session {
  * only — the snapshot field clears to null on success).
  */
 export type SandboxLaunchStage =
-  | "provisioning"
-  | "cloning"
-  | "starting"
-  | "connecting"
-  | "ready"
-  | "failed";
+  "provisioning" | "cloning" | "starting" | "connecting" | "ready" | "failed";
 
 /**
  * Managed-sandbox launch progress — mirrors
@@ -494,31 +492,26 @@ export interface SkillSummary {
   description: string;
 }
 
-/**
- * One raw Codex model option from app-server ``model/list``.
- */
-export interface CodexReasoningEffortOption {
-  /** Codex effort id, e.g. ``"xhigh"``. */
+/** Reasoning-effort metadata advertised for a native model. */
+export interface NativeReasoningEffortOption {
+  /** Effort id, e.g. ``"xhigh"``. */
   reasoningEffort: string;
-  /** Codex-provided description, when present. */
+  /** User-facing description, when present. */
   description?: string;
-  /** Additional Codex metadata. */
-  [key: string]: unknown;
 }
 
-export interface CodexModelOption {
-  /** Codex picker id to pass back to ``thread/settings/update``. */
+/** One runner-owned native model-picker row. */
+export interface NativeModelOption {
+  /** Native picker id (a Claude alias or Codex model id). */
   id: string;
-  /** Provider-facing model id Codex will run. */
+  /** Provider-facing model id the native harness will run. */
   model?: string;
-  /** Codex display label. */
+  /** User-facing model label; provider rows may omit it — fall back to `id`. */
   displayName?: string;
   /** Default reasoning effort for this model. */
   defaultReasoningEffort?: string;
-  /** Raw effort objects Codex advertises for this model. */
-  supportedReasoningEfforts?: CodexReasoningEffortOption[];
-  /** Whether Codex marks this as the default model. */
+  /** Reasoning efforts advertised for this model. */
+  supportedReasoningEfforts?: NativeReasoningEffortOption[];
+  /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
-  /** Additional Codex metadata. */
-  [key: string]: unknown;
 }

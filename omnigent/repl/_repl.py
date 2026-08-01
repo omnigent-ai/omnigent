@@ -966,7 +966,7 @@ def _build_elicitation_content_from_schema(
     """
     from omnigent.tools._elicitation_schema import build_accept_content_from_schema
 
-    return build_accept_content_from_schema(schema)  # type: ignore[arg-type]
+    return build_accept_content_from_schema(schema)
 
 
 def _make_elicitation_prompt(
@@ -2154,7 +2154,7 @@ class _SessionsChatReplAdapter:
                             "filename": pathlib.Path(path).name,
                         }
                     )
-            input = content_blocks  # type: ignore[assignment]
+            input = content_blocks
 
         if isinstance(input, str):
             content: list[dict[str, object]] = [{"type": "input_text", "text": input}]
@@ -2309,7 +2309,7 @@ class _SessionsChatReplAdapter:
                 self._pending_local_skill_slash_commands.remove(command_key)
             self._is_streaming = False
 
-    async def cancel(self):
+    async def cancel(self) -> None:
         """
         Interrupt the running turn (if any).
 
@@ -2348,7 +2348,7 @@ class _SessionsChatReplAdapter:
         import inspect
         import json as _json
 
-        callable_fn = self._tool_callables.get(name) if self._tool_callables else None  # type: ignore[union-attr]
+        callable_fn = self._tool_callables.get(name) if self._tool_callables else None
         if callable_fn is None:
             return
 
@@ -2487,7 +2487,7 @@ class _SessionsChatReplAdapter:
         if not properties or not isinstance(properties, dict):
             return None
 
-        required = set(schema.get("required", []))  # type: ignore[arg-type]
+        required = set(schema.get("required", []))
         content: dict[str, str | int | float | bool | list[str] | None] = {}
 
         for key, prop in properties.items():
@@ -3086,7 +3086,7 @@ async def run_repl(
     if debug_events:
         _pipeline_counters = PipelineCounters()
         _event_tape = EventTape(counters=_pipeline_counters)
-        host.pipeline_counters = _pipeline_counters  # type: ignore[attr-defined]
+        host.pipeline_counters = _pipeline_counters
 
     # Ctrl+T: toggle tool-output panels in the formatter.
     def _toggle_tool_output() -> None:
@@ -3123,7 +3123,7 @@ async def run_repl(
     tool_callables: dict[str, object] | None = None
     if tool_handler is not None:
         tool_callables = {
-            schema["name"]: tool_handler.execute  # type: ignore[index]
+            schema["name"]: tool_handler.execute
             for schema in tool_handler.schemas
             if isinstance(schema, dict) and "name" in schema
         }
@@ -3134,7 +3134,7 @@ async def run_repl(
     # set_reasoning_effort/reasoning_effort). mypy is
     # appeased via the runtime cast; the static type
     # mismatch surfaces in tests, not at runtime.
-    session = _SessionsChatReplAdapter(  # type: ignore[assignment]
+    session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
         tool_callables=tool_callables,
@@ -3295,7 +3295,7 @@ async def run_repl(
                 # Local name distinct from run_repl's `agent_name` param:
                 # assigning to `agent_name` here would shadow it for the
                 # whole handler, leaving it unbound in other branches.
-                current_agent = session._agent_name  # type: ignore[union-attr]
+                current_agent = session._agent_name
                 items_out = list(
                     fmt.format_response_start(
                         ResponseStartBlock(
@@ -3385,8 +3385,8 @@ async def run_repl(
                     _maybe_log_tape_entry(tape_entry)
                 return
             if event.data.type == "message" and event.data.data.get("role") == "user":
-                if session._pending_local_user_sends > 0:  # type: ignore[union-attr]
-                    session._pending_local_user_sends -= 1  # type: ignore[union-attr]
+                if session._pending_local_user_sends > 0:
+                    session._pending_local_user_sends -= 1
                 else:
                     text = _extract_message_text(event.data.data)
                     items_out = [fmt.user_message(text)]
@@ -3509,7 +3509,7 @@ async def run_repl(
                 fmt.format_reasoning_start(
                     ReasoningStartBlock(
                         ctx=BlockContext(
-                            agent=session._agent_name,  # type: ignore[union-attr]
+                            agent=session._agent_name,
                             depth=0,
                             turn=0,
                         ),
@@ -3535,7 +3535,7 @@ async def run_repl(
                     _RC(
                         text=sdk_ev.delta,
                         ctx=BlockContext(
-                            agent=session._agent_name,  # type: ignore[union-attr]
+                            agent=session._agent_name,
                             depth=0,
                             turn=0,
                         ),
@@ -3558,14 +3558,14 @@ async def run_repl(
                 if (
                     item.get("type") == "function_call"
                     and item.get("status") == "action_required"
-                    and session._tool_callables  # type: ignore[union-attr]
+                    and session._tool_callables
                 ):
                     call_id = item.get("call_id", "")
                     name = item.get("name", "")
                     args_str = item.get("arguments", "{}")
                     sid = getattr(session, "session_id", None) or ""
                     if isinstance(call_id, str) and isinstance(name, str):
-                        session._spawn_client_tool(  # type: ignore[union-attr]
+                        session._spawn_client_tool(
                             sid,
                             call_id,
                             name,
@@ -3649,7 +3649,7 @@ async def run_repl(
                             captured.append(it)
                             original_output(it)
 
-                        host.output = _capturing_output  # type: ignore[assignment]
+                        host.output = _capturing_output
                         try:
                             if plan.flush_inflight_text:
                                 # Commit in-flight streamed prose before
@@ -3664,7 +3664,7 @@ async def run_repl(
                                 call_id_to_tool_metadata=call_id_to_tool_metadata,
                             )
                         finally:
-                            host.output = original_output  # type: ignore[assignment]
+                            host.output = original_output
                         _event_tape.update_format(tape_entry, captured)  # type: ignore[union-attr]
                         _event_tape.mark_rendered(tape_entry, len(captured))  # type: ignore[union-attr]
                     else:
@@ -3685,7 +3685,7 @@ async def run_repl(
             return
 
         if isinstance(sdk_ev, _Created):
-            session._current_response_id = sdk_ev.response.id  # type: ignore[union-attr]
+            session._current_response_id = sdk_ev.response.id
             if tape_entry is not None:
                 _maybe_log_tape_entry(tape_entry)
             return
@@ -3771,7 +3771,7 @@ async def run_repl(
                 sdk_ev, getattr(session, "session_id", None) or ""
             )
             elicit_task = asyncio.create_task(
-                session._handle_elicitation(sid, sdk_ev),  # type: ignore[union-attr]
+                session._handle_elicitation(sid, sdk_ev),
             )
             _background_event_tasks.add(elicit_task)
             elicit_task.add_done_callback(_background_event_tasks.discard)
@@ -3790,7 +3790,7 @@ async def run_repl(
                 _maybe_log_tape_entry(tape_entry)
             return
 
-    session._on_event = _render_session_event  # type: ignore[union-attr]
+    session._on_event = _render_session_event
 
     def _maybe_log_tape_entry(entry: TapeEntry) -> None:
         """Write a tape entry to the JSONL log if the handle is open.
@@ -3800,7 +3800,7 @@ async def run_repl(
         if _event_log_fh is not None:
             from omnigent.repl._event_tape import log_entry_jsonl
 
-            log_entry_jsonl(_event_log_fh, entry)  # type: ignore[arg-type]
+            log_entry_jsonl(_event_log_fh, entry)
 
     is_streaming = False
 
@@ -4306,7 +4306,7 @@ async def run_repl(
             return build_tape_detail(
                 _event_tape,
                 target.key,
-                fmt,  # type: ignore[arg-type]
+                fmt,
             )
 
         async def _tape_targets() -> list[OverlayTarget]:
@@ -4317,7 +4317,7 @@ async def run_repl(
             from omnigent.repl._event_tape import _OverlayTargetLike
 
             raw_targets: list[_OverlayTargetLike] = build_tape_targets(
-                _event_tape,  # type: ignore[arg-type]
+                _event_tape,
             )
             return [OverlayTarget(key=t.key, label=t.label, icon=t.icon) for t in raw_targets]
 
@@ -4460,7 +4460,7 @@ async def run_repl(
                     await _task
             # Close the JSONL event log file handle if it was opened.
             if _event_log_fh is not None:
-                _event_log_fh.close()  # type: ignore[union-attr]
+                _event_log_fh.close()
     close_session = getattr(session, "aclose", None)
     if close_session is not None:
         result = close_session()
@@ -4771,6 +4771,7 @@ async def _cmd_effort(
 
 
 _MODEL_CLEAR_ALIASES = {"default", "off", "reset"}
+_MODEL_SHOW_ALIASES = {"show", "list", "status", "current"}
 
 
 def _model_readout_harness(active_model: str | None) -> str:
@@ -4869,11 +4870,22 @@ def _build_model_readout_lines(
         PI_SURFACE,
         describe_active_credential,
         harness_family,
+        harness_owns_its_credential,
         load_providers,
         provider_families,
     )
 
     lines: list[str] = []
+    if harness and harness_owns_its_credential(harness):
+        # The external agent authenticates itself, so there is no Omnigent
+        # credential to name. An in-session override is still shown (it's
+        # real, and e.g. goose applies it as GOOSE_MODEL); whether it reaches
+        # the agent varies per ACP agent, so no claim is made either way.
+        model_label = model_override or "(the agent's own model)"
+        return [
+            f"Active:  {model_label}  ·  🤖 ACP agent (agent's own auth)",
+            "usage: /model <name> · /model default | off | reset to clear",
+        ]
     cred = describe_active_credential(config, harness, model_override=model_override)
     if cred is None:
         # Nothing resolves for this harness's surface — not in the explicit
@@ -5059,8 +5071,7 @@ async def _cmd_model(
     """
     from rich.text import Text
 
-    value = arg.strip()
-    if not value:
+    def _emit_model_readout() -> None:
         from omnigent.onboarding.detected import effective_config_with_detected
         from omnigent.onboarding.provider_config import load_config
 
@@ -5071,6 +5082,12 @@ async def _cmd_model(
         config = effective_config_with_detected(load_config())
         for line in _build_model_readout_lines(config, harness, current):
             host.output(Text.from_markup(f"  [{fmt.muted}]{line}[/{fmt.muted}]"))
+
+    value = arg.strip()
+    # Bare `/model` and the display keywords both just show the readout — never
+    # persist `show`/`list`/`status`/`current` as a literal model override.
+    if not value or value.lower() in _MODEL_SHOW_ALIASES:
+        _emit_model_readout()
         return
 
     if value.lower() in _MODEL_CLEAR_ALIASES:
@@ -5458,7 +5475,7 @@ async def _attach_to_conversation(
             effective = _items_for_context_token_count(items)
             llm = getattr(session, "llm_model", None) or getattr(session, "_agent_name", "")
             tokens = count_tokens(
-                [dict(i) for i in effective],  # type: ignore[arg-type]
+                [dict(i) for i in effective],
                 llm,
             )
         host.update_context_usage(tokens, cw)
@@ -5781,7 +5798,7 @@ async def _update_context_ring_estimate(
     # time, not captured at task-spawn time, so they stay current.
     llm = getattr(session, "llm_model", None) or session.model
     tokens = count_tokens(
-        [dict(i) for i in effective],  # type: ignore[arg-type]
+        [dict(i) for i in effective],
         llm,
     )
     host.update_context_usage(tokens, context_window)
@@ -5990,7 +6007,7 @@ async def _cmd_context(
         # recognised LLM identifier — good enough for an estimate.
         effective_items = _items_for_context_token_count(result.items)
         message_tokens = count_tokens(
-            [dict(item) for item in effective_items],  # type: ignore[arg-type]
+            [dict(item) for item in effective_items],
             llm_model or agent_name,
         )
     _render_context_tree(agent_name, llm_model, message_tokens, context_window, host, fmt)
@@ -8301,12 +8318,32 @@ class _SlashCommandCompleter(Completer):
         if "/" in text_before[1:]:
             return
 
-        prefix = text_before.lower()
+        # Match the web UI's rule (slashCommandMatches in
+        # SlashCommandMenu.tsx): a case-insensitive substring of the
+        # command name (sans the leading "/"), so a namespaced skill is
+        # reachable by its leaf name (``/using-superpowers`` ->
+        # ``/superpowers:using-superpowers``). Name only, not the
+        # description — kept identical to the web menu, which never shows
+        # descriptions inline.
+        #
+        # Prefix matches rank ahead of mid-string matches (mirrors the web
+        # menu's ``rankedSlashCommandNames``): ``/e`` surfaces ``/effort``
+        # (a prefix) before ``/context`` (which merely contains "e"), so
+        # the first, auto-selectable completion is the intended one. Each
+        # tier keeps ``COMMANDS`` insertion order (an empty query — lone
+        # "/" — puts every command in the prefix tier, unchanged).
+        query = text_before[1:].lower()
+        prefix_hits: list[tuple[str, str]] = []
+        substring_hits: list[tuple[str, str]] = []
         for name, (desc, _) in COMMANDS.items():
             if name in _SLASH_COMMAND_ALIASES:
                 continue
-            if not name.startswith(prefix):
-                continue
+            body = name[1:].lower()
+            if body.startswith(query):
+                prefix_hits.append((name, desc))
+            elif query in body:
+                substring_hits.append((name, desc))
+        for name, desc in (*prefix_hits, *substring_hits):
             yield Completion(
                 text=name,
                 # Replace everything typed so far so the splice

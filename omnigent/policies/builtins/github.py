@@ -427,6 +427,16 @@ _MCP_WRITE_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# MCP write tools that are destructive (irreversible deletes). Gated separately
+# by ``allow_destructive`` — denied by default even on allowed repos.
+_MCP_DESTRUCTIVE_TOOLS: frozenset[str] = frozenset(
+    {
+        "delete_file",
+        "delete_branch",
+        "delete_release",
+    }
+)
+
 # Verb prefixes used to classify GitHub-prefixed tools we don't list explicitly.
 # Only applied when the raw tool name carried a GitHub server prefix (we are
 # certain it is a GitHub tool); never used to claim un-prefixed tools, which
@@ -606,6 +616,24 @@ _GH_WRITE_ACTIONS: dict[str, frozenset[str]] = {
 
 # gh groups that are GitHub-aware but never touch a specific repo's contents —
 # ignore them (auth, local config, etc.).
+# gh groups → destructive action names (a subset of _GH_WRITE_ACTIONS). Gated
+# separately by ``allow_destructive`` — denied by default even on allowed repos.
+_GH_DESTRUCTIVE_ACTIONS: dict[str, frozenset[str]] = {
+    "repo": frozenset({"delete"}),
+    "release": frozenset({"delete"}),
+    "issue": frozenset({"delete"}),
+    "gist": frozenset({"delete"}),
+    "cache": frozenset({"delete"}),
+    "codespace": frozenset({"delete"}),
+    "project": frozenset({"delete", "item-delete"}),
+    "variable": frozenset({"delete"}),
+    "ssh-key": frozenset({"delete"}),
+    "gpg-key": frozenset({"delete"}),
+    "secret": frozenset({"delete"}),
+    "label": frozenset({"delete"}),
+    "run": frozenset({"delete"}),
+}
+
 _GH_IGNORE_GROUPS: frozenset[str] = frozenset(
     {
         "auth",
@@ -640,6 +668,8 @@ class _ShellOp:
         content (``gh issue create``, ``gh pr merge`` …).
     :param detail: Short description for the decision reason, e.g.
         ``"git push"`` or ``"gh pr create"``.
+    :param destructive: Whether the operation is an irreversible delete, gated
+        separately by ``allow_destructive``.
     """
 
     kind: str
@@ -647,6 +677,7 @@ class _ShellOp:
     branches: frozenset[str]
     branch_targeted: bool
     detail: str
+    destructive: bool = False
 
 
 def _repo_from_tokens(tokens: list[str]) -> str | None:
@@ -716,12 +747,18 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
             branch = _normalize_branch(dest)
             if branch:
                 branches.add(branch)
+        # Detect delete semantics: ``--delete`` / ``-d`` flag, or a refspec
+        # starting with ``:`` (empty left side = delete the remote branch).
+        is_destructive = any(t in ("--delete", "-d") for t in args) or any(
+            refspec.startswith(":") for refspec in positionals[1:]
+        )
         return _ShellOp(
             kind="write",
             repo=repo,
             branches=frozenset(branches),
             branch_targeted=True,
             detail="git push",
+            destructive=is_destructive,
         )
     return None
 
@@ -757,8 +794,14 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
     if is_write:
         # gh writes are not inherently branch-targeted (they act on PRs/issues/
         # repos by number/name); a branch named via --base is still checked.
+        is_destructive = action in _GH_DESTRUCTIVE_ACTIONS.get(group, frozenset())
         return _ShellOp(
-            kind="write", repo=repo, branches=branches, branch_targeted=False, detail=detail
+            kind="write",
+            repo=repo,
+            branches=branches,
+            branch_targeted=False,
+            detail=detail,
+            destructive=is_destructive,
         )
     # Known read group, or an unknown group treated conservatively as a read
     # (reads are the safer default — they are only gated when read_all is off).
@@ -866,6 +909,7 @@ def github_policy(
     read_repos: list[str] | None = None,
     write_repos: list[str] | None = None,
     write_branches: list[str] | None = None,
+    allow_destructive: bool = False,
     mcp_tool_prefixes: list[str] | None = None,
     shell_tools: list[str] | None = None,
     deny_reason: str = "GitHub operation blocked by policy.",
@@ -883,6 +927,9 @@ def github_policy(
     :param write_branches: Branches writable within an allowed repo, e.g.
         ``["main", "develop"]``. ``None`` / empty means branches are not
         restricted (any branch on an allowed repo is writable).
+    :param allow_destructive: When ``False`` (default), irreversible destructive
+        operations (deletes) are denied even on allowed repos. Set to ``True``
+        to let destructive operations through normal write gating.
     :param mcp_tool_prefixes: GitHub MCP server name-prefixes to strip when
         canonicalizing MCP tool names. ``None`` uses the standard
         ``mcp__github__`` / ``github__``.
@@ -1008,7 +1055,7 @@ def github_policy(
             )
         # cls == "write"
         branches = _extract_branches_from_args(args)
-        return _gate_write(
+        write_result = _gate_write(
             repos,
             branches,
             branch_targeted=_mcp_base(canonical) in _MCP_BRANCH_WRITE_TOOLS,
@@ -1019,6 +1066,16 @@ def github_policy(
                 f"not be determined."
             ),
         )
+        if write_result is not None:
+            return write_result
+        # Destructive check fires after the repo allowlist so a destructive op
+        # on a non-allowed repo still gets the repo DENY, not this one.
+        if not allow_destructive and _mcp_base(canonical) in _MCP_DESTRUCTIVE_TOOLS:
+            return _deny(
+                f"{deny_reason} Destructive operation {raw_tool!r} is blocked by default. "
+                f"Set allow_destructive=true to permit deletes."
+            )
+        return None
 
     def _evaluate_shell(command: str) -> PolicyResponse | None:
         """
@@ -1058,6 +1115,11 @@ def github_policy(
                 ),
             )
         if op.kind == "write":
+            if op.destructive and not allow_destructive:
+                return _deny(
+                    f"{deny_reason} Destructive operation `{op.detail}` is blocked by "
+                    f"default. Set allow_destructive=true to permit deletes."
+                )
             return _gate_write(
                 {op.repo} if op.repo else set(),
                 set(op.branches),
@@ -1158,6 +1220,12 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Branches writable within an allowed repo. Empty = any branch.",
+                },
+                "allow_destructive": {
+                    "type": "boolean",
+                    "description": "Allow irreversible destructive operations (deletes). "
+                    "When false (default), deletes are denied even on allowed repos.",
+                    "default": False,
                 },
                 "mcp_tool_prefixes": {
                     "type": "array",

@@ -1,3 +1,5 @@
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
@@ -25,7 +27,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals etc.) — only the
   // network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(),
 }));
 
@@ -47,7 +49,7 @@ function makeTerminal(id: string, name: string, session: string): TerminalInfo {
   };
 }
 
-function useTerminalList(terminals: TerminalInfo[]) {
+function mockTerminalList(terminals: TerminalInfo[]) {
   useTerminalsMock.mockReturnValue({
     terminals,
     isLoading: false,
@@ -67,7 +69,7 @@ function renderPanel({
   readOnly?: boolean;
   terminals?: TerminalInfo[];
 } = {}) {
-  useTerminalList(terminals);
+  mockTerminalList(terminals);
   return render(
     <TerminalsPanel
       open

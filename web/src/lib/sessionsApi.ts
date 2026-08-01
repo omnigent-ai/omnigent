@@ -17,8 +17,8 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import type {
-  CodexModelOption,
   ModelUsage,
+  NativeModelOption,
   NestedSessionItem,
   SandboxStatus,
   Session,
@@ -166,18 +166,18 @@ interface SessionResponseWire {
    * SSE event the chat would have received live — same fields the
    * `sse.ts` parser already handles.
    */
-  pending_elicitations?: Array<Record<string, unknown>>;
+  pending_elicitations?: Record<string, unknown>[];
   /**
    * Un-consumed web-composer user messages on native-terminal sessions
    * at snapshot time, each ``{pending_id, content}``. Replayed so a
    * client that posted then navigated away / rebound re-hydrates the
    * optimistic bubble. Empty for non-native sessions.
    */
-  pending_inputs?: Array<{
+  pending_inputs?: {
     pending_id: string;
     content: MessageContentBlock[];
     created_by?: string;
-  }>;
+  }[];
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
@@ -185,6 +185,8 @@ interface SessionResponseWire {
    * entirely, and absent on older recorded fixtures.
    */
   permission_level?: number | null;
+  /** Whether this viewer may accept privileged actions for the session. */
+  can_approve?: boolean | null;
   /**
    * Parent conversation id when this session is a sub-agent (child),
    * e.g. ``"conv_parent987"``. ``null`` (or absent on older fixtures)
@@ -198,18 +200,20 @@ interface SessionResponseWire {
    * absent) for top-level sessions.
    */
   sub_agent_name?: string | null;
-  todos?: Array<{
+  kind?: "default" | "sub_agent" | null;
+  todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
   /**
    * Skills the bound agent can invoke — bundled + host-discovered
    * (subject to the spec's ``skills_filter``). Just name + one-line
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
-  model_options?: CodexModelOption[];
+  /** Runner-owned model picker rows for native sessions. */
+  model_options?: NativeModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -308,8 +312,10 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
     })),
     permissionLevel: wire.permission_level ?? null,
+    canApprove: wire.can_approve ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
+    kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
     codexModelOptions: wire.model_options ?? [],
@@ -649,9 +655,10 @@ export async function updateSession(
     costControlModeOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
+    labels?: Record<string, string>;
   },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null> = {};
+  const body: Record<string, string | boolean | null | Record<string, string>> = {};
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }
@@ -666,6 +673,11 @@ export async function updateSession(
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
+  }
+  if (updates.labels !== undefined) {
+    // Merge-upsert on the server; an empty-string value clears a label
+    // (e.g. the pinned flag on unpin — see PATCH /v1/sessions handler).
+    body.labels = updates.labels;
   }
   if (updates.silent) {
     body.silent = true;
@@ -808,19 +820,20 @@ export async function fetchSessionItemsPage(
   return { items: [...page.data].reverse(), hasMore: page.has_more };
 }
 
-/**
- * Upper bound on pages `fetchInitialHistoryWindow` will fetch before
- * giving up on reaching the previous-user-message boundary. Caps a
- * pathological single turn (thousands of tool calls between two user
- * prompts) from fanning out into unbounded requests on open. When the
- * cap is hit we stop with `hasMore: true`, so the rest stays reachable
- * via scroll-up `loadMoreHistory` — not a silent truncation.
- */
-const MAX_INITIAL_PAGES = 8;
+/** Pages allowed while looking for the previous user-message boundary. */
+export const MAX_INITIAL_PAGES = 8;
 
 /** A real (non-meta) user prompt — the boundary the initial window snaps to. */
 function isUserPrompt(item: ConversationItem): boolean {
   return isMessageItem(item) && item.role === "user" && !item.is_meta;
+}
+
+/**
+ * The prompt boundary is complete after two real prompts or the page cap.
+ * The cap applies only to this semantic target, not viewport filling.
+ */
+export function initialWindowComplete(userPromptCount: number, pagesFetched: number): boolean {
+  return userPromptCount >= 2 || pagesFetched >= MAX_INITIAL_PAGES;
 }
 
 /**
@@ -847,16 +860,19 @@ function isUserPrompt(item: ConversationItem): boolean {
 export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
   let items: ConversationItem[] = [];
   let hasMore = true;
-  for (let pages = 0; pages < MAX_INITIAL_PAGES; pages++) {
+  // Each page starts before the cursor returned by the prior page.
+  /* oxlint-disable no-await-in-loop */
+  for (let pagesFetched = 1; pagesFetched <= MAX_INITIAL_PAGES; pagesFetched += 1) {
     const cursor = items[0]?.id;
     const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
     items = [...page.items, ...items]; // prepend the older page
     hasMore = page.hasMore;
     if (!hasMore) break; // reached the start of the conversation
-    const userCount = items.filter(isUserPrompt).length;
-    if (items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2) break;
+    const userPromptCount = items.filter(isUserPrompt).length;
+    if (initialWindowComplete(userPromptCount, pagesFetched)) break;
     if (!items[0]?.id) break; // no cursor to page further; avoid a spin
   }
+  /* oxlint-enable no-await-in-loop */
   // If the cap stopped us before the previous user prompt (a pathological
   // single turn spanning >MAX_INITIAL_PAGES pages), `hasMore` stays true so
   // the rest remains reachable via scroll-up — same fallback as the default.

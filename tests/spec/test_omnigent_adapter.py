@@ -2181,6 +2181,18 @@ def test_use_responses_absent_omits_key_from_executor_config() -> None:
     assert "use_responses" not in spec.executor.config
 
 
+def test_malformed_acp_agent_propagates_for_runtime_validation() -> None:
+    agent_def, raw_yaml = _build_agent_def_with_raw_yaml()
+    raw_yaml["executor"] = {
+        "harness": "acp:helper",
+        "acp_agent": "not-a-mapping",
+    }
+
+    spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw_yaml)
+
+    assert spec.executor.config["acp_agent"] == "not-a-mapping"
+
+
 def test_unknown_policy_type_rejected_with_clear_message() -> None:
     """
     A policy with an unrecognized ``type:`` value fails with an

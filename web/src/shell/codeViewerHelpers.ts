@@ -2,6 +2,7 @@
 // No React imports — these are plain functions, easy to unit-test in isolation.
 
 import type { BundledLanguage } from "shiki";
+import type { ResolvedThemeMode } from "@/components/theme/themeMode";
 
 // ---------------------------------------------------------------------------
 // Shared selection type
@@ -142,6 +143,119 @@ export function isImageFile(path: string, contentType?: string | null): boolean 
 export function isPdfFile(path: string, contentType?: string | null): boolean {
   if (contentType) return contentType === "application/pdf";
   return path.split(".").pop()?.toLowerCase() === "pdf";
+}
+
+// 3D model formats we render in an interactive WebGL preview (three.js). Scoped
+// deliberately to the three loaders we ship — STL, 3MF, OBJ — and nothing else.
+export type ModelFormat = "stl" | "3mf" | "obj";
+
+// Model file extensions → the loader format they select.
+const MODEL_EXTENSION_FORMATS: Record<string, ModelFormat> = {
+  stl: "stl",
+  "3mf": "3mf",
+  obj: "obj",
+};
+
+// MIME types servers commonly report for these formats → the loader format.
+// Extension-driven `guess_type` and some toolchains disagree on the canonical
+// value (STL in particular has several historical types), so match a small
+// explicit set rather than a `model/` prefix — `model/gltf+json` etc. are NOT
+// in scope. Generic types (`application/octet-stream`, `text/plain`) are
+// deliberately absent so they fall through to the extension.
+const MODEL_CONTENT_TYPE_FORMATS: Record<string, ModelFormat> = {
+  "model/stl": "stl",
+  "application/sla": "stl",
+  "application/vnd.ms-pki.stl": "stl",
+  "model/3mf": "3mf",
+  "application/vnd.ms-package.3dmanufacturing-3dmodel+xml": "3mf",
+  "model/obj": "obj",
+};
+
+/**
+ * Resolve the 3D-model loader format for `path` / `contentType`, or `null` if
+ * it isn't a previewable model.
+ *
+ * This is the SINGLE source of truth shared by both the dispatch decision
+ * (`isModelFile`) and the loader selection in `ModelViewer` — so what routes
+ * into the viewer is exactly what the parser accepts, with no divergence.
+ *
+ * MIME-first: a recognized model content type wins and picks the loader
+ * (handles files with missing or misleading extensions). Falls back to the
+ * file extension otherwise — which is what carries the ambiguous cases, since
+ * binary STL/3MF are often served as `application/octet-stream` and ASCII OBJ
+ * as `text/plain` (neither of which is a model MIME).
+ */
+export function getModelFormat(path: string, contentType?: string | null): ModelFormat | null {
+  if (contentType) {
+    const type = contentType.split(";")[0].trim().toLowerCase();
+    const byMime = MODEL_CONTENT_TYPE_FORMATS[type];
+    if (byMime) return byMime;
+  }
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return MODEL_EXTENSION_FORMATS[ext] ?? null;
+}
+
+/**
+ * Return true if `path` should be previewed as an interactive 3D model.
+ *
+ * Thin wrapper over `getModelFormat` so detection and loader selection can
+ * never disagree.
+ */
+export function isModelFile(path: string, contentType?: string | null): boolean {
+  return getModelFormat(path, contentType) !== null;
+}
+
+/**
+ * Theme-derived appearance for the 3D model preview, keyed by the app's
+ * resolved light/dark mode.
+ *
+ * Mirrors `resolvedThemeToMonaco`: one pure map from the concrete theme mode to
+ * the values the viewer needs, so STL/3MF/OBJ all share a single source of
+ * theme truth instead of hardcoding a neutral scene. WebGL wants numeric colors
+ * (`0xRRGGBB`), and the values track the app's `--background`/`--foreground`
+ * tokens so the canvas sits flush with the surrounding panel in both modes.
+ *
+ *   • `background`       — canvas clear color (the panel background per mode).
+ *   • `stlMaterial`      — default surface for STL (which carries no material);
+ *                          a mid-grey that reads against the mode's background.
+ *   • `ambientIntensity` — hemisphere fill; higher in dark so the mesh stays
+ *                          legible against the dark background.
+ *   • `keyIntensity`     — directional key light, likewise boosted in dark.
+ */
+export interface ModelViewerTheme {
+  background: number;
+  stlMaterial: number;
+  ambientIntensity: number;
+  keyIntensity: number;
+}
+
+const MODEL_VIEWER_THEMES: Record<ResolvedThemeMode, ModelViewerTheme> = {
+  // Light: white canvas (matches `--background: #fff`), a neutral grey surface,
+  // and moderate lights.
+  light: {
+    background: 0xffffff,
+    stlMaterial: 0x9aa0a6,
+    ambientIntensity: 1.0,
+    keyIntensity: 1.2,
+  },
+  // Dark: the app's dark panel color (`--background: #0d1218`), a lighter grey
+  // surface, and brighter lights so the mesh doesn't sink into the background.
+  dark: {
+    background: 0x0d1218,
+    stlMaterial: 0xc4c9ce,
+    ambientIntensity: 1.5,
+    keyIntensity: 1.6,
+  },
+};
+
+/**
+ * Map the app's resolved palette to the 3D model preview's appearance.
+ *
+ * @param resolved Concrete mode from `normalizeResolvedTheme`, e.g. `"dark"`.
+ * @returns The background/material/light values for that mode.
+ */
+export function modelViewerTheme(resolved: ResolvedThemeMode): ModelViewerTheme {
+  return MODEL_VIEWER_THEMES[resolved];
 }
 
 export function detectLang(path: string): BundledLanguage | "text" {

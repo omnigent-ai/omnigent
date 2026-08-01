@@ -76,6 +76,23 @@ describe("ApprovePage states", () => {
     expect(screen.getByRole("button", { name: /Reject/ })).toBeInTheDocument();
   });
 
+  it("disables approve but keeps reject enabled for a plain editor", async () => {
+    vi.mocked(identity.authenticatedFetch).mockResolvedValue(
+      jsonResponse({
+        status: "pending",
+        message: "Run the migration?",
+        can_approve: false,
+      }),
+    );
+    renderPage();
+
+    expect(
+      (await screen.findByRole("button", { name: /Approve/ })) as HTMLButtonElement,
+    ).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: /Reject/ })).toHaveProperty("disabled", false);
+    expect(screen.getByRole("note").textContent).toContain("delegated approver");
+  });
+
   it("shows the resolved state when the elicitation is no longer pending", async () => {
     // WHY: a `status: "resolved"` payload means the prompt was already
     // resolved/timed-out/cancelled — no buttons, just an informational alert.

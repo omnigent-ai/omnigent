@@ -61,6 +61,16 @@ initNativeInsets();
 applyUiFontScale(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
 
+// The sidebar font size control was removed. Clear any previously persisted
+// value so existing users fall back to the default 13px size on reload.
+if (typeof window !== "undefined") {
+  try {
+    localStorage.removeItem("omnigent:sidebar-font-size");
+  } catch {
+    // localStorage access errors are non-fatal.
+  }
+}
+
 // Apply the saved color palette (data-theme on <html>) before first paint too,
 // so the app renders in the chosen theme rather than flashing the brand default.
 applyCustomTheme(readCustomTheme());
@@ -72,9 +82,9 @@ applyThemePalette(readThemePalette());
 // missing server doesn't deadlock first paint. We add a small
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
-const _bootProbe: Promise<ServerInfo> = Promise.race([
+const bootProbe: Promise<ServerInfo> = Promise.race([
   resolveServerInfo(),
-  new Promise<ServerInfo>((resolve) =>
+  new Promise<ServerInfo>((resolve) => {
     setTimeout(
       () =>
         resolve({
@@ -89,13 +99,16 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
+          harness_install_enabled: false,
+          installable_harnesses: [],
+          dictation_available: false,
         }),
       1500,
-    ),
-  ),
+    );
+  }),
 ]);
 
-void _bootProbe.then((info) => {
+void bootProbe.then((info) => {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <CapabilitiesProvider info={info}>

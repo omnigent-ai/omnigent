@@ -30,7 +30,7 @@ import { hostFetch } from "./host";
  * an unknown/missing value.
  */
 export type SharingMode = "on" | "read_only" | "restricted_read_only" | "off";
-const _SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_read_only", "off"];
+const SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_read_only", "off"];
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
@@ -99,14 +99,37 @@ export interface ServerInfo {
    */
   server_version: string | null;
   /**
-   * True when the server has a routing client configured
-   * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
+   * True when the server has a routing client configured — a server ``llm:``
+   * block, or a ``routing.provider=external`` block.
    */
   smart_routing_enabled: boolean;
+  /**
+   * True when the server accepts UI-driven harness installs
+   * (``OMNIGENT_HARNESS_INSTALL_ENABLED=1``). Gates the New Chat dialog's
+   * one-click "Install" action for a missing harness. Fails to ``false`` so a
+   * failed probe never offers an install the server would reject.
+   */
+  harness_install_enabled: boolean;
+  /**
+   * Harness ids the install route accepts (bare ids + native spellings that
+   * resolve to an npm-installable family, e.g. ``"codex"``, ``"codex-native"``).
+   * The dialog offers the one-click install only for a harness in this set, so
+   * it never shows an Install button the server would reject. Empty when
+   * ``harness_install_enabled`` is false (or on a failed probe).
+   */
+  installable_harnesses: string[];
+  /**
+   * True when the server can transcribe dictation audio
+   * (``WS /v1/dictation/stream``; the ``dictation`` extra plus models
+   * are installed). Gates the composer mic button's server
+   * speech-to-text fallback where the browser Web Speech API has no
+   * backend (Electron, Firefox/Chromium).
+   */
+  dictation_available: boolean;
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
-const _OFF: ServerInfo = {
+const FALLBACK_SERVER_INFO: ServerInfo = {
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -121,23 +144,26 @@ const _OFF: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  harness_install_enabled: false,
+  installable_harnesses: [],
+  dictation_available: false,
 };
 
-let _cached: ServerInfo | null = null;
-let _pending: Promise<ServerInfo> | null = null;
+let cachedServerInfo: ServerInfo | null = null;
+let pendingServerInfo: Promise<ServerInfo> | null = null;
 
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
- * Resolves to ``_OFF`` on any failure (network error, non-JSON,
+ * Resolves to ``FALLBACK_SERVER_INFO`` on any failure (network error, non-JSON,
  * 5xx). The frontend treats "no probe result" as "accounts is
  * off" — failing closed prevents the accounts UI from rendering
  * against a server that doesn't actually support it.
  */
 export async function resolveServerInfo(): Promise<ServerInfo> {
-  if (_cached !== null) return _cached;
-  if (_pending !== null) return _pending;
-  _pending = (async () => {
+  if (cachedServerInfo !== null) return cachedServerInfo;
+  if (pendingServerInfo !== null) return pendingServerInfo;
+  pendingServerInfo = (async () => {
     try {
       // Route through the host transport (`hostFetch`) so the embed hits the
       // proxied omnigent API; standalone `hostFetch` falls back to plain
@@ -145,7 +171,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       const res = await hostFetch("/v1/info");
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
-        _cached = {
+        cachedServerInfo = {
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
@@ -154,23 +180,28 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
-          sharing_mode: _SHARING_MODES.includes(data.sharing_mode as SharingMode)
+          sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
             ? (data.sharing_mode as SharingMode)
             : "on",
           // Fail open: only an explicit false disables the public toggle.
           public_sharing_enabled: data.public_sharing_enabled !== false,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: data.smart_routing_enabled === true,
+          harness_install_enabled: data.harness_install_enabled === true,
+          installable_harnesses: Array.isArray(data.installable_harnesses)
+            ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
+            : [],
+          dictation_available: data.dictation_available === true,
         };
-        return _cached;
+        return cachedServerInfo;
       }
     } catch {
       // Network failure — fall through to the off sentinel.
     }
-    _cached = _OFF;
-    return _cached;
+    cachedServerInfo = FALLBACK_SERVER_INFO;
+    return cachedServerInfo;
   })();
-  return _pending;
+  return pendingServerInfo;
 }
 
 /**
@@ -183,7 +214,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
  * than calling this directly.
  */
 export function getCachedServerInfo(): ServerInfo | null {
-  return _cached;
+  return cachedServerInfo;
 }
 
 /**
@@ -204,7 +235,7 @@ export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
  * not listed here fall back to a title-cased id so a newly-wired
  * provider still reads sensibly without a frontend change.
  */
-const _SANDBOX_PROVIDER_NAMES: Record<string, string> = {
+const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
   modal: "Modal",
   lakebox: "Databricks",
   daytona: "Daytona",
@@ -222,6 +253,6 @@ const _SANDBOX_PROVIDER_NAMES: Record<string, string> = {
 export function sandboxOptionLabel(provider: string | null): string {
   if (!provider) return "New Sandbox";
   const name =
-    _SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
+    SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
   return `${name} Sandbox`;
 }

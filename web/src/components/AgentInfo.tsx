@@ -1,7 +1,7 @@
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
@@ -19,9 +19,10 @@ import {
   useCreateMcpServer,
   useDeleteMcpServer,
   useUpdateMcpServer,
+  type Agent,
+  type McpServerSummary,
   type UpsertMcpServerInput,
 } from "@/hooks/useAgents";
-import type { Agent, McpServerSummary } from "@/hooks/useAgents";
 import type { ModelUsage } from "@/lib/types";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -56,6 +57,10 @@ import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
+
+const MCP_SERVERS_UPDATED_TOAST = (
+  <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>
+);
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -176,7 +181,7 @@ function formatTokenCount(tokens: number): string {
  * Token buckets shown per model in the ``usage_by_model`` section, mapping
  * the ``ModelUsage`` field to its row label. Cost is rendered separately.
  */
-const MODEL_TOKEN_ROWS: ReadonlyArray<{ key: keyof ModelUsage; label: string }> = [
+const MODEL_TOKEN_ROWS: readonly { key: keyof ModelUsage; label: string }[] = [
   { key: "inputTokens", label: "Input" },
   { key: "outputTokens", label: "Output" },
   { key: "cacheReadInputTokens", label: "Cache read" },
@@ -379,7 +384,7 @@ function AddPolicyDialog({
         onOpenChange(next);
       }}
     >
-      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-md">
+      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Add Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply to this session.</DialogDescription>
@@ -487,7 +492,7 @@ function AddPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="break-all text-[11px] text-muted-foreground">
+                      <p className="break-words text-[11px] text-muted-foreground">
                         {prop.description}
                       </p>
                     )}
@@ -660,8 +665,16 @@ interface McpFormState {
   transport: "http" | "stdio";
   description: string;
   url: string;
+  /** Key-value pairs for HTTP headers. Values from existing servers are "[REDACTED]". */
+  headers: { id: string; key: string; value: string }[];
   command: string;
   argsText: string;
+}
+
+let nextMcpHeaderId = 0;
+
+function mcpHeader(key = "", value = "") {
+  return { id: `mcp-header-${nextMcpHeaderId++}`, key, value };
 }
 
 const EMPTY_MCP_FORM: McpFormState = {
@@ -670,6 +683,7 @@ const EMPTY_MCP_FORM: McpFormState = {
   transport: "http",
   description: "",
   url: "",
+  headers: [],
   command: "",
   argsText: "",
 };
@@ -681,6 +695,7 @@ function mcpFormFromServer(server: McpServerSummary): McpFormState {
     transport: server.transport === "stdio" ? "stdio" : "http",
     description: server.description ?? "",
     url: server.url ?? "",
+    headers: Object.entries(server.headers ?? {}).map(([key, value]) => mcpHeader(key, value)),
     command: server.command ?? "",
     argsText: (server.args ?? []).join("\n"),
   };
@@ -693,10 +708,21 @@ function payloadFromMcpForm(form: McpFormState): UpsertMcpServerInput {
     description: form.description.trim() || null,
   };
   if (form.transport === "http") {
+    // null → "preserve existing" (used when creating a new server with no headers).
+    // {}  → "clear all headers" (user explicitly removed every row on an existing server).
+    // {…} → replace with these headers.
+    const filledHeaders =
+      form.headers.length > 0
+        ? Object.fromEntries(
+            form.headers.filter((h) => h.key.trim()).map((h) => [h.key.trim(), h.value]),
+          )
+        : null;
+    const headers = filledHeaders ?? (form.originalName !== null ? {} : null);
     return {
       ...base,
       transport: "http",
       url: form.url.trim(),
+      headers,
       command: null,
       args: [],
     };
@@ -900,14 +926,76 @@ function McpServerManagerDialog({
               </select>
             </label>
             {form.transport === "http" ? (
-              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-                URL
-                <Input
-                  value={form.url}
-                  onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
-                  placeholder="https://example.com/sse"
-                />
-              </label>
+              <>
+                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  URL
+                  <Input
+                    value={form.url}
+                    onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
+                    placeholder="https://example.com/sse"
+                  />
+                </label>
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Headers</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setForm((prev) => ({
+                          ...prev,
+                          headers: [...prev.headers, mcpHeader()],
+                        }))
+                      }
+                      className="rounded p-0.5 hover:bg-muted"
+                      aria-label="Add header"
+                    >
+                      <PlusIcon className="size-3" />
+                    </button>
+                  </div>
+                  {form.headers.map((header, i) => (
+                    <div key={header.id} className="flex items-center gap-1">
+                      <Input
+                        value={header.key}
+                        onChange={(e) =>
+                          setForm((prev) => {
+                            const headers = [...prev.headers];
+                            headers[i] = { ...headers[i], key: e.target.value };
+                            return { ...prev, headers };
+                          })
+                        }
+                        className="font-mono text-xs"
+                        placeholder="Header-Name"
+                      />
+                      <Input
+                        value={header.value}
+                        onChange={(e) =>
+                          setForm((prev) => {
+                            const headers = [...prev.headers];
+                            headers[i] = { ...headers[i], value: e.target.value };
+                            return { ...prev, headers };
+                          })
+                        }
+                        className="font-mono text-xs"
+                        placeholder="value"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Remove header"
+                        onClick={() =>
+                          setForm((prev) => ({
+                            ...prev,
+                            headers: prev.headers.filter((_, j) => j !== i),
+                          }))
+                        }
+                      >
+                        <XIcon className="size-3 text-destructive" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </>
             ) : (
               <>
                 <label className="flex flex-col gap-1 text-xs text-muted-foreground">
@@ -971,24 +1059,56 @@ function McpServersSection({
   sessionId,
   servers,
   editable,
+  onManagerOpenChange,
+  dirty: controlledDirty,
+  onDirtyChange,
 }: {
   sessionId?: string | null;
   servers: McpServerSummary[];
   editable: boolean;
+  onManagerOpenChange?: (open: boolean) => void;
+  dirty?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [managerOpen, setManagerOpen] = useState(false);
-  const [mcpDirty, setMcpDirty] = useState(false);
+
+  function setManagerOpenWithCallback(open: boolean) {
+    setManagerOpen(open);
+    onManagerOpenChange?.(open);
+  }
+  const [localDirty, setLocalDirty] = useState(false);
+  const dirtyControlled = controlledDirty !== undefined;
+  const mcpDirty = controlledDirty ?? localDirty;
+
+  const setMcpDirty = useCallback(
+    (dirty: boolean) => {
+      if (!dirtyControlled) setLocalDirty(dirty);
+      onDirtyChange?.(dirty);
+    },
+    [dirtyControlled, onDirtyChange],
+  );
+
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   // Clear the dirty flag when the session restarts (launching picks up
   // the updated MCP config) or when the user navigates to another session.
   useEffect(() => {
-    if (sessionStatus === "launching") setMcpDirty(false);
-  }, [sessionStatus]);
+    if (!dirtyControlled && sessionStatus === "launching") setLocalDirty(false);
+  }, [dirtyControlled, sessionStatus]);
   useEffect(() => {
-    setMcpDirty(false);
-  }, [sessionId]);
+    if (!dirtyControlled) setLocalDirty(false);
+  }, [dirtyControlled, sessionId]);
   const canEdit = !!(sessionId && editable);
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
+  const handleDeleteServer = useCallback(
+    (name: string) =>
+      deleteServer.mutate(name, {
+        onSuccess: () => {
+          setMcpDirty(true);
+          showToast(MCP_SERVERS_UPDATED_TOAST);
+        },
+      }),
+    [deleteServer, setMcpDirty],
+  );
   const showSection = servers.length > 0 || canEdit;
   if (!showSection) return null;
 
@@ -999,7 +1119,7 @@ function McpServersSection({
         {canEdit && (
           <button
             type="button"
-            onClick={() => setManagerOpen(true)}
+            onClick={() => setManagerOpenWithCallback(true)}
             className="rounded p-0.5 hover:bg-muted"
             title="Manage MCP servers"
             aria-label="Manage MCP servers"
@@ -1015,24 +1135,7 @@ function McpServersSection({
         </p>
       )}
       {servers.length > 0 ? (
-        <McpServerList
-          servers={servers}
-          onDelete={
-            canEdit
-              ? (name) =>
-                  deleteServer.mutate(name, {
-                    onSuccess: () => {
-                      setMcpDirty(true);
-                      showToast(
-                        <span className="text-sm">
-                          MCP servers updated. Restart the session to apply changes.
-                        </span>,
-                      );
-                    },
-                  })
-              : undefined
-          }
-        />
+        <McpServerList servers={servers} onDelete={canEdit ? handleDeleteServer : undefined} />
       ) : (
         <p className="text-xs text-muted-foreground">No MCP servers</p>
       )}
@@ -1041,7 +1144,7 @@ function McpServersSection({
           sessionId={sessionId!}
           servers={servers}
           open={managerOpen}
-          onOpenChange={setManagerOpen}
+          onOpenChange={setManagerOpenWithCallback}
           dirty={mcpDirty}
           onDirty={() => setMcpDirty(true)}
         />
@@ -1144,6 +1247,16 @@ interface AgentInfoProps {
   agent: Agent | undefined;
   /** Session ID — needed to manage user policies. */
   sessionId?: string | null;
+  /**
+   * Called when a sub-dialog (e.g. the MCP server manager) opens or closes.
+   * The parent popover uses this to suppress its own outside-click dismiss
+   * while a nested dialog is open.
+   */
+  onSubdialogOpenChange?: (open: boolean) => void;
+  /** Controlled MCP restart-warning state for parents that outlive the content mount. */
+  mcpDirty?: boolean;
+  /** Update the controlled MCP restart-warning state. */
+  onMcpDirtyChange?: (dirty: boolean) => void;
 }
 
 /**
@@ -1160,7 +1273,13 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  * Shared by the desktop header popover ({@link AgentInfoButton}) and the
  * mobile header menu's agent-info dialog.
  */
-export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
+export function AgentInfoContent({
+  agent,
+  sessionId,
+  onSubdialogOpenChange,
+  mcpDirty,
+  onMcpDirtyChange,
+}: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
   const mcpEditable = agent?.mcp_servers_editable === true;
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
@@ -1294,7 +1413,14 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
             )}
           </div>
         )}
-      <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
+      <McpServersSection
+        sessionId={sessionId}
+        servers={servers}
+        editable={mcpEditable}
+        onManagerOpenChange={onSubdialogOpenChange}
+        dirty={mcpDirty}
+        onDirtyChange={onMcpDirtyChange}
+      />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
       {versionFooter && (
         <div className="py-3">
@@ -1345,6 +1471,9 @@ export const HOVER_CLICK_GRACE_MS = 30;
  */
 export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   const [open, setOpen] = useState(false);
+  const [mcpDirty, setMcpDirty] = useState(false);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const subdialogOpenRef = useRef(false);
   // Tracks whether the current open came from hover, so we can suppress Radix's
   // focus move into the panel on hover-open (which would steal focus and could
   // scroll the page) while keeping it for click / keyboard access.
@@ -1360,6 +1489,12 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
       if (closeTimeoutRef.current !== null) window.clearTimeout(closeTimeoutRef.current);
     };
   }, []);
+  useEffect(() => {
+    if (sessionStatus === "launching") setMcpDirty(false);
+  }, [sessionStatus]);
+  useEffect(() => {
+    setMcpDirty(false);
+  }, [sessionId]);
 
   if (!agentHasInfo(agent, sessionId)) return null;
 
@@ -1393,7 +1528,7 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   }
 
   function scheduleCloseOnLeave(e: React.PointerEvent) {
-    if (e.pointerType !== "mouse") return;
+    if (e.pointerType !== "mouse" || !openedByHoverRef.current) return;
     scheduleClose();
   }
 
@@ -1416,12 +1551,14 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
           openedByHoverRef.current &&
           performance.now() - hoverOpenedAtRef.current < HOVER_CLICK_GRACE_MS
         ) {
+          cancelClose();
+          openedByHoverRef.current = false;
           return;
         }
         // Click / keyboard / outside-dismiss path: honor Radix immediately and
         // drop the hover flag so focus behaves normally.
         cancelClose();
-        if (!next) openedByHoverRef.current = false;
+        openedByHoverRef.current = false;
         setOpen(next);
       }}
     >
@@ -1458,8 +1595,22 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         onOpenAutoFocus={(e) => {
           if (openedByHoverRef.current) e.preventDefault();
         }}
+        onInteractOutside={(e) => {
+          if (subdialogOpenRef.current) e.preventDefault();
+        }}
+        onFocusOutside={(e) => {
+          if (subdialogOpenRef.current) e.preventDefault();
+        }}
       >
-        <AgentInfoContent agent={agent} sessionId={sessionId} />
+        <AgentInfoContent
+          agent={agent}
+          sessionId={sessionId}
+          mcpDirty={mcpDirty}
+          onMcpDirtyChange={setMcpDirty}
+          onSubdialogOpenChange={(isOpen) => {
+            subdialogOpenRef.current = isOpen;
+          }}
+        />
       </PopoverContent>
     </Popover>
   );

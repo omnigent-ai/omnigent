@@ -116,9 +116,10 @@ def _expect_relayed_reply(page: Page, nonce: str) -> None:
 def _expect_dispatch_tool_call_rendered(page: Page) -> None:
     """Assert the `sys_session_send` dispatch shows as a transcript tool call.
 
-    Completed turns fold their tool calls into a collapsed "See N steps"
-    group (ToolCard.tsx ToolGroupSummary), so every group is expanded
-    first. The trigger renders toolTitle.ts's raw-name fallback
+    A lone call can render directly; completed multi-step turns fold calls
+    into a collapsed summary group labeled by formatToolRunLabel (generic
+    "Called N tools" for unrecognized sys_* names). Expand groups when
+    present. The trigger renders toolTitle.ts's raw-name fallback
     ("sys_session_send(...)"), not the friendly "Start child session:"
     verb: sessionTitle() reads `tool`/`session` args while the named
     spawn schema (omnigent/tools/builtins/spawn.py) sends `agent`/`title`,
@@ -128,7 +129,12 @@ def _expect_dispatch_tool_call_rendered(page: Page) -> None:
 
     :param page: The Playwright page, on the parent session.
     """
-    step_groups = page.get_by_text(re.compile(r"^See \d+ steps?$"))
+    direct_call = page.get_by_role("button", name=re.compile(r"^sys_session_send\("))
+    if direct_call.count():
+        expect(direct_call.first).to_be_visible()
+        return
+
+    step_groups = page.get_by_text(re.compile(r"^Called \d+ tools?$"))
     expect(step_groups.first).to_be_visible()
     for group in step_groups.all():
         group.click()
@@ -186,11 +192,9 @@ def _expect_child_transcript(page: Page, child_session_id: str, nonces: list[str
         expect(page.locator(_ASSISTANT, has_text=nonce).first).to_be_visible(timeout=30_000)
 
 
-# Nightly: six serial real-LLM turns (two rounds of dispatch + sub-agent +
-# auto-wake continuation), so it is too heavy and 429-sensitive for the PR
-# gate. The 600s budget overrides the suite-wide 300s default for the same
-# reason tests/e2e/test_named_sub_agent_persistence.py uses it: FMAPI
-# backoff stacks multiplicatively across the serial turns.
+# Nightly: two full dispatch + child + auto-wake rounds exercise a heavier
+# multi-session browser journey than the PR gate needs. Scripted LLM queues
+# preserve the orchestration coverage without gateway cost or 429 flakes.
 @pytest.mark.nightly
 @pytest.mark.timeout(600)
 def test_two_agents_discuss_hitchhikers_guide(
@@ -207,7 +211,7 @@ def test_two_agents_discuss_hitchhikers_guide(
         "Let's talk about The Hitchhiker's Guide to the Galaxy. Ask Deep "
         "Thought for the Answer to the Ultimate Question of Life, the "
         "Universe, and Everything, then tell me exactly what it said, "
-        "including its verification code.",
+        f"including its verification code. Routing marker: {chat.routing_token}",
     )
     _expect_relayed_reply(page, chat.verification_code)
     # Deep Thought's Answer itself rendered too — the relay was verbatim.
@@ -224,7 +228,8 @@ def test_two_agents_discuss_hitchhikers_guide(
     _send(
         page,
         "Now ask Deep Thought what the Ultimate Question actually IS, and "
-        "report back exactly what it says, including any code.",
+        "report back exactly what it says, including any code. "
+        f"Routing marker: {chat.routing_token}",
     )
     _expect_relayed_reply(page, chat.question_code)
 

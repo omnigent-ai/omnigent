@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal, TypedDict, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
@@ -18,6 +18,8 @@ from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
+    DatabricksProfileBinding,
+    DatabricksProxySpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
     TerminalEnvSpec,
@@ -132,7 +134,7 @@ def _parse_int_field(raw: object, field_name: str) -> int:
             code=ErrorCode.INVALID_INPUT,
         )
     try:
-        return int(raw)
+        return int(cast(str | bytes | bytearray | int | float, raw))
     except (TypeError, ValueError) as exc:
         raise OmnigentError(
             f"{field_name} must be an integer, got {raw!r}",
@@ -153,7 +155,7 @@ def _parse_float_field(raw: object, field_name: str) -> float:
             code=ErrorCode.INVALID_INPUT,
         )
     try:
-        return float(raw)
+        return float(cast(str | bytes | bytearray | int | float, raw))
     except (TypeError, ValueError) as exc:
         raise OmnigentError(
             f"{field_name} must be a number, got {raw!r}",
@@ -311,7 +313,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
 
 
 def _parse_llm(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> LLMConfig | None:
@@ -390,7 +392,7 @@ def _parse_llm(
 
 
 def _parse_interaction(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
 ) -> InteractionConfig:
     """
     Parse the ``interaction:`` block from config.yaml into an
@@ -421,7 +423,7 @@ def _parse_interaction(
 
 
 def _parse_tools_config(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> ToolsConfig:
@@ -442,8 +444,14 @@ def _parse_tools_config(
     retry = _parse_retry(raw.get("retry"))
     builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
+    raw_agents = raw.get("agents", [])
+    if not isinstance(raw_agents, list):
+        raise OmnigentError(
+            f"tools.agents must be a list, got {type(raw_agents).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return ToolsConfig(
-        agents=raw.get("agents", []),
+        agents=[str(agent) for agent in raw_agents],
         builtins=builtins,
         timeout=timeout,
         retry=retry,
@@ -452,7 +460,7 @@ def _parse_tools_config(
 
 
 def _parse_sandbox_config(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> SandboxConfig:
     """
     Parse the ``tools.sandbox`` block from config.yaml.
@@ -464,7 +472,7 @@ def _parse_sandbox_config(
 
         sandbox:
           container_image: python:3.12-slim
-          container_runtime: podman  # optional, defaults to docker
+          container_runtime: podman  # optional, defaults to OMNIGENT_CONTAINER_RUNTIME or docker
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).
@@ -472,20 +480,26 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
-    runtime = raw.get("container_runtime", "docker")
-    if runtime not in ("docker", "podman"):
+    raw_image = raw.get("container_image") or raw.get("docker_image")
+    image = str(raw_image) if raw_image is not None else None
+    raw_runtime = raw.get("container_runtime")
+    runtime: Literal["docker", "podman"] | None
+    if "container_runtime" not in raw:
+        runtime = None
+    elif raw_runtime == "docker":
+        runtime = "docker"
+    elif raw_runtime == "podman":
+        runtime = "podman"
+    else:
         raise ValueError(
-            f"Unsupported container_runtime {runtime!r}; expected 'docker' or 'podman'."
+            f"Unsupported container_runtime {raw_runtime!r}; "
+            f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
         )
-    image = raw.get("container_image") or raw.get("docker_image")
-    return SandboxConfig(
-        container_image=image,
-        container_runtime=runtime,
-    )
+    return SandboxConfig(container_image=image, container_runtime=runtime)
 
 
 def _parse_builtin_tools(
-    raw: list[str | dict[str, Any]],
+    raw: object,
     *,
     expand_env: bool = True,
 ) -> list[BuiltinToolConfig]:
@@ -508,6 +522,11 @@ def _parse_builtin_tools(
     :returns: A list of :class:`BuiltinToolConfig` instances.
     :raises OmnigentError: If a dict entry is missing ``name``.
     """
+    if not isinstance(raw, list):
+        raise OmnigentError(
+            f"tools.builtins must be a list, got {type(raw).__name__}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     result: list[BuiltinToolConfig] = []
     for entry in raw:
         if isinstance(entry, str):
@@ -537,7 +556,7 @@ def _parse_builtin_tools(
 
 
 def _parse_retry(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> RetryPolicy:
     """
     Parse a ``retry:`` block into a :class:`RetryPolicy`.
@@ -550,7 +569,22 @@ def _parse_retry(
     """
     if not raw:
         return RetryPolicy()
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"retry must be a mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     defaults = RetryPolicy()
+    retryable_status_codes = raw.get(
+        "retryable_status_codes",
+        defaults.retryable_status_codes,
+    )
+    if not isinstance(retryable_status_codes, list | tuple):
+        raise OmnigentError(
+            "retry.retryable_status_codes must be a list or tuple, "
+            f"got {type(retryable_status_codes).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return RetryPolicy(
         max_retries=_parse_int_field(
             raw.get("max_retries", defaults.max_retries),
@@ -571,14 +605,13 @@ def _parse_retry(
             else defaults.timeout_per_request_s
         ),
         retryable_status_codes=tuple(
-            _parse_int_field(c, "retry.retryable_status_codes")
-            for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
+            _parse_int_field(c, "retry.retryable_status_codes") for c in retryable_status_codes
         ),
     )
 
 
 def _parse_executor(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> ExecutorSpec:
@@ -606,7 +639,7 @@ def _parse_executor(
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
     raw_config = raw.get("config")
-    config: dict[str, Any] = {}
+    config: dict[str, object] = {}
     if isinstance(raw_config, dict):
         config = {
             str(k): (v if k in _STRUCTURED_EXECUTOR_CONFIG_KEYS else str(v))
@@ -656,7 +689,7 @@ def _parse_executor(
 
 
 def _parse_executor_auth(
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     *,
     expand_env: bool = True,
 ) -> ApiKeyAuth | DatabricksAuth | ProviderAuth | None:
@@ -882,6 +915,8 @@ def _parse_os_env_sandbox(
         ["/home/me/.claude.json"], "cwd_allow_hidden": [".venv",
         ".git"], "cwd_hidden_scan_max_entries": 100000,
         "cwd_hidden_scan_overflow": "warn",
+        "cwd_hidden_scan_recursive": False,
+        "mask_paths": ["config/production.key"],
         "env_passthrough": ["AWS_PROFILE", "GITHUB_TOKEN"],
         "allow_network": False}``.
     :returns: A populated :class:`OSEnvSandboxSpec` when the
@@ -891,8 +926,10 @@ def _parse_os_env_sandbox(
         ``cwd_allow_hidden`` entry contains a path separator, or
         ``cwd_hidden_scan_max_entries`` is not a positive integer,
         or ``cwd_hidden_scan_overflow`` is not one of ``"error"``,
-        ``"warn"``, ``"unlimited"``, or ``env_passthrough`` is not
-        a list of POSIX environment variable names.
+        ``"warn"``, ``"unlimited"``, or ``cwd_hidden_scan_recursive``
+        is not a boolean, or ``mask_paths`` is not a list of non-empty
+        strings, or ``env_passthrough`` is not a list of POSIX
+        environment variable names.
     """
     if raw is None:
         return None
@@ -907,6 +944,8 @@ def _parse_os_env_sandbox(
     cwd_allow_hidden = _parse_cwd_allow_hidden(raw.get("cwd_allow_hidden"))
     max_entries = _parse_cwd_hidden_scan_max_entries(raw.get("cwd_hidden_scan_max_entries"))
     overflow = _parse_cwd_hidden_scan_overflow(raw.get("cwd_hidden_scan_overflow"))
+    recursive = _parse_cwd_hidden_scan_recursive(raw.get("cwd_hidden_scan_recursive"))
+    mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
     raw_type = raw.get("type")
@@ -968,6 +1007,8 @@ def _parse_os_env_sandbox(
         cwd_allow_hidden=cwd_allow_hidden,
         cwd_hidden_scan_max_entries=max_entries,
         cwd_hidden_scan_overflow=overflow,
+        cwd_hidden_scan_recursive=recursive,
+        mask_paths=mask_paths,
         env_passthrough=env_passthrough,
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
@@ -1049,7 +1090,10 @@ def _parse_cwd_hidden_scan_max_entries(raw: object) -> int:
         strictly positive.
     """
     if raw is None:
-        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_max_entries"].default
+        return cast(
+            int,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_max_entries"].default,
+        )
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise OmnigentError(
             "os_env.sandbox.cwd_hidden_scan_max_entries must be an integer, "
@@ -1081,7 +1125,10 @@ def _parse_cwd_hidden_scan_overflow(raw: object) -> str:
         modes.
     """
     if raw is None:
-        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_overflow"].default
+        return cast(
+            str,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_overflow"].default,
+        )
     if not isinstance(raw, str) or raw not in _CWD_HIDDEN_SCAN_OVERFLOW_MODES:
         raise OmnigentError(
             "os_env.sandbox.cwd_hidden_scan_overflow must be one of "
@@ -1089,6 +1136,71 @@ def _parse_cwd_hidden_scan_overflow(raw: object) -> str:
             code=ErrorCode.INVALID_INPUT,
         )
     return raw
+
+
+def _parse_cwd_hidden_scan_recursive(raw: object) -> bool:
+    """
+    Parse ``os_env.sandbox.cwd_hidden_scan_recursive``.
+
+    Falls back to the dataclass default (``False`` — top-level-only
+    scan) when the field is absent. Rejects non-boolean values.
+
+    :param raw: Raw value from the YAML, e.g. ``True`` or ``None``.
+    :returns: ``True`` to recurse the full tree, ``False`` to scan
+        only the top level of each root.
+    :raises OmnigentError: If ``raw`` is not a boolean.
+    """
+    if raw is None:
+        return cast(
+            bool,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_recursive"].default,
+        )
+    if not isinstance(raw, bool):
+        raise OmnigentError(
+            "os_env.sandbox.cwd_hidden_scan_recursive must be a boolean, "
+            f"got {type(raw).__name__}: {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return raw
+
+
+def _parse_mask_paths(raw: object) -> list[str] | None:
+    """
+    Parse and validate the ``mask_paths:`` field of ``os_env.sandbox``.
+
+    Each entry is a path string the backend resolves like
+    ``read_paths`` (``~`` expanded, relative-to-cwd, ``$VAR`` left
+    intact). We only validate shape here; path resolution happens in
+    the backend's ``resolve()``.
+
+    :param raw: Raw value from the YAML — ``None``, or a list of
+        non-empty path strings.
+    :returns: The list of path strings, or ``None`` when absent.
+    :raises OmnigentError: If ``raw`` is not a list, or any entry is
+        not a non-empty string.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise OmnigentError(
+            f"os_env.sandbox.mask_paths must be a list, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    sanitized: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise OmnigentError(
+                "os_env.sandbox.mask_paths entries must be strings, "
+                f"got {type(entry).__name__}: {entry!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not entry:
+            raise OmnigentError(
+                "os_env.sandbox.mask_paths entries must not be empty strings",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        sanitized.append(entry)
+    return sanitized
 
 
 # POSIX-portable environment variable name: starts with a letter or
@@ -1209,7 +1321,7 @@ _GH_BASIC_DEFAULT_TARGETS = ("github.com", "api.github.com")
 _GH_TOKEN_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 
 
-class _CredentialSourceModel(BaseModel):
+class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for a ``credential_proxy[*].source`` mapping.
 
     The secret origin is a structured single-key mapping —
@@ -1273,7 +1385,7 @@ class _CredentialSourceModel(BaseModel):
         return CredentialSourceSpec(kind="command", command=self.command.strip())
 
 
-class _CredentialProxyItemModel(BaseModel):
+class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for one raw ``credential_proxy`` entry.
 
     Validates the entry's *shape* — ``type``, ``source``, ``target`` /
@@ -1303,12 +1415,14 @@ class _CredentialProxyItemModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["https_bearer", "https_basic", "git_https", "gh_basic"]
-    source: _CredentialSourceModel
+    type: Literal["https_bearer", "https_basic", "git_https", "gh_basic", "databricks_cli"]
+    source: _CredentialSourceModel | None = None
     target: str | None = None
     targets: list[str] | None = None
     env: str | None = None
     username: str | None = None
+    profiles: list[str] | None = None
+    default: str | None = None
 
     @field_validator("env")
     @classmethod
@@ -1347,12 +1461,23 @@ class _CredentialProxyItemModel(BaseModel):
         ``targets``; ``gh_basic`` allows neither (it defaults to the
         GitHub git + API hosts) but not both. The ``env`` shim is only
         meaningful for the ``https_*`` primitives, and ``username`` only
-        applies to the Basic schemes.
+        applies to the Basic schemes. ``databricks_cli`` is profile-keyed:
+        it takes ``profiles`` (+ optional ``default``) and none of the
+        host-keyed fields (``source`` is implicit — the profile).
 
         :returns: ``self`` once validated.
         :raises ValueError: On a cardinality violation or a per-type
             option that does not apply.
         """
+        if self.type == "databricks_cli":
+            return self._check_databricks_cli()
+        # The host-keyed types resolve their secret from an explicit source.
+        if self.source is None:
+            raise ValueError("source is required")
+        if self.profiles is not None:
+            raise ValueError(f"{self.type} does not accept 'profiles'")
+        if self.default is not None:
+            raise ValueError(f"{self.type} does not accept 'default'")
         has_target = self.target is not None
         has_targets = self.targets is not None
         if has_targets and not self.targets:
@@ -1366,6 +1491,44 @@ class _CredentialProxyItemModel(BaseModel):
             raise ValueError(f"{self.type} does not accept an 'env' injection shim")
         if self.username is not None and self.type == "https_bearer":
             raise ValueError("https_bearer does not accept a 'username'")
+        return self
+
+    def _check_databricks_cli(self) -> _CredentialProxyItemModel:
+        """
+        Validate a ``databricks_cli`` entry.
+
+        The Databricks CLI is profile-keyed: it takes a non-empty
+        ``profiles`` list and an optional ``default`` (which must be one of
+        the listed profiles). The host-keyed fields (``source`` — resolved
+        from the profile — ``target``/``targets``, ``env``, ``username``)
+        do not apply and are rejected so typos fail loud.
+
+        :returns: ``self`` once validated.
+        :raises ValueError: On a missing/empty/duplicate profile, a
+            ``default`` outside ``profiles``, or a host-keyed field set.
+        """
+        for name, value in (
+            ("source", self.source),
+            ("target", self.target),
+            ("targets", self.targets),
+            ("env", self.env),
+            ("username", self.username),
+        ):
+            if value is not None:
+                raise ValueError(f"databricks_cli does not accept {name!r}")
+        if not self.profiles:
+            raise ValueError("databricks_cli requires a non-empty 'profiles' list")
+        seen: set[str] = set()
+        for profile in self.profiles:
+            if not profile or not profile.strip():
+                raise ValueError("databricks_cli 'profiles' entries must be non-empty strings")
+            if profile in seen:
+                raise ValueError(f"databricks_cli lists profile {profile!r} more than once")
+            seen.add(profile)
+        if self.default is not None and self.default not in self.profiles:
+            raise ValueError(
+                f"databricks_cli 'default' {self.default!r} must be one of 'profiles'"
+            )
         return self
 
 
@@ -1439,6 +1602,9 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
     if not raw:
         return None
     entries: list[CredentialProxyEntry] = []
+    databricks_profiles: list[DatabricksProfileBinding] = []
+    databricks_default: str | None = None
+    databricks_seen: set[str] = set()
     for i, item in enumerate(raw):
         try:
             model = _CredentialProxyItemModel.model_validate(item)
@@ -1448,6 +1614,16 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
                 f"{_format_validation_error(exc)}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        if model.type == "databricks_cli":
+            databricks_default = _merge_databricks_cli(
+                model,
+                profiles=databricks_profiles,
+                seen=databricks_seen,
+                current_default=databricks_default,
+                index=i,
+            )
+            continue
+        assert model.source is not None  # guaranteed by the model validator
         source = model.source.to_spec()
         if model.type == "gh_basic":
             entries.extend(_normalize_gh_basic(model, source=source, index=i))
@@ -1457,12 +1633,11 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
             entries.extend(_normalize_https_basic(model, source=source, index=i))
         else:  # git_https
             entries.extend(_normalize_git_https(model, source=source, index=i))
-    if not entries:
-        return None
     # Fail loud on conflicting host bindings. The egress proxy keys its
     # rewrite table by host, so two entries binding the same host would
     # silently last-win (one credential dropped). Reject it at parse time
-    # rather than picking a binding nondeterministically.
+    # rather than picking a binding nondeterministically. (Databricks
+    # hosts are resolved at runtime, so their collision guard lives there.)
     seen_hosts: dict[str, str] = {}
     for entry in entries:
         host_key = entry.host.lower()
@@ -1475,7 +1650,65 @@ def _parse_credential_proxy(raw: object) -> CredentialProxySpec | None:
                 code=ErrorCode.INVALID_INPUT,
             )
         seen_hosts[host_key] = entry.host
-    return CredentialProxySpec(entries=entries)
+    databricks = (
+        DatabricksProxySpec(profiles=databricks_profiles, default=databricks_default)
+        if databricks_profiles
+        else None
+    )
+    if not entries and databricks is None:
+        return None
+    return CredentialProxySpec(entries=entries, databricks=databricks)
+
+
+def _merge_databricks_cli(
+    model: _CredentialProxyItemModel,
+    *,
+    profiles: list[DatabricksProfileBinding],
+    seen: set[str],
+    current_default: str | None,
+    index: int,
+) -> str | None:
+    """
+    Merge one validated ``databricks_cli`` entry into the shared profile list.
+
+    Multiple ``databricks_cli`` entries are allowed and coalesced into a
+    single :class:`DatabricksProxySpec`. Profile names must be unique
+    across every entry (each profile maps to one materialized cfg section
+    and one workspace-host binding), and at most one ``default`` may be
+    declared in total.
+
+    :param model: The validated entry; ``profiles`` is non-empty and
+        ``default`` (if set) is one of them.
+    :param profiles: Accumulator of bindings, mutated in place.
+    :param seen: Accumulator of profile names already claimed.
+    :param current_default: The default declared by a prior entry, or
+        ``None``.
+    :param index: Entry index for error messages.
+    :returns: The (possibly updated) default profile name.
+    :raises OmnigentError: On a duplicate profile across entries or a
+        second conflicting ``default``.
+    """
+    assert model.profiles is not None  # guaranteed by the model validator
+    for profile in model.profiles:
+        if profile in seen:
+            raise OmnigentError(
+                f"os_env.sandbox.credential_proxy[{index}] lists Databricks "
+                f"profile {profile!r} which is already proxied by another "
+                "databricks_cli entry; each profile may appear once.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        seen.add(profile)
+        profiles.append(DatabricksProfileBinding(profile=profile))
+    if model.default is not None:
+        if current_default is not None and current_default != model.default:
+            raise OmnigentError(
+                "os_env.sandbox.credential_proxy declares conflicting "
+                f"databricks_cli defaults ({current_default!r} and "
+                f"{model.default!r}); declare at most one default profile.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return model.default
+    return current_default
 
 
 def _credential_proxy_macos_unsupported_reason(
@@ -1501,16 +1734,30 @@ def _credential_proxy_macos_unsupported_reason(
     the original ``type`` keeps this check independent of how the presets
     normalize into bindings.
 
+    ``databricks_cli`` fails on macOS for the same reason — the ``databricks``
+    CLI is also a Go binary — so it is rejected here too.
+
     :param credential_proxy: Parsed credential-proxy spec, or ``None`` when the
         ``credential_proxy:`` field is absent.
     :param sandbox_type: Resolved sandbox backend, e.g. ``"darwin_seatbelt"``
         (macOS) or ``"linux_bwrap"`` (Linux).
     :returns: A human-readable rejection message when a ``gh_basic`` (i.e. a
-        ``token``-scheme) binding is configured on ``darwin_seatbelt``, else
-        ``None``.
+        ``token``-scheme) binding or a ``databricks_cli`` policy is configured
+        on ``darwin_seatbelt``, else ``None``.
     """
     if credential_proxy is None or sandbox_type != "darwin_seatbelt":
         return None
+    if credential_proxy.databricks is not None:
+        return (
+            "os_env.sandbox.credential_proxy type 'databricks_cli' does not work "
+            "on macOS (sandbox.type=darwin_seatbelt). The 'databricks' CLI is a Go "
+            "binary, and Go on macOS verifies TLS against the system keychain "
+            "(Security.framework) and ignores SSL_CERT_FILE -- the environment "
+            "variable the egress MITM proxy uses to publish its CA to sandboxed "
+            "tools. Every 'databricks' call would fail with 'certificate is not "
+            "trusted'. Use sandbox.type=linux_bwrap (Go honors SSL_CERT_FILE on "
+            "Linux)."
+        )
     if not any(entry.scheme == "token" for entry in credential_proxy.entries):
         return None
     return (
@@ -1752,7 +1999,7 @@ def _parse_credential_proxy_host(raw: str, *, field_path: str) -> str:
 
 
 def _parse_compaction(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
 ) -> CompactionConfig | None:
     """
     Parse the ``compaction:`` block from config.yaml into a
@@ -2300,7 +2547,7 @@ def _parse_inline_mcp_servers(
         command = val.get("command")
         url = val.get("url")
         if command is not None:
-            transport: str = "stdio"
+            transport: Literal["http", "stdio"] = "stdio"
         elif url is not None:
             transport = "http"
         else:
@@ -2427,7 +2674,7 @@ def _discover_mcp_servers(
 
 def _parse_http_mcp_server(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     expand_env: bool,
@@ -2466,14 +2713,20 @@ def _parse_http_mcp_server(
             f"MCP server {name!r} missing required field 'url': {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
+    raw_headers = raw.get("headers", {})
+    if not isinstance(raw_headers, dict):
+        raise OmnigentError(
+            f"MCP server {name!r} (transport='http') 'headers' must be a mapping: {yaml_file}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    headers = {str(key): str(value) for key, value in raw_headers.items()}
+    raw_description = raw.get("description")
     return MCPServerConfig(
         name=str(name),
         transport="http",
         url=str(url),
-        headers=(
-            expand_env_vars(raw.get("headers", {})) if expand_env else raw.get("headers", {})
-        ),
-        description=raw.get("description"),
+        headers=expand_env_vars(headers) if expand_env else headers,
+        description=str(raw_description) if raw_description is not None else None,
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2485,7 +2738,7 @@ def _parse_http_mcp_server(
 
 def _parse_stdio_mcp_server(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     expand_env: bool,
@@ -2544,7 +2797,8 @@ def _parse_stdio_mcp_server(
             f"MCP server {name!r} (transport='stdio') 'env' must be a mapping: {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
-    env = expand_env_vars(raw_env) if expand_env else raw_env
+    string_env = {str(key): str(value) for key, value in raw_env.items()}
+    env = expand_env_vars(string_env) if expand_env else string_env
     if "sandbox" in raw:
         # Step 7: ``sandbox: <bool>`` was an AP-only no-op that
         # wrapped the stdio spawn with ``srt``. srt's default
@@ -2563,13 +2817,14 @@ def _parse_stdio_mcp_server(
             f"per-MCP outbound-host allowlist with a different schema.",
             code=ErrorCode.INVALID_INPUT,
         )
+    raw_description = raw.get("description")
     return MCPServerConfig(
         name=str(name),
         transport="stdio",
         command=str(command),
         args=[str(a) for a in raw_args],
-        env={str(k): str(v) for k, v in env.items()},
-        description=raw.get("description"),
+        env=env,
+        description=str(raw_description) if raw_description is not None else None,
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2581,7 +2836,7 @@ def _parse_stdio_mcp_server(
 
 def _reject_wrong_transport_keys(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     disallowed: tuple[str, ...],
@@ -2689,8 +2944,15 @@ def _discover_sub_agents(
 # parity for label values — see §14 of the audit).
 
 
+class _PolicyBaseFields(TypedDict):
+    name: str
+    on: list[PhaseSelector] | None
+    condition: dict[str, str | list[str]] | None
+    ask_timeout: int | None
+
+
 def _parse_guardrails(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> GuardrailsSpec | None:
@@ -2732,7 +2994,7 @@ def _parse_guardrails(
     )
 
 
-def _parse_guardrails_ask_timeout(raw: Any) -> int:
+def _parse_guardrails_ask_timeout(raw: object) -> int:
     """
     Validate and coerce the spec-wide ``ask_timeout`` value.
 
@@ -2759,7 +3021,7 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
 
 
 def _parse_label_defs(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> dict[str, LabelDef] | None:
     """
     Parse the ``guardrails.labels:`` block into a dict of
@@ -2793,7 +3055,7 @@ def _parse_label_defs(
     return defs
 
 
-def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
+def _parse_single_label_def(key: str, entry: object) -> LabelDef:
     """
     Parse one label definition entry.
 
@@ -2831,12 +3093,12 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
     return LabelDef(initial=initial, values=values)
 
 
-def _coerce_label_initial(raw: Any) -> str | None:
+def _coerce_label_initial(raw: object) -> str | None:
     """Coerce an ``initial:`` value to ``str | None``."""
     return None if raw is None else str(raw)
 
 
-def _coerce_label_values(key: str, raw: Any) -> list[str] | None:
+def _coerce_label_values(key: str, raw: object) -> list[str] | None:
     """
     Coerce a ``values:`` list to ``list[str]`` or ``None``.
 
@@ -2883,7 +3145,7 @@ def _validate_label_def_cross_fields(
 
 
 def _parse_policies(
-    raw: dict[str, Any] | list[Any] | None,
+    raw: object,
     *,
     expand_env: bool = True,
 ) -> list[PolicySpec] | None:
@@ -2920,7 +3182,7 @@ def _parse_policies(
 
 def _parse_policy_spec(
     name: str,
-    data: Any,
+    data: object,
     *,
     expand_env: bool = True,
 ) -> PolicySpec:
@@ -2971,10 +3233,10 @@ def _parse_policy_spec(
 
 def _parse_policy_base_fields(
     name: str,
-    data: dict[str, Any],
+    data: dict[str, object],
     *,
     is_function: bool = False,
-) -> dict[str, Any]:
+) -> _PolicyBaseFields:
     """
     Parse the fields every policy type shares.
 
@@ -3013,8 +3275,8 @@ def _parse_policy_base_fields(
 
 def _parse_function_policy(
     name: str,
-    data: dict[str, Any],
-    base_kwargs: dict[str, Any],
+    data: dict[str, object],
+    base_kwargs: _PolicyBaseFields,
 ) -> FunctionPolicySpec:
     """
     Parse a ``type: function`` policy block.
@@ -3058,7 +3320,7 @@ def _parse_function_policy(
 
 
 def _parse_on(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> list[PhaseSelector]:
@@ -3101,7 +3363,7 @@ def _parse_on(
 
 
 def _parse_on_entry(
-    entry: Any,
+    entry: object,
     *,
     policy_name: str,
 ) -> PhaseSelector:
@@ -3176,7 +3438,7 @@ def _resolve_phase(
 
 
 def _parse_condition(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> dict[str, str | list[str]] | None:
@@ -3225,7 +3487,7 @@ def _parse_condition(
 
 
 def _parse_writable_labels(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> list[str] | None:
@@ -3253,7 +3515,7 @@ def _parse_writable_labels(
 
 
 def _parse_function_ref(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> FunctionRef:
@@ -3307,7 +3569,7 @@ def _parse_function_ref(
 
 
 def _parse_policy_ask_timeout(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> int | None:
@@ -3338,7 +3600,7 @@ def _parse_policy_ask_timeout(
 
 
 def parse_default_policies(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> list[PolicySpec]:
@@ -3386,7 +3648,7 @@ def parse_default_policies(
 
 
 def parse_server_llm(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> LLMConfig | None:

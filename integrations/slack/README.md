@@ -6,6 +6,11 @@ bot talks to **one** Omnigent server, set by the operator via
 issues requests to that fixed host. Each user still authenticates as their own
 Omnigent identity against it.
 
+> This README is the operator/user guide (setup, scopes, running, auth). For the
+> user-facing behaviour contract (setup, DM, channels, error handling), see
+> **[docs/CUJS.md](docs/CUJS.md)**; for the Databricks-App auth design, see
+> **[docs/DATABRICKS_APP_WEBAUTH_DESIGN.md](docs/DATABRICKS_APP_WEBAUTH_DESIGN.md)**.
+
 ## Setup
 
 1. Create a Slack app with Socket Mode **and** Interactivity enabled (Socket
@@ -15,11 +20,12 @@ Omnigent identity against it.
 3. Add a slash command `/omnigent` (Features → Slash Commands). In Socket Mode
   the request URL is ignored, so any placeholder works.
 4. Install the app into the workspace.
-5. Copy `.env.example` to `.env` and fill in the two Slack tokens
-  (`OMNIGENT_SLACK_BOT_TOKEN`, `OMNIGENT_SLACK_APP_TOKEN`) and your Omnigent
-   server URL (`OMNIGENT_SERVER_URL`). If your server sets
+5. Set the two Slack tokens (`OMNIGENT_SLACK_BOT_TOKEN`,
+   `OMNIGENT_SLACK_APP_TOKEN`) and your Omnigent server URL
+   (`OMNIGENT_SERVER_URL`) as **environment variables**. If your server sets
    `OMNIGENT_DEVICE_CLIENT_SECRET`, set the same value here so the bot is
-   accepted as an authorized device-grant client.
+   accepted as an authorized device-grant client. See **Configuration** below
+   for how the bot reads config.
 6. Run the bot — see **Running the bot** below.
 
 ## Required scopes
@@ -39,6 +45,7 @@ required for the bot's core behaviour:
 | `im:history` | Read direct messages. DMs are a first-class entry point and do **not** fire `app_mention`, so without this the bot can't respond in DMs. |
 | `commands` | Register and receive the `/omnigent` slash command. |
 | `team:read` | Read the workspace name (`team.info`) to label the delegated-login request. |
+| `users:read`, `users:read.email` | Read the user's email (`users.info`) — **required only for Databricks web-auth mode**, where it's signed into the enrollment link and matched against the OAuth-authenticated email to bind the token to the right person. Omit for `accounts`/`oidc` mode. |
 
 **Channel history — add per channel type where the bot will run.** These back
 the plain-`message` event; add only the ones matching where you'll use the bot:
@@ -74,21 +81,28 @@ Under **Event Subscriptions → Subscribe to bot events**, add:
 With the `omni` CLI installed, the Slack bot is managed as a background daemon:
 
 ```bash
-omni integration slack           # run in the foreground (Ctrl-C to stop)
-omni integration slack start     # run in the background (detached)
-omni integration slack status    # is the background bot running?
-omni integration slack stop      # stop the background bot
-omni integration slack logs      # print the background bot's log path
-omni integration slack logs -f   # follow the log (like tail -f)
+omni integration slack              # run in the foreground (Ctrl-C to stop)
+omni integration slack --background # run in the background (detached)
+omni integration slack status       # is the background bot running?
+omni integration slack stop         # stop the background bot
+omni integration slack logs         # print the background bot's log path
+omni integration slack logs -f      # follow the log (like tail -f)
 ```
 
-`omni integration slack start` spawns a detached daemon and returns
-immediately; `status`/`stop`/`logs` manage it. Running `start` again while it's
-already up is a no-op that reports the existing process.
+`omni integration slack --background` spawns a detached daemon and returns
+immediately; `status`/`stop`/`logs` manage it. Running `--background` again
+while it's already up is a no-op that reports the existing process.
+
+### Configuration
 
 All configuration (the two Slack tokens, `OMNIGENT_SERVER_URL`, and the
 optional `OMNIGENT_DEVICE_CLIENT_SECRET` / `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY`)
-comes from the environment and the `.env` file — the CLI only launches the bot.
+comes from **real environment variables** — the bot does **not** read a `.env`
+file itself. For local dev, either export the vars, or launch under a tool that
+injects a `.env` — e.g. `uv run --env-file .env omni integration slack`, or
+`export $(grep -v '^#' .env | xargs)` before running. In production the
+Docker / Databricks deploy sets them directly. `.env.example` documents the
+full set of variables to copy from.
 
 The bot lives in the separate `omnigent-slack` package, which must be installed
 **in the same environment as** `omni` for the `omni integration slack` commands
@@ -98,7 +112,7 @@ to find it. Install it as the `slack` extra of omnigent:
 uv tool install "omnigent[slack]"     # or, from a source checkout: uv sync --extra slack
 ```
 
-Set `LOG_LEVEL=DEBUG` in `.env` when diagnosing why Slack events are not producing replies.
+Set `LOG_LEVEL=DEBUG` in the environment when diagnosing why Slack events are not producing replies.
 
 ## Per-user setup flow
 
@@ -134,8 +148,12 @@ command.
 The bot **auto-detects the server's auth mode** (an unauthenticated `GET /v1/me`, exactly as the `omnigent login` CLI does) and picks the matching flow:
 
 - `accounts` **mode** → **OAuth 2.0 Device Authorization Grant** (RFC 8628).
-The modal shows a verification link + code; the user approves a consent page
-in their browser. The server issues a short-lived, session-scoped delegated
+The modal shows a one-click login link (code prefilled) and the short code to
+confirm; the user opens the link and approves a consent page in their browser.
+(The consent page **forces a fresh password entry** before it will approve —
+even if the user is already signed in — so a link the user didn't personally
+start can't be approved by reflex.) The server issues a short-lived,
+session-scoped delegated
 token plus a rotating refresh token, so the bot silently refreshes and the
 token can't reach admin endpoints. **The Omnigent server must have the device
 grant enabled** (`OMNIGENT_DEVICE_GRANT_ENABLED=1` — it is default-off);
@@ -148,11 +166,15 @@ socket server can drive the device flow.
 IdP* in their browser. The server hands back its session JWT — the same token
 a browser session gets. There is **no device grant and no refresh token**: the
 session lasts its normal TTL (default 8h), after which the user logs in again.
-- `header` **/ proxy mode** → **unsupported**. Identity is asserted by a trusted
-upstream proxy header (e.g. `X-Forwarded-Email`), so the server mints no token
-and exposes no per-user login the bot can drive; setup reports that the server
-can't be logged into. Run the server in `accounts` or `oidc` mode to use the
-bot with authentication, or place the bot behind the same identity proxy.
+- `header` **/ proxy mode** → identity is asserted by a trusted upstream proxy
+header (e.g. `X-Forwarded-Email`), so the server mints no token and exposes no
+per-user login the auto-detect flow can drive. Two options:
+  - **Databricks Apps** (the common case): set
+    `OMNIGENT_SLACK_SERVER_AUTH=databricks` and the bot enrolls each user
+    through a web page it serves as its own Databricks App — see
+    [Databricks Apps web-auth](#databricks-apps-web-auth) below.
+  - Otherwise run the server in `accounts`/`oidc` mode, or place the bot behind
+    the same identity proxy.
 
 Either way the flow is the same from Slack's side:
 
@@ -178,6 +200,47 @@ Run `/omnigent` afterwards to set up again.
 
 See `designs/DEVICE_AUTH.md` in the main repo for the full design and
 threat model.
+
+### Databricks Apps web-auth
+
+When the Omnigent server is deployed as a **Databricks App**, it runs in header
+mode: the Databricks Apps proxy authenticates every request and injects the
+user's identity. A Socket-Mode event carries no such proxy-authenticated
+request, so the device/OIDC flows above can't be driven. Instead the bot runs a
+**custom U2M OAuth app** (authorization code + PKCE, `offline_access`) via an
+enrollment page it serves as its own Databricks App:
+
+1. On `/omnigent`, the bot looks up the user's email (`users.info`), generates a
+   PKCE verifier + single-use nonce, and posts a *Sign in with Databricks* link
+   — the workspace `/oidc/v1/authorize` URL whose signed `state` carries that
+   email and nonce.
+2. The user signs in at the Databricks authorize screen and Databricks redirects
+   back to the bot's `GET /auth/callback` with a single-use, PKCE-bound code.
+3. The callback consumes the PKCE verifier for the nonce (single-use — a
+   replayed redirect is refused) and exchanges the code at `/oidc/v1/token` for
+   an **access + refresh** pair, reading the authenticated email from the
+   `id_token` (falling back to SCIM `Me`).
+4. **Identity binding (confused-deputy guard):** the callback requires the
+   OAuth-authenticated email to equal the Slack email in the signed state — so a
+   link bound to user A, signed in by victim V, can't store V's token under A.
+   Mismatch → refused (HTTP 403).
+5. **Confirm before storing:** the GET stores nothing — it shows a consent page
+   naming the exact identities being linked ("your Omnigent `<server>` account
+   `<idp-email>` with Slack user `<slack-email>`") and a **Confirm** button. The
+   pair is persisted only when the user submits the confirming POST, then the
+   setup modal advances automatically. The token is bounded by the OAuth app's
+   requested scopes, so it isn't a broad workspace credential.
+6. The bot calls the server with the access token; the proxy validates it and
+   injects the real `X-Forwarded-Email`, so the server maps the request to the
+   user — **no server-side change needed**. On expiry the bot refreshes silently
+   via the refresh token; the user signs in once, not hourly.
+
+Enabled with `OMNIGENT_SLACK_SERVER_AUTH=databricks` plus the custom OAuth app's
+`OMNIGENT_SLACK_DATABRICKS_CLIENT_ID` / `OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET`
+and a `OMNIGENT_SLACK_DATABRICKS_STATE_SECRET` (see `.env.example`). To deploy
+the bot as its own Databricks App, see
+[`deploy/databricks/README.md`](deploy/databricks/README.md); for the full
+design and threat model, [`docs/DATABRICKS_APP_WEBAUTH_DESIGN.md`](docs/DATABRICKS_APP_WEBAUTH_DESIGN.md).
 
 Run `/omnigent` (or `/omnigent config`) any time to reopen this modal and change
 your agent, host, or workspace. The server is fixed by the operator, so there's
@@ -205,110 +268,24 @@ Mention the bot with a message to start a session:
 @your-bot help me inspect this failure
 ```
 
-Replies stream in live (via Slack's `chat.startStream` API) and render Markdown
-server-side. If a turn runs long enough that Slack finalizes the streaming
-message, the bot opens a fresh streaming reply in the same thread and keeps
-going, so a long answer arrives live across as many messages as it needs.
-Replies in that Slack thread continue the same Omnigent session. A channel
-thread belongs to whoever started it; a follow-up `@mention` from a different
-user is not added to that session — that user instead gets a private
-("Only visible to you") note explaining why, and pointing them to start their
-own thread.
+Replies stream in live and render Markdown. Replies in that Slack thread continue
+the same Omnigent session. A channel thread belongs to whoever started it; a
+follow-up from a different user gets a private ("Only visible to you") note
+pointing them to start their own thread.
 
-### Multi-agent turns
+When the agent needs you — a tool-call approval or a multiple-choice question —
+it appears in the thread as an **Approve / Deny** card or a radio/checkbox
+**Submit** form; answer it there (or in the web UI). A request it can't render
+with buttons (free-form typed input) links out to the web UI instead.
 
-`session.status: idle` is an ambiguous turn boundary, so at each idle the bot
-waits before deciding the turn is over — on two timescales:
+Send another message while the bot is still replying and it privately tells you
+to wait or continue in the web UI; a message to an idle thread just continues the
+conversation.
 
-- **Settle (short, ~2s).** A single agent oscillates `running`/`idle` *while
-  still streaming* its answer, with sub-second gaps between bursts. Every idle
-  first waits a brief settle window for the next burst, so a reply is never
-  truncated mid-answer. A genuinely final idle adds only this small tail.
-- **Snapshot + poll (coarse).** If still quiet after the settle, the bot checks
-  the session's rolled-up status, which reads `running` while any sub-agent
-  child is still working (a fan-out orchestrator like `debby` parked between
-  wake cycles). While running it polls (every 5s, up to a 10-minute cap) so a
-  slow sub-agent keeps the turn alive; otherwise the turn ends.
-
-While the agent works before the first tokens arrive, the thread shows a
-"Working on it…" placeholder. It's removed only once the reply is actually on
-screen — on the first streamed chunk, or after the finalizing flush for a
-buffered answer — so there's never an empty gap between the placeholder
-disappearing and the reply appearing.
-
-### Approvals & questions
-
-When the agent needs the user — a tool-call approval, or a multiple-choice
-question — the turn pauses and the bot surfaces it in the thread. It renders
-the server's `response.elicitation_request` in one of three ways:
-
-- **Approval** (a gated tool call): an **Approve / Deny** card with a preview of
-  the pending action. Click to resume; deny (or let it sit past the wait
-  window) to refuse.
-- **Question** (Claude's `AskUserQuestion` and equivalents): the choices render
-  as radio buttons (or checkboxes for multi-select) with a **Submit** — the
-  selected labels are sent back to the agent as its answer, exactly like the
-  web UI.
-- **Free-form input** (a request for typed values the bot can't collect with
-  buttons): the bot posts a link to resolve the request in the Omnigent web UI,
-  rather than mishandling it. The turn stays alive (via the idle grace window)
-  so it resumes once you answer there.
-
-The classification is by the *decision shape*, not the server's delivery mode.
-The server defaults to `url`-mode elicitations (carrying a suggested standalone
-approve page), but the bot still renders a `url`-mode approval or question
-natively and posts the verdict to the resolve endpoint — only genuinely
-uncollectable typed input falls back to the link.
-
-The card is updated in place with the outcome once answered, and the "Working
-on it…" placeholder is cleared while parked so it doesn't sit stale. Multiple
-requests in one turn are handled in order.
-
-This mirrors the web UI and CLI — the bot consumes `response.elicitation_request`
-and posts the verdict (with any selections as `content`) back to the session's
-resolve endpoint.
-
-While a request is outstanding the turn stays open, so a message sent to that
-thread meanwhile is deflected like any other mid-turn message (see below). If the
-user answers the request in the web UI instead of clicking the Slack card, the
-bot notices (it polls for external resolution) and continues without waiting. An
-unanswered card gives up after a few minutes so it can't hold the thread open
-indefinitely — the user can just re-send.
-
-**One turn at a time per thread.** Each turn opens its own event stream, so the
-bot runs one turn per thread at a time — a second concurrent stream would render
-into Slack twice. There is no queue. A message that arrives *while a thread is
-still streaming* is not run: the bot privately ("Only visible to you") tells the
-user it's still working and to re-send once it has replied, or to continue right
-now in the web UI (which accepts concurrent input and shows any pending actions).
-A message to a thread that is idle again runs normally — Slack stays a full
-conversational surface, not just a way to kick a session off. Messages that race
-the check are safe regardless: the server buffers a message that lands mid-turn
-and runs it as a continuation.
-
-**Ordering.** A streamed reply is a single Slack message anchored to the moment
-it opened, so text kept flowing into it would sort *before* any card or notice
-posted mid-turn — inverting cause and effect. The bot avoids this by *sealing*
-the current reply at each interruption (approval card, policy/file notice): the
-answer so far ends there, the out-of-band message sorts after it, and anything
-the agent says next opens a fresh reply below. So the thread reads in true
-order — reply, card, continued reply — even across several approvals in one turn.
-
-### Turn progress
-
-Beyond the streamed answer, the bot surfaces a few other signals when the
-harness emits them:
-
-- **Thinking** — while the agent reasons before producing output, the
-  placeholder switches to a "Thinking…" indicator so a long think isn't silent.
-- **Plan / todos** — a task list (from harnesses that report one, e.g. Claude
-  Code's `TodoWrite`) is posted once and edited in place as items progress.
-- **Blocked by policy** — when a tool call is hard-blocked by policy (a DENY,
-  with no approval offered), the bot posts why, so an absent action is
-  explained rather than silent.
-- **Produced files** — a note naming any file artifact the agent generated.
-
-All are best-effort and never interrupt the answer stream.
+For the full set of user-facing behaviours — setup, DM vs channel routing,
+ownership, and error handling — see **[docs/CUJS.md](docs/CUJS.md)**. The
+under-the-hood details (streaming, turn-end detection, elicitation handling,
+concurrency, ordering) live in the module docstrings and inline comments.
 
 ## Development
 

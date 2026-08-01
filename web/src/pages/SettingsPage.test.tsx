@@ -3,7 +3,7 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
-import { type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -103,7 +103,7 @@ vi.mock("@/hooks/useConversations", async () => {
 // so the stub lifts it from the trigger child onto the native <select>.
 vi.mock("@/components/ui/select", async () => {
   const { Children, isValidElement } = await import("react");
-  const SelectTrigger = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
   const Select = ({
     value,
     onValueChange,
@@ -133,7 +133,7 @@ vi.mock("@/components/ui/select", async () => {
     Select,
     SelectTrigger,
     SelectValue: () => null,
-    SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
     SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
       <option value={value}>{children}</option>
     ),
@@ -195,6 +195,7 @@ afterEach(() => {
   // don't leak persisted state or the --ui-font-scale variable into each other.
   localStorage.clear();
   document.documentElement.style.removeProperty("--ui-font-scale");
+  document.documentElement.style.removeProperty("--sidebar-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
@@ -429,6 +430,69 @@ describe("SettingsPage", () => {
     expect(input.value).toBe("");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
+  });
+
+  it("resets every appearance preference back to product defaults", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+
+    // Tweak a representative set of appearance preferences.
+    mocks.theme = "dark";
+    fireEvent.click(screen.getByTestId("theme-dark"));
+    fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
+      target: { value: "github" },
+    });
+    fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
+    fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
+      target: { value: "Inter" },
+    });
+    fireEvent.click(screen.getByTestId("code-font-size-inc"));
+    fireEvent.click(screen.getByTestId("code-font-size-inc"));
+    fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
+      target: { value: "Fira Code" },
+    });
+
+    // Sanity: the non-default choices were persisted.
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
+    expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
+
+    // Open the confirmation dialog and confirm the reset.
+    fireEvent.click(screen.getByTestId("reset-appearance-button"));
+    fireEvent.click(screen.getByTestId("reset-appearance-confirm"));
+
+    // Mode is restored to "system".
+    expect(mocks.setTheme).toHaveBeenCalledWith("system");
+
+    // Fonts are back to their defaults.
+    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("16");
+    expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
+    expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
+    expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
+    expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
+
+    // Color theme is back to Omnigent.
+    expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
+    expect(document.documentElement.getAttribute("data-theme")).toBeNull();
+
+    // Terminal theme, workspace panel, and harness visibility are restored.
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {
@@ -864,5 +928,47 @@ describe("SettingsPage", () => {
     expect(mocks.fetchNextPage).toHaveBeenCalled();
     expect(screen.getByTestId("archived-row")).toBeInTheDocument();
     expect(screen.getByText("Deep archive")).toBeInTheDocument();
+  });
+
+  it("groups archived sessions under date headers", () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Use local-time construction so bucket boundaries align with the
+    // local-time arithmetic in dateGroupLabel regardless of the test runner's
+    // timezone.
+    vi.setSystemTime(new Date(2026, 6, 15, 12, 0, 0));
+
+    try {
+      const todaySec = new Date(2026, 6, 15, 10, 0, 0).getTime() / 1000;
+      const yesterdaySec = new Date(2026, 6, 14, 8, 0, 0).getTime() / 1000;
+      const fiveDaysAgoSec = new Date(2026, 6, 10, 8, 0, 0).getTime() / 1000;
+      const twentyDaysAgoSec = new Date(2026, 5, 25, 8, 0, 0).getTime() / 1000;
+      const oldDate = new Date(2026, 2, 1, 8, 0, 0);
+      const oldSec = oldDate.getTime() / 1000;
+
+      mocks.conversations = [
+        conv("c_today", { archived: true, title: "Today chat", updated_at: todaySec }),
+        conv("c_yesterday", { archived: true, title: "Yesterday chat", updated_at: yesterdaySec }),
+        conv("c_week", { archived: true, title: "This week chat", updated_at: fiveDaysAgoSec }),
+        conv("c_month", { archived: true, title: "This month chat", updated_at: twentyDaysAgoSec }),
+        conv("c_old", { archived: true, title: "Old chat", updated_at: oldSec }),
+      ];
+      renderPage("/settings/archived");
+
+      expect(screen.getByText("Today")).toBeInTheDocument();
+      expect(screen.getByText("Yesterday")).toBeInTheDocument();
+      expect(screen.getByText("Previous 7 days")).toBeInTheDocument();
+      expect(screen.getByText("Previous 30 days")).toBeInTheDocument();
+      // Derive the expected label the same way the component does so the
+      // assertion is locale-independent.
+      const expectedOldLabel = oldDate.toLocaleDateString(undefined, {
+        month: "long",
+        year: "numeric",
+      });
+      expect(screen.getByText(expectedOldLabel)).toBeInTheDocument();
+
+      expect(screen.getAllByTestId("archived-row")).toHaveLength(5);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

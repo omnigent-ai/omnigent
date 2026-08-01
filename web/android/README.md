@@ -6,9 +6,9 @@ shipping a duplicate copy of the SPA. It is a native _shell_, not a rewrite.
 
 ## Development
 
-Open `web/android` in Android Studio (Ladybug / AGP 8.6+) and run the `app`
-configuration on an API 34/35 emulator. Requires JDK 17 and the Android SDK
-(`compileSdk 35`, `minSdk 28`).
+Open `web/android` in Android Studio Meerkat (AGP 9.1+) and run the `app`
+configuration on an API 36 emulator. Requires JDK 17 and the Android SDK
+(`compileSdk 36`, `targetSdk 36`, `minSdk 28`).
 
 Debug builds permit cleartext (`http://`) to localhost and private-range hosts
 via `res/xml/network_security_config.xml` for local development; release builds
@@ -121,6 +121,6 @@ reused code). Change the target track via `track.set(...)` in
 `app/build.gradle.kts` (`internal` → `alpha` → `beta` → `production`).
 
 > Status: builds clean — `gradlew :app:assembleDebug :app:lintDebug` produces a
-> debug APK with 0 lint errors (JDK 17, Gradle 8.9 wrapper, `compileSdk 35`).
+> debug APK with 0 lint errors (JDK 17, Gradle 9.3 wrapper, `compileSdk 36`).
 > Implementation for omnigent-ai/omnigent#1604; not yet exercised on a device
 > (no runtime/instrumented testing here), so treat device behavior as unverified.

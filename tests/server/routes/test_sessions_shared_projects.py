@@ -90,10 +90,11 @@ def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> Non
     _seed_shared_project_session(db_uri)
     app = _multi_user_app(db_uri)
 
-    # Bob owns it, so it's his project.
+    # Bob owns it, so it's his project. Label-only (no first-class row here),
+    # so it lists with id=None.
     bob = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": BOB})
     assert bob.status_code == 200
-    assert bob.json() == ["Bob Project"]
+    assert bob.json() == [{"id": None, "name": "Bob Project"}]
 
     # Alice can access the session, but doesn't own it — no folder for her.
     alice = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": ALICE})

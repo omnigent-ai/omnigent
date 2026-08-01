@@ -473,7 +473,7 @@ async def test_managed_session_create_end_to_end(
     # same as a directly-connected host would be.
     host = env.host_store.get_host(conv.host_id)
     assert host is not None
-    assert host.owner == RESERVED_USER_LOCAL
+    assert host.user_id == RESERVED_USER_LOCAL
     assert host.status == "online"
     assert host.sandbox_provider == "modal"
     assert host.sandbox_id == "sb-fake-1"
@@ -1068,7 +1068,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     host_store.register_managed_host(
         host_id="40bb7200abc8ed27d5b2fcbfad8e89d2",
         name="managed-stale-live-islo",
-        owner=RESERVED_USER_LOCAL,
+        user_id=RESERVED_USER_LOCAL,
         token="tok-stale-live-islo",
         provider="islo",
         sandbox_id="sb-stale-live-islo",
@@ -1077,7 +1077,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     host_store.upsert_on_connect(
         host_id="40bb7200abc8ed27d5b2fcbfad8e89d2",
         name="managed-stale-live-islo",
-        owner=RESERVED_USER_LOCAL,
+        user_id=RESERVED_USER_LOCAL,
     )
     conv = conv_store.create_conversation(
         agent_id=None,
@@ -1134,7 +1134,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     host_store.register_managed_host(
         host_id="055e31f38d07908f171ebad4ff5cbe9c",
         name="managed-stale-tunnel-islo",
-        owner=RESERVED_USER_LOCAL,
+        user_id=RESERVED_USER_LOCAL,
         token="tok-stale-tunnel-islo",
         provider="islo",
         sandbox_id="sb-stale-tunnel-islo",
@@ -1143,7 +1143,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     host_store.upsert_on_connect(
         host_id="055e31f38d07908f171ebad4ff5cbe9c",
         name="managed-stale-tunnel-islo",
-        owner=RESERVED_USER_LOCAL,
+        user_id=RESERVED_USER_LOCAL,
     )
     conv = conv_store.create_conversation(
         agent_id=None,

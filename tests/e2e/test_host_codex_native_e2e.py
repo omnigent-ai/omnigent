@@ -31,10 +31,9 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
-
-_CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
 
 # Marker file the cwd-resolution tests ask Codex to read back. It is placed
 # only in the session's intended cwd (worktree / picked workspace) and never
@@ -114,10 +113,10 @@ def _codex_native_agent_id(client: httpx.Client) -> str:
     resp = client.get("/v1/agents")
     resp.raise_for_status()
     for agent in resp.json()["data"]:
-        if agent["name"] == _CODEX_NATIVE_AGENT_NAME:
+        if agent["name"] == CODEX_NATIVE_AGENT_NAME:
             return str(agent["id"])
     raise AssertionError(
-        f"{_CODEX_NATIVE_AGENT_NAME!r} not registered on the server "
+        f"{CODEX_NATIVE_AGENT_NAME!r} not registered on the server "
         "(expected from _ensure_default_agents at startup)"
     )
 
@@ -264,6 +263,24 @@ def _poll_for_assistant_marker(
         f"No assistant message containing {marker!r} within {timeout}s — "
         "the codex-native message was not answered."
     )
+
+
+def _poll_for_child_session(
+    client: httpx.Client,
+    *,
+    parent_session_id: str,
+    timeout: float,
+) -> dict[str, object]:
+    """Poll until a Codex-native child appears under its parent."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{parent_session_id}/child_sessions")
+        if resp.status_code == 200:
+            children = resp.json().get("data", [])
+            if children:
+                return children[0]
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"No child session appeared within {timeout}s")
 
 
 def _poll_for_assistant_reply(
@@ -486,16 +503,16 @@ def test_codex_native_builtin_registered_at_startup(
     """
     The server auto-registers ``codex-native-ui`` as a built-in agent.
 
-    ``_ensure_default_codex_agent`` runs during lifespan startup and
+    ``_ensure_default_native_agents`` runs during lifespan startup and
     inserts the agent into the store. ``GET /v1/agents`` must list it
     so the Web UI new-session picker can offer Codex alongside Claude.
     """
     resp = http_client.get("/v1/agents")
     resp.raise_for_status()
     agent_names = {a["name"] for a in resp.json()["data"]}
-    assert _CODEX_NATIVE_AGENT_NAME in agent_names, (
-        f"Expected {_CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
-        f"{agent_names}. _ensure_default_codex_agent did not run or "
+    assert CODEX_NATIVE_AGENT_NAME in agent_names, (
+        f"Expected {CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
+        f"{agent_names}. _ensure_default_native_agents did not run or "
         f"used a different name."
     )
 
@@ -511,7 +528,7 @@ def test_codex_native_builtin_session_can_be_created(
     resp.raise_for_status()
     agent_id = None
     for agent in resp.json()["data"]:
-        if agent["name"] == _CODEX_NATIVE_AGENT_NAME:
+        if agent["name"] == CODEX_NATIVE_AGENT_NAME:
             agent_id = agent["id"]
             break
     assert agent_id is not None
@@ -644,6 +661,73 @@ def test_codex_native_builtin_session_round_trip(
         assert marker in _user_text(messages[first_user]), (
             f"user message text missing the prompt marker {marker!r}; "
             f"got {_user_text(messages[first_user])!r}"
+        )
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
+    reason=(
+        "codex-native subagent e2e needs `codex` on PATH and OMNIGENT_E2E_CODEX_NATIVE=1 to run"
+    ),
+)
+def test_codex_native_spawn_creates_child_session(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """A real Codex native spawn appears as an Omnigent child session."""
+    workspace = tmp_path / "codex_subagent_ws"
+    workspace.mkdir()
+    child_marker = f"CHILD_{uuid.uuid4().hex[:6].upper()}"
+    parent_marker = f"PARENT_{uuid.uuid4().hex[:6].upper()}"
+
+    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+    try:
+        host_id = _online_host_id(http_client, timeout=30.0)
+        agent_id = _codex_native_agent_id(http_client)
+        session_id = _create_codex_host_session(
+            http_client,
+            agent_id=agent_id,
+            host_id=host_id,
+            workspace=str(workspace),
+        )
+        _send_user_text(
+            http_client,
+            session_id=session_id,
+            text=(
+                "Use your native multi-agent tool to spawn exactly one subagent. "
+                f"Ask it to reply with exactly {child_marker}. Wait for it, then reply "
+                f"with exactly {parent_marker}."
+            ),
+        )
+
+        child = _poll_for_child_session(
+            http_client,
+            parent_session_id=session_id,
+            timeout=180.0,
+        )
+        child_id = str(child["id"])
+        labels = child.get("labels", {})
+        assert isinstance(labels, dict)
+        assert labels.get("omnigent.codex_native.subagent_thread_id")
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=child_id,
+            marker=child_marker,
+            timeout=180.0,
+        )
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=session_id,
+            marker=parent_marker,
+            timeout=180.0,
         )
     finally:
         daemon.send_signal(signal.SIGTERM)

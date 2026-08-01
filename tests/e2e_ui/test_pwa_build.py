@@ -37,7 +37,7 @@ def test_embed_build_ships_no_service_worker(built_spa: None, tmp_path: Path) ->
     """
     out = tmp_path / "embed"
     subprocess.run(
-        ["npm", "run", "build:embed", "--", "--outDir", str(out)],
+        ["pnpm", "run", "build:embed", "--outDir", str(out)],
         cwd=_WEB_DIR,
         check=True,
     )

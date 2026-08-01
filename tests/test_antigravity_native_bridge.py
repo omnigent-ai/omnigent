@@ -704,6 +704,9 @@ def _fast_tmux_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_mod, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(_mod, "_PASTE_COMMIT_TIMEOUT_S", 0.3)
     monkeypatch.setattr(_mod, "_SUBMIT_VERIFY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(_mod, "_VERIFY_PROBE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 5.0)
 
 
 def test_inject_user_message_via_tui_happy_path(
@@ -1044,6 +1047,231 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
     """Empty content is a programming error, not something to type into the TUI."""
     with pytest.raises(RuntimeError, match="non-empty content"):
         inject_user_message_via_tui(tmp_path / "bridge", content="")
+
+
+# ---------------------------------------------------------------------------
+# Collapsed-paste draft detection
+# ---------------------------------------------------------------------------
+
+
+def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
+    """
+    agy's collapsed-paste placeholder counts as a rendered draft.
+
+    Past ~13 line breaks agy replaces the pasted text with a single
+    ``[Pasted text #N +M lines]`` row instead of echoing it, so the needle is
+    never visible in the composer. Without this the render gate reads a
+    correctly pasted multi-line prompt as "never rendered".
+    """
+    baseline = "> "
+    pane = "> [Pasted text #1 +17 lines]\n? for shortcuts"
+    assert _mod._draft_in_input_region(pane, "Find the current weather", baseline)
+    # Once the placeholder leaves the composer the draft is gone (submit verified).
+    submitted = "> \n? for shortcuts"
+    assert not _mod._draft_in_input_region(submitted, "Find the current weather", baseline)
+
+
+def test_inject_user_message_via_tui_submits_a_collapsed_paste(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A multi-line prompt agy collapses is still submitted, not reported as lost.
+
+    Reproduces the polly sub-agent dispatch: the task prompt is long enough that
+    agy shows only the placeholder, which previously failed the render gate and
+    raised "did not render the pasted message" while the draft sat in the
+    composer.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "\n".join(f"Find the current weather line {i}" for i in range(1, 19))
+    tui = {"pane": "> \n? for shortcuts"}
+    enters = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """agy collapses the paste, then starts a turn on Enter."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> [Pasted text #1 +18 lines]\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            enters["n"] += 1
+            tui["pane"] = "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert enters["n"] == 1, "the collapsed draft should submit on the first Enter"
+
+
+# ---------------------------------------------------------------------------
+# Account-verification re-delivery
+# ---------------------------------------------------------------------------
+
+
+_VERIFYING_PANE = (
+    "⚠ Verifying your account...\n"
+    "  ⎿  We're finishing verifying your account eligibility.\n"
+    "     This usually takes a moment. Please try again shortly.\n"
+    "> \n? for shortcuts"
+)
+
+
+def test_inject_user_message_via_tui_redelivers_while_account_verifying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A turn agy answers with its account-verification notice is re-delivered.
+
+    agy consumes a turn submitted before its startup eligibility check settles —
+    the draft leaves the composer, so the submit verifies — and renders the
+    notice instead of starting a cascade. Without a re-delivery the turn is lost
+    and the terminal sits idle, which is what a programmatically dispatched
+    sub-agent hits on every launch.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+    pastes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Reject the first submit with the notice; start a turn on the second."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            pastes["n"] += 1
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = _VERIFYING_PANE if pastes["n"] == 1 else "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert pastes["n"] == 2, "expected the rejected turn to be re-delivered once"
+
+
+def test_inject_user_message_via_tui_raises_when_account_verification_never_clears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    Re-delivery is bounded: a never-clearing notice surfaces a clear error.
+
+    Retrying forever would hang the turn; the executor needs a failure it can
+    surface so the user learns the account is not usable yet.
+    """
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Every submit is answered with the verification notice."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = _VERIFYING_PANE
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="still verifying the Antigravity account"):
+        inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+
+def test_inject_user_message_via_tui_does_not_redeliver_an_accepted_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A stale notice left on screen from a prior attempt never causes a duplicate.
+
+    agy clears the notice only when a turn actually starts, so the running-turn
+    marker must win over notice text still visible in the same capture.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+    pastes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Start a turn while the previous attempt's notice is still rendered."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            pastes["n"] += 1
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = _VERIFYING_PANE.replace("? for shortcuts", "esc to cancel")
+        return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert pastes["n"] == 1, "a running turn must not be re-delivered"
+
+
+def test_inject_user_message_via_tui_ignores_stale_notice_with_changed_active_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A renamed active footer still prevents a stale-notice duplicate."""
+    monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 0.2)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "do the thing"
+    tui = {"pane": "> \n? for shortcuts"}
+    pastes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Reject once, then accept while the stale notice remains visible."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            pastes["n"] += 1
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = (
+                _VERIFYING_PANE
+                if pastes["n"] == 1
+                else _VERIFYING_PANE.replace(
+                    "? for shortcuts", "(generating response, press the cancel key to stop)"
+                )
+            )
+        return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert pastes["n"] == 2, "the accepted retry must not be delivered again"
 
 
 # ---------------------------------------------------------------------------

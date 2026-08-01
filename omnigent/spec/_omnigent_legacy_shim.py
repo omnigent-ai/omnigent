@@ -41,8 +41,8 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Mapping
+from typing import Protocol, TypeAlias, cast
 
 from omnigent.policies.types import EvaluationContext
 from omnigent.spec.types import Phase
@@ -59,6 +59,19 @@ from omnigent.spec.types import Phase
 _LEGACY_FIRST_PARAM = "content"
 _LEGACY_SECOND_PARAM = "phase"
 
+_JsonObject: TypeAlias = dict[str, object]
+
+
+class _PolicyCallable(Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        raise NotImplementedError
+
+
+class _AsyncPolicyCallable(Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> Awaitable[object]:
+        raise NotImplementedError
+
+
 # Maps Omnigent' :class:`Phase` enum to the string literal
 # the legacy callable expects as its ``phase`` argument.
 _PHASE_TO_LEGACY_STR: dict[Phase, str] = {
@@ -73,9 +86,9 @@ _PHASE_TO_LEGACY_STR: dict[Phase, str] = {
 
 def build(
     target: str,
-    factory_kwargs: dict[str, Any] | None = None,
+    factory_kwargs: Mapping[str, object] | None = None,
     configured_phases: list[str] | None = None,
-) -> Callable[..., Any]:
+) -> _PolicyCallable:
     """
     Factory invoked by :class:`FunctionPolicySpec` dispatch when
     loading an omnigent-sourced function policy.
@@ -116,21 +129,22 @@ def build(
     """
     module_path, attr = target.rsplit(".", 1)
     module = importlib.import_module(module_path)
-    fn = getattr(module, attr)
+    resolved: object = getattr(module, attr)
     if factory_kwargs:
-        fn = fn(**factory_kwargs)
-    if not callable(fn):
+        resolved = cast(_PolicyCallable, resolved)(**factory_kwargs)
+    if not callable(resolved):
         raise TypeError(
             f"legacy-shim target {target!r} resolved to "
-            f"{type(fn).__name__}; expected a callable "
+            f"{type(resolved).__name__}; expected a callable "
             f"(or a factory returning one when factory_kwargs is set).",
         )
+    fn = cast(_PolicyCallable, resolved)
     if not _has_legacy_signature(fn):
         return fn
     return _wrap_legacy(fn, configured_phases=configured_phases)
 
 
-def _has_legacy_signature(fn: Callable[..., Any]) -> bool:
+def _has_legacy_signature(fn: _PolicyCallable) -> bool:
     """
     True iff *fn*'s first two positional parameters are named
     ``content`` then ``phase`` (the legacy omnigent convention).
@@ -158,7 +172,7 @@ def _has_legacy_signature(fn: Callable[..., Any]) -> bool:
     return positional_names[:2] == [_LEGACY_FIRST_PARAM, _LEGACY_SECOND_PARAM]
 
 
-def _coerce_legacy_return(result: Any) -> Any:
+def _coerce_legacy_return(result: object) -> object:
     """
     Convert a legacy callable's return value to the format expected
     by :func:`omnigent.policies.function._coerce_to_policy_result`.
@@ -178,7 +192,7 @@ def _coerce_legacy_return(result: Any) -> Any:
     """
     if isinstance(result, dict) and "action" in result and "decision" not in result:
         action = str(result.get("action", "allow")).upper()
-        decision: dict[str, Any] = {"result": action}
+        decision: _JsonObject = {"result": action}
         if result.get("reason") is not None:
             decision["reason"] = result["reason"]
         return decision
@@ -186,10 +200,10 @@ def _coerce_legacy_return(result: Any) -> Any:
 
 
 def _wrap_legacy(
-    fn: Callable[..., Any],
+    fn: _PolicyCallable,
     *,
     configured_phases: list[str] | None = None,
-) -> Callable[..., Any]:
+) -> _PolicyCallable:
     """
     Wrap a legacy ``(content, phase)`` or ``(content, phase,
     context)`` callable so it can be invoked as
@@ -223,11 +237,12 @@ def _wrap_legacy(
     reset_turn_fn = getattr(fn, "reset_turn", None)
 
     if is_async:
+        async_fn = cast(_AsyncPolicyCallable, fn)
 
         async def _async_shim(
             ctx: EvaluationContext,
-            context: dict[str, Any],
-        ) -> Any:
+            context: _JsonObject,
+        ) -> object:
             """Async wrapper for legacy async policies."""
             args = _convert_args(
                 ctx,
@@ -235,17 +250,17 @@ def _wrap_legacy(
                 wants_context=wants_context,
                 configured_phases=configured_phases,
             )
-            result = await fn(*args)
+            result = await async_fn(*args)
             return _coerce_legacy_return(result)
 
         if callable(reset_turn_fn):
             _async_shim.reset_turn = reset_turn_fn  # type: ignore[attr-defined]
-        return _async_shim
+        return cast(_PolicyCallable, _async_shim)
 
     def _sync_shim(
         ctx: EvaluationContext,
-        context: dict[str, Any],
-    ) -> Any:
+        context: _JsonObject,
+    ) -> object:
         """Sync wrapper for legacy sync policies."""
         args = _convert_args(
             ctx,
@@ -258,10 +273,10 @@ def _wrap_legacy(
 
     if callable(reset_turn_fn):
         _sync_shim.reset_turn = reset_turn_fn  # type: ignore[attr-defined]
-    return _sync_shim
+    return cast(_PolicyCallable, _sync_shim)
 
 
-def _positional_arity(fn: Callable[..., Any]) -> int:
+def _positional_arity(fn: _PolicyCallable) -> int:
     """
     Count positional parameters on *fn*.
 
@@ -288,7 +303,7 @@ def _positional_arity(fn: Callable[..., Any]) -> int:
     )
 
 
-def _v0_event_to_legacy_phase(event: dict[str, Any]) -> str:
+def _v0_event_to_legacy_phase(event: Mapping[str, object]) -> str:
     """
     Map an event ``type`` string to the legacy phase string.
 
@@ -302,10 +317,11 @@ def _v0_event_to_legacy_phase(event: dict[str, Any]) -> str:
     """
     # Inner system uses "request"/"response"/"tool_call"/"tool_result" —
     # legacy callables expect the same strings (these were chosen to match).
-    return event.get("type", "request")
+    event_type = event.get("type")
+    return event_type if isinstance(event_type, str) else "request"
 
 
-def _v0_event_to_legacy_content(event: dict[str, Any]) -> Any:
+def _v0_event_to_legacy_content(event: Mapping[str, object]) -> object:
     """
     Extract the legacy ``content`` value from an event dict.
 
@@ -326,12 +342,12 @@ def _v0_event_to_legacy_content(event: dict[str, Any]) -> Any:
 
 
 def _convert_args(
-    ctx: EvaluationContext | dict[str, Any],
-    context: dict[str, Any],
+    ctx: EvaluationContext | _JsonObject,
+    context: Mapping[str, object],
     *,
     wants_context: bool,
     configured_phases: list[str] | None = None,
-) -> tuple[Any, ...]:
+) -> tuple[object, ...]:
     """
     Produce ``(content, phase)`` or
     ``(content, phase, context)`` from Omnigent'
@@ -364,8 +380,9 @@ def _convert_args(
         phase_str = _v0_event_to_legacy_phase(ctx)
         legacy_content = _v0_event_to_legacy_content(ctx)
         if wants_context:
-            labels = ctx.get("context", {}).get("labels", {})
-            leg_ctx: dict[str, Any] = {"labels": labels}
+            event_context = ctx.get("context")
+            labels = event_context.get("labels", {}) if isinstance(event_context, dict) else {}
+            leg_ctx: _JsonObject = {"labels": labels}
             if configured_phases is not None:
                 leg_ctx["configured_phases"] = configured_phases
             if ctx.get("target"):
@@ -384,7 +401,7 @@ def _convert_args(
     return (legacy_content, phase_str)
 
 
-def _legacy_content(ctx: EvaluationContext) -> Any:
+def _legacy_content(ctx: EvaluationContext) -> object:
     """
     Convert ``ctx.content`` to the per-phase shape the legacy
     callable expects.
@@ -428,7 +445,7 @@ def _legacy_content(ctx: EvaluationContext) -> Any:
     return _maybe_parse_json(ctx.content)
 
 
-def _maybe_parse_json(value: Any) -> Any:
+def _maybe_parse_json(value: object) -> object:
     """
     Try to parse a JSON-encoded string into its native form.
 
@@ -446,17 +463,18 @@ def _maybe_parse_json(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     try:
-        return json.loads(value)
+        parsed: object = json.loads(value)
+        return parsed
     except (json.JSONDecodeError, ValueError):
         return value
 
 
 def _legacy_context(
     ctx: EvaluationContext,
-    engine_context: dict[str, Any],
+    engine_context: Mapping[str, object],
     *,
     configured_phases: list[str] | None = None,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """
     Build the ``context`` dict a 3-arg legacy callable expects.
 
@@ -487,7 +505,7 @@ def _legacy_context(
     :returns: A fresh dict combining all sources. Never
         mutates *engine_context*.
     """
-    legacy: dict[str, Any] = {"labels": engine_context.get("labels", {})}
+    legacy: _JsonObject = {"labels": engine_context.get("labels", {})}
     if configured_phases is not None:
         legacy["configured_phases"] = list(configured_phases)
     # Native omnigent only adds ``tool_name`` on

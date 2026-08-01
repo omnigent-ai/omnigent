@@ -12,6 +12,12 @@ from omnigent.spec.parser import discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
+@pytest.fixture(autouse=True)
+def _clean_container_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure OMNIGENT_CONTAINER_RUNTIME never leaks from the host environment."""
+    monkeypatch.delenv("OMNIGENT_CONTAINER_RUNTIME", raising=False)
+
+
 @pytest.fixture()
 def agent_dir(tmp_path: Path) -> Path:
     """Create a minimal valid agent image directory."""
@@ -1301,6 +1307,67 @@ def test_parse_tools_sandbox_container_image_precedence(tmp_path: Path) -> None:
     assert spec.tools.sandbox.docker_image == "python:3.12-slim"
 
 
+def test_parse_tools_sandbox_runtime_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_CONTAINER_RUNTIME env var is used when YAML omits container_runtime."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    config = {
+        "spec_version": 1,
+        "name": "env-var-runtime",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_runtime == "podman"
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+
+
+def test_parse_tools_sandbox_yaml_beats_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit YAML container_runtime takes precedence over the env var."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    config = {
+        "spec_version": 1,
+        "name": "yaml-beats-env",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "container_runtime": "docker",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_runtime == "docker"
+
+
+def test_parse_tools_sandbox_null_runtime_rejected(tmp_path: Path) -> None:
+    """``container_runtime: null`` in YAML is rejected, not silently ignored."""
+    config = {
+        "spec_version": 1,
+        "name": "null-runtime",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "container_runtime": None,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(ValueError, match="container_runtime"):
+        parse(tmp_path)
+
+
 def test_parse_inline_mcp_skips_non_mcp_type_entries(tmp_path: Path) -> None:
     """
     Tools-block entries whose ``type`` is not ``"mcp"`` are silently
@@ -1775,6 +1842,86 @@ def test_parse_os_env_sandbox_cwd_hidden_scan_defaults(tmp_path: Path) -> None:
     assert spec.os_env is not None and spec.os_env.sandbox is not None
     assert spec.os_env.sandbox.cwd_hidden_scan_max_entries == 50000
     assert spec.os_env.sandbox.cwd_hidden_scan_overflow == "warn"
+    assert spec.os_env.sandbox.cwd_hidden_scan_recursive is False
+    assert spec.os_env.sandbox.mask_paths is None
+
+
+def test_parse_os_env_sandbox_mask_and_recursive_explicit_values(tmp_path: Path) -> None:
+    """
+    Explicit ``cwd_hidden_scan_recursive`` + ``mask_paths`` values
+    pass through to the spec unchanged.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "tuned-mask",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "cwd_hidden_scan_recursive": True,
+                "mask_paths": ["config/production.key", "~/secrets"],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.os_env is not None and spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_hidden_scan_recursive is True
+    assert spec.os_env.sandbox.mask_paths == ["config/production.key", "~/secrets"]
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    ["yes", 1, ["true"]],
+    ids=["string", "int", "list"],
+)
+def test_parse_os_env_sandbox_cwd_hidden_scan_recursive_validation(
+    tmp_path: Path, bad_value: object
+) -> None:
+    """Non-boolean ``cwd_hidden_scan_recursive`` fails at parse time."""
+    config = {
+        "spec_version": 1,
+        "name": "bad-recursive",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "cwd_hidden_scan_recursive": bad_value,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"must be a boolean"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "bad_value,match_regex",
+    [
+        ("not-a-list", r"must be a list"),
+        ([123], r"entries must be strings"),
+        ([""], r"must not be empty strings"),
+    ],
+    ids=["not_list", "non_string_entry", "empty_entry"],
+)
+def test_parse_os_env_sandbox_mask_paths_validation(
+    tmp_path: Path, bad_value: object, match_regex: str
+) -> None:
+    """``mask_paths`` must be a list of non-empty strings."""
+    config = {
+        "spec_version": 1,
+        "name": "bad-mask",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "mask_paths": bad_value,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match_regex):
+        parse(tmp_path)
 
 
 def test_parse_os_env_sandbox_cwd_hidden_scan_explicit_values(tmp_path: Path) -> None:
@@ -3382,13 +3529,105 @@ def test_parse_credential_proxy_https_env_optional(tmp_path: Path) -> None:
     assert entry.inject_env == []
 
 
+def test_parse_credential_proxy_databricks_cli(tmp_path: Path) -> None:
+    """A ``databricks_cli`` entry parses into a profile-keyed policy.
+
+    Unlike the host-keyed types it lands on ``credential_proxy.databricks``
+    (not ``entries``), preserving the profile list and default. If this
+    broke, the runtime would never materialize the ``.databrickscfg`` or
+    resolve the profiles.
+    """
+    config = _credential_proxy_config(
+        [
+            {
+                "type": "databricks_cli",
+                "profiles": ["dbc-adb7b1a3-9097", "oss"],
+                "default": "dbc-adb7b1a3-9097",
+            }
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    proxy = spec.os_env.sandbox.credential_proxy
+    assert proxy is not None
+    assert proxy.entries == []
+    assert proxy.databricks is not None
+    assert [b.profile for b in proxy.databricks.profiles] == ["dbc-adb7b1a3-9097", "oss"]
+    assert proxy.databricks.default == "dbc-adb7b1a3-9097"
+
+
+@pytest.mark.parametrize(
+    "entry,match",
+    [
+        # ``default`` must name one of the listed profiles.
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "default": "b"},
+            r"'default' 'b' must be one of 'profiles'",
+        ),
+        # Empty ``profiles`` list.
+        ({"type": "databricks_cli", "profiles": []}, r"non-empty 'profiles' list"),
+        # A host-keyed field doesn't apply.
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "target": "h.example.com"},
+            r"databricks_cli does not accept 'target'",
+        ),
+        # ``source`` doesn't apply (resolved from the profile).
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "source": {"env": "X"}},
+            r"databricks_cli does not accept 'source'",
+        ),
+        # Duplicate profile within one entry.
+        (
+            {"type": "databricks_cli", "profiles": ["a", "a"]},
+            r"more than once",
+        ),
+    ],
+)
+def test_parse_credential_proxy_databricks_cli_fail_loud(
+    tmp_path: Path, entry: dict[str, object], match: str
+) -> None:
+    """Malformed ``databricks_cli`` entries fail loudly at parse time."""
+    config = _credential_proxy_config([entry])
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_databricks_cli_rejected_on_macos(tmp_path: Path) -> None:
+    """``databricks_cli`` is rejected on macOS (``darwin_seatbelt``).
+
+    The ``databricks`` CLI is a Go binary and Go on macOS ignores
+    ``SSL_CERT_FILE`` (the var the egress MITM proxy uses to publish its
+    CA), so every call would fail with an opaque TLS error. Fail loud at
+    parse time instead.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-dbx-macos",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "darwin_seatbelt",
+                "egress_rules": ["* corp.example.com/**"],
+                "credential_proxy": [{"type": "databricks_cli", "profiles": ["a"]}],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"databricks_cli' does not work\s+on macOS"):
+        parse(tmp_path)
+
+
 @pytest.mark.parametrize(
     "entries,match",
     [
         # Unknown ``type`` — caught by the pydantic ``Literal``.
         ([{"type": "bogus", "source": {"env": "X"}}], r"type: Input should be"),
-        # Missing ``source`` — pydantic ``Field required``.
-        ([{"type": "https_bearer", "target": "h.example.com"}], r"source: Field required"),
+        # Missing ``source`` — required for the host-keyed types (the
+        # field is optional at the pydantic layer because ``databricks_cli``
+        # forbids it, so the requirement is enforced in the model validator).
+        ([{"type": "https_bearer", "target": "h.example.com"}], r"source is required"),
         # ``source`` as a bare string (the old surface) is now rejected —
         # it must be a nested ``{env|file|command: ...}`` mapping.
         (

@@ -63,8 +63,8 @@
     let url;
     try {
       url = new URL(withScheme);
-    } catch (e) {
-      throw new Error(`invalid URL: ${e.message}`);
+    } catch (error) {
+      throw new Error(`invalid URL: ${error.message}`, { cause: error });
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`unsupported scheme '${url.protocol}' (use http/https)`);

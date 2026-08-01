@@ -12,6 +12,7 @@
 
 import { createPortal } from "react-dom";
 import {
+  isValidElement,
   lazy,
   Suspense,
   useCallback,
@@ -19,7 +20,9 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
   type RefObject,
+  type UIEvent,
 } from "react";
 import {
   AtSignIcon,
@@ -39,11 +42,13 @@ import remarkEmoji from "remark-emoji";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
-import { type Comment } from "@/hooks/useComments";
+import { mermaid } from "@streamdown/mermaid";
+import { Streamdown } from "streamdown";
+import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
   fileContentToBlob,
-  useFileContent,
+  type useFileContent,
 } from "@/hooks/useFileContent";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
@@ -56,11 +61,13 @@ import {
   indexToLine,
   isBinaryPath,
   isImageFile,
+  isModelFile,
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
+import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
@@ -78,6 +85,11 @@ const MonacoCodeEditor = lazy(() =>
 // react-pdf + pdf.js (worker) is heavy; load it only when a PDF is actually
 // viewed so it never enters the initial bundle.
 const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.PdfViewer })));
+
+// three.js (+ its loaders) is heavy; load the 3D model viewer only when a
+// model file is actually opened so it stays out of the main bundle (same
+// lazy strategy as Monaco).
+const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m.ModelViewer })));
 
 // ---------------------------------------------------------------------------
 // MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
@@ -126,6 +138,18 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
 ];
 
+const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
+
+function MermaidPreview({ source }: { source: string }) {
+  return (
+    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
+      <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
+        {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
+      </Streamdown>
+    </div>
+  );
+}
+
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
 // GitHub honors explicit dimensions, so mirror them onto an inline style —
@@ -133,6 +157,16 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
 // after sanitize (React components render the already-sanitized tree), so it
 // adds no attack surface. Only literal integer pixel values are forwarded.
 const MARKDOWN_COMPONENTS: Components = {
+  pre({ children, ...props }) {
+    const child = isValidElement(children) ? children : null;
+    if (
+      isValidElement<{ className?: string; children?: ReactNode }>(child) &&
+      child.props.className?.split(/\s+/).includes("language-mermaid")
+    ) {
+      return <MermaidPreview source={String(child.props.children ?? "")} />;
+    }
+    return <pre {...props}>{children}</pre>;
+  },
   img({ node: _node, width, height, style, ...props }) {
     const px = (v: string | number | undefined) =>
       typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ? `${v}px` : undefined;
@@ -149,14 +183,17 @@ const MARKDOWN_COMPONENTS: Components = {
 function MarkdownPreview({
   content,
   rootRef,
+  onScroll,
 }: {
   content: string;
   rootRef?: RefObject<HTMLDivElement | null>;
+  onScroll?: (event: UIEvent<HTMLElement>) => void;
 }) {
   return (
     <div
       ref={rootRef}
       data-preview-scroll
+      onScroll={onScroll}
       className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
     >
       <ReactMarkdown
@@ -181,6 +218,8 @@ function PreviewWithSearch({
   searchOpen,
   onSearchHandled,
   searchInputRef,
+  scrollKey,
+  scrollReady,
 }: {
   content: string;
   isNotebook: boolean;
@@ -188,8 +227,15 @@ function PreviewWithSearch({
   searchOpen: boolean;
   onSearchHandled: () => void;
   searchInputRef: RefObject<HTMLInputElement | null>;
+  /** Persist/restore the preview's scroll position under this cache key. */
+  scrollKey: string | null;
+  /** True once the file content backing the preview is present. */
+  scrollReady: boolean;
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
+  // The preview div (not the FileViewer content area) is the real scroller
+  // here, so scroll persistence attaches to it directly.
+  const handleScroll = useScrollRestore(previewRef, scrollKey, scrollReady);
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
@@ -200,9 +246,9 @@ function PreviewWithSearch({
     />
   );
   const preview = isNotebook ? (
-    <NotebookPreview content={content} rootRef={previewRef} />
+    <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   ) : (
-    <MarkdownPreview content={content} rootRef={previewRef} />
+    <MarkdownPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   );
   // The find bar sits above the preview; a truncated preview also shows the
   // banner. The bar renders nothing when closed, so layout is unchanged then.
@@ -648,6 +694,19 @@ export function CodeViewer({
       </Suspense>
     );
   }
+  if (fileQuery.data && isModelFile(path, fileQuery.data.content_type)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading 3D preview…
+          </div>
+        }
+      >
+        <ModelViewer data={fileQuery.data} path={path} />
+      </Suspense>
+    );
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
@@ -701,6 +760,8 @@ export function CodeViewer({
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}
         searchInputRef={searchInputRef}
+        scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
+        scrollReady={fileQuery.data !== undefined}
       />
     );
   }

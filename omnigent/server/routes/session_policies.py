@@ -38,6 +38,10 @@ from omnigent.spec.types import FunctionPolicySpec, PolicySpec
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import PolicyDeletedEvent as _TelPolicyDeletedEvent
+from omnigent.telemetry.events import PolicyRegisteredEvent as _TelPolicyRegisteredEvent
+from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 
 
 def _generate_policy_id() -> str:
@@ -208,6 +212,26 @@ def create_session_policies_router(
                 code=ErrorCode.CONFLICT,
             ) from exc
         invalidate_session_policy_specs_cache(session_id)
+        try:
+            import hashlib as _hashlib
+
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyRegisteredEvent(
+                    installation_id=_srv_id,
+                    handler=policy.handler,
+                    policy_type=policy.type,
+                    scope="session",
+                    session_id=session_id,
+                    anon_user_id=_anon,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return _entity_to_response(policy)
 
     @router.get("/sessions/{session_id}/policies")
@@ -297,7 +321,9 @@ def create_session_policies_router(
             unchanged.
         :returns: The updated policy as a serialized dict.
         :raises OmnigentError: 401/403 if the user lacks edit
-            permission, or 404 if the policy is not found.
+            permission, 404 if the policy is not found, or 409 if
+            renaming would collide with another policy in this
+            session.
         """
         user_id = get_user_id(request, auth_provider)
         if permission_store is not None:
@@ -331,13 +357,19 @@ def create_session_policies_router(
                         f"must add custom handlers via the 'policy_modules' config.",
                         code=ErrorCode.INVALID_INPUT,
                     )
-        policy = store.update(
-            policy_id,
-            session_id,
-            name=body.name,
-            handler=body.handler,
-            enabled=body.enabled,
-        )
+        try:
+            policy = store.update(
+                policy_id,
+                session_id,
+                name=body.name,
+                handler=body.handler,
+                enabled=body.enabled,
+            )
+        except IntegrityError as exc:
+            raise OmnigentError(
+                f"Policy with name '{body.name}' already exists in this session",
+                code=ErrorCode.CONFLICT,
+            ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
         invalidate_session_policy_specs_cache(session_id)
@@ -371,6 +403,24 @@ def create_session_policies_router(
             )
         store.delete(policy_id, session_id)
         invalidate_session_policy_specs_cache(session_id)
+        try:
+            import hashlib as _hashlib
+
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyDeletedEvent(
+                    installation_id=_srv_id,
+                    scope="session",
+                    session_id=session_id,
+                    anon_user_id=_anon,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"deleted": True}
 
     return router

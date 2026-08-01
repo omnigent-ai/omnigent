@@ -99,26 +99,27 @@ export function CommentsPanel({
   const currentAuthorId = getCurrentAuthorId();
   const canModify = (c: Comment): boolean =>
     canEdit && (c.created_by == null || c.created_by === currentAuthorId);
+  const activeSelectionStart = activeSelection?.start_index;
+  const activeSelectionEnd = activeSelection?.end_index;
 
   useEffect(() => {
     setBody("");
     if (pendingBodyRef) pendingBodyRef.current = "";
-  }, [activeSelection?.start_index, activeSelection?.end_index]);
+  }, [activeSelectionStart, activeSelectionEnd, pendingBodyRef]);
 
   // Auto-focus the textarea when a new pending selection appears (no existing
   // comment at that range) so the user can start typing immediately.
   useEffect(() => {
-    if (!activeSelection) return;
+    if (activeSelectionStart == null || activeSelectionEnd == null) return;
     const isExisting = comments.some(
-      (c) =>
-        c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index,
+      (c) => c.start_index === activeSelectionStart && c.end_index === activeSelectionEnd,
     );
     if (!isExisting) {
       // rAF ensures the textarea has been rendered before we try to focus it.
       const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
       return () => cancelAnimationFrame(id);
     }
-  }, [activeSelection?.start_index, activeSelection?.end_index, comments]);
+  }, [activeSelectionStart, activeSelectionEnd, comments]);
 
   // Selecting a highlighted range in the file activates its comment; if that
   // comment lives on the other tab, switch to the tab that holds it so its card

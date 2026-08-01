@@ -9,6 +9,14 @@
   "rules": {
     "react/react-in-jsx-scope": "off",
     "import/no-unassigned-import": "off",
+    "import/newline-after-import": "error",
+    "import/no-cycle": "error",
+    "import/no-duplicates": "error",
+    "no-empty": "error",
+    "no-fallthrough": "error",
+    "no-multi-assign": "error",
+    "no-param-reassign": "error",
+    "no-promise-executor-return": "error",
     "no-restricted-globals": [
       "error",
       {
@@ -16,6 +24,23 @@
         "message": "Don't call the bare global fetch(). Use hostFetch (@/lib/host) or authenticatedFetch (@/lib/identity) so requests route through the embed host transport. The only allowed bare fetch() is the choke point in src/lib/host.ts."
       }
     ],
+    "no-throw-literal": "error",
+    "no-unreachable-loop": "error",
+    "no-useless-assignment": "error",
+    "prefer-object-has-own": "error",
+    "react/button-has-type": "error",
+    "react/jsx-no-useless-fragment": "error",
+    "react/no-react-children": "error",
+    "react-hooks/rules-of-hooks": "error",
+    "typescript/array-type": "error",
+    "typescript/consistent-generic-constructors": "error",
+    "typescript/consistent-type-definitions": "error",
+    "typescript/consistent-type-imports": "error",
+    "typescript/method-signature-style": "error",
+    "typescript/no-dynamic-delete": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/no-import-type-side-effects": "error",
+    "typescript/no-inferrable-types": "error",
     "no-restricted-imports": [
       "error",
       {

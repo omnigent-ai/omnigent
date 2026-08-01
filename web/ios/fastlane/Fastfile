@@ -120,6 +120,33 @@ platform :ios do
     )
   end
 
+  desc "Build and run the Omnigent app in the iOS Simulator"
+  lane :simulator do |options|
+    device = options[:device] || ENV.fetch("OMNIGENT_IOS_SIMULATOR", "iPhone 17 Pro")
+    build_dir = File.expand_path("build", __dir__)
+
+    # Build the .app for simulator
+    xcodebuild(
+      project: "Omnigent.xcodeproj",
+      scheme: "Omnigent",
+      configuration: "Debug",
+      destination: "platform=iOS Simulator,name=#{device}",
+      derivedDataPath: build_dir,
+      build_settings: {
+        "CODE_SIGNING_ALLOWED" => "NO",
+      }
+    )
+
+    app_path = File.join(build_dir, "Build/Products/Debug-iphonesimulator/Omnigent.app")
+
+    # Boot, install, and launch
+    sh("xcrun simctl boot '#{device}' || true") # || true so already-booted is fine
+    sh("xcrun simctl install booted '#{app_path}'")
+    sh("xcrun simctl launch booted ai.omnigent.ios")
+
+    UI.success("Launched on #{device}")
+  end
+
   desc "Generate App Store screenshots with fastlane snapshot"
   lane :screenshots do
     repo_root = File.expand_path("../../..", __dir__)
