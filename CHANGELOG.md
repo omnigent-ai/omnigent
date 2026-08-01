@@ -53,7 +53,7 @@ website under `/releases`.
 - [Bug fix] Credential proxy no longer attaches injected credentials to TRACE/OPTIONS requests, and the egress proxy now honors Max-Forwards as a conformant intermediary. (#3029)
 - [Docs] N/A — internal documentation cleanup. (#3031)
 - [Feature] Import local Qwen, Kiro, Pi, and Kimi coding chats into Omnigent (#3032)
-- [UI / Feature] Press ⌘⌥V (Ctrl+Alt+V) to toggle voice dictation from anywhere; while dictating, Enter keeps the text and Esc discards it (#3044)
+- [UI / Feature] Press ⌘⌥V (Ctrl+Alt+V) to toggle voice dictation anywhere in the focused Omnigent window; while dictating, Enter keeps the text and Esc discards it (#3044)
 - [UI / Feature] Added: "Auto · smart routing" harness option in the new-chat picker — lets the intelligent router pick both harness and model based on the task description (#3045)
 - [Feature] Import existing OpenCode chats, including files and tool activity, with `omnigent import` (#3046)
 - [Bug fix] Dictation streams now reliably release their worker slot when a browser disconnects abruptly. (#3048)

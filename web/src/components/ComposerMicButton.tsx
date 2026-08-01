@@ -439,9 +439,8 @@ export const ComposerMicButton = ({
     }
   }, [isListening, Ctor, preferences.path, serverAvailable, toggleServer]);
 
-  // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
-  // whenever dictation could run (Web Speech OR the server path) and the
-  // composer isn't disabled, so the chord is inert when it can't do anything.
+  // ⌘⌥V toggles dictation anywhere in the focused Omnigent window. It isn't an
+  // OS-global shortcut. Keep it inert when the selected path cannot run.
   const pathAvailable =
     preferences.path === "server"
       ? serverAvailable
