@@ -35,6 +35,17 @@ def test_scan_flags_python_positional_argument(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["gemini-3.5-flash", "gemini-2.0", "gemini-3-pro", "gemini-2-5-pro"],
+)
+def test_scan_flags_gemini_release_ids(tmp_path: Path, model: str) -> None:
+    dirty = tmp_path / "dirty.py"
+    dirty.write_text(f'MODEL = "{model}"\n')
+
+    assert [(hit.line, hit.model) for hit in scan(dirty)] == [(1, model)]
+
+
 def test_scan_flags_python_bare_collection(tmp_path: Path) -> None:
     dirty = tmp_path / "dirty.py"
     dirty.write_text('("databricks-claude-sonnet-4-6", "gpt-oss-120b")\n')
@@ -49,7 +60,7 @@ def test_scan_ignores_model_family_fragments(tmp_path: Path) -> None:
     clean = tmp_path / "clean.py"
     clean.write_text(
         'prefixes = ("databricks-claude-opus-", "databricks-claude-fable-")\n'
-        'families = ("gpt-oss",)\n'
+        'families = ("gpt-oss", "gemini-2-5")\n'
     )
 
     assert scan(clean) == []

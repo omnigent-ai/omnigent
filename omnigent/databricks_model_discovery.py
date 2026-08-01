@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
 
 import httpx
 
@@ -68,7 +67,7 @@ def _list_model_service_ids(
             params=params,
         )
         response.raise_for_status()
-        payload: Any = response.json()
+        payload: object = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Databricks model-services response must be an object")
         services = payload.get("model_services")
@@ -111,7 +110,7 @@ def _list_anthropic_gateway_ids(
         headers=headers,
     )
     response.raise_for_status()
-    payload: Any = response.json()
+    payload: object = response.json()
     if not isinstance(payload, dict):
         raise ValueError("Databricks Anthropic models response must be an object")
     data = payload.get("data")

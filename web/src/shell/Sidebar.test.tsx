@@ -1026,6 +1026,28 @@ describe("Sidebar project sections", () => {
     expect(within(projectSection).getByText("conv_far_2")).toBeInTheDocument();
   });
 
+  it("shows a window member inside the folder even when the folder's own fetch lacks it", () => {
+    // The optimistic-move frame: the row already carries the folder's
+    // first-class id in the loaded window (useMoveToProject's overlay), but
+    // the folder's own fetch answered before the PATCH committed and lacks
+    // it. The folder body unions both sources, so the just-moved row is
+    // visible immediately instead of waiting out the PATCH + refetch chain.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_unfiled", "Claude Code"),
+      conv("conv_moved", "Claude Code", { project_id: "p_Customer X" }),
+    ]);
+    projectSessionsMock.current["Customer X"] = [];
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const projectSection = screen.getByText("Customer X").closest("section")!;
+    expect(within(projectSection).getByText("conv_moved")).toBeInTheDocument();
+    // Grouped out of the flat Sessions list, not duplicated there.
+    const recentSection = screen.getByText("Sessions").closest("section")!;
+    expect(within(recentSection).queryByText("conv_moved")).toBeNull();
+  });
+
   it("offers a pencil that starts a new session pre-filed under the project", () => {
     projectsMock.push("Customer X");
     mockConversations([

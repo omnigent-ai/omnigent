@@ -77,9 +77,6 @@ from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
-from omnigent.policies.types import (
-    PolicyAction,
-)
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
@@ -90,13 +87,19 @@ from omnigent.runner.identity import (
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
-    get_agent_cache,
-    get_caps,
+    get_agent_cache as _runtime_get_agent_cache,
+)
+from omnigent.runtime import (
+    get_caps as _runtime_get_caps,
+)
+from omnigent.runtime import (
     get_policy_store,
     pending_elicitations,
     pending_inputs,
-    session_stream,
     user_session_stream,
+)
+from omnigent.runtime import (
+    session_stream as session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -147,7 +150,7 @@ from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
-    get_user_id as _get_user_id,
+    get_user_id as _auth_get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
@@ -302,6 +305,7 @@ from omnigent.session_lifecycle import (
 from omnigent.spec.types import (
     FunctionPolicySpec,
     Phase,
+    PolicyAction,
     PolicySpec,
 )
 from omnigent.stores import AgentStore, ConversationStore
@@ -319,6 +323,10 @@ from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedE
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+
+get_agent_cache = _runtime_get_agent_cache
+get_caps = _runtime_get_caps
+_get_user_id = _auth_get_user_id
 
 # ── Module-level constants (rule 34) ──────────────────────────────
 

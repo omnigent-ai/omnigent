@@ -58,6 +58,7 @@ from omnigent.onboarding.sandboxes.base import (
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
+    import threading
     from pathlib import Path
 
     from openshell import ExecResult
@@ -156,7 +157,7 @@ class _OpenShellClient:
         # exec_background): OpenShell kills an exec's processes when the
         # ExecSandbox RPC returns, so a backgrounded host must be kept on
         # an open stream for its lifetime.
-        self._bg_threads: list[object] = []
+        self._bg_threads: list[threading.Thread] = []
 
     def close(self) -> None:
         """Release the gRPC channel and any bearer-auth resources."""

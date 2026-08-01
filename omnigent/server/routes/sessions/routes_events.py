@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from fastapi import (
@@ -1076,7 +1076,10 @@ def register_events_routes(
                 _runner_needs_session_init = _is_native_terminal_session(conv)
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
-            _grace_host_reg = getattr(request.app.state, "host_registry", None)
+            _grace_host_reg = cast(
+                HostRegistry | None,
+                getattr(request.app.state, "host_registry", None),
+            )
             _grace_host_conn = (
                 _grace_host_reg.get(conv.host_id) if _grace_host_reg is not None else None
             )
@@ -1103,7 +1106,7 @@ def register_events_routes(
                     conv.runner_id,
                     session_id,
                 )
-                if _grace_host_conn is not None:
+                if _grace_host_reg is not None and _grace_host_conn is not None:
                     runner_client = await _wait_for_host_bound_runner_client(
                         session_id,
                         runner_router,

@@ -1248,6 +1248,13 @@ class HarnessApp:
                     code=ErrorCode.CONFLICT,
                 )
 
+            model = request.model
+            if model is None:
+                raise OmnigentError(
+                    "model is required when starting a new turn",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
             response_id = f"resp_{uuid.uuid4().hex[:24]}"
             event_queue: asyncio.Queue[HarnessStreamEvent | None] = asyncio.Queue()
             cancelled = asyncio.Event()
@@ -1260,12 +1267,12 @@ class HarnessApp:
             self._active_turn_ctx = ctx
 
         return StreamingResponse(
-            self._stream_turn(request, ctx),
+            self._stream_turn(request, ctx, model),
             media_type="text/event-stream",
         )
 
     async def _stream_turn(
-        self, request: CreateResponseRequest, ctx: TurnContext
+        self, request: CreateResponseRequest, ctx: TurnContext, model: str
     ) -> AsyncIterator[bytes]:
         """
         Drive ``run_turn`` and yield SSE-formatted events.
@@ -1288,9 +1295,7 @@ class HarnessApp:
             HTTP response.
         """
         sequence = 0
-        for initial_event in self._initial_envelope_events(
-            ctx, model=request.model, start_seq=sequence
-        ):
+        for initial_event in self._initial_envelope_events(ctx, model=model, start_seq=sequence):
             yield _format_sse_event(initial_event)
             sequence += 1
 
@@ -1334,7 +1339,7 @@ class HarnessApp:
                 sequence += 1
                 yield _format_sse_event(event)
             terminal = await self._build_terminal_event(
-                ctx, model=request.model, run_task=run_task, sequence=sequence
+                ctx, model=model, run_task=run_task, sequence=sequence
             )
             # Clear before yielding the terminal event so the next
             # request (continuation turn) sees _active_turn_ctx as

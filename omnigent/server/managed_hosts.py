@@ -141,7 +141,7 @@ from omnigent.db.utils import now_epoch
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
-    from omnigent.onboarding.sandboxes import SandboxLauncher
+    from omnigent.onboarding.sandboxes import SandboxHostLauncher
 
 _logger = logging.getLogger(__name__)
 
@@ -402,7 +402,7 @@ class ManagedSandboxConfig:
     """
 
     server_url: str
-    launcher_factory: Callable[[], SandboxLauncher]
+    launcher_factory: Callable[[], SandboxHostLauncher]
     token_ttl_s: int
     managed_launch_supported: bool = True
     provider: str | None = None
@@ -585,7 +585,7 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
 def _modal_launcher_factory(
     image: str | None,
     secrets: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: modal`` path.
 
@@ -600,7 +600,7 @@ def _modal_launcher_factory(
     :returns: A factory producing parameterized Modal launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Modal launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.modal import ModalSandboxLauncher
 
@@ -609,7 +609,7 @@ def _modal_launcher_factory(
     return _build
 
 
-def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher]:
+def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxHostLauncher]:
     """
     Build a factory that rejects launch for a not-yet-supported provider.
 
@@ -621,7 +621,7 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher
     :returns: A factory that raises ``HTTPException`` 400 when called.
     """
 
-    def _reject() -> SandboxLauncher:
+    def _reject() -> SandboxHostLauncher:
         """Reject the launch with the provider named."""
         raise HTTPException(
             status_code=400,
@@ -948,7 +948,7 @@ def _parse_modal_secrets(raw: dict[str, object]) -> list[str] | None:
 def _daytona_launcher_factory(
     image: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: daytona`` path.
 
@@ -964,7 +964,7 @@ def _daytona_launcher_factory(
     :returns: A factory producing parameterized Daytona launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Daytona launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
 
@@ -1055,7 +1055,7 @@ def _boxlite_launcher_factory(
     env: list[str] | None,
     home_dir: str | None,
     registry: dict[str, object] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
 
@@ -1076,7 +1076,7 @@ def _boxlite_launcher_factory(
     :returns: A factory producing parameterized boxlite launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the boxlite launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.boxlite import BoxliteSandboxLauncher
 
@@ -1286,10 +1286,10 @@ def _parse_boxlite_registry(local: dict[str, object]) -> dict[str, object] | Non
 def _cwsandbox_launcher_factory(
     image: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """Build the launcher factory for the YAML ``provider: cwsandbox`` path."""
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         from omnigent.onboarding.sandboxes.cwsandbox import CWSandboxLauncher
 
         return CWSandboxLauncher(image=image, env=env)
@@ -1338,7 +1338,7 @@ def _parse_cwsandbox_env(raw: dict[str, object]) -> list[str] | None:
 def _e2b_launcher_factory(
     template: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: e2b`` path.
 
@@ -1356,7 +1356,7 @@ def _e2b_launcher_factory(
     :returns: A factory producing parameterized E2B launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the E2B launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
 
@@ -1435,7 +1435,7 @@ def _islo_launcher_factory(
     memory_mb: int | None,
     disk_gb: int | None,
     idle_pause_after_s: int | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: islo`` path.
 
@@ -1459,7 +1459,7 @@ def _islo_launcher_factory(
     :returns: A factory producing parameterized Islo launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Islo launcher."""
         from omnigent.onboarding.sandboxes.islo import IsloSandboxLauncher
 
@@ -1485,7 +1485,7 @@ def _openshell_launcher_factory(
     env: list[str] | None,
     cluster: str | None,
     workspace: str | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: openshell`` path.
 
@@ -1504,7 +1504,7 @@ def _openshell_launcher_factory(
     :returns: A factory producing parameterized OpenShell launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the OpenShell launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
 
@@ -2056,7 +2056,7 @@ def _kubernetes_launcher_factory(
     resources: dict[str, object] | None,
     pvc_mounts: list[dict[str, object]] | None,
     secret_mounts: list[dict[str, object]] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
 
@@ -2086,7 +2086,7 @@ def _kubernetes_launcher_factory(
     """
     _validate_kubernetes_identifiers(namespace, secret_name, service_account, node_selector)
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Kubernetes launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
 
@@ -2258,9 +2258,77 @@ async def relaunch_managed_host(
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
 
+async def _start_sandbox_host(
+    launcher: SandboxHostLauncher,
+    sandbox_id: str,
+    *,
+    token: str,
+    host_id: str,
+    host_name: str,
+    server_url: str,
+    repo_url: str | None,
+    repo_branch: str | None,
+    repo_name: str | None,
+    host_config: dict[str, object] | None,
+    on_stage: Callable[[str], None] | None = None,
+) -> str:
+    """Start a host without sending absent optional arguments to legacy launchers."""
+    if host_config is None and on_stage is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+        )
+    if host_config is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            on_stage=on_stage,
+        )
+    if on_stage is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+        )
+    return await asyncio.to_thread(
+        launcher.start_host,
+        sandbox_id,
+        token=token,
+        host_id=host_id,
+        host_name=host_name,
+        server_url=server_url,
+        repo_url=repo_url,
+        repo_branch=repo_branch,
+        repo_name=repo_name,
+        host_config=host_config,
+        on_stage=on_stage,
+    )
+
+
 async def _arm_and_start_host(
     *,
-    launcher: SandboxLauncher,
+    launcher: SandboxHostLauncher,
     config: ManagedSandboxConfig,
     host_store: HostStore,
     host_id: str,
@@ -2322,8 +2390,8 @@ async def _arm_and_start_host(
         # a token that already resolves. The exec-model default execs in; the
         # entrypoint model (k8s) creates the Pod that boots the host. *repo* is
         # unpacked into primitives — the launcher API takes no RepoWorkspace.
-        workspace = await asyncio.to_thread(
-            launcher.start_host,
+        workspace = await _start_sandbox_host(
+            launcher,
             sandbox_id,
             token=token,
             host_id=host_id,
@@ -2332,10 +2400,8 @@ async def _arm_and_start_host(
             repo_url=repo.url if repo is not None else None,
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
+            host_config=config.host_config,
             on_stage=on_stage,
-            # Omitted entirely when unset: a deployment-injected launcher
-            # predating the host_config parameter must keep launching.
-            **({"host_config": config.host_config} if config.host_config is not None else {}),
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
@@ -2388,7 +2454,7 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
 def _launcher_for_teardown(
     host: Host,
     config: ManagedSandboxConfig | None,
-) -> SandboxLauncher | None:
+) -> SandboxHostLauncher | None:
     """
     Resolve the launcher that can terminate a managed host's sandbox.
 
@@ -2555,21 +2621,17 @@ async def resume_managed_host(
                 sandbox_id=sandbox_id,
                 token_expires_at=now_epoch() + config.token_ttl_s,
             )
-            await asyncio.to_thread(
-                launcher.start_host,
+            await _start_sandbox_host(
+                launcher,
                 sandbox_id,
                 token=token,
                 host_id=host.host_id,
                 host_name=host.name,
                 server_url=config.server_url,
                 repo_url=None,  # the persistent volume already holds the workspace
-                # Re-materialized on every wake, so an operator's host_config
-                # change lands on the next resume without a new sandbox.
-                # Omitted entirely when unset: a deployment-injected launcher
-                # predating the host_config parameter must keep resuming.
-                # (Base start_host still cleans up previously injected entries
-                # on resumable launchers when the block is removed.)
-                **({"host_config": config.host_config} if config.host_config is not None else {}),
+                repo_branch=None,
+                repo_name=None,
+                host_config=config.host_config,
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
@@ -2612,7 +2674,7 @@ async def terminate_managed_host(
 
 
 async def _terminate_sandbox_best_effort(
-    launcher: SandboxLauncher | None,
+    launcher: SandboxHostLauncher | None,
     host: Host,
 ) -> None:
     """

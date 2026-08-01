@@ -1537,7 +1537,7 @@ def _build_acp_spawn_env(
     )
 
     has_embedded = isinstance(cfg, dict) and "acp_agent" in cfg
-    embedded = cfg.get("acp_agent") if has_embedded else None
+    embedded = cfg.get("acp_agent") if isinstance(cfg, dict) else None
     agent: AcpAgentEntry | None = None
     if has_embedded:
         if not isinstance(embedded, dict):

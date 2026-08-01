@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlparse
 
 from omnigent.inner.credential_proxy import (
@@ -260,6 +261,7 @@ class EgressProxy:
         # the base64 round-trip on every connection. Stored as bytes
         # so we can ``hmac.compare_digest`` against the raw header
         # value lifted from the request without re-encoding.
+        self._expected_auth_value: bytes | None
         if auth_token is not None:
             self._expected_auth_value = b"Basic " + base64.b64encode(
                 f"omnigent:{auth_token}".encode()
@@ -501,7 +503,7 @@ class EgressProxy:
             await self._send_forbidden(writer, str(exc))
             return
 
-        writer.transport.pause_reading()
+        cast(asyncio.ReadTransport, writer.transport).pause_reading()
 
         writer.write(_CONNECT_RESPONSE)
         await writer.drain()
@@ -540,8 +542,9 @@ class EgressProxy:
         transport = writer.transport
         loop = asyncio.get_event_loop()
         try:
-            tls_transport = await loop.start_tls(
-                transport, tls_protocol, ssl_ctx, server_side=True
+            tls_transport = cast(
+                asyncio.WriteTransport,
+                await loop.start_tls(transport, tls_protocol, ssl_ctx, server_side=True),
             )
         except (ssl.SSLError, ConnectionResetError, OSError) as exc:
             # WARNING (was DEBUG) so a client that drops mid-handshake

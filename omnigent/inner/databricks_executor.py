@@ -20,7 +20,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
 
@@ -320,6 +320,11 @@ class DatabricksAuthError(OSError):
     """
 
 
+class _DatabricksAuthConfig(Protocol):
+    def authenticate(self) -> dict[str, str]:
+        raise NotImplementedError
+
+
 class _DatabricksBearerAuth(httpx.Auth):
     """httpx Auth that calls ``Config.authenticate()`` on every HTTP request.
 
@@ -340,7 +345,7 @@ class _DatabricksBearerAuth(httpx.Auth):
 
     def __init__(
         self,
-        config: Any,
+        config: _DatabricksAuthConfig,
         profile_name: str | None = None,
         failure_message: str | None = None,
     ) -> None:
@@ -785,7 +790,7 @@ def _convert_messages(
     return result
 
 
-def _extract_stream_text_delta(content: Any) -> str:
+def _extract_stream_text_delta(content: object) -> str:
     """
     Extract assistant-visible text from a Chat Completions stream delta.
 

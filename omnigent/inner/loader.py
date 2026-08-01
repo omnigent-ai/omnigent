@@ -6,7 +6,7 @@ import importlib
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import yaml
 
@@ -842,17 +842,17 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         cwd_hidden_scan_max_entries=(
             int(max_entries_raw)
             if max_entries_raw is not None
-            else fields["cwd_hidden_scan_max_entries"].default
+            else cast(int, fields["cwd_hidden_scan_max_entries"].default)
         ),
         cwd_hidden_scan_overflow=(
             str(overflow_raw)
             if overflow_raw is not None
-            else fields["cwd_hidden_scan_overflow"].default
+            else cast(str, fields["cwd_hidden_scan_overflow"].default)
         ),
         cwd_hidden_scan_recursive=(
             bool(recursive_raw)
             if recursive_raw is not None
-            else fields["cwd_hidden_scan_recursive"].default
+            else cast(bool, fields["cwd_hidden_scan_recursive"].default)
         ),
         mask_paths=list(mask_paths_raw) if mask_paths_raw is not None else None,
         env_passthrough=data.get("env_passthrough"),
