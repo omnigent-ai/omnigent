@@ -38,6 +38,7 @@ NULL/short blobs cost only their bytes).
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -78,7 +79,9 @@ def _as_uuid_bytes(value: object) -> bytes | None:
             return raw
         # A varchar id surfaced as bytes (e.g. hex text) — decode then normalise.
         return uuid_to_bytes(raw.decode("ascii"))
-    return uuid_to_bytes(value)  # str / uuid.UUID
+    if isinstance(value, (str, uuid.UUID)):
+        return uuid_to_bytes(value)
+    raise TypeError(f"Unsupported UUID value: {type(value).__name__}")
 
 
 def _encode_overrides(values: dict[str, str | None]) -> str | None:
