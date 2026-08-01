@@ -29,7 +29,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { iconForTool } from "@/lib/toolIcon";
-import { type ToolTitle, formatToolTitle } from "@/lib/toolTitle";
+import {
+  type ToolRunCall,
+  type ToolTitle,
+  formatToolRunLabel,
+  formatToolTitle,
+} from "@/lib/toolTitle";
 import { useFileViewer } from "@/shell/FileViewerContext";
 
 const OUTPUT_PREVIEW_LINE_LIMIT = 80;
@@ -224,29 +229,21 @@ export function ToolCard({
 }
 
 /**
- * Render a contiguous run of tool calls as one muted "See N steps" line.
- * Clicking expands to show each tool as its own (also-collapsible)
- * trigger. `BlockRenderer` decides which tools fold here (older tools
- * once a streaming-tail of the most recent ones has been peeled off,
- * or all completed tools once streaming finishes).
+ * Render the folded (older) part of a contiguous tool run as one muted
+ * summary line ("Read 2 files"). Clicking expands to show each tool as
+ * its own (also-collapsible) trigger. `BlockRenderer` decides which
+ * tools fold here: older tools once the visible tail of the most
+ * recent ones has been peeled off.
  */
-export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?: number }) {
-  // Label the FULL contiguous run, not just the folded tools — during
-  // streaming the most-recent tools render as a visible tail outside this
-  // group, so counting only `tools` would undercount ("See 2 steps" when
-  // there are more visible). `count` defaults to the folded length for
-  // fully-collapsed runs (reload / idle), where they're equal.
-  const n = count ?? tools.length;
-  const label = `See ${n} step${n === 1 ? "" : "s"}`;
+export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
+  const label = formatToolRunLabel(tools.map(toolRunCall));
   return (
     // Named `group/tool-summary` so this collapsible only rotates its
     // OWN chevron (line 296 in `ToolTriggerRow` uses an unnamed
     // `group-data-[state=open]:rotate-90` that would otherwise match
     // any ancestor `.group[data-state=open]` and incorrectly rotate
     // chevrons of inner tool cards when this outer group is open).
-    // `peer` lets `BlockRenderer`'s trailing tail react to this
-    // collapsible's open/closed state for the border-join effect.
-    <Collapsible defaultOpen={false} className="group/tool-summary peer not-prose w-full">
+    <Collapsible defaultOpen={false} className="group/tool-summary not-prose w-full">
       <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
         <span>{label}</span>
@@ -284,6 +281,15 @@ export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?
       </CollapsibleContent>
     </Collapsible>
   );
+}
+
+/** Tool name + args used to categorize a run item for the summary label. */
+function toolRunCall(item: RenderItem): ToolRunCall {
+  if (item.kind === "tool") {
+    return { name: item.execution.name, args: item.execution.arguments };
+  }
+  if (item.kind === "native_tool") return { name: item.toolType, args: item.data };
+  return { name: "" };
 }
 
 /**

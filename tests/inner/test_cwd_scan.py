@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner._cwd_scan import MaskedEntry, scan_cwd_mask_entries
+from omnigent.inner._cwd_scan import MaskedEntry, merge_scan_roots, scan_cwd_mask_entries
 
 # The walker contract says ``safe_roots`` should include cwd plus the
 # backend-specific exposed mounts. For these decision-level tests we
@@ -41,6 +41,7 @@ def _scan(
     safe_roots: list[Path] | None = None,
     max_entries: int = _DEFAULT_MAX,
     overflow: str = "error",
+    recursive: bool = True,
     deprioritize_names: list[str] | None = None,
 ) -> list[MaskedEntry]:
     """
@@ -65,6 +66,10 @@ def _scan(
         cap/overflow tests can assert on the raised :class:`OSError`;
         note this differs from the production default (``"warn"``),
         which is pinned in the spec-parser tests instead.
+    :param recursive: Whether the walker descends into subdirectories.
+        Default ``True`` here so the existing recursive-behaviour
+        tests keep passing; note the production default is ``False``
+        (top-level only), pinned in the spec-parser tests.
     :param deprioritize_names: Directory basenames walked last.
         ``None`` (the default) lets the walker apply its own default
         (``("node_modules",)``); pass ``[]`` to disable
@@ -83,6 +88,7 @@ def _scan(
             safe_roots=roots,
             max_entries=max_entries,
             overflow=overflow,
+            recursive=recursive,
         )
     return scan_cwd_mask_entries(
         cwd.resolve(strict=False),
@@ -90,6 +96,7 @@ def _scan(
         safe_roots=roots,
         max_entries=max_entries,
         overflow=overflow,
+        recursive=recursive,
         deprioritize_names=deprioritize_names,
     )
 
@@ -242,6 +249,52 @@ def test_nested_dotfile_is_marked(tmp_path: Path) -> None:
     assert entry.kind == "file"
     # Sibling non-dotfile stays visible.
     assert _entry_for(entries, nested_dir / "main.py") is None
+
+
+def test_non_recursive_masks_top_level_only(tmp_path: Path) -> None:
+    """
+    With ``recursive=False`` the walker masks top-level dotfiles but
+    leaves dotfiles nested below the top level visible. This is the
+    scalable production default: top-level ``.env`` is still hidden,
+    but the walker never descends ``cwd/services/api``.
+    """
+    top_secret = tmp_path / ".env"
+    top_secret.write_text("TOP=secret")
+    nested_dir = tmp_path / "services" / "api"
+    nested_dir.mkdir(parents=True)
+    nested_secret = nested_dir / ".env"
+    nested_secret.write_text("DB_PASSWORD=secret")
+
+    entries = _scan(tmp_path, allow_hidden=[".venv"], recursive=False)
+
+    top_entry = _entry_for(entries, top_secret)
+    assert top_entry is not None
+    assert top_entry.kind == "file"
+    assert _entry_for(entries, nested_secret) is None, (
+        "Non-recursive scan must not descend into subdirectories; nested .env should stay visible."
+    )
+
+
+def test_non_recursive_ignores_nested_escaping_symlink(tmp_path: Path) -> None:
+    """
+    The symlink-escape defense is depth-1 in non-recursive mode: a
+    top-level escaping symlink is masked but one nested under a
+    subdirectory is not (the walker never reaches it).
+    """
+    target = Path("/etc/shadow")
+    if not target.exists():
+        pytest.skip("/etc/shadow not present on this host")
+    top_link = tmp_path / "leak"
+    top_link.symlink_to(target)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    nested_link = sub / "leak"
+    nested_link.symlink_to(target)
+
+    entries = _scan(tmp_path, allow_hidden=[".venv"], recursive=False)
+
+    assert _entry_for(entries, top_link) is not None
+    assert _entry_for(entries, nested_link) is None
 
 
 def test_walker_prunes_at_masked_dotdir(tmp_path: Path) -> None:
@@ -732,3 +785,108 @@ def test_unreadable_subdirectory_is_skipped_silently(tmp_path: Path) -> None:
         assert "locked" not in str(entry.path) or entry.path == sub, (
             f"Unreadable subdir leaked a child mask entry: {entry.path}"
         )
+
+
+def test_merge_scan_roots_recursive_drops_cwd_nested_and_duplicates(tmp_path: Path) -> None:
+    """
+    With ``recursive=True`` a kept root's walk descends its whole
+    subtree, so ``merge_scan_roots`` folds the read + write grant lists
+    into one set: it drops roots at-or-under cwd, drops a root nested
+    under another kept root, dedupes exact repeats (including a path
+    granted both read and write), and returns the survivors ancestor-
+    first.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    a.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
+    nested = a / "child"  # under ``a`` → subsumed by the recursive walk of ``a``
+    nested.mkdir()
+    under_cwd = cwd / "sub"  # under cwd → covered by the cwd scan
+    under_cwd.mkdir()
+
+    result = merge_scan_roots(
+        cwd,
+        [a, b, a, cwd],  # read grants: duplicate ``a`` and cwd itself
+        [b, nested, under_cwd],  # write grants: dup ``b``, a nested + under-cwd root
+        recursive=True,
+    )
+
+    # Only the two distinct outside-cwd top roots survive, ancestor-
+    # first (siblings ordered lexicographically).
+    assert result == [a, b], result
+
+
+def test_merge_scan_roots_non_recursive_keeps_nested_grant(tmp_path: Path) -> None:
+    """
+    Regression guard for the top-level-only default: a granted root
+    nested under another grant MUST still be walked, because a
+    non-recursive walk of the parent only masks the parent's immediate
+    children and never reaches the nested grant's dotfiles. Only exact
+    duplicates and roots under cwd are dropped.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    a.mkdir()
+    nested = a / "deep" / "nested"  # granted separately, below a's first level
+    nested.mkdir(parents=True)
+    under_cwd = cwd / "sub"  # under cwd → still dropped (cwd is special)
+    under_cwd.mkdir()
+
+    result = merge_scan_roots(
+        cwd,
+        [a, a],  # duplicate ``a`` → deduped
+        [nested, under_cwd],
+        recursive=False,
+    )
+
+    # ``a`` and its nested grant both survive (nested is NOT subsumed in
+    # top-level-only mode); the under-cwd root is dropped; ordered
+    # ancestor-first.
+    assert result == [a, nested], result
+
+
+def test_merge_scan_roots_keeps_ancestor_of_cwd(tmp_path: Path) -> None:
+    """
+    A grant that is an ANCESTOR of cwd is still walked — cwd only
+    covers itself and its descendants, so the rest of the ancestor
+    tree (siblings of cwd) would otherwise go unscanned.
+    """
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    cwd = parent / "work"
+    cwd.mkdir()
+
+    assert merge_scan_roots(cwd, [parent], None, recursive=True) == [parent]
+    assert merge_scan_roots(cwd, [parent], None, recursive=False) == [parent]
+
+
+def test_merge_scan_roots_skips_framework_roots(tmp_path: Path) -> None:
+    """
+    Framework scratch / runtime write roots passed via ``skip_roots`` are
+    dropped from the scan — along with anything nested under them — so the
+    dotfile mask never hides the sandbox's own machinery (e.g. the egress
+    ``.egress.sock`` that lives in the scratch tmpdir). A genuine user
+    grant that merely sits beside a skip root is still walked.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    scratch = tmp_path / "scratch"  # framework write root (holds .egress.sock)
+    scratch.mkdir()
+    nested_in_scratch = scratch / "inner"
+    nested_in_scratch.mkdir()
+    user_grant = tmp_path / "grant"  # real user write/read root — must survive
+    user_grant.mkdir()
+
+    result = merge_scan_roots(
+        cwd,
+        [user_grant],
+        [scratch, nested_in_scratch, user_grant],
+        recursive=False,
+        skip_roots=[scratch],
+    )
+
+    assert result == [user_grant], result

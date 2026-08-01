@@ -117,7 +117,7 @@ async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDi
   let truncated = false;
   // Sequential by necessity: each page's cursor is the previous
   // page's last entry path, so the requests can't be parallelized.
-  /* oxlint-disable eslint(no-await-in-loop) */
+  /* oxlint-disable no-await-in-loop */
   for (let page = 0; page < MAX_PAGES; page++) {
     const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
     if (after !== null) {
@@ -143,7 +143,7 @@ async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDi
       truncated = true;
     }
   }
-  /* oxlint-enable eslint(no-await-in-loop) */
+  /* oxlint-enable no-await-in-loop */
   return { entries, truncated };
 }
 
@@ -177,6 +177,47 @@ export function useHostFilesystem(hostId: string | null, path: string | null) {
   });
 }
 
+/**
+ * Probe whether a directory exists (and is listable) on a host.
+ *
+ * Requests a single-entry ``list_dir`` page — the filesystem route
+ * returns 404 for a missing (or non-directory) path, which is the
+ * only existence signal exposed over HTTP (``host.stat`` is a WS
+ * frame reachable from the server alone).
+ *
+ * @param hostId Host identifier, e.g. ``"host_a1b2..."``.
+ * @param path Absolute directory path to probe.
+ * @returns ``null`` when the directory is listable; otherwise a
+ *   user-facing message saying why it can't be used (missing path,
+ *   offline host, network failure). Never throws.
+ */
+export async function checkHostDirectory(hostId: string, path: string): Promise<string | null> {
+  const baseUrl = buildHostFilesystemUrl(hostId, path);
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  let res: Response;
+  try {
+    res = await authenticatedFetch(`${baseUrl}${sep}limit=1`);
+  } catch {
+    return "Couldn't verify the working directory. Check your connection and try again.";
+  }
+  if (res.ok) return null;
+  if (res.status === 404) {
+    // The route 404s for missing paths AND for paths that exist but
+    // aren't listable directories (e.g. a file) — say so.
+    return `The working directory ${path} doesn't exist on this host (or isn't a directory).`;
+  }
+  // Host offline / timed out (502/504) or another server failure —
+  // surface its detail so the user sees why the check failed.
+  let detail: string | null;
+  try {
+    const body = (await res.json()) as { detail?: string };
+    detail = typeof body.detail === "string" && body.detail !== "" ? body.detail : null;
+  } catch {
+    detail = null;
+  }
+  return detail ?? `Couldn't verify the working directory (HTTP ${res.status}).`;
+}
+
 /** Shape returned by ``POST /v1/hosts/{id}/directories``. */
 interface CreateHostDirectoryResponse {
   object: string;
@@ -208,7 +249,7 @@ export async function createHostDirectory(hostId: string, path: string): Promise
   if (!res.ok) {
     // Surface the server's detail (e.g. "directory already exists") so
     // the user sees why creation failed rather than a bare status code.
-    let detail: string | null = null;
+    let detail: string | null;
     try {
       const body = (await res.json()) as { detail?: string };
       detail = typeof body.detail === "string" ? body.detail : null;

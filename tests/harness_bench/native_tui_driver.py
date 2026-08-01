@@ -123,8 +123,7 @@ class NativeVendor:
         Used for documentation and as a non-empty gate: empty means the
         tool/policy probes cannot run for this vendor and SKIP. The deny gates
         on the tool_call phase (name-agnostic), so this need not be wire-exact.
-        Not derivable from the capability model, so it is an explicit per-vendor
-        fact (see :data:`_NATIVE_TOOL_PROVOCATION`).
+        Sourced from the harness's ``shell_tool_name`` capability field.
     :param tool_prompt: A prompt that reliably makes the vendor call its shell
         tool. Empty when :attr:`tool_name` is.
     """
@@ -140,23 +139,6 @@ class NativeVendor:
 
 # These vendors create external_session_id only after the first message.
 _LAZY_CHAT_HARNESSES: frozenset[str] = frozenset({"cursor-native"})
-
-# Missing entries skip tool and policy probes.
-_SHELL_PROMPT = "Use your shell/terminal tool to run this exact command: echo omnigent-bench-ok"
-_NATIVE_TOOL_PROVOCATION: dict[str, tuple[str, str]] = {
-    "claude-native": (
-        "Bash",
-        "Use the Bash tool to run this exact command: echo omnigent-bench-ok",
-    ),
-    "codex-native": ("shell", _SHELL_PROMPT),
-    "pi-native": ("Bash", "Use the Bash tool to run this exact command: echo omnigent-bench-ok"),
-    "kiro-native": ("shell", _SHELL_PROMPT),
-    "qwen-native": ("run_shell_command", _SHELL_PROMPT),
-    "goose-native": ("developer__shell", _SHELL_PROMPT),
-    "hermes-native": ("terminal", _SHELL_PROMPT),
-    "antigravity-native": ("run_command", _SHELL_PROMPT),
-    "kimi-native": ("Bash", "Use the Bash tool to run this exact command: echo omnigent-bench-ok"),
-}
 
 _NATIVE_OMNIGENT_MCP_HARNESSES = frozenset(
     {
@@ -194,7 +176,10 @@ def native_vendor(harness: str) -> NativeVendor | None:
     caps = harness_capabilities().get(harness)
     if caps is None or caps.integration_mode is not IntegrationMode.NATIVE_TUI:
         return None
-    tool_name, tool_prompt = _NATIVE_TOOL_PROVOCATION.get(harness, ("", ""))
+    # Shell-tool provocation is declared on the capability record; an unset
+    # (None) name/prompt leaves these empty, which skips the tool/policy probes.
+    tool_name = caps.shell_tool_name or ""
+    tool_prompt = caps.shell_tool_prompt or ""
     return NativeVendor(
         harness=harness,
         agent_name=f"{harness}-ui",

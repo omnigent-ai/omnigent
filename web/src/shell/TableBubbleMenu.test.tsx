@@ -20,7 +20,7 @@ import { createRef } from "react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Table, TableCell, TableHeader, TableRow } from "@tiptap/extension-table";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import { TableHandles } from "./TableBubbleMenu";
 
 /** Minimal 3×3 table: one header row + two body rows. */

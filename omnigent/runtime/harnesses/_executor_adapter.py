@@ -298,21 +298,21 @@ class ExecutorAdapter(HarnessApp):
         # attribute set is best-effort — executors that don't
         # read it ignore the value, executors that DO read it
         # (Claude SDK) honor the round-trip protocol.
-        if getattr(executor, "_tool_executor", None) is None:  # type: ignore[attr-defined]
+        if getattr(executor, "_tool_executor", None) is None:
             executor._tool_executor = self._stable_tool_executor  # type: ignore[attr-defined]
         # Install the elicitation handler once on first use, same
         # stable-reference pattern as ``_tool_executor``. The SDK's
         # ``can_use_tool`` callback is constructed per-turn inside
         # ClaudeSDKExecutor.run_turn() from this attribute, so the
         # closure always reads ``_current_ctx`` at call time.
-        if getattr(executor, "_elicitation_handler", None) is None:  # type: ignore[attr-defined]
+        if getattr(executor, "_elicitation_handler", None) is None:
             executor._elicitation_handler = self._stable_elicitation_handler  # type: ignore[attr-defined]
         # Install the policy evaluator bridge once on first use, same
         # stable-reference pattern as ``_tool_executor``. The inner
         # executor calls this before/after each LLM call to evaluate
         # LLM_REQUEST / LLM_RESPONSE policies via a round-trip to the
         # Omnigent server (routed through the runner).
-        if getattr(executor, "_policy_evaluator", None) is None:  # type: ignore[attr-defined]
+        if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
         self._current_agent = request.model
@@ -428,7 +428,7 @@ class ExecutorAdapter(HarnessApp):
                                 _active_tool_parent = None
                         elif isinstance(event, TurnComplete):
                             response_text = event.response
-                            if event.usage is not None:
+                            if event.usage is not None and agent_span is not None:
                                 from omnigent.runtime.telemetry import record_llm_usage
 
                                 # Record usage on the agent span for
@@ -1293,7 +1293,7 @@ def _classify_anthropic_exception(exception: BaseException) -> str | None:
         recognize.
     """
     try:
-        import anthropic
+        import anthropic  # type: ignore[import-not-found]
     except ImportError:
         return None
 

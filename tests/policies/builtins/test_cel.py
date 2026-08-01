@@ -137,6 +137,32 @@ def test_string_contains() -> None:
     assert evaluate({"type": "request", "data": "normal"}) == {"result": "ALLOW"}
 
 
+def test_request_dict_data_projected_to_user_text() -> None:
+    """A request-phase ``data`` dict is projected to ``user_content`` for CEL.
+
+    Regression for #2906: the web input gate now passes REQUEST ``data`` as
+    ``{"user_content", "attachments"}``. String CEL expressions authored for the
+    request phase (e.g. ``event.data.contains(...)``) must keep matching — a raw
+    map would fail-open (``.contains`` raises → abstain → ALLOW), silently
+    disabling a UI-configured DENY policy.
+    """
+    evaluate = cel_policy(
+        expression=(
+            'event.type == "request" && event.data.contains("SECRET")'
+            ' ? {"result": "DENY", "reason": "Secret detected."}'
+            ' : {"result": "ALLOW"}'
+        ),
+    )
+    # Structured dict shape with the secret in user_content → still DENY.
+    assert evaluate(
+        {"type": "request", "data": {"user_content": "my SECRET key", "attachments": []}}
+    ) == {"result": "DENY", "reason": "Secret detected."}
+    # Clean structured dict → ALLOW (not a crash / abstain).
+    assert evaluate(
+        {"type": "request", "data": {"user_content": "normal", "attachments": []}}
+    ) == {"result": "ALLOW"}
+
+
 def test_in_list() -> None:
     """CEL ``in`` operator works."""
     evaluate = cel_policy(

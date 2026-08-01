@@ -15,11 +15,21 @@
 # from finalize-release.yml's App-token publish; `workflow_dispatch` covers
 # retries and catch-up (e.g. jumping the formula straight to the newest
 # version after a missed cycle).
+#
+# brew resolves resources through pip's `--uploaded-prior-to=P1D` window, so a
+# run within 24h of the PyPI upload cannot see the new sdist and used to go
+# red every release day (v0.6.0, v0.7.0). Now: runs inside that window defer
+# (green, with a warning), and the nightly `schedule` catch-up — which targets
+# the latest published release and no-ops when the formula is already
+# current — opens the tap PR once the window has passed.
 name: Update Homebrew tap
 
 on:
   release:
     types: [published]
+  schedule:
+    # Nightly catch-up for the P1D window (see header). No-ops when current.
+    - cron: "45 23 * * *"
   workflow_dispatch:
     inputs:
       tag:
@@ -31,7 +41,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: update-homebrew-${{ github.event.release.tag_name || inputs.tag }}
+  group: update-homebrew-${{ github.event.release.tag_name || inputs.tag || 'nightly' }}
   cancel-in-progress: false
 
 jobs:
@@ -46,12 +56,18 @@ jobs:
       - name: Resolve tag and finality
         id: r
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_TAG: ${{ github.event.release.tag_name }}
           PRERELEASE: ${{ github.event.release.prerelease }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$EVENT_TAG}"
+          if [ -z "$tag" ]; then
+            # Scheduled catch-up: target the latest published final release
+            # (empty when the repo has none yet — resolves to is_final=false).
+            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || echo "")"
+          fi
           is_final=true
           case "$tag" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
@@ -145,12 +161,29 @@ jobs:
           path: tap
           persist-credentials: false
 
+      - name: Skip when the formula is already at this version
+        id: current
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.sdist.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Nightly catch-up no-op: the stable url already points at this sdist.
+          if grep -q "omnigent-${VERSION}\.tar\.gz" Formula/omnigent.rb; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Formula already at ${VERSION} — nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Homebrew
+        if: steps.current.outputs.skip != 'true'
         uses: Homebrew/actions/setup-homebrew@18fcb8e3e06b4247c676c506750dc95ea7226479 # 2026-07-10
         with:
           token: ${{ github.token }}
 
       - name: Rewrite the formula's stable url/sha256
+        if: steps.current.outputs.skip != 'true'
         working-directory: tap
         env:
           SDIST_URL: ${{ steps.sdist.outputs.url }}
@@ -172,9 +205,12 @@ jobs:
           git diff --stat
 
       - name: Regenerate the pinned Python resources
+        id: regen
+        if: steps.current.outputs.skip != 'true'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_FROM_API: "1"
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # Make the checkout visible to brew as the real tap.
@@ -185,12 +221,31 @@ jobs:
           # deps (certifi/cryptography/pydantic/rpds-py and their transitive
           # cffi/pycparser) and the platform-conditional google-antigravity
           # wheel stanzas.
-          brew update-python-resources \
+          if ! brew update-python-resources \
             --exclude-packages=certifi,cryptography,pydantic,rpds-py,cffi,pycparser,google-antigravity \
-            omnigent-ai/tap/omnigent
+            omnigent-ai/tap/omnigent; then
+            # brew resolves through pip's --uploaded-prior-to=P1D window: a
+            # release <24h old is invisible and resolution ALWAYS fails. Defer
+            # to the nightly catch-up instead of going red; older releases are
+            # real failures.
+            published_at="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .published_at 2>/dev/null || echo "")"
+            age_h=999
+            if [ -n "$published_at" ]; then
+              age_h="$(python3 -c 'import datetime, sys; d = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")); print(int((datetime.datetime.now(datetime.timezone.utc) - d).total_seconds() // 3600))' "$published_at")"
+            fi
+            if [ "$age_h" -lt 24 ]; then
+              echo "deferred=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::Resource resolution failed with ${TAG} only ${age_h}h old — inside pip's --uploaded-prior-to=P1D window. The nightly catch-up will open the tap PR."
+              echo "Deferred to the nightly catch-up (${TAG} is ${age_h}h old, inside the 24h PyPI window)." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "deferred=false" >> "$GITHUB_OUTPUT"
           brew style omnigent-ai/tap/omnigent
 
       - name: Assert the hand-maintained sections survived
+        if: steps.current.outputs.skip != 'true' && steps.regen.outputs.deferred != 'true'
         working-directory: tap
         run: |
           set -euo pipefail
@@ -214,6 +269,7 @@ jobs:
           done
 
       - name: Open or update the tap bump PR
+        if: steps.current.outputs.skip != 'true' && steps.regen.outputs.deferred != 'true'
         working-directory: tap
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}

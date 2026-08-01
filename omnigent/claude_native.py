@@ -35,6 +35,7 @@ from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import IO, TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
@@ -46,6 +47,7 @@ import yaml
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
+from omnigent import model_catalog
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
@@ -89,6 +91,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.model_fallbacks import static_model_fallback
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -103,8 +106,12 @@ from omnigent.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
 from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -130,6 +137,7 @@ _BEDROCK_AUTH_COMMAND_TIMEOUT_S = 15.0
 _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
+_CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 # Claude Code's agent view (the session list opened by `claude agents`, the
 # left-arrow shortcut on an empty prompt, or /background) lets the user hop to
@@ -311,6 +319,22 @@ class ClaudeNativeUcodeConfig:
     model: str | None = None
 
 
+def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
+    """Whether the config's endpoint accepts canonical Anthropic ids and aliases.
+
+    Bedrock and custom gateways route their own model ids only; the Anthropic
+    API (and a config with no endpoint override) resolves family aliases
+    natively, so aliases must not be rewritten for it.
+    """
+    if claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
+        return False
+    base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+    if not base_url:
+        return True
+    host = (urlparse(base_url).hostname or "").lower()
+    return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
 def resolve_claude_native_model_selection(
     model: str | None,
     claude_config: ClaudeNativeUcodeConfig | None,
@@ -324,11 +348,25 @@ def resolve_claude_native_model_selection(
     Direct Claude logins have no provider config, so they use the canonical
     Anthropic model id.
 
+    On a gateway/Bedrock endpoint, a family alias with no tier pin (launch env
+    or managed settings) resolves to the provider's default model — Claude
+    Code would canonicalize it to an Anthropic id the endpoint rejects.
+
     :param model: Persisted picker id, built-in alias, or concrete model id.
     :param claude_config: Resolved provider config for the terminal.
     :returns: A model identifier suitable for ``--model`` or ``/model``.
     """
     if model != _UCODE_CLAUDE_CUSTOM_TIER:
+        tier_env = _UCODE_CLAUDE_TIER_TO_ENV.get(model or "")
+        if (
+            tier_env is not None
+            and claude_config is not None
+            and not claude_config.env.get(tier_env)
+            and not _serves_canonical_anthropic_ids(claude_config)
+        ):
+            managed = _managed_claude_model_config()
+            if managed is None or not managed.env.get(tier_env):
+                return claude_config.model or model
         return model
     if claude_config is not None:
         custom_model = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
@@ -339,7 +377,26 @@ def resolve_claude_native_model_selection(
             return provider_fallback
         if claude_config.model:
             return claude_config.model
-    return "claude-sonnet-5"
+    fallback = static_model_fallback(SUBSCRIPTION_KIND, "claude")
+    if fallback is None:
+        raise ValueError("Claude subscription fallback has no routable Sonnet model")
+    exact_match = next(
+        (
+            model_id
+            for model_id in fallback.model_ids
+            if _claude_model_display_name("sonnet", model_id) == _UCODE_CLAUDE_CUSTOM_TIER_LABEL
+        ),
+        None,
+    )
+    if exact_match is not None:
+        return exact_match
+    family_match = next(
+        (model_id for model_id in fallback.model_ids if "claude-sonnet-" in model_id.lower()),
+        None,
+    )
+    if family_match is None:
+        raise ValueError("Claude subscription fallback has no routable Sonnet model")
+    return family_match
 
 
 def _claude_model_display_name(tier: str, model_id: str) -> str:
@@ -429,6 +486,13 @@ def claude_native_model_options(
                     )
     if options:
         return options
+    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+        # No tier pins on a gateway/Bedrock endpoint: it rejects the
+        # subscription aliases below, so offer the one model it routes.
+        model_id = claude_config.model
+        if not model_id:
+            return []
+        return [{"id": model_id, "model": model_id, "displayName": model_id, "isDefault": True}]
     return [
         {
             "id": model_id,
@@ -507,7 +571,8 @@ def run_claude_native(
     *,
     server: str | None,
     session_id: str | None,
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    claude_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str = _DEFAULT_CLAUDE_COMMAND,
     use_claude_config: bool = False,
@@ -542,6 +607,9 @@ def run_claude_native(
     :returns: None after the attach session ends.
     :raises click.ClickException: If setup, launch, or attach fails.
     """
+    claude_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=claude_args, legacy_param="claude_args"
+    )
     startup_profiler = startup_profiler or StartupProfiler.from_env(
         name="omnigent claude",
         env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -1569,10 +1637,7 @@ def _ucode_config_for_profile(
     if not profile:
         return None
 
-    from omnigent.onboarding.databricks_config import (
-        DATABRICKS_CLAUDE_DEFAULT_MODEL,
-        get_workspace_url_for_profile,
-    )
+    from omnigent.onboarding.databricks_config import get_workspace_url_for_profile
     from omnigent.onboarding.ucode_state import read_ucode_state
 
     workspace_url = get_workspace_url_for_profile(profile)
@@ -1640,11 +1705,8 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
+        _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
     }
-    # Don't disable betas when gateway-aware mode (CLAUDE_CODE_USE_GATEWAY=1)
-    # is selected: that mode keeps tool search on so MCP schemas load on demand.
-    if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1":
-        env[_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV] = "1"
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
     # names.  Without this Claude Code normalises the picked model to a
@@ -1694,7 +1756,9 @@ def _ucode_config_for_profile(
     return ClaudeNativeUcodeConfig(
         env=env,
         api_key_helper=agent_state.auth_command,
-        model=default_model or configured_default or DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        model=default_model
+        or configured_default
+        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
     )
 
 
@@ -1839,8 +1903,7 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
         _logger.warning(
             "native-claude: bedrock provider %r sets no models.default — Claude Code "
             "will choose its own default model, which is usually not enabled on a "
-            "Bedrock account. Set models.default to a Bedrock inference-profile id "
-            "(e.g. us.anthropic.claude-opus-4-5-20251101-v1:0).",
+            "Bedrock account. Set models.default to a Bedrock inference-profile id.",
             entry.name,
         )
     _logger.info(
@@ -4707,23 +4770,31 @@ def _websocket_connect(attach_url: str, *, headers: dict[str, str]) -> Any:
     import websockets
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
     # guard (CSWSH protection) allows the handshake — this attach client
     # is not a browser. Set on a copy so the caller's dict (which also
     # carries auth headers and may be reused) is not mutated here.
     handshake_headers = {**headers, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+    # A remote (https) workspace yields a wss:// attach URL; build a verifying
+    # SSL context from a real CA bundle so verification works on interpreters
+    # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
+    # library default — no TLS). See omnigent/tls.py and issue #1730.
+    ssl_ctx = client_ssl_context() if attach_url.startswith("wss://") else None
     try:
         return websockets.connect(
             attach_url,
             additional_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
+            ssl=ssl_ctx,
         )
     except TypeError:
         return websockets.connect(
             attach_url,
             extra_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
+            ssl=ssl_ctx,
         )
 
 

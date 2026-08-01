@@ -23,6 +23,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.entities import MessageData, NewConversationItem
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT
@@ -41,6 +42,16 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
 )
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent
+
+_RUNNER_BINDING_TOKEN = "runner-created-by-token"
+
+
+def _bind_runner(db_uri: str, session_id: str) -> dict[str, str]:
+    """Bind a test runner token to *session_id* and return request headers."""
+    runner_id = token_bound_runner_id(_RUNNER_BINDING_TOKEN)
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(session_id, runner_id) is True
+    return {RUNNER_TUNNEL_TOKEN_HEADER: _RUNNER_BINDING_TOKEN}
+
 
 # ── Route helper: actor is stamped onto the new item ─────────────────────────
 
@@ -232,8 +243,12 @@ async def test_session_items_expose_per_actor_attribution(
 class _CaptureRunnerClient:
     """Stub runner client that accepts the forwarded event POST."""
 
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+
     async def post(self, path: str, *, json: dict[str, Any], **_: Any) -> Any:
         """Return a fake 202 so persist-before-forward completes."""
+        self.posts.append((path, json))
 
         class _Resp:
             status_code = 202
@@ -244,6 +259,11 @@ class _CaptureRunnerClient:
 
     async def get(self, *_: Any, **__: Any) -> Any:
         raise NotImplementedError
+
+
+async def _noop_relay_ready(*_: Any, **__: Any) -> None:
+    """Stand in for runner stream relay setup in attribution route tests."""
+    return
 
 
 @pytest.mark.asyncio
@@ -261,12 +281,18 @@ async def test_post_event_records_authenticated_poster(
     """
     from omnigent.server.routes import sessions as sessions_mod
 
+    runner_client = _CaptureRunnerClient()
+
     async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
-        return _CaptureRunnerClient()
+        return runner_client
 
     monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
 
-    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    session_id = _seed_shared_session(
+        db_uri,
+        {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
+    )
 
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
@@ -275,6 +301,121 @@ async def test_post_event_records_authenticated_poster(
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
         },
         headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
+    [persisted] = items.data
+    assert persisted.created_by == "alice@example.com"
+    [(path, forwarded)] = runner_client.posts
+    assert path == f"/v1/sessions/{session_id}/events"
+    assert forwarded["created_by"] == "alice@example.com"
+    assert forwarded["author_attribution_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_post_event_uses_runner_supplied_created_by(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner-originated wake events preserve the triggering collaborator."""
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    session_id = _seed_shared_session(
+        db_uri,
+        {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
+    )
+    runner_headers = _bind_runner(db_uri, session_id)
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "created_by": "bob@example.com",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "[System: sub-agent done]"}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
+    [persisted] = items.data
+    assert persisted.created_by == "bob@example.com"
+
+
+@pytest.mark.asyncio
+async def test_post_event_rejects_client_supplied_created_by(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Co-editors cannot spoof another editor as the policy actor."""
+    from omnigent.server.routes import sessions as sessions_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+
+    session_id = _seed_shared_session(
+        db_uri,
+        {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
+    )
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "created_by": "bob@example.com",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_post_event_stale_runner_created_by_falls_back_to_runner_user(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A revoked collaborator cannot strand a trusted runner wake notice."""
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    runner_headers = _bind_runner(db_uri, session_id)
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "created_by": "bob@example.com",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "[System: sub-agent done]"}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
     )
     assert resp.status_code == 202, resp.text
 

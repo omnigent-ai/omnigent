@@ -996,14 +996,20 @@ def map_step_to_events(
             # response when present.  Both fields appear in live fixtures and
             # are equal when no moderation has occurred.
             modified = planner.get("modifiedResponse")
-            text = modified if isinstance(modified, str) and modified else response_text
-            if isinstance(text, str) and text:
+            planner_text = (
+                modified
+                if isinstance(modified, str) and modified
+                else response_text
+                if isinstance(response_text, str)
+                else None
+            )
+            if planner_text:
                 # ONE message event — NO delta (the double-render fix).
                 events.append(
                     _message_event(
                         conversation_id=conversation_id,
                         step_idx=step_idx,
-                        text=text,
+                        text=planner_text,
                     )
                 )
             tool_calls = planner.get("toolCalls")

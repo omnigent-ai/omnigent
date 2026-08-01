@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.7.0.dev0"
+version = "0.8.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,10 +26,12 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.7.0.dev0",
-    "omnigent-ui-sdk==0.7.0.dev0",
+    "omnigent-client==0.8.0.dev0",
+    "omnigent-ui-sdk==0.8.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
+    # OpenClaw stores its wrapped acpx registry as JSON5.
+    "json5>=0.10,<1",
     # openai-agents<0.18.2 omits a field required by openai>=2.45.
     # Keep this cap until the websockets<15 compatibility pin can be lifted.
     "openai>=1.0,<2.45",
@@ -100,6 +102,11 @@ dependencies = [
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
+    # CA root bundle for client TLS verification (omnigent/tls.py,
+    # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
+    # python-build-standalone interpreters whose OpenSSL has no default cert
+    # path; previously only transitive, pinned here now that we import it.
+    "certifi>=2023.7",
     # Protobuf schema for the AI-gateway routing API
     # (omnigent/api/routing/v1/routing.proto).
     # Previously only a transitive dep; declared directly now that we ship a proto.
@@ -157,7 +164,7 @@ islo = ["islo>=0.3.5,<0.4"]
 # NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.
-openshell = ["openshell>=0.0.7,<1"]
+openshell = ["openshell>=0.0.88,<1"]
 # On-demand Kubernetes runner Pod launcher (server-managed
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the
@@ -225,7 +232,7 @@ memory = ["hindsight-client>=0.4.0"]
 # (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
 # `[project].version` in `integrations/slack/pyproject.toml`.
 slack = [
-    "omnigent-slack==0.7.0.dev0",
+    "omnigent-slack==0.8.0.dev0",
 ]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
@@ -622,6 +629,10 @@ module = "claude_agent_sdk.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = ["copilot", "copilot.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "agents.*"
 ignore_missing_imports = true
 
@@ -639,6 +650,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "daytona.*"
+ignore_missing_imports = true
+
+# islo is an optional dep (the `islo` extra); same lazy-import posture
+# as modal above.
+[[tool.mypy.overrides]]
+module = "islo.*"
 ignore_missing_imports = true
 
 # hindsight-client is an optional dep (the `hindsight` extra); the

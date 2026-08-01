@@ -51,6 +51,10 @@ def _wheel_install(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.1.0")
     monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
     monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _uv_registry_info)
+    # Pretend a uv tool receipt exists so the install is not mistaken for uv pip.
+    monkeypatch.setattr(
+        "omnigent.update_check._uv_tool_receipt_path", lambda: Path("/dev/null/uv-receipt.toml")
+    )
     # Neutralize the process side effects unless a test opts in to assert them.
     monkeypatch.setattr(
         "omnigent.cli.local_server_status",

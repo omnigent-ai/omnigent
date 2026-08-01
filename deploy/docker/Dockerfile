@@ -55,7 +55,7 @@
 
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
-ARG NODE_VERSION=20
+ARG NODE_VERSION=22
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the web SPA so `docker build` works from a clean checkout —
@@ -70,12 +70,20 @@ ARG NODE_VERSION=20
 FROM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
-WORKDIR /web/web
-# Manifests first so the install layer caches across pure source edits.
-COPY web/package.json web/package-lock.json ./
-RUN npm install --no-audit --no-fund
-COPY web/ ./
-RUN npm run build
+WORKDIR /web
+
+# Workspace manifests + lockfile first so the install layer caches across pure
+# source edits. The electron package JSON is included so the root workspace is
+# structurally complete, but we --filter web to avoid downloading Electron.
+COPY pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY web/package.json ./web/
+COPY web/electron/package.json ./web/electron/
+
+RUN npm install -g pnpm@11.15.1
+RUN pnpm install --frozen-lockfile --filter web
+
+COPY web/ ./web/
+RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────
 # Installs the package (and its transitive native-extension deps) into

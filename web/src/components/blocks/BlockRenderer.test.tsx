@@ -221,11 +221,10 @@ describe("BlockRenderer dispatch", () => {
     expect(sections[1]!).not.toHaveClass("mt-2");
   });
 
-  it("'See N steps' counts the whole tool run, including the streaming tail", () => {
-    // While streaming, the most-recent tools render as a visible tail
-    // OUTSIDE the fold. The "See N steps" label must count the whole run
-    // (5), not just the folded part — else it reads "See 2 steps" with 3
-    // more tool cards visible below (the reported miscount).
+  it("labels the fold with only the hidden count while the tail streams", () => {
+    // The most-recent tools render as a visible tail OUTSIDE the fold, so
+    // the fold line describes only what's hidden ("Called 2 tools") — a
+    // whole-run count would double-count the tool cards visible below.
     const tool = (n: number): RenderItem => ({
       kind: "tool",
       itemId: `fc_${n}`,
@@ -252,15 +251,50 @@ describe("BlockRenderer dispatch", () => {
       tool(5),
     ];
     render(<BlockRenderer items={items} sessionStatus="running" />);
-    expect(screen.getByText("See 5 steps")).toBeDefined();
-    expect(screen.queryByText("See 2 steps")).toBeNull();
-    // The label counts the WHOLE run, but the recent tools must still be
-    // visible as a tail OUTSIDE the collapsed group — the most-recent tool
-    // renders (the collapsed group's content is unmounted), while an older
-    // one stays folded. Guards against a regression that folds everything
-    // (the count would still read 5, but the live tail would vanish).
+    expect(screen.getByText("Called 2 tools")).toBeDefined();
+    expect(screen.queryByText("Called 5 tools")).toBeNull();
+    // The recent tools must be visible as a tail OUTSIDE the collapsed
+    // group — the most-recent tool renders (the collapsed group's content
+    // is unmounted), while an older one stays folded. Guards against a
+    // regression that folds everything.
     expect(screen.getByText(/tool_5/)).toBeDefined();
     expect(screen.queryByText(/tool_1/)).toBeNull();
+  });
+
+  it("folds the whole run into one labeled row once the session is idle", () => {
+    // Mirrors the terminal's collapsed past turns: after a run
+    // completes, every step folds into a single expandable summary
+    // line labeled with the run's actions.
+    const tool = (n: number, name = `tool_${n}`): RenderItem => ({
+      kind: "tool",
+      itemId: `fc_${n}`,
+      execution: {
+        name,
+        arguments: {},
+        argsSummary: "",
+        callId: `c_${n}`,
+        agentName: "nessie",
+        executedBy: "server",
+        output: "ok",
+      },
+      output: "ok",
+      state: "output-available",
+      startedAt: null,
+      duration: undefined,
+    });
+    const items: RenderItem[] = [
+      tool(1, "Bash"),
+      tool(2, "Bash"),
+      tool(3),
+      tool(4),
+      tool(5),
+      { kind: "text", itemId: "m1", text: "Done.", final: true },
+    ];
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    // The whole run folds; the label describes all five steps.
+    expect(screen.getByText("Ran 2 shell commands, called 3 other tools")).toBeDefined();
+    expect(screen.queryByText(/tool_5/)).toBeNull();
+    expect(screen.queryByText(/Bash/)).toBeNull();
   });
 
   // Proves the markdown throttle is actually wired into the render path (not
@@ -460,6 +494,30 @@ const NOT_FOUND_RESPONSE = {
   json: async () => ({ error: { code: "not_found" } }),
 } as unknown as Response;
 
+interface TestFileViewerContext {
+  openFile: (path: string) => void;
+  isChangedPath: (path: string) => boolean;
+  conversationId: string | undefined;
+  workspaceRoot: string | null;
+  workspaceHome: string | null;
+}
+
+function TestProviders({
+  children,
+  queryClient,
+  fileViewerContext,
+}: {
+  children: ReactNode;
+  queryClient: QueryClient;
+  fileViewerContext: TestFileViewerContext;
+}) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <FileViewerContext.Provider value={fileViewerContext}>{children}</FileViewerContext.Provider>
+    </QueryClientProvider>
+  );
+}
+
 function renderMessage(
   text: string,
   ctx: {
@@ -470,7 +528,7 @@ function renderMessage(
     workspaceHome?: string | null;
   },
 ) {
-  const fullCtx = {
+  const fullCtx: TestFileViewerContext = {
     workspaceRoot: null,
     workspaceHome: null,
     ...ctx,
@@ -479,17 +537,10 @@ function renderMessage(
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 0 } },
   });
-  function Wrap({ children }: { children: ReactNode }) {
-    return (
-      <QueryClientProvider client={qc}>
-        <FileViewerContext.Provider value={fullCtx}>{children}</FileViewerContext.Provider>
-      </QueryClientProvider>
-    );
-  }
   return render(
-    <Wrap>
+    <TestProviders queryClient={qc} fileViewerContext={fullCtx}>
       <BlockRenderer items={items} sessionStatus="idle" />
-    </Wrap>,
+    </TestProviders>,
   );
 }
 

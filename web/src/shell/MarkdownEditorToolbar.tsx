@@ -107,15 +107,15 @@ function TableBtn({ editor }: { editor: Editor | null }) {
           {hovered.rows > 0 ? `${hovered.rows} × ${hovered.cols} table` : "Insert table"}
         </p>
         <div className="flex flex-col gap-0.5">
-          {Array.from({ length: MAX }, (_, r) => (
-            <div key={r} className="flex gap-0.5">
-              {Array.from({ length: MAX }, (_, c) => (
+          {Array.from({ length: MAX }, (_, rowIndex) => (
+            <div key={rowIndex} className="flex gap-0.5">
+              {Array.from({ length: MAX }, (__, columnIndex) => (
                 <button
-                  key={c}
+                  key={columnIndex}
                   type="button"
-                  aria-label={`Insert ${r + 1}×${c + 1} table`}
+                  aria-label={`Insert ${rowIndex + 1}×${columnIndex + 1} table`}
                   onMouseDown={(e) => e.preventDefault()}
-                  onMouseEnter={() => setHovered({ rows: r + 1, cols: c + 1 })}
+                  onMouseEnter={() => setHovered({ rows: rowIndex + 1, cols: columnIndex + 1 })}
                   onClick={() => {
                     // Use stable loop indices rather than async hovered state to
                     // avoid a 0×0 insert on fast clicks before state flushes.
@@ -123,8 +123,8 @@ function TableBtn({ editor }: { editor: Editor | null }) {
                       ?.chain()
                       .focus()
                       .insertTable({
-                        rows: r + 1,
-                        cols: c + 1,
+                        rows: rowIndex + 1,
+                        cols: columnIndex + 1,
                         withHeaderRow: true,
                       })
                       .run();
@@ -132,7 +132,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
                   }}
                   className={cn(
                     "h-5 w-5 cursor-pointer rounded-sm border transition-colors",
-                    r < hovered.rows && c < hovered.cols
+                    rowIndex < hovered.rows && columnIndex < hovered.cols
                       ? "border-primary bg-primary/20"
                       : "border-border bg-muted hover:border-primary/50 hover:bg-primary/10",
                   )}

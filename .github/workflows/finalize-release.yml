@@ -2,13 +2,16 @@
 # run after the prod PyPI publish succeeded and the draft notes are curated
 # (designs/RELEASE-AUTOMATION.md).
 #
-# Deterministic gates first (all fail with actionable links):
-#   * the tag is a final vX.Y.Z with an unpublished draft release,
+# Deterministic gates first (each fails with actionable links):
+#   * the tag is a final vX.Y.Z (input is normalized: `0.7.0` -> `v0.7.0`)
+#     with an unpublished draft release; a draft whose tag binding was lost
+#     to a web-UI edit (tag_name became `untagged-…`) is rebound automatically,
 #   * PyPI serves all three lockstep packages at the version (never advertise
 #     a release that isn't installable),
-#   * the auto/changelog/vX.Y.Z CHANGELOG PR isn't sitting open,
-#   * the docs sweep: no open PRs against omnigent-site's X.Y-docs staging
-#     branch (every doc staged this cycle is reviewed + merged/closed).
+#   * the auto/changelog/vX.Y.Z CHANGELOG PR isn't sitting open.
+# The docs sweep (open PRs against omnigent-site's X.Y-docs staging branch) is
+# ADVISORY only: it lists what is still unmerged but never blocks the publish —
+# docs can land after the release, any time before the docs-publish PR merges.
 #
 # The publish job binds the `publish-release` environment (one-time setup:
 # create it in repo settings with required reviewers). Approving it is the
@@ -64,16 +67,23 @@ jobs:
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
       already_published: ${{ steps.draft.outputs.already_published }}
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - name: Require a final vX.Y.Z tag
+        id: tag
         env:
-          TAG: ${{ inputs.tag }}
+          RAW_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          # Normalize the input: trim whitespace, add the leading v if omitted
+          # (`0.7.0` -> `v0.7.0`), so a bare version doesn't fail the dispatch.
+          TAG="$(printf '%s' "$RAW_TAG" | tr -d '[:space:]')"
+          case "$TAG" in v*) ;; *) TAG="v${TAG}" ;; esac
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::${TAG} is not a final vX.Y.Z tag — rc/dev/pre releases never finalize."
+            echo "::error::${RAW_TAG} is not a final vX.Y.Z tag — rc/dev/pre releases never finalize."
             exit 1
           fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       # Drafts are invisible to read-only tokens and unaddressable by tag
       # (the get-by-tag endpoint 404s on drafts) — resolve by listing with the
@@ -93,11 +103,32 @@ jobs:
         id: draft
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           match="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
             --jq 'map(select(.tag_name == env.TAG)) | first // empty')"
+          if [ -z "$match" ]; then
+            # Editing a draft in the web UI can silently drop its tag binding
+            # (tag_name becomes `untagged-…` while the name stays vX.Y.Z; bit
+            # v0.5.0 and v0.7.0). Recover: match the DRAFT by name and rebind —
+            # only ever onto a tag that already exists, so publishing can never
+            # mint a new tag at main.
+            match="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+              --jq 'map(select(.draft == true and .name == env.TAG)) | first // empty')"
+            if [ -n "$match" ]; then
+              if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha >/dev/null 2>&1; then
+                echo "::error::Draft named ${TAG} exists but the git tag does not — push the tag before finalizing."
+                exit 1
+              fi
+              rebind_id="$(printf '%s' "$match" | jq -r '.id')"
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${rebind_id}" \
+                -f tag_name="$TAG" > /dev/null
+              match="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${rebind_id}")"
+              echo "Rebound draft ${rebind_id} to ${TAG} (tag binding was lost, usually to a web-UI edit)." \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
           if [ -z "$match" ]; then
             echo "::error::No GitHub release found for ${TAG}. Did the tag push run github-release.yml?"
             exit 1
@@ -118,7 +149,7 @@ jobs:
       - name: Assert PyPI serves all three packages
         if: steps.draft.outputs.already_published != 'true'
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
@@ -134,7 +165,7 @@ jobs:
         if: steps.draft.outputs.already_published != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           open_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "auto/changelog/${TAG}" \
@@ -145,11 +176,14 @@ jobs:
           fi
           echo "CHANGELOG PR for ${TAG}: merged or not needed."
 
-      - name: Docs sweep — no open PRs against the X.Y-docs staging branch
+      # Advisory only: docs frequently land after the release. The list tells
+      # the coordinator what must merge into X.Y-docs before the docs-publish
+      # PR does — it never blocks the publish itself.
+      - name: Docs sweep — list open PRs against the X.Y-docs staging branch
         if: steps.draft.outputs.already_published != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.tag.outputs.tag }}
           SITE_REPO: ${{ github.repository_owner }}/omnigent-site
         run: |
           set -euo pipefail
@@ -158,16 +192,17 @@ jobs:
           open="$(gh pr list --repo "$SITE_REPO" --base "$docs_branch" --state open \
             --json url,title --jq '.[] | "- \(.url)  \(.title)"')"
           if [ -n "$open" ]; then
+            count="$(printf '%s\n' "$open" | grep -c .)"
             {
-              echo "## Docs sweep failed for ${TAG}"
+              echo "## Docs sweep for ${TAG} — ${count} open PR(s) still target \`${docs_branch}\`"
               echo ""
-              echo "Open PRs still target \`${docs_branch}\` on ${SITE_REPO} — review and merge/close them, then re-dispatch:"
+              echo "Advisory, not blocking. Merge/close these before merging the docs-publish PR:"
               echo "$open"
             } | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "::error::Open doc PRs still target ${docs_branch} — see the run summary."
-            exit 1
+            echo "::warning::${count} open doc PR(s) still target ${docs_branch} (non-blocking) — see the run summary."
+          else
+            echo "Docs sweep clean: no open PRs against ${docs_branch}." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
-          echo "Docs sweep clean: no open PRs against ${docs_branch}." | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Approving this environment attests "I reviewed the curated draft notes".
   publish:
@@ -189,7 +224,7 @@ jobs:
       - name: Publish the draft as Latest
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.checks.outputs.tag }}
           RELEASE_ID: ${{ needs.checks.outputs.release_id }}
         run: |
           set -euo pipefail
