@@ -1944,12 +1944,13 @@ def register_core_routes(
         # agent belongs to one conversation (possibly another user's) and
         # must never be cloned across sessions.
         base_agent = source_agent
-        switching_agent = body.agent_id is not None and body.agent_id != source.agent_id
-        if switching_agent:
-            target_agent = await asyncio.to_thread(agent_store.get, body.agent_id)
+        target_agent_id = body.agent_id
+        switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
+        if target_agent_id is not None and switching_agent:
+            target_agent = await asyncio.to_thread(agent_store.get, target_agent_id)
             if target_agent is None or target_agent.session_id is not None:
                 raise OmnigentError(
-                    f"Agent not found or not bindable: {body.agent_id!r}",
+                    f"Agent not found or not bindable: {target_agent_id!r}",
                     code=ErrorCode.NOT_FOUND,
                 )
             base_agent = target_agent
