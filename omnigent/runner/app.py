@@ -130,6 +130,7 @@ from omnigent.runner.session_init_protocol import (
     parse_runner_session_init_envelope,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.memory import cognee_framework_instructions
 from omnigent.runtime.prompt import (
     SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
     input_items_have_multiple_authors,
@@ -5030,7 +5031,7 @@ def create_runner_app(
                 (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
                 if shared_message_attribution_enabled() and conv in _author_attribution_sessions
                 else ()
-            )
+            ) + cognee_framework_instructions(cached_spec)
             instructions = build_instructions(
                 cached_spec,
                 None,
