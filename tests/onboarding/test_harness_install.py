@@ -1078,7 +1078,6 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
     [
         (hi.OPENCODE_KEY, "1.17.7", "1.18.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
-        (hi.KIMI_KEY, "1.47.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
         (hi.PI_KEY, "0.79.0", None),
@@ -1096,6 +1095,33 @@ def test_versioned_specs_declare_bounds(
     assert spec is not None
     assert spec.min_version == min_version
     assert spec.max_version_exclusive == max_version_exclusive
+
+
+@pytest.mark.parametrize("reported", ["0.31.1", "0.5.0", "0.12.3"])
+def test_kimi_code_current_versions_are_accepted(
+    monkeypatch: pytest.MonkeyPatch, reported: str
+) -> None:
+    """Kimi Code ships a ``0.x`` line; those versions must count as installed.
+
+    Regression: the spec previously declared a ``1.47.0`` floor copied from the
+    unrelated legacy ``kimi-cli`` project, so every real Kimi Code build was
+    rejected as outdated.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=reported, stderr=""),
+    )
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_kimi_spec_declares_no_version_bounds() -> None:
+    """Kimi Code has no code-derived minimum, so the spec stays unbounded."""
+    spec = hi.harness_install_spec(hi.KIMI_KEY)
+    assert spec is not None
+    assert spec.min_version is None
+    assert spec.max_version_exclusive is None
 
 
 @pytest.mark.parametrize(
@@ -1130,7 +1156,6 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
     "key",
     [
         hi.CURSOR_KEY,
-        hi.KIMI_KEY,
         ANTHROPIC_FAMILY,
         OPENAI_FAMILY,
         hi.PI_KEY,
@@ -1192,7 +1217,7 @@ def test_harness_cli_installed_ignores_upper_bound_for_unversioned_specs(
         ("cursor-agent 2026.07.01-777f564", "2026.07.01"),
         ("2026.06.19-20-24-33-653a7fb", "2026.06.19"),
         ("2026.05.24.1.dda726e", "2026.05.24"),
-        ("kimi version 1.47.0", "1.47.0"),
+        ("kimi version 0.31.1", "0.31.1"),
         ("1.17.7-rc1", "1.17.7-rc1"),
     ],
 )
@@ -1206,7 +1231,6 @@ def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: 
     "key,outdated,satisfying",
     [
         (hi.CURSOR_KEY, "2026.05.24", "2026.06.22"),
-        (hi.KIMI_KEY, "1.46.0", "1.48.0"),
         (hi.HERMES_KEY, "2026.05.29", "2026.06.19"),
     ],
 )
@@ -1216,7 +1240,7 @@ def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
     outdated: str,
     satisfying: str,
 ) -> None:
-    """Cursor and Kimi default to the first release after 2026-06-01."""
+    """Cursor and Hermes default to the first release after 2026-06-01."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:

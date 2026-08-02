@@ -101,8 +101,6 @@ KIRO_KEY = "kiro"
 #   2026-06-01. The first Codex release after the cutoff is 0.137.0.
 # - cursor: Cursor's CLI uses ``YYYY.MM.DD[-build]`` date versions. Default
 #   to the day after 2026-06-01 so we don't support stale pre-June builds.
-# - kimi: first ``kimi-cli`` release after 2026-06-01 is 1.47.0
-#   (https://github.com/MoonshotAI/kimi-cli/blob/main/CHANGELOG.md).
 # - hermes: parent_session_id schema was introduced in v0.17.0, but Hermes now
 #   ships date-tagged releases; the first one after 2026-06-01 is 2026.06.05.
 _CODEX_MIN_VERSION = "0.137.0"
@@ -113,7 +111,6 @@ _HERMES_MIN_VERSION = "2026.06.05"
 _KIRO_MIN_VERSION = "2.10.0"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
-_KIMI_MIN_VERSION = "1.47.0"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
@@ -234,9 +231,9 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         login_args=("login",),
         logout_args=("logout",),
         install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
-        # First kimi-cli release after 2026-06-01. Older builds may lack
-        # newer TUI/session wiring needed by the native harness.
-        min_version=_KIMI_MIN_VERSION,
+        # Deliberately unbounded: Kimi Code (code.kimi.com, 0.x line) is a
+        # different product from the legacy kimi-cli (1.x), and no harness code
+        # requires a minimum. Any future floor must come from the 0.x line.
     ),
     KIRO_KEY: HarnessInstallSpec(
         "Kiro",
