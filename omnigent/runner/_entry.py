@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import logging
 import os
 import signal
@@ -42,6 +43,11 @@ _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
+# The runner offloads short native-CLI/IPC ops via asyncio.to_thread. Python's
+# default executor sizes to min(32, cpu+4) threads, which on a many-core host
+# inflates RSS (thread stacks + glibc arenas) for little benefit. Cap it small.
+_DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS = 8
+_RUNNER_THREADPOOL_MAX_WORKERS_ENV_VAR = "OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS"
 # Backstop on how long a graceful (idle-reaper) shutdown waits for the tunnel
 # to drain its session streams and complete its close handshake before we give
 # up and tear it down anyway. Comfortably above serve_tunnel's own drain +
@@ -144,6 +150,55 @@ def _load_runner_idle_timeout_s_from_config() -> float:
     if timeout_s < 0:
         raise RuntimeError("runner.idle_timeout_s must be a non-negative number of seconds")
     return timeout_s
+
+
+def _runner_threadpool_max_workers() -> int:
+    """Load the runner's asyncio default-executor size.
+
+    Reads ``runner.threadpool_max_workers`` from the global config file,
+    overridable by ``OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS``. Missing config
+    defaults to 8. Non-positive, boolean, or non-integer values fail loud so a
+    misconfiguration surfaces at startup rather than silently reverting.
+
+    :returns: Positive worker count for the runner threadpool.
+    :raises RuntimeError: If the configured value is invalid.
+    """
+    raw_env = os.environ.get(_RUNNER_THREADPOOL_MAX_WORKERS_ENV_VAR)
+    if raw_env is not None and raw_env.strip():
+        try:
+            workers = int(raw_env)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{_RUNNER_THREADPOOL_MAX_WORKERS_ENV_VAR} must be a positive integer"
+            ) from exc
+        if workers < 1:
+            raise RuntimeError(
+                f"{_RUNNER_THREADPOOL_MAX_WORKERS_ENV_VAR} must be a positive integer"
+            )
+        return workers
+
+    import yaml
+
+    path = _runner_config_path()
+    if not path.exists():
+        return _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"failed to read runner config from {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        return _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
+    runner_cfg = raw.get("runner")
+    if runner_cfg is None:
+        return _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
+    if not isinstance(runner_cfg, dict):
+        raise RuntimeError("runner config must be a mapping")
+    raw_workers = runner_cfg.get("threadpool_max_workers")
+    if raw_workers is None:
+        return _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
+    if isinstance(raw_workers, bool) or not isinstance(raw_workers, int) or raw_workers < 1:
+        raise RuntimeError("runner.threadpool_max_workers must be a positive integer")
+    return raw_workers
 
 
 async def _run_inactivity_monitor(
@@ -1298,8 +1353,20 @@ async def _run_tunnel_from_env() -> None:
 
     :returns: None.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
+
+    # Bound the asyncio default executor before anything uses it (create_app,
+    # telemetry, and every to_thread offload). Setting it here means Python's
+    # lazy min(32, cpu+4)-thread default pool is never created.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=_runner_threadpool_max_workers(),
+            thread_name_prefix="runner",
+        )
+    )
 
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
@@ -1334,6 +1401,9 @@ async def _run_tunnel_from_env() -> None:
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
     _lifespan_cm = app.router.lifespan_context(app)
     await _lifespan_cm.__aenter__()
+    # Move the now-static import graph out of GC's tracked set: cheaper cyclic
+    # collections and fewer dirtied pages over the runner's life.
+    gc.freeze()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()

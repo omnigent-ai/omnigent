@@ -3161,6 +3161,10 @@ def _start_cli_runner_process(
         env[RUNNER_ISOLATE_SESSION_ENV_VAR] = "1"
     if prewarm_spec_path is not None:
         env["RUNNER_PREWARM_SPEC_PATH"] = str(Path(prewarm_spec_path).expanduser().resolve())
+    # Bound glibc allocator RSS in the runner (no-op off Linux). setdefault so
+    # an explicit operator export in the parent env still wins.
+    for _k, _v in _proc.malloc_tuning_env().items():
+        env.setdefault(_k, _v)
 
     log_path: Path | None = None
     log_fh: BinaryIO | None = None

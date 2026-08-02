@@ -74,6 +74,7 @@ from omnigent.host.git_worktree import (
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -638,6 +639,11 @@ def _build_runner_env(
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    # Bound glibc allocator RSS in the runner (no-op off Linux). Injected
+    # explicitly because the allowlist above would otherwise drop an inherited
+    # MALLOC_ARENA_MAX. setdefault so an operator override still wins.
+    for key, value in _proc.malloc_tuning_env().items():
+        env.setdefault(key, value)
     return env
 
 
