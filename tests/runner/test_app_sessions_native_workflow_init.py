@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -2186,6 +2187,160 @@ async def test_has_active_work_reports_process_manager_turns() -> None:
     pm.mark_turn_active("8e32600337d08f59ad381caf96a90659")
 
     assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_has_active_work_reports_native_pane_running() -> None:
+    """The runner idle watchdog sees a native PTY pane marked ``running``.
+
+    Native turns clear ``_active_turns`` at proxy-stream end while the pane is
+    still working. Without counting ``_native_pane_status == "running"``, the
+    inactivity monitor would shut the runner down mid-turn (premature idle /
+    orphaned native agent).
+
+    :returns: None.
+    """
+    app, _pm, _hc = _build_lifecycle_app()
+    session_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": session_id,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+
+    assert resp.status_code == 201
+    assert app.state.has_active_work() is False
+
+    registry = app.state.session_resource_registry
+    publisher = getattr(registry, "_session_status_publisher", None)
+    assert callable(publisher)
+
+    publisher(session_id, "running")
+    assert app.state.has_active_work() is True
+
+    publisher(session_id, "idle")
+    assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_has_active_work_ignores_stale_native_pane_running() -> None:
+    """A stale ``running`` entry must not pin the idle watchdog forever.
+
+    If a forwarder is SIGKILLed or the pane freezes without a final status
+    edge, ``_native_pane_status`` can linger as ``running``. Without a
+    freshness bound that turns into a whole-runner leak (the mirror of the
+    premature-idle bug).
+
+    :returns: None.
+    """
+    app, _pm, _hc = _build_lifecycle_app()
+    session_id = "b2c3d4e5f60718293a4b5c6d7e8f90a1"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": session_id,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+
+    assert resp.status_code == 201
+    set_status = app.state._set_native_pane_status
+    has_fresh = app.state._has_fresh_native_pane_running
+    stale_s = float(app.state._native_pane_running_stale_s)
+
+    # Fresh running pin keeps the runner alive (stamp = now).
+    set_status(session_id, "running")
+    assert app.state.has_active_work() is True
+
+    # Injected clock: past the staleness window the pin expires even though
+    # the stored status string is still ``running``.
+    now = time.monotonic()
+    set_status(session_id, "running", now=now)
+    assert has_fresh(now=now) is True
+    assert has_fresh(now=now + stale_s + 1.0) is False
+
+    # Drive has_active_work through the live clock with an already-stale stamp.
+    set_status(session_id, "running", now=now - stale_s - 1.0)
+    assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_activity_refreshes_native_pane_running_freshness() -> None:
+    """Pane activity pulses keep a long ``running`` turn from going stale.
+
+    Status edges are idle→running only; continuous work refreshes liveness via
+    ``session.terminal.activity`` so a healthy multi-minute turn still pins
+    the watchdog.
+
+    :returns: None.
+    """
+    app, _pm, _hc = _build_lifecycle_app()
+    session_id = "c3d4e5f60718293a4b5c6d7e8f90a1b2"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": session_id,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+
+    assert resp.status_code == 201
+    registry = app.state.session_resource_registry
+    status_publisher = getattr(registry, "_session_status_publisher", None)
+    activity_publisher = getattr(registry, "_terminal_activity_publisher", None)
+    assert callable(status_publisher) and callable(activity_publisher)
+
+    status_publisher(session_id, "running")
+    assert app.state.has_active_work() is True
+
+    # Age the stamp past the window, then an activity pulse must revive it.
+    set_status = app.state._set_native_pane_status
+    stale_s = float(app.state._native_pane_running_stale_s)
+    set_status(session_id, "running", now=time.monotonic() - stale_s - 1.0)
+    assert app.state.has_active_work() is False
+    activity_publisher(session_id, "terminal_claude_main")
+    assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_external_session_status_failed_clears_native_pane_running_pin() -> None:
+    """Forwarder ``failed`` clears the idle-watchdog pin without a PTY idle edge.
+
+    Part A posts ``external_session_status: failed`` when the forwarder gives
+    up. That must drop the ``running`` pin even if the PTY watcher never
+    observes quiescence (SIGKILL / hung TUI with a frozen pane).
+
+    :returns: None.
+    """
+    app, _pm, _hc = _build_lifecycle_app()
+    session_id = "d4e5f60718293a4b5c6d7e8f90a1b2c3"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": session_id,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert resp.status_code == 201
+
+        app.state._set_native_pane_status(session_id, "running")
+        assert app.state.has_active_work() is True
+
+        fail_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": "forwarder gave up"},
+            },
+        )
+        assert fail_resp.status_code == 204
+        assert app.state.has_active_work() is False
 
 
 @pytest.mark.asyncio

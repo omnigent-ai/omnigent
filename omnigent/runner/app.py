@@ -225,6 +225,13 @@ for _builder_name in (
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# A native pane ``running`` entry only pins the idle watchdog while fresh.
+# Status edges are edge-triggered (idle→running once); continuous work instead
+# refreshes the stamp via ``session.terminal.activity`` (~1s). Without a bound,
+# a SIGKILLed forwarder / frozen pane leaves ``running`` forever and the runner
+# never shuts down. 120s is well above the activity cadence and the 1s PTY idle
+# threshold, but short enough that a dead pin cannot hold billable compute open.
+_NATIVE_PANE_RUNNING_STALE_S = 120.0
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -1883,7 +1890,10 @@ def create_runner_app(
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
-    _native_pane_status: dict[str, str] = {}
+    # session_id → (status, monotonic timestamp of last liveness refresh).
+    # ``running`` only pins the idle watchdog while the stamp is fresh; see
+    # :data:`_NATIVE_PANE_RUNNING_STALE_S`.
+    _native_pane_status: dict[str, tuple[str, float]] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
@@ -1900,6 +1910,47 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    def _set_native_pane_status(session_id: str, status: str, *, now: float | None = None) -> None:
+        """Record a native pane status edge and refresh its liveness stamp.
+
+        :param session_id: Omnigent session/conversation id.
+        :param status: Status value, e.g. ``"running"`` or ``"idle"``.
+        :param now: Optional monotonic timestamp (tests inject a clock).
+        :returns: None.
+        """
+        _native_pane_status[session_id] = (
+            status,
+            time.monotonic() if now is None else now,
+        )
+
+    def _touch_native_pane_running(session_id: str, *, now: float | None = None) -> None:
+        """Refresh the liveness stamp when a running pane still has activity.
+
+        :param session_id: Omnigent session/conversation id.
+        :param now: Optional monotonic timestamp (tests inject a clock).
+        :returns: None.
+        """
+        entry = _native_pane_status.get(session_id)
+        if entry is None or entry[0] != "running":
+            return
+        _native_pane_status[session_id] = (
+            "running",
+            time.monotonic() if now is None else now,
+        )
+
+    def _has_fresh_native_pane_running(*, now: float | None = None) -> bool:
+        """Return whether any native pane is freshly ``running``.
+
+        :param now: Optional monotonic timestamp (tests inject a clock).
+        :returns: ``True`` when at least one session is ``running`` and its
+            liveness stamp is within :data:`_NATIVE_PANE_RUNNING_STALE_S`.
+        """
+        stamp = time.monotonic() if now is None else now
+        for status, seen_at in _native_pane_status.values():
+            if status == "running" and stamp - seen_at <= _NATIVE_PANE_RUNNING_STALE_S:
+                return True
+        return False
+
     def _has_active_work() -> bool:
         if _active_turns:
             return True
@@ -1915,9 +1966,19 @@ def create_runner_app(
             session_ids = set(_session_start_cache) | set(_session_agent_ids)
             if any(process_manager.has_active_turn(session_id) for session_id in session_ids):
                 return True
+        # Native PTY turns clear `_active_turns` at proxy-stream end while the
+        # pane is still working; the pane reaper already treats this as busy.
+        # Bound by freshness so a stuck ``running`` entry cannot pin the
+        # runner awake forever after a silent forwarder/pane death.
+        if _has_fresh_native_pane_running():
+            return True
         return False
 
     app.state.has_active_work = _has_active_work
+    # Test seams for the freshness bound.
+    app.state._set_native_pane_status = _set_native_pane_status
+    app.state._has_fresh_native_pane_running = _has_fresh_native_pane_running
+    app.state._native_pane_running_stale_s = _NATIVE_PANE_RUNNING_STALE_S
 
     def _drain_session_streams() -> None:
         for queue in list(_session_event_queues.values()):
@@ -1931,10 +1992,24 @@ def create_runner_app(
             queue = asyncio.Queue()
             _session_event_queues[session_id] = queue
         queue.put_nowait(event)
-        if event.get("type") == "session.status":
+        event_type = event.get("type")
+        if event_type == "session.status":
             _status_value = event.get("status")
             if isinstance(_status_value, str):
-                _native_pane_status[session_id] = _status_value
+                _set_native_pane_status(session_id, _status_value)
+                # Reset the runner idle timer on native status edges so a long
+                # PTY turn does not look "already timed out" the moment it
+                # settles to idle.
+                mark_activity = getattr(app.state, "mark_activity", None)
+                if callable(mark_activity):
+                    mark_activity()
+        elif event_type == "session.terminal.activity":
+            # Continuous pane work does not re-emit ``running`` (edge-only);
+            # activity pulses keep the freshness stamp alive instead.
+            _touch_native_pane_running(session_id)
+            mark_activity = getattr(app.state, "mark_activity", None)
+            if callable(mark_activity):
+                mark_activity()
         _fan_out_child_delta_to_parent(session_id, event)
 
     def _child_preview_from_status(
@@ -5991,6 +6066,11 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
+                # Keep the idle-watchdog pin aligned with forwarder-observed
+                # edges without re-publishing ``session.status`` (the server
+                # already did). Terminal ``idle``/``failed`` clear a stuck
+                # ``running`` pin even when the PTY watcher never fires again.
+                _set_native_pane_status(conversation_id, status)
                 resource_registry.note_external_session_status(conversation_id, status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,
@@ -6943,6 +7023,11 @@ def create_runner_app(
             tmux_target=entry.instance.tmux_target,
             read_only=read_only,
             on_client_interaction=entry.instance.note_client_interaction,
+            on_pane_dead=(
+                (lambda: resource_registry.notify_pane_dead(session_id, terminal_id))
+                if resource_registry is not None
+                else None
+            ),
         )
 
     async def _require_os_env(session_id: str) -> Any | None:
@@ -8432,7 +8517,12 @@ def create_runner_app(
                 process_manager is not None and process_manager.has_active_turn(conv_id)
             ):
                 return True
-            if _native_pane_status.get(conv_id) == "running":
+            entry = _native_pane_status.get(conv_id)
+            if (
+                entry is not None
+                and entry[0] == "running"
+                and time.monotonic() - entry[1] <= _NATIVE_PANE_RUNNING_STALE_S
+            ):
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             return bool(clients)

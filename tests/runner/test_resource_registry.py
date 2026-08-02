@@ -480,6 +480,158 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_notify_pane_dead_while_running_publishes_failure_exit(
+    tmp_path: Path,
+) -> None:
+    """Attach-bridge pane death mid-turn drives the same durable failure path.
+
+    When the websocket bridge observes ``#{pane_dead}=1`` during a running
+    turn, ``notify_pane_dead`` must schedule the required-terminal exit with
+    ``session_was_idle=False`` so the runner publishes ``failed`` and clears
+    the spinner — not only close the websocket.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :returns: None.
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_pane", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_pane"
+    )
+    on_activity = callbacks["on_activity"]
+    assert callable(on_activity)
+    on_activity()
+
+    registry.notify_pane_dead("conv_pane", terminal_resource_id("claude", "main"))
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].session_was_idle is False
+    assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_notify_pane_dead_while_idle_is_clean_shutdown(tmp_path: Path) -> None:
+    """Attach-bridge pane death after idle must not look like a crash.
+
+    A clean ``/quit`` goes idle first; when the pane then dies, the exit must
+    carry ``session_was_idle=True`` so the runner does not publish a spurious
+    failed card.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :returns: None.
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_quit", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_quit"
+    )
+    on_activity = callbacks["on_activity"]
+    on_idle = callbacks["on_idle"]
+    assert callable(on_activity) and callable(on_idle)
+    on_activity()
+    on_idle()
+
+    registry.notify_pane_dead("conv_quit", terminal_resource_id("claude", "main"))
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].session_was_idle is True
+
+
+@pytest.mark.asyncio
+async def test_notify_pane_dead_is_idempotent_with_idle_watcher_exit(
+    tmp_path: Path,
+) -> None:
+    """Pane-death notify and watcher ``on_exit`` must not double-publish.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :returns: None.
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_once", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_once"
+    )
+    on_activity = callbacks["on_activity"]
+    on_exit = callbacks["on_exit"]
+    assert callable(on_activity) and callable(on_exit)
+    on_activity()
+
+    registry.notify_pane_dead("conv_once", terminal_resource_id("claude", "main"))
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+    on_exit()
+    await registry.wait_for_terminal_exit_cleanup()
+
+    assert len(exits) == 1
+
+
+@pytest.mark.asyncio
+async def test_notify_pane_dead_is_noop_before_terminal_observed(tmp_path: Path) -> None:
+    """Pane-death notify before observe cannot publish a spurious failed card.
+
+    Native cold start briefly has no observed lifecycle. ``notify_pane_dead``
+    must no-op until ``observe_required_terminal`` registers the pane — the
+    attach bridge also refuses to connect until ``is_alive()`` is true, so a
+    pre-pane cold start cannot trip part B.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :returns: None.
+    """
+    from omnigent.entities.session_resources import terminal_resource_id
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_cold", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    registry.notify_pane_dead("conv_cold", terminal_resource_id("claude", "main"))
+    await asyncio.sleep(0)
+    assert exits == []
+
+
+@pytest.mark.asyncio
 async def test_required_terminal_exit_without_observed_status_is_failure(tmp_path: Path) -> None:
     """A required terminal that never reported a PTY status fails on exit.
 

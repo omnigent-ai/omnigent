@@ -510,6 +510,7 @@ async def bridge_tmux_pty_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    on_pane_dead: Callable[[], None] | None = None,
 ) -> None:
     """
     Bridge a tmux attach PTY to an already-accepted *websocket*.
@@ -538,6 +539,11 @@ async def bridge_tmux_pty_to_websocket(
         mis-reading them as agent activity. ``None`` (e.g. the
         server-direct attach path, which is out-of-process from the
         watcher) disables that attribution.
+    :param on_pane_dead: Optional callback fired when the bridge observes
+        a definitive dead pane (``#{pane_dead}=1`` or session gone). The
+        runner uses this to drive the same required-terminal exit path as
+        the idle watcher so a mid-turn crash publishes durable ``failed``
+        instead of only closing the websocket.
     """
     # Attaching is itself a client interaction: tmux resizes the window to
     # the new client, which reflows the pane. Stamp it before the bridge
@@ -668,6 +674,8 @@ async def bridge_tmux_pty_to_websocket(
                                 "tmux-attach: pane is dead; closing websocket target=%s",
                                 tmux_target,
                             )
+                            if on_pane_dead is not None:
+                                on_pane_dead()
                             with contextlib.suppress(RuntimeError):
                                 await websocket.close(
                                     code=WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -732,6 +740,8 @@ async def bridge_tmux_pty_to_websocket(
                 if pane_dead is True or (
                     pane_dead is None and not await _tmux_session_alive(socket_path, tmux_target)
                 ):
+                    if on_pane_dead is not None:
+                        on_pane_dead()
                     await websocket.close(
                         code=WS_CLOSE_TERMINAL_NOT_FOUND,
                         reason="terminal session ended",
