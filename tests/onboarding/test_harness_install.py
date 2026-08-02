@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
@@ -1122,6 +1123,24 @@ def test_kimi_spec_declares_no_version_bounds() -> None:
     assert spec is not None
     assert spec.min_version is None
     assert spec.max_version_exclusive is None
+
+
+def test_kimi_floor_can_never_come_from_the_legacy_cli_line() -> None:
+    """Any Kimi floor must belong to the Kimi Code 0.x line.
+
+    Omnigent installs Kimi Code from code.kimi.com, whose releases are 0.x.
+    The legacy MoonshotAI kimi-cli project is on a separate 1.x line; a floor
+    borrowed from it rejects every real Kimi Code build.
+    """
+    spec = hi.harness_install_spec(hi.KIMI_KEY)
+    assert spec is not None
+    assert spec.install_hint is not None and "code.kimi.com" in spec.install_hint
+    for bound in (spec.min_version, spec.max_version_exclusive):
+        if bound is not None:
+            assert Version(bound) < Version("1.0.0"), (
+                f"Kimi bound {bound!r} looks like a legacy kimi-cli version; "
+                "Kimi Code releases are 0.x"
+            )
 
 
 @pytest.mark.parametrize(
