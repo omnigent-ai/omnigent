@@ -123,7 +123,6 @@ class ProviderCredentialError(OmnigentError):
     """
 
 
-
 class ElicitationDeclinedError(Exception):
     """Raised when a user explicitly declines an elicitation (action == "decline").
 
