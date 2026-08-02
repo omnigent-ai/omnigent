@@ -6802,14 +6802,12 @@ def _execute_skill_tool(
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
 
-    if tool_name == "load_skill":
-        tool = LoadSkillTool(
-            bundled_skills,
-            agent_root=runner_workspace,
-            skills_filter=skills_filter,
-        )
-    else:
-        tool = ReadSkillFileTool(bundled_skills)
+    loader = LoadSkillTool(
+        bundled_skills,
+        agent_root=runner_workspace,
+        skills_filter=skills_filter,
+    )
+    tool = loader if tool_name == "load_skill" else ReadSkillFileTool(loader.skills)
 
     arguments_json = json.dumps(args)
     from omnigent.tools.base import ToolContext

@@ -1190,20 +1190,6 @@ def _completed_agent_message_text(
     return phase, message_buffers.get(completed_item_id, completed_text)
 
 
-def _latest_buffered_agent_message(message_buffers: dict[str, str]) -> str:
-    """Return the most recent buffered assistant text from Codex deltas.
-
-    ``turn/completed`` can arrive without a terminal ``item/completed``. In
-    that case the best available response is the last accumulated delta text.
-
-    :param message_buffers: Per-item accumulated delta text keyed by item id.
-    :returns: The most recent buffered assistant text, or ``""`` when absent.
-    """
-    if not message_buffers:
-        return ""
-    return next(reversed(message_buffers.values()))
-
-
 def _sandbox_mode(spec: OSEnvSpec | None) -> str:
     if spec is None:
         return "read-only"
@@ -1492,8 +1478,9 @@ class _CodexAppServerSession:
         *,
         active_turn_id: str,
         message_buffers: dict[str, str],
-        final_response: str,
-    ) -> str:
+        final_response: str | None,
+        saw_agent_message: bool,
+    ) -> tuple[str | None, bool]:
         """Collect a trailing final-answer item that arrives after ``turn/completed``.
 
         Some Codex app-server turns emit ``turn/completed`` slightly before the
@@ -1503,18 +1490,19 @@ class _CodexAppServerSession:
 
         :param active_turn_id: The current turn id.
         :param message_buffers: Accumulated delta text keyed by item id.
-        :param final_response: The response text accumulated so far.
-        :returns: The best final response observed during the drain window.
+        :param final_response: The terminal response observed so far, if any.
+        :param saw_agent_message: Whether the turn emitted assistant text.
+        :returns: The terminal response and assistant-message observation state.
         """
         deadline = time.monotonic() + _TURN_COMPLETED_DRAIN_SECONDS
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return final_response
+                return final_response, saw_agent_message
             try:
                 message = await asyncio.wait_for(self._events.get(), timeout=remaining)
             except asyncio.TimeoutError:
-                return final_response
+                return final_response, saw_agent_message
             self._record_event(message)
             params = message.get("params", {})
             if not isinstance(params, dict):
@@ -1532,14 +1520,14 @@ class _CodexAppServerSession:
                 if isinstance(item_id, str) and isinstance(delta, str) and delta:
                     prior = message_buffers.get(item_id, "")
                     message_buffers[item_id] = f"{prior}{delta}"
-                    if not final_response:
-                        final_response = message_buffers[item_id]
+                    saw_agent_message = True
                 continue
             if message.get("method") != "item/completed":
                 continue
             item = params.get("item", {})
             if not isinstance(item, dict) or item.get("type") != "agentMessage":
                 continue
+            saw_agent_message = True
             phase, completed_text = _completed_agent_message_text(item, message_buffers)
             if phase == "commentary":
                 item_id = item.get("id")
@@ -1548,8 +1536,7 @@ class _CodexAppServerSession:
                 continue
             if phase == "final_answer" or phase is None:
                 final_response = completed_text
-            if phase == "final_answer":
-                return final_response
+                return final_response, saw_agent_message
 
     async def run_turn(
         self,
@@ -1681,7 +1668,8 @@ class _CodexAppServerSession:
 
         message_buffers: dict[str, str] = {}
         pending_tool_results: dict[str, _PendingToolResult] = {}
-        final_response = ""
+        final_response: str | None = None
+        saw_agent_message = False
         observed_turn_id: str | None = None
 
         def _event_turn_matches(params: CodexParams) -> bool:
@@ -1836,6 +1824,7 @@ class _CodexAppServerSession:
                     delta: str = raw_delta
                     prior = message_buffers.get(item_id)
                     message_buffers[item_id] = (prior if prior is not None else "") + delta
+                    saw_agent_message = True
                     yield TextChunk(text=delta)
                     continue
 
@@ -1859,6 +1848,7 @@ class _CodexAppServerSession:
                         raw_item_type if isinstance(raw_item_type, str) else None
                     )
                     if item_type == "agentMessage":
+                        saw_agent_message = True
                         raw_completed_id = item.get("id")
                         if not isinstance(raw_completed_id, str):
                             continue
@@ -1884,12 +1874,12 @@ class _CodexAppServerSession:
                             logger.info(
                                 "Codex TurnComplete: turn_id=%s response_head=%r",
                                 active_turn_id,
-                                final_response[:120],
+                                completed_text[:120],
                             )
                             turn_usage = self._last_turn_usage
                             self._last_turn_usage = None
                             _notify_usage_from_dict(model=model, usage=turn_usage)
-                            yield TurnComplete(response=final_response, usage=turn_usage)
+                            yield TurnComplete(response=completed_text, usage=turn_usage)
                             return
                         continue
                     if item_type == "dynamicToolCall":
@@ -1919,18 +1909,25 @@ class _CodexAppServerSession:
                             active_turn_id,
                         )
                         continue
-                    if not final_response:
-                        final_response = _latest_buffered_agent_message(message_buffers)
-                    if not final_response:
-                        final_response = await self._drain_turn_completed_tail(
+                    if final_response is None:
+                        final_response, saw_agent_message = await self._drain_turn_completed_tail(
                             active_turn_id=active_turn_id,
                             message_buffers=message_buffers,
                             final_response=final_response,
+                            saw_agent_message=saw_agent_message,
                         )
                     turn_usage = self._last_turn_usage
                     self._last_turn_usage = None
                     _notify_usage_from_dict(model=model, usage=turn_usage)
-                    yield TurnComplete(response=final_response, usage=turn_usage)
+                    if final_response is None and saw_agent_message:
+                        yield ExecutorError(
+                            message=(
+                                "Codex App Server turn completed after assistant text "
+                                "without a terminal final-answer item"
+                            )
+                        )
+                    else:
+                        yield TurnComplete(response=final_response or "", usage=turn_usage)
                     return
 
                 if method == "turn/failed":
