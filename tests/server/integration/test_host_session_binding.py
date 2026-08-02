@@ -1481,7 +1481,13 @@ async def test_bind_fails_launch_when_host_never_registers_tunnel(
         lambda session_id, stage, error=None: statuses.append((stage, error)),
     )
     # Collapse the connect budget so the never-registering host times out fast.
-    monkeypatch.setattr(sessions_module, "_MANAGED_HOST_CONNECT_TIMEOUT_S", 0.2)
+    # Patch the DEFINING module's global: _bind_and_launch_managed_runner reads
+    # the constant from omnigent.server.routes._sessions.orchestration's own
+    # namespace (star-imported from common), so patching the re-exported
+    # sessions-facade attribute would leave the real 120s budget in place.
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+
+    monkeypatch.setattr(orchestration_module, "_MANAGED_HOST_CONNECT_TIMEOUT_S", 0.2)
 
     # A registry that never has the host — models "host never dialed back".
     empty_registry = SimpleNamespace(get=lambda _host_id: None)

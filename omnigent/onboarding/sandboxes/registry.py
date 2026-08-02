@@ -167,6 +167,15 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 launcher_class="omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
+            # No static managed_token_ttl_s: the TTL is derived from the
+            # (operator-overridable) MicroVM lifetime at config-parse time via
+            # lambda_microvm.managed_token_ttl_s(), mirroring cwsandbox/e2b.
+            "lambda_microvm": SandboxProviderMetadata(
+                name="lambda_microvm",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.lambda_microvm:LambdaMicroVMSandboxLauncher"
+                ),
+            ),
         },
     )
 

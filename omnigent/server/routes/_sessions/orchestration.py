@@ -2624,6 +2624,15 @@ async def _bind_and_launch_managed_runner(
             # (which strands the session: the host reads online, so the message
             # relaunch path won't wake it either). The budget covers a cold
             # MicroVM boot (run → RUNNING → /run hook → omnigent host dial-back).
+            #
+            # REPLICA-LOCAL: HostRegistry only sees tunnels terminated on THIS
+            # server process. A host that dialed back to a different replica
+            # never appears here, so this poll runs its full budget and fails a
+            # launch that actually succeeded elsewhere. Fine on the current
+            # single-replica deployment topology; horizontal scaling needs
+            # either tunnel-affinity routing (the launching replica receives
+            # the dial-back) or a shared connection registry before this path
+            # is correct with >1 replica.
             _host_connect_deadline = time.monotonic() + _MANAGED_HOST_CONNECT_TIMEOUT_S
             while host_conn is None and time.monotonic() < _host_connect_deadline:
                 await asyncio.sleep(0.5)

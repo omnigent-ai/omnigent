@@ -126,8 +126,8 @@ model key enters the sandbox.
   is derived above that cap (override the requested lifetime with
   `OMNIGENT_LAMBDA_MICROVM_MAX_LIFETIME_S`).
 - **Idle suspend/resume.** The launcher sets an idle policy
-  (`maxIdleDurationSeconds` 900, `suspendedDurationSeconds` matched to the 8 h
-  lifetime, `autoResumeEnabled` true), so an idle microVM suspends to a snapshot
+  (`maxIdleDurationSeconds` 900, `suspendedDurationSeconds` matched to the
+  requested lifetime, `autoResumeEnabled` true), so an idle microVM suspends to a snapshot
   and the managed wake path resumes it when the next message arrives. Idle is
   measured **only** by inbound traffic to the microVM's proxy endpoint, and this
   host receives none (it holds an **outbound** tunnel), so:
@@ -136,10 +136,17 @@ model key enters the sandbox.
   - A single turn running longer than `maxIdleDurationSeconds` can be
     snapshot-frozen mid-work. Raise the idle window for long-running agents.
   - `suspendedDurationSeconds` is when Lambda **terminates** a suspended VM, so
-    it matches the lifetime cap. A shorter value silently kills sessions idle
-    past it and the next wake fails with `ResourceNotFoundException`.
+    the launcher derives it from the requested lifetime (including an
+    `OMNIGENT_LAMBDA_MICROVM_MAX_LIFETIME_S` override). A shorter value silently
+    kills sessions idle past it and the next wake fails with
+    `ResourceNotFoundException`.
 - **Snapshot uniqueness.** A resumed microVM restores memory state, so reseed
   CSPRNGs and rotate any in-memory secrets on resume (the host does this on
   restart). See the AWS "snapshots and uniqueness" docs.
 - **No self-suspend.** A microVM cannot suspend itself; suspension is driven by
   the idle policy or an external `suspend-microvm` call.
+- **Single server replica.** The launch path waits for the microVM's tunnel in
+  the replica-local host registry, so the replica that launches a microVM must
+  be the one its host dials back to. With one server replica (the current
+  deployment shape) this holds trivially; running multiple replicas needs
+  tunnel-affinity routing or a shared connection registry first.

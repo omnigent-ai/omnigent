@@ -4726,6 +4726,7 @@ async def test_enqueue_session_message_returns_false_without_queuing() -> None:
     assert result is False
     assert not query_called, "query() must not be called during enqueue"
 
+
 def test_env_non_negative_int_allows_zero(monkeypatch) -> None:
     """``_env_non_negative_int`` accepts 0 so the connect-retry count can be
     disabled via env (0 is a valid count, unlike ``_env_float``'s positive-only

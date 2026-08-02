@@ -183,7 +183,14 @@ class _HookHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         # /ready is a GET in the platform contract; a 200 signals "booted".
-        self._ok()
+        # Anything else 404s — a blanket 200 would make a typo'd probe path
+        # look healthy and hide the misconfiguration.
+        if self.path == _READY_PATH:
+            self._ok()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     def _read_body(self) -> bytes:
         """Read the request body, tolerating a missing/garbled Content-Length
