@@ -22,7 +22,7 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
-from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.utils import generate_agent_id, generate_task_id, now_epoch
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -767,6 +767,7 @@ def _build_session_response(
         status=status,
         background_task_count=background_task_count,
         created_at=conv.created_at,
+        updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
         runner_id=conv.runner_id,
@@ -880,6 +881,10 @@ def _accumulate_session_usage(
     (its presence is what distinguishes a priced ``$0.00`` from
     "unpriced"; see :func:`_priced_cost_for_display`).
 
+    A reported ``usage.context_tokens`` is persisted separately via
+    :func:`_persist_context_fill` — it is a fill level, so it is set
+    rather than accumulated, and it never enters ``session_usage``.
+
     :param resp_obj: The ``response`` dict from the
         ``response.completed`` SSE event.
     :param session_id: Session/conversation identifier,
@@ -894,6 +899,21 @@ def _accumulate_session_usage(
     usage_obj = resp_obj.get("usage")
     if not isinstance(usage_obj, dict):
         return None
+    # Context fill is a LEVEL the executor reports, not one of the cumulative
+    # buckets below, so it is set rather than added — and set ahead of the
+    # counter early-out, which would otherwise drop the reading on a turn that
+    # reports fill without token deltas. Terminal-backed harnesses reach the
+    # same labels through _persist_external_session_usage; this is the relay's
+    # half of that parity. The window is left to the snapshot's spec resolver,
+    # which may block on a provider catalog fetch and must not run here.
+    raw_context_tokens = usage_obj.get("context_tokens")
+    if isinstance(raw_context_tokens, int) and raw_context_tokens >= 0:
+        _persist_context_fill(
+            session_id,
+            tokens=raw_context_tokens,
+            window=None,
+            conversation_store=conversation_store,
+        )
     input_tokens = usage_obj.get("input_tokens", 0)
     output_tokens = usage_obj.get("output_tokens", 0)
     total_tokens = usage_obj.get("total_tokens", 0)
@@ -1173,6 +1193,48 @@ def _persist_native_cumulative_usage(
     return _priced_cost_for_display(current)
 
 
+def _persist_context_fill(
+    session_id: str,
+    *,
+    tokens: int | None,
+    window: int | None,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist a session's context-fill reading and when it was taken.
+
+    The single writer for the fill labels, shared by the terminal-backed
+    ``external_session_usage`` path and the relay's per-response
+    accumulation, so both harness families report the same thing.
+
+    ``tokens`` is a fill LEVEL, not a counter — it is SET, never summed.
+    Two concurrent turns each report their own post-turn fill and the
+    later commit should win, so last-write-wins is the correct semantic
+    here (unlike the cumulative usage counters, where a lost update
+    destroys information).
+
+    :param session_id: Session/conversation identifier.
+    :param tokens: Context tokens in use, or ``None`` when unreported.
+    :param window: Observed context window, or ``None`` when unreported.
+    :param conversation_store: Store used to upsert the labels.
+    """
+    updates: dict[str, str] = {}
+    stamp = now_epoch()
+    if tokens is not None:
+        updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(tokens)
+        # Stamped only alongside a fill reading. A window-only report carries
+        # no new measurement, so moving the timestamp would make a stale
+        # token count look freshly taken.
+        updates[_LAST_CONTEXT_AT_LABEL_KEY] = str(stamp)
+    if window is not None:
+        updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(window)
+    if not updates:
+        return
+    # One call, so the count and its timestamp land in the same transaction
+    # and a reader can never see a fresh stamp beside an older count.
+    conversation_store.set_labels(session_id, updates, stamp)
+
+
 async def _persist_external_session_usage(
     session_id: str,
     body: SessionEventInput,
@@ -1231,15 +1293,12 @@ async def _persist_external_session_usage(
         conversation_store,
     )
 
-    label_updates: dict[str, str] = {}
-    if raw_tokens is not None:
-        label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
-    if raw_window is not None:
-        label_updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(raw_window)
     await asyncio.to_thread(
-        conversation_store.set_labels,
+        _persist_context_fill,
         session_id,
-        label_updates,
+        tokens=raw_tokens,
+        window=raw_window,
+        conversation_store=conversation_store,
     )
     # The displayed cost is this session's SUBTREE total (itself + its
     # sub-agents), matching the GET snapshot. A sub-agent persists its spend on
@@ -6787,6 +6846,7 @@ __all__ = [
     "_maybe_wake_stale_resumable_managed_sandbox",
     "_native_subagent_wrapper_labels",
     "_native_terminal_runtime",
+    "_persist_context_fill",
     "_persist_external_codex_subagent_start",
     "_persist_external_conversation_item",
     "_persist_external_session_usage",

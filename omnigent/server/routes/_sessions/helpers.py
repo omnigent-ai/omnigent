@@ -3376,11 +3376,18 @@ def _publish_status(
         # snapshot to reopen a streaming bubble.
         _session_active_response_cache.pop(session_id, None)
         return
+    previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
     session_live_state.persist_live_status(session_id, status)
+    # Stamp when the turn stopped, for callers deciding whether a session's
+    # cached prompt prefix is still warm. Only on the transition: relays
+    # re-publish a steady ``idle``, and re-stamping would keep reporting a
+    # long-quiet session as having just finished.
+    if status in ("idle", "failed") and previous_status != status:
+        session_live_state.persist_last_turn_at(session_id)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
     # still-``running`` scheduled_task_run to succeeded/failed. This is the

@@ -4366,6 +4366,13 @@ async def test_post_external_session_usage_window_only_payload_persists_window(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda sid, ev: published.append((sid, ev)),
     )
+    # Distinct stamps per write, so a moved timestamp can't hide behind two
+    # posts landing in the same wall-clock second.
+    clock = iter([1_785_000_000, 1_785_000_600])
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.now_epoch",
+        lambda: next(clock),
+    )
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
@@ -4386,6 +4393,10 @@ async def test_post_external_session_usage_window_only_payload_persists_window(
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["last_total_tokens"] == 100
     assert snapshot["context_window"] == 1_000_000
+    # The window post carried no new measurement, so the fill timestamp stays
+    # at the first post — advancing it would make the 100-token reading look
+    # freshly taken when it is 10 minutes old.
+    assert snapshot["labels"]["omnigent.last_context_at"] == "1785000000"
 
 
 async def test_post_external_session_usage_rejects_empty_payload(
@@ -4422,6 +4433,22 @@ def _read_session_usage(db_uri: str, session_id: str) -> dict[str, Any]:
     """
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     return dict(conv.session_usage) if conv and conv.session_usage else {}
+
+
+def _read_labels(db_uri: str, session_id: str) -> dict[str, str]:
+    """
+    Read a conversation's labels directly from the DB.
+
+    The context-fill metrics land on labels, and the relay path is exercised
+    below the HTTP layer, so these tests read them through a reader store on
+    the same DB file the app writes to.
+
+    :param db_uri: The per-test SQLite URI (same one the ``client`` app uses).
+    :param session_id: Conversation id to read.
+    :returns: The conversation's labels (empty when the row is missing).
+    """
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    return dict(conv.labels) if conv and conv.labels else {}
 
 
 async def test_external_session_usage_persists_cumulative_cost(
@@ -5001,6 +5028,101 @@ async def test_accumulate_session_usage_records_per_model_breakdown(
     assert by_model["model-a"]["total_cost_usd"] + by_model["model-b"][
         "total_cost_usd"
     ] == pytest.approx(usage["total_cost_usd"])
+
+
+async def test_accumulate_session_usage_persists_context_fill(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A relay turn's ``context_tokens`` reaches the snapshot, as on native harnesses.
+
+    The relay path accumulates cumulative counters and used to drop the fill
+    level entirely, so every SDK-harness session reported a null
+    ``last_total_tokens`` while terminal-backed ones reported a real number.
+    An orchestrator applying one compaction policy across a mixed tree can't
+    do that while half its children report nothing.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "context_tokens": 48213}},
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+
+    labels = _read_labels(db_uri, session["id"])
+    assert labels["omnigent.last_context_tokens"] == "48213"
+    # Every fill reading is stamped, so a caller can tell a fresh measurement
+    # from one left behind by a turn that died mid-flight.
+    assert labels["omnigent.last_context_at"].isdigit()
+    # The fill is a level, so it must stay out of the cumulative buckets that
+    # feed the cost badge — summing it across turns would produce nonsense.
+    assert "context_tokens" not in _read_session_usage(db_uri, session["id"])
+
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["last_total_tokens"] == 48213
+
+
+async def test_accumulate_session_usage_without_context_tokens_writes_no_fill(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A turn that reports no fill leaves the fill labels absent.
+
+    Executors that make a single LLM call per turn don't emit
+    ``context_tokens``. Writing a synthesized value for them would hand the
+    caller a fabricated occupancy reading; absent is the honest answer.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500}},
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+
+    labels = _read_labels(db_uri, session["id"])
+    assert "omnigent.last_context_tokens" not in labels
+    assert "omnigent.last_context_at" not in labels
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["last_total_tokens"] is None
+
+
+async def test_accumulate_session_usage_context_fill_is_set_not_summed(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Successive turns overwrite the fill rather than adding to it.
+
+    ``context_tokens`` measures how full the window is right now. Routing it
+    through the cumulative counter path would make it grow without bound and
+    read as "over budget" within a few turns.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "context_tokens": 10_000}},
+        session["id"],
+        store,
+    )
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "context_tokens": 12_500}},
+        session["id"],
+        store,
+    )
+
+    # The second reading, not 22_500.
+    assert _read_labels(db_uri, session["id"])["omnigent.last_context_tokens"] == "12500"
 
 
 async def test_accumulate_session_usage_unpriced_model_has_tokens_no_cost(

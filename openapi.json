@@ -5261,6 +5261,18 @@
             "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
             "title": "Total Cost Usd"
           },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds of the last row activity \u2014 an item append, a title change, and so on. Generic activity, NOT turn completion; a caller wanting the latter reads the `omnigent.last_turn_at` label. Optional here (unlike the required field on `SessionListItem`) so a snapshot can still be constructed without a conversation row.",
+            "title": "Updated At"
+          },
           "usage_by_model": {
             "anyOf": [
               {

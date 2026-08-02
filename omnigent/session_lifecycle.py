@@ -8,6 +8,18 @@ CLOSED_LABEL_KEY = "omnigent.closed"
 CLOSED_LABEL_VALUE = "true"
 CLOSED_TITLE_INFIX = ":closed:"
 
+# Context-fill metrics, written by the server whenever a harness reports usage.
+# ``_AT`` stamps when the fill was measured — a bare token count can't be told
+# apart from a stale one left behind by a turn that failed mid-flight.
+LAST_CONTEXT_TOKENS_LABEL_KEY = "omnigent.last_context_tokens"
+LAST_CONTEXT_WINDOW_LABEL_KEY = "omnigent.last_context_window"
+LAST_CONTEXT_AT_LABEL_KEY = "omnigent.last_context_at"
+
+# When the session's last turn reached a terminal edge (idle / failed). Distinct
+# from the fill timestamp: terminal-backed harnesses report usage mid-turn, so
+# the two answer different questions.
+LAST_TURN_AT_LABEL_KEY = "omnigent.last_turn_at"
+
 
 def title_without_closed_marker(title: str | None) -> str | None:
     """

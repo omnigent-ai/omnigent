@@ -55,9 +55,18 @@ class _RecordingStore:
         self.pending_writes: list[tuple[str, int]] = []
         self.touches: list[list[str]] = []
         self.clears: list[str] = []
+        self.label_writes: list[tuple[str, dict[str, str], int | None]] = []
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
+
+    def set_labels(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        updated_at: int | None = None,
+    ) -> None:
+        self.label_writes.append((conversation_id, dict(updates), updated_at))
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         self.pending_writes.append((conversation_id, count))
@@ -97,6 +106,36 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
         ("conv_1", "idle"),
         ("conv_2", "idle"),
     ]
+
+
+def test_persist_last_turn_at_writes_stamped_label(recording_store: _RecordingStore) -> None:
+    """The turn-end stamp lands as a label carrying its own timestamp.
+
+    It goes on a label rather than ``conversations.updated_at`` because the
+    latter orders the sidebar — a turn ending must not reshuffle the list.
+    The row's ``updated_at`` is passed explicitly so the stored value and
+    the row's own timestamp agree.
+    """
+    before = int(time.time())
+    session_live_state.persist_last_turn_at("conv_1")
+    _wait_until(lambda: len(recording_store.label_writes) >= 1)
+
+    conversation_id, updates, updated_at = recording_store.label_writes[0]
+    assert conversation_id == "conv_1"
+    assert set(updates) == {"omnigent.last_turn_at"}
+    stamp = int(updates["omnigent.last_turn_at"])
+    assert before <= stamp <= int(time.time())
+    assert updated_at == stamp
+
+
+def test_persist_last_turn_at_is_a_no_op_when_unconfigured() -> None:
+    """Without a store the stamp is dropped, like every other live-state write.
+
+    The runner process and unit tests never call ``configure``; a write
+    attempt there would raise on ``None``.
+    """
+    session_live_state.configure(None)
+    session_live_state.persist_last_turn_at("conv_1")
 
 
 def test_pending_count_hook_persists_publish_and_resolve(

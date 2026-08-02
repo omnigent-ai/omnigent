@@ -44,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
+from omnigent.session_lifecycle import LAST_TURN_AT_LABEL_KEY
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
@@ -174,6 +175,34 @@ def persist_live_status(session_id: str, status: str) -> None:
             _last_status.pop(session_id, None)
 
     _submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+
+
+def persist_last_turn_at(session_id: str) -> None:
+    """
+    Persist when a session's turn reached a terminal edge.
+
+    Called from the ``idle`` / ``failed`` branches of the status publish —
+    the one place relay and terminal-backed harnesses both report a turn
+    ending, so the stamp means the same thing whichever ran it. Distinct
+    from the context-fill timestamp: forwarders report usage mid-turn, so
+    that one answers "when was the window measured", this one "when did
+    the session last stop working".
+
+    Writes a label, which leaves ``conversations.updated_at`` untouched —
+    sidebar ordering must not shift on a turn ending.
+
+    :param session_id: Session/conversation identifier.
+    """
+    if _store is None:
+        return
+    stamp = int(time.time())
+    _submit(
+        "last_turn_at",
+        _store.set_labels,
+        session_id,
+        {LAST_TURN_AT_LABEL_KEY: str(stamp)},
+        stamp,
+    )
 
 
 def persist_scheduled_run_completion(

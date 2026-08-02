@@ -14,6 +14,12 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.session_lifecycle import (
+    LAST_CONTEXT_AT_LABEL_KEY,
+    LAST_CONTEXT_TOKENS_LABEL_KEY,
+    LAST_CONTEXT_WINDOW_LABEL_KEY,
+    LAST_TURN_AT_LABEL_KEY,
+)
 
 # Label set on a fork of a session that had a working directory. Its
 # value is the source session id. Presence marks the (unbound) clone as
@@ -148,10 +154,11 @@ def pinned_label_key(user_id: str | None) -> str:
 #   * Runtime state bound to ONE running instance — the native bridge-id
 #     labels would route the new context's terminal + web injection to the
 #     SOURCE's claude/codex bridge (whose active-session marker isn't the
-#     clone → "session no longer active"); the context-size metrics would
-#     display the source's last usage. The bridge-id literals mirror the
-#     harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
-#     cross-checks them so a rename in those modules fails loudly here.
+#     clone → "session no longer active"); the context-size metrics and the
+#     turn timestamps would describe the source's last activity, not the new
+#     context's. The bridge-id literals mirror the harness modules'
+#     ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test cross-checks them so a
+#     rename in those modules fails loudly here.
 #
 #   * Per-context safety opt-in — the DANGEROUS codex full-bypass directive
 #     (:data:`CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY`). Letting it ride into a
@@ -164,8 +171,10 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
-        "omnigent.last_context_tokens",
-        "omnigent.last_context_window",
+        LAST_CONTEXT_TOKENS_LABEL_KEY,
+        LAST_CONTEXT_WINDOW_LABEL_KEY,
+        LAST_CONTEXT_AT_LABEL_KEY,
+        LAST_TURN_AT_LABEL_KEY,
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )

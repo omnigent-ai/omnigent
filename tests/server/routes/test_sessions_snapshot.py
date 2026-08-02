@@ -2018,6 +2018,34 @@ async def test_session_snapshot_cost_is_own_usage_for_childless_session() -> Non
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_carries_row_activity_timestamp() -> None:
+    """The snapshot exposes ``updated_at`` alongside ``created_at``.
+
+    A caller reading one session needs to know how recently it saw any
+    activity; the list endpoint has always carried this and the single-session
+    snapshot did not, so the same question could only be answered by listing
+    every session and finding the row.
+    """
+    conv = Conversation(
+        id="3f1c9a2b4d5e6f708192a3b4c5d6e7f8",
+        created_at=1_784_990_000,
+        updated_at=1_785_000_000,
+        root_conversation_id="3f1c9a2b4d5e6f708192a3b4c5d6e7f8",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"3f1c9a2b4d5e6f708192a3b4c5d6e7f8": conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, "3f1c9a2b4d5e6f708192a3b4c5d6e7f8")  # type: ignore[arg-type]
+
+    # Distinct values, so a field wired to the wrong source is visible.
+    assert snapshot.created_at == 1_784_990_000
+    assert snapshot.updated_at == 1_785_000_000
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_sums_by_model_over_subtree() -> None:
     """The snapshot's ``usage_by_model`` sums token buckets across the subtree.
 

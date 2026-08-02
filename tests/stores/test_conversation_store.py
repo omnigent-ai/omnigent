@@ -3461,6 +3461,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
+            "omnigent.last_context_at": "1785000000",
+            "omnigent.last_turn_at": "1785000060",
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             # An ordinary, non-instance label that SHOULD carry over.
@@ -3839,12 +3841,26 @@ def test_instance_scoped_label_keys_match_harness_constants() -> None:
     """
     from omnigent.claude_native_bridge import BRIDGE_ID_LABEL_KEY
     from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.session_lifecycle import (
+        LAST_CONTEXT_AT_LABEL_KEY,
+        LAST_CONTEXT_TOKENS_LABEL_KEY,
+        LAST_CONTEXT_WINDOW_LABEL_KEY,
+        LAST_TURN_AT_LABEL_KEY,
+    )
     from omnigent.stores.conversation_store import _INSTANCE_SCOPED_LABEL_KEYS
 
     # Each harness's canonical bridge-id key must be in the denylist; a
     # miss means a rename slipped past the store's hard-coded literal.
     assert BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
     assert CODEX_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+
+    # The fill metrics and turn stamp describe one running instance. A key
+    # missing here leaves a fork reporting the source's measurement — worse
+    # than reporting none, since the stale value looks live.
+    assert LAST_CONTEXT_TOKENS_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+    assert LAST_CONTEXT_WINDOW_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+    assert LAST_CONTEXT_AT_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+    assert LAST_TURN_AT_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(
