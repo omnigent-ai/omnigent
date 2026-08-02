@@ -3511,6 +3511,7 @@ async def _handle_codex_elicitation_request(
     :returns: None.
     """
     request_id = event.get("id")
+    # JSON-RPC notifications have no response channel for an elicitation result.
     if not isinstance(request_id, (int, str)):
         return
     result = await _codex_elicitation_hook_result(
