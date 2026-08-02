@@ -16,14 +16,25 @@ managed drivers in this directory.
 The flow (each step asserts, exits non-zero on failure):
 
   1. server advertises managed sandboxes with provider ``lambda_microvm``
-  2. create a managed session bound to an agent
+  2. create a managed session bound to an agent (snapshotting the account's
+     live MicroVM ids first, so the launched VM's real ``microvmId`` can be
+     identified by diffing)
   3. wait for the launched MicroVM's host to dial back and register
   4. run a real LLM turn from inside the MicroVM and read the assistant reply
   5. post a follow-up turn and assert the SAME host_id serves it — the headline
      feature: ``resume_preserves_host`` means a thawed snapshot reconnects the
      running host WITHOUT a fresh start (``--idle-wait`` forces a real suspend
      first; without it this proves host-reuse, not a forced suspend/resume)
-  6. delete the session, which terminates the MicroVM by its real ``microvmId``
+  6. delete the session, assert the DELETE succeeded, then poll AWS until the
+     launched ``microvmId`` is actually TERMINATED/gone — provider teardown is
+     deliberately best-effort on the server, so only AWS can prove the VM died.
+     A VM still alive at the deadline FAILS the run (this is the teardown-leak
+     check; a surviving MicroVM was observed once during review).
+
+Step 2/6's AWS-side id tracking needs boto3 + AWS credentials for the account
+the server launches into (the same account the operator configured). Pass
+``--skip-aws-check`` to drop back to the HTTP-only flow when the driver runs
+without AWS access — the teardown-leak check is skipped and says so.
 
 Set ``OMNIGENT_E2E_TOKEN`` when the server runs in accounts mode — binding to a
 non-local interface forces it on, and a MicroVM dialing back over a VPC egress
@@ -65,7 +76,11 @@ def log(msg: str) -> None:
 
 def check_server(base: str) -> None:
     log(f"[1/6] checking {base}/v1/info")
-    info = httpx.get(f"{base}/v1/info", headers=_HEADERS, timeout=10.0).json()
+    resp = httpx.get(f"{base}/v1/info", headers=_HEADERS, timeout=10.0)
+    # raise_for_status first: an auth failure (401/403) or proxy error page is
+    # a clear HTTPStatusError here, not a JSONDecodeError three lines later.
+    resp.raise_for_status()
+    info = resp.json()
     if not info.get("managed_sandboxes_enabled"):
         raise SystemExit("server does not advertise managed sandboxes — is sandbox: configured?")
     if info.get("sandbox_provider") != PROVIDER:
@@ -73,6 +88,86 @@ def check_server(base: str) -> None:
             f"server's sandbox provider is {info.get('sandbox_provider')!r}, not {PROVIDER!r}"
         )
     log(f"      ✓ managed sandboxes enabled ({PROVIDER})")
+
+
+# ── AWS-side MicroVM tracking (the teardown-leak check) ─────
+
+
+def _microvm_client():  # type: ignore[no-untyped-def]
+    """A ``lambda-microvms`` boto3 client from the ambient credentials."""
+    import boto3  # deferred: only the AWS-check path needs it
+
+    return boto3.client("lambda-microvms", region_name=os.environ.get("AWS_REGION"))
+
+
+def _live_microvm_ids(client) -> set[str]:  # type: ignore[no-untyped-def]
+    """Ids of all MicroVMs not yet terminated, across pagination."""
+    ids: set[str] = set()
+    token: str | None = None
+    while True:
+        kwargs = {"nextToken": token} if token else {}
+        page = client.list_microvms(**kwargs)
+        for item in page.get("items", []):
+            if item.get("state") not in ("TERMINATING", "TERMINATED"):
+                ids.add(item["microvmId"])
+        token = page.get("nextToken")
+        if not token:
+            return ids
+
+
+def identify_launched_microvm(client, before: set[str], timeout_s: float) -> str:  # type: ignore[no-untyped-def]
+    """Diff the account's live MicroVMs against the pre-launch snapshot.
+
+    The server assigns the real ``microvmId`` at ``run-microvm`` and the public
+    API doesn't expose it, so the driver identifies the launched VM as the one
+    that appeared after the session was created. Requires the account to be
+    otherwise quiet for the diff to be unambiguous — a multi-launch account
+    makes this fail loud rather than guess.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        appeared = _live_microvm_ids(client) - before
+        if len(appeared) == 1:
+            microvm_id = appeared.pop()
+            log(f"      ✓ launched MicroVM identified: {microvm_id}")
+            return microvm_id
+        if len(appeared) > 1:
+            raise SystemExit(
+                f"ambiguous launch: {len(appeared)} new MicroVMs appeared ({sorted(appeared)}) "
+                "— run the driver against a quiet account so the teardown check can "
+                "track the right VM"
+            )
+        time.sleep(5.0)
+    raise SystemExit(f"no new MicroVM appeared in AWS within {timeout_s:.0f}s of session create")
+
+
+def assert_microvm_terminated(client, microvm_id: str, timeout_s: float) -> None:  # type: ignore[no-untyped-def]
+    """Poll AWS until the MicroVM is TERMINATED/gone; a survivor FAILS the run.
+
+    Provider teardown is deliberately best-effort on the server (a failed AWS
+    call is logged and swallowed so session delete never 502s), so a green
+    DELETE proves nothing about the VM. Only AWS's own state does — and a VM
+    that outlives session delete bills compute until its lifetime cap, which is
+    exactly the leak observed once during review.
+    """
+    deadline = time.monotonic() + timeout_s
+    state = "UNKNOWN"
+    while time.monotonic() < deadline:
+        try:
+            state = client.get_microvm(microvmIdentifier=microvm_id).get("state", "UNKNOWN")
+        except client.exceptions.ResourceNotFoundException:
+            log(f"      ✓ MicroVM {microvm_id} is gone (ResourceNotFoundException)")
+            return
+        if state == "TERMINATED":
+            log(f"      ✓ MicroVM {microvm_id} is TERMINATED")
+            return
+        time.sleep(5.0)
+    raise SystemExit(
+        f"TEARDOWN LEAK: MicroVM {microvm_id} still {state} {timeout_s:.0f}s after "
+        "session delete — it will bill until its lifetime cap. This is the "
+        "session-delete → terminate path failing; check the server logs for the "
+        "best-effort teardown error it swallowed."
+    )
 
 
 def pick_agent(base: str, agent_id: str | None) -> str:
@@ -259,6 +354,16 @@ def main() -> int:
         help="Skip the follow-up-turn / host-reuse step (step 5)",
     )
     parser.add_argument(
+        "--skip-aws-check",
+        action="store_true",
+        help=(
+            "Skip the AWS-side teardown verification (step 6's poll that the "
+            "launched microvmId actually reaches TERMINATED). Use only when the "
+            "driver has no AWS credentials for the server's account — the "
+            "teardown-leak check does not run."
+        ),
+    )
+    parser.add_argument(
         "--idle-wait",
         type=float,
         default=0.0,
@@ -273,8 +378,20 @@ def main() -> int:
 
     check_server(base)
     agent_id = pick_agent(base, args.agent_id)
+
+    # Snapshot the account's live MicroVMs BEFORE the launch so the new VM's
+    # real microvmId is identifiable by diff — the public API never exposes it.
+    aws_client = None
+    before_ids: set[str] = set()
+    if not args.skip_aws_check:
+        aws_client = _microvm_client()
+        before_ids = _live_microvm_ids(aws_client)
+
     conv_id = create_managed_session(base, agent_id)
+    microvm_id: str | None = None
     try:
+        if aws_client is not None:
+            microvm_id = identify_launched_microvm(aws_client, before_ids, args.timeout)
         host_id = wait_host_online(base, conv_id, args.timeout)
         reply = wait_for_reply(base, conv_id, args.timeout)
         if "4" not in reply:
@@ -289,10 +406,20 @@ def main() -> int:
             log(f"[6/6] --keep: leaving session {conv_id} (and its MicroVM) running")
         else:
             log(f"[6/6] deleting session {conv_id} (terminates the MicroVM by its real id)")
-            try:
-                httpx.delete(f"{base}/v1/sessions/{conv_id}", headers=_HEADERS, timeout=60.0)
-            except httpx.HTTPError as exc:
-                log(f"      cleanup failed (MicroVM may linger until its lifetime cap): {exc}")
+            # The DELETE must succeed — an HTTP error here is a failure, not a
+            # shrug: nothing else will terminate the VM before its lifetime cap.
+            resp = httpx.delete(f"{base}/v1/sessions/{conv_id}", headers=_HEADERS, timeout=60.0)
+            if resp.status_code >= 300:
+                raise SystemExit(
+                    f"session delete failed: HTTP {resp.status_code}: {resp.text[:600]} "
+                    f"— the MicroVM ({microvm_id or 'id unknown'}) is likely still running"
+                )
+            # A green DELETE is necessary but not sufficient: provider teardown
+            # is best-effort on the server, so prove termination against AWS.
+            if aws_client is not None and microvm_id is not None:
+                assert_microvm_terminated(aws_client, microvm_id, args.timeout)
+            elif args.skip_aws_check:
+                log("      --skip-aws-check: teardown-leak verification SKIPPED")
     log("PASS")
     return 0
 
