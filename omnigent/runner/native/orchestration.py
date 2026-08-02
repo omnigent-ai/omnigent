@@ -5489,6 +5489,7 @@ async def _auto_create_claude_terminal(
 
     from omnigent.claude_native_bridge import (
         BRIDGE_ID_LABEL_KEY,
+        augment_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
     )
@@ -5601,7 +5602,6 @@ async def _auto_create_claude_terminal(
 
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.claude_native import (
-        augment_claude_args,
         build_native_claude_terminal_env,
         resolve_claude_native_model_selection,
         resolve_native_claude_config,

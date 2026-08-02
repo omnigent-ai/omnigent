@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib as _hashlib
 import json as _json
 import re as _re
-from typing import Any
+from typing import Literal
 
 from omnigent.policies.schema import (
     PolicyCallable,
@@ -117,13 +117,13 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
             ],
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 _LOOP_STATE_KEY = "_policy_loop_recent_hashes"
 
 
-def _args_hash(tool_name: str, arguments: Any) -> str:  # type: ignore[explicit-any]
+def _args_hash(tool_name: str, arguments: object) -> str:
     """Deterministic hash of (tool_name, arguments).
 
     :param tool_name: Tool being called.
@@ -208,7 +208,7 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
             ],
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── OS tool approval ────────────────────────────────────────────────────────
@@ -419,7 +419,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
 
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Sandbox enforcement ────────────────────────────────────────────────────
@@ -479,7 +479,7 @@ def enforce_sandbox(
         ``__agent_start`` tool calls.
     """
     # Build the override dict — only include keys the admin explicitly set.
-    override: dict[str, Any] = {
+    override: dict[str, object] = {
         "type": sandbox_type,
         "allow_network": allow_network,
     }
@@ -511,7 +511,12 @@ def enforce_sandbox(
             args = {}
 
         # Merge: existing sandbox config as base, policy overrides on top.
-        current_sandbox: dict[str, Any] = args.get("sandbox") or {}
+        raw_sandbox = args.get("sandbox")
+        current_sandbox: dict[str, object] = (
+            {key: value for key, value in raw_sandbox.items() if isinstance(key, str)}
+            if isinstance(raw_sandbox, dict)
+            else {}
+        )
         forced_sandbox = {
             k: v for k, v in {**current_sandbox, **override}.items() if k in _SANDBOX_OVERRIDE_KEYS
         }
@@ -524,7 +529,7 @@ def enforce_sandbox(
             },
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── PII detection on LLM requests ────────────────────────────────────────────
@@ -581,7 +586,7 @@ def deny_pii_in_llm_request(
         # None or empty list → all categories enabled.
         selected = dict(_PII_CATEGORY_PATTERNS)
 
-    effective_action = action if action in ("DENY", "ASK") else "DENY"
+    effective_action: Literal["DENY", "ASK"] = "ASK" if action == "ASK" else "DENY"
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate user input or LLM request for PII matches.
@@ -646,12 +651,12 @@ def deny_pii_in_llm_request(
                 }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.safety.max_tool_calls_per_session",
         "kind": "factory",

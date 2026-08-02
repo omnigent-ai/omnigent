@@ -1260,6 +1260,7 @@ def test_catalog_payload_serializes_normalized_model_metadata() -> None:
                     supported_capabilities=frozenset({ModelCapability.TOOL_USE}),
                     unsupported_capabilities=frozenset({ModelCapability.VISION}),
                     context_window=200_000,
+                    max_output_tokens=16_000,
                     cost_tier=ModelCostTier.STANDARD,
                     wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES}),
                     reasoning=ModelReasoningMetadata(
@@ -1279,6 +1280,7 @@ def test_catalog_payload_serializes_normalized_model_metadata() -> None:
             "id": "provider/model-a",
             "family": "provider-family",
             "context_window": 200_000,
+            "max_output_tokens": 16_000,
             "capabilities": {"tool-use": True, "vision": False},
             "cost_tier": "standard",
             "wire_apis": ["openai-responses"],
@@ -1326,6 +1328,7 @@ def test_bundled_catalog_entries_normalize_capabilities_context_and_cost(
 
     premium = entries[0]
     assert premium.metadata.context_window == 100_000
+    assert premium.metadata.max_output_tokens == 20_000
     assert premium.metadata.cost_tier == ModelCostTier.PREMIUM
     assert premium.metadata.supports(ModelCapability.TOOL_USE) is True
     assert premium.metadata.supports(ModelCapability.REASONING) is True

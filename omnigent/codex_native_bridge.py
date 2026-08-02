@@ -618,8 +618,16 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     thread_id = raw.get("thread_id")
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
-    required = (session_id, socket_path, thread_id, codex_home)
-    if not all(isinstance(value, str) and value for value in required):
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(socket_path, str)
+        or not socket_path
+        or not isinstance(thread_id, str)
+        or not thread_id
+        or not isinstance(codex_home, str)
+        or not codex_home
+    ):
         return None
     parsed_active_turn_id = (
         active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None

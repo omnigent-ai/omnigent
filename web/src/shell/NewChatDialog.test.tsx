@@ -1888,6 +1888,15 @@ describe("NewChatLandingScreen", () => {
     // freshly-created session via first-class project_id.
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(3));
     expect(authenticatedFetchMock.mock.calls[0][0]).toBe("/v1/sessions");
+    // Born filed: the create POST stamps the project's `omni_project` label so
+    // the session groups under its project from its first sidebar appearance
+    // (the sidebar dual-reads the label OR project_id), rather than flashing
+    // through the ungrouped "Sessions" section until the follow-up move's
+    // project_id write catches up in the search-indexed session list.
+    const createBody = JSON.parse(
+      (authenticatedFetchMock.mock.calls[0][1] as RequestInit).body as string,
+    ) as { labels?: Record<string, string> };
+    expect(createBody.labels?.omni_project).toBe("docs");
     expect(authenticatedFetchMock.mock.calls[1][0]).toBe("/v1/projects");
     const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[2];
     expect(patchUrl).toBe("/v1/sessions/conv_new");

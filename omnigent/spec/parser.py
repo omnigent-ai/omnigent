@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal, TypedDict, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
@@ -134,7 +134,7 @@ def _parse_int_field(raw: object, field_name: str) -> int:
             code=ErrorCode.INVALID_INPUT,
         )
     try:
-        return int(raw)
+        return int(cast(str | bytes | bytearray | int | float, raw))
     except (TypeError, ValueError) as exc:
         raise OmnigentError(
             f"{field_name} must be an integer, got {raw!r}",
@@ -155,7 +155,7 @@ def _parse_float_field(raw: object, field_name: str) -> float:
             code=ErrorCode.INVALID_INPUT,
         )
     try:
-        return float(raw)
+        return float(cast(str | bytes | bytearray | int | float, raw))
     except (TypeError, ValueError) as exc:
         raise OmnigentError(
             f"{field_name} must be a number, got {raw!r}",
@@ -313,7 +313,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
 
 
 def _parse_llm(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> LLMConfig | None:
@@ -392,7 +392,7 @@ def _parse_llm(
 
 
 def _parse_interaction(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
 ) -> InteractionConfig:
     """
     Parse the ``interaction:`` block from config.yaml into an
@@ -423,7 +423,7 @@ def _parse_interaction(
 
 
 def _parse_tools_config(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> ToolsConfig:
@@ -444,8 +444,14 @@ def _parse_tools_config(
     retry = _parse_retry(raw.get("retry"))
     builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
+    raw_agents = raw.get("agents", [])
+    if not isinstance(raw_agents, list):
+        raise OmnigentError(
+            f"tools.agents must be a list, got {type(raw_agents).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return ToolsConfig(
-        agents=raw.get("agents", []),
+        agents=[str(agent) for agent in raw_agents],
         builtins=builtins,
         timeout=timeout,
         retry=retry,
@@ -454,7 +460,7 @@ def _parse_tools_config(
 
 
 def _parse_sandbox_config(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> SandboxConfig:
     """
     Parse the ``tools.sandbox`` block from config.yaml.
@@ -474,21 +480,26 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
-    image = raw.get("container_image") or raw.get("docker_image")
-    kwargs: dict[str, Any] = {"container_image": image}
-    if "container_runtime" in raw:
-        runtime = raw["container_runtime"]
-        if runtime not in SandboxConfig.ALLOWED_RUNTIMES:
-            raise ValueError(
-                f"Unsupported container_runtime {runtime!r}; "
-                f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
-            )
-        kwargs["container_runtime"] = runtime
-    return SandboxConfig(**kwargs)
+    raw_image = raw.get("container_image") or raw.get("docker_image")
+    image = str(raw_image) if raw_image is not None else None
+    raw_runtime = raw.get("container_runtime")
+    runtime: Literal["docker", "podman"] | None
+    if "container_runtime" not in raw:
+        runtime = None
+    elif raw_runtime == "docker":
+        runtime = "docker"
+    elif raw_runtime == "podman":
+        runtime = "podman"
+    else:
+        raise ValueError(
+            f"Unsupported container_runtime {raw_runtime!r}; "
+            f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
+        )
+    return SandboxConfig(container_image=image, container_runtime=runtime)
 
 
 def _parse_builtin_tools(
-    raw: list[str | dict[str, Any]],
+    raw: object,
     *,
     expand_env: bool = True,
 ) -> list[BuiltinToolConfig]:
@@ -511,6 +522,11 @@ def _parse_builtin_tools(
     :returns: A list of :class:`BuiltinToolConfig` instances.
     :raises OmnigentError: If a dict entry is missing ``name``.
     """
+    if not isinstance(raw, list):
+        raise OmnigentError(
+            f"tools.builtins must be a list, got {type(raw).__name__}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     result: list[BuiltinToolConfig] = []
     for entry in raw:
         if isinstance(entry, str):
@@ -540,7 +556,7 @@ def _parse_builtin_tools(
 
 
 def _parse_retry(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> RetryPolicy:
     """
     Parse a ``retry:`` block into a :class:`RetryPolicy`.
@@ -553,7 +569,22 @@ def _parse_retry(
     """
     if not raw:
         return RetryPolicy()
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"retry must be a mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     defaults = RetryPolicy()
+    retryable_status_codes = raw.get(
+        "retryable_status_codes",
+        defaults.retryable_status_codes,
+    )
+    if not isinstance(retryable_status_codes, list | tuple):
+        raise OmnigentError(
+            "retry.retryable_status_codes must be a list or tuple, "
+            f"got {type(retryable_status_codes).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return RetryPolicy(
         max_retries=_parse_int_field(
             raw.get("max_retries", defaults.max_retries),
@@ -574,14 +605,13 @@ def _parse_retry(
             else defaults.timeout_per_request_s
         ),
         retryable_status_codes=tuple(
-            _parse_int_field(c, "retry.retryable_status_codes")
-            for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
+            _parse_int_field(c, "retry.retryable_status_codes") for c in retryable_status_codes
         ),
     )
 
 
 def _parse_executor(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> ExecutorSpec:
@@ -609,7 +639,7 @@ def _parse_executor(
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
     raw_config = raw.get("config")
-    config: dict[str, Any] = {}
+    config: dict[str, object] = {}
     if isinstance(raw_config, dict):
         config = {
             str(k): (v if k in _STRUCTURED_EXECUTOR_CONFIG_KEYS else str(v))
@@ -659,7 +689,7 @@ def _parse_executor(
 
 
 def _parse_executor_auth(
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     *,
     expand_env: bool = True,
 ) -> ApiKeyAuth | DatabricksAuth | ProviderAuth | None:
@@ -1060,7 +1090,10 @@ def _parse_cwd_hidden_scan_max_entries(raw: object) -> int:
         strictly positive.
     """
     if raw is None:
-        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_max_entries"].default
+        return cast(
+            int,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_max_entries"].default,
+        )
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise OmnigentError(
             "os_env.sandbox.cwd_hidden_scan_max_entries must be an integer, "
@@ -1092,7 +1125,10 @@ def _parse_cwd_hidden_scan_overflow(raw: object) -> str:
         modes.
     """
     if raw is None:
-        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_overflow"].default
+        return cast(
+            str,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_overflow"].default,
+        )
     if not isinstance(raw, str) or raw not in _CWD_HIDDEN_SCAN_OVERFLOW_MODES:
         raise OmnigentError(
             "os_env.sandbox.cwd_hidden_scan_overflow must be one of "
@@ -1115,7 +1151,10 @@ def _parse_cwd_hidden_scan_recursive(raw: object) -> bool:
     :raises OmnigentError: If ``raw`` is not a boolean.
     """
     if raw is None:
-        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_recursive"].default
+        return cast(
+            bool,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_recursive"].default,
+        )
     if not isinstance(raw, bool):
         raise OmnigentError(
             "os_env.sandbox.cwd_hidden_scan_recursive must be a boolean, "
@@ -1282,7 +1321,7 @@ _GH_BASIC_DEFAULT_TARGETS = ("github.com", "api.github.com")
 _GH_TOKEN_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 
 
-class _CredentialSourceModel(BaseModel):
+class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for a ``credential_proxy[*].source`` mapping.
 
     The secret origin is a structured single-key mapping —
@@ -1346,7 +1385,7 @@ class _CredentialSourceModel(BaseModel):
         return CredentialSourceSpec(kind="command", command=self.command.strip())
 
 
-class _CredentialProxyItemModel(BaseModel):
+class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for one raw ``credential_proxy`` entry.
 
     Validates the entry's *shape* — ``type``, ``source``, ``target`` /
@@ -1960,7 +1999,7 @@ def _parse_credential_proxy_host(raw: str, *, field_path: str) -> str:
 
 
 def _parse_compaction(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
 ) -> CompactionConfig | None:
     """
     Parse the ``compaction:`` block from config.yaml into a
@@ -2508,7 +2547,7 @@ def _parse_inline_mcp_servers(
         command = val.get("command")
         url = val.get("url")
         if command is not None:
-            transport: str = "stdio"
+            transport: Literal["http", "stdio"] = "stdio"
         elif url is not None:
             transport = "http"
         else:
@@ -2635,7 +2674,7 @@ def _discover_mcp_servers(
 
 def _parse_http_mcp_server(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     expand_env: bool,
@@ -2674,14 +2713,20 @@ def _parse_http_mcp_server(
             f"MCP server {name!r} missing required field 'url': {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
+    raw_headers = raw.get("headers", {})
+    if not isinstance(raw_headers, dict):
+        raise OmnigentError(
+            f"MCP server {name!r} (transport='http') 'headers' must be a mapping: {yaml_file}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    headers = {str(key): str(value) for key, value in raw_headers.items()}
+    raw_description = raw.get("description")
     return MCPServerConfig(
         name=str(name),
         transport="http",
         url=str(url),
-        headers=(
-            expand_env_vars(raw.get("headers", {})) if expand_env else raw.get("headers", {})
-        ),
-        description=raw.get("description"),
+        headers=expand_env_vars(headers) if expand_env else headers,
+        description=str(raw_description) if raw_description is not None else None,
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2693,7 +2738,7 @@ def _parse_http_mcp_server(
 
 def _parse_stdio_mcp_server(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     expand_env: bool,
@@ -2752,7 +2797,8 @@ def _parse_stdio_mcp_server(
             f"MCP server {name!r} (transport='stdio') 'env' must be a mapping: {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
-    env = expand_env_vars(raw_env) if expand_env else raw_env
+    string_env = {str(key): str(value) for key, value in raw_env.items()}
+    env = expand_env_vars(string_env) if expand_env else string_env
     if "sandbox" in raw:
         # Step 7: ``sandbox: <bool>`` was an AP-only no-op that
         # wrapped the stdio spawn with ``srt``. srt's default
@@ -2771,13 +2817,14 @@ def _parse_stdio_mcp_server(
             f"per-MCP outbound-host allowlist with a different schema.",
             code=ErrorCode.INVALID_INPUT,
         )
+    raw_description = raw.get("description")
     return MCPServerConfig(
         name=str(name),
         transport="stdio",
         command=str(command),
         args=[str(a) for a in raw_args],
-        env={str(k): str(v) for k, v in env.items()},
-        description=raw.get("description"),
+        env=env,
+        description=str(raw_description) if raw_description is not None else None,
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2789,7 +2836,7 @@ def _parse_stdio_mcp_server(
 
 def _reject_wrong_transport_keys(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     disallowed: tuple[str, ...],
@@ -2897,8 +2944,15 @@ def _discover_sub_agents(
 # parity for label values — see §14 of the audit).
 
 
+class _PolicyBaseFields(TypedDict):
+    name: str
+    on: list[PhaseSelector] | None
+    condition: dict[str, str | list[str]] | None
+    ask_timeout: int | None
+
+
 def _parse_guardrails(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> GuardrailsSpec | None:
@@ -2940,7 +2994,7 @@ def _parse_guardrails(
     )
 
 
-def _parse_guardrails_ask_timeout(raw: Any) -> int:
+def _parse_guardrails_ask_timeout(raw: object) -> int:
     """
     Validate and coerce the spec-wide ``ask_timeout`` value.
 
@@ -2967,7 +3021,7 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
 
 
 def _parse_label_defs(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> dict[str, LabelDef] | None:
     """
     Parse the ``guardrails.labels:`` block into a dict of
@@ -3001,7 +3055,7 @@ def _parse_label_defs(
     return defs
 
 
-def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
+def _parse_single_label_def(key: str, entry: object) -> LabelDef:
     """
     Parse one label definition entry.
 
@@ -3039,12 +3093,12 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
     return LabelDef(initial=initial, values=values)
 
 
-def _coerce_label_initial(raw: Any) -> str | None:
+def _coerce_label_initial(raw: object) -> str | None:
     """Coerce an ``initial:`` value to ``str | None``."""
     return None if raw is None else str(raw)
 
 
-def _coerce_label_values(key: str, raw: Any) -> list[str] | None:
+def _coerce_label_values(key: str, raw: object) -> list[str] | None:
     """
     Coerce a ``values:`` list to ``list[str]`` or ``None``.
 
@@ -3091,7 +3145,7 @@ def _validate_label_def_cross_fields(
 
 
 def _parse_policies(
-    raw: dict[str, Any] | list[Any] | None,
+    raw: object,
     *,
     expand_env: bool = True,
 ) -> list[PolicySpec] | None:
@@ -3128,7 +3182,7 @@ def _parse_policies(
 
 def _parse_policy_spec(
     name: str,
-    data: Any,
+    data: object,
     *,
     expand_env: bool = True,
 ) -> PolicySpec:
@@ -3179,10 +3233,10 @@ def _parse_policy_spec(
 
 def _parse_policy_base_fields(
     name: str,
-    data: dict[str, Any],
+    data: dict[str, object],
     *,
     is_function: bool = False,
-) -> dict[str, Any]:
+) -> _PolicyBaseFields:
     """
     Parse the fields every policy type shares.
 
@@ -3221,8 +3275,8 @@ def _parse_policy_base_fields(
 
 def _parse_function_policy(
     name: str,
-    data: dict[str, Any],
-    base_kwargs: dict[str, Any],
+    data: dict[str, object],
+    base_kwargs: _PolicyBaseFields,
 ) -> FunctionPolicySpec:
     """
     Parse a ``type: function`` policy block.
@@ -3266,7 +3320,7 @@ def _parse_function_policy(
 
 
 def _parse_on(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> list[PhaseSelector]:
@@ -3309,7 +3363,7 @@ def _parse_on(
 
 
 def _parse_on_entry(
-    entry: Any,
+    entry: object,
     *,
     policy_name: str,
 ) -> PhaseSelector:
@@ -3384,7 +3438,7 @@ def _resolve_phase(
 
 
 def _parse_condition(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> dict[str, str | list[str]] | None:
@@ -3433,7 +3487,7 @@ def _parse_condition(
 
 
 def _parse_writable_labels(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> list[str] | None:
@@ -3461,7 +3515,7 @@ def _parse_writable_labels(
 
 
 def _parse_function_ref(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> FunctionRef:
@@ -3515,7 +3569,7 @@ def _parse_function_ref(
 
 
 def _parse_policy_ask_timeout(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> int | None:
@@ -3546,7 +3600,7 @@ def _parse_policy_ask_timeout(
 
 
 def parse_default_policies(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> list[PolicySpec]:
@@ -3594,7 +3648,7 @@ def parse_default_policies(
 
 
 def parse_server_llm(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> LLMConfig | None:

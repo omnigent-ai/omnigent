@@ -15,13 +15,12 @@ import httpx
 from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
 
 _logger = logging.getLogger(__name__)
-
-_JsonObject = dict[str, object]
 
 
 def _build_accept_content(

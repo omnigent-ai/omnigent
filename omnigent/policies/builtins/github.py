@@ -798,7 +798,7 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
         return _ShellOp(
             kind="write",
             repo=repo,
-            branches=branches,
+            branches=frozenset(branches),
             branch_targeted=False,
             detail=detail,
             destructive=is_destructive,

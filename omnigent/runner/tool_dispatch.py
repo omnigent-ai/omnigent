@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from omnigent.json_types import JsonObject as _JsonObject
+
 if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.spec.types import AgentSpec
@@ -104,7 +106,6 @@ from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 
 _logger = logging.getLogger(__name__)
 
-_JsonObject = dict[str, object]
 _EventPublisher = Callable[[str, _JsonObject], None]
 
 

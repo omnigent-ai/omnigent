@@ -104,6 +104,13 @@ jobs:
             exit 1
           }
 
+      # A `--frozen-lockfile` / lockfile-regen gate can't catch an override that
+      # pins a version outside a package.json range: overrides outrank
+      # package.json, so the declared version is silently ignored and the lock
+      # stays internally consistent for the pin. Check overrides directly.
+      - name: Check pnpm overrides satisfy declared ranges
+        run: .venv/bin/python dev/lint/lint_pnpm_override_consistency.py
+
       # ktlint is invoked by the android-ktlint-* pre-commit hooks. The wrapper
       # script (web/android/bin/ktlint.sh) exits 0 if ktlint is absent, so we
       # install it here before pre-commit runs to ensure the check is enforced.

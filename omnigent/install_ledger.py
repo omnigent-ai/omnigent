@@ -8,10 +8,13 @@ import os
 import platform
 import shutil
 import subprocess
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import NotRequired, TypedDict, cast
+
+from omnigent.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
 LEDGER_NAME = "install_ledger.json"
@@ -112,6 +115,59 @@ class StatePathsEntry:
     desktop_data: list[str] = field(default_factory=list)
 
 
+class _ProfileEntryPayload(TypedDict):
+    path: str
+    marker_begin: NotRequired[str]
+    marker_end: NotRequired[str]
+    line_range: NotRequired[list[int]]
+    block_sha256: NotRequired[str | None]
+    content_matches_current: NotRequired[bool]
+    source: NotRequired[str]
+    confidence: NotRequired[str]
+
+
+class _ExternalConfigPayload(TypedDict):
+    path: str
+    marker: str
+    format: str
+    allowlist: NotRequired[list[str]]
+    block_sha256: NotRequired[str | None]
+    source: NotRequired[str]
+    confidence: NotRequired[str]
+
+
+class _DepPayload(TypedDict):
+    present: bool
+    path: NotRequired[str | None]
+    version: NotRequired[str | None]
+    installed_by: NotRequired[str]
+    confidence: NotRequired[str]
+    notes: NotRequired[str | None]
+
+
+class _WheelPayload(TypedDict):
+    installed: bool
+    uv_tool_dir: NotRequired[str | None]
+    bin_dir: NotRequired[str | None]
+    console_scripts: NotRequired[list[str]]
+    source: NotRequired[str]
+    confidence: NotRequired[str]
+
+
+class _LaunchAgentPayload(TypedDict):
+    kind: str
+    path: str
+    label: str
+    source: NotRequired[str]
+    confidence: NotRequired[str]
+
+
+class _StatePathsPayload(TypedDict):
+    omnigent_home: str
+    workspace: str
+    desktop_data: NotRequired[list[str]]
+
+
 @dataclass
 class LedgerEntries:
     profiles: list[ProfileEntry] = field(default_factory=list)
@@ -137,40 +193,69 @@ class InstallLedger:
     last_validated_at: str
     entries: LedgerEntries
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> _JsonObject:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> InstallLedger:
-        entries_data = data.get("entries") or {}
+    def from_dict(cls, data: _JsonObject) -> InstallLedger:
+        entries_value = data.get("entries")
+        if entries_value is None:
+            entries_data: _JsonObject = {}
+        elif isinstance(entries_value, dict):
+            entries_data = entries_value
+        else:
+            raise ValueError("install ledger entries must be an object")
         entries = LedgerEntries(
-            profiles=[ProfileEntry(**item) for item in entries_data.get("profiles", [])],
+            profiles=[
+                ProfileEntry(**item)
+                for item in cast(list[_ProfileEntryPayload], entries_data.get("profiles") or [])
+            ],
             injected_external_config=[
                 ExternalConfigEntry(**item)
-                for item in entries_data.get("injected_external_config", [])
+                for item in cast(
+                    list[_ExternalConfigPayload],
+                    entries_data.get("injected_external_config") or [],
+                )
             ],
             deps={
-                name: DepEntry(**value) for name, value in (entries_data.get("deps") or {}).items()
+                name: DepEntry(**value)
+                for name, value in cast(
+                    dict[str, _DepPayload], entries_data.get("deps") or {}
+                ).items()
             },
-            wheel=WheelEntry(**(entries_data.get("wheel") or {"installed": False})),
+            wheel=WheelEntry(
+                **cast(
+                    _WheelPayload,
+                    entries_data.get("wheel") or {"installed": False},
+                )
+            ),
             launch_agents=[
-                LaunchAgentEntry(**item) for item in entries_data.get("launch_agents", [])
+                LaunchAgentEntry(**item)
+                for item in cast(
+                    list[_LaunchAgentPayload], entries_data.get("launch_agents") or []
+                )
             ],
             state_paths=StatePathsEntry(
-                **(
+                **cast(
+                    _StatePathsPayload,
                     entries_data.get("state_paths")
                     or {
                         "omnigent_home": str(state_dir()),
                         "workspace": str(Path.home() / "omnigent"),
-                    }
+                    },
                 )
             ),
         )
+        schema_version = data.get("schema_version", SCHEMA_VERSION)
+        if isinstance(schema_version, bool) or not isinstance(
+            schema_version, int | str | bytes | bytearray
+        ):
+            raise ValueError("install ledger schema_version must be an integer")
         return cls(
-            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+            schema_version=int(schema_version),
             ledger_source=str(data.get("ledger_source", "backfill")),
-            generator=dict(data.get("generator") or {}),
-            installation_id=data.get("installation_id"),
+            generator=dict(cast(Mapping[str, str], data.get("generator") or {})),
+            installation_id=cast(str | None, data.get("installation_id")),
             created_at=str(data.get("created_at") or utc_now()),
             updated_at=str(data.get("updated_at") or utc_now()),
             last_validated_at=str(data.get("last_validated_at") or utc_now()),
@@ -178,7 +263,7 @@ class InstallLedger:
         )
 
 
-def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+def atomic_write_json(path: Path, payload: _JsonObject) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -203,16 +288,22 @@ def load_ledger(path: Path) -> InstallLedger | None:
         return None
     except json.JSONDecodeError:
         return None
-    if data.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(data, dict):
         return None
-    return InstallLedger.from_dict(data)
+    schema_version = data.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
+        return None
+    try:
+        return InstallLedger.from_dict(data)
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def write_ledger(ledger: InstallLedger, *, path: Path | None = None) -> None:
     atomic_write_json(path or ledger_path(), ledger.to_dict())
 
 
-def _backfill_content_key(ledger: InstallLedger) -> dict[str, Any]:
+def _backfill_content_key(ledger: InstallLedger) -> _JsonObject:
     data = ledger.to_dict()
     for key in ("created_at", "updated_at", "last_validated_at"):
         data.pop(key, None)
@@ -348,7 +439,7 @@ def _json_has_key_path(path: Path, key_path: str) -> bool:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    current: Any = data
+    current: object = data
     for part in key_path.split("."):
         if not isinstance(current, dict) or part not in current:
             return False

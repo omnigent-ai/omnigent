@@ -22,12 +22,13 @@ import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.codex_native_bridge import CodexNativeBridgeState
     from omnigent.terminals.registry import TerminalListEntry
 
 import click
@@ -2891,6 +2892,20 @@ def create_runner_app(
         # Native terminal transcripts are mirrored from the underlying
         # runtime — a trailing user item can be a real failed native turn —
         # so skip the history load (and its attachment downloads) entirely.
+        #
+        # Skip the recovery-turn check when the server set
+        # suppress_recovery_turn=True in the init envelope.  That flag means
+        # the server is about to forward the triggering message immediately
+        # after this handshake completes.  If the message was already
+        # persisted to DB before the init call (invariant I1), the history
+        # load would see it and start a redundant recovery turn; the
+        # subsequent forward would then find _active_turns occupied, buffer
+        # the message, and re-process it once the recovery turn finishes —
+        # causing the first message to be silently ignored (sandbox/lakebox
+        # wake) or processed twice (managed relaunch).
+        _suppress_recovery = (
+            init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
+        )
         history: list[dict[str, Any]]
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
@@ -2907,7 +2922,7 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if needs_turn and session_id not in _active_turns:
+            if needs_turn and session_id not in _active_turns and not _suppress_recovery:
                 _active_turns[session_id] = None
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -3648,7 +3663,7 @@ def create_runner_app(
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> Any | None:
+    ) -> CodexNativeBridgeState | None:
         from omnigent.codex_native_bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
@@ -8566,6 +8581,17 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
 _HARNESS_MODEL_ENV_KEY = model_env_keys()
 
 
+class _SpawnEnvBuilder(Protocol):
+    def __call__(
+        self,
+        spec: object,
+        *,
+        cwd: Path | None,
+        workdir: Path | None,
+    ) -> dict[str, str]:
+        raise NotImplementedError
+
+
 def _build_spawn_env_from_spec(
     spec: Any,
     harness: str,
@@ -8642,7 +8668,13 @@ def _build_spawn_env_from_spec(
             builder_path = spawn_env_builders().get(harness)
             if builder_path is not None:
                 builder = load_object(builder_path)
-                env = builder(effective_spec, cwd=cwd, workdir=workdir)
+                if not callable(builder):
+                    raise TypeError(f"spawn environment builder {builder_path!r} is not callable")
+                env = cast(_SpawnEnvBuilder, builder)(
+                    effective_spec,
+                    cwd=cwd,
+                    workdir=workdir,
+                )
             else:
                 # Native terminal harnesses and unknown harnesses build env elsewhere.
                 return None

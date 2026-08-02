@@ -35,7 +35,8 @@ Factory form (with ``factory_params``)::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, cast
 
 if TYPE_CHECKING:
     from omnigent.policies.types import PolicyLLMClient
@@ -309,6 +310,8 @@ class PolicyResponse(TypedDict, total=False):
 
 # ── Callable protocol ────────────────────────────────────────────────────────
 
+_PolicyCallableReturn: TypeAlias = PolicyResponse | Awaitable[PolicyResponse | None] | None
+
 
 class PolicyCallable(Protocol):
     """Protocol for a one-argument policy callable.
@@ -325,7 +328,8 @@ class PolicyCallable(Protocol):
             return {"result": "ALLOW"}
     """
 
-    def __call__(self, event: PolicyEvent) -> PolicyResponse | None: ...
+    def __call__(self, event: PolicyEvent) -> _PolicyCallableReturn:
+        raise NotImplementedError
 
 
 class PolicyCallableWithConfig(Protocol):
@@ -344,7 +348,8 @@ class PolicyCallableWithConfig(Protocol):
             ...
     """
 
-    def __call__(self, event: PolicyEvent, config: dict[str, str]) -> PolicyResponse | None: ...
+    def __call__(self, event: PolicyEvent, config: dict[str, str]) -> _PolicyCallableReturn:
+        raise NotImplementedError
 
 
 # ── REQUEST-phase data helpers ───────────────────────────────────────────────

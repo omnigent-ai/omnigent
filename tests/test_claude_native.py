@@ -757,6 +757,47 @@ def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
     )
 
 
+def test_sonnet_5_subscription_selection_uses_owned_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct-login custom row resolves from the central fallback record."""
+    fallback = SimpleNamespace(model_ids=("future-claude-sonnet-5",))
+    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
+
+    assert (
+        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
+        == "future-claude-sonnet-5"
+    )
+
+
+def test_sonnet_5_subscription_selection_uses_first_sonnet_family_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A renamed Sonnet release stays routable when its display label drifts."""
+    fallback = SimpleNamespace(model_ids=("future-claude-opus-5", "future-claude-sonnet-5-1"))
+    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
+
+    assert (
+        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
+        == "future-claude-sonnet-5-1"
+    )
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [None, SimpleNamespace(model_ids=("future-claude-opus-5",))],
+)
+def test_sonnet_5_subscription_selection_fails_without_sonnet_fallback(
+    fallback: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private picker id never reaches Claude when its fallback disappears."""
+    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
+
+    with pytest.raises(ValueError, match="no routable Sonnet model"):
+        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
+
+
 def test_removed_sonnet_5_selection_falls_back_to_routable_databricks_sonnet() -> None:
     """A stale Sonnet 5 override cannot launch a non-gateway Anthropic id."""
     config = claude_native.ClaudeNativeUcodeConfig(

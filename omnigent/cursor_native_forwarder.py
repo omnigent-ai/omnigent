@@ -44,6 +44,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import httpx
 
@@ -289,9 +290,9 @@ def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int
 def _get_current_rowid(store_path: Path) -> int:
     """Return the highest rowid currently in *store_path*, or 0 on any error."""
     sql = "SELECT MAX(rowid) FROM blobs"
-    for uri, kw in ((f"file:{store_path}?mode=ro", {"uri": True}), (str(store_path), {})):
+    for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
-            con = sqlite3.connect(uri, timeout=5.0, **kw)
+            con = sqlite3.connect(uri, timeout=5.0, uri=use_uri)
         except sqlite3.Error:
             continue
         try:
@@ -490,13 +491,16 @@ def _read_blob_rows(store_path: Path, last_rowid: int) -> list[tuple[int, str, o
     (only SELECTs are issued).
     """
     sql = "SELECT rowid, id, data FROM blobs WHERE rowid > ? ORDER BY rowid"
-    for uri, kw in ((f"file:{store_path}?mode=ro", {"uri": True}), (str(store_path), {})):
+    for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
-            con = sqlite3.connect(uri, timeout=5.0, **kw)
+            con = sqlite3.connect(uri, timeout=5.0, uri=use_uri)
         except sqlite3.Error:
             continue
         try:
-            return con.execute(sql, (last_rowid,)).fetchall()
+            return cast(
+                list[tuple[int, str, object]],
+                con.execute(sql, (last_rowid,)).fetchall(),
+            )
         except sqlite3.Error:
             continue
         finally:
@@ -524,9 +528,9 @@ def _read_last_used_model(store_path: Path) -> str | None:
         not yet written, or malformed.
     """
     sql = "SELECT value FROM meta"
-    for uri, kw in ((f"file:{store_path}?mode=ro", {"uri": True}), (str(store_path), {})):
+    for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
-            con = sqlite3.connect(uri, timeout=5.0, **kw)
+            con = sqlite3.connect(uri, timeout=5.0, uri=use_uri)
         except sqlite3.Error:
             continue
         try:

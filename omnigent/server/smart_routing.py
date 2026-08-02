@@ -20,6 +20,7 @@ from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
     import httpx  # used in type annotations only; runtime import is lazy in fetch_runner_models
+    from databricks.sdk.config import Config
 
 _logger = logging.getLogger(__name__)
 
@@ -162,7 +163,7 @@ async def _fetch_runner_catalog(
         ordered_models = sorted(
             indexed_models,
             key=lambda item: (
-                cost_order.get(item[1].cost_tier, len(cost_order)),
+                cost_order.get(item[1].cost_tier or "", len(cost_order)),
                 item[0],
             ),
         )
@@ -271,7 +272,7 @@ _VERDICT_SCHEMA: dict[str, object] = {
 class LLMRoutingClient:
     """Default routing client using the server-level PolicyLLMClient."""
 
-    def __init__(self, llm_client: Any) -> None:  # type: ignore[explicit-any]
+    def __init__(self, llm_client: Any) -> None:
         self._llm = llm_client
 
     async def route(
@@ -348,7 +349,7 @@ class LLMRoutingClient:
         return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
 
 
-def _bearer_auth(token: str) -> Any:  # type: ignore[explicit-any]  # returns httpx.Auth
+def _bearer_auth(token: str) -> httpx.Auth:
     """Build a static ``Authorization: Bearer <token>`` httpx auth.
 
     :param token: The bearer token, e.g. a Databricks workspace token.
@@ -412,7 +413,7 @@ class ExternalRoutingClient:
         *,
         base_url: str,
         router_name: str,
-        auth: Any = None,  # type: ignore[explicit-any]  # httpx.Auth, imported lazily
+        auth: httpx.Auth | None = None,
         databricks_profile: str | None = None,
         model_prefixes: list[str] | None = None,
         request_timeout: float = 20.0,
@@ -449,7 +450,7 @@ class ExternalRoutingClient:
         self._databricks_profile = databricks_profile
         # Cached SDK Config for the profile (created lazily), reused across
         # calls; its authenticate() refreshes the OAuth token as needed.
-        self._sdk_config: Any = None
+        self._sdk_config: Config | None = None
         self._model_prefixes = model_prefixes or []
         self._request_timeout = request_timeout
         # Human-readable reason the most recent route() returned None, for the
@@ -458,7 +459,7 @@ class ExternalRoutingClient:
         # path, cleared on success.
         self.last_error: str | None = None
 
-    def _resolve_auth(self) -> Any:  # type: ignore[explicit-any]  # httpx.Auth | None
+    def _resolve_auth(self) -> httpx.Auth | None:
         """Return the auth for a request, refreshing an OAuth token per call.
 
         A static *auth* (explicit api_key) is returned as-is. When only a
@@ -543,7 +544,7 @@ class ExternalRoutingClient:
                     self._url,
                     headers={"Content-Type": "application/json"},
                     json=body,
-                    auth=auth,
+                    auth=auth if auth is not None else httpx.USE_CLIENT_DEFAULT,
                 )
         except httpx.HTTPError as exc:
             # Transport-level failure (connect/timeout/DNS): no response body.

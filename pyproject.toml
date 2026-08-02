@@ -629,6 +629,10 @@ module = "claude_agent_sdk.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = ["copilot", "copilot.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "agents.*"
 ignore_missing_imports = true
 
@@ -646,6 +650,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "daytona.*"
+ignore_missing_imports = true
+
+# islo is an optional dep (the `islo` extra); same lazy-import posture
+# as modal above.
+[[tool.mypy.overrides]]
+module = "islo.*"
 ignore_missing_imports = true
 
 # hindsight-client is an optional dep (the `hindsight` extra); the

@@ -63,7 +63,7 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import COPILOT_EFFORTS, validate_effort
@@ -233,7 +233,7 @@ def _build_copilot_prompt(messages: list[Message], *, is_first_turn: bool) -> st
 # ---------------------------------------------------------------------------
 
 
-def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
+def _encode_tool_result(result: object) -> object:
     """Encode a bridged-tool result as a :class:`copilot.ToolResult`.
 
     A dict carrying a truthy ``error`` or ``blocked`` is a dispatch failure or a
@@ -261,12 +261,25 @@ def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
 # ---------------------------------------------------------------------------
 
 
+class _CopilotSession(Protocol):
+    """SDK session methods used by the executor."""
+
+    def on(self, callback: Callable[[object], None]) -> Callable[[], None]:
+        pass
+
+    async def send_and_wait(self, prompt: str, *, timeout: float) -> object:
+        pass
+
+    async def abort(self) -> object:
+        pass
+
+
 @dataclass
 class _CopilotSessionState:
     """Per-Omnigent-conversation SDK session state."""
 
-    client: Any = None  # copilot.CopilotClient
-    session: Any = None  # copilot.CopilotSession
+    client: object | None = None
+    session: _CopilotSession | None = None
     system_prompt: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
@@ -321,11 +334,13 @@ class CopilotExecutor(Executor):
         # Installed by the runtime adapter; evaluates PHASE_LLM_REQUEST /
         # PHASE_LLM_RESPONSE policies (the same round-trip pi / claude-sdk /
         # cursor use). ``None`` on single-process / pre-turn paths (no-op).
-        self._policy_evaluator: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
+        self._policy_evaluator: Callable[[str, dict[str, object]], Awaitable[object]] | None = None
         # Installed by the runtime adapter; surfaces native-tool calls to the
         # user via the web-UI elicitation approval card. ``None`` when no
         # handler is wired (single-process / test paths → default approve).
-        self._elicitation_handler: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
+        self._elicitation_handler: Callable[[str, dict[str, object]], Awaitable[bool]] | None = (
+            None
+        )
 
     def supports_streaming(self) -> bool:
         return True
@@ -423,7 +438,11 @@ class CopilotExecutor(Executor):
 
     # -- session lifecycle --------------------------------------------------
 
-    async def _on_permission_request(self, request: Any, _invocation: dict[str, str]) -> Any:  # type: ignore[explicit-any]
+    async def _on_permission_request(
+        self,
+        request: object,
+        _invocation: dict[str, str],
+    ) -> object:
         """Gate a Copilot NATIVE-tool permission request through policy + elicitation.
 
         Installed as ``create_session(on_permission_request=...)``. The SDK awaits
@@ -599,6 +618,7 @@ class CopilotExecutor(Executor):
 
         state.has_sent_prompt = True
         session = state.session
+        assert session is not None
 
         # Stream the session's events into a queue from the SDK's ``on`` callback
         # (invoked in the SDK loop), then drain-and-translate them here while the

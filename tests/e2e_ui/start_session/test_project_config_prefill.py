@@ -347,3 +347,101 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
             assert "host_id" not in body or body["host_id"] is None, body
         finally:
             await browser.close()
+
+
+def test_composer_files_new_session_into_project(seeded_session: tuple[str, str]) -> None:
+    """A ``?project=`` visit files the new session at create time (born filed).
+
+    The sidebar's per-project "new session" pencil lands here with the project
+    pre-scoped. On Send the session must be *born filed*: the create
+    ``POST /v1/sessions`` carries the legacy ``omni_project`` label so the
+    sidebar groups the new row under its project from its first appearance —
+    instead of briefly showing it under the ungrouped "Sessions" section until
+    the follow-up ``project_id`` move (``moveConversationToProject``) catches up
+    in the search-indexed session list. The sidebar, the ``?project=`` folder
+    query, and the project list all dual-read membership from this label OR the
+    first-class ``project_id`` the move then sets, so there is no ungrouped
+    window either way.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_born_filed(base_url, session_id))
+
+
+async def _drive_born_filed(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_projects_list(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_projects_list_body()
+                )
+
+            async def handle_project_config(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_project_config_body()
+                )
+
+            async def handle_events(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            async def handle_sessions(route: Route) -> None:
+                if route.request.method == "POST":
+                    create_bodies.append(route.request.post_data_json)
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"id": session_id}),
+                    )
+                else:
+                    await route.continue_()
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            await page.route("**/v1/sessions/projects", handle_projects_list)
+            await page.route(_PROJECT_CFG_RE, handle_project_config)
+            await page.route("**/v1/sessions/*/events", handle_events)
+            await page.route(_SESSIONS_RE, handle_sessions)
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # The per-project pencil destination: the composer lands pre-scoped
+            # to this project (no interaction needed to file into it).
+            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("write the docs")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            # Born filed: the create carries the legacy omni_project label so the
+            # sidebar files the new row under its project immediately, rather than
+            # flashing under "Sessions" until the follow-up project_id move lands.
+            labels = body.get("labels") or {}
+            assert labels.get("omni_project") == _PROJECT_NAME, body
+        finally:
+            await browser.close()
