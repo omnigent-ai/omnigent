@@ -32,6 +32,7 @@ from omnigent.tools.builtins.spawn import (
     _HISTORY_DEFAULT_TAIL,
     _HISTORY_MAX_TAIL,
     SysSessionCloseTool,
+    SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionListTool,
     SysSessionSendTool,
@@ -202,6 +203,27 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
     assert object_schema["properties"]["model"]["type"] == "string"
     assert "CREATES" in model_desc
     assert "harness default" in model_desc
+
+
+def test_create_schema_advertises_optional_model_and_reasoning_effort() -> None:
+    """
+    ``sys_session_create`` advertises optional ``model`` (landed in #2603)
+    and ``reasoning_effort`` (this change, #2080) so a caller can launch an
+    existing agent on a non-default model / effort for that session. Both
+    are optional (``required`` stays empty — the agent_id/config_path mode
+    split is enforced in the handler).
+    """
+    params = SysSessionCreateTool().get_schema()["function"]["parameters"]
+
+    assert params["required"] == []
+    props = params["properties"]
+    assert {"agent_id", "config_path", "title", "message", "model", "reasoning_effort"} <= set(
+        props
+    )
+    assert props["model"]["type"] == "string"
+    assert props["reasoning_effort"]["type"] == "string"
+    # The reasoning_effort property is scoped to the by-id existing-agent launch.
+    assert "agent_id" in props["reasoning_effort"]["description"]
 
 
 def _object_branch_props(tool: SysSessionSendTool) -> set[str]:

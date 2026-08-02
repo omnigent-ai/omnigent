@@ -51,6 +51,7 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.native_coding_agents import public_agent_name
+from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -2190,12 +2191,36 @@ async def _send_to_existing_session(
     )
 
 
+def _session_create_reasoning_effort_from_args(args: dict[str, Any]) -> str | None:
+    """
+    Validate the per-session reasoning effort from ``sys_session_create`` args.
+
+    The optional flat ``reasoning_effort`` field is threaded to the server
+    as ``SessionCreateRequest.reasoning_effort`` and persisted on the child
+    conversation (reaching a native CLI as ``--effort`` at terminal launch,
+    SDK harnesses via the spawn env). Validated against the shared effort
+    vocabulary (:data:`EFFORT_VALUES`), mirroring the server-side check on
+    ``POST /v1/sessions``; provider-specific support (e.g.
+    ``ANTHROPIC_EFFORTS``) is enforced downstream at launch. The companion
+    ``model`` field is already threaded through by ``_build_session_create_body``
+    (added in #2603); this adds the effort knob alongside it.
+
+    :param args: Parsed ``sys_session_create`` arguments, e.g.
+        ``{"agent_id": "ag_x", "reasoning_effort": "high"}``.
+    :returns: The validated effort, or ``None`` when absent/empty.
+    :raises ValueError: If ``reasoning_effort`` is not in
+        :data:`EFFORT_VALUES`.
+    """
+    return validate_effort(args.get("reasoning_effort"), "session metadata", EFFORT_VALUES)
+
+
 def _build_session_create_body(
     agent_id: str,
     conversation_id: str,
     title: Any,
     message: Any,
     model: Any = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2203,8 +2228,10 @@ def _build_session_create_body(
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
     top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    ``model`` are included when provided, and a validated
+    ``reasoning_effort`` when supplied; the message becomes the child's
+    first queued user turn via ``initial_items``. An absent
+    ``reasoning_effort`` leaves the body byte-for-byte as before.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2214,6 +2241,10 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param reasoning_effort: Optional validated per-session reasoning
+        effort to persist on the child
+        (``SessionCreateRequest.reasoning_effort``); ``None`` omits the key
+        (harness/spec default).
     :returns: The JSON request body.
     """
     body: dict[str, Any] = {
@@ -2231,6 +2262,8 @@ def _build_session_create_body(
                 "data": {"role": "user", "content": [{"type": "input_text", "text": message}]},
             }
         ]
+    if reasoning_effort is not None:
+        body["reasoning_effort"] = reasoning_effort
     return body
 
 
@@ -2368,12 +2401,23 @@ async def _execute_session_create(
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
         )
+    # agent_id (existing-agent) launch only: validate the optional
+    # per-session reasoning_effort before the create call. In config_path
+    # mode (handled above) the caller authors the spec locally, so this knob
+    # is scoped to the by-id launch the issue names (#2080). The companion
+    # `model` param is threaded by #2603; an absent effort leaves today's
+    # behavior unchanged.
+    try:
+        reasoning_effort = _session_create_reasoning_effort_from_args(args)
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_create invalid 'reasoning_effort': {exc}"})
     body = _build_session_create_body(
         str(agent_id),
         conversation_id,
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=reasoning_effort,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)

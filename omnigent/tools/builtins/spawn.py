@@ -932,6 +932,17 @@ class SysSessionCreateTool(Tool):
                                 "agent's default."
                             ),
                         },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": (
+                                "Optional per-session reasoning effort "
+                                "for the launched agent, e.g. 'low', "
+                                "'medium', 'high'. Applies to agent_id "
+                                "(existing-agent) mode. Omitted = the "
+                                "agent/harness default. Provider-specific "
+                                "support is enforced at launch."
+                            ),
+                        },
                     },
                     # Only the always-optional fields are listed in
                     # ``required`` (none): the agent_id-vs-config_path

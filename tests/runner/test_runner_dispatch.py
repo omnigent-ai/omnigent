@@ -6210,6 +6210,113 @@ async def test_sys_session_create_requires_exactly_one_mode(
     assert "exactly one of 'agent_id'" in info["error"]
 
 
+@pytest.mark.asyncio
+async def test_sys_session_create_threads_reasoning_effort_alongside_model() -> None:
+    """
+    ``sys_session_create`` (agent_id mode) threads a per-session
+    ``reasoning_effort`` into the JSON create body, alongside the ``model``
+    override landed in #2603 (issue #2080). Both keys reach
+    ``POST /v1/sessions`` as ``model_override`` / ``reasoning_effort``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_child", "agent_id": "ag_x", "status": "idle"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "model": "databricks-claude-sonnet-4-6",
+                    "reasoning_effort": "low",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert captured["agent_id"] == "ag_x"
+    assert captured["parent_session_id"] == "conv_caller"
+    assert captured["model_override"] == "databricks-claude-sonnet-4-6"
+    assert captured["reasoning_effort"] == "low"
+    assert json.loads(output)["conversation_id"] == "conv_child"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_omits_reasoning_effort_when_absent() -> None:
+    """
+    Backwards compatible: with no ``reasoning_effort`` the create body
+    carries no ``reasoning_effort`` key (byte-for-byte the pre-#2080 body),
+    so the launched agent keeps its spec-default effort.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_child", "agent_id": "ag_x", "status": "idle"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "auth"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert "reasoning_effort" not in captured
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_rejects_invalid_reasoning_effort() -> None:
+    """
+    A malformed ``reasoning_effort`` fails loud without ever reaching the
+    server (no orphan session), mirroring the fail-loud effort validation
+    elsewhere. (``model`` is threaded unvalidated by #2603 and resolved
+    downstream at launch, so it has no runner-side reject path here.)
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached on invalid args: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "reasoning_effort": "turbo"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert "invalid 'reasoning_effort'" in info["error"]
+
+
 def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:
     """
     Decode a captured multipart ``POST /v1/sessions`` request body.
