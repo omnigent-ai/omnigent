@@ -57,7 +57,11 @@ import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
-import { initialWindowComplete } from "@/lib/sessionsApi";
+import {
+  initialWindowComplete,
+  MAX_INITIAL_PAGES,
+  SESSION_HISTORY_PAGE_SIZE,
+} from "@/lib/sessionsApi";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
@@ -2218,8 +2222,31 @@ export function HistoryAutoLoader({
       return;
     }
 
-    if (buildingInitialWindow) pagesFetchedRef.current += 1;
-    void state.loadMoreHistory();
+    if (buildingInitialWindow) {
+      // Ask for the whole remaining window in one request: the server
+      // extends the page to the previous-prompt boundary
+      // (until_user_prompts), so the page-per-effect-pass loop collapses
+      // to a single round trip. Older servers ignore the params and
+      // return one page — this effect re-fires and the loop proceeds
+      // page-by-page as before. The page budget is then spent by
+      // page-equivalents received, so the MAX_INITIAL_PAGES cap holds
+      // for both server generations.
+      const pagesBudget = Math.max(1, MAX_INITIAL_PAGES - pagesFetchedRef.current);
+      pagesFetchedRef.current += 1;
+      void state
+        .loadMoreHistory({
+          untilUserPrompts: Math.max(1, 2 - userPromptCount),
+          maxItems: pagesBudget * SESSION_HISTORY_PAGE_SIZE,
+        })
+        .then((received) => {
+          pagesFetchedRef.current += Math.max(
+            0,
+            Math.ceil(received / SESSION_HISTORY_PAGE_SIZE) - 1,
+          );
+        });
+    } else {
+      void state.loadMoreHistory();
+    }
   }, [
     ctx.scrollRef,
     historyGeneration,

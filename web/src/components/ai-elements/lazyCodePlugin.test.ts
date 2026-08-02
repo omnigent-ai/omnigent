@@ -1,5 +1,40 @@
 import { describe, expect, it, vi } from "vitest";
-import { lazyCodePlugin } from "./lazyCodePlugin";
+import { lazyCodePlugin, schedulePrewarmCodeHighlighter } from "./lazyCodePlugin";
+
+// First describe in the file on purpose: the pre-warm must observe the
+// engine genuinely cold, before any other test triggers a highlight.
+describe("schedulePrewarmCodeHighlighter", () => {
+  it("defers while the app is busy, then warms the engine from idle time", async () => {
+    vi.useFakeTimers();
+    let busy = true;
+    const busyFn = vi.fn(() => busy);
+    schedulePrewarmCodeHighlighter(busyFn);
+    // jsdom has no requestIdleCallback → the setTimeout fallback fires.
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(busyFn).toHaveBeenCalledTimes(1); // checked, and deferred
+    await vi.advanceTimersByTimeAsync(2_000); // retry spacing + idle fallback
+    expect(busyFn.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+    busy = false;
+    await vi.advanceTimersByTimeAsync(2_000); // now idle → load + warm
+    vi.useRealTimers();
+
+    // Once warmed, a first "real" highlight resolves synchronously — the
+    // engine compile already happened off the render path.
+    await vi.waitFor(
+      () => {
+        expect(
+          lazyCodePlugin.highlight({
+            code: "const warmed = true;",
+            language: "typescript",
+            themes: ["github-light", "github-dark"],
+          }),
+        ).not.toBeNull();
+      },
+      { timeout: 10_000 },
+    );
+  });
+});
 
 describe("lazyCodePlugin — deferred Shiki engine", () => {
   it("satisfies the Streamdown code-highlighter plugin contract", () => {

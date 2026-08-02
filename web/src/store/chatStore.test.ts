@@ -442,6 +442,56 @@ describe("chatStore — switchTo", () => {
     expect(state.conversationLoadError).toBeNull();
   });
 
+  it("renders the items page before a slow session snapshot resolves", async () => {
+    // The "Loading conversation…" gate must clear on the items page alone:
+    // a stalled snapshot (cold model-catalog resolve, asleep-runner probe)
+    // previously blanked the whole transcript for its full duration.
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "hello"),
+      assistantMessage("resp_1", "hi there"),
+    ];
+    seedSession("conv_slowsnap", items);
+    let releaseSnapshot: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.split("?")[0] === "/v1/sessions/conv_slowsnap" && (init?.method ?? "GET") === "GET") {
+        return new Promise<Response>((resolve) => {
+          releaseSnapshot = () => resolve(defaultFetchHandler(input, init));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switching = useChatStore.getState().switchTo("conv_slowsnap");
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().loadingConversation).toBe(false);
+    });
+    // Transcript rendered from the items page alone…
+    expect(useChatStore.getState().blocks).toHaveLength(2);
+    // …while the snapshot (composer metadata) is still in flight.
+    expect(releaseSnapshot).not.toBeNull();
+
+    releaseSnapshot!();
+    await switching;
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
+    expect(useChatStore.getState().conversationLoadError).toBeNull();
+  });
+
+  it("surfaces a snapshot failure as the load error even after items rendered", async () => {
+    seedSession("conv_snapfail", [userMessage("resp_1", "hello")]);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.split("?")[0] === "/v1/sessions/conv_snapfail" && (init?.method ?? "GET") === "GET") {
+        return Promise.reject(new Error("snapshot down"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_snapfail");
+
+    expect(useChatStore.getState().conversationLoadError).not.toBeNull();
+  });
+
   it("hydrates pendingUserMessages from the snapshot's pending_inputs (native rebind)", async () => {
     // The core fix: a native web message that hasn't round-tripped
     // through the transcript yet is replayed by the server in
@@ -3699,6 +3749,21 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("refreshSessionState", () => {
+    it("skips the refetch while the bind's snapshot is still fresh", async () => {
+      // The runner-online edge fires right after bind on healthy sessions;
+      // re-fetching a snapshot the bind fetched moments ago is the exact
+      // duplicate this guard removes.
+      useChatStore.setState({ conversationId: "conv_codex" });
+      client.setQueryData(["session", "conv_codex"], { id: "conv_codex" });
+      fetchMock.mockClear();
+
+      await useChatStore.getState().refreshSessionState("conv_codex");
+
+      expect(
+        fetchMock.mock.calls.filter(([u]) => String(u).startsWith("/v1/sessions/conv_codex")),
+      ).toHaveLength(0);
+    });
+
     it("forces a fresh snapshot and applies runner-backed Codex model options", async () => {
       useChatStore.setState({
         conversationId: "conv_codex",

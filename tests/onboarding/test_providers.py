@@ -142,6 +142,7 @@ def real_catalog_loader(
     monkeypatch.setattr(_providers_mod, "_catalog_cache_root", lambda: tmp_path)
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     _providers_mod._catalog_cache.clear()
+    _providers_mod._catalog_refresh_inflight.clear()
     return tmp_path
 
 
@@ -339,12 +340,17 @@ def test_provider_catalog_reuses_fresh_disk_without_network(
     assert (real_catalog_loader / "anthropic.json").is_file()
 
 
-def test_provider_catalog_uses_stale_disk_only_after_live_failure(
+def test_provider_catalog_serves_stale_disk_without_blocking_on_network(
     real_catalog_loader: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A stale-but-bounded entry is used with observable provenance."""
+    """A stale-but-bounded entry serves immediately, with observable provenance.
+
+    The download must never run on the request path here — the session
+    snapshot blocks the web UI's loading gate on this lookup — so the
+    stale copy returns at once and only a background refresh is kicked.
+    """
     fetched_at = 3_000.0
     monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: fetched_at)
     monkeypatch.setattr(
@@ -359,16 +365,82 @@ def test_provider_catalog_uses_stale_disk_only_after_live_failure(
         "_catalog_now",
         lambda: fetched_at + _providers_mod._CATALOG_TTL_SECONDS + 1,
     )
-    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", lambda _provider: None)
+
+    def _unexpected_download(_provider: str) -> None:
+        raise AssertionError("a stale disk entry must serve without a request-path download")
+
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", _unexpected_download)
+    refreshes: list[str] = []
+    monkeypatch.setattr(_providers_mod, "_refresh_catalog_in_background", refreshes.append)
 
     with caplog.at_level(logging.WARNING, logger=_providers_mod.__name__):
         result = _REAL_FETCH_PROVIDER_CATALOG("anthropic")
 
     assert result == _FAKE_CATALOG["anthropic"]
+    assert refreshes == ["anthropic"]
     assert "Using stale model catalog cache" in caplog.text
     assert "provider=anthropic" in caplog.text
     assert "source=https://github.com/" in caplog.text
     assert (real_catalog_loader / "anthropic.json").is_file()
+
+
+def test_catalog_background_refresh_updates_memory_and_disk(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refresh replaces both tiers; an invalid download replaces neither."""
+    fetched_at = 5_000.0
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: fetched_at)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["anthropic"],
+    )
+    _REAL_FETCH_PROVIDER_CATALOG("anthropic")
+
+    refreshed_at = fetched_at + 10
+    monkeypatch.setattr(_providers_mod, "_catalog_now", lambda: refreshed_at)
+    monkeypatch.setattr(
+        _providers_mod,
+        "_download_provider_catalog",
+        lambda _provider: _FAKE_CATALOG["openai"],
+    )
+    _providers_mod._refresh_provider_catalog_now("anthropic")
+
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["openai"]
+    value = json.loads((real_catalog_loader / "anthropic.json").read_text())
+    assert value["fetched_at"] == refreshed_at
+
+    # A failed re-download leaves the refreshed copy in place.
+    monkeypatch.setattr(_providers_mod, "_download_provider_catalog", lambda _provider: None)
+    _providers_mod._refresh_provider_catalog_now("anthropic")
+    assert _REAL_FETCH_PROVIDER_CATALOG("anthropic") == _FAKE_CATALOG["openai"]
+
+
+def test_catalog_background_refresh_is_single_flight(
+    real_catalog_loader: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent kicks for one provider spawn exactly one refresh thread."""
+    del real_catalog_loader
+    started: list[str] = []
+
+    class _FakeThread:
+        def __init__(self, *, target: object, name: str, daemon: bool) -> None:
+            del target, daemon
+            self.name = name
+
+        def start(self) -> None:
+            started.append(self.name)
+
+    monkeypatch.setattr(_providers_mod.threading, "Thread", _FakeThread)
+
+    _providers_mod._refresh_catalog_in_background("anthropic")
+    _providers_mod._refresh_catalog_in_background("anthropic")
+
+    # The guard stays held until the (never-run) thread body clears it, so
+    # the second kick is absorbed instead of spawning a second thread.
+    assert started == ["catalog-refresh-anthropic"]
 
 
 def test_provider_catalog_rejects_over_age_cache(

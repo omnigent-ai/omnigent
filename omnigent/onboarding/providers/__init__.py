@@ -4,8 +4,10 @@ Provider catalog and model discovery for onboarding.
 Model lists are fetched live from the MLflow GitHub Release catalog
 (``https://github.com/mlflow/mlflow/releases/download/model-catalog%2Flatest/{provider}.json``)
 with a 1-hour memory/disk freshness window and a validated 7-day
-stale-if-error cache. MLflow is **not** a required dependency — the fetch uses
-only the standard library ``urllib.request``.
+stale-if-error cache. A stale disk entry serves immediately while a
+single-flight background refresh replaces it, so the download stays off
+latency-sensitive request paths. MLflow is **not** a required dependency —
+the fetch uses only the standard library ``urllib.request``.
 Auth configuration (``PROVIDER_ENV_VARS``, ``get_provider_config``) is
 omnigent-specific and lives here permanently.
 """
@@ -317,15 +319,66 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
         return None
 
 
+_catalog_refresh_inflight: set[str] = set()
+
+
+def _refresh_provider_catalog_now(provider: str) -> None:
+    """
+    Blocking live refresh of one provider catalog.
+
+    Downloads, validates, persists, and updates the in-memory cache; an
+    unusable download leaves both tiers serving the previous copy.
+
+    :param provider: Provider name, e.g. ``"anthropic"``.
+    """
+    now = _catalog_now()
+    result = _download_provider_catalog(provider)
+    if result is None or not _valid_catalog_payload(result):
+        return
+    entry = _DiskCatalogEntry(
+        catalog=result,
+        source_url=_catalog_source_url(provider),
+        fetched_at=now,
+    )
+    _write_disk_catalog(entry, provider)
+    with _catalog_cache_lock:
+        _catalog_cache[provider] = entry
+
+
+def _refresh_catalog_in_background(provider: str) -> None:
+    """
+    Run :func:`_refresh_provider_catalog_now` off-thread, single-flight.
+
+    :param provider: Provider name, e.g. ``"anthropic"``.
+    """
+    with _catalog_cache_lock:
+        if provider in _catalog_refresh_inflight:
+            return
+        _catalog_refresh_inflight.add(provider)
+
+    def _run() -> None:
+        try:
+            _refresh_provider_catalog_now(provider)
+        finally:
+            with _catalog_cache_lock:
+                _catalog_refresh_inflight.discard(provider)
+
+    threading.Thread(target=_run, name=f"catalog-refresh-{provider}", daemon=True).start()
+
+
 def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
     """
     Return the MLflow catalog for *provider* through memory and disk caches.
 
-    Fresh cache entries last one hour. A live failure can use a validated disk
-    entry for seven days and retains that fallback in memory for at most one
-    cache TTL before retrying discovery. Otherwise callers receive an empty
-    dict. Setting ``OMNIGENT_DISABLE_CATALOG_LOOKUP=1`` bypasses every cache
-    tier and network.
+    Fresh entries (memory, or a disk copy under one hour old) serve
+    directly. A stale validated disk entry serves immediately — for at
+    most seven days — while a single-flight background refresh replaces
+    it: the download must stay off latency-sensitive request paths (the
+    session snapshot blocks the web UI's "Loading conversation" gate on
+    it). Only a true first run (no usable disk entry) blocks on the
+    network; otherwise callers receive an empty dict. Setting
+    ``OMNIGENT_DISABLE_CATALOG_LOOKUP=1`` bypasses every cache tier and
+    network.
 
     :param provider: Provider name, e.g. ``"anthropic"``.
     :returns: Parsed catalog dict (``schema_version`` + ``models`` keys),
@@ -348,10 +401,26 @@ def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
                 return cached.catalog
             del _catalog_cache[provider]
     disk_entry = _read_disk_catalog(provider, source_url)
-    if disk_entry is not None and _catalog_age_seconds(disk_entry, now) <= _CATALOG_TTL_SECONDS:
-        with _catalog_cache_lock:
-            _catalog_cache[provider] = disk_entry
-        return disk_entry.catalog
+    if disk_entry is not None:
+        age_seconds = _catalog_age_seconds(disk_entry, now)
+        if age_seconds <= _CATALOG_TTL_SECONDS:
+            with _catalog_cache_lock:
+                _catalog_cache[provider] = disk_entry
+            return disk_entry.catalog
+        if age_seconds <= _CATALOG_STALE_IF_ERROR_SECONDS:
+            _logger.warning(
+                "Using stale model catalog cache provider=%s age_seconds=%.0f source=%s",
+                provider,
+                age_seconds,
+                disk_entry.source_url,
+            )
+            with _catalog_cache_lock:
+                _catalog_cache[provider] = disk_entry
+            _refresh_catalog_in_background(provider)
+            return disk_entry.catalog
+    # First run, or an over-age/invalid disk entry: nothing to serve, so
+    # the download runs in-line. Over-age entries stay failed-closed — a
+    # week-old catalog must not become a default silently.
     result = _download_provider_catalog(provider)
     live_entry: _DiskCatalogEntry | None = None
     if result is not None and _valid_catalog_payload(result):
@@ -361,18 +430,6 @@ def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
             fetched_at=now,
         )
         _write_disk_catalog(live_entry, provider)
-    elif (
-        disk_entry is not None
-        and _catalog_age_seconds(disk_entry, now) <= _CATALOG_STALE_IF_ERROR_SECONDS
-    ):
-        age_seconds = _catalog_age_seconds(disk_entry, now)
-        _logger.warning(
-            "Using stale model catalog cache provider=%s age_seconds=%.0f source=%s",
-            provider,
-            age_seconds,
-            disk_entry.source_url,
-        )
-        live_entry = disk_entry
     with _catalog_cache_lock:
         _catalog_cache[provider] = live_entry
     return live_entry.catalog if live_entry is not None else {}

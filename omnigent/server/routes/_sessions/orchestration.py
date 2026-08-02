@@ -6331,6 +6331,50 @@ async def _handle_mcp_tools_call(
     )
 
 
+# Single-flight guard for the background runner status probe: one in-flight
+# query per session, so snapshot polls can't stack probes on a slow runner.
+_runner_status_probe_inflight: dict[str, asyncio.Task[None]] = {}
+
+
+def _kick_runner_status_probe(runner_client: httpx.AsyncClient, session_id: str) -> None:
+    """
+    Fill the session-status cache from the runner, off the request path.
+
+    Fired on a status-cache miss during a snapshot build. The probe runs
+    as a background single-flight task so an asleep runner (which holds
+    the query until its 5s timeout) can never stall the snapshot
+    response; the fetched status lands in ``_session_status_cache`` (and
+    the persisted live status) for the next poll/snapshot to serve.
+
+    :param runner_client: HTTP client pointed at the bound runner.
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    """
+    if session_id in _runner_status_probe_inflight:
+        return
+
+    async def _probe() -> None:
+        try:
+            resp = await runner_client.get(
+                f"/v1/sessions/{session_id}",
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                raw = resp.json().get("status", "idle")
+                _session_status_cache[session_id] = raw
+                if raw in ("idle", "running", "waiting", "failed"):
+                    session_live_state.persist_live_status(session_id, raw)
+        except (httpx.HTTPError, ConnectionError):
+            _logger.debug(
+                "Runner status query failed for %s",
+                session_id,
+            )
+
+    task = asyncio.create_task(_probe())
+    _runner_status_probe_inflight[session_id] = task
+    task.add_done_callback(lambda _t, sid=session_id: _runner_status_probe_inflight.pop(sid, None))
+
+
 async def _fetch_runner_skills(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
@@ -6577,27 +6621,18 @@ async def _get_session_snapshot(
         # relay has not yet published the first ``"running"`` event for a
         # freshly bound session (the relay's GET /stream is still in its
         # tunnel handshake). Ask the runner for live status so we don't
-        # synthesize a stale ``"idle"`` while a turn is actually in flight.
+        # keep synthesizing a stale ``"idle"`` while a turn is actually in
+        # flight — but in the background: an asleep/unreachable runner
+        # holds this probe for its full 5s timeout, and awaiting it here
+        # would stall the snapshot the web UI's "Loading conversation"
+        # gate blocks on. The result lands in the status cache and the
+        # next poll/snapshot serves it (same serve-stale-then-correct
+        # pattern as skills and model options below).
         # ``_session_status_from_cache`` already collapses the fine-grained
         # relay values (``"waiting"`` → ``"running"``), so the raw cache value
         # is only needed here when it is actually missing (None).
         if _session_status_cache.get(session_id) is None and runner_client is not None:
-            try:
-                resp = await runner_client.get(
-                    f"/v1/sessions/{session_id}",
-                    timeout=5.0,
-                )
-                if resp.status_code == 200:
-                    raw = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = raw
-                    if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
-                    status = _session_status_from_cache(session_id)
-            except (httpx.HTTPError, ConnectionError):
-                _logger.debug(
-                    "Runner status query failed for %s",
-                    session_id,
-                )
+            _kick_runner_status_probe(runner_client, session_id)
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None

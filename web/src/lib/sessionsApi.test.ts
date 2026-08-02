@@ -18,6 +18,7 @@ import {
   getSessionSlim,
   interrupt,
   listRunners,
+  MAX_INITIAL_PAGES,
   openSessionStream,
   postEvent,
   SESSION_HISTORY_PAGE_SIZE,
@@ -788,6 +789,29 @@ describe("fetchSessionItemsPage", () => {
       "/v1/sessions/conv_abc/items?limit=25&order=desc&after=msg_50",
     );
   });
+
+  it("serializes the initial-window params when untilUserPrompts is set", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [],
+        first_id: null,
+        last_id: null,
+        has_more: false,
+      }),
+    );
+
+    await fetchSessionItemsPage("conv_abc", {
+      olderThan: "msg_9",
+      untilUserPrompts: 1,
+      maxItems: 140,
+    });
+
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc` +
+        "&after=msg_9&until_user_prompts=1&max_items=140",
+    );
+  });
 });
 
 describe("fetchInitialHistoryWindow", () => {
@@ -842,10 +866,29 @@ describe("fetchInitialHistoryWindow", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(page.items).toHaveLength(SESSION_HISTORY_PAGE_SIZE);
     expect(page.hasMore).toBe(true);
-    // Single descending request, no cursor — same shape as the plain page.
+    // Single descending request, no cursor, carrying the initial-window
+    // params so a supporting server can extend to the boundary in this
+    // same round trip (here the first page already satisfies it).
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
-      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
+      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc` +
+        `&until_user_prompts=2&max_items=${MAX_INITIAL_PAGES * SESSION_HISTORY_PAGE_SIZE}`,
     );
+  });
+
+  it("finishes in one round trip when the server extends to the boundary itself", async () => {
+    // A server that honors until_user_prompts answers the first request
+    // with the whole window: the long newest turn plus both prompts.
+    const turn = Array.from({ length: 30 }, (_, i) => asstWire(`t${i}`));
+    fetchMock.mockResolvedValueOnce(
+      pageBody([...turn, userWire("u_last"), asstWire("a_prev"), userWire("u_prev")], true),
+    );
+
+    const page = await fetchInitialHistoryWindow("conv_abc");
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(page.items[0]!.id).toBe("u_prev");
+    expect(page.items).toHaveLength(33);
+    expect(page.hasMore).toBe(true);
   });
 
   it("pages backward until the previous user message is included (long single turn)", async () => {

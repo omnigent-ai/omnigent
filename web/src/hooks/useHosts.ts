@@ -26,18 +26,11 @@ interface HostsResponse {
   hosts: Host[];
 }
 
-async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
+async function fetchHosts(): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
-  // Hide server-managed sandbox hosts from every host picker: they
-  // are launch targets the server creates on demand (and relaunches
-  // at will), not user-connectable machines, so offering them as
-  // manual targets is misleading. Hosts from older servers lack the
-  // field and are kept. `includeSandbox` opts a caller (the chat-header
-  // HostBadge) back into seeing them so it can label sandbox sessions.
-  if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider);
+  return body.hosts;
 }
 
 interface UseHostsOptions {
@@ -55,11 +48,21 @@ export function useHosts(options: UseHostsOptions = {}) {
   const includeSandbox = options.includeSandbox ?? false;
   const refetchOnFocus = options.refetchOnFocus ?? false;
   return useQuery({
-    // Distinct cache key per filtering mode so the picker's filtered
-    // list and the header's unfiltered list don't overwrite each other.
-    // A bare ["hosts"] invalidation still prefix-matches both.
-    queryKey: ["hosts", { includeSandbox }],
-    queryFn: () => fetchHosts(includeSandbox),
+    // One cache entry for the single /v1/hosts wire call; each caller
+    // derives its view via `select`, so the picker's filtered list and
+    // the header's unfiltered list share one fetch instead of firing a
+    // separate request each for the same URL. Bare ["hosts"]
+    // invalidations and the setQueriesData readiness patches keep
+    // targeting this one raw entry.
+    queryKey: ["hosts"],
+    queryFn: fetchHosts,
+    // Hide server-managed sandbox hosts from every host picker: they
+    // are launch targets the server creates on demand (and relaunches
+    // at will), not user-connectable machines, so offering them as
+    // manual targets is misleading. Hosts from older servers lack the
+    // field and are kept. `includeSandbox` opts a caller (the chat-header
+    // HostBadge) back into seeing them so it can label sandbox sessions.
+    select: (hosts) => (includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider)),
     enabled,
     // Readiness is pushed live via WS (hosts_changed → invalidate in
     // SessionUpdatesProvider), so the badge normally clears within seconds of

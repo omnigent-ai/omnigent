@@ -8249,3 +8249,104 @@ async def test_message_forward_failure_surfaces_runner_unavailable(
         )
     finally:
         await fake_runner.aclose()
+
+
+async def test_items_until_user_prompts_extends_initial_window(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``until_user_prompts`` extends a desc page back to the prompt boundary.
+
+    Layout (oldest → newest, 35 items): p0, 12 fillers, p1, 4 fillers,
+    one meta user item, 5 fillers, p2, 9 fillers, one assistant reply.
+    With ``limit=10`` the newest page holds no prompt, so the server must
+    page internally: stopping only once BOTH p2 and p1 are in the window
+    proves the meta user item did not count as a prompt boundary.
+    """
+    from omnigent.entities import MessageData, NewConversationItem
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    def _user(text: str, *, meta: bool = False) -> NewConversationItem:
+        return NewConversationItem(
+            type="message",
+            response_id=f"resp_{text.replace(' ', '_')}",
+            data=MessageData(
+                role="user",
+                content=[{"type": "input_text", "text": text}],
+                is_meta=meta,
+            ),
+        )
+
+    def _fillers(count: int, tag: str) -> list[NewConversationItem]:
+        return [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{tag}_{i}",
+                data=MessageData(
+                    role="assistant",
+                    agent="test-agent",
+                    content=[{"type": "output_text", "text": f"{tag} {i}"}],
+                ),
+            )
+            for i in range(count)
+        ]
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.append(
+        sid,
+        [
+            _user("prompt zero"),
+            *_fillers(12, "before p1"),
+            _user("prompt one"),
+            *_fillers(4, "after p1"),
+            _user("meta note", meta=True),
+            *_fillers(5, "before p2"),
+            _user("prompt two"),
+            *_fillers(9, "after p2"),
+        ],
+    )
+
+    resp = await client.get(
+        f"/v1/sessions/{sid}/items",
+        params={"limit": 10, "order": "desc", "until_user_prompts": 2, "max_items": 160},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    texts = [
+        item["content"][0]["text"]
+        for item in body["data"]
+        if item["type"] == "message" and item.get("content")
+    ]
+    real_prompts = [
+        item
+        for item in body["data"]
+        if item["type"] == "message" and item["role"] == "user" and not item.get("is_meta")
+    ]
+    assert len(real_prompts) == 2
+    assert "prompt two" in texts
+    assert "prompt one" in texts
+    # The window stops at the page holding the second real prompt; older
+    # history (p0 and its fillers) stays behind the cursor.
+    assert "prompt zero" not in texts
+    assert body["has_more"] is True
+    assert len(body["data"]) == 30
+    # The meta user item rode along inside the window without counting.
+    assert any(item["type"] == "message" and item.get("is_meta") for item in body["data"])
+
+    # max_items caps the accumulation even before the boundary is found.
+    capped = await client.get(
+        f"/v1/sessions/{sid}/items",
+        params={"limit": 10, "order": "desc", "until_user_prompts": 2, "max_items": 15},
+    )
+    assert capped.status_code == 200, capped.text
+    assert len(capped.json()["data"]) == 20
+    assert capped.json()["has_more"] is True
+
+    # Without the parameter the endpoint is a plain single page, unchanged.
+    plain = await client.get(f"/v1/sessions/{sid}/items", params={"limit": 10, "order": "desc"})
+    assert plain.status_code == 200, plain.text
+    assert len(plain.json()["data"]) == 10

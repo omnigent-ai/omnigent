@@ -639,7 +639,13 @@ export interface ChatState {
    * No-ops when `hasMoreHistory` is false, `loadingMoreHistory` is true,
    * or there is no active conversation / oldest-item cursor yet.
    */
-  loadMoreHistory: () => Promise<void>;
+  /**
+   * Load one older history page (scroll-up paging), or — with the
+   * initial-window opts — everything back to the previous user prompt in
+   * one request on servers supporting `until_user_prompts`. Resolves to
+   * the number of items prepended (0 when skipped, voided, or failed).
+   */
+  loadMoreHistory: (opts?: { untilUserPrompts?: number; maxItems?: number }) => Promise<number>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -1716,6 +1722,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
   refreshSessionState: async (conversationId) => {
     const id = conversationId ?? get().conversationId;
     if (!id) return;
+    // The runner-online edge (useRefreshSessionStateOnRunnerOnline) fires
+    // this right after bind on healthy sessions, duplicating the snapshot
+    // the bind just fetched with refresh_state=true. Skip while that fetch
+    // is this fresh; a real wake-from-asleep edge arrives with an old
+    // snapshot and proceeds.
+    const snapshotState = queryClient?.getQueryState(["session", id]);
+    if (snapshotState !== undefined && Date.now() - snapshotState.dataUpdatedAt < 2_500) {
+      return;
+    }
     await refetchRunnerBackedSessionState(id, {
       refreshState: true,
       applyBindingPatch: true,
@@ -1815,10 +1830,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  loadMoreHistory: async () => {
+  loadMoreHistory: async (opts) => {
     const { conversationId, oldestItemId, loadingMoreHistory, hasMoreHistory, historyGeneration } =
       get();
-    if (!conversationId || !oldestItemId || loadingMoreHistory || !hasMoreHistory) return;
+    if (!conversationId || !oldestItemId || loadingMoreHistory || !hasMoreHistory) return 0;
     set({ loadingMoreHistory: true });
     // Drop the result if the window was reset while this page was in flight
     // (navigate away-and-back, rebind hydration, reconnect re-hydrate): the
@@ -1829,8 +1844,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
         olderThan: oldestItemId,
+        untilUserPrompts: opts?.untilUserPrompts,
+        maxItems: opts?.maxItems,
       });
-      if (stale()) return;
+      if (stale()) return 0;
       const newBlocks = itemsToBlocks(items);
       set((state) => {
         // Rebind hydration resets the cursor to the fresh window's top while
@@ -1846,12 +1863,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
           loadingMoreHistory: false,
         };
       });
+      return items.length;
     } catch {
       // A stale failure must not disable scroll-up on the NEW window.
-      if (stale()) return;
+      if (stale()) return 0;
       // Disable further fetches on error — a persistent server failure
       // would otherwise re-trigger the scroll listener on every scroll event.
       set({ loadingMoreHistory: false, hasMoreHistory: false });
+      return 0;
     }
   },
 }));
@@ -2238,19 +2257,47 @@ async function bindStream(
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   try {
-    // Fetch one page here so the newest items can render after one round-trip.
+    // Render the transcript after ONE round-trip: the newest items page is
+    // all the "Loading conversation…" gate waits for. The session snapshot
+    // (composer metadata, model picker, usage) loads in parallel and
+    // hydrates in a second commit when it lands — a slow snapshot (cold
+    // model-catalog resolve, asleep-runner probe) must not blank an
+    // already-renderable transcript.
     // HistoryAutoLoader fetches any additional initial pages after this commit.
-    const [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
-        staleTime: 0,
-        retry: false,
-      }),
-      fetchSessionItemsPage(id),
-    ]);
+    const sessionPromise = queryClient.fetchQuery({
+      queryKey: ["session", id],
+      queryFn: () => getSessionSlim(id, { refreshState: true }),
+      staleTime: 0,
+      retry: false,
+    });
+    // The items await can throw first; keep the snapshot rejection handled
+    // so it can't surface as an unhandled rejection in that window.
+    sessionPromise.catch(() => undefined);
+    const page = await fetchSessionItemsPage(id);
     if (get().conversationId !== id) return;
     const items = page.items;
+    const snapshotBlocks = itemsToBlocks(items);
+    const oldestItemId = items[0]?.id ?? null;
+    set((state) => {
+      // The pump may have already pushed blocks — dedupe by item id.
+      const seenItemIds = new Set(
+        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+      );
+      const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
+      return {
+        blocks: [...unique, ...state.blocks],
+        loadingConversation: false,
+        hasMoreHistory: page.hasMore,
+        oldestItemId,
+        // The window cursor was reset: void any in-flight loadMoreHistory.
+        historyGeneration: state.historyGeneration + 1,
+        // The voided page's stale early-return skips its own flag clear.
+        loadingMoreHistory: false,
+      };
+    });
+
+    const session = await sessionPromise;
+    if (get().conversationId !== id) return;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
     const nativeModelFamily = nativeModelFamilyForSession(session);
@@ -2319,12 +2366,10 @@ async function bindStream(
       );
     }
 
-    const snapshotBlocks = itemsToBlocks(items);
     // Replay outstanding elicitation prompts from the snapshot.
     // The live SSE stream has no buffer, so a prompt that fired
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
-    const oldestItemId = items[0]?.id ?? null;
     set((state) => {
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
@@ -2344,10 +2389,6 @@ async function bindStream(
           ...session,
           codexModelOptions: racedOptions!,
         });
-      const seenItemIds = new Set(
-        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
-      );
-      const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
       // Dedupe against any elicitation blocks already produced by
       // the live pump (the snapshot may race ahead of or behind
       // the SSE event — match by elicitationId).
@@ -2370,7 +2411,7 @@ async function bindStream(
       // live blocks the pump already inserted) so the ApprovalCard
       // appears at the bottom of the chat — same position the live
       // stream would have given it.
-      const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
+      const allBlocks = [...state.blocks, ...uniquePendingElicitations];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
@@ -2483,13 +2524,6 @@ async function bindStream(
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
         pendingByConversation: prunedStash,
-        loadingConversation: false,
-        hasMoreHistory: page.hasMore,
-        oldestItemId,
-        // The window cursor was reset: void any in-flight loadMoreHistory.
-        historyGeneration: state.historyGeneration + 1,
-        // The voided page's stale early-return skips its own flag clear.
-        loadingMoreHistory: false,
         sessionStatus: session.status,
         // Re-show "N background tasks still running" after a reload/navigate-back: the
         // live SSE edge that set this is long gone, so the count rides in on

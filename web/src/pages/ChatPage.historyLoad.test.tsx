@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
-import { MAX_INITIAL_PAGES } from "@/lib/sessionsApi";
+import { MAX_INITIAL_PAGES, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { HistoryAutoLoader, JumpToTopButton, LatestTurnSpacer } from "./ChatPage";
 
@@ -88,6 +88,7 @@ describe("HistoryAutoLoader", () => {
   it("preserves the visible scroll offset after a scroll-up prepend", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
+      return 0;
     });
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
@@ -114,6 +115,7 @@ describe("HistoryAutoLoader", () => {
   it("preserves the offset after the user scrolls again during the request", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
+      return 0;
     });
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
@@ -148,6 +150,7 @@ describe("HistoryAutoLoader", () => {
       // The loading skeleton prepends 100px before the request settles.
       metrics.scrollHeight = 1100;
       useChatStore.setState({ loadingMoreHistory: true });
+      return 0;
     });
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
 
@@ -173,7 +176,7 @@ describe("HistoryAutoLoader", () => {
   });
 
   it("loads older history when the user scrolls near the top", () => {
-    const loadMoreHistory = vi.fn(async () => {});
+    const loadMoreHistory = vi.fn(async () => 0);
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
     const metrics = { scrollTop: 500, scrollHeight: 100 };
@@ -188,7 +191,7 @@ describe("HistoryAutoLoader", () => {
   });
 
   it("attaches when the live scroll element becomes available after mount", () => {
-    const loadMoreHistory = vi.fn(async () => {});
+    const loadMoreHistory = vi.fn(async () => 0);
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
     const metrics = { scrollTop: 600, scrollHeight: 1000 };
@@ -213,6 +216,7 @@ describe("HistoryAutoLoader", () => {
   it("starts initial paging when the live scroll element becomes available after mount", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
+      return 0;
     });
     useChatStore.setState({
       blocks: [userBlock("latest")],
@@ -239,6 +243,7 @@ describe("HistoryAutoLoader", () => {
   it("keeps loading after reaching the top during an in-flight fetch", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
+      return 0;
     });
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
     const scrollRoot = document.createElement("div");
@@ -266,6 +271,7 @@ describe("HistoryAutoLoader", () => {
   it("loads to the second real user prompt even when the viewport already scrolls", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
+      return 0;
     });
     useChatStore.setState({
       blocks: [userBlock("latest"), userBlock("system", "[System: task completed]")],
@@ -295,6 +301,7 @@ describe("HistoryAutoLoader", () => {
   it("caps the prompt search at the page cap", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
+      return 0;
     });
     useChatStore.setState({
       blocks: [userBlock("latest")],
@@ -325,8 +332,68 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(MAX_INITIAL_PAGES - 1);
   });
 
+  it("asks for the whole remaining window in one request while building the initial window", () => {
+    const loadMoreHistory = vi.fn(async () => 0);
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+
+    // One prompt on screen → one more needed; the budget is the cap minus
+    // the already-loaded newest page.
+    expect(loadMoreHistory).toHaveBeenCalledWith({
+      untilUserPrompts: 1,
+      maxItems: (MAX_INITIAL_PAGES - 1) * SESSION_HISTORY_PAGE_SIZE,
+    });
+  });
+
+  it("spends the page budget by pages received so the cap holds for server windows", async () => {
+    // A supporting server returns 120 items (6 pages) in one response; the
+    // budget accounting must count them, capping any follow-up request.
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+      return 120;
+    });
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+    await act(async () => {}); // flush the received-pages accounting
+
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_older" });
+    });
+    // Still only one prompt: a second request goes out, but its budget
+    // reflects the 6 pages already received (1 seed + 1 + 5 ⇒ one page left).
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+    expect(loadMoreHistory).toHaveBeenLastCalledWith({
+      untilUserPrompts: 1,
+      maxItems: SESSION_HISTORY_PAGE_SIZE,
+    });
+    await act(async () => {});
+
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_oldest" });
+    });
+    // Budget exhausted (another 6 pages received) — the window build stops.
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+  });
+
   it("does not page a short window for viewport fill (the spacer handles reachability)", () => {
-    const loadMoreHistory = vi.fn(async () => {});
+    const loadMoreHistory = vi.fn(async () => 0);
     // Two prompts already loaded → prompt boundary met. A window too short to
     // scroll must NOT trigger a fetch: the spacer keeps it reachable instead.
     useChatStore.setState({
@@ -344,7 +411,7 @@ describe("HistoryAutoLoader", () => {
   });
 
   it("does not auto-load a short window once history is exhausted", () => {
-    const loadMoreHistory = vi.fn(async () => {});
+    const loadMoreHistory = vi.fn(async () => 0);
     useChatStore.setState({ loadMoreHistory });
     const scrollRoot = document.createElement("div");
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 100, clientHeight: 500 });
@@ -714,6 +781,7 @@ describe("JumpToTopButton", () => {
       // jumpToTop must keep clearing the lock for the final scroll to hold.
       scroller.state.isAtBottom = true;
       if (calls >= 2) useChatStore.setState({ hasMoreHistory: false });
+      return 0;
     });
     useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
 

@@ -467,6 +467,30 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
     await act(async () => void rerender());
     expect(result.current.terminals).toEqual([TERMINAL]);
   });
+
+  it("fires one edge correction across several mounted instances", async () => {
+    // AppShell, SessionRail, and the terminal views all mount this hook
+    // for the same conversation. The → online edge must trigger a single
+    // invalidate (shared edge state), not one per mounted instance.
+    fetchMock.mockResolvedValue(emptyList());
+    runnerOnlineMock.mockReturnValue(undefined);
+    const { client, wrapper } = makeClientWrapper();
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+
+    const first = renderHook(() => useTerminals("conv_abc"), { wrapper });
+    const second = renderHook(() => useTerminals("conv_abc"), { wrapper });
+    await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
+    expect(invalidateSpy).not.toHaveBeenCalled();
+
+    runnerOnlineMock.mockReturnValue(true);
+    await act(async () => {
+      first.rerender();
+      second.rerender();
+      await vi.runAllTimersAsync();
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("terminalTabKey", () => {

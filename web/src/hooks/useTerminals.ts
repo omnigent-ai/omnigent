@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
@@ -297,6 +297,15 @@ export function useCreateTerminal(conversationId: string) {
  * to the cache while the seed fetch was in flight, the ``queryFn`` unions
  * the fetched list with whatever is already cached, deduped by id.
  */
+/**
+ * Runner-online edge state per conversation, ref-counted across mounted
+ * :func:`useTerminals` instances so one real liveness edge triggers one
+ * correction, no matter how many components watch the same conversation.
+ * The entry drops with the last unmount, so navigating back later
+ * re-observes the edge (re-reconciling SSE deltas missed while away).
+ */
+const runnerOnlineEdges = new Map<string, { value: boolean | undefined; observers: number }>();
+
 export function useTerminals(
   conversationId: string | null,
   options?: UseTerminalsOptions,
@@ -355,16 +364,33 @@ export function useTerminals(
   //     it fires for a real stop, not for the cold-boot `undefined → false`
   //     window (where the runner is on its way up and a terminal may already
   //     have arrived via SSE).
-  const wasRunnerOnline = useRef<boolean | undefined>(undefined);
+  //
+  // Edge state is SHARED across the hook's instances (see
+  // `runnerOnlineEdges`): several components mount useTerminals for the
+  // same conversation, and per-instance edge refs made each of them
+  // observe its own `undefined → true` transition and fire its own
+  // invalidate — duplicate /resources/terminals fetches on every open.
   useEffect(() => {
-    if (conversationId !== null) {
-      if (runnerOnline === true && wasRunnerOnline.current !== true) {
-        void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) });
-      } else if (runnerOnline === false && wasRunnerOnline.current === true) {
-        queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), []);
-      }
+    if (conversationId === null) return;
+    const edge = runnerOnlineEdges.get(conversationId) ?? { value: undefined, observers: 0 };
+    edge.observers += 1;
+    runnerOnlineEdges.set(conversationId, edge);
+    return () => {
+      edge.observers -= 1;
+      if (edge.observers <= 0) runnerOnlineEdges.delete(conversationId);
+    };
+  }, [conversationId]);
+  useEffect(() => {
+    if (conversationId === null) return;
+    const edge = runnerOnlineEdges.get(conversationId);
+    if (edge === undefined || edge.value === runnerOnline) return;
+    const was = edge.value;
+    edge.value = runnerOnline;
+    if (runnerOnline === true && was !== true) {
+      void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) });
+    } else if (runnerOnline === false && was === true) {
+      queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), []);
     }
-    wasRunnerOnline.current = runnerOnline;
   }, [conversationId, runnerOnline, queryClient]);
   return {
     // SSE-primary: the list is whatever the cache holds (seed + live deltas,

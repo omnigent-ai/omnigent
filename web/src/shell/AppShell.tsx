@@ -63,6 +63,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
+import { schedulePrewarmCodeHighlighter } from "@/components/ai-elements/lazyCodePlugin";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { ChatHeader } from "./ChatHeader";
@@ -134,6 +135,15 @@ export function AppShell() {
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
   useIOSViewportLock();
+
+  // Pre-warm the code highlighter once per tab from idle time, gated so it
+  // never runs while a conversation is binding or backfilling its window.
+  useEffect(() => {
+    schedulePrewarmCodeHighlighter(() => {
+      const s = useChatStore.getState();
+      return s.loadingConversation || s.loadingMoreHistory;
+    });
+  }, []);
 
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.

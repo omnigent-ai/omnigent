@@ -20,6 +20,54 @@ const DEFAULT_THEMES: [ThemeInput, ThemeInput] = ["github-light", "github-dark"]
 let realCode: CodeHighlighterPlugin | null = null;
 let codePromise: Promise<CodeHighlighterPlugin> | null = null;
 
+/** Retry spacing while a session bind/backfill is holding the pre-warm off. */
+const PREWARM_RETRY_MS = 500;
+
+let prewarmScheduled = false;
+
+/**
+ * Warm the code highlighter from idle time, off any session-open path.
+ *
+ * The first highlight in a tab pays Shiki's one-time engine + grammar
+ * compilation — a ~half-second main-thread block that otherwise lands in
+ * the middle of the first opened session's transcript render. A throwaway
+ * highlight while the shell idles moves that cost to before any code
+ * block exists. `busy` gates it: while a conversation is binding or
+ * backfilling (e.g. a direct /c/<id> page load), the warm-up defers and
+ * retries, so it can never add jank to the load it exists to protect.
+ */
+export function schedulePrewarmCodeHighlighter(busy: () => boolean): void {
+  if (prewarmScheduled || typeof window === "undefined") return;
+  prewarmScheduled = true;
+  // The timeout backstop matters: environments that produce no frames
+  // (headless, background tabs) can starve requestIdleCallback entirely,
+  // and a late warm-up is a warm-up that lands mid-session-open.
+  const idle: (cb: () => void) => void =
+    typeof window.requestIdleCallback === "function"
+      ? (cb) => window.requestIdleCallback(() => cb(), { timeout: 1_200 })
+      : (cb) => window.setTimeout(cb, 1_200);
+  const attempt = (): void => {
+    if (realCode !== null) return; // a real code block already warmed it
+    if (busy()) {
+      window.setTimeout(() => idle(attempt), PREWARM_RETRY_MS);
+      return;
+    }
+    // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
+    void loadCode().then((plugin) => {
+      // One tiny highlight per common language: the first call initializes
+      // the engine and its grammar; the follow-up pays python's marginal
+      // grammar so tool-heavy transcripts open clean too. (A session's own
+      // large code blocks still pay their first content tokenization —
+      // that part is content-cached, not engine-cached.)
+      plugin.highlight({ code: "const warm = 1;", language: "typescript", themes: DEFAULT_THEMES });
+      idle(() => {
+        plugin.highlight({ code: "warm = 1", language: "python", themes: DEFAULT_THEMES });
+      });
+    });
+  };
+  idle(attempt);
+}
+
 const loadCode = (): Promise<CodeHighlighterPlugin> => {
   // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
   codePromise ??= import("@streamdown/code").then(({ code }) => {

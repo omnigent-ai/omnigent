@@ -10,6 +10,7 @@ from fastapi import (
     Request,
 )
 
+from omnigent.entities import ConversationItem, MessageData
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -45,6 +46,21 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
 
+def _is_user_prompt(item: ConversationItem) -> bool:
+    """
+    A real (non-meta) user message — the initial-window boundary.
+
+    :param item: A conversation item from the store.
+    :returns: ``True`` for user-authored, non-meta message items.
+    """
+    return (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and not item.data.is_meta
+    )
+
+
 def register_items_routes(
     router: APIRouter,
     *,
@@ -67,6 +83,8 @@ def register_items_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
+        until_user_prompts: int | None = Query(default=None, ge=1, le=10),
+        max_items: int = Query(default=500, ge=1, le=1000),
     ) -> PaginatedList:
         """
         List items in a session with cursor-based pagination.
@@ -84,6 +102,13 @@ def register_items_routes(
         :param before: Cursor — return items before this item ID.
         :param order: Sort order, ``"asc"`` (chronological,
             default) or ``"desc"``.
+        :param until_user_prompts: Initial-window mode (``order=desc``
+            only): keep extending the page with older items until it
+            contains this many real (non-meta) user prompts, history is
+            exhausted, or ``max_items`` is reached. Turns the client's
+            serial prompt-boundary page loop into one round trip.
+        :param max_items: Cap on items accumulated in initial-window
+            mode (1-1000, default 500). Ignored otherwise.
         :returns: A :class:`PaginatedList` of conversation items.
         :raises OmnigentError: 404 if no session exists.
         """
@@ -103,12 +128,35 @@ def register_items_routes(
             before=before,
             order=order,
         )
-        data = [m.to_api_dict() for m in page.data]
+        items = list(page.data)
+        has_more = page.has_more
+        last_id = page.last_id
+        if until_user_prompts is not None and order == "desc" and before is None:
+            # Initial-window mode: page older (newest-first keyset) inside
+            # this one request until the window holds the requested number
+            # of real user prompts. Each store page costs single-digit ms,
+            # vs a full network round trip per page from the browser.
+            prompts = sum(1 for item in items if _is_user_prompt(item))
+            while has_more and len(items) < max_items and prompts < until_user_prompts:
+                next_page = await asyncio.to_thread(
+                    conversation_store.list_items,
+                    session_id,
+                    limit=limit,
+                    after=items[-1].id,
+                    order="desc",
+                )
+                if not next_page.data:
+                    break
+                items.extend(next_page.data)
+                prompts += sum(1 for item in next_page.data if _is_user_prompt(item))
+                has_more = next_page.has_more
+                last_id = next_page.last_id
+        data = [m.to_api_dict() for m in items]
         return PaginatedList(
             data=data,
             first_id=page.first_id,
-            last_id=page.last_id,
-            has_more=page.has_more,
+            last_id=last_id,
+            has_more=has_more,
         )
 
     # ── GET /sessions/{session_id}/child_sessions ────────────────

@@ -807,11 +807,30 @@ export interface SessionItemsPage {
  */
 export async function fetchSessionItemsPage(
   sessionId: string,
-  { olderThan, limit = SESSION_HISTORY_PAGE_SIZE }: { olderThan?: string; limit?: number } = {},
+  {
+    olderThan,
+    limit = SESSION_HISTORY_PAGE_SIZE,
+    untilUserPrompts,
+    maxItems,
+  }: {
+    olderThan?: string;
+    limit?: number;
+    untilUserPrompts?: number;
+    maxItems?: number;
+  } = {},
 ): Promise<SessionItemsPage> {
   const params = new URLSearchParams({ limit: String(limit), order: "desc" });
   // "Older than the cursor" within a descending scan = items after it.
   if (olderThan) params.set("after", olderThan);
+  // Initial-window mode: the server extends the page internally (store
+  // pages cost single-digit ms there) until it holds this many real user
+  // prompts or `maxItems`, collapsing the client's serial page loop into
+  // one round trip. Older servers ignore the params and return a single
+  // page — callers keep looping, unchanged.
+  if (untilUserPrompts !== undefined) {
+    params.set("until_user_prompts", String(untilUserPrompts));
+    if (maxItems !== undefined) params.set("max_items", String(maxItems));
+  }
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
   );
@@ -864,7 +883,16 @@ export async function fetchInitialHistoryWindow(sessionId: string): Promise<Sess
   /* oxlint-disable no-await-in-loop */
   for (let pagesFetched = 1; pagesFetched <= MAX_INITIAL_PAGES; pagesFetched += 1) {
     const cursor = items[0]?.id;
-    const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
+    // The first request asks the server to extend to the prompt boundary
+    // in one round trip (until_user_prompts); on servers that honor it
+    // the loop exits after a single iteration. Older servers return one
+    // page and the loop pages backward exactly as before.
+    const page = await fetchSessionItemsPage(
+      sessionId,
+      cursor
+        ? { olderThan: cursor }
+        : { untilUserPrompts: 2, maxItems: MAX_INITIAL_PAGES * SESSION_HISTORY_PAGE_SIZE },
+    );
     items = [...page.items, ...items]; // prepend the older page
     hasMore = page.hasMore;
     if (!hasMore) break; // reached the start of the conversation
