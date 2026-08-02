@@ -15,6 +15,8 @@ import shlex
 from collections.abc import Callable, Collection
 from typing import Any, TypeAlias
 
+from omnigent.policies.builtins._shell import SHELL_TOOLS
+
 # Heterogeneous JSON-shaped maps — the V0 policy event + decision payloads.
 _Json: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
@@ -129,9 +131,7 @@ _GIT_GLOBAL_VALUE_OPTS: frozenset[str] = frozenset(
 )
 _PUSH_SHORT_VALUE_OPTS: frozenset[str] = frozenset({"o"})
 _ENV_ASSIGNMENT_RE: re.Pattern[str] = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
-_SHELL_TOOLS: frozenset[str] = frozenset(
-    {"sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"}
-)
+_SHELL_TOOLS: frozenset[str] = SHELL_TOOLS
 
 
 def _shell_statements(command: str) -> list[list[str]]:
