@@ -1,4 +1,8 @@
-"""Shared contracts for open JSON objects and serializable JSON values."""
+"""Shared JSON type contracts.
+
+``JsonObject`` is an open object bag whose values are narrowed at use sites.
+``JsonValue`` is recursively constrained to JSON-serializable values.
+"""
 
 from typing import TypeAlias
 
