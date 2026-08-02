@@ -15,8 +15,11 @@
 // `--font-sans` at runtime is a no-op. The `html` rule reads
 // `var(--ui-font-family, var(--font-sans))`, so an unset family falls back to
 // the system stack and any value we set on documentElement wins.
+//
+// Size is owned by {@link createLocalPreference}; family is still hand-rolled
+// (migrate next — same pattern).
 
-const STORAGE_KEY = "omnigent:ui-font-size";
+import { createLocalPreference } from "@/lib/preferences";
 
 /** Reference size that a scale of 1 corresponds to (Tailwind/browser default). */
 const BASE_FONT_SIZE_PX = 16;
@@ -31,44 +34,6 @@ export function clampUiFontSizePx(px: number): number {
   return Math.min(UI_FONT_SIZE_MAX, Math.max(UI_FONT_SIZE_MIN, Math.round(px)));
 }
 
-function isValidPx(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-/**
- * Read the persisted UI font size in px.
- *
- * Returns the default when nothing is stored, on a server render (no `window`),
- * or when the stored value is missing/malformed — never throws, so a corrupt
- * entry can't break app boot. A stored value outside the range is clamped.
- */
-export function readUiFontSizePx(): number {
-  if (typeof window === "undefined") return UI_FONT_SIZE_DEFAULT;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return UI_FONT_SIZE_DEFAULT;
-    const parsed: unknown = JSON.parse(raw);
-    if (!isValidPx(parsed)) return UI_FONT_SIZE_DEFAULT;
-    return clampUiFontSizePx(parsed);
-  } catch {
-    return UI_FONT_SIZE_DEFAULT;
-  }
-}
-
-/**
- * Persist the UI font size (px). The value is clamped to the supported range
- * before writing. Swallows quota/access errors so a failed write can't break
- * the app.
- */
-export function writeUiFontSizePx(px: number): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(clampUiFontSizePx(px)));
-  } catch {
-    // localStorage quota or access errors shouldn't break the app.
-  }
-}
-
 /**
  * Apply the given px size to the DOM by setting the `--ui-font-scale` variable
  * on the document root. The root font-size rules in index.css multiply this in,
@@ -79,6 +44,42 @@ export function applyUiFontScale(px: number): void {
   if (typeof document === "undefined") return;
   const scale = clampUiFontSizePx(px) / BASE_FONT_SIZE_PX;
   document.documentElement.style.setProperty("--ui-font-scale", String(scale));
+}
+
+function parseUiFontSizePx(raw: string): number {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "number" || !Number.isFinite(parsed)) {
+      return UI_FONT_SIZE_DEFAULT;
+    }
+    return clampUiFontSizePx(parsed);
+  } catch {
+    return UI_FONT_SIZE_DEFAULT;
+  }
+}
+
+/**
+ * Declarative UI font-size preference. Same key and JSON number format as the
+ * pre-factory helpers — existing localStorage values load unchanged.
+ */
+export const uiFontSizePreference = createLocalPreference<number>({
+  key: "omnigent:ui-font-size",
+  defaultValue: UI_FONT_SIZE_DEFAULT,
+  parse: parseUiFontSizePx,
+  serialize: (px) => JSON.stringify(clampUiFontSizePx(px)),
+  normalize: clampUiFontSizePx,
+  onChange: applyUiFontScale,
+  appearance: true,
+});
+
+/** Read the persisted UI font size in px. */
+export function readUiFontSizePx(): number {
+  return uiFontSizePreference.read();
+}
+
+/** Persist the UI font size (px) and apply `--ui-font-scale`. */
+export function writeUiFontSizePx(px: number): void {
+  uiFontSizePreference.write(px);
 }
 
 // ---- Font family ---------------------------------------------------------

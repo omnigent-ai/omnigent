@@ -4,6 +4,7 @@ import {
   readDefaultWorkspacePanelOpen,
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
+  workspacePanelPreference,
   writeWorkspacePanelDefault,
 } from "./workspacePanelPreferences";
 
@@ -30,6 +31,14 @@ describe("workspacePanelPreferences — read/write", () => {
     expect(readWorkspacePanelDefault()).toBe("open");
     expect(readDefaultWorkspacePanelOpen()).toBe(true);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("preserves a pre-factory localStorage seed (backward compatible)", () => {
+    // Old helper stored the raw enum string under this exact key.
+    localStorage.setItem(STORAGE_KEY, "collapsed");
+    expect(workspacePanelPreference.read()).toBe("collapsed");
+    expect(readWorkspacePanelDefault()).toBe("collapsed");
+    expect(localStorage.getItem(STORAGE_KEY)).toBe("collapsed");
   });
 });
 

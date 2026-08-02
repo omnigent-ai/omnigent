@@ -96,19 +96,18 @@ import {
   normalizeThemeMode,
   type ThemeMode,
 } from "@/components/theme/themeMode";
+import { usePreference } from "@/hooks/usePreference";
+import { LEGACY_APPEARANCE_STORAGE_KEYS, resetAppearancePreferences } from "@/lib/preferences";
 import {
   applyUiFontFamily,
-  applyUiFontScale,
   clampUiFontSizePx,
   readUiFontFamily,
-  readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
-  UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
   UI_FONT_SIZE_STEP,
+  uiFontSizePreference,
   writeUiFontFamily,
-  writeUiFontSizePx,
 } from "@/lib/uiFontPreferences";
 import {
   clampCodeFontSizePx,
@@ -122,16 +121,9 @@ import {
   writeCodeFontFamily,
   writeCodeFontSizePx,
 } from "@/lib/codeFontPreferences";
+import { terminalThemePreference, type TerminalThemeMode } from "@/lib/terminalThemePreferences";
 import {
-  readTerminalThemeMode,
-  TERMINAL_THEME_DEFAULT,
-  writeTerminalThemeMode,
-  type TerminalThemeMode,
-} from "@/lib/terminalThemePreferences";
-import {
-  readWorkspacePanelDefault,
-  WORKSPACE_PANEL_DEFAULT,
-  writeWorkspacePanelDefault,
+  workspacePanelPreference,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
@@ -497,12 +489,8 @@ function ModeControl() {
 
 /** Terminal light/dark/match-app theme — its own section. */
 function TerminalThemeControl() {
-  const [mode, setMode] = useState(() => readTerminalThemeMode());
+  const [mode, setMode] = usePreference(terminalThemePreference);
   const labelId = useId();
-  const choose = useCallback((next: TerminalThemeMode) => {
-    setMode(next);
-    writeTerminalThemeMode(next);
-  }, []);
   return (
     <ThemeSubsection
       labelId={labelId}
@@ -512,7 +500,7 @@ function TerminalThemeControl() {
       <CardRadioGroup<TerminalThemeMode>
         labelledBy={labelId}
         value={mode}
-        onSelect={choose}
+        onSelect={setMode}
         className="grid grid-cols-3 gap-3"
         cardClassName="items-center gap-2 p-4"
         items={terminalThemeCards.map((card) => ({
@@ -531,12 +519,8 @@ function TerminalThemeControl() {
  * sessions keep restoring whatever the user last left them as.
  */
 function WorkspacePanelDefaultControl() {
-  const [value, setValue] = useState(() => readWorkspacePanelDefault());
+  const [value, setValue] = usePreference(workspacePanelPreference);
   const labelId = useId();
-  const choose = useCallback((next: WorkspacePanelDefault) => {
-    setValue(next);
-    writeWorkspacePanelDefault(next);
-  }, []);
   return (
     <ThemeSubsection
       labelId={labelId}
@@ -546,7 +530,7 @@ function WorkspacePanelDefaultControl() {
       <CardRadioGroup<WorkspacePanelDefault>
         labelledBy={labelId}
         value={value}
-        onSelect={choose}
+        onSelect={setValue}
         className="grid grid-cols-2 gap-3"
         cardClassName="items-center gap-2 p-4"
         items={workspacePanelCards.map((card) => ({
@@ -810,6 +794,12 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+/**
+ * Appearance localStorage keys not yet owned by `createLocalPreference(...,
+ * { appearance: true })` live in {@link LEGACY_APPEARANCE_STORAGE_KEYS}
+ * (`lib/preferences/appearancePrefs.ts`). Reset clears them explicitly.
+ */
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode and Color theme pickers
   // would be no-ops — hide them and say so (matching ThemeModeMenu). Terminal
@@ -824,40 +814,31 @@ function AppearanceSection() {
     // Reset every appearance preference back to the product default.
     setTheme("system");
 
-    writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
+    // Migrated prefs: one registry call clears keys, notifies subscribers, and
+    // runs onChange (e.g. UI font scale). Adding a setting with
+    // `appearance: true` picks it up here automatically.
+    resetAppearancePreferences();
 
+    // Legacy appearance prefs not yet on the declarative layer. Shrink
+    // LEGACY_APPEARANCE_STORAGE_KEYS (and this block) as each module migrates —
+    // see `web/src/lib/preferences/appearancePrefs.ts`.
     writeThemePalette(DEFAULT_PALETTE);
     applyThemePalette(DEFAULT_PALETTE);
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
-    writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
-
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
-    applyUiFontScale(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
     writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
 
-    // Remove the persisted keys so this device has no appearance overrides at
-    // all. Some write helpers already remove the key for the default value;
-    // clearing the list here makes the intent explicit and keeps the reset
-    // behavior consistent even if a helper changes later.
+    // Clear remaining legacy keys so this device has no appearance overrides.
+    // Migrated keys are already removed by resetAppearancePreferences().
     if (typeof window !== "undefined") {
       try {
-        for (const key of [
-          "omnigent:ui-font-size",
-          "omnigent:ui-font-family",
-          "omnigent:code-font-size",
-          "omnigent:code-font-family",
-          "omnigent:terminal-theme",
-          "omnigent:ui-theme-palette",
-          "omnigent:custom-theme",
-          "omnigent:default-workspace-panel",
-          "omnigent:hide-unconfigured-harnesses",
-        ]) {
+        for (const key of LEGACY_APPEARANCE_STORAGE_KEYS) {
           window.localStorage.removeItem(key);
         }
       } catch {
@@ -865,8 +846,8 @@ function AppearanceSection() {
       }
     }
 
-    // Remount the controls so they re-read the freshly-cleared defaults from
-    // localStorage rather than keeping their stale seeded state.
+    // Remount legacy (non-usePreference) controls so they re-read defaults.
+    // Migrated controls subscribe and update without a remount.
     setResetKey((k) => k + 1);
   };
 
@@ -1008,30 +989,40 @@ function UiFontSizeControl() {
   // the way to "18") or an empty field while retyping — don't get clamped on
   // every keystroke. We only commit while typing when the draft is already a
   // valid in-range size; blur/Enter clamps and re-syncs the text.
-  const [px, setPx] = useState(() => readUiFontSizePx());
+  const [px, setPx] = usePreference(uiFontSizePreference);
   const [draft, setDraft] = useState(() => String(px));
 
-  const commit = useCallback((next: number) => {
-    const clamped = clampUiFontSizePx(next);
-    setPx(clamped);
-    setDraft(String(clamped));
-    writeUiFontSizePx(clamped);
-    applyUiFontScale(clamped);
-  }, []);
+  // Keep the draft text in sync when Appearance reset (or another writer)
+  // changes the committed size out from under the field.
+  useEffect(() => {
+    setDraft(String(px));
+  }, [px]);
 
-  const onDraftChange = useCallback((text: string) => {
-    setDraft(text);
-    // Apply live only once the field holds a valid, in-range whole number;
-    // leave partial/out-of-range/empty drafts untouched until blur.
-    if (/^\d+$/.test(text)) {
-      const value = Number(text);
-      if (value >= UI_FONT_SIZE_MIN && value <= UI_FONT_SIZE_MAX) {
-        setPx(value);
-        writeUiFontSizePx(value);
-        applyUiFontScale(value);
+  const commit = useCallback(
+    (next: number) => {
+      const clamped = clampUiFontSizePx(next);
+      setPx(clamped);
+      // Always re-sync draft text. When blur reverts an empty/invalid field to
+      // the same committed size, `px` is unchanged so the effect won't run.
+      setDraft(String(clamped));
+    },
+    [setPx],
+  );
+
+  const onDraftChange = useCallback(
+    (text: string) => {
+      setDraft(text);
+      // Apply live only once the field holds a valid, in-range whole number;
+      // leave partial/out-of-range/empty drafts untouched until blur.
+      if (/^\d+$/.test(text)) {
+        const value = Number(text);
+        if (value >= UI_FONT_SIZE_MIN && value <= UI_FONT_SIZE_MAX) {
+          setPx(value);
+        }
       }
-    }
-  }, []);
+    },
+    [setPx],
+  );
 
   // Clamp and re-sync the text to the committed value. An empty or invalid
   // draft reverts to the last committed size rather than a bogus one.

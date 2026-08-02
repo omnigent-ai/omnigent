@@ -5,6 +5,7 @@ import {
   resolveTerminalIsDark,
   subscribeTerminalTheme,
   TERMINAL_THEME_DEFAULT,
+  terminalThemePreference,
   writeTerminalThemeMode,
 } from "./terminalThemePreferences";
 
@@ -36,6 +37,14 @@ describe("terminalThemePreferences — read/write", () => {
     writeTerminalThemeMode("auto");
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
     expect(readTerminalThemeMode()).toBe("auto");
+  });
+
+  it("preserves a pre-factory localStorage seed (backward compatible)", () => {
+    // Old helper stored the raw mode string under this exact key.
+    localStorage.setItem(STORAGE_KEY, "light");
+    expect(terminalThemePreference.read()).toBe("light");
+    expect(readTerminalThemeMode()).toBe("light");
+    expect(localStorage.getItem(STORAGE_KEY)).toBe("light");
   });
 });
 

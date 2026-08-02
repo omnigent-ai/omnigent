@@ -43,6 +43,9 @@ import {
 } from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
+// Eagerly register every Appearance preference so Reset doesn't depend on
+// which lazily-loaded chunks the user has visited.
+import "./lib/preferences/appearancePrefs";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 

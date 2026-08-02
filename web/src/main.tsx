@@ -24,6 +24,9 @@ import {
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
+// Eagerly register every Appearance preference so Reset doesn't depend on
+// which lazily-loaded chunks the user has visited.
+import "./lib/preferences/appearancePrefs";
 import "./index.css";
 
 // Start tracing before any request fires so fetch/XHR are patched in time

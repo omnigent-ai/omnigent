@@ -8,6 +8,7 @@ import {
   UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
+  uiFontSizePreference,
   writeUiFontFamily,
   writeUiFontSizePx,
 } from "./uiFontPreferences";
@@ -69,6 +70,21 @@ describe("uiFontPreferences", () => {
     applyUiFontScale(99);
     // Clamped to the 20px max → 20 / 16 = 1.25.
     expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.25");
+  });
+
+  it("applies the scale as a write side-effect", () => {
+    writeUiFontSizePx(18);
+    // 18 / 16 = 1.125.
+    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.125");
+  });
+
+  it("preserves a pre-factory localStorage seed (backward compatible)", () => {
+    // Old helper wrote JSON.stringify(px) under this exact key.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(18));
+    expect(uiFontSizePreference.read()).toBe(18);
+    expect(readUiFontSizePx()).toBe(18);
+    // Must not rewrite/clear the user's value on read.
+    expect(localStorage.getItem(STORAGE_KEY)).toBe("18");
   });
 });
 
