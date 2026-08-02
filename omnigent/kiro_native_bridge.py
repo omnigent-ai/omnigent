@@ -12,11 +12,10 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import TypeAlias, TypedDict
+from typing import TypedDict
 
 from omnigent._platform import stable_user_id
-
-_JsonObject: TypeAlias = dict[str, object]
+from omnigent.json_types import JsonObject as _JsonObject
 
 
 class _McpServerEntry(TypedDict):

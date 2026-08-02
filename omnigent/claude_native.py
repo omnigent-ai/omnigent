@@ -22,6 +22,8 @@ import subprocess
 import sys
 import uuid
 
+from omnigent.json_types import JsonObject as _JsonObject
+
 # termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
 # which is disabled on Windows. Guard the import (special-cased by mypy, which
 # type-checks on Linux) so importing this module never crashes the CLI there.
@@ -125,7 +127,6 @@ from omnigent.terminals.ws_bridge import (
 
 _logger = logging.getLogger(__name__)
 
-_JsonObject: TypeAlias = dict[str, object]
 _TermiosAttrs: TypeAlias = list[int | list[bytes | int]]
 _SignalHandler: TypeAlias = (
     Callable[[int, FrameType | None], object] | int | signal.Handlers | None

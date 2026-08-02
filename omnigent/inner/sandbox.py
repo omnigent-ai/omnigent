@@ -14,8 +14,9 @@ from abc import ABC, abstractmethod
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, TypeAlias, cast
+from typing import Protocol, cast
 
+from omnigent.json_types import JsonValue
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
 from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
@@ -47,11 +48,6 @@ _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
-
-# JSON-shaped payload passed across the parent/launcher boundary: the
-# SandboxPolicy serialized via `to_jsonable()` plus whatever `json.loads`
-# returns on the helper side.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 @dataclass

@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeAlias
 
 import click
 import httpx
@@ -74,6 +73,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -96,7 +96,6 @@ from omnigent.native_terminal import (
 
 _logger = logging.getLogger(__name__)
 
-_JsonObject: TypeAlias = dict[str, object]
 
 _AGENT_NAME = "codex-native-ui"
 _DEFAULT_CODEX_COMMAND = "codex"
