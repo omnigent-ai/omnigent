@@ -34,6 +34,15 @@ else
   cd "${WORKSPACE}"
 fi
 
+# Deployment-supplied host config: the launcher renders the shared
+# config-write command (base64-json payload inside `python3 -c '...'`) and
+# ships it in the /run payload, because there is no exec transport to run it
+# from the server side. Executed before the host starts so the config is in
+# place on first read.
+if [ -n "${OMNIGENT_HOST_CONFIG_CMD:-}" ]; then
+  eval "${OMNIGENT_HOST_CONFIG_CMD}"
+fi
+
 # The server URL must be passed with --server (a bare `omnigent host` with no
 # server spawns a LOCAL server and connects to itself instead of dialing back).
 # Identity + token come from the OMNIGENT_HOST_* environment the hooks server

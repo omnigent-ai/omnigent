@@ -21,7 +21,6 @@ from omnigent.host.identity import (
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
 )
-from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.onboarding.sandboxes.lambda_microvm import (
     DEBUG_INGRESS_CONNECTORS_ENV_VAR,
     IMAGE_IDENTIFIER_ENV_VAR,
@@ -368,6 +367,47 @@ def test_start_host_workspace_matches_entrypoint_sanitization(
     assert workspace == f"/root/workspace/{expected}"
 
 
+def test_start_host_threads_host_config_write_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """host_config rides the /run payload as the rendered write command.
+
+    There is no exec transport to install the config from the server side, so
+    the shared marker-aware write command travels as OMNIGENT_HOST_CONFIG_CMD
+    and start_host.sh runs it before starting the host.
+    """
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    launcher.start_host(
+        "managed-abc",
+        token="tok",
+        host_id="host_x",
+        host_name="managed-x",
+        server_url="https://srv.example.com",
+        host_config={"providers": {"gw": {"type": "openai"}}},
+    )
+    env = json.loads(client.run_calls[0]["runHookPayload"])
+    assert env["OMNIGENT_HOST_CONFIG_CMD"].startswith("python3 -c ")
+
+
+def test_start_host_omits_host_config_cmd_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No host_config → no OMNIGENT_HOST_CONFIG_CMD in the payload (and no
+    16 KB budget spent on it)."""
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    launcher.start_host(
+        "managed-abc",
+        token="tok",
+        host_id="host_x",
+        host_name="managed-x",
+        server_url="https://srv.example.com",
+    )
+    env = json.loads(client.run_calls[0]["runHookPayload"])
+    assert "OMNIGENT_HOST_CONFIG_CMD" not in env
+
+
 def test_start_host_threads_repo_env_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
     """A repo workspace is passed to the image entrypoint via the /run payload."""
     client = _FakeMicroVMClient()
@@ -479,14 +519,14 @@ def test_terminate_raises_on_real_error(monkeypatch: pytest.MonkeyPatch) -> None
         launcher.terminate("microvm-run-42")
 
 
-def test_run_is_unsupported() -> None:
-    """No exec transport: run raises a capability error (host is the entrypoint)."""
+def test_no_exec_transport() -> None:
+    """Entrypoint-as-host: the launcher inherits SandboxHostLauncher directly
+    (like Kubernetes) and carries NO exec transport — there is no run()."""
     launcher = LambdaMicroVMSandboxLauncher(
         image_identifier="omnigent-host",
         execution_role_arn="arn:aws:iam::123456789012:role/x",
     )
-    with pytest.raises(SandboxCapabilityError):
-        launcher.run("microvm-1", "echo hi")
+    assert not hasattr(launcher, "run")
 
 
 # ── config resolution (no client) ──────────────────────────

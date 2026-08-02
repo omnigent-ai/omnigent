@@ -2217,7 +2217,7 @@ def _lambda_microvm_launcher_factory(
     execution_role_arn: str | None,
     env: list[str] | None,
     egress_network_connectors: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: lambda_microvm`` path.
 
@@ -2240,7 +2240,7 @@ def _lambda_microvm_launcher_factory(
     :returns: A factory producing parameterized Lambda MicroVM launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Lambda MicroVM launcher (lazy boto3 import inside)."""
         from omnigent.onboarding.sandboxes.lambda_microvm import LambdaMicroVMSandboxLauncher
 

@@ -64,8 +64,8 @@ from omnigent.host.identity import (
     HOST_TOKEN_ENV_VAR,
 )
 from omnigent.onboarding.sandboxes.base import (
-    RemoteCommandResult,
-    SandboxLauncher,
+    SandboxHostLauncher,
+    render_host_config_write_command,
 )
 
 if TYPE_CHECKING:
@@ -412,15 +412,17 @@ def _ensure_sdk() -> None:
         )
 
 
-class LambdaMicroVMSandboxLauncher(SandboxLauncher):
+class LambdaMicroVMSandboxLauncher(SandboxHostLauncher):
     """
-    :class:`SandboxLauncher` for AWS Lambda MicroVMs.
+    :class:`SandboxHostLauncher` for AWS Lambda MicroVMs.
 
-    Server-managed only and entrypoint-as-host: :meth:`provision` reserves a
-    MicroVM name, :meth:`start_host` calls ``run-microvm`` on a prebuilt image
-    whose command runs ``omnigent host``, :meth:`resume` thaws a suspended VM,
-    and :meth:`terminate` calls ``terminate-microvm``. All transport rides the
-    ``lambda-microvms`` boto3 client, created lazily and cached.
+    Server-managed only and entrypoint-as-host (like Kubernetes, this inherits
+    :class:`SandboxHostLauncher` directly — no exec transport): :meth:`provision`
+    reserves a MicroVM name, :meth:`start_host` calls ``run-microvm`` on a
+    prebuilt image whose command runs ``omnigent host``, :meth:`resume` thaws a
+    suspended VM, and :meth:`terminate` calls ``terminate-microvm``. All
+    transport rides the ``lambda-microvms`` boto3 client, created lazily and
+    cached.
     """
 
     provider: ClassVar[str] = "lambda_microvm"
@@ -626,6 +628,7 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -670,6 +673,13 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
             workspace.
         :param repo_branch: Branch to clone, or ``None`` for the default branch.
         :param repo_name: Directory the clone lands in, or ``None``.
+        :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
+            content. Delivered through the /run payload as
+            ``OMNIGENT_HOST_CONFIG_CMD`` — the shared
+            :func:`~omnigent.onboarding.sandboxes.base.
+            render_host_config_write_command` command, which ``start_host.sh``
+            executes before starting the host (there is no exec transport to
+            run it from here). Counts against the payload's 16 KB cap.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_name* is set).
@@ -689,6 +699,14 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
                 env_literals["OMNIGENT_REPO_BRANCH"] = repo_branch
             if repo_name is not None:
                 env_literals["OMNIGENT_REPO_NAME"] = repo_name
+        if host_config is not None:
+            # No exec transport exists to install the config from here, so the
+            # rendered (shared, marker-aware) write command rides the payload
+            # and start_host.sh runs it before starting the host.
+            env_literals = {
+                **env_literals,
+                "OMNIGENT_HOST_CONFIG_CMD": render_host_config_write_command(host_config),
+            }
         if on_stage is not None:
             on_stage("starting")
         kwargs = build_run_microvm_kwargs(
@@ -814,17 +832,3 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
             raise click.ClickException(
                 f"Could not terminate Lambda MicroVM '{sandbox_id}': {exc}"
             ) from exc
-
-    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
-        """
-        Unsupported: the host runs as the MicroVM's entrypoint, so there is no
-        exec-in transport.
-
-        :param sandbox_id: Unused.
-        :param command: Unused.
-        :param check: Unused.
-        :raises SandboxCapabilityError: Always.
-        """
-        raise self._capability_error(
-            "run a command via exec — the host runs as the MicroVM entrypoint"
-        )
