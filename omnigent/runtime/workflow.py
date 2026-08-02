@@ -32,7 +32,7 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.env_credentials import expand_envvars_with_omnigent_prefix
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, ProviderCredentialError
 from omnigent.llms import Client as LLMClient
 from omnigent.model_catalog import resolve_catalog_model
 from omnigent.model_resolver import ModelResolutionError
@@ -822,7 +822,7 @@ def _optional_provider_family(entry: ProviderEntry, family_name: str) -> FamilyC
     """
     try:
         return entry.family(family_name)
-    except OmnigentError:
+    except ProviderCredentialError:
         return None
 
 

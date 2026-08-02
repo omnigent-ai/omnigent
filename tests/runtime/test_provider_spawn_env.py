@@ -520,6 +520,61 @@ def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:
     assert env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] == "responses"
 
 
+def test_pi_resolves_env_api_key_ref_through_spawn_path(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi resolves an ``env:`` credential when reached through the runner."""
+    monkeypatch.setenv("MY_TOKEN", "token-from-env")
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "my-gateway": {
+                    "kind": "gateway",
+                    "default": "pi",
+                    "openai": {
+                        "api_key_ref": "env:MY_TOKEN",
+                        "base_url": "https://example.com/v1",
+                        "models": {"default": "some-model-id"},
+                    },
+                }
+            }
+        },
+    )
+
+    env = _build_pi_spawn_env(_make_spec(harness="pi"), workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY"] == "true"
+    assert env["HARNESS_PI_GATEWAY_BASE_URLS"] == '{"openai": "https://example.com/v1"}'
+    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s token-from-env"
+    assert env["HARNESS_PI_MODEL"] == "some-model-id"
+
+
+def test_pi_does_not_hide_non_credential_provider_errors(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi must not turn malformed family resolution into a generic auth error."""
+    monkeypatch.setenv("MY_TOKEN", "token-from-env")
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "my-gateway": {
+                    "kind": "gateway",
+                    "default": "pi",
+                    "openai": {
+                        "api_key_ref": "env:MY_TOKEN",
+                        "base_url": "$MISSING_BASE_URL",
+                    },
+                }
+            }
+        },
+    )
+
+    with pytest.raises(Exception, match="MISSING_BASE_URL"):
+        _build_pi_spawn_env(_make_spec(harness="pi"), workdir=None)
+
+
 # ── Named ProviderAuth selection ───────────────────────────────────────────
 
 

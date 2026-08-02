@@ -115,6 +115,14 @@ class OmnigentError(Exception):
         return _CODE_TO_HTTP_STATUS.get(self.code, 500)
 
 
+class ProviderCredentialError(OmnigentError):
+    """A configured provider credential cannot currently be resolved.
+
+    This is distinct from other provider/configuration errors so multi-family
+    harnesses can skip an unconfigured family without hiding malformed config.
+    """
+
+
 class ElicitationDeclinedError(Exception):
     """Raised when a user explicitly declines an elicitation (action == "decline").
 

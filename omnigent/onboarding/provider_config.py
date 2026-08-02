@@ -53,7 +53,7 @@ from omnigent.env_credentials import (
     getenv_with_omnigent_prefix,
     omnigent_prefixed_env_name,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, ProviderCredentialError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.spec.parser import check_unresolved_env_vars
 
@@ -450,7 +450,7 @@ def resolve_secret(ref: str) -> str:
 
         value = secrets.load_secret(name)
         if value is None:
-            raise OmnigentError(
+            raise ProviderCredentialError(
                 f"no stored secret named {name!r}; run "
                 "`omnigent setup --no-internal-beta` to set it.",
                 code=ErrorCode.INVALID_INPUT,
@@ -462,7 +462,7 @@ def resolve_secret(ref: str) -> str:
         if resolved is None:
             prefixed = omnigent_prefixed_env_name(var)
             fallback = f" or ${prefixed}" if prefixed != var else ""
-            raise OmnigentError(
+            raise ProviderCredentialError(
                 f"Unresolved environment variable '${var}' referenced by "
                 f"'env:{var}'. Set ${var}{fallback} in the environment.",
                 code=ErrorCode.INVALID_INPUT,
