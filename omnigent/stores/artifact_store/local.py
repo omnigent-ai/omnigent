@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from omnigent.stores.artifact_store import ArtifactStore
+
+
+def _io_path(path: Path) -> Path:
+    """Return a Windows extended-length path for filesystem I/O."""
+    if os.name != "nt":
+        return path
+    raw_path = str(path)
+    if raw_path.startswith("\\\\?\\"):
+        return path
+    if raw_path.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + raw_path[2:])
+    return Path("\\\\?\\" + raw_path)
 
 
 class LocalArtifactStore(ArtifactStore):
@@ -80,7 +93,7 @@ class LocalArtifactStore(ArtifactStore):
             e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
         :param data: Raw bytes to write.
         """
-        path = self._resolve(key)
+        path = _io_path(self._resolve(key))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
@@ -93,7 +106,7 @@ class LocalArtifactStore(ArtifactStore):
         :returns: The raw bytes of the file.
         :raises KeyError: If no file exists at the resolved path.
         """
-        path = self._resolve(key)
+        path = _io_path(self._resolve(key))
         if not path.exists():
             raise KeyError(key)
         return path.read_bytes()
@@ -106,7 +119,7 @@ class LocalArtifactStore(ArtifactStore):
         :param key: Forward-slash-separated artifact key,
             e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
         """
-        path = self._resolve(key)
+        path = _io_path(self._resolve(key))
         if path.exists():
             path.unlink()
 
@@ -118,4 +131,4 @@ class LocalArtifactStore(ArtifactStore):
             e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
         :returns: ``True`` if the file exists, ``False`` otherwise.
         """
-        return self._resolve(key).exists()
+        return _io_path(self._resolve(key)).exists()

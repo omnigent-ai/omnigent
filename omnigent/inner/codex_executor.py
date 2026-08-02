@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent import model_catalog
-from omnigent._platform import resolve_cli_binary
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -1260,6 +1260,23 @@ def _dynamic_tool_result_payload(result: CodexToolResult) -> CodexParams:
     }
 
 
+def _default_model_from_codex_list(response: CodexMessage) -> str:
+    """Return Codex's live default model from a ``model/list`` response."""
+    result = response.get("result")
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, list):
+        raise RuntimeError("Codex model/list response did not contain a model list")
+    models = [item for item in data if isinstance(item, dict)]
+    preferred = next((item for item in models if item.get("isDefault") is True), None)
+    if preferred is None and models:
+        preferred = models[0]
+    if preferred is not None:
+        raw_model = preferred.get("model") or preferred.get("id")
+        if isinstance(raw_model, str) and raw_model:
+            return raw_model
+    raise RuntimeError("Codex model/list response did not contain a usable default model")
+
+
 @dataclass
 class _PendingToolResult:
     """Tracks a dynamic tool invocation pending a Codex result event.
@@ -1317,6 +1334,7 @@ class _CodexAppServerSession:
         # a fresh thread so it is re-sent. ``turn/start`` carries no ``effort``
         # field (it is silently dropped), hence the separate settings update.
         self._applied_effort: str | None = None
+        self._resolved_default_model: str | None = None
         self._recent_stderr: list[str] = []
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
@@ -1333,7 +1351,7 @@ class _CodexAppServerSession:
             return
         self._loop = asyncio.get_running_loop()
         codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd and self._cwd != "/":
+        if not IS_WINDOWS and self._cwd and self._cwd != "/":
             try:
                 codex_home_root = Path(self._cwd) / ".codex-tmp"
                 codex_home_root.mkdir(parents=True, exist_ok=True)
@@ -1419,6 +1437,7 @@ class _CodexAppServerSession:
             self._loop = None
             self.thread_id = None
             self.active_turn_id = None
+            self._resolved_default_model = None
             self._cleanup_process_cwd()
             return
 
@@ -1455,6 +1474,7 @@ class _CodexAppServerSession:
         self._loop = None
         self.thread_id = None
         self.active_turn_id = None
+        self._resolved_default_model = None
         self._recent_events.clear()
         self._cleanup_process_cwd()
 
@@ -1557,13 +1577,20 @@ class _CodexAppServerSession:
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-        model: str,
+        model: str | None,
         cwd: str,
         sandbox: str,
         reasoning_effort: str | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
+
+        if model is None:
+            if self._resolved_default_model is None:
+                self._resolved_default_model = _default_model_from_codex_list(
+                    await self._request("model/list", {"includeHidden": False})
+                )
+            model = self._resolved_default_model
 
         is_new_thread = self.thread_id is None
         if is_new_thread:
@@ -2117,6 +2144,19 @@ class _CodexAppServerSession:
             raise
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error  # pragma: no cover - defensive
             logger.debug("Codex App Server reader loop ended: %s", exc)
+        finally:
+            if self._pending_requests:
+                stderr_detail = "; ".join(self._recent_stderr[-3:])
+                returncode = self._proc.returncode
+                detail = f" (exit code {returncode})" if returncode is not None else ""
+                if stderr_detail:
+                    detail += f": {stderr_detail}"
+                error = RuntimeError(f"Codex App Server closed before replying{detail or '.'}")
+                pending = list(self._pending_requests.values())
+                self._pending_requests.clear()
+                for future in pending:
+                    if not future.done():
+                        future.set_exception(error)
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
@@ -2138,7 +2178,7 @@ class _CodexAppServerSession:
 @dataclass
 class _CodexSessionState:
     app_session: _CodexAppServerSession | None = None
-    signature: tuple[str, str, str, str] | None = None
+    signature: tuple[str | None, str, str, str] | None = None
 
 
 class _AppSessionFactory(Protocol):
@@ -2486,7 +2526,7 @@ class CodexExecutor(Executor):
         self,
         state: _CodexSessionState,
         *,
-        signature: tuple[str, str, str, str],
+        signature: tuple[str | None, str, str, str],
         effective_cwd: str,
     ) -> _CodexAppServerSession:
         if state.signature == signature and state.app_session is not None:
@@ -2520,7 +2560,7 @@ class CodexExecutor(Executor):
         # cfg.model (per-request /model override) wins over the spec default.
         # An unresolved default comes from the active provider catalog.
         model = cfg.model or self._model_override
-        if model is None:
+        if model is None and self._gateway:
             provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
             resolution = await run_sync_on_thread(
                 model_catalog.resolve_catalog_model,

@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 from omnigent.host.frames import HostStatFrame, encode_host_frame
@@ -149,15 +150,26 @@ def _is_relative_cwd(spec_cwd: str | None) -> bool:
     return False
 
 
+def _is_windows_absolute_host_path(path: str) -> bool:
+    """Return whether *path* is absolute under Windows path semantics."""
+    return PureWindowsPath(path).is_absolute()
+
+
+def _is_absolute_host_path(path: str) -> bool:
+    """Return whether *path* is absolute under POSIX or Windows semantics."""
+    return PurePosixPath(path).is_absolute() or _is_windows_absolute_host_path(path)
+
+
 def _is_subpath_of(canonical_workspace: str, canonical_boundary: str) -> bool:
     """
     Return ``True`` when ``canonical_workspace`` equals the
     boundary or is a subdirectory of it.
 
-    Pure string comparison on canonicalized absolute paths — both
-    inputs are realpaths returned by ``host.stat``, so symlinks
-    are already resolved and ``..`` segments are gone. Without the
-    canonicalization step, this comparison would be unsafe.
+    Uses the matching POSIX or Windows pure-path semantics for both
+    canonicalized absolute paths. Both inputs are realpaths returned
+    by ``host.stat``, so symlinks are already resolved and ``..``
+    segments are gone. Without the canonicalization step, this
+    comparison would be unsafe.
 
     :param canonical_workspace: Realpath returned by host.stat for
         the workspace, e.g. ``"/Users/corey/universe/src/foo"``.
@@ -166,16 +178,14 @@ def _is_subpath_of(canonical_workspace: str, canonical_boundary: str) -> bool:
     :returns: ``True`` when the workspace is the boundary or
         nested under it.
     """
-    if canonical_workspace == canonical_boundary:
-        return True
-    # Add a trailing separator so ``/a/foo`` is not treated as a
-    # subpath of ``/a/fo`` (prefix collision). ``/`` is the only
-    # separator the host stat returns since ``canonical_path`` is
-    # always absolute.
-    boundary_with_sep = (
-        canonical_boundary if canonical_boundary.endswith("/") else canonical_boundary + "/"
-    )
-    return canonical_workspace.startswith(boundary_with_sep)
+    workspace_is_windows = _is_windows_absolute_host_path(canonical_workspace)
+    boundary_is_windows = _is_windows_absolute_host_path(canonical_boundary)
+    if workspace_is_windows != boundary_is_windows:
+        return False
+    path_cls = PureWindowsPath if workspace_is_windows else PurePosixPath
+    workspace_path = path_cls(canonical_workspace)
+    boundary_path = path_cls(canonical_boundary)
+    return workspace_path == boundary_path or boundary_path in workspace_path.parents
 
 
 async def validate_workspace(
@@ -199,8 +209,9 @@ async def validate_workspace(
     :param host_id: Target host's stable id, e.g.
         ``"host_a1b2c3d4..."``.
     :param workspace: User-supplied absolute path on the host, e.g.
-        ``"/Users/corey/universe/src/foo"``. Tilde-prefixed and
-        relative paths are rejected upstream by the request schema.
+        ``"/Users/corey/universe/src/foo"`` or
+        ``"C:\\Users\\corey\\universe\\src\\foo"``. Tilde-prefixed
+        and relative paths are rejected upstream by the request schema.
     :param spec_cwd: Value of the bound agent's ``os_env.cwd``
         from its YAML (or ``None`` when the agent has no os_env
         block). Drives boundary computation.
@@ -214,11 +225,11 @@ async def validate_workspace(
         The exception message is suitable for surfacing to the
         API caller verbatim.
     """
-    if not workspace.startswith("/"):
+    if not _is_absolute_host_path(workspace):
         # Belt-and-suspenders. The Pydantic schema layer also
         # rejects this; pin it here so direct callers (tests,
         # other server-internal paths) can't bypass.
-        raise WorkspaceValidationError("workspace must be an absolute path starting with /")
+        raise WorkspaceValidationError("workspace must be an absolute path on the host")
 
     display_host = host_name_for_errors or host_id
 
@@ -293,7 +304,12 @@ async def validate_workspace(
         # Build under the canonical workspace so any symlinks in the
         # picked path are already resolved — without that, a user
         # whose workspace is a symlink could fool the existence check.
-        subdir_path = canonical_workspace.rstrip("/") + "/" + subdir
+        path_cls = (
+            PureWindowsPath
+            if _is_windows_absolute_host_path(canonical_workspace)
+            else PurePosixPath
+        )
+        subdir_path = str(path_cls(canonical_workspace) / subdir)
         subdir_stat = await _ask_host_stat(
             host_registry=host_registry,
             host_conn=host_conn,

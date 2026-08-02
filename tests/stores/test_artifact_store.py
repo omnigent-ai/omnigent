@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -18,6 +20,20 @@ def store(tmp_path):
 def test_put_and_get(store):
     store.put("abc123", b"hello world")
     assert store.get("abc123") == b"hello world"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows long-path regression")
+def test_windows_extended_length_artifact_round_trip(store):
+    """Verify artifact I/O works when the resolved path exceeds MAX_PATH."""
+    key = f"{'a' * 100}/{'b' * 100}/{'c' * 100}"
+    assert len(str(store._resolve(key))) > 260
+
+    store.put(key, b"long-path-data")
+
+    assert store.exists(key)
+    assert store.get(key) == b"long-path-data"
+    store.delete(key)
+    assert not store.exists(key)
 
 
 def test_put_overwrites(store):

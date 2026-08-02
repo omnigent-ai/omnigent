@@ -70,7 +70,11 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
-from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import (
+    HostIdentity,
+    host_identity_config_path,
+    load_or_create_host_identity,
+)
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -304,6 +308,15 @@ def _url_is_loopback(url: str) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 10.0
 _RECONNECT_JITTER = 0.5
+
+
+def _console_safe_text(text: str) -> str:
+    """Return text encodable by the active stdout stream."""
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return text
+    return text.encode(encoding, errors="replace").decode(encoding)
+
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -2452,12 +2465,12 @@ class HostProcess:
         # success line after the noisy ``databricks.sdk`` warnings —
         # otherwise the terminal goes silent after auth and there's no
         # signal the WS handshake actually completed.
-        print(
+        connected_message = (
             f"✓ Connected as {self._identity.name!r} "
             f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
-            "Listening for sessions — Ctrl-C to disconnect.",
-            flush=True,
+            "Listening for sessions — Ctrl-C to disconnect."
         )
+        print(_console_safe_text(connected_message), flush=True)
 
         loop = asyncio.get_running_loop()
         next_quick_refresh = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
@@ -2622,9 +2635,7 @@ def run_host_process(
 
     telemetry.init("omni-host")
 
-    from omnigent.host.identity import CONFIG_PATH
-
-    path = config_path or CONFIG_PATH
+    path = config_path or host_identity_config_path()
     identity = load_or_create_host_identity(path)
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")

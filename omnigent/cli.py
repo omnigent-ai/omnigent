@@ -67,7 +67,7 @@ from omnigent.host.local_server import (
 from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
-from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
+from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir
 
 if TYPE_CHECKING:
     import socket
@@ -1955,7 +1955,12 @@ def _runner_loopback_host(host: str) -> str:
     return "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
 
 
-_HOST_PID_PATH = Path.home() / ".omnigent" / "host.pid"
+_HOST_PID_PATH: Path | None = None
+
+
+def _host_pid_path() -> Path:
+    """Return the daemon pidfile path, honoring ``OMNIGENT_DATA_DIR``."""
+    return _HOST_PID_PATH or data_dir() / "host.pid"
 
 
 # host.pid records the daemon PID + the "target" it serves: a normalized
@@ -2159,7 +2164,7 @@ def _daemon_registry_dir() -> Path:
     :returns: Registry directory path, e.g.
         ``Path("~/.omnigent/daemons")``.
     """
-    return _HOST_PID_PATH.parent / "daemons"
+    return _host_pid_path().parent / "daemons"
 
 
 def _daemon_record_path(target: str) -> Path:
@@ -2265,7 +2270,7 @@ def _delete_daemon_record(record: _HostDaemonRecord) -> None:
     legacy = _read_host_pid_file()
     if legacy is not None and legacy[1] == record.target:
         with contextlib.suppress(OSError):
-            _HOST_PID_PATH.unlink()
+            _host_pid_path().unlink()
 
 
 def _legacy_daemon_record() -> _HostDaemonRecord | None:
@@ -2607,7 +2612,7 @@ def _persist_spawned_daemon(
             config_sig=config_sig,
         )
     )
-    _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+    _host_pid_path().write_text(f"{spawned.pid}\n{target}\n")
 
 
 def _foreground_daemon_record(
@@ -2725,10 +2730,10 @@ def _load_or_create_host_id() -> str | None:
     host_id = _load_existing_host_id()
     if host_id is not None:
         return host_id
-    from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
+    from omnigent.host.identity import load_or_create_host_identity
 
     try:
-        return load_or_create_host_identity(CONFIG_PATH).host_id
+        return load_or_create_host_identity().host_id
     except OSError:
         return None
 
@@ -2752,7 +2757,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
         return False
 
-    _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _host_pid_path().parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
     args = [sys.executable, "-m", "omnigent.host._daemon_entry", *mode_args]
     spawned = _spawn_host_daemon_process(
@@ -2824,10 +2829,11 @@ def _read_host_pid_file() -> tuple[int, str] | None:
 
     :returns: ``(pid, server_url)`` if well-formed, ``None`` otherwise.
     """
-    if not _HOST_PID_PATH.exists():
+    host_pid_path = _host_pid_path()
+    if not host_pid_path.exists():
         return None
     try:
-        lines = _HOST_PID_PATH.read_text().strip().splitlines()
+        lines = host_pid_path.read_text().strip().splitlines()
         if len(lines) < 2:
             return None
         return int(lines[0]), lines[1]

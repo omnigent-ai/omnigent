@@ -181,6 +181,24 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
+def test_real_builders_keep_windows_process_runtime(monkeypatch):
+    """Windows Node launchers need these non-secret process variables."""
+    windows_runtime = {
+        "SYSTEMROOT": r"C:\Windows",
+        "SYSTEMDRIVE": "C:",
+        "WINDIR": r"C:\Windows",
+        "COMSPEC": r"C:\Windows\System32\cmd.exe",
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        "USERPROFILE": r"C:\Users\test",
+        "APPDATA": r"C:\Users\test\AppData\Roaming",
+        "LOCALAPPDATA": r"C:\Users\test\AppData\Local",
+    }
+    monkeypatch.setattr("os.environ", windows_runtime)
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert all(env.get(name) == value for name, value in windows_runtime.items()), harness
+
+
 @pytest.mark.parametrize("harness", sorted(HARNESS_PREFIXES))
 def test_no_harness_inherits_unrelated_secrets(harness, hostile_env):
     env = clean_agent_env(allow_prefixes=HARNESS_PREFIXES[harness], source=hostile_env)

@@ -19,6 +19,7 @@ from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     _build_runner_env,
+    _console_safe_text,
     _RunnerHandle,
     run_host_process,
 )
@@ -61,6 +62,15 @@ from omnigent.runner.identity import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_console_safe_text_replaces_unencodable_status_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Windows code-page stdout must not crash the host after handshake."""
+    monkeypatch.setattr("omnigent.host.connect.sys.stdout", SimpleNamespace(encoding="cp1252"))
+
+    assert _console_safe_text("✓ Connected") == "? Connected"
 
 
 async def test_handle_model_options_uses_host_claude_configuration(

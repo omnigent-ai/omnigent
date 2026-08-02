@@ -33,6 +33,17 @@ def test_create_identity_when_no_config(tmp_path: Path) -> None:
     assert identity.name == socket.gethostname()
 
 
+def test_default_identity_path_honors_config_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The implicit identity path must respect ``OMNIGENT_CONFIG_HOME``."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    load_or_create_host_identity()
+
+    assert (tmp_path / "config.yaml").exists()
+
+
 def test_load_existing_identity(tmp_path: Path) -> None:
     """
     Verify that load_or_create reads the host section from an

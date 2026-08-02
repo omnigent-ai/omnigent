@@ -47,6 +47,19 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
     {
         "HOME",
         "PATH",
+        # Windows process-runtime essentials. Node-based CLI launchers can
+        # abort during cryptographic RNG initialization when SYSTEMROOT is
+        # stripped, while COMSPEC/PATHEXT are required for .cmd shims.
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        # These three are jointly required by the Windows Codex/Node launcher;
+        # with any one omitted it exits cleanly before its JSON-RPC handshake.
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
         "TERM",
         "TMPDIR",
         "TMP",

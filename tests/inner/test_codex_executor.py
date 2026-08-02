@@ -20,6 +20,7 @@ from omnigent.inner.codex_executor import (
     _codex_cli_version,
     _CodexAppServerSession,
     _databricks_codex_config_overrides,
+    _default_model_from_codex_list,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
     _prompt_for_turn,
@@ -413,7 +414,7 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[2], ToolCallComplete)
             self.assertIsInstance(events[3], TurnComplete)
             self.assertEqual(fake_session.calls[0]["system_prompt"], "Be helpful.")
-            self.assertEqual(fake_session.calls[0]["model"], "catalog-openai-openai-default")
+            self.assertIsNone(fake_session.calls[0]["model"])
             self.assertEqual(fake_session.calls[0]["tools"][0]["name"], "calculate")
 
         _run(_t())
@@ -1790,6 +1791,89 @@ class TestCodexExecutor(unittest.TestCase):
 # two codex app-server failure paths. Kept outside the unittest class
 # above to comply with the project-wide function-based test rule —
 # the class-style tests above pre-date that rule.
+
+
+async def test_reader_eof_fails_pending_request_immediately() -> None:
+    """A dead app-server must not strand initialize until the turn watchdog."""
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    proc = _FakeProcess()
+    proc.returncode = 134
+    session._proc = proc
+    future = asyncio.get_running_loop().create_future()
+    session._pending_requests[1] = future
+    session._recent_stderr.append("Node CSPRNG initialization failed")
+
+    await session._reader_loop()
+
+    with pytest.raises(RuntimeError, match=r"exit code 134.*CSPRNG"):
+        await future
+
+
+def test_default_model_uses_codex_live_catalog_default() -> None:
+    """Subscription turns must use Codex's account-compatible default id."""
+    response = {
+        "result": {
+            "data": [
+                {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True},
+                {"id": "gpt-5.4", "model": "gpt-5.4", "isDefault": False},
+            ]
+        }
+    }
+
+    assert _default_model_from_codex_list(response) == "gpt-5.6-sol"
+
+
+async def test_windows_private_codex_home_stays_outside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows executor infrastructure must not write into a read-only workspace."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir()
+    captured_env: dict[str, str] = {}
+    fake_proc = _FakeProcess()
+
+    async def _fake_create_subprocess_exec(*args: object, **kwargs: object) -> _FakeProcess:
+        captured_env.update(kwargs["env"])  # type: ignore[arg-type]
+        return fake_proc
+
+    monkeypatch.setattr("omnigent.inner.codex_executor.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.tempfile.gettempdir", lambda: str(temp_root)
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._create_subprocess_exec",
+        _fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._populate_codex_home_config",
+        lambda *args: None,
+    )
+    session = _CodexAppServerSession(
+        codex_path="codex",
+        cwd=str(workspace),
+        env={},
+        tool_executor=None,
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+
+    await session.start()
+    try:
+        codex_home = Path(captured_env["CODEX_HOME"])
+        assert codex_home.parent == temp_root
+        assert not (workspace / ".codex-tmp").exists()
+    finally:
+        await session.close()
 
 
 async def test_run_turn_turn_failed_emits_retryable_executor_error() -> None:

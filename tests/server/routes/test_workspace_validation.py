@@ -268,6 +268,23 @@ async def test_relative_cwd_skips_boundary_check(
     assert canonical == "/tmp/scratch"
 
 
+async def test_windows_workspace_with_relative_cwd_accepted(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """Verify a Windows absolute workspace reaches host validation."""
+    registry, _, _ = host_setup
+    workspace = "C:\\projects\\active\\fixture"
+    _set_stat(registry, workspace, canonical=workspace)
+
+    canonical = await validate_workspace(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        workspace=workspace,
+        spec_cwd=".",
+    )
+    assert canonical == workspace
+
+
 # ── Steps 2/3/5: boundary check ─────────────────────────
 
 
