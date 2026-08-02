@@ -192,6 +192,7 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "cost_budget",
     }
@@ -220,7 +221,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
     Per design D.4 the runtime harness override is allowlist-gated: the
     schema exposes ``harness`` only when at least one declared sub-agent
     declares a non-empty ``executor.config.allowed_harnesses``. A sub-agent
-    without that opt-in keeps the base ``{input, purpose, model, file_ids}``
+    without that opt-in keeps the base ``{input, purpose, model, reasoning_effort, file_ids}``
     args object, so the orchestrator never sees a harness knob it cannot use.
     This mirrors the per-child dispatch guard in tool_dispatch.py — the two
     gates must agree on what "opted in" means.
@@ -233,6 +234,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "cost_budget",
     }
@@ -257,6 +259,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "harness",
         "cost_budget",
@@ -283,6 +286,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "harness",
         "cost_budget",
