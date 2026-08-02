@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +32,7 @@ from omnigent.inner.databricks_genie_executor import (
     _extract_text,
     _latest_user_text,
     _md_cell,
+    _output_payload,
     _parse_arguments,
     _reasoning_text,
     _render_table,
@@ -230,12 +232,15 @@ def test_first_turn_maps_every_item_kind_to_its_event() -> None:
 
     assert [type(e).__name__ for e in events] == [
         "ReasoningChunk",
+        "ReasoningChunk",
         "ToolCallRequest",
         "ToolCallComplete",
         "TextChunk",
         "TurnComplete",
     ]
-    reasoning = next(e for e in events if isinstance(e, ReasoningChunk))
+    anchor, reasoning = (e for e in events if isinstance(e, ReasoningChunk))
+    assert anchor.delta == ""
+    assert anchor.event_type == "reasoning_started"
     assert reasoning.delta == "Plan it."
     assert reasoning.event_type == "reasoning_text"
     assert _response(events) == "One row."
@@ -313,6 +318,45 @@ def test_conversation_id_is_captured_from_response_completed() -> None:
 
     assert "conversation_id" not in client.responses.calls[0].get("extra_body", {})
     assert client.responses.calls[1]["extra_body"]["conversation_id"] == "conv-late"
+
+
+def test_each_reasoning_item_opens_its_own_block() -> None:
+    """Genie plans before every SQL call; adjacent items must not run together.
+
+    The ``reasoning_started`` anchor before each item's text is what lets the
+    web reducer separate consecutive blocks instead of gluing sentences.
+    """
+    client = FakeClient(
+        [
+            _item_done(FakeReasoningItem(content=[{"text": "Check the tables."}])),
+            _item_done(FakeReasoningItem(content=[{"text": "Aggregate by region."}])),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    reasoning = [e for e in events if isinstance(e, ReasoningChunk)]
+    assert [(e.event_type, e.delta) for e in reasoning] == [
+        ("reasoning_started", ""),
+        ("reasoning_text", "Check the tables."),
+        ("reasoning_started", ""),
+        ("reasoning_text", "Aggregate by region."),
+    ]
+
+
+def test_whitespace_only_reasoning_emits_no_chunk() -> None:
+    """A formatting-artifact item must not open a visually empty reasoning block."""
+    client = FakeClient(
+        [
+            _item_done(FakeReasoningItem(content=[{"text": "  \n"}])),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == ["TurnComplete"]
 
 
 def test_enable_viz_is_sent_only_when_enabled() -> None:
@@ -688,6 +732,59 @@ def test_parse_arguments_never_silently_drops_a_present_value(
     assert _parse_arguments(raw) == expected
 
 
+def test_call_with_item_id_but_no_call_id_correlates_by_that_id() -> None:
+    """The wire's ``id`` is the fallback correlation key when ``call_id`` is absent."""
+    client = FakeClient(
+        [
+            _item_done({"type": "function_call", "id": "fc_9", "arguments": "{}"}),
+            _item_done({"type": "function_call_output", "call_id": "fc_9", "output": "ok"}),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    request = next(e for e in events if isinstance(e, ToolCallRequest))
+    completion = next(e for e in events if isinstance(e, ToolCallComplete))
+    assert request.metadata["call_id"] == "fc_9"
+    assert completion.metadata["call_id"] == "fc_9"
+    assert completion.result == "ok"
+
+
+def test_list_shaped_output_flattens_to_its_text() -> None:
+    """A parts-list ``output`` renders as the query result, not a parts dump."""
+    client = FakeClient(
+        [
+            _item_done(FakeFunctionCallItem(call_id="c1")),
+            _item_done(
+                {
+                    "type": "function_call_output",
+                    "call_id": "c1",
+                    "output": [
+                        {"type": "input_text", "text": "42 "},
+                        {"type": "input_text", "text": "rows"},
+                    ],
+                }
+            ),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    completion = next(e for e in events if isinstance(e, ToolCallComplete))
+    assert completion.result == "42 rows"
+
+
+def test_output_payload_keeps_text_less_values_verbatim() -> None:
+    """A payload with no extractable text (or a raw dict) passes through untouched."""
+    image_parts = [{"type": "input_image", "image_url": "u"}]
+    assert _output_payload(image_parts) is image_parts
+    raw = {"rows": 2}
+    assert _output_payload(raw) is raw
+    assert _output_payload("already text") == "already text"
+
+
 # ---------------------------------------------------------------------------
 # I/O matrix: failures and guard rails
 # ---------------------------------------------------------------------------
@@ -800,6 +897,29 @@ def test_resolved_sql_call_is_not_cancelled_when_the_stream_truncates() -> None:
     completions = [e for e in events if isinstance(e, ToolCallComplete)]
     assert [e.status for e in completions] == [ToolCallStatus.SUCCESS]
     assert [type(e).__name__ for e in events][-1] == "ExecutorError"
+
+
+def test_unresolved_sql_call_is_cancelled_when_the_turn_completes() -> None:
+    """Success must not strand a card either: an unanswered call is cancelled
+    before ``TurnComplete``, or its SQL card would spin forever on a turn that
+    looks perfectly healthy."""
+    client = FakeClient(
+        [
+            _item_done(FakeFunctionCallItem(call_id="call_x")),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == [
+        "ToolCallRequest",
+        "ToolCallComplete",
+        "TurnComplete",
+    ]
+    cancelled = events[1]
+    assert cancelled.status is ToolCallStatus.CANCELLED
+    assert cancelled.metadata["call_id"] == "call_x"
 
 
 def test_feature_disabled_404_points_at_the_beta_preview() -> None:
@@ -916,6 +1036,42 @@ def test_unknown_event_types_are_ignored() -> None:
     assert [type(e).__name__ for e in events] == ["TextChunk", "TurnComplete"]
 
 
+def test_unknown_item_types_are_dropped_without_breaking_the_turn() -> None:
+    """An unmapped output item — a viz item under ``enable_viz`` is today's
+    occupant of this branch — is skipped; the rest of the turn stays intact."""
+    client = FakeClient(
+        [
+            _item_done({"type": "visualization", "spec": {"chart": "bar"}}),
+            _item_done(_text_item(FakeTextPart(text="report"))),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client, enable_viz=True))
+
+    assert [type(e).__name__ for e in events] == ["TextChunk", "TurnComplete"]
+    assert _response(events) == "report"
+
+
+def test_non_output_text_parts_are_skipped() -> None:
+    """A message part that is not ``output_text`` (e.g. a refusal) is not report text."""
+    client = FakeClient(
+        [
+            _item_done(
+                _text_item(
+                    FakeTextPart(text="shown"),
+                    FakeTextPart(text="hidden", type="refusal"),
+                )
+            ),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert _texts(events) == ["shown"]
+
+
 # ---------------------------------------------------------------------------
 # Lazy client construction
 # ---------------------------------------------------------------------------
@@ -972,7 +1128,7 @@ def test_lazy_client_never_snapshots_a_token(_stub_databricks_auth: _FakeAuth) -
         client.close()
 
 
-def test_lazy_client_applies_the_turn_timeout_and_disables_retries(
+def test_lazy_client_applies_the_stream_idle_timeout_and_disables_retries(
     _stub_databricks_auth: _FakeAuth,
 ) -> None:
     """Genie's 409 is in the SDK's default retry set but is never retryable."""
@@ -1081,6 +1237,150 @@ def test_missing_databricks_sdk_names_the_package_and_the_extra(
     assert isinstance(events[0], ExecutorError)
     assert "databricks-sdk" in events[0].message
     assert "omnigent[databricks]" in events[0].message
+    # The setup message is self-describing and must NOT be buried behind the
+    # generic "databricks-genie request failed:" prefix.
+    assert events[0].message.startswith("the databricks-sdk package is required")
+
+
+def test_concurrent_first_turns_build_exactly_one_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two workers racing the lazy build share one client; no pool leaks.
+
+    A cancelled first turn can overlap the next turn's ``to_thread`` worker, so
+    the check-then-build must be atomic — the loser of an unguarded race would
+    leak its httpx connection pool for the process lifetime.
+    """
+    auth = _FakeAuth()
+
+    def _slow_resolve(profile: Any = None, **_: Any) -> tuple[Any, str]:
+        time.sleep(0.2)
+        return auth, "https://ws.example.com/"
+
+    monkeypatch.setattr(databricks_executor, "_resolve_databricks_auth", _slow_resolve)
+    built: list[httpx.Client] = []
+
+    class _CountingClient(httpx.Client):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(httpx, "Client", _CountingClient)
+    executor = DatabricksGenieExecutor(space_id="sp")
+
+    results: list[object] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(executor._ensure_client("sp")))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    try:
+        assert len(built) == 1
+        assert len(results) == 2
+        assert results[0] is results[1]
+    finally:
+        _run(executor.close())
+    assert all(client.is_closed for client in built)
+
+
+# ---------------------------------------------------------------------------
+# Interrupt: closing the live stream unblocks a cancelled turn
+# ---------------------------------------------------------------------------
+
+
+class _BlockingClosableStream:
+    """Iterator that replays a prefix, then blocks until :meth:`close`."""
+
+    def __init__(self, prefix: list[Any]) -> None:
+        self._items = iter(prefix)
+        self._unblock = threading.Event()
+        self.closed = False
+
+    def __iter__(self) -> _BlockingClosableStream:
+        return self
+
+    def __next__(self) -> Any:
+        for item in self._items:
+            return item
+        self._unblock.wait(timeout=5.0)
+        raise RuntimeError("stream closed" if self.closed else "stream never closed")
+
+    def close(self) -> None:
+        self.closed = True
+        self._unblock.set()
+
+
+def test_interrupt_session_with_no_active_stream_returns_false() -> None:
+    """Nothing in flight → nothing to interrupt."""
+    executor = DatabricksGenieExecutor(space_id="sp", client=FakeClient([_completed()]))
+    assert _run(executor.interrupt_session("k")) is False
+
+
+def test_interrupt_session_mid_stream_closes_the_stream_and_unblocks_the_turn() -> None:
+    """Closing the stream ends a turn parked mid-query with cancellations + one error."""
+    stream = _BlockingClosableStream(
+        [_created("conv-1"), _item_done(FakeFunctionCallItem(call_id="c1"))]
+    )
+    executor = DatabricksGenieExecutor(space_id="sp", client=FakeClient(stream))
+
+    async def _scenario() -> list[Any]:
+        events: list[Any] = []
+
+        async def _consume() -> None:
+            async for event in executor.run_turn([_user("q")], [], "SYS"):
+                events.append(event)
+
+        task = asyncio.ensure_future(_consume())
+        while not events:  # wait until the SQL call surfaced, then interrupt
+            await asyncio.sleep(0.01)
+        assert await executor.interrupt_session("k") is True
+        await asyncio.wait_for(task, timeout=5.0)
+        return events
+
+    events = _run(_scenario())
+
+    assert stream.closed
+    assert [type(e).__name__ for e in events] == [
+        "ToolCallRequest",
+        "ToolCallComplete",
+        "ExecutorError",
+    ]
+    assert events[1].status is ToolCallStatus.CANCELLED
+    assert events[1].metadata["call_id"] == "c1"
+
+
+def test_interrupt_session_twice_is_safe_and_clears_after_the_turn() -> None:
+    """Double interrupt is idempotent; a finished turn leaves nothing to close."""
+    stream = _BlockingClosableStream([_created("conv-1")])
+    executor = DatabricksGenieExecutor(space_id="sp", client=FakeClient(stream))
+
+    async def _scenario() -> None:
+        events: list[Any] = []
+
+        async def _consume() -> None:
+            async for event in executor.run_turn([_user("q")], [], "SYS"):
+                events.append(event)
+
+        task = asyncio.ensure_future(_consume())
+        while executor._active_stream is None:
+            await asyncio.sleep(0.01)
+        assert await executor.interrupt_session("k") is True
+        assert await executor.interrupt_session("k") is True
+        await asyncio.wait_for(task, timeout=5.0)
+        assert await executor.interrupt_session("k") is False
+
+    _run(_scenario())
+
+
+def test_interrupt_session_tolerates_a_stream_without_close() -> None:
+    """A close-less iterator (the test fakes' shape) must not make interrupt raise."""
+    executor = DatabricksGenieExecutor(space_id="sp", client=FakeClient([]))
+    executor._active_stream = iter([])
+    assert _run(executor.interrupt_session("k")) is True
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1427,8 @@ def test_latest_user_text_no_user_message_returns_empty() -> None:
         ({"content": [{"text": "a"}, {"text": "b"}]}, "a\nb"),  # list of parts
         ({"content": ["a", "b"]}, "a\nb"),  # list of bare strings
         ({"content": "", "summary": "fallback"}, "fallback"),  # empty → next field
+        ({"content": "  ", "summary": "fallback"}, "fallback"),  # whitespace-only too
+        ({"content": ["  "], "summary": "fallback"}, "fallback"),  # …and as parts
         ({"content": [], "text": "last resort"}, "last resort"),  # neither field → ``text``
         ({}, ""),  # nothing to show
     ],
@@ -1159,6 +1461,10 @@ def test_latest_user_text_takes_the_last_user_turn_and_joins_parts() -> None:
         ("a\nb\tc  d", "a b c d"),  # newline/tab/double-space collapse to single spaces
         ("  trim  ", "trim"),  # leading/trailing whitespace stripped
         ("a|b", r"a\|b"),  # pipe escaped so it doesn't open a column
+        # A pre-escaped pipe would otherwise become ``\\|`` — an escaped
+        # backslash before a LIVE delimiter — so backslashes escape first.
+        ("a\\|b", "a\\\\\\|b"),
+        ("C:\\*.txt", "C:\\\\*.txt"),  # a lone backslash is doubled, not swallowed
         (1200, "1200"),  # non-str coerced via str()
     ],
 )
@@ -1233,3 +1539,41 @@ def test_render_table_truncates_beyond_the_row_cap() -> None:
 def test_render_table_single_omitted_row_is_singular() -> None:
     rows = [[str(i)] for i in range(_MAX_RESULT_ROWS + 1)]
     assert "… (1 more row)" in _render_table({"columns": ["i"], "preview_rows": rows})
+
+
+def test_render_table_reports_rows_genie_previewed_away_upstream() -> None:
+    """``preview_rows`` is itself a preview: ``total_row_count`` counts the full
+    result, so a 2-row preview of a 12,000-row result must say so."""
+    metadata = {
+        "columns": ["customer"],
+        "preview_rows": [["Acme"], ["Globex"]],
+        "total_row_count": 12000,
+    }
+    assert "… (11998 more rows)" in _render_table(metadata)
+
+
+def test_render_table_with_total_matching_the_preview_adds_no_footer() -> None:
+    """A complete preview (the common case on the wire) stays footer-free."""
+    metadata = {
+        "columns": ["customer"],
+        "preview_rows": [["Acme"], ["Globex"]],
+        "total_row_count": 2,
+    }
+    assert "more row" not in _render_table(metadata)
+
+
+def test_render_table_combines_upstream_total_with_the_local_cap() -> None:
+    """Local capping and upstream truncation fold into one honest footer."""
+    rows = [[str(i)] for i in range(_MAX_RESULT_ROWS + 5)]
+    rendered = _render_table({"columns": ["i"], "preview_rows": rows, "total_row_count": 100})
+    assert f"… ({100 - _MAX_RESULT_ROWS} more rows)" in rendered
+
+
+def test_render_table_ignores_a_malformed_total_row_count() -> None:
+    """A non-int total (Beta wire drift) falls back to counting preview rows."""
+    metadata = {
+        "columns": ["c"],
+        "preview_rows": [["v"]],
+        "total_row_count": "not-a-number",
+    }
+    assert "more row" not in _render_table(metadata)

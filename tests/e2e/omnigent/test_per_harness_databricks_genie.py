@@ -45,9 +45,9 @@ _PROMPT = "Give me a one-sentence summary of what this space can answer."
 # Minimum assistant-text length proving a genuine Genie reply (not empty/error).
 _MIN_ASSISTANT_CHARS = 4
 
-# Outlast the executor's own per-turn deadline (900s) plus process startup, so a
-# slow warehouse query surfaces as the executor's actionable error rather than a
-# truncated subprocess.
+# Outlast the executor's stream idle timeout (900s of wire silence) plus process
+# startup, so a wedged stream surfaces as the executor's actionable error rather
+# than a truncated subprocess.
 _RUN_TIMEOUT_SEC = 960
 
 # Substrings in a failed run that mean "the environment isn't ready", not "the
@@ -69,7 +69,13 @@ def test_per_harness_databricks_genie_one_shot(
     :param omnigent_python: Interpreter with omnigent installed and importable.
     :param omnigent_repo_root: Cwd for the subprocess so the YAML spec resolves.
     """
-    if importlib.util.find_spec("databricks.sdk") is None:
+    try:
+        # find_spec("databricks.sdk") imports the parent package first, so a
+        # machine without the extra raises here rather than returning None.
+        databricks_sdk_missing = importlib.util.find_spec("databricks.sdk") is None
+    except ModuleNotFoundError:
+        databricks_sdk_missing = True
+    if databricks_sdk_missing:
         pytest.skip(
             "databricks-genie prerequisite missing: the 'databricks-sdk' package is "
             "not installed (install the 'databricks' extra), so no workspace "

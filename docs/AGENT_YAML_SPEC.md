@@ -187,10 +187,14 @@ Two Genie-specific knobs:
   from `executor.config`, so it belongs in a bundle spec such as
   [`examples/genie/config.yaml`](../examples/genie/config.yaml) — the
   single-file format above has no `config:` block. For a single-file spec, set
-  `HARNESS_DATABRICKS_GENIE_ENABLE_VIZ=true` in the environment instead.
-- **`HARNESS_DATABRICKS_GENIE_TIMEOUT`** overrides the per-turn HTTP deadline in
-  seconds (default `900`), which has to cover Genie planning, running real
-  warehouse queries, and writing its report.
+  `HARNESS_DATABRICKS_GENIE_ENABLE_VIZ=true` in the environment instead. The
+  chart itself renders in the Genie room — follow the citation link in the
+  answer; Omnigent's own output stays text and tables.
+- **`HARNESS_DATABRICKS_GENIE_TIMEOUT`** overrides the stream idle timeout in
+  seconds (default `900`). It bounds each silent gap in the streamed response —
+  one long warehouse query is a single gap — not the turn's total length. The
+  harness subprocess's idle watchdog (`HARNESS_TURN_TIMEOUT_S`) is sized just
+  above it automatically unless you set that variable yourself.
 
 Unlike the gateway-backed harnesses, Genie talks to the workspace directly with
 the credentials the Databricks SDK resolves from your profile — every request

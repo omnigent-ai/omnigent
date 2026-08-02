@@ -43,6 +43,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
@@ -61,6 +62,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     ToolSpec,
     TurnComplete,
+    _close_stream_quietly,
     iterate_blocking_stream,
 )
 
@@ -74,9 +76,9 @@ _logger = logging.getLogger(__name__)
 # too; this is a belt-and-braces bound on what we echo back.
 _MAX_RESULT_ROWS = 50
 
-# HTTP deadline for the streamed response. An Agent-mode turn plans, runs real
-# warehouse queries, and writes a report, so this is generous while still
-# bounding a wedged stream.
+# Idle timeout for the streamed response: bounds each silent gap between
+# stream chunks — one warehouse query can be a single long gap — not the
+# turn's total duration. Generous, while still bounding a wedged stream.
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
 # Responses API model slug for a Genie agent; which agent is selected by the
@@ -156,14 +158,16 @@ def _md_cell(value: object) -> str:
     """Sanitize a value for one GitHub-Flavored-Markdown table cell.
 
     Collapses internal whitespace (so a multi-line review stays on a single
-    table row instead of shattering the layout) and escapes pipes (so a value
-    containing ``|`` doesn't open a spurious column).
+    table row instead of shattering the layout) and escapes backslashes and
+    pipes (so a value containing ``|`` — or ``\\|``, which would otherwise
+    become an escaped backslash before a live delimiter — doesn't open a
+    spurious column).
 
     :param value: A raw cell value; ``None`` renders as an empty cell.
     :returns: A single-line, pipe-safe cell string.
     """
     text = "" if value is None else str(value)
-    return re.sub(r"\s+", " ", text).strip().replace("|", r"\|")
+    return re.sub(r"\s+", " ", text).strip().replace("\\", "\\\\").replace("|", r"\|")
 
 
 def _get(node: object, name: str) -> object:
@@ -217,7 +221,9 @@ def _render_table(metadata: object) -> str:
     Emits a ``| col | col |`` header, a ``| --- | --- |`` delimiter row, and one
     ``| ... |`` line per row — the form the web UI renders as an HTML table.
     Cells are sanitized via :func:`_md_cell`; rows beyond
-    :data:`_MAX_RESULT_ROWS` are summarized rather than printed.
+    :data:`_MAX_RESULT_ROWS` — and rows Genie already previewed away upstream,
+    per ``total_row_count`` — are summarized rather than printed, so a partial
+    preview is never presented as the complete result.
 
     :param metadata: The ``output_text`` part's ``metadata`` blob, carrying
         ``columns`` and ``preview_rows``.
@@ -244,7 +250,11 @@ def _render_table(metadata: object) -> str:
     table = [_line([_md_cell(label) for label in labels]), _line(["---"] * width)]
     table.extend(_line(cells) for cells in shown)
 
-    omitted = len(rows) - len(shown)
+    # ``preview_rows`` is itself a preview: ``total_row_count`` counts the full
+    # query result, so the footer owns both our cap and Genie's upstream one.
+    total = _get(metadata, "total_row_count")
+    row_count = max(len(rows), total) if isinstance(total, int) else len(rows)
+    omitted = row_count - len(shown)
     if omitted > 0:
         table.append(f"\n… ({omitted} more row{'s' if omitted != 1 else ''})")
     return "\n".join(table)
@@ -308,7 +318,7 @@ def _reasoning_text(item: object) -> str:
     for key in ("content", "summary"):
         value = _get(item, key)
         if isinstance(value, str):
-            if value:
+            if value.strip():
                 return value
             continue
         parts = [
@@ -316,9 +326,26 @@ def _reasoning_text(item: object) -> str:
             for part in _as_sequence(value)
         ]
         joined = "\n".join(part for part in parts if part)
-        if joined:
+        if joined.strip():
             return joined
     return _get_str(item, "text")
+
+
+def _output_payload(output: object) -> object:
+    """Return a ``function_call_output``'s payload, flattened to text when parts.
+
+    The wire carries ``output`` as either a string or a list of content parts;
+    a parts list is joined into its text so the result renders as the query
+    result rather than a parts dump. Anything else — including a raw dict —
+    passes through verbatim.
+    """
+    if isinstance(output, str):
+        return output
+    parts = [
+        part if isinstance(part, str) else _get_str(part, "text") for part in _as_sequence(output)
+    ]
+    joined = "".join(part for part in parts if part)
+    return joined if joined else output
 
 
 def _parse_arguments(raw: object) -> ToolArgs:
@@ -434,7 +461,7 @@ class _CallPairing:
         self._awaiting.remove(call_id)
         return ToolCallComplete(
             name=_get_str(item, "name") or self._names[call_id],
-            result=_get(item, "output"),
+            result=_output_payload(_get(item, "output")),
             metadata={"call_id": call_id},
         )
 
@@ -466,7 +493,11 @@ def _item_events(item: object, pairing: _CallPairing) -> Iterator[ExecutorEvent]
     item_type = _get_str(item, "type")
     if item_type == "reasoning":
         reasoning = _reasoning_text(item)
-        if reasoning:
+        if reasoning.strip():
+            # Anchor each item as its own reasoning block — Genie plans before
+            # every SQL call, and consecutive items would otherwise run
+            # together downstream (mirrors the claude-sdk whole-block path).
+            yield ReasoningChunk(delta="", event_type="reasoning_started")
             yield ReasoningChunk(delta=reasoning, event_type="reasoning_text")
     elif item_type == "function_call":
         yield pairing.request(item)
@@ -493,7 +524,8 @@ class DatabricksGenieExecutor(Executor):
         ``None``, one is built lazily on the first turn so a missing
         ``databricks-sdk`` install — or an expired login — surfaces as a turn
         error, not a boot crash.
-    :param timeout_seconds: HTTP deadline for the streamed response.
+    :param timeout_seconds: Idle timeout bounding each silent gap in the
+        streamed response (not the turn's total duration).
     :param enable_viz: Whether to ask Genie to attach visualizations to its
         answer. Off by default, and the field is omitted from the request
         entirely when off.
@@ -514,11 +546,18 @@ class DatabricksGenieExecutor(Executor):
         # Set only for a client this executor built; an injected one belongs to
         # its caller, so :meth:`close` must not close it.
         self._http_client: httpx.Client | None = None
+        # Guards the lazy build: a turn cancelled mid-construction can overlap
+        # the next turn's ``to_thread`` worker, and an unguarded check-then-set
+        # would leak the losing worker's connection pool.
+        self._client_lock = threading.Lock()
         self._timeout_seconds = timeout_seconds
         self._enable_viz = enable_viz
         # Captured from the first ``response.created``; later turns continue
         # that conversation instead of starting a new one.
         self._conversation_id: str | None = None
+        # The turn's live SSE stream; :meth:`interrupt_session` closes it to
+        # unblock the reader thread instead of waiting out a warehouse query.
+        self._active_stream: Iterator[object] | None = None
 
     def supports_streaming(self) -> bool:
         """Agent-mode responses stream reasoning, SQL, and report text over SSE."""
@@ -542,48 +581,51 @@ class DatabricksGenieExecutor(Executor):
         :returns: The (possibly newly constructed) ``OpenAI`` client.
         :raises DatabricksGenieError: When ``databricks-sdk`` is not installed.
         """
-        if self._client is not None:
+        with self._client_lock:
+            if self._client is not None:
+                return self._client
+
+            import httpx
+            from openai import OpenAI
+
+            from omnigent.inner.databricks_executor import _resolve_databricks_auth
+            from omnigent.inner.open_responses_sdk import _OPENAI_KEY_PLACEHOLDER
+
+            try:
+                auth, host = _resolve_databricks_auth(self._profile)
+            except ImportError as exc:
+                from omnigent.onboarding.databricks_config import DATABRICKS_EXTRA_INSTALL_HINT
+
+                raise DatabricksGenieError(
+                    "the databricks-sdk package is required for the databricks-genie "
+                    "harness but is not installed; it ships in the omnigent[databricks] "
+                    f"extra. {DATABRICKS_EXTRA_INSTALL_HINT}"
+                ) from exc
+
+            http_client = httpx.Client(auth=auth)
+            try:
+                self._client = OpenAI(
+                    base_url=f"{host.rstrip('/')}/api/2.0/genie/agents/{agent_id}",
+                    # The bearer token rides on the httpx auth hook, which
+                    # re-mints it per request so a turn outliving the OAuth
+                    # token still works; the key is only the placeholder the
+                    # SDK insists on.
+                    api_key=_OPENAI_KEY_PLACEHOLDER,
+                    http_client=http_client,
+                    timeout=self._timeout_seconds,
+                    # The SDK's default retry set includes 409, which here
+                    # means "a response is already being generated for this
+                    # conversation" — never retryable, so retrying only delays
+                    # an actionable error.
+                    max_retries=0,
+                )
+            except Exception:
+                # Nothing else holds this client yet, so it would leak its
+                # connection pool if the constructor rejected our arguments.
+                http_client.close()
+                raise
+            self._http_client = http_client
             return self._client
-
-        import httpx
-        from openai import OpenAI
-
-        from omnigent.inner.databricks_executor import _resolve_databricks_auth
-        from omnigent.inner.open_responses_sdk import _OPENAI_KEY_PLACEHOLDER
-
-        try:
-            auth, host = _resolve_databricks_auth(self._profile)
-        except ImportError as exc:
-            from omnigent.onboarding.databricks_config import DATABRICKS_EXTRA_INSTALL_HINT
-
-            raise DatabricksGenieError(
-                "the databricks-sdk package is required for the databricks-genie "
-                "harness but is not installed; it ships in the omnigent[databricks] "
-                f"extra. {DATABRICKS_EXTRA_INSTALL_HINT}"
-            ) from exc
-
-        http_client = httpx.Client(auth=auth)
-        try:
-            self._client = OpenAI(
-                base_url=f"{host.rstrip('/')}/api/2.0/genie/agents/{agent_id}",
-                # The bearer token rides on the httpx auth hook, which re-mints
-                # it per request so a turn outliving the OAuth token still
-                # works; the key is only the placeholder the SDK insists on.
-                api_key=_OPENAI_KEY_PLACEHOLDER,
-                http_client=http_client,
-                timeout=self._timeout_seconds,
-                # The SDK's default retry set includes 409, which here means "a
-                # response is already being generated for this conversation" —
-                # never retryable, so retrying only delays an actionable error.
-                max_retries=0,
-            )
-        except Exception:
-            # Nothing else holds this client yet, so it would leak its
-            # connection pool if the constructor rejected our arguments.
-            http_client.close()
-            raise
-        self._http_client = http_client
-        return self._client
 
     async def close(self) -> None:
         """Close the httpx client backing the Responses client, if we built one.
@@ -630,7 +672,26 @@ class DatabricksGenieExecutor(Executor):
         if extra_body:
             kwargs["extra_body"] = extra_body
         stream = client.responses.create(**kwargs)  # type: ignore[attr-defined]  # duck-typed client
-        return cast("Iterator[object]", stream)
+        # Recorded here, in the worker thread, so a cancel landing between the
+        # POST returning and run_turn resuming can still close the stream.
+        self._active_stream = cast("Iterator[object]", stream)
+        return self._active_stream
+
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one conversation per executor instance
+        """Close the live response stream so a cancelled turn unblocks now.
+
+        Genie streams only whole output items, so a cancelled turn would
+        otherwise stay parked until the next item arrives — mid-query, that is
+        minutes away. Closing errors the reader thread's blocked iteration,
+        which ends :meth:`run_turn` with cancellations and one
+        :class:`ExecutorError` (surfaced as ``response.cancelled`` upstream).
+        Best-effort and idempotent, mirroring the databricks executor.
+        """
+        stream = self._active_stream
+        if stream is None:
+            return False
+        await asyncio.to_thread(_close_stream_quietly, stream)
+        return True
 
     def _capture_conversation_id(self, event: object) -> None:
         """Remember the conversation Genie opened, for the next turn's request."""
@@ -678,8 +739,9 @@ class DatabricksGenieExecutor(Executor):
         or a single :class:`ExecutorError`, never both. Only
         ``response.completed`` ends a turn successfully: a stream that stops
         without it delivered a partial answer, which must not be reported as a
-        finished one. Any SQL call still awaiting its output is cancelled first,
-        so the turn leaves no card rendering as in progress.
+        finished one. On every terminal path, any SQL call still awaiting its
+        output is cancelled before the terminal event, so no turn — failed or
+        successful — leaves a card rendering as in progress.
 
         :param stream: The response's blocking SSE iterator.
         """
@@ -718,9 +780,12 @@ class DatabricksGenieExecutor(Executor):
 
         if error is None and not completed:
             error = _TRUNCATED_STREAM_MESSAGE
+        # Every terminal path cancels first: a call Genie never answered —
+        # even on a completed response — would otherwise leave its SQL card
+        # rendering as in progress forever.
+        for cancelled in pairing.cancel_awaiting():
+            yield cancelled
         if error is not None:
-            for cancelled in pairing.cancel_awaiting():
-                yield cancelled
             yield ExecutorError(message=error)
             return
 
@@ -772,5 +837,8 @@ class DatabricksGenieExecutor(Executor):
             yield ExecutorError(message=self._request_failure(exc))
             return
 
-        async for event in self._stream_events(stream):
-            yield event
+        try:
+            async for event in self._stream_events(stream):
+                yield event
+        finally:
+            self._active_stream = None

@@ -6,7 +6,9 @@ the databricks-genie harness wrap reads at first-turn time: the Genie space id
 from ``executor.model``, the Databricks profile from ``executor.auth``
 (``type: databricks``) or the legacy ``executor.profile`` /
 ``executor.config["profile"]``, and the visualization opt-in from
-``executor.config["enable_viz"]``. There is NO gateway / base-URL resolution.
+``executor.config["enable_viz"]``. It also sizes the scaffold idle watchdog
+(``HARNESS_TURN_TIMEOUT_S``) above the stream idle timeout unless the ambient
+environment already sets it. There is NO gateway / base-URL resolution.
 
 This is a unit test — no subprocess spawn. Mirrors ``test_cursor_spawn_env.py``.
 """
@@ -124,3 +126,54 @@ def test_unset_enable_viz_omits_the_env_var() -> None:
     """No key in ``executor.config`` → no env var at all, not an empty one."""
     env = _build_databricks_genie_spawn_env(_make_spec())
     assert "HARNESS_DATABRICKS_GENIE_ENABLE_VIZ" not in env
+
+
+def test_executor_profile_wins_over_config_profile() -> None:
+    """Both legacy spellings set → ``executor.profile`` wins, matching
+    ``_resolve_provider_for_build``'s precedence."""
+    env = _build_databricks_genie_spawn_env(
+        _make_spec(profile="from-executor", config_profile="from-config")
+    )
+    assert env["HARNESS_DATABRICKS_GENIE_PROFILE"] == "from-executor"
+
+
+@pytest.fixture
+def _clear_watchdog_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strip the ambient watchdog / genie-timeout vars so sizing is deterministic."""
+    monkeypatch.delenv("HARNESS_TURN_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("HARNESS_DATABRICKS_GENIE_TIMEOUT", raising=False)
+
+
+def test_watchdog_sized_above_the_default_stream_idle_timeout(
+    _clear_watchdog_env: None,
+) -> None:
+    """With nothing configured, the watchdog sits one margin above the 900s default."""
+    env = _build_databricks_genie_spawn_env(_make_spec())
+    assert env["HARNESS_TURN_TIMEOUT_S"] == "960.0"
+
+
+def test_watchdog_sized_above_an_ambient_genie_timeout(
+    _clear_watchdog_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raised stream idle timeout raises the watchdog with it."""
+    monkeypatch.setenv("HARNESS_DATABRICKS_GENIE_TIMEOUT", "1200")
+    env = _build_databricks_genie_spawn_env(_make_spec())
+    assert env["HARNESS_TURN_TIMEOUT_S"] == "1260.0"
+
+
+def test_ambient_watchdog_setting_wins(
+    _clear_watchdog_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator-set ``HARNESS_TURN_TIMEOUT_S`` is inherited, never overridden."""
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "300")
+    env = _build_databricks_genie_spawn_env(_make_spec())
+    assert "HARNESS_TURN_TIMEOUT_S" not in env
+
+
+def test_malformed_genie_timeout_falls_back_to_default_watchdog_sizing(
+    _clear_watchdog_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-positive genie timeout falls back to the default before sizing."""
+    monkeypatch.setenv("HARNESS_DATABRICKS_GENIE_TIMEOUT", "-5")
+    env = _build_databricks_genie_spawn_env(_make_spec())
+    assert env["HARNESS_TURN_TIMEOUT_S"] == "960.0"

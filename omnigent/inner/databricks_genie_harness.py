@@ -10,7 +10,8 @@ Wraps a :class:`omnigent.inner.databricks_genie_executor.DatabricksGenieExecutor
 which converses with a remote Databricks Genie space in Agent mode over the
 Genie Responses API. Mirrors the cursor wrap's env-var config flow.
 
-Env vars read at startup. Three are spec-driven — set by
+Env vars read when the adapter builds the executor — lazily, on the first
+turn. Three are spec-driven — set by
 :func:`omnigent.runtime.workflow._build_databricks_genie_spawn_env`:
 
 - ``HARNESS_DATABRICKS_GENIE_MODEL``: the Genie space id (carried in
@@ -21,14 +22,16 @@ Env vars read at startup. Three are spec-driven — set by
   resolution order.
 - ``HARNESS_DATABRICKS_GENIE_ENABLE_VIZ``: optional opt-in asking Genie to
   attach visualizations to its answer, from ``executor.config["enable_viz"]``.
-  Off unless set to ``"true"``/``"1"``.
+  Off unless set (case-insensitively) to ``"true"``/``"True"``/``"1"`` — the
+  spawn-env builder exports a YAML ``true`` as the string ``"True"``.
 
 The remaining one has no spec surface — the spawn-env builder never exports it,
 so it is read from the ambient environment the harness subprocess inherits:
 
-- ``HARNESS_DATABRICKS_GENIE_TIMEOUT``: optional per-turn deadline (seconds,
-  float) applied to the streamed response. Values that are not a positive,
-  finite number fall back to the executor default.
+- ``HARNESS_DATABRICKS_GENIE_TIMEOUT``: optional idle timeout (seconds, float)
+  bounding each silent gap in the streamed response — not the turn's total
+  length. Values that are not a positive, finite number fall back to the
+  executor default.
 """
 
 from __future__ import annotations
@@ -59,7 +62,7 @@ _TRUTHY = frozenset({"true", "1"})
 
 
 def _resolve_timeout() -> float:
-    """Resolve the per-turn timeout from :data:`_ENV_TIMEOUT`.
+    """Resolve the stream idle timeout from :data:`_ENV_TIMEOUT`.
 
     Only a positive, finite number of seconds is a usable HTTP deadline —
     ``0``, a negative, ``nan``, and ``inf`` all parse as floats but would either

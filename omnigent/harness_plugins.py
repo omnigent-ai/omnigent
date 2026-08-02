@@ -625,19 +625,23 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
     ),
     # Genie streams each turn's reasoning, SQL, and report over the Agent-mode
-    # Responses API — DatabricksGenieExecutor.supports_streaming() returns True.
-    # It does not override interrupt_session(), so interrupt stays False. The
-    # conversation id it threads across turns lives on the executor instance and
-    # is not rehydrated on resume, hence COLD_ONLY.
+    # Responses API — DatabricksGenieExecutor.supports_streaming() returns True
+    # (progressively, as whole output items rather than token deltas).
+    # interrupt_session() closes the live response stream, so a cancelled turn
+    # unblocks immediately instead of waiting out a warehouse query — hence
+    # interrupt True. Continuity lives only in the in-process conversation id
+    # and only the latest user message is forwarded (no transcript replay), so
+    # a restarted harness process starts a fresh, contextless Genie
+    # conversation — hence resume NONE.
     "databricks-genie": _C(
         _IM.SDK_IN_PROCESS,
         _EL.NONE,
-        _RS.COLD_ONLY,
+        _RS.NONE,
         _EF.NONE,
         _MF.MULTI,
         _AU.OWN_AUTH,
         subagents=False,
-        interrupt=False,
+        interrupt=True,
         streaming=True,
     ),
     # open-responses is resolved via an alternate path, but its executor
@@ -814,6 +818,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
+        # databricks-genie is deliberately not a picker row either: an agent
+        # needs a Genie space id and a Databricks profile the create dialog
+        # cannot collect, so it stays YAML/CLI-configured.
         "pi": "Pi",
     },
     capabilities=_BUILTIN_CAPABILITIES,

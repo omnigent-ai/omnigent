@@ -55,13 +55,15 @@ Edit [`config.yaml`](config.yaml):
   (`DATABRICKS_CONFIG_PROFILE` env var / `[DEFAULT]` section).
 - `executor.config.enable_viz` — set to `true` to ask Genie to attach
   visualizations to its answer. Defaults to `false`, and when off the field is
-  omitted from the request entirely.
+  omitted from the request entirely. The chart itself renders in the Genie
+  room — follow the citation link in the answer; Omnigent's own output stays
+  text and tables.
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HARNESS_DATABRICKS_GENIE_TIMEOUT` | `900` | Per-turn HTTP deadline in seconds for the streamed response — it has to cover planning, real warehouse queries, and the written report. A malformed value falls back to the default. |
+| `HARNESS_DATABRICKS_GENIE_TIMEOUT` | `900` | Stream idle timeout in seconds — bounds each silent gap in the streamed response (one long warehouse query is a single gap), not the turn's total length. A malformed value falls back to the default. |
 | `HARNESS_DATABRICKS_GENIE_ENABLE_VIZ` | unset (off) | `true` / `1` turns the visualization opt-in on. `executor.config.enable_viz` sets this for you; set it in the shell for specs that have no `config:` block. |
 | `HARNESS_DATABRICKS_GENIE_MODEL` | — | The space id. Omnigent sets it from `executor.model`, which wins over any value already in your shell. |
 | `HARNESS_DATABRICKS_GENIE_PROFILE` | — | The `~/.databrickscfg` profile. Omnigent sets it from `executor.auth.profile`, which wins over any value already in your shell. |

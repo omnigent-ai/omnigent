@@ -1921,6 +1921,8 @@ def _build_databricks_genie_spawn_env(spec: AgentSpec) -> dict[str, str]:
       ``HARNESS_DATABRICKS_GENIE_PROFILE``
     - ``executor.config["enable_viz"]`` (Genie's visualization opt-in) →
       ``HARNESS_DATABRICKS_GENIE_ENABLE_VIZ``
+    - ``HARNESS_TURN_TIMEOUT_S`` (the scaffold idle watchdog), sized above the
+      stream idle timeout unless the ambient environment already sets it
 
     Genie reaches the workspace with Databricks-CLI / OAuth / PAT credentials
     resolved by the databricks-sdk, NOT the Databricks AI gateway — so, like
@@ -1941,8 +1943,9 @@ def _build_databricks_genie_spawn_env(spec: AgentSpec) -> dict[str, str]:
     if isinstance(auth, DatabricksAuth):
         profile = auth.profile or None
     else:
-        # Legacy path: executor.config["profile"] or executor.profile.
-        profile = spec.executor.config.get("profile") or spec.executor.profile or None
+        # Legacy path: executor.profile then executor.config["profile"], the
+        # same order as _resolve_provider_for_build.
+        profile = spec.executor.profile or spec.executor.config.get("profile") or None
     if profile:
         env["HARNESS_DATABRICKS_GENIE_PROFILE"] = profile
 
@@ -1951,6 +1954,16 @@ def _build_databricks_genie_spawn_env(spec: AgentSpec) -> dict[str, str]:
     enable_viz = spec.executor.config.get("enable_viz")
     if enable_viz is not None:
         env["HARNESS_DATABRICKS_GENIE_ENABLE_VIZ"] = str(enable_viz)
+
+    # A Genie turn is silent while a warehouse query runs — the stream carries
+    # only completed items — so size the scaffold idle watchdog above the
+    # executor's stream idle timeout; the HTTP read then fails first, with an
+    # actionable databricks-genie message instead of a "wedged LLM" one.
+    # Ambient env wins, per the shared env > config > default precedence.
+    if "HARNESS_TURN_TIMEOUT_S" not in os.environ:
+        from omnigent.inner.databricks_genie_harness import _resolve_timeout
+
+        env["HARNESS_TURN_TIMEOUT_S"] = str(_resolve_timeout() + 60.0)
     return env
 
 
