@@ -9971,6 +9971,33 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
     assert len(post_items) == 1
 
 
+def test_codex_event_msg_record_ignores_non_list_content() -> None:
+    """Malformed message content is skipped as it was before type narrowing."""
+    assert (
+        codex_native._codex_event_msg_record_for_message(
+            {"type": "message", "role": "user", "content": "not-a-list"},
+            timestamp="2026-08-02T00:00:00.000Z",
+        )
+        is None
+    )
+
+
+def test_codex_event_msg_record_reports_non_string_text_cleanly() -> None:
+    """Malformed block text produces a user-facing CLI error."""
+    with pytest.raises(
+        click.ClickException,
+        match="Codex message content text must be a string",
+    ):
+        codex_native._codex_event_msg_record_for_message(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": 42}],
+            },
+            timestamp="2026-08-02T00:00:00.000Z",
+        )
+
+
 def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> None:
     """Sessions without compaction produce no Compacted rollout record."""
     items: list[dict[str, Any]] = [

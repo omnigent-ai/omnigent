@@ -2119,14 +2119,14 @@ def _codex_event_msg_record_for_message(
         return None
     content = payload.get("content", [])
     if not isinstance(content, list):
-        raise TypeError("Codex message content must be a list.")
+        return None
     text_parts: list[str] = []
     for block in content:
         if not isinstance(block, dict):
             continue
         block_text = block.get("text", "")
         if not isinstance(block_text, str):
-            raise TypeError("Codex message content text must be a string.")
+            raise click.ClickException("Codex message content text must be a string.")
         text_parts.append(block_text)
     text = " ".join(text_parts).strip()
     if not text:
