@@ -1420,10 +1420,18 @@ async def test_serve_tunnel_401_without_factory_is_fatal(
 
 
 @pytest.mark.asyncio
-async def test_serve_tunnel_403_remains_fatal_with_factory(
+async def test_serve_tunnel_403_fatal_for_never_connected_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """HTTP 403 stays fatal even when a factory is available.
+    """HTTP 403 on a never-connected runner is fatal after a short streak.
+
+    A plain refresh factory (no host-bootstrap ``invalidate`` hook)
+    that keeps getting 403'd on a runner that never completed an
+    upgrade is a credentials/authorization problem retrying can't
+    fix, so after ``_FORBIDDEN_FATAL_ATTEMPTS`` the loop fails loud —
+    mirroring the never-connected login-redirect posture. The short
+    streak (rather than an immediate exit) tolerates a server
+    mid-restart returning 403 before the app is ready.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -1440,6 +1448,9 @@ async def test_serve_tunnel_403_remains_fatal_with_factory(
         factory_calls += 1
         return "tok-valid"
 
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
     async def _serve_once(
         app: Any,
         *,
@@ -1451,7 +1462,7 @@ async def test_serve_tunnel_403_remains_fatal_with_factory(
         tunnel_token: str | None = None,
         **_kwargs: Any,
     ) -> None:
-        """Raise 403.
+        """Raise 403 on every attempt without ever connecting.
 
         :param app: Runner ASGI app.
         :param tunnel_url: WebSocket URL.
@@ -1462,14 +1473,26 @@ async def test_serve_tunnel_403_remains_fatal_with_factory(
         :raises InvalidStatus: Always with 403.
         """
         del app, tunnel_url, runner_id, runner_version, auth_token, tunnel_token
+        attempts.append(1)
         raise InvalidStatus(Response(403, "Forbidden", [], b""))
 
-    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    async def _sleep(delay: float) -> None:
+        """Record retry backoff delays without waiting.
 
-    # 403 with factory → still fatal. Factory is called once for
-    # the proactive refresh before the connection attempt, but the
-    # 403 handler must NOT call it again.
-    with pytest.raises(RuntimeError, match="HTTP 403"):
+        :param delay: Reconnect delay.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args, **_kw: 0.0)
+
+    # 403 with a non-invalidatable factory on a never-connected runner
+    # → fatal after the streak. The 403 handler must NOT call the
+    # factory itself (no host-bootstrap bearer to invalidate); the only
+    # factory calls are the loop-top proactive refresh, once per attempt.
+    with pytest.raises(RuntimeError, match="HTTP 403 persisted across 3 attempts"):
         await serve_tunnel(
             _noop_app,
             server_url="http://127.0.0.1:8000",
@@ -1478,9 +1501,169 @@ async def test_serve_tunnel_403_remains_fatal_with_factory(
             auth_token="tok-valid",
             auth_token_factory=_factory,
         )
-    # 1 call = proactive refresh only. If 2, the 403 handler
-    # incorrectly attempted a refresh for a permissions error.
-    assert factory_calls == 1
+    # A couple of retries rule out a transient server restart, then fatal.
+    assert len(attempts) == 3
+    assert sleeps == [0.5, 1.0]
+    # One proactive loop-top refresh per attempt; the 403 handler adds none.
+    assert factory_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_retries_403_after_successful_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP 403 on an ever-connected runner retries, not exit.
+
+    The apiproxy → control-plane edge (unlike the Databricks Apps
+    OAuth proxy, which redirects) rejects an expired bearer on the
+    tunnel upgrade with a 403 — e.g. after a tunnel recycle past the
+    ~1h token lifetime. A runner that has already served this tunnel
+    must keep retrying (the loop-top refresh mints a fresh token each
+    attempt) instead of exiting and killing the session with
+    ``runner_disconnected``. This is the local-host regression that
+    killed runners ~62-68 min after launch on a ``1012`` recycle.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    forbidden_after_connect = 5
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        on_connected: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Connect once, then 403 every reconnect.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Optional bearer token.
+        :param tunnel_token: Optional tunnel binding token.
+        :param on_connected: Successful-upgrade callback from the loop.
+        :raises InvalidStatus: On every attempt after the first.
+        :raises asyncio.CancelledError: Once enough 403s were retried.
+        """
+        del app, tunnel_url, runner_id, runner_version, auth_token, tunnel_token
+        attempts.append(1)
+        if len(attempts) == 1:
+            on_connected()
+            return
+        if len(attempts) > 1 + forbidden_after_connect:
+            raise asyncio.CancelledError
+        raise InvalidStatus(Response(403, "Forbidden", [], b""))
+
+    async def _sleep(delay: float) -> None:
+        """Record retry backoff delays without waiting.
+
+        :param delay: Reconnect delay.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args, **_kw: 0.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_403_retry",
+            runner_version="0.1.0",
+        )
+
+    # One successful connect, then well past the never-connected fatal
+    # streak without raising, ending only via the test's cancellation.
+    assert len(attempts) == 2 + forbidden_after_connect
+    # 403 retries back off (no fatal, no prompt-reconnect reset):
+    # 0.5 after the clean first connection, then doubling per 403 to the cap.
+    assert sleeps == [0.5, 1.0, 2.0, 4.0, 8.0, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_403_refreshes_rejected_host_bootstrap_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403-rejected host bearer activates local refresh before retry.
+
+    The local-host launch path hands the runner a one-time snapshot of
+    the host's bearer (``_InitialAuthTokenFactory``). When the apiproxy
+    edge 403s it (expired), the 403 handler invalidates that snapshot so
+    the next call resolves the runner's own refreshable auth, then
+    retries immediately with the replacement token — without waiting out
+    the fatal streak.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    seen_tokens: list[str | None] = []
+
+    class _BootstrapFactory:
+        """Factory double that switches token when invalidated."""
+
+        def __init__(self) -> None:
+            self.invalidated = False
+
+        def __call__(self) -> str:
+            return "runner-refreshed-token" if self.invalidated else "host-bootstrap-token"
+
+        def invalidate(self) -> bool:
+            if self.invalidated:
+                return False
+            self.invalidated = True
+            return True
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Reject the host token with 403, then stop after the replacement.
+
+        :raises InvalidStatus: On the first attempt (host bearer).
+        :raises asyncio.CancelledError: Once the refreshed token is seen.
+        """
+        del app, tunnel_url, server_url, runner_id, runner_version, tunnel_token
+        seen_tokens.append(auth_token)
+        if len(seen_tokens) == 1:
+            raise InvalidStatus(Response(403, "Forbidden", [], b""))
+        raise asyncio.CancelledError
+
+    factory = _BootstrapFactory()
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_403_bootstrap_refresh",
+            runner_version="0.1.0",
+            auth_token="host-bootstrap-token",
+            auth_token_factory=factory,
+        )
+
+    # First attempt used the host bootstrap token (403'd); the second used
+    # the runner-local refreshed token — the invalidate-and-retry recovered
+    # the session instead of exiting fatally.
+    assert seen_tokens == ["host-bootstrap-token", "runner-refreshed-token"]
+    assert factory.invalidated is True
 
 
 @pytest.mark.asyncio

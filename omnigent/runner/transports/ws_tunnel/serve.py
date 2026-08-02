@@ -124,6 +124,17 @@ _AUTH_REDIRECT_SCHEMES = {"http", "https"}
 # mirrors the host tunnel's ``_LOGIN_REDIRECT_FATAL_ATTEMPTS`` posture.
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
 
+# Consecutive HTTP 403 upgrade rejections tolerated on a runner that has
+# NEVER completed a WS upgrade in this process. The apiproxy → control-plane
+# edge (unlike the Databricks Apps OAuth proxy, which redirects) rejects an
+# expired/invalid bearer on the tunnel upgrade with a 403. This mirrors the
+# ``_LOGIN_REDIRECT_FATAL_ATTEMPTS`` posture for that surface: a runner that
+# never authenticated fails loud after a short streak (ruling out a server
+# mid-restart blip), while a runner that HAS served this tunnel keeps
+# retrying with refreshed credentials so a mid-session bearer expiry (e.g. a
+# tunnel recycle past the ~1h token lifetime) never kills a live session.
+_FORBIDDEN_FATAL_ATTEMPTS = 3
+
 
 async def dispatch_via_asgi(
     app: _ASGIApp,
@@ -328,11 +339,14 @@ async def serve_tunnel(
     ever_connected = False
     # Consecutive login-page redirects; reset by a successful upgrade.
     login_redirect_streak = 0
+    # Consecutive HTTP 403 upgrade rejections; reset by a successful upgrade.
+    forbidden_streak = 0
 
     def _mark_connected() -> None:
-        nonlocal ever_connected, login_redirect_streak
+        nonlocal ever_connected, login_redirect_streak, forbidden_streak
         ever_connected = True
         login_redirect_streak = 0
+        forbidden_streak = 0
 
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
@@ -406,6 +420,7 @@ async def serve_tunnel(
                 )
             else:
                 http_status = _websocket_http_status(exc)
+                close_code = _websocket_close_code(exc)
                 if http_status in _REFRESHABLE_HTTP_STATUSES:
                     _invalidate_auth_token_factory(auth_token_factory)
                     auth_token = await _handle_refreshable_auth_failure(
@@ -414,17 +429,39 @@ async def serve_tunnel(
                     delay_s = _INITIAL_RECONNECT_DELAY_S
                     continue
                 if http_status in _FATAL_SERVER_HTTP_STATUSES:
-                    raise RuntimeError(
-                        f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                        f"(HTTP {http_status}); check remote server authentication"
-                    ) from exc
-                close_code = _websocket_close_code(exc)
-                if close_code in _FATAL_SERVER_CLOSE_CODES:
+                    forbidden_streak += 1
+                    if _invalidate_auth_token_factory(auth_token_factory):
+                        auth_token = await _handle_refreshable_auth_failure(
+                            auth_token_factory, http_status, exc
+                        )
+                        delay_s = _INITIAL_RECONNECT_DELAY_S
+                        continue
+                    # No host-bootstrap bearer left to invalidate. On a
+                    # runner that never authenticated a 403 is a
+                    # credentials/authorization problem retrying can't fix,
+                    # so after a short streak (allowing for a server
+                    # mid-restart) fail loud. On a runner that HAS served
+                    # this tunnel it usually means the bearer expired
+                    # mid-session (the apiproxy edge signals that as a 403,
+                    # not a 401) — keep retrying: the loop-top refresh mints
+                    # a fresh token each attempt, so the session survives
+                    # once credentials become valid again.
+                    if not ever_connected and forbidden_streak >= _FORBIDDEN_FATAL_ATTEMPTS:
+                        raise RuntimeError(
+                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                            f"(HTTP {http_status} persisted across "
+                            f"{forbidden_streak} attempts); "
+                            "check remote server authentication"
+                        ) from exc
+                    retry_reason = (
+                        f"HTTP {http_status} during upgrade; retrying with refreshed credentials"
+                    )
+                elif close_code in _FATAL_SERVER_CLOSE_CODES:
                     raise RuntimeError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                         f"(close code {close_code}); check frame protocol compatibility"
                     ) from exc
-                if (
+                elif (
                     close_code in _TUNNEL_RECYCLE_CLOSE_CODES
                     or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
                 ):
