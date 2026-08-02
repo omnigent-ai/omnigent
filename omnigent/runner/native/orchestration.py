@@ -4475,6 +4475,10 @@ def _mint_runner_agy_conversation_id() -> str:
 # afterward and keeps polling discovery as a functional fallback.
 _AGY_COLD_START_PORT_TIMEOUT_S = 20.0
 _AGY_COLD_START_PORT_POLL_INTERVAL_S = 0.25
+# A non-empty model catalog is the first reliable signal that agy post-login
+# initialization has reached the model service. Live cold starts still needed a
+# short settling window after that response before StartCascade was reliable.
+_AGY_COLD_START_MODEL_STABILIZATION_S = 4.0
 
 
 async def _agy_cold_start_poll_sleep(seconds: float) -> None:
@@ -4517,7 +4521,9 @@ async def _cold_start_agy_conversation(
     pane is reachable (remote runner), or once our agy is up in the pane but its
     port is not lsof-attributable; while our agy is NOT yet up in the pane it keeps
     polling rather than risk a foreign-agy candidate. This polls that resolver
-    until a port binds, then ``StartCascade``s a runner-generated
+    until a port binds and ``GetAvailableModels`` returns a non-empty catalog,
+    allows agy post-login initialization to settle, then ``StartCascade``s a
+    runner-generated
     ``uuid4`` and writes THAT real id into bridge state (replacing the
     ``agy_conv_*`` placeholder) so :func:`read_bridge_state` returns the real id
     and the reader/executor address the cold-started conversation directly.
@@ -4534,7 +4540,8 @@ async def _cold_start_agy_conversation(
     if a future caller forgets the resume gate.
 
     **Best-effort, never raises.** A bootstrap failure (no port within
-    *timeout_s*, or ``StartCascade`` erroring) must NOT abort the auto-create:
+    *timeout_s*, no ready model catalog within *timeout_s*, or ``StartCascade``
+    erroring) must NOT abort the auto-create:
     that would leave a registered terminal with no reader (which a later
     ensure sees and returns 200 for, never self-healing). On failure this logs
     and returns ``None`` (the placeholder stays; the reader's discovery then binds
@@ -4554,7 +4561,8 @@ async def _cold_start_agy_conversation(
         ``None`` (remote runner / no local pane) falls back to the candidate scan.
     :param tmux_target: This session's tmux target (e.g. ``"main"``), paired with
         ``tmux_socket`` for the pane-scoped port resolution.
-    :param timeout_s: Total seconds to wait for agy's connect-RPC port to bind.
+    :param timeout_s: Total seconds to wait for agy's connect-RPC port and model
+        catalog to become ready.
     :returns: The real (cold-started) cascade/conversation id on success, or
         ``None`` when no port answered in time or ``StartCascade`` failed.
     """
@@ -4565,6 +4573,7 @@ async def _cold_start_agy_conversation(
     )
     from omnigent.antigravity_native_rpc import (
         AntigravityRpcError,
+        get_available_models,
         resolve_cold_start_agy_rpc_port,
         start_cascade,
     )
@@ -4587,18 +4596,25 @@ async def _cold_start_agy_conversation(
         # local pane is reachable or the pane is not resolvable yet.
         port = await asyncio.to_thread(resolve_cold_start_agy_rpc_port, tmux_socket, tmux_target)
         if port is not None:
-            break
+            try:
+                catalog = await asyncio.to_thread(get_available_models, port)
+            except (httpx.HTTPError, ValueError):
+                catalog = {}
+            models = catalog.get("models")
+            if isinstance(models, dict) and models:
+                break
         if time.monotonic() >= deadline:
             _logger.warning(
-                "Antigravity cold-start: no agy connect-RPC port bound within %.0fs for "
-                "session %s; leaving the placeholder conversation id for the reader to "
-                "bind once a turn creates the conversation.",
+                "Antigravity cold-start: agy did not expose a ready model catalog within "
+                "%.0fs for session %s; leaving the placeholder conversation id for the "
+                "reader to bind once a turn creates the conversation.",
                 timeout_s,
                 session_id,
             )
             return None
         await _agy_cold_start_poll_sleep(_AGY_COLD_START_PORT_POLL_INTERVAL_S)
 
+    await _agy_cold_start_poll_sleep(_AGY_COLD_START_MODEL_STABILIZATION_S)
     cascade_id = str(uuid.uuid4())
     try:
         await asyncio.to_thread(start_cascade, port, cascade_id)

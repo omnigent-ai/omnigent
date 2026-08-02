@@ -1816,6 +1816,11 @@ async def _run_antigravity_auto_create(
 
     monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _no_sleep)
     monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", lambda: list(candidate_ports))
+    monkeypatch.setattr(
+        rpc_mod,
+        "get_available_models",
+        lambda _port: {"models": {"ready": {"model": "ready"}}},
+    )
     start_cascade_calls: list[tuple[int, str]] = []
 
     def _fake_start_cascade(port: int, cascade_id: str, **_kwargs: Any) -> None:
@@ -2146,6 +2151,120 @@ async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_st
     state = bridge_mod.read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == real_id
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_waits_for_model_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """StartCascade runs only after models appear and the settling delay passes."""
+    import omnigent.antigravity_native_rpc as rpc_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner.native import orchestration as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "158889f76b7143cd97d1c564db115235"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=f"agy_conv_{'a' * 32}",
+        ),
+    )
+
+    events: list[tuple[str, object]] = []
+    catalogs = iter(
+        [
+            {},
+            {"models": {}},
+            {"models": {"gemini": {"model": "MODEL_GEMINI"}}},
+        ]
+    )
+    monkeypatch.setattr(
+        rpc_mod,
+        "resolve_cold_start_agy_rpc_port",
+        lambda *_args: 52548,
+    )
+
+    def _models(port: int) -> dict[str, object]:
+        events.append(("models", port))
+        return next(catalogs)
+
+    monkeypatch.setattr(rpc_mod, "get_available_models", _models)
+
+    def _start(port: int, cascade_id: str) -> None:
+        events.append(("start", (port, cascade_id)))
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _start)
+
+    async def _sleep(seconds: float) -> None:
+        events.append(("sleep", seconds))
+
+    monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _sleep)
+
+    result = await runner_app_mod._cold_start_agy_conversation(
+        bridge_dir,
+        session_id,
+        timeout_s=1.0,
+    )
+
+    assert result is not None
+    assert events[:-1] == [
+        ("models", 52548),
+        ("sleep", runner_app_mod._AGY_COLD_START_PORT_POLL_INTERVAL_S),
+        ("models", 52548),
+        ("sleep", runner_app_mod._AGY_COLD_START_PORT_POLL_INTERVAL_S),
+        ("models", 52548),
+        ("sleep", 4.0),
+    ]
+    assert events[-1] == ("start", (52548, result))
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_model_timeout_keeps_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound RPC port without models never receives StartCascade."""
+    import omnigent.antigravity_native_rpc as rpc_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner.native import orchestration as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "4908a3a50e4c4323a3f0183013ea79ba"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    placeholder = f"agy_conv_{'b' * 32}"
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=placeholder,
+        ),
+    )
+    monkeypatch.setattr(
+        rpc_mod,
+        "resolve_cold_start_agy_rpc_port",
+        lambda *_args: 52548,
+    )
+    monkeypatch.setattr(rpc_mod, "get_available_models", lambda _port: {"models": {}})
+
+    def _unexpected_start(_port: int, _cascade_id: str) -> None:
+        raise AssertionError("StartCascade must wait for a non-empty model catalog")
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _unexpected_start)
+
+    result = await runner_app_mod._cold_start_agy_conversation(
+        bridge_dir,
+        session_id,
+        timeout_s=0.0,
+    )
+
+    assert result is None
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == placeholder
 
 
 @pytest.mark.asyncio
