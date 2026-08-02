@@ -91,3 +91,5 @@
 **4f — Two items the same critique added.** Managed-plugin readiness is a commit-1 requirement (2a), and the in-session model indicator is a must-fix bug (2k, 3g).
 
 **4g — RESOLVED: pi is not a routed harness for now.** Smart-routing eligibility requires a gateway-backed family, and the requirement includes the mid-session toggle. The bar list goes with it, and the layered-redirect diff against main goes to ~zero (plan `3k`).
+
+**4h — RESOLVED (2026-08-02): the fleet writes the new branch from scratch.** Bryan: keep the code as clean as possible. This reverses the earlier "assemble, do not re-implement" rule. Nothing in §2's fates changes, and the §3 invariants still hold. Three plan blocks carry the risk that the method adds: `0c` names the inputs an agent reads before it writes a slice (the behavior inventory, the trap list, and the reference implementation on `routing-mvp-v1`), `0d` says to rewrite the shape but transcribe the empirical constants, and `6f` records that no evidence transfers, so the fleet earns every registry row again.

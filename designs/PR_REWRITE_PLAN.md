@@ -4,7 +4,15 @@
 
 **0a** Goal: a rewritten branch replaces PR #3506. The new branch ships the same three CUJs plus the CLI entry points. It is a fraction of the current size. Its commit series is short enough for a reviewer to read. The three CUJs are Smart Routing as a model choice on Claude Code and Codex, the Smart Routing harness, and routed native subagent spawns. Bryan critiques this plan before the Opus fleet executes it.
 
-**0b** Hard constraints. The rewrite starts from the current verified tree, not from scratch. Evidence covers every behavior on the branch: the registry holds a 15/15 matrix and live checks. A re-implementation would lose that evidence. Cuts remove scope, not correctness. The fleet rebases the final branch onto current main, which is 201 commits ahead again. The fleet then re-runs the §11 matrix. Only then does the branch replace #3506.
+**0b** Hard constraints. Bryan chose a complete rewrite from scratch on 2026-08-02 (7g). The fleet therefore writes new code, and it does not move old code. The behavior target does not change, and 2a–2e define it. The branch starts from current origin/main, which is 201 commits ahead again. No evidence transfers: the registry's 15/15 matrix attests to the OLD tree, so every row returns to unverified and the fleet earns it again (6f). Cuts remove scope, not correctness. Only a fully verified branch replaces #3506.
+
+**0c** A from-scratch build must not rediscover what this branch already learned. Three inputs are therefore required reading, per slice, before an agent writes code:
+
+- **The behavior inventory.** `CUJ_STATUS.md` §2 lists every behavior the branch verified. It is the specification for what to build. It is also the coverage gate for the tests (3g).
+- **The trap list.** `CUJ_IMPLEMENTATION.md` states each step in the form "why the naive approach failed". `INTELLIGENT_ROUTING_PLAN.md` §12 holds 23 deltas in the form plan assumption → what reality showed → what shipped. Both documents exist because the naive implementation of nearly every step is wrong. An agent that skips them rediscovers each trap by breaking a live session.
+- **The reference implementation.** `routing-mvp-v1` (6b) stays checked out in a sibling worktree for the whole build. An agent reads it to answer "what did the working version do here". An agent never copies from it wholesale.
+
+**0d** Rewrite the shape, and transcribe the constants. The structure is worth writing again: the module boundaries, the names, the control flow, and the tests. A small set of values and orderings is NOT worth rediscovering, because experiment produced each one and only the old tree records it. These are examples: `python -I` in the hook command; the codex version probe that runs before config population; the trust handshake that follows the app-server connect and precedes the first turn; the alias-pin exactness check; the timeout ladder; separator-safe prefix stripping. An agent transcribes such a value verbatim, and it cites the trap in a one-line comment. An agent never "cleans up" a constant that it cannot explain.
 
 ## 1. What the PR is today
 
@@ -65,22 +73,24 @@
 
 The chain therefore has four steps: strip the prefix → match the catalog exactly → apply the family fallback → decline honestly. An honest decline writes no pin, records `applied=false`, shows a decision card, and keeps the session default model. The session never breaks. Two boundaries hold for the fleet. First, the gateway spelling pin stays: `glm-5-2` serves under the `system.ai.glm-5-2` route, and that pin is a spelling, not a substitution. Second, the claude `/model` alias vocabulary is NOT part of this cut, because the Claude CLI accepts only its own aliases for a mid-session switch; 2a keeps that vocabulary.
 
-**3j** Net size estimate, if 3a–3d, 3g, and the 3i/3k cuts all apply: roughly **28,991 → ~14,900** insertions, with production source around 6,100. The items are:
+**3j** Size target. The old PR's 28,991 insertions are a reference point, and they are no longer a baseline to subtract from, because the fleet writes the new branch rather than trims the old one (7g). The target is a ceiling of about **15,000** insertions, with production source at or below **6,100**. These items are why the number falls:
 
-- −2,593 docs
-- −~2,700 enforcement src+tests
-- −~230 redirect+fork
-- −~600 resolution machinery + bar list, with their tests
-- −~4,500 test rewrite
-- −~500 misc consolidation
+- The docs move out: about 2,600.
+- No enforcement stack: about 2,700 with its tests.
+- No redirect and no fork exemption: about 230.
+- No resolution machinery and no bar list: about 600 with their tests.
+- A directed test suite instead of an accreted one: about 4,500.
+- No per-fix consolidation scar tissue: about 500.
 
-Honest caveat: the test line is an estimate, not a target (3g). The floor depends on how much coverage the behavior inventory demands, and the inventory wins.
+Two honest caveats. First, the test line is an estimate and not a target (3g); the coverage gate wins over the ceiling. Second, from-scratch code should land BELOW the assembled estimate, because the fleet never writes the intermediate states that three review waves left behind. The earlier arithmetic gap between this headline and the item list no longer matters, because neither number is a subtraction now.
 
 **3k** **Pi is not a routed harness (RESOLVED 2026-08-01; Bryan: "for now").** Smart-routing eligibility requires a gateway-backed family. That requirement includes the mid-session toggle on ChatPage (`isCostRoutingEligible`). `gateway_inference` reports only the claude and codex families, so pi leaves the routed set. This closes a real hole: a pi session could turn Smart Routing on and pass the gateway rule vacuously, because the rule never saw pi's family. Two consequences follow. The rewrite cuts the bar list (~137 lines plus plumbing), because pi was its only consumer. Our layered-redirect diff against main goes to about zero, because main's wire-compat redirect function stays as main wrote it. The door stays open for later. This PR does no pi work.
 
+**3l** Under the from-scratch method (7g), every entry in this section reads as "do not build this", and not as "delete this". The negative numbers are therefore budget that the fleet does not spend, and they are not deletions from a diff. The reasoning per entry does not change.
+
 ## 4. Shape of the rewritten branch
 
-**4a** Method: assemble the branch, do not re-implement it. Start a new branch from current origin/main. Bring over the final tree per area, minus the cut list. Hand-reconcile only where main moved again; expect drift in the `smart_routing.py`-adjacent files, because main gained 107 more commits since the last rebase. Every commit is a working slice with its tests.
+**4a** Method: write the branch from scratch (7g). Start a new branch from current origin/main. Build each slice against the 2a–2e specification and the 0c inputs. Never copy a file wholesale from `routing-mvp-v1`; read it, and then write the new version. One benefit is large. The reconciliation that dominated the last rebase disappears, because the fleet writes against main's current mechanisms from the start: its catalog plumbing, its wire-compat redirect, and its judge rubric. No "our contracts versus main's mechanisms" merge exists any more. Every commit is a working slice with its tests.
 
 **4b** Proposed series (~9 commits). Tests ride inside each commit; there is no separate test commit.
 
@@ -98,11 +108,13 @@ Honest caveat: the test line is an estimate, not a target (3g). The floor depend
 
 **4d** One follow-up PR is planned: **telemetry integration for the Databricks-managed deployment.** The OSS analytics events ship unchanged in this PR (3e). The managed side wires those events into the managed telemetry pipeline after merge. That work happens alongside the managed plugin swap that commit 1 prepares (2a). This block is a placeholder for that work. It is *not* the enforcement follow-up: 3b cuts that stack outright and schedules nothing.
 
+**4e** The from-scratch method moves where the risk sits. An assembled branch carries its integration risk in the merge. A from-scratch branch carries that risk at the end, when nine independently written slices first run together. Two rules contain it. First, slices 1–3 (the routing core, persistence, and orchestration) land and pass their gate BEFORE slices 4–6 start, because every later slice depends on the shape of the seam and of the decision record. Second, no slice enters the series with a failing test (6e). The fleet works in ONE worktree with the file-ownership partition (6a), so a later slice always builds on real code and never on a stub.
+
 ## 5. CLI fixes integration
 
-**5a** Sequencing rule: the CLI worktree merges into `routing-mvp` FIRST, and Bryan's other session owns that merge. The matrix re-runs on the merged tree. Only then does the rewrite assembly start, because the rewrite must never race an inbound merge. **Both halves are now in** (`907f8886`, then `8f3c0c60`/`6f2893d9` + `8d7c9cb2` + `b10a7239`), so nothing further is inbound from that worktree. The *verification* is still owed. The CLI surface is unit-verified only, so the re-run must add the `CUJ_STATUS.md` §2.10 rows (recipe **R10**) alongside the 15-row matrix.
+**5a** Sequencing rule: the CLI worktree merges into `routing-mvp` FIRST, and Bryan's other session owns that merge. The matrix re-runs on the merged tree. Only then does the rewrite build start, because the specification branch must stop moving before the fleet writes against it. **Both halves are now in** (`907f8886`, then `8f3c0c60`/`6f2893d9` + `8d7c9cb2` + `b10a7239`), so nothing further is inbound from that worktree. The *verification* is still owed. The CLI surface is unit-verified only, so the re-run must add the `CUJ_STATUS.md` §2.10 rows (recipe **R10**) alongside the 15-row matrix.
 
-**5b** In the rewrite, the CLI is commit 8 (4b). The tier-2 server half is already a **separate** commit, so the split is mechanical rather than a hand-untangling job. `8f3c0c60` touches only `orchestration.py` plus its test, and it goes into commit 3 verbatim. `8d7c9cb2` touches **no** server file, and it goes into commit 8 verbatim. `8d7c9cb2` also did **not** extend `_resolve_native_smart_routing`. The fixed-harness route is a parallel path (`_fixed_native_routing_harness` + `_resolve_fixed_native_model_routing`). The only edit to the auto path is a refactor that lifts its authorize-first host lookup into the shared `_routing_host_for_create`. The assembler must keep that helper, because both create paths now call it. A drop would undo the §4.3d authorization-order fix.
+**5b** In the rewrite, the CLI is commit 8 (4b). The two CLI commits are **specifications, not patches to apply** (7g). `8f3c0c60` specifies commit 3's server behavior, and `8d7c9cb2` specifies commit 8's CLI behavior. The split is clean, because `8f3c0c60` touches only `orchestration.py` plus its test, and `8d7c9cb2` touches **no** server file. `8d7c9cb2` also did **not** extend `_resolve_native_smart_routing`. The fixed-harness route is a parallel path (`_fixed_native_routing_harness` + `_resolve_fixed_native_model_routing`). One trap must survive the rewrite. Both create paths share `_routing_host_for_create`, and that helper authorizes the host BEFORE it looks the host up. The new code keeps that order, because the reverse order is the §4.3d authorization bug.
 
 ## 6. Execution and verification
 
@@ -116,7 +128,7 @@ Honest caveat: the test line is an estimate, not a target (3g). The floor depend
 
 6c defines the evidence bars for these checks. 6d names the recipes. 6e scopes each verification run.
 
-**6b** The old branch survives as `routing-mvp-v1`, like `routing-mvp-backup` before it. The PR either force-pushes or opens fresh, and Bryan makes that call at handoff time.
+**6b** The old branch survives as `routing-mvp-v1`, like `routing-mvp-backup` before it. Under the from-scratch method it is more than a backup. It is the reference implementation and the behavioral oracle (0c), so the fleet keeps it checked out in a sibling worktree for the whole build. The PR either force-pushes or opens fresh, and Bryan makes that call at handoff time.
 
 **6c** The evidence bars. A behavior counts as verified only when it clears the bar for its layer:
 
@@ -135,7 +147,9 @@ Honest caveat: the test line is an estimate, not a target (3g). The floor depend
 3. After slice 8, when the CLI is in: the R10 rows from `CUJ_STATUS.md` §2.10.
 4. After slice 9, when the web is in: the three 2e surfaces plus the model-indicator fix, by hand on a live stack, and R9's gating flip in both directions.
 
-The final gate before anything replaces #3506 is 6a's five items, run once on the assembled branch.
+The final gate before anything replaces #3506 is 6a's five items, run once on the finished branch.
+
+**6f** Evidence does not transfer. Every ✅ in `CUJ_STATUS.md` attests to the OLD tree, and the new branch inherits none of it. The fleet therefore resets every row to unverified, and it earns each row again. Two consequences follow. The verification tail grows rather than shrinks, and 6e's four runs become the only proof that the new branch works. The registry's own update contract still applies: a status changes only with named evidence, a date, and a commit.
 
 ## 7. Bryan's critique — the decisions
 
@@ -156,3 +170,5 @@ The final gate before anything replaces #3506 is 6a's five items, run once on th
 See 3i and 3k. Bryan closed the last assumptions on 2026-08-01: the gpt and glm families fall back to luna (`databricks-gpt-5-6-luna`, itself a frozen arm); the claude fallback follows the `sonnet` alias pin (today `databricks-claude-sonnet-5`); terra is out. No open assumptions remain.
 
 **7f** Two items entered the plan from the same critique, rather than leaving it. Managed-plugin readiness is a commit-1 requirement (2a, 4b). The in-session model indicator is a must-fix bug (2e).
+
+**7g** **RESOLVED (2026-08-02): a complete rewrite from scratch.** Bryan: keep the code as clean as possible. The fleet writes new code against the 2a–2e specification, and it does not move code from `routing-mvp`. This decision reverses the earlier rule, which said "assemble the branch, do not re-implement it". Five blocks carry the consequences: 0b holds the constraint, 0c holds the required inputs, 0d holds the transcribe rule, 4a holds the method, and 6f holds the evidence reset. The rest of the plan survives the reversal in substance. The cut list still says what not to ship, the 4b commit series is now a build order rather than a slicing order, and the verification plan (6a–6f) is unchanged except that it now carries the whole safety burden.
