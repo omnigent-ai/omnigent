@@ -221,7 +221,11 @@ def build_opencode_omnigent_mcp_server(
         raise ValueError("Claude MCP server config is malformed")
     command = server.get("command")
     args = server.get("args", [])
-    if not isinstance(command, str) or not isinstance(args, list):
+    if (
+        not isinstance(command, str)
+        or not isinstance(args, list)
+        or not all(isinstance(arg, str) for arg in args)
+    ):
         raise ValueError("Claude MCP server command is malformed")
     entry: dict[str, object] = {
         "type": "local",
@@ -229,7 +233,14 @@ def build_opencode_omnigent_mcp_server(
         "enabled": True,
     }
     env_value = server.get("env")
-    env = dict(env_value) if isinstance(env_value, dict) else {}
+    if env_value is None:
+        env: dict[str, str] = {}
+    elif isinstance(env_value, dict) and all(
+        isinstance(key, str) and isinstance(value, str) for key, value in env_value.items()
+    ):
+        env = dict(env_value)
+    else:
+        raise ValueError("Claude MCP server environment is malformed")
     if env:
         entry["environment"] = env
     return {str(name): entry}
