@@ -20,9 +20,11 @@ import logging
 import os
 from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
+
+from omnigent import model_catalog
 
 if TYPE_CHECKING:
     from openai import OpenAI, Stream
@@ -318,6 +320,11 @@ class DatabricksAuthError(OSError):
     """
 
 
+class _DatabricksAuthConfig(Protocol):
+    def authenticate(self) -> dict[str, str]:
+        raise NotImplementedError
+
+
 class _DatabricksBearerAuth(httpx.Auth):
     """httpx Auth that calls ``Config.authenticate()`` on every HTTP request.
 
@@ -338,7 +345,7 @@ class _DatabricksBearerAuth(httpx.Auth):
 
     def __init__(
         self,
-        config: Any,  # type: ignore[explicit-any]
+        config: _DatabricksAuthConfig,
         profile_name: str | None = None,
         failure_message: str | None = None,
     ) -> None:
@@ -783,7 +790,7 @@ def _convert_messages(
     return result
 
 
-def _extract_stream_text_delta(content: Any) -> str:
+def _extract_stream_text_delta(content: object) -> str:
     """
     Extract assistant-visible text from a Chat Completions stream delta.
 
@@ -897,7 +904,12 @@ class DatabricksExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model
         if not model:
-            model = "databricks-claude-sonnet-4-6"
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="claude",
+            )
+            model = resolution.model_id
         session_key = self._session_key(messages)
         state = self._get_or_create_session_state(session_key)
         state.interrupt_requested = False

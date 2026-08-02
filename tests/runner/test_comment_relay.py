@@ -594,3 +594,131 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
         assert result == {"items": []}, f"Expected parsed Omnigent response dict, got {result!r}."
     finally:
         shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_terminal_launch_writes_session_id_into_tool_relay_json(
+    relay_env: _RelayEnv,
+) -> None:
+    """tool_relay.json written by bridge_inject_dir launch contains session_id."""
+    resp = await _launch_terminal(relay_env.client, relay_env.session_id, bridge_inject_dir=True)
+    assert resp.status_code == 200, f"terminal launch failed: {resp.text}"
+
+    relay_file = relay_env.bridge_dir / _TOOL_RELAY_FILE
+    assert relay_file.exists(), "tool_relay.json was not written"
+    info = json.loads(relay_file.read_text())
+    assert info.get("session_id") == relay_env.session_id, (
+        f"session_id missing or wrong in tool_relay.json: {info}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_policy_evaluate_proxies_to_server_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay POST /policies/evaluate forwards body to server_client and returns verdict."""
+    import asyncio
+
+    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
+    from omnigent.claude_native_bridge import start_tool_relay
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+
+    bridge_dir = _prep("relay-policy-test", workspace=tmp_path)
+    session_id = "conv_relay_test"
+
+    captured: dict[str, object] = {}
+
+    class _CapturingServerClient:
+        """Fake server_client that records the /policies/evaluate POST."""
+
+        content = b'{"result":"POLICY_ACTION_DENY","reason":"blocked"}'
+        status_code = 200
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+
+        async def post(self, url: str, **kwargs: object) -> _CapturingServerClient:
+            captured["url"] = url
+            captured["json"] = kwargs.get("json")
+            return self
+
+    server_client = _CapturingServerClient()
+    loop = asyncio.get_running_loop()
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=loop,
+        policy_client=server_client,
+        session_id=session_id,
+    )
+    try:
+        relay_info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+        relay_url = relay_info["url"]
+        relay_token = relay_info["token"]
+
+        eval_body = {"event": {"type": "PHASE_TOOL_CALL", "target": "", "data": {"name": "Bash"}}}
+
+        async with httpx.AsyncClient() as c:
+            resp = await c.post(
+                f"{relay_url}/policies/evaluate",
+                json=eval_body,
+                headers={"Authorization": f"Bearer {relay_token}"},
+                timeout=5.0,
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["result"] == "POLICY_ACTION_DENY"
+        # Verify proxy forwarded to server_client at the correct path.
+        assert captured.get("url") == f"/v1/sessions/{session_id}/policies/evaluate"
+        assert captured.get("json") == eval_body
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_policy_evaluate_rejects_wrong_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay /policies/evaluate returns 401 for wrong bearer token."""
+    import asyncio
+
+    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
+    from omnigent.claude_native_bridge import start_tool_relay
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+
+    bridge_dir = _prep("relay-policy-auth-test", workspace=tmp_path)
+
+    class _NeverCalledClient:
+        async def post(self, *a: object, **kw: object) -> object:
+            raise AssertionError("server_client.post should not be called on auth failure")
+
+    loop = asyncio.get_running_loop()
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=loop,
+        policy_client=_NeverCalledClient(),
+        session_id="conv_auth_test",
+    )
+    try:
+        relay_url = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())["url"]
+
+        async with httpx.AsyncClient() as c:
+            resp = await c.post(
+                f"{relay_url}/policies/evaluate",
+                json={"event": {}},
+                headers={"Authorization": "Bearer wrong-token"},
+                timeout=5.0,
+            )
+
+        assert resp.status_code == 401
+    finally:
+        relay.close()

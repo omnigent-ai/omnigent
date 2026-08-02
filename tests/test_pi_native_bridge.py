@@ -330,3 +330,38 @@ def test_refresh_config_auth_headers_preserves_launch_written_headers(tmp_path: 
     assert payload["authHeaders"]["Authorization"] == "Bearer fresh"
     # Tunnel token written at launch is preserved across the bearer rotation.
     assert payload["authHeaders"]["X-Omnigent-Runner-Tunnel-Token"] == "tunnel-tok"
+
+
+def test_inject_relay_into_config_writes_relay_fields(tmp_path: Path) -> None:
+    """inject_relay_into_config writes relayUrl and relayToken into config.json."""
+    from omnigent import pi_native_bridge
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_test",
+        server_url="http://127.0.0.1:6767",
+        conversation_url="http://127.0.0.1:6767/c/conv_test",
+        auth_headers={"Authorization": "Bearer old"},
+    )
+
+    updated = pi_native_bridge.inject_relay_into_config(
+        bridge_dir, "http://127.0.0.1:9999", "relay-tok"
+    )
+
+    assert updated is True
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    assert payload["relayUrl"] == "http://127.0.0.1:9999"
+    assert payload["relayToken"] == "relay-tok"
+    # Existing fields are preserved.
+    assert "serverUrl" in payload
+
+
+def test_inject_relay_into_config_noops_when_config_absent(tmp_path: Path) -> None:
+    """inject_relay_into_config returns False when config.json is missing."""
+    from omnigent import pi_native_bridge
+
+    bridge_dir = tmp_path / "missing"
+    bridge_dir.mkdir()
+    assert pi_native_bridge.inject_relay_into_config(bridge_dir, "http://x", "tok") is False

@@ -61,9 +61,15 @@ interface PermissionsModalProps {
   sessionId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  canDelegateApprovals?: boolean;
 }
 
-export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsModalProps) {
+export function PermissionsModal({
+  sessionId,
+  open,
+  onOpenChange,
+  canDelegateApprovals = false,
+}: PermissionsModalProps) {
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
   // server-side gate is the real enforcement point regardless.
@@ -99,8 +105,9 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
     const trimmed = newUserId.trim();
     if (!trimmed) return;
     setError(null);
+    const canApprove = newLevel === "2-approve";
     grant.mutate(
-      { userId: trimmed, level: parseInt(newLevel, 10) },
+      { userId: trimmed, level: canApprove ? 2 : parseInt(newLevel, 10), canApprove },
       {
         onSuccess: () => {
           setNewUserId("");
@@ -118,9 +125,9 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
     });
   }
 
-  function handleChangeLevel(userId: string, level: number) {
+  function handleChangeLevel(userId: string, level: number, canApprove: boolean) {
     setError(null);
-    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
+    grant.mutate({ userId, level, canApprove }, { onError: (err) => setError(err.message) });
   }
 
   function handlePublicToggle(checked: boolean) {
@@ -212,6 +219,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
                     onChangeLevel={handleChangeLevel}
                     busy={grant.isPending || revoke.isPending}
                     readOnly={sharingReadOnly}
+                    canDelegateApprovals={canDelegateApprovals}
                   />
                 ))}
               </div>
@@ -239,6 +247,9 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
                 <SelectItem value="1">Read</SelectItem>
                 {/* Read-only sharing caps new grants at view; hide Edit. */}
                 {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                {!sharingReadOnly && canDelegateApprovals && (
+                  <SelectItem value="2-approve">Edit + approve</SelectItem>
+                )}
               </SelectContent>
             </Select>
           </div>
@@ -247,6 +258,12 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             Grant
           </Button>
         </form>
+
+        {canDelegateApprovals && !sharingReadOnly && (
+          <p className="text-xs text-muted-foreground">
+            Approvers can authorize actions that use your session credentials.
+          </p>
+        )}
 
         {error && <p className="text-xs text-destructive">{error}</p>}
 
@@ -568,12 +585,14 @@ function GrantRow({
   onChangeLevel,
   busy,
   readOnly,
+  canDelegateApprovals,
 }: {
   permission: Permission;
   onRevoke: (userId: string) => void;
-  onChangeLevel: (userId: string, level: number) => void;
+  onChangeLevel: (userId: string, level: number, canApprove: boolean) => void;
   busy: boolean;
   readOnly: boolean;
+  canDelegateApprovals: boolean;
 }) {
   const isOwner = permission.level === 4;
   // Manage is not grantable from the UI, so a pre-existing manage grant
@@ -582,7 +601,10 @@ function GrantRow({
   const isManage = permission.level === 3;
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
-  const fixedLevel = isOwner || isManage || readOnly;
+  const fixedLevel =
+    isOwner || isManage || readOnly || (permission.can_approve && !canDelegateApprovals);
+  const baseLevelLabel = LEVEL_LABELS[permission.level] ?? "Read";
+  const levelLabel = permission.can_approve ? `${baseLevelLabel} + approve` : baseLevelLabel;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
@@ -594,12 +616,15 @@ function GrantRow({
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
-          {LEVEL_LABELS[permission.level] ?? "Read"}
+          {levelLabel}
         </span>
       ) : (
         <Select
-          value={String(permission.level)}
-          onValueChange={(v) => onChangeLevel(permission.user_id, parseInt(v, 10))}
+          value={permission.can_approve ? "2-approve" : String(permission.level)}
+          onValueChange={(value) => {
+            const canApprove = value === "2-approve";
+            onChangeLevel(permission.user_id, canApprove ? 2 : parseInt(value, 10), canApprove);
+          }}
           disabled={busy}
         >
           <SelectTrigger
@@ -611,6 +636,7 @@ function GrantRow({
           <SelectContent>
             <SelectItem value="1">Read</SelectItem>
             <SelectItem value="2">Edit</SelectItem>
+            {canDelegateApprovals && <SelectItem value="2-approve">Edit + approve</SelectItem>}
           </SelectContent>
         </Select>
       )}

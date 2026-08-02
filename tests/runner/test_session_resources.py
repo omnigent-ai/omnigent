@@ -2195,7 +2195,9 @@ async def test_claude_terminal_ensure_concurrent_calls_create_once(
         terminal_ready = True
         return fake_view
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", fake_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", fake_auto_create
+    )
 
     async def fake_get_terminal_resource(
         self: Any,

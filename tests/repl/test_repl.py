@@ -3047,3 +3047,96 @@ def test_resume_hint_appends_resume_flag_to_invocation_parts() -> None:
         "--harness claude-sdk "
         "--resume conv_abc"
     )
+
+
+def _openai_key_default_config() -> dict[str, object]:
+    """A config whose openai key default the unmapped fallback used to fabricate."""
+    return {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": "openai",
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "$OPENAI_API_KEY",
+                    "models": {"default": "gpt-5.5"},
+                },
+            }
+        }
+    }
+
+
+def test_model_readout_own_auth_acp_harness_reports_agent_not_provider() -> None:
+    """
+    Own-auth ACP harnesses must not report an Omnigent provider credential.
+
+    ``acp``/``acp:<slug>`` and ``goose`` spawn without any Omnigent provider
+    wiring, but ``default_provider_for_harness`` used to fall through to the
+    configured key/gateway default for them (the unmapped pi-style fallback),
+    so the readout named a model and credential the session never touches.
+    A failure here means that fabrication is back.
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "acp:droid", "goose"):
+        lines = _build_model_readout_lines(config, harness, None)
+        assert any("ACP agent" in line for line in lines), (harness, lines)
+        assert not any("API Key" in line for line in lines), (harness, lines)
+        assert not any("gpt-5.5" in line for line in lines), (harness, lines)
+
+
+def test_model_readout_own_auth_acp_harness_shows_live_override() -> None:
+    """
+    An in-session ``/model`` override is real state and must stay visible.
+
+    The runner forwards it to these harnesses (``model_env_keys()`` covers
+    acp/goose; goose applies it as ``GOOSE_MODEL``), so the readout may not
+    hide it or claim the model can't be changed.
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "goose"):
+        lines = _build_model_readout_lines(config, harness, "qwen3-coder-plus")
+        assert any("qwen3-coder-plus" in line for line in lines), (harness, lines)
+        assert not any("does not reach" in line for line in lines), (harness, lines)
+
+
+def test_model_readout_qwen_still_names_routed_provider() -> None:
+    """
+    qwen is provider-routed, so its readout keeps naming the openai default.
+
+    ``_build_qwen_spawn_env`` injects the configured openai-family default
+    into the qwen subprocess (see ``test_qwen_uses_openai_global_default``),
+    so for qwen — unlike acp/goose — the credential readout is truthful and
+    must not be declined as "own auth".
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    lines = _build_model_readout_lines(_openai_key_default_config(), "qwen", None)
+    assert any("OpenAI API Key" in line for line in lines), lines
+    assert not any("ACP agent" in line for line in lines), lines
+
+
+def test_describe_active_credential_declines_own_auth_acp_harnesses() -> None:
+    """
+    The resolver, not just the readout, must decline own-auth ACP harnesses.
+
+    ``_resolve_startup_header`` calls ``describe_active_credential``
+    independently of the ``/model`` readout, so fixing only the readout
+    would leave the startup banner naming the same wrong credential. The
+    config uses a key-kind default — the kind the unmapped fallback actually
+    fabricated (a subscription default was already skipped, so it can't pin
+    this fix).
+    """
+    from omnigent.onboarding.provider_config import describe_active_credential
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "acp:droid", "goose"):
+        assert describe_active_credential(config, harness) is None, harness
+    # Provider-routed harnesses on the same config still resolve, proving the
+    # short-circuit is scoped to own-auth ACP spawns and didn't blank the
+    # resolver: qwen consumes the openai family at spawn.
+    qwen_cred = describe_active_credential(config, "qwen")
+    assert qwen_cred is not None and qwen_cred.provider_name == "openai"

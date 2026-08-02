@@ -6,7 +6,7 @@ const { FakeWorkbox } = vi.hoisted(() => {
   class FakeWorkboxImpl {
     static instances: FakeWorkboxImpl[] = [];
     scriptURL: string;
-    listeners: Record<string, Array<() => void>> = {};
+    listeners: Record<string, (() => void)[]> = {};
     register = vi.fn().mockResolvedValue(undefined);
     messageSkipWaiting = vi.fn();
     constructor(scriptURL: string) {

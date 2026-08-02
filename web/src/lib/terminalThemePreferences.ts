@@ -81,8 +81,8 @@ export function resolveTerminalIsDark(mode: TerminalThemeMode, appIsDark: boolea
     case "dark":
       return true;
     default: {
-      const _exhaustive: never = mode;
-      return _exhaustive;
+      const exhaustive: never = mode;
+      return exhaustive;
     }
   }
 }

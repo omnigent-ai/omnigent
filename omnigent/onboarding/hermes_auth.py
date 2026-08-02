@@ -80,7 +80,7 @@ class HermesConfigSummary:
         return self.provider or self.model or "Configured"
 
 
-def _model_section() -> dict:
+def _model_section() -> dict[str, object]:
     """Return the ``model`` mapping from ``~/.hermes/config.yaml`` (best-effort).
 
     Returns ``{}`` on a missing file, parse failure, or a non-mapping top-level
@@ -97,7 +97,9 @@ def _model_section() -> dict:
     if not isinstance(data, dict):
         return {}
     model = data.get("model")
-    return model if isinstance(model, dict) else {}
+    if not isinstance(model, dict):
+        return {}
+    return {key: value for key, value in model.items() if isinstance(key, str)}
 
 
 def hermes_config_summary() -> HermesConfigSummary:

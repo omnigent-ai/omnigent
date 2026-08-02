@@ -444,7 +444,14 @@ describe("useStopAndDeleteConversation cache eviction", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     } satisfies Session);
+    // The deleted session is also pinned. The Pinned section reads a sibling
+    // cache the ["conversations"] sweep skips, so delete must drop it here too.
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: [conversation({ id: "conv_x" }), conversation({ id: "conv_pinned_other" })],
+      filterHonored: true,
+    });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const rendered = renderHook(() => useStopAndDeleteConversation(), { wrapper });
@@ -495,6 +502,21 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The open-chat snapshot must go too so a later visit to /c/{id}
     // can't render the deleted session from cache.
     expect(queryClient.getQueryData(["session", "conv_x"])).toBeUndefined();
+  });
+
+  it("drops a deleted pinned session from the sibling pinned cache", async () => {
+    const { queryClient, rendered } = seedAndDelete();
+
+    rendered.result.current.mutate({ id: "conv_x" });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // The Pinned section renders from PINNED_CONVERSATIONS_KEY, a sibling of
+    // ["conversations"] that the delete sweep deliberately skips — so without
+    // an explicit patch the deleted row lingers in Pinned until a reload.
+    const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+    expect(pinned!.conversations.map((c) => c.id)).toEqual(["conv_pinned_other"]);
+    // The patch preserves the query's filterHonored flag.
+    expect(pinned!.filterHonored).toBe(true);
   });
 
   it("does not refetch the conversations list, but does refresh the project list", async () => {
@@ -554,6 +576,7 @@ describe("useRenameConversation cache patching", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     } satisfies Session);
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
@@ -1192,7 +1215,13 @@ describe("useBulkArchiveConversations", () => {
     rendered.result.current.mutate({ ids: ["conv_a", "conv_b"], archived: true });
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
 
-    expect((rendered.result.current.error as any).failed).toEqual(["conv_b"]);
+    expect(rendered.result.current.error).toBeInstanceOf(Error);
+    expect(rendered.result.current.error).toMatchObject({
+      message: "Failed to archive 1 of 2 conversations",
+      failed: ["conv_b"],
+      succeeded: [],
+      total: 2,
+    });
   });
 });
 
@@ -1249,6 +1278,13 @@ describe("useBulkDeleteConversations", () => {
     expect(ids).not.toContain("conv_a");
     expect(ids).toContain("conv_b");
     expect(ids).toContain("conv_keep");
+    expect(rendered.result.current.error).toBeInstanceOf(Error);
+    expect(rendered.result.current.error).toMatchObject({
+      message: "Failed to delete 1 of 2 conversations",
+      failed: ["conv_b"],
+      succeeded: ["conv_a"],
+      total: 2,
+    });
   });
 });
 
@@ -1291,9 +1327,13 @@ describe("useBulkStopSessions", () => {
     rendered.result.current.mutate(["conv_a", "conv_b"]);
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
 
-    const err = rendered.result.current.error as any;
-    expect(err.succeeded).toEqual(["conv_a"]);
-    expect(err.failed).toEqual(["conv_b"]);
+    expect(rendered.result.current.error).toBeInstanceOf(Error);
+    expect(rendered.result.current.error).toMatchObject({
+      message: "Failed to stop 1 of 2 conversations",
+      failed: ["conv_b"],
+      succeeded: ["conv_a"],
+      total: 2,
+    });
   });
 });
 
@@ -1521,6 +1561,268 @@ describe("useMoveToProject", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
+
+  it("overlays the new membership from the cached project id before the network resolves", async () => {
+    // Hold the first request (the name→id resolution list) open: everything
+    // the assertions below observe happened purely from the onMutate overlay.
+    let resolveList: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveList = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_sprint",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    // The move UI rendered its targets from this cache — the overlay resolves
+    // the clicked name to an id from the same place, without a network trip.
+    queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move", labels: { omni_project: "Old folder" } })]),
+    );
+    queryClient.setQueryData(
+      ["project-sessions", "Old folder"],
+      infinitePage([conversation({ id: "conv_move", labels: { omni_project: "Old folder" } })]),
+    );
+    queryClient.setQueryData(
+      ["project-sessions", "Sprint 42"],
+      infinitePage([conversation({ id: "conv_resident" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Sprint 42" });
+
+    // The row regroups before any response arrives: first-class id set, legacy
+    // label dropped (the sidebar dual-reads both, so a stale label would keep
+    // the row matched to its old folder at the same time).
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      const row = data!.pages[0].data.find((c) => c.id === "conv_move")!;
+      expect(row.project_id).toBe("p_sprint");
+      expect(row.labels).toEqual({});
+    });
+
+    // The old folder's pages drop the row immediately (no dual-show) …
+    const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Old folder",
+    ]);
+    expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_move")).toBeUndefined();
+    // … while the target's pages are NOT force-fed the row — the sidebar
+    // renders it there by unioning the overlaid flat-window row instead.
+    const targetFolder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(targetFolder!.pages[0].data.map((c) => c.id)).toEqual(["conv_resident"]);
+
+    resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("unfiles optimistically without needing the projects cache", async () => {
+    // "" needs no name→id resolution, so the held-open PATCH is the only call.
+    let resolvePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "" });
+
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      expect(data!.pages[0].data.find((c) => c.id === "conv_move")!.project_id).toBeNull();
+    });
+
+    resolvePatch(
+      mockResponse({
+        id: "conv_move",
+        object: "conversation",
+        title: "t",
+        created_at: 0,
+        updated_at: 1,
+        project_id: null,
+      }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("moves a folder-only row into the target folder's cache (no sidebar vanish)", async () => {
+    // A row loaded only through an expanded folder's own pagination is absent
+    // from every ["conversations"] page, so the folder union can't re-home it.
+    // The overlay must insert it into the target folder's cache in the same
+    // pass that removes it from the source folder's.
+    let resolveList: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveList = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_deep",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_sprint",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+    queryClient.setQueryData(["conversations", "", false], infinitePage([]));
+    queryClient.setQueryData(
+      ["project-sessions", "Old folder"],
+      infinitePage([conversation({ id: "conv_deep", project_id: "p_old" })]),
+    );
+    queryClient.setQueryData(
+      ["project-sessions", "Sprint 42"],
+      infinitePage([conversation({ id: "conv_resident" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
+
+    await waitFor(() => {
+      const target = queryClient.getQueryData<ConversationsInfiniteData>([
+        "project-sessions",
+        "Sprint 42",
+      ]);
+      const moved = target!.pages[0].data.find((c) => c.id === "conv_deep")!;
+      expect(moved.project_id).toBe("p_sprint");
+    });
+    const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Old folder",
+    ]);
+    expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_deep")).toBeUndefined();
+
+    resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("keeps a folder-only row in its source folder when nothing else can show it", async () => {
+    // Same deep row, but the target folder has never been expanded (no cache
+    // to insert into) — dropping the source copy would blank the row from the
+    // sidebar until the refetches land, so the removal must be skipped.
+    let resolveList: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveList = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_deep",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_sprint",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+    queryClient.setQueryData(["conversations", "", false], infinitePage([]));
+    queryClient.setQueryData(
+      ["project-sessions", "Old folder"],
+      infinitePage([conversation({ id: "conv_deep", project_id: "p_old" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
+    resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Old folder",
+    ]);
+    expect(oldFolder!.pages[0].data.map((c) => c.id)).toEqual(["conv_deep"]);
+  });
+
+  it("restores the previous membership when the PATCH fails", async () => {
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }),
+      )
+      .mockResolvedValueOnce(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        conversation({ id: "conv_move", project_id: "p_before", labels: { keep: "me" } }),
+      ]),
+    );
+    queryClient.setQueryData(
+      ["project-sessions", "Before folder"],
+      infinitePage([conversation({ id: "conv_move", project_id: "p_before" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Sprint 42" });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // A failed move must not leave the row stranded in the target folder.
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    const row = data!.pages[0].data.find((c) => c.id === "conv_move")!;
+    expect(row.project_id).toBe("p_before");
+    expect(row.labels).toEqual({ keep: "me" });
+    // The overlay dropped the row from its old folder's pages; the rollback
+    // must put it back (wholesale snapshot restore, not a field revert).
+    const folder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Before folder",
+    ]);
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_move"]);
+  });
 });
 
 describe("useArchiveConversation", () => {
@@ -1652,13 +1954,12 @@ describe("useDeleteProject", () => {
     result.current.mutate({ id: "p_1", name: "Sprint 42" });
     await waitFor(() => expect(result.current.isError).toBe(true));
 
-    const err = result.current.error as unknown as {
-      failed: string[];
-      succeeded: string[];
-      total: number;
-    };
-    expect(err.failed).toEqual(["conv_b"]);
-    expect(err.succeeded).toEqual(["conv_a"]);
-    expect(err.total).toBe(2);
+    expect(result.current.error).toBeInstanceOf(Error);
+    expect(result.current.error).toMatchObject({
+      message: "Failed to archive and unfile 1 of 2 conversations",
+      failed: ["conv_b"],
+      succeeded: ["conv_a"],
+      total: 2,
+    });
   });
 });

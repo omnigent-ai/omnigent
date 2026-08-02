@@ -47,7 +47,7 @@ import {
 import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import {
-  __resetReadStateForTests,
+  resetReadStateForTests,
   markConversationSeen,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
@@ -139,7 +139,7 @@ beforeEach(() => {
   // NOT mocked); start each test with a clean slate, and seed an empty list
   // to flip `hydrated` so markConversationSeen writes (it is gated until the
   // first seed to avoid the reload-clobber race).
-  __resetReadStateForTests();
+  resetReadStateForTests();
   seedReadState([]);
 });
 

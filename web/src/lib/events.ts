@@ -287,7 +287,7 @@ export interface NativeToolCall {
 /** The final assistant message from `output_item.done` (type `message`). */
 export interface MessageDone {
   type: "message_done";
-  content: Array<Record<string, unknown>>;
+  content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
 }
@@ -565,11 +565,11 @@ export interface SessionAgentChangedEvent {
 export interface SessionTodosEvent {
   type: "session_todos";
   conversationId: string;
-  todos: Array<{
+  todos: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
 }
 
 /**

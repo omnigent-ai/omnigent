@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+
 from sqlalchemy import and_, asc, desc, or_, select
 
 from omnigent.db.db_models import SqlFile, current_workspace_id, normalize_uuid
@@ -202,7 +204,7 @@ class SqlAlchemyFileStore(FileStore):
             session.delete(row)
             return True
 
-    def delete_all_for_session(self, session_id: str) -> list[str]:
+    def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
         """
         Delete all file metadata for a session.
 

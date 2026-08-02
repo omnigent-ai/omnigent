@@ -131,9 +131,11 @@ def _harnesses_body() -> str:
                     },
                     {
                         "kind": "auth",
-                        "title": "Sign in to Codex",
-                        "detail": "Uses your ChatGPT subscription — sign in on the host.",
-                        "action": "command",
+                        "title": "Set up authentication",
+                        "detail": (
+                            "Sign in with your ChatGPT subscription, an API key, or a gateway."
+                        ),
+                        "action": "auth",
                         "command": "codex login",
                         "status_key": "authed",
                     },

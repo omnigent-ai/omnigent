@@ -73,6 +73,7 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
         "source": "claude",
         "external_session_id": session_id,
         "workspace": "/repo",
+        "force": False,
         "items": [
             {
                 "type": "message",
@@ -84,6 +85,30 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
             }
         ],
     }
+
+
+@respx.mock
+def test_import_command_sends_force_override(tmp_path: Path) -> None:
+    """The force flag asks the server to replace the previous source import."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345679"
+    _write_claude_transcript(tmp_path, session_id, text="updated prompt")
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_replaced", "status": "imported", "item_count": 1},
+        )
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "claude", "--session", session_id, "--force"],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls.last.request.content)["force"] is True
+    assert "conv_replaced" in result.output
 
 
 def test_import_command_rejects_cursor() -> None:

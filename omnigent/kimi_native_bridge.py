@@ -19,9 +19,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
 
 from omnigent._platform import stable_user_id
+from omnigent.json_types import JsonObject as _JsonObject
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
@@ -116,7 +116,7 @@ def write_hook_config(
     os.replace(tmp, bridge_dir / _HOOK_CONFIG_FILE)
 
 
-def read_hook_config(bridge_dir: Path) -> dict[str, Any]:
+def read_hook_config(bridge_dir: Path) -> _JsonObject:
     """Read Omnigent routing details for the kimi hook subprocess.
 
     :param bridge_dir: The kimi-native bridge dir.
@@ -153,7 +153,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running Kimi terminal."""
     _ensure_dir(bridge_dir)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),

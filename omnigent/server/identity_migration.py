@@ -35,8 +35,10 @@ grants we still need).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import cast
 
 from sqlalchemy import Engine, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
@@ -211,23 +213,29 @@ def remap_identities(
                 (SqlComment, SqlComment.created_by),
                 (SqlPolicy, SqlPolicy.created_by),
             ):
-                result = session.execute(
-                    update(model)
-                    .where(model.workspace_id == current_workspace_id(), column == old_id)
-                    .values(created_by=new_id)
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        update(model)
+                        .where(model.workspace_id == current_workspace_id(), column == old_id)
+                        .values(created_by=new_id)
+                    ),
                 )
                 report._bump(model.__tablename__, result.rowcount or 0)
 
             # account_tokens has two id columns to repoint.
             for column_name in ("user_id", "created_by"):
                 column = getattr(SqlAccountToken, column_name)
-                result = session.execute(
-                    update(SqlAccountToken)
-                    .where(
-                        SqlAccountToken.workspace_id == current_workspace_id(),
-                        column == old_id,
-                    )
-                    .values(**{column_name: new_id})
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        update(SqlAccountToken)
+                        .where(
+                            SqlAccountToken.workspace_id == current_workspace_id(),
+                            column == old_id,
+                        )
+                        .values(**{column_name: new_id})
+                    ),
                 )
                 report._bump(SqlAccountToken.__tablename__, result.rowcount or 0)
 

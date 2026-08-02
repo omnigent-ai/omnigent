@@ -135,6 +135,9 @@ from omnigent.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
 from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 
@@ -198,7 +201,8 @@ def run_antigravity_native(
     *,
     server: str | None,
     session_id: str | None,
-    antigravity_args: tuple[str, ...] = (),
+    extra_args: tuple[str, ...] | None = None,
+    antigravity_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str | None = None,
     model: str | None = None,
@@ -237,6 +241,9 @@ def run_antigravity_native(
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup, launch, or attach fails.
     """
+    antigravity_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=antigravity_args, legacy_param="antigravity_args"
+    )
     resolved_command = (command or agy_binary_path()).strip()
     if not resolved_command:
         raise click.ClickException("Antigravity command must not be empty.")

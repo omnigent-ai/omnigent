@@ -41,7 +41,7 @@ function focusOwnsHotkey(): boolean {
  * @param enabled  Pass `false` to skip binding (e.g. the secondary composer in
  *   the New Chat dialog, so two mics don't fight for the device). Defaults on.
  */
-export function useVoiceDictationHotkey(onToggle: () => void, enabled: boolean = true): void {
+export function useVoiceDictationHotkey(onToggle: () => void, enabled = true): void {
   // Held in a ref so the bound handler always calls the latest closure without
   // re-registering on every render (onToggle changes as listening state flips).
   const latest = useRef(onToggle);

@@ -90,11 +90,11 @@ impl Pod {
         self.repo_root.join("web")
     }
 
-    /// Whether `web/` needs `npm install` before Vite can start: either
+    /// Whether `web/` needs `pnpm install` before Vite can start: either
     /// `node_modules/` is absent, or the lockfile / `package.json` is newer
     /// than the installed tree (a dependency was added/changed since the last
     /// install — the case that makes Vite's dependency scan fail).
-    pub fn needs_npm_install(&self) -> bool {
+    pub fn needs_pnpm_install(&self) -> bool {
         let web = self.web_dir();
         let modules = web.join("node_modules");
         if !modules.is_dir() {
@@ -105,7 +105,7 @@ impl Pod {
             return true;
         };
         // Reinstall if either manifest is newer than node_modules.
-        [web.join("package-lock.json"), web.join("package.json")]
+        [self.repo_root.join("pnpm-lock.yaml"), web.join("package.json")]
             .into_iter()
             .filter_map(mtime)
             .any(|t| t > installed)
@@ -123,7 +123,7 @@ impl Pod {
     /// The env overrides applied on top of the inherited parent env for every
     /// child. We isolate omnigent's own state — the DB, data dir, and config
     /// home — so concurrent pods don't share a database, pidfile, or
-    /// `config.yaml`. The rest (real `HOME`, credentials, uv/npm caches) is
+    /// `config.yaml`. The rest (real `HOME`, credentials, uv/pnpm caches) is
     /// inherited, since the agents omnigent runs need it. `OMNIGENT_URL` is the
     /// seam `web/vite.config.ts` reads to point its proxy at this pod's backend;
     /// `OMNIGENT_CONFIG_HOME` is where the server/host/runner read `config.yaml`.

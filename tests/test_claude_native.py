@@ -8,6 +8,7 @@ import importlib.metadata
 import io
 import json
 import os
+import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,16 @@ from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
 
 
 def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
@@ -289,7 +300,7 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
         env={
             "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            "CLAUDE_CODE_USE_GATEWAY": "1",
         },
         api_key_helper="printf token",
         model="databricks-claude-opus-test",
@@ -506,7 +517,7 @@ def test_ucode_config_for_profile_defaults_model_when_ucode_omits_it(
 
     assert config is not None
     # The verified routable gateway endpoint name, not the CLI's own default.
-    assert config.model == "databricks-claude-opus-4-8"
+    assert config.model == "catalog-databricks-claude-default"
 
 
 def test_ucode_config_refreshes_live_models_and_builds_picker_options(
@@ -646,6 +657,93 @@ def test_claude_native_model_options_follow_managed_claude_catalog(
     ]
 
 
+def test_unpinned_family_alias_resolves_to_the_provider_default_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier alias with no env pin cannot reach the gateway as a canonical id."""
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        model="databricks-claude-sonnet-4-5",
+    )
+    assert (
+        claude_native.resolve_claude_native_model_selection("opus", config)
+        == "databricks-claude-sonnet-4-5"
+    )
+
+
+def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
+    """The Anthropic API resolves aliases natively; never rewrite them there."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        model="claude-sonnet-5",
+    )
+    assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
+
+
+def test_managed_settings_pin_keeps_alias_passthrough_on_a_gateway(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code applies managed-settings pins, so the alias still routes."""
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        model="databricks-claude-sonnet-4-5",
+    )
+    assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
+
+
+def test_family_alias_passes_through_when_substitution_is_not_needed() -> None:
+    """Pinned (env resolves it), direct login (Claude does), or no default (nothing to swap in)."""
+    pinned = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"},
+        model="databricks-claude-sonnet-4-5",
+    )
+    no_default = claude_native.ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": "https://x"})
+    assert claude_native.resolve_claude_native_model_selection("opus", pinned) == "opus"
+    assert claude_native.resolve_claude_native_model_selection("opus", None) == "opus"
+    assert claude_native.resolve_claude_native_model_selection("opus", no_default) == "opus"
+
+
+def test_provider_config_without_pins_offers_only_the_default_model_row() -> None:
+    """Gateway configs never get the subscription alias rows they cannot route."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        model="databricks-claude-sonnet-4-5",
+    )
+    assert claude_native.claude_native_model_options(config) == [
+        {
+            "id": "databricks-claude-sonnet-4-5",
+            "model": "databricks-claude-sonnet-4-5",
+            "displayName": "databricks-claude-sonnet-4-5",
+            "isDefault": True,
+        }
+    ]
+    assert (
+        claude_native.claude_native_model_options(
+            claude_native.ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": "https://x"})
+        )
+        == []
+    )
+
+
+def test_anthropic_endpoint_config_without_pins_keeps_the_alias_rows() -> None:
+    """API-key providers on the Anthropic API keep the alias catalog Claude resolves."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        model="claude-sonnet-5",
+    )
+    options = claude_native.claude_native_model_options(config)
+    assert options
+    assert all(option["model"] == option["id"] for option in options)
+
+
 def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
     """The friendly Sonnet 5 row launches the provider's routable model id."""
     config = claude_native.ClaudeNativeUcodeConfig(
@@ -657,6 +755,47 @@ def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
         claude_native.resolve_claude_native_model_selection("sonnet_5", config)
         == "system.ai.claude-sonnet-5[1m]"
     )
+
+
+def test_sonnet_5_subscription_selection_uses_owned_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct-login custom row resolves from the central fallback record."""
+    fallback = SimpleNamespace(model_ids=("future-claude-sonnet-5",))
+    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
+
+    assert (
+        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
+        == "future-claude-sonnet-5"
+    )
+
+
+def test_sonnet_5_subscription_selection_uses_first_sonnet_family_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A renamed Sonnet release stays routable when its display label drifts."""
+    fallback = SimpleNamespace(model_ids=("future-claude-opus-5", "future-claude-sonnet-5-1"))
+    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
+
+    assert (
+        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
+        == "future-claude-sonnet-5-1"
+    )
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [None, SimpleNamespace(model_ids=("future-claude-opus-5",))],
+)
+def test_sonnet_5_subscription_selection_fails_without_sonnet_fallback(
+    fallback: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private picker id never reaches Claude when its fallback disappears."""
+    monkeypatch.setattr(claude_native, "static_model_fallback", lambda *_args: fallback)
+
+    with pytest.raises(ValueError, match="no routable Sonnet model"):
+        claude_native.resolve_claude_native_model_selection("sonnet_5", None)
 
 
 def test_removed_sonnet_5_selection_falls_back_to_routable_databricks_sonnet() -> None:
@@ -4083,6 +4222,9 @@ def test_websocket_connect_sets_short_close_timeout(monkeypatch: pytest.MonkeyPa
     )
 
     assert result is sentinel
+    # A wss:// attach URL carries a verifying SSL context (asserted separately
+    # since an SSLContext isn't equality-comparable to a literal).
+    assert isinstance(captured.pop("ssl"), ssl.SSLContext)
     # The wrapper adds the first-party Origin sentinel alongside the
     # caller's auth header so the server's CSWSH origin guard admits this
     # non-browser attach client; the caller's bearer is preserved.
@@ -6741,6 +6883,42 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
     ]
     assert len(boundaries) == 1
     assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
+
+
+def test_websocket_connect_passes_ssl_context_for_wss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wss:// attach URL (remote https workspace) gets a verifying SSL context.
+
+    Without it, claude-native attach fails with CERTIFICATE_VERIFY_FAILED on
+    interpreters whose OpenSSL default trust store is empty (see issue #1730).
+    """
+    captured: dict[str, Any] = {}
+
+    def _stub_connect(url: str, **kwargs: Any) -> str:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return "cm"
+
+    monkeypatch.setattr(websockets, "connect", _stub_connect)
+    claude_native._websocket_connect("wss://example.databricksapps.com/attach", headers={})
+    assert isinstance(captured["kwargs"]["ssl"], ssl.SSLContext)
+
+
+def test_websocket_connect_no_ssl_context_for_ws(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain ws:// attach URL (local runner) passes ssl=None — the library default."""
+    captured: dict[str, Any] = {}
+
+    def _stub_connect(url: str, **kwargs: Any) -> str:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return "cm"
+
+    monkeypatch.setattr(websockets, "connect", _stub_connect)
+    claude_native._websocket_connect("ws://127.0.0.1:6767/attach", headers={})
+    assert captured["kwargs"]["ssl"] is None
 
 
 @pytest.mark.parametrize(

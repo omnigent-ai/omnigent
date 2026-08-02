@@ -108,7 +108,11 @@
    * browser default; the root `html` rules multiply it into their font-size so
    * the whole rem-based UI scales. Overridden at runtime on documentElement. */
   --ui-font-scale: 1;
-  --sidebar-font-size: 13px;
+  /* Compact sidebar text size. In `rem` so it rides the root font-size (which
+   * folds in --ui-font-scale and the mobile bump) — 0.8125rem = 13px at the
+   * 16px default, matching the design while still scaling with the Appearance
+   * font-size setting. */
+  --sidebar-font-size: 0.8125rem;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -338,7 +342,6 @@
 
 .sidebar-compact-text {
   font-size: var(--sidebar-font-size);
-  line-height: calc(var(--sidebar-font-size) + 7px);
 }
 
 /* App-shell canvas gradient. Copied verbatim from the brand mock
