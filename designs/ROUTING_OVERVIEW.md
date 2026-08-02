@@ -14,7 +14,7 @@
 
 **1b — Codex.** The user makes the same pick in _Configure Codex_, over the Codex arms. The codex-native executor sends the routed model to the running thread, and it mirrors the model into the session's `config.toml`. It types nothing into the pane.
 
-**1c — Smart Routing harness.** The user picks the top-level **Smart Routing** row in the harness dropdown. That row is a router over the harnesses, and it is not a harness. The server picks both the harness and the model at session create, from the first message. Both picks stay for the session's life.
+**1c — Smart Routing harness.** The user picks the top-level **Smart Routing** row in the harness dropdown. That row is a router over the harnesses, and it is not a harness. The server picks both the harness and the model at session create, from the first message. Both picks stay for the session's life. The routed harness set is claude and codex today, and pi is out of it for now (`2j`, `4g`).
 
 **1d — CLI.** The user runs `omnigent claude --smart-routing -p "…"`, or the same flag on `omnigent codex` or `omnigent run`. The CLI checks availability, creates the routed session itself, and then attaches the wrapper to it. A pinned `--harness` routes the model only. No `--harness` routes the harness and the model.
 
@@ -86,7 +86,7 @@
 
 **4d — RESOLVED: no numeric test target.** The fleet writes directed tests of the final behavior and gates them on coverage against the registry inventory. The 5,500 and 1,500 line numbers are withdrawn (plan `7d`, `3g`).
 
-**4e — RESOLVED (2026-08-01).** The honest `applied=false` record and the raw-versus-applied arrow on the chip stay. Bryan ruled on the rest: cut the `MODEL_LISTS` fork and the cost table; revert the seam to main's shape; use the per-family fallback (claude → sonnet, gpt → terra) with an honest decline behind it (plan `7e`, `3i`). Two assumptions stay open for Bryan's veto: glm has no fallback and declines; terra's catalog id is `databricks-gpt-5-6-terra`.
+**4e — RESOLVED (2026-08-01).** The honest `applied=false` record and the raw-versus-applied arrow on the chip stay. Bryan ruled on the rest: cut the `MODEL_LISTS` fork and the cost table; revert the seam to main's shape; use the per-family fallback (claude → sonnet, gpt → terra) with an honest decline behind it (plan `7e`, `3i`). Three assumptions stay open for Bryan's veto: glm has no fallback and declines; terra is the gpt fallback (`databricks-gpt-5-6-terra`, known to the code today only as a pi-exclusion entry); sonnet pins to `databricks-claude-sonnet-5`.
 
 **4f — Two items the same critique added.** Managed-plugin readiness is a commit-1 requirement (2a), and the in-session model indicator is a must-fix bug (2k, 3g).
 
