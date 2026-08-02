@@ -294,6 +294,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+            _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
         ):
@@ -955,6 +956,16 @@ def register_events_routes(
             # Returned to the claude-native forwarder so it can address
             # subsequent ``external_conversation_item`` /
             # ``external_session_status`` events to the child id.
+            return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE:
+            child_id = await _persist_external_antigravity_subagent_start(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            # Returned to the agy reader so it can mirror the child cascade's
+            # steps into this id.
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_CODEX_SUBAGENT_START_TYPE:
             child_id = await _persist_external_codex_subagent_start(

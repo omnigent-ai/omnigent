@@ -339,6 +339,15 @@ _AGY_SEED_FILES = (
 )
 
 
+# agy resolves imported plugins (skills + hooks) relative to its Gemini dir, so a
+# bridge-owned ``--gemini_dir`` starts with none of the user's plugins unless they
+# are seeded. ``plugins/`` is symlinked rather than copied: the payload is a git
+# checkout per plugin, and a link keeps a mid-session ``/plugin install`` or update
+# visible instead of pinning a stale copy.
+_AGY_PLUGINS_DIR = "plugins"
+_AGY_IMPORT_MANIFEST = "import_manifest.json"
+
+
 def agy_home_dir(bridge_dir: Path) -> Path:
     """Return the parent directory for this session's isolated agy state.
 
@@ -534,10 +543,46 @@ def seed_isolated_agy_home(
     with contextlib.suppress(OSError):
         (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
 
+    _seed_isolated_agy_plugins(real_home, iso_gemini)
+
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
 
     return {}
+
+
+def _seed_isolated_agy_plugins(real_home: Path, iso_gemini: Path) -> None:
+    """Expose the user's imported agy plugins under the isolated Gemini dir.
+
+    Links ``config/plugins`` to the real tree and copies ``import_manifest.json``
+    (agy needs both: the manifest declares which plugins are imported, the
+    directory holds their skills and hooks). Without this an omnigent-spawned
+    session lists zero plugin skills while a direct ``agy`` run lists them all.
+
+    Best-effort: a user with no plugins, or a platform that refuses symlinks,
+    simply gets a session without them rather than a failed launch.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    real_config = real_home / ".gemini" / _MCP_CONFIG_DIR
+    iso_config = iso_gemini / _MCP_CONFIG_DIR
+
+    real_plugins = real_config / _AGY_PLUGINS_DIR
+    if real_plugins.is_dir():
+        link = iso_config / _AGY_PLUGINS_DIR
+        with contextlib.suppress(OSError):
+            # Re-seeding an existing bridge dir must not fail on the prior link;
+            # drop a stale or broken one so the target is always current.
+            if link.is_symlink() or link.is_file():
+                link.unlink()
+            if not link.exists():
+                link.symlink_to(real_plugins.resolve(), target_is_directory=True)
+
+    real_manifest = real_config / _AGY_IMPORT_MANIFEST
+    if real_manifest.is_file():
+        with contextlib.suppress(OSError):
+            (iso_config / _AGY_IMPORT_MANIFEST).write_bytes(real_manifest.read_bytes())
 
 
 # agy's periodic engagement survey ("How's the CLI experience so far?") is gated by

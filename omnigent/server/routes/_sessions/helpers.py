@@ -2902,6 +2902,105 @@ async def _persist_external_subagent_start(
     return child.id
 
 
+def _antigravity_subagent_title(role: str, cascade_id: str) -> str:
+    """
+    Build the child row title for an agy sub-agent.
+
+    ``"<role>:<cascade id>"``. The Agents rail splits a child title on its FIRST
+    colon into ``tool`` / ``session_name``, so this renders the role as the agent
+    name and the cascade id as the correlation handle with no rail-side special
+    case — unlike claude/codex children, which need a display helper each. Any
+    colon inside the role is folded to a dash so that split lands where intended.
+
+    The cascade id is agy's own stable per-sub-agent id, which also makes the
+    title the idempotency key: a redelivered start trips the
+    ``(parent_conversation_id, title)`` unique index instead of minting a second
+    row for the same sub-agent.
+
+    :param role: agy ``subagentSpec`` role, e.g. ``"App Router Code Reviewer"``.
+    :param cascade_id: agy child conversation id, e.g. ``"1eca7625-…"``.
+    :returns: Child conversation title.
+    """
+    head = role.replace(":", "-").strip() or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK
+    return f"{head}:{cascade_id}"
+
+
+def _antigravity_subagent_labels_from_body(
+    cascade_id: str,
+    body: SessionEventInput,
+) -> dict[str, str]:
+    """
+    Build the label dict for an agy sub-agent child row.
+
+    :param cascade_id: agy child conversation id, e.g. ``"1eca7625-…"``.
+    :param body: Validated ``external_antigravity_subagent_start`` event body.
+    :returns: Labels to upsert on the child conversation row.
+    """
+    labels: dict[str, str] = {
+        _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+        _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY: cascade_id,
+    }
+    for data_key, label_key in (
+        ("tool_call_id", _ANTIGRAVITY_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY),
+        ("role", _ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL_KEY),
+        ("agent_type", _ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY),
+    ):
+        value = body.data.get(data_key)
+        if isinstance(value, str) and value:
+            labels[label_key] = value
+    return labels
+
+
+async def _create_and_publish_antigravity_child(
+    parent_id: str,
+    parent_conv: Conversation,
+    title: str,
+    agent_type: str,
+    labels: dict[str, str],
+    conversation_store: ConversationStore,
+) -> str:
+    """
+    Create an agy sub-agent child row and publish ``session.created``.
+
+    :param parent_id: Parent antigravity-native conversation id.
+    :param parent_conv: Parent row whose ``agent_id`` / ``runner_id`` the child
+        inherits.
+    :param title: Child title from :func:`_antigravity_subagent_title`.
+    :param agent_type: agy ``subagentSpec`` type, e.g. ``"research"``.
+    :param labels: Labels to stamp on the new child row.
+    :param conversation_store: Store used to create the child row.
+    :returns: New child conversation id, e.g. ``"conv_child456"``.
+    """
+    try:
+        child = await asyncio.to_thread(
+            conversation_store.create_conversation,
+            kind="sub_agent",
+            title=title,
+            parent_conversation_id=parent_id,
+            agent_id=parent_conv.agent_id,
+            runner_id=parent_conv.runner_id,
+            sub_agent_name=agent_type or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+        )
+    except NameAlreadyExistsError:
+        # The (parent, title) unique index fired: a concurrent start, or a
+        # redelivery that arrived before ``set_labels`` ran. Adopt the row and
+        # upsert labels rather than 500ing the sub-agent out of the rail.
+        existing = await asyncio.to_thread(
+            _find_subagent_child_by_title, conversation_store, parent_id, title
+        )
+        if existing is None:
+            raise
+        await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        # An orphaned row's creator died before publishing, so live clients have
+        # never heard about this child; a duplicate publish in the race case is a
+        # harmless extra cache invalidation.
+        _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+        return existing.id
+    await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
+    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    return child.id
+
+
 def _find_codex_native_subagent_child(
     conversation_store: ConversationStore,
     parent_id: str,
@@ -8649,6 +8748,8 @@ __all__ = [
     "_allow_remember_eligible",
     "_ancestor_session_ids",
     "_announce_session_added",
+    "_antigravity_subagent_labels_from_body",
+    "_antigravity_subagent_title",
     "_apply_liveness_to_items",
     "_apply_pending_policy_ask_writes",
     "_approval_access_from_grants",
@@ -8672,6 +8773,7 @@ __all__ = [
     "_collect_descendant_conversation_ids",
     "_compact_lock",
     "_consume_pre_resolved_harness_elicitation",
+    "_create_and_publish_antigravity_child",
     "_create_and_publish_codex_child",
     "_create_session_worktree",
     "_delete_stored_session_bundle_after_failure",

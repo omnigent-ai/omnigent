@@ -1,0 +1,42 @@
+{
+  "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+  "status": "CORTEX_STEP_STATUS_DONE",
+  "metadata": {
+    "stepGenerationVersion": 1,
+    "createdAt": "2026-08-02T04:49:11.356933257Z",
+    "viewableAt": "2026-08-02T04:49:12.421632134Z",
+    "finishedGeneratingAt": "2026-08-02T04:49:12.911533930Z",
+    "startedAt": "2026-08-02T04:49:12.911533930Z",
+    "completedAt": "2026-08-02T04:49:12.911533930Z",
+    "source": "CORTEX_STEP_SOURCE_MODEL",
+    "modelUsage": {
+      "model": "MODEL_PLACEHOLDER_M71",
+      "inputTokens": "13614",
+      "outputTokens": "472",
+      "thinkingOutputTokens": "212",
+      "responseOutputTokens": "260",
+      "cacheReadTokens": "12205",
+      "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+      "responseHeader": {
+        "sessionID": "-3750763034362895579"
+      },
+      "responseId": "R8xuatSTIo6i9tMPnP3OqQU"
+    },
+    "generatorModel": "MODEL_PLACEHOLDER_M71",
+    "requestedModel": {
+      "model": "MODEL_PLACEHOLDER_M71"
+    },
+    "executionId": "99875cd6-e73c-4e0f-8f1f-eb7505a88330",
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "efb134b2-d69f-43de-bb54-c9ece346d8a3",
+      "stepIndex": 13,
+      "metadataIndex": 5,
+      "cascadeId": "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+    }
+  },
+  "plannerResponse": {
+    "modifiedResponse": "Here is a status summary of your workspace:\n\n### \ud83d\udcc1 **Repository & Branch**\n- **Project**: [`kyoto-studio`](file:///Users/bryanli/.gemini/antigravity-cli/scratch) (Next.j",
+    "messageId": "bot-8aa1ae92-622b-46ad-b13b-f6ee0bbbf11b",
+    "stopReason": "STOP_REASON_STOP_PATTERN"
+  }
+}

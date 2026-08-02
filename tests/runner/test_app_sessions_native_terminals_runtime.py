@@ -1727,6 +1727,7 @@ async def _run_antigravity_auto_create(
     pane: tuple[Path, str] | None = None,
     pane_scoped_port: int | None = None,
     pane_agy_found: bool = True,
+    lsof_attributes_ports: bool = False,
 ) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
@@ -1816,10 +1817,24 @@ async def _run_antigravity_auto_create(
 
     monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _no_sleep)
     monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", lambda: list(candidate_ports))
+    # Pinned so the cold-start's state-2 branch never reads the HOST's process
+    # table: default False models restricted /proc (attribution impossible for
+    # anyone), where the lone candidate really is ours.
+    monkeypatch.setattr(rpc_mod, "_can_attribute_any_agy_port", lambda: lsof_attributes_ports)
     start_cascade_calls: list[tuple[int, str]] = []
 
     def _fake_start_cascade(port: int, cascade_id: str, **_kwargs: Any) -> None:
         start_cascade_calls.append((port, cascade_id))
+        # Mirror real agy: the conversation db is written into the Gemini dir of
+        # whichever agy served the call. These fixtures model OUR agy answering,
+        # so it lands in our bridge — which is the cold-start's ownership proof.
+        convs = (
+            bridge_mod.agy_gemini_dir(bridge_mod.bridge_dir_for_bridge_id(session_id))
+            / "antigravity-cli"
+            / "conversations"
+        )
+        convs.mkdir(parents=True, exist_ok=True)
+        (convs / f"{cascade_id}.db").write_bytes(b"")
 
     monkeypatch.setattr(rpc_mod, "start_cascade", _fake_start_cascade)
 
@@ -2049,6 +2064,44 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_port_unattribu
     assert start_cascade_calls[0][0] == 52548  # safe candidate fallback
     assert state is not None
     assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_cold_start_waits_out_our_agy_boot_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pane agy present but not listening yet, on a host with ANOTHER live agy.
+
+    The real-world race: the cold-start fires ~250ms after tmux exec-s agy, so
+    agy IS in the pane subtree (``agy_found=True``) but has not bound its
+    connect-RPC listener. lsof works fine here — it attributes a port for an
+    OLDER agy (52548) — so the missing port means still-booting, not
+    unattributable.
+
+    Binding 52548 would StartCascade inside that other session's agy: the reader
+    then adopts ITS active cascade, so the user's new chat mirrors an existing
+    conversation while their own agy is orphaned. The cold-start must instead
+    time out and leave the placeholder for the reader to resolve.
+    """
+    session_id = "0c1e4c0f6a3b45a2b19d0e6d5c4b3a29"
+    state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={},
+        candidate_ports=[52548],  # a FOREIGN agy, the only one listening
+        pane=(tmp_path / "agy.sock", "main"),
+        pane_agy_found=True,  # our agy is exec-ed...
+        pane_scoped_port=None,  # ...but has not bound its port yet
+        lsof_attributes_ports=True,  # lsof works here → still-booting, not restricted
+    )
+    assert start_cascade_calls == [], "must not StartCascade onto a foreign agy"
+    assert patch_calls == []
+    assert state is not None
+    assert bridge_mod_is_placeholder(state.conversation_id), (
+        "the placeholder must survive so the reader binds our own agy's conversation"
+    )
 
 
 @pytest.mark.asyncio
@@ -2807,3 +2860,88 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     # A RuntimeError must never be described as a timeout.
     if not isinstance(exc, TimeoutError):
         assert "timed out" not in recorded
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_rejects_a_foreign_agy_cascade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cascade that did not land in THIS bridge's Gemini dir is not persisted.
+
+    Defense-in-depth behind the port scoping. ``StartCascade`` on a foreign agy
+    succeeds and returns an id, but agy writes the conversation into ITS OWN
+    ``--gemini_dir``. Persisting that id cross-binds the session durably: the
+    reader mirrors another session's conversation (the user sees a duplicate of
+    an ongoing chat) while this session's own agy is orphaned and its replies
+    never arrive. Refusing leaves the placeholder, which the reader's own
+    discovery later resolves correctly.
+    """
+    import omnigent.antigravity_native_rpc as rpc_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "aa44894f77886259ee71e892a9e2af00"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    placeholder = "agy_conv_placeholder"
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=placeholder,
+        ),
+    )
+
+    monkeypatch.setattr(rpc_mod, "resolve_cold_start_agy_rpc_port", lambda _s, _t: 34601)
+    monkeypatch.setattr(rpc_mod, "start_cascade", lambda _port, _cid, **_k: None)
+    # The conversations dir stays EMPTY: the foreign agy wrote the .db into its
+    # own Gemini dir, not ours.
+    (bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations").mkdir(
+        parents=True, exist_ok=True
+    )
+
+    result = await runner_app_mod._cold_start_agy_conversation(bridge_dir, session_id)
+
+    assert result is None, "a foreign cascade must not be adopted"
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == placeholder, "placeholder must survive for the reader"
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The happy path still persists: our own agy wrote the conversation here."""
+    import omnigent.antigravity_native_rpc as rpc_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "bb44894f77886259ee71e892a9e2af11"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id="agy_conv_placeholder",
+        ),
+    )
+    convs = bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    convs.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(rpc_mod, "resolve_cold_start_agy_rpc_port", lambda _s, _t: 34601)
+
+    def _start_cascade(_port: int, cascade_id: str, **_kwargs: Any) -> None:
+        # Our agy owns it: the conversation db lands in OUR Gemini dir.
+        (convs / f"{cascade_id}.db").write_bytes(b"")
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _start_cascade)
+
+    result = await runner_app_mod._cold_start_agy_conversation(bridge_dir, session_id)
+
+    assert result is not None
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None and state.conversation_id == result
