@@ -70,7 +70,9 @@ async def test_console_safe_text_replaces_unencodable_status_symbol(
     """A Windows code-page stdout must not crash the host after handshake."""
     monkeypatch.setattr("omnigent.host.connect.sys.stdout", SimpleNamespace(encoding="cp1252"))
 
-    assert _console_safe_text("✓ Connected") == "? Connected"
+    assert _console_safe_text("✓ Connected ↑ started ↓ stopped") == (
+        "? Connected ? started ? stopped"
+    )
 
 
 async def test_handle_model_options_uses_host_claude_configuration(

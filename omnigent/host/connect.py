@@ -1060,9 +1060,12 @@ class HostProcess:
                 # terminal — print once per redirect streak so a foreground
                 # `omnigent host` shows the auth problem and its fix instead
                 # of sitting silent while it retries.
-                print(
+                warning = (
                     f"⚠ {cause} Retrying — this also happens briefly while "
-                    f"the server restarts. {self._credentials_fix_hint()}",
+                    f"the server restarts. {self._credentials_fix_hint()}"
+                )
+                print(
+                    _console_safe_text(warning),
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1236,12 +1239,12 @@ class HostProcess:
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
         session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
-        print(
+        lifecycle_message = (
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
             f"    log: {_display_log_path(log_path)}"
-            f"{session_line}",
-            flush=True,
+            f"{session_line}"
         )
+        print(_console_safe_text(lifecycle_message), flush=True)
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
             status="launched",
@@ -1274,10 +1277,8 @@ class HostProcess:
                 handle.proc.kill()
                 handle.proc.wait()
         _logger.info("Stopped runner %s", frame.runner_id)
-        print(
-            f"  ↓ Runner stopped: {frame.runner_id}",
-            flush=True,
-        )
+        lifecycle_message = f"  ↓ Runner stopped: {frame.runner_id}"
+        print(_console_safe_text(lifecycle_message), flush=True)
         return HostStopRunnerResultFrame(
             request_id=frame.request_id,
             status="stopped",
@@ -2660,5 +2661,6 @@ def run_host_process(
         # Fail loud: a permanent connection failure must not look like the
         # process is still working. Print the cause + fix, then exit non-zero
         # instead of the old behavior of reconnecting silently forever.
-        print(f"\n✗ Could not connect to {server_url}.\n{exc}", file=sys.stderr, flush=True)
+        failure = f"\n✗ Could not connect to {server_url}.\n{exc}"
+        print(_console_safe_text(failure), file=sys.stderr, flush=True)
         raise SystemExit(1) from exc

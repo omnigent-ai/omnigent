@@ -2975,6 +2975,41 @@ def test_prepare_claude_cli_path_bypasses_wrapper_when_env_set(
     ]
 
 
+def test_prepare_claude_cli_path_uses_native_executable_for_windows_jobobject(
+    monkeypatch,
+) -> None:
+    """CreateProcess cannot execute the Python sandbox launcher on Windows."""
+    from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.resolve_sandbox",
+        lambda *args, **kwargs: SandboxPolicy(
+            backend_type="windows_jobobject",
+            active=True,
+            read_roots=[],
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.create_exec_launcher",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Windows Job Objects must not create a .py cli_path")
+        ),
+    )
+
+    prepared = prepare_claude_cli_path(
+        r"C:\claude\claude.exe",
+        OSEnvSpec(type="caller_process", cwd=r"C:\workspace"),
+    )
+
+    assert prepared.cli_path == r"C:\claude\claude.exe"
+    assert prepared.enable_native_tools is False
+
+
 def test_prepare_tight_cli_process_path_bypasses_wrapper_when_env_set(monkeypatch) -> None:
     """``prepare_tight_cli_process_path`` must also honor the bypass env."""
     from omnigent.inner.claude_sdk_executor import prepare_tight_cli_process_path
@@ -4443,6 +4478,22 @@ def test_find_system_claude_delegates_to_shared_resolver(monkeypatch) -> None:
     monkeypatch.setattr(cse, "resolve_cli_binary", fake_resolve)
     assert cse._find_system_claude() == "/opt/homebrew/bin/claude"
     assert captured == {"name": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
+
+
+def test_find_system_claude_uses_native_npm_launcher_on_windows(monkeypatch, tmp_path) -> None:
+    """The SDK cannot execute npm's ``.cmd`` shim via CreateProcess."""
+    from omnigent.inner import claude_sdk_executor as cse
+
+    shim = tmp_path / "claude.cmd"
+    shim.write_text("@echo off", encoding="utf-8")
+    launcher = tmp_path / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_bytes(b"MZ")
+
+    monkeypatch.setattr(cse, "IS_WINDOWS", True)
+    monkeypatch.setattr(cse, "resolve_cli_binary", lambda *args, **kwargs: str(shim))
+
+    assert cse._find_system_claude() == str(launcher)
 
 
 def test_claude_sdk_does_not_claim_live_message_queue() -> None:

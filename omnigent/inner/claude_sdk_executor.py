@@ -43,7 +43,7 @@ from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
 from omnigent import model_catalog
-from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
@@ -915,7 +915,23 @@ def _find_system_claude() -> str | None:
     beta flags the Databricks gateway doesn't support. Returns the absolute
     path, or ``None`` if not found.
     """
-    return resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
+    resolved = resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
+    if not IS_WINDOWS or resolved is None:
+        return resolved
+
+    # npm exposes Claude on Windows through ``claude.cmd``. The Claude Agent
+    # SDK launches ``cli_path`` with CreateProcess directly, which cannot
+    # execute a batch shim and fails with WinError 193. Current Claude npm
+    # packages place the real native launcher beside that shim under the
+    # package's ``bin`` directory, so prefer it when present.
+    path = pathlib.Path(resolved)
+    if path.suffix.lower() in {".bat", ".cmd", ".ps1"}:
+        native_launcher = (
+            path.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+        )
+        if native_launcher.is_file():
+            return str(native_launcher)
+    return resolved
 
 
 def _resolve_gateway_env(
@@ -1166,6 +1182,19 @@ def prepare_claude_cli_path(
     if not sandbox.allow_network:
         # The Claude CLI itself must reach the provider, so we cannot run the
         # whole native-tool process tree inside a network-denying sandbox.
+        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
+    if sandbox.backend_type == "windows_jobobject":
+        # ``create_exec_launcher`` is a Python script. POSIX can execute that
+        # shebang launcher directly, but the Claude Agent SDK uses
+        # CreateProcess on Windows and a ``.py`` cli_path fails with WinError
+        # 193. A Job Object also cannot enforce the filesystem/network rules
+        # that make Claude's native tools safe, so keep those tools disabled
+        # and give the SDK the real native Claude executable instead.
+        logger.warning(
+            "Windows Job Objects cannot provide an executable Claude SDK "
+            "sandbox launcher; running the Claude CLI unwrapped with native "
+            "tools disabled (file/shell access stays confined to sys_os_* tools)."
+        )
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
 
     sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
