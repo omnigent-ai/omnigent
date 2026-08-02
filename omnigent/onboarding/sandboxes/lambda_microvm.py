@@ -36,11 +36,14 @@ Platform notes that shape this launcher:
   ``create-microvm-image`` (a Dockerfile + zip in S3, closer to E2B's template
   model). The image identifier is operator-supplied config; building it is a
   deploy-time step (see ``deploy/aws-lambda-microvm/README.md``).
-- **Idle policy drives suspend/resume.** ``run-microvm`` is given an idle policy
-  so an idle VM auto-suspends and auto-resumes on the next request. A snapshot
-  thaw restores the whole guest — the running ``omnigent host`` and its still-
-  valid token — so the host reconnects on its own; the wake path does not
-  restart it (``resume_preserves_host = True``).
+- **Idle policy drives suspend; the server drives resume.** ``run-microvm`` is
+  given an idle policy so an idle VM auto-suspends to a snapshot. Lambda
+  measures idleness only by inbound endpoint traffic, which this host never
+  receives (it holds an *outbound* tunnel), so auto-resume never fires — every
+  wake is the server's explicit ``resume-microvm``. A snapshot thaw restores
+  the whole guest — the running ``omnigent host`` and its still-valid token —
+  so the host reconnects on its own; the wake path does not restart it
+  (``resume_preserves_host = True``).
 - **No CLI bootstrap / port forward.** Like Modal/Daytona/Kubernetes, the
   launcher exists for server-managed hosts only.
 """
@@ -129,20 +132,25 @@ _DEFAULT_MAX_LIFETIME_S: int = 8 * 60 * 60
 _TOKEN_TTL_SLACK_S: int = 3600
 
 # Idle policy defaults for run-microvm: an idle VM auto-suspends after 15 min,
-# then may stay suspended for the rest of its 8 h lifetime. Tuned so a session
+# then may stay suspended for the rest of its lifetime. Tuned so a session
 # that sits between turns sleeps to a snapshot instead of holding warm compute,
 # and wakes on the next message via the managed wake path.
 #
 # suspendedDurationSeconds is the time a VM may stay SUSPENDED *before Lambda
-# terminates it*, so it must match the total lifetime: a shorter value silently
-# kills any session idle longer than it, and the next wake fails with
-# ResourceNotFoundException. maximumDurationInSeconds already bounds lifetime,
-# and a suspended VM bills snapshot storage only.
+# terminates it*, so build_idle_policy() derives it from the RESOLVED lifetime
+# (not a fixed 8 h constant): a shorter value silently kills any session idle
+# longer than it (the next wake fails with ResourceNotFoundException), and a
+# value contradicting a lowered maximumDurationInSeconds misleads operators
+# about when a suspended VM dies. A suspended VM bills snapshot storage only.
 _DEFAULT_MAX_IDLE_S: int = 900
-_DEFAULT_SUSPENDED_S: int = 28800
 
 # boto3 service name for the Lambda MicroVMs control plane.
 _SERVICE_NAME: str = "lambda-microvms"
+
+# RunMicrovm caps runHookPayload at 16 KB (UTF-8 bytes). The whole launch
+# identity + env passthrough rides this one string, so the builder pre-checks
+# the size and fails with a pointed message instead of AWS's ValidationException.
+_RUN_HOOK_PAYLOAD_MAX_BYTES: int = 16_384
 
 # Env names the launcher owns in the /run payload: the per-launch identity,
 # token, dial-back URL, and the sandbox marker. An operator passthrough
@@ -165,6 +173,21 @@ _RESERVED_ENV_NAMES: frozenset[str] = frozenset(
 # controls the image, so the in-sandbox workspace path is a known constant rather
 # than something asked of the sandbox.
 _MICROVM_HOME: str = "/root"
+
+
+def _sanitize_repo_dir_name(repo_name: str) -> str:
+    """The clone directory start_host.sh actually creates for *repo_name*.
+
+    Mirrors the entrypoint's sanitization (``basename --`` + the ``.``/``..``/
+    leading-``-`` guard) exactly: the returned workspace path is validated with
+    ``Path(...).is_dir()`` INSIDE the guest, so any divergence between what the
+    script creates and what this launcher returns makes every runner launch
+    fail with "workspace path does not exist".
+    """
+    base = os.path.basename(repo_name.rstrip("/"))
+    if base in ("", ".", "..") or base.startswith("-"):
+        return "repo"
+    return base
 
 
 def resolve_max_lifetime_s() -> int:
@@ -217,9 +240,10 @@ def managed_token_ttl_s() -> int:
     return resolve_max_lifetime_s() + _TOKEN_TTL_SLACK_S
 
 
-def build_idle_policy() -> dict[str, object]:
+def build_idle_policy(max_lifetime_s: int | None = None) -> dict[str, object]:
     """
-    Build the ``idlePolicy`` for ``run-microvm``.
+    Build the ``idlePolicy`` for ``run-microvm``, consistent with the resolved
+    lifetime.
 
     Auto-suspend on idle is what lets a between-turns session sleep to a
     snapshot and wake cheaply. The snapshot thaw restores the running
@@ -228,6 +252,14 @@ def build_idle_policy() -> dict[str, object]:
     (:func:`omnigent.server.managed_hosts.resume_managed_host`) resumes the VM
     WITHOUT restarting the host — the host reconnects on its own.
 
+    Both durations are derived from the lifetime rather than fixed constants,
+    so an operator override (:data:`MAX_LIFETIME_ENV_VAR`) cannot produce a
+    self-contradicting policy: ``suspendedDurationSeconds`` matches the
+    lifetime exactly (a suspended VM may sleep until its lifetime cap, never a
+    fixed 8 h that outlives a shorter cap), and ``maxIdleDurationSeconds`` is
+    capped below the lifetime so a short-lived VM doesn't carry an idle timer
+    longer than its own life.
+
     Lambda measures idleness only by traffic arriving at the MicroVM's inbound
     endpoint. This host receives none (it holds an *outbound* tunnel to the
     server), so ``autoResumeEnabled`` never fires on its own and every wake
@@ -235,11 +267,15 @@ def build_idle_policy() -> dict[str, object]:
     harmless backstop. The same blindness means a turn running longer than
     ``maxIdleDurationSeconds`` can be snapshot-frozen mid-work.
 
+    :param max_lifetime_s: The resolved MicroVM lifetime; ``None`` resolves
+        :func:`resolve_max_lifetime_s` (callers that already resolved it pass
+        it through so the policy and ``maximumDurationInSeconds`` can't drift).
     :returns: The idle-policy mapping.
     """
+    lifetime_s = max_lifetime_s if max_lifetime_s is not None else resolve_max_lifetime_s()
     return {
-        "maxIdleDurationSeconds": _DEFAULT_MAX_IDLE_S,
-        "suspendedDurationSeconds": _DEFAULT_SUSPENDED_S,
+        "maxIdleDurationSeconds": min(_DEFAULT_MAX_IDLE_S, lifetime_s),
+        "suspendedDurationSeconds": lifetime_s,
         "autoResumeEnabled": True,
     }
 
@@ -283,7 +319,13 @@ def build_run_microvm_kwargs(
     :param env_literals: Harness credential env (name → value) resolved from the
         server environment, merged into the /run payload's ``env`` map.
     :param image_version: Specific image version, or ``None`` for the latest.
+    :param egress_network_connectors: Egress network-connector ARNs to attach
+        (``egressNetworkConnectors``) so the host's outbound traffic — including
+        its dial-back — rides the customer VPC; ``None``/empty omits the key
+        (account-default public egress).
     :returns: The ``run-microvm`` kwargs.
+    :raises click.ClickException: When the assembled ``runHookPayload`` exceeds
+        the 16 KB platform cap.
     """
     # Identity keys are spread LAST so they always win over operator passthrough
     # (_resolve_sandbox_env already rejects a passthrough naming a reserved key,
@@ -297,12 +339,27 @@ def build_run_microvm_kwargs(
         "OMNIGENT_SERVER": server_url,
         "IS_SANDBOX": "1",
     }
+    payload_json = json.dumps(payload)
+    # RunMicrovm caps runHookPayload at 16 KB (UTF-8). Passthrough credentials
+    # and repo fields all aggregate into this one string, so fail fast with the
+    # actual size here rather than an opaque ValidationException at the AWS
+    # boundary.
+    payload_size = len(payload_json.encode("utf-8"))
+    if payload_size > _RUN_HOOK_PAYLOAD_MAX_BYTES:
+        raise click.ClickException(
+            f"the run-microvm launch payload is {payload_size} bytes, over the "
+            f"{_RUN_HOOK_PAYLOAD_MAX_BYTES}-byte runHookPayload cap — trim the "
+            "sandbox env passthrough (sandbox.lambda_microvm.env / "
+            f"{SANDBOX_ENV_PASSTHROUGH_ENV_VAR}); large secrets should reach the "
+            "VM via the execution role or a secrets store, not the payload."
+        )
+    max_lifetime_s = resolve_max_lifetime_s()
     kwargs: dict[str, Any] = {
         "imageIdentifier": image_identifier,
         "executionRoleArn": execution_role_arn,
-        "idlePolicy": build_idle_policy(),
-        "maximumDurationInSeconds": resolve_max_lifetime_s(),
-        "runHookPayload": json.dumps(payload),
+        "idlePolicy": build_idle_policy(max_lifetime_s),
+        "maximumDurationInSeconds": max_lifetime_s,
+        "runHookPayload": payload_json,
     }
     if image_version is not None:
         kwargs["imageVersion"] = image_version
@@ -325,21 +382,34 @@ def build_run_microvm_kwargs(
 
 def _ensure_sdk() -> None:
     """
-    Verify boto3 is importable, with an install hint when not.
+    Verify boto3 is importable AND ships the ``lambda-microvms`` service model,
+    with an install/upgrade hint when not.
 
     Called at the top of every launcher entry point because boto3 is an optional
-    dependency — the base ``omnigent`` install does not pull it in.
+    dependency — the base ``omnigent`` install does not pull it in. The model
+    check matters independently of the import: a pre-GA boto3 (older than
+    1.43.35) imports fine but has no ``lambda-microvms`` model, so
+    ``boto3.client(...)`` would fail later with an opaque
+    ``UnknownServiceError``.
 
-    :raises click.ClickException: When ``boto3`` is not installed.
+    :raises click.ClickException: When ``boto3`` is not installed, or the
+        installed botocore predates the ``lambda-microvms`` service model.
     """
     try:
         import boto3  # noqa: F401  # presence probe only
+        import botocore.session
     except ImportError as exc:
         raise click.ClickException(
             "boto3 is required for the 'lambda_microvm' sandbox provider. "
             "Install it with `pip install 'omnigent[lambda-microvm]'`, then "
             "configure AWS credentials (profile, environment, or instance role)."
         ) from exc
+    if _SERVICE_NAME not in botocore.session.get_session().get_available_services():
+        raise click.ClickException(
+            f"the installed botocore has no '{_SERVICE_NAME}' service model — "
+            "the 'lambda_microvm' provider needs boto3/botocore >= 1.43.35. "
+            "Upgrade with `pip install -U 'omnigent[lambda-microvm]'`."
+        )
 
 
 class LambdaMicroVMSandboxLauncher(SandboxLauncher):
@@ -657,7 +727,9 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
         # every runner launch fail with "workspace path does not exist".
         workspace = f"{_MICROVM_HOME}/workspace"
         if repo_name:
-            workspace = f"{workspace}/{repo_name}"
+            # Same sanitization start_host.sh applies before cloning — the
+            # returned path must name the directory the script actually made.
+            workspace = f"{workspace}/{_sanitize_repo_dir_name(repo_name)}"
         return workspace
 
     def resume(self, sandbox_id: str) -> None:
@@ -689,7 +761,20 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
         click.echo(f"▸ Resuming Lambda MicroVM '{sandbox_id}'")
         try:
             client.resume_microvm(microvmIdentifier=sandbox_id)
-        except (BotoCoreError, ClientError) as exc:
+        except ClientError as exc:
+            # resume-microvm requires the SUSPENDED state and returns
+            # ConflictException for a VM that is already RUNNING — the desired
+            # end state holds, so treat it as success. Reachable in practice:
+            # the wake path resumes with force=True when persisted liveness may
+            # be stale, so a still-running VM gets a redundant resume.
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ConflictException":
+                click.echo(f"  → already running {sandbox_id}")
+                return
+            raise click.ClickException(
+                f"Could not resume Lambda MicroVM '{sandbox_id}': {exc}"
+            ) from exc
+        except BotoCoreError as exc:
             raise click.ClickException(
                 f"Could not resume Lambda MicroVM '{sandbox_id}': {exc}"
             ) from exc

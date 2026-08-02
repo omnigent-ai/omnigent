@@ -84,7 +84,9 @@ def test_build_run_microvm_kwargs_includes_version_when_set() -> None:
 
 
 def test_build_idle_policy_enables_auto_resume() -> None:
-    """The idle policy auto-suspends on idle and auto-resumes on the next request."""
+    """The idle policy auto-suspends on idle; autoResumeEnabled stays on as a
+    backstop (this host receives no inbound endpoint traffic, so every real
+    wake is the server's explicit resume-microvm)."""
     policy = build_idle_policy()
     assert policy["autoResumeEnabled"] is True
     assert policy["maxIdleDurationSeconds"] > 0
@@ -102,6 +104,65 @@ def test_build_idle_policy_suspends_for_the_full_lifetime() -> None:
     policy = build_idle_policy()
     assert policy["suspendedDurationSeconds"] == resolve_max_lifetime_s()
     assert policy["maxIdleDurationSeconds"] < policy["suspendedDurationSeconds"]
+
+
+@pytest.mark.parametrize("lifetime_s", [3600, 7200])
+def test_build_idle_policy_follows_lowered_lifetime(
+    monkeypatch: pytest.MonkeyPatch, lifetime_s: int
+) -> None:
+    """A lowered lifetime override propagates into the idle policy.
+
+    A fixed 8 h suspendedDurationSeconds would contradict a lowered
+    maximumDurationInSeconds — the policy must track the resolved lifetime.
+    """
+    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, str(lifetime_s))
+    policy = build_idle_policy()
+    assert policy["suspendedDurationSeconds"] == lifetime_s
+    assert policy["maxIdleDurationSeconds"] <= lifetime_s
+
+
+def test_build_idle_policy_caps_idle_below_tiny_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lifetime below the 900 s idle default caps the idle window to it.
+
+    Otherwise a 600 s VM would carry a 900 s idle timer — longer than its own
+    life — which the API may reject and operators cannot reason about.
+    """
+    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, "600")
+    policy = build_idle_policy()
+    assert policy["maxIdleDurationSeconds"] == 600
+    assert policy["suspendedDurationSeconds"] == 600
+
+
+def test_build_run_microvm_kwargs_idle_policy_matches_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The built request's idle policy agrees with its maximumDurationInSeconds."""
+    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, "3600")
+    kwargs = build_run_microvm_kwargs(**_RUN_KW)
+    assert kwargs["maximumDurationInSeconds"] == 3600
+    assert kwargs["idlePolicy"]["suspendedDurationSeconds"] == 3600
+
+
+def test_build_run_microvm_kwargs_rejects_oversized_payload() -> None:
+    """A launch payload over the 16 KB runHookPayload cap fails fast.
+
+    Passthrough credentials and repo fields aggregate into one string with a
+    hard AWS-side 16,384-byte limit; the builder pre-checks so the failure is a
+    pointed ClickException, not a run-time ValidationException.
+    """
+    oversized = {**_RUN_KW, "env_literals": {"BIG_SECRET": "x" * 17_000}}
+    with pytest.raises(click.ClickException, match="runHookPayload"):
+        build_run_microvm_kwargs(**oversized)
+
+
+def test_build_run_microvm_kwargs_counts_utf8_bytes_not_chars() -> None:
+    """The payload cap is measured in UTF-8 bytes, not characters."""
+    # ~9k chars of a 2-byte codepoint → >16 KB encoded (plus JSON escaping).
+    oversized = {**_RUN_KW, "env_literals": {"NOTE": "é" * 9_000}}
+    with pytest.raises(click.ClickException, match="runHookPayload"):
+        build_run_microvm_kwargs(**oversized)
 
 
 def test_resolve_max_lifetime_defaults_to_eight_hours() -> None:
@@ -165,12 +226,16 @@ class _FakeMicroVMClient:
         self.terminated: list[str] = []
         # When set, terminate_microvm raises this to simulate an AWS error.
         self.terminate_error: Exception | None = None
+        # When set, resume_microvm raises this to simulate an AWS error.
+        self.resume_error: Exception | None = None
 
     def run_microvm(self, **kwargs: Any) -> dict[str, str]:
         self.run_calls.append(kwargs)
         return {"microvmId": self._run_id}
 
     def resume_microvm(self, *, microvmIdentifier: str) -> dict[str, str]:
+        if self.resume_error is not None:
+            raise self.resume_error
         self.resumed.append(microvmIdentifier)
         return {}
 
@@ -272,6 +337,37 @@ def test_start_host_returns_clone_dir_when_repo_name_set(
     assert workspace == "/root/workspace/repo"
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("..", "repo"),
+        (".", "repo"),
+        ("-rf", "repo"),
+        ("../../etc", "etc"),
+        ("nested/path/proj", "proj"),
+        ("normal-name", "normal-name"),
+    ],
+)
+def test_start_host_workspace_matches_entrypoint_sanitization(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    """The returned workspace path applies the SAME repo-name sanitization as
+    start_host.sh — a divergent path fails Path(...).is_dir() inside the guest
+    and no runner ever launches."""
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    workspace = launcher.start_host(
+        "managed-abc",
+        token="tok",
+        host_id="host_x",
+        host_name="managed-x",
+        server_url="https://srv.example.com",
+        repo_url="https://github.com/org/repo.git",
+        repo_name=raw,
+    )
+    assert workspace == f"/root/workspace/{expected}"
+
+
 def test_start_host_threads_repo_env_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
     """A repo workspace is passed to the image entrypoint via the /run payload."""
     client = _FakeMicroVMClient()
@@ -298,6 +394,42 @@ def test_resume_calls_resume_microvm(monkeypatch: pytest.MonkeyPatch) -> None:
     launcher = _launcher_with_fake(monkeypatch, client)
     launcher.resume("microvm-run-42")
     assert client.resumed == ["microvm-run-42"]
+
+
+def test_resume_treats_already_running_conflict_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ConflictException (VM already RUNNING) is idempotent success.
+
+    resume-microvm requires the SUSPENDED state and conflicts on a running VM.
+    The wake path resumes with force=True when persisted liveness may be stale,
+    so a redundant resume against a live VM is a normal event — it must not
+    become a 502.
+    """
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.resume_error = ClientError(
+        {"Error": {"Code": "ConflictException", "Message": "MicroVM is not suspended"}},
+        "ResumeMicrovm",
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    # Does not raise.
+    launcher.resume("microvm-already-running")
+
+
+def test_resume_raises_on_real_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-conflict AWS error still surfaces as a ClickException."""
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.resume_error = ClientError(
+        {"Error": {"Code": "ResourceNotFoundException", "Message": "gone"}},
+        "ResumeMicrovm",
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    with pytest.raises(click.ClickException):
+        launcher.resume("microvm-gone")
 
 
 def test_can_resume_flag_is_true() -> None:
@@ -460,3 +592,39 @@ def test_debug_ingress_separators_only_omits_key(
     monkeypatch.setenv(DEBUG_INGRESS_CONNECTORS_ENV_VAR, blank)
     kwargs = build_run_microvm_kwargs(**_RUN_KW)
     assert "ingressNetworkConnectors" not in kwargs
+
+
+# ── SDK availability (real botocore, no network) ────────────
+
+
+def test_installed_botocore_ships_lambda_microvms_service_model() -> None:
+    """The locked botocore carries the ``lambda-microvms`` service model.
+
+    The extra's floor (boto3/botocore >= 1.43.35, the service's GA release)
+    exists precisely so ``boto3.client("lambda-microvms")`` can resolve; this
+    guards the pin against a future lockfile downgrade that would pass the
+    import probe and fail at client construction.
+    """
+    botocore = pytest.importorskip("botocore")
+    del botocore  # presence probe; the session below does the real check
+    import botocore.session
+
+    assert "lambda-microvms" in botocore.session.get_session().get_available_services()
+
+
+def test_ensure_sdk_rejects_botocore_without_service_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_ensure_sdk fails loud (with an upgrade hint) on a pre-GA botocore."""
+    pytest.importorskip("botocore")
+    import botocore.session
+
+    from omnigent.onboarding.sandboxes import lambda_microvm as mod
+
+    class _OldSession:
+        def get_available_services(self) -> list[str]:
+            return ["s3", "lambda"]  # no lambda-microvms
+
+    monkeypatch.setattr(botocore.session, "get_session", lambda: _OldSession())
+    with pytest.raises(click.ClickException, match=r"1\.43\.35"):
+        mod._ensure_sdk()
