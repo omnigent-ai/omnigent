@@ -275,6 +275,9 @@ loadtest = [
 ]
 dev = [
     "pytest>=7.0",
+    # Dictation engine tests mock optional native runtimes but exercise the
+    # shared PCM normalization path directly.
+    "numpy>=1.24,<3",
     # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
     # memory tool tests import + mock it, so keep it in the dev set.
     "hindsight-client>=0.4.0",
