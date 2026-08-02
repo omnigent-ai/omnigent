@@ -26,7 +26,8 @@ import secrets
 import shlex
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import NotRequired, TypedDict
 
 import httpx
 
@@ -79,6 +80,18 @@ _RELAY_URL_ENV = "_OMNIGENT_RELAY_URL"
 _RELAY_TOKEN_ENV = "_OMNIGENT_RELAY_TOKEN"
 
 _TOOL_RELAY_FILE = "tool_relay.json"
+
+
+class _EvaluationEvent(TypedDict):
+    type: str
+    target: str
+    data: dict[str, object]
+    context: dict[str, object]
+    request_data: NotRequired[dict[str, object]]
+
+
+class PolicyHookEvaluationRequest(TypedDict):
+    event: _EvaluationEvent
 
 
 def read_relay_policy_config(
@@ -260,7 +273,7 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
 def hook_payload_to_evaluation_request(
     hook_event: str,
     payload: dict[str, object],
-) -> dict[str, object] | None:
+) -> PolicyHookEvaluationRequest | None:
     """
     Convert a native-harness tool-hook payload into a proto ``EvaluationRequest``.
 
@@ -510,7 +523,7 @@ def fail_closed_hook_output(
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],
-    eval_request: dict[str, object],
+    eval_request: Mapping[str, object],
     read_timeout: float,
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,

@@ -15,7 +15,6 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -369,7 +368,7 @@ def build_mcp_config(
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Build agy's ``mcp_config.json`` payload for the Omnigent relay server.
 
     Mirrors cursor #742's :func:`omnigent.cursor_native_bridge.build_mcp_config`

@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import asc, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlProject, current_workspace_id
 from omnigent.db.utils import (
@@ -121,7 +122,7 @@ class SqlAlchemyProjectStore(ProjectStore):
 
     def _name_taken(
         self,
-        session,
+        session: Session,
         *,
         owner_user_id: str | None,
         name: str,

@@ -283,7 +283,7 @@ def test_get_launcher_unknown_raises_click_exception() -> None:
 def test_instantiate_rejects_non_launcher_class(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A contribution whose launcher class is not a SandboxLauncher is rejected."""
+    """A contribution without the host-launch contract is rejected."""
     reset_plugin_state_for_tests()
     contribution = SandboxProviderContribution(
         name="not-a-launcher",
@@ -307,5 +307,5 @@ def test_instantiate_rejects_non_launcher_class(
         lambda _: _NotALauncher,
     )
 
-    with pytest.raises(SandboxRegistryError, match="not a SandboxLifecycle subclass"):
+    with pytest.raises(SandboxRegistryError, match="not a SandboxHostLauncher subclass"):
         instantiate("not-a-launcher")

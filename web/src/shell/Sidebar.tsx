@@ -967,6 +967,7 @@ function InfiniteScrollSentinel({
 function ProjectFolder({
   name,
   projectId,
+  windowConversations,
   expanded,
   marker,
   onToggleCollapsed,
@@ -985,6 +986,10 @@ function ProjectFolder({
   name: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /** This folder's members from the globally-loaded window (may lag or lead
+      the folder's own pages — e.g. a just-moved row carries its optimistic
+      membership here before the folder query returns it). */
+  windowConversations: Conversation[];
   expanded: boolean;
   marker: SessionState | null;
   onToggleCollapsed: () => void;
@@ -1010,14 +1015,20 @@ function ProjectFolder({
   const query = useProjectSessions(name, expanded);
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
-    const loaded = query.data?.pages.flatMap((page) => page.data) ?? [];
+    // Union the folder's own pages with its members from the globally-loaded
+    // window, window rows winning: those carry the move overlay
+    // (useMoveToProject), so a just-filed session shows here immediately
+    // instead of waiting out the PATCH + folder refetch round-trips.
+    const byId = new Map<string, Conversation>();
+    for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
+    for (const c of windowConversations) byId.set(c.id, c);
     // Pinned sessions live in the global Pinned section, not their folder.
     return sortByUpdatedAtDesc(
-      loaded.filter((c) => !pinnedSet.has(c.id)),
+      [...byId.values()].filter((c) => !pinnedSet.has(c.id)),
       activeOverride,
       frozenSortKeys,
     );
-  }, [query.data, pinnedSet, activeOverride, frozenSortKeys]);
+  }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
 
   // Publish the folder's rendered rows upward so projects-scope bulk selection
   // resolves them (the parent sources its action set from these, not the global
@@ -1808,6 +1819,7 @@ function ConversationList({
                         key={group.name}
                         name={group.name}
                         projectId={group.id}
+                        windowConversations={group.conversations}
                         expanded={expandedProjects.includes(group.name)}
                         // Best-effort marker from the globally-loaded window: a
                         // collapsed folder hasn't fetched its own sessions yet.

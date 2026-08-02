@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypedDict
 
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 from .datamodel import OSEnvSpec
@@ -77,7 +78,6 @@ logger = logging.getLogger(__name__)
 # Omnigent's bridged-tool callback: (tool_name, args) -> awaitable result.
 # Installed by the runtime adapter (see ``_executor_adapter``); mirrors the
 # claude-sdk executor's ``ToolExecutor``.
-_JsonObject: TypeAlias = dict[str, object]
 ToolExecutor: TypeAlias = Callable[[str, _JsonObject], Awaitable[object]]
 PolicyEvaluator: TypeAlias = Callable[[str, _JsonObject], Awaitable[object]]
 ElicitationHandler: TypeAlias = Callable[[str, _JsonObject], Awaitable[bool]]

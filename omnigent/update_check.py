@@ -948,7 +948,7 @@ def _read_build_info() -> tuple[float, str] | None:
         without ``git``); the caller treats that as "no commit info".
     """
     try:
-        from omnigent import _build_info  # type: ignore[attr-defined]
+        from omnigent import _build_info
     except ImportError:
         return None
     try:
@@ -1112,9 +1112,9 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
             uv_data = None
         if isinstance(uv_data, dict):
             if install_time_epoch is None:
-                ts = uv_data.get("timestamp")
-                if isinstance(ts, dict):
-                    secs = ts.get("secs_since_epoch")
+                timestamp_data = uv_data.get("timestamp")
+                if isinstance(timestamp_data, dict):
+                    secs = timestamp_data.get("secs_since_epoch")
                     if isinstance(secs, (int, float)):
                         install_time_epoch = float(secs)
             if commit_sha is None:

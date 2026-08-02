@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from omnigent._platform import installed_interactive_shells
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import (
@@ -93,7 +91,7 @@ def native_coding_agent_for_terminal_name(name: str | None) -> NativeCodingAgent
     return _BY_TERMINAL_NAME.get(name or "")
 
 
-def native_shell_terminal_spec() -> dict[str, Any]:
+def native_shell_terminal_spec() -> dict[str, dict[str, object]]:
     """The user-shell terminals every native wrapper declares.
 
     Native sessions expose the web UI's "+ New shell" affordance, which lets a

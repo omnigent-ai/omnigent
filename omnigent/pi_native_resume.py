@@ -38,11 +38,12 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypeAlias, cast
+from typing import cast
 
 import httpx
 
 from omnigent.host.daemon_launch import error_text
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_terminal import url_component
 
 # Pi session ids are UUIDv7 hex with dashes (e.g.
@@ -61,8 +62,6 @@ _PI_SESSION_VERSION = 3
 
 # 8-char hex entry ids, matching Pi's own ``SessionEntryBase.id`` shape.
 _ENTRY_ID_LEN = 8
-
-_JsonObject: TypeAlias = dict[str, object]
 
 
 def is_safe_pi_session_id(external_session_id: str) -> bool:

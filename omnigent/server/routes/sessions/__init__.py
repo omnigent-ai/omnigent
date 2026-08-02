@@ -96,8 +96,10 @@ from omnigent.runtime import (
     get_policy_store,
     pending_elicitations,
     pending_inputs,
-    session_stream,
     user_session_stream,
+)
+from omnigent.runtime import (
+    session_stream as session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE

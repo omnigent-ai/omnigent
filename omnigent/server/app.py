@@ -2359,7 +2359,7 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
-        else:
+        elif isinstance(auth_provider, UnifiedAuthProvider):
             from omnigent.server.routes.auth import create_auth_router
 
             # OIDC invites are opt-in (OMNIGENT_OIDC_ALLOW_INVITES) and
@@ -2388,6 +2388,11 @@ def create_app(
                 ),
                 prefix="/auth",
                 tags=["auth"],
+            )
+        else:
+            _logger.debug(
+                "Skipping built-in auth routes for custom provider %s",
+                type(auth_provider).__name__,
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
@@ -2451,7 +2456,7 @@ def create_app(
     all_extra_routers = list(extra_routers or [])
     all_extra_routers.extend(_load_debug_routers(debug_router_modules))
     for router, prefix, tags in all_extra_routers:
-        app.include_router(router, prefix=prefix, tags=tags)
+        app.include_router(router, prefix=prefix, tags=[*tags])
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()

@@ -14,8 +14,9 @@ from abc import ABC, abstractmethod
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, TypeAlias, cast
+from typing import Protocol, cast
 
+from omnigent.json_types import JsonValue
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
 from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
@@ -47,11 +48,6 @@ _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
-
-# JSON-shaped payload passed across the parent/launcher boundary: the
-# SandboxPolicy serialized via `to_jsonable()` plus whatever `json.loads`
-# returns on the helper side.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 @dataclass
@@ -799,14 +795,14 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         # tempdir root, which the profile only granted a subpath of —
         # ``FileNotFoundError: No usable temporary directory`` on
         # seatbelt (bwrap masked it via its ``--tmpfs /tmp`` fallback).
-        tmpdir = create_private_tmpdir()
+        host_tmpdir = create_private_tmpdir()
         try:
-            sandbox = with_additional_write_roots(sandbox, [tmpdir])
-            set_temp_env(os.environ, tmpdir)
+            sandbox = with_additional_write_roots(sandbox, [host_tmpdir])
+            set_temp_env(os.environ, host_tmpdir)
             encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
             # Name the dir for the in-wrap pass: it adopts this exact
             # path (no second mint) and owns the cleanup on exit.
-            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(tmpdir)
+            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(host_tmpdir)
             # Re-invoke run_launcher via an INLINE python -c script
             # rather than re-running the launcher tempfile. Reason:
             # bwrap mounts ``/tmp`` as a fresh tmpfs, so the host's
@@ -851,7 +847,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # ``except`` only fires if the wrap/exec never handed off.
             os.execvp(wrapped[0], wrapped)
         except BaseException:
-            cleanup_private_tmpdir(tmpdir)
+            cleanup_private_tmpdir(host_tmpdir)
             raise
 
     tmpdir: Path | None = None

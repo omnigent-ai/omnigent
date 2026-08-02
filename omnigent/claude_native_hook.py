@@ -11,7 +11,6 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import httpx
 
@@ -458,8 +457,12 @@ def _create_clear_replacement_session(
     if not isinstance(agent_id, str) or not agent_id:
         raise RuntimeError(f"session {old_session_id!r} has no agent_id")
     runner_id = old.get("runner_id")
-    labels = old.get("labels") if isinstance(old.get("labels"), dict) else {}
-    labels = {str(key): str(value) for key, value in labels.items()}
+    raw_labels = old.get("labels")
+    labels = (
+        {str(key): str(value) for key, value in raw_labels.items()}
+        if isinstance(raw_labels, dict)
+        else {}
+    )
     labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
 
     create_resp = client.post(
@@ -620,7 +623,7 @@ def _conversation_url_for_active_session(
 def _post_hook_with_reattach(
     url: str,
     headers: dict[str, str],
-    payload: dict[str, Any],
+    payload: dict[str, object],
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
 ) -> httpx.Response | None:

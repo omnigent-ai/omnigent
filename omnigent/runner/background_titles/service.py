@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
+
+import httpx
 
 from omnigent.harness_plugins import (
     BackgroundTitleGeneratorSpec,
@@ -34,9 +36,11 @@ class BackgroundTitleProcessManager(Protocol):
         harness_name: str,
         *,
         env: dict[str, str] | None = None,
-    ) -> Any: ...
+    ) -> httpx.AsyncClient:
+        pass
 
-    async def release(self, conversation_id: str) -> None: ...
+    async def release(self, conversation_id: str) -> None:
+        pass
 
 
 @dataclass(frozen=True)

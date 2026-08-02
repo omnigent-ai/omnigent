@@ -44,6 +44,7 @@ import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
 from omnigent.model_fallbacks import StaticModelFallback, static_model_fallback
 from omnigent.model_metadata import (
@@ -107,7 +108,6 @@ _ProviderHarness: TypeAlias = Literal[
     "kimi",
     "qwen",
 ]
-_JsonObject: TypeAlias = dict[str, object]
 
 # Harness spellings -> the workflow harness whose provider resolution they
 # share; natives resolve via their SDK sibling (the resolve_native_* rule).
