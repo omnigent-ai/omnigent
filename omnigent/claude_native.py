@@ -4237,9 +4237,12 @@ def _json_object(value: object) -> _JsonObject | None:
     """Return a string-keyed object for a decoded JSON mapping."""
     if not isinstance(value, dict):
         return None
-    if not all(isinstance(key, str) for key in value):
-        return None
-    return {key: item for key, item in value.items() if isinstance(key, str)}
+    result: _JsonObject = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            return None
+        result[key] = item
+    return result
 
 
 def _json_object_from_string(value: object) -> _JsonObject:
