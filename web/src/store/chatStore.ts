@@ -3884,6 +3884,16 @@ async function refetchRunnerBackedSessionState(
           skills: session.skills ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
         };
+  // A `refreshState` request invalidates the server's runner-skill cache and
+  // skills resolve off the snapshot hot path, so this response can answer an
+  // empty list for a session that has them. Treat that as "not yet known"
+  // rather than "none" and keep whatever the menu already holds — the
+  // `session_skills` event refills it when the re-fetch lands. Without this a
+  // runner-online refresh mid-session blanks the slash-command menu until the
+  // conversation is re-opened.
+  if (options.refreshState === true && (session.skills ?? []).length === 0) {
+    delete statePatch.skills;
+  }
   if (stickyModel != null) {
     statePatch.selectedModel = stickyModel;
     statePatch.sessionModelOverride = stickyModel;

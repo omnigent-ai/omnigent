@@ -4661,7 +4661,7 @@ async def _relay_runner_stream(
         # land stale values from the dead runner; the model catalog is only
         # marked stale so the picker keeps serving it while the session sleeps.
         _invalidate_runner_backed_snapshot_state(
-            session_id, cancel_inflight=True, drop_model_options=False
+            session_id, cancel_inflight=True, drop_model_options=False, drop_skills=False
         )
 
 
@@ -6357,12 +6357,15 @@ async def _fetch_runner_skills(
     if runner_client is None:
         return []
     cached = _runner_skills_cache.get(session_id)
-    if cached is not None:
+    stale = session_id in _runner_skills_stale
+    if cached is not None and not stale:
         return cached
     # Don't await the runner here: this snapshot is polled continuously
     # (incl. mid-turn), and a per-poll runner round-trip pins the runner's
     # event loop and wedges the turn. Kick one background fetch (single-
     # flight) and return ``[]``; a later poll serves the cached result.
+    # A STALE entry keeps serving meanwhile, so an invalidation never makes
+    # this snapshot answer a spurious empty list.
     if session_id not in _runner_skills_inflight:
         task = asyncio.create_task(_load_runner_skills(runner_client, session_id))
         _runner_skills_inflight[session_id] = task
@@ -6371,7 +6374,9 @@ async def _fetch_runner_skills(
             _runner_skills_inflight.pop(session_id, None)
 
         task.add_done_callback(_clear_skills_inflight)
-    return []
+    # Serve the stale list while the re-fetch runs; ``[]`` only when nothing
+    # has ever been cached for this session.
+    return cached if cached is not None else []
 
 
 async def _fetch_model_options(
@@ -6569,6 +6574,10 @@ async def _get_session_snapshot(
             drop_model_options=(
                 runner_client is not None and wrapper != _CURSOR_NATIVE_WRAPPER_LABEL_VALUE
             ),
+            # Same agent, so the cached skills are still this session's: keep
+            # serving them while the re-fetch runs. Dropping them would make
+            # THIS snapshot answer [] and blank the client's menu.
+            drop_skills=False,
         )
 
     status = _session_status_from_cache(session_id)
