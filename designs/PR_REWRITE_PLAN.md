@@ -61,7 +61,7 @@
 
 1. **The resolution machinery reverts to main's simple shape.** The rewrite cuts the `MODEL_LISTS` fork, the cost-substitution machinery (~260 source lines: `MODEL_LISTS`, `_cost_position`, the nearest-cost walk), and the 10-id hardcoded allowlist. Research basis: the substitution path has zero live triggers on the reference workspace; all five frozen arms resolve exactly today; of the 20 recorded raw-model events, 17 were prefix-spelling restores and 3 came from one bug that is already fixed.
 2. **Pi is not a routed harness, for now.** 3k holds this ruling and its consequences.
-3. **The fallback is one fixed model per family (Bryan's rule).** The claude family's fallback is sonnet. The gpt family's fallback is terra (catalog id `databricks-gpt-5-6-terra`, confirmed in `LIVE_MODEL_STATE.md`). When the router picks an arm the workspace does not serve, the seam applies that family's fallback and stamps `raw_model`, so the record and the chip stay honest. Assumption for Bryan to confirm or veto: glm is a single-arm family with no designated fallback, so an unservable glm pick declines honestly. Two more items need Bryan's confirmation. Terra exists in the tree today only on pi's old exclusion list, so the implementation must add it as a servable fallback target. "Sonnet" must pin to one catalog id: `databricks-claude-sonnet-5` is the routed arm, and `databricks-claude-sonnet-4-6` also exists in the workspace.
+3. **The fallback is one fixed model per family (Bryan's rule; ids settled 2026-08-01).** The claude family falls back to sonnet. Sonnet means the id that the `sonnet` alias pin resolves to (today `databricks-claude-sonnet-5`); the fallback follows the pin, never a hardcoded id. The gpt family and the glm family both fall back to luna (`databricks-gpt-5-6-luna`). Luna is itself a frozen arm, so the router's own menu already contains the fallback target. Luna serves on the codex side, so a glm fallback never leaves its harness. When the router picks an arm the workspace does not serve, the seam applies that family's fallback and stamps `raw_model`, so the record and the chip stay honest. This ruling replaced two earlier drafts: terra is out (the tree knew it only as a pi-exclusion entry), and glm no longer declines — it falls back to luna.
 
 The chain therefore has four steps: strip the prefix → match the catalog exactly → apply the family fallback → decline honestly. An honest decline writes no pin, records `applied=false`, shows a decision card, and keeps the session default model. The session never breaks. Two boundaries hold for the fleet. First, the gateway spelling pin stays: `glm-5-2` serves under the `system.ai.glm-5-2` route, and that pin is a spelling, not a substitution. Second, the claude `/model` alias vocabulary is NOT part of this cut, because the Claude CLI accepts only its own aliases for a mid-session switch; 2a keeps that vocabulary.
 
@@ -114,7 +114,28 @@ Honest caveat: the test line is an estimate, not a target (3g). The floor depend
 4. The registry re-stamped.
 5. The PR body regenerated from the final diff.
 
+6c defines the evidence bars for these checks. 6d names the recipes. 6e scopes each verification run.
+
 **6b** The old branch survives as `routing-mvp-v1`, like `routing-mvp-backup` before it. The PR either force-pushes or opens fresh, and Bryan makes that call at handoff time.
+
+**6c** The evidence bars. A behavior counts as verified only when it clears the bar for its layer:
+
+- A routing decision is exact when the raw pick and the applied model name the same arm, and the record shows `applied=true`. A spelling difference is not a substitution.
+- Process truth beats UI truth. For claude, the proof is the pane: the status bar shows the routed model, and the transcript holds exactly one `/model` injection per switch. For codex, the proof is the bridge dir: `config.toml` and the newest rollout `turn_context` name the routed model.
+- The server log must show zero anomalies for the run: no `harness=None`, no missing-spelling warnings, no malformed router ids.
+- The UI acceptance is 2e's three surfaces, and a human checks them on a live stack.
+- The fallback and decline steps (3i) have no live trigger on the reference workspace, so unit tests with a synthetic catalog verify them. The live matrix verifies the exact-match path.
+
+**6d** The recipes. `CUJ_STATUS.md` §1 holds the exact commands as reusable handles, and the fleet reuses them instead of inventing new ones: **R0** stack bring-up (the three `run-*.sh` scripts), **R1** the decisions query against the chat DB, **R2** claude pane capture over the runner's tmux socket, **R3** codex `config.toml` + rollout ground truth, **R4** the server-log signature greps, **R5** the router probe, **R7** the headless session driver, **R9** the gateway-gating flip, **R10** the CLI invocations. **R8** (the canary provoke) dies with 3b, so the slim branch's registry drops it. The docs PR updates the registry to the slimmed scope, and the registry stays the source of truth for how to verify every row.
+
+**6e** Per-slice gates. Every slice must pass its own unit tests before it enters the series (4a). The verification agent's four runs (6a) have these scopes:
+
+1. After slice 5, when both apply layers are in: the decision-and-apply matrix rows (A1–A4, B1–B2, C1–C3) via R1 + R2 + R3, with R4 clean.
+2. After slice 6, when subagent routing is in: the spawn and toggle rows (B-sub, B-tog, C-sub, C-tog, A-sub), with the family constraints proven in both directions.
+3. After slice 8, when the CLI is in: the R10 rows from `CUJ_STATUS.md` §2.10.
+4. After slice 9, when the web is in: the three 2e surfaces plus the model-indicator fix, by hand on a live stack, and R9's gating flip in both directions.
+
+The final gate before anything replaces #3506 is 6a's five items, run once on the assembled branch.
 
 ## 7. Bryan's critique — the decisions
 
@@ -130,8 +151,8 @@ Honest caveat: the test line is an estimate, not a target (3g). The floor depend
 
 1. Cut the `MODEL_LISTS` fork and the cost-substitution table, and revert the resolution machinery to main's shape.
 2. Drop pi from the routed set, for now.
-3. Use the per-family fallback (claude → sonnet, gpt → terra), with an honest decline behind it.
+3. Use the per-family fallback (claude → sonnet, gpt and glm → luna), with an honest decline behind it.
 
-See 3i and 3k. Three assumptions stay open for Bryan's veto: glm has no fallback and declines; terra is the gpt fallback (`databricks-gpt-5-6-terra`, known to the code today only as a pi-exclusion entry, so the code must add it as a servable target); sonnet pins to `databricks-claude-sonnet-5`.
+See 3i and 3k. Bryan closed the last assumptions on 2026-08-01: the gpt and glm families fall back to luna (`databricks-gpt-5-6-luna`, itself a frozen arm); the claude fallback follows the `sonnet` alias pin (today `databricks-claude-sonnet-5`); terra is out. No open assumptions remain.
 
 **7f** Two items entered the plan from the same critique, rather than leaving it. Managed-plugin readiness is a commit-1 requirement (2a, 4b). The in-session model indicator is a must-fix bug (2e).
