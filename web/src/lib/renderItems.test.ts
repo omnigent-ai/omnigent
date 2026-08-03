@@ -1645,3 +1645,82 @@ describe("buildBubbles — workedForS turn duration", () => {
     ).toBeUndefined();
   });
 });
+
+describe("buildBubbles — continued turns (sub-agent await)", () => {
+  const narrationThenTools = (rid: string): AnyBlock[] => [
+    {
+      type: "text_done",
+      ctx: ctx({ itemId: `${rid}_t`, responseId: rid }),
+      fullText: "Dispatching two sub-agents.",
+      hasCodeBlocks: false,
+    },
+    {
+      type: "tool_group",
+      ctx: ctx({ itemId: `${rid}_g`, responseId: rid }),
+      executions: [mkExec("Agent", `${rid}_c1`), mkExec("Agent", `${rid}_c2`)],
+    },
+  ];
+  const answer = (rid: string): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId: `${rid}_a`, responseId: rid }),
+    fullText: "Both repos profiled.",
+    hasCodeBlocks: false,
+  });
+  const userMessage = (rid: string, text: string): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx({ itemId: `${rid}_u`, responseId: rid }),
+    content: [{ type: "input_text", text }],
+  });
+  const assistantAt = (bubbles: Bubble[], i: number) =>
+    bubbles[i] as Extract<Bubble, { kind: "assistant" }>;
+
+  it("marks a turn continued across the [System: …] sub-agent wakes", () => {
+    // The dispatch turn must END to await its sub-agents; the inbox wake
+    // starts a NEW response carrying the answer. Both halves belong to one
+    // logical turn, so the first is flagged continued.
+    const bubbles = buildBubbles(
+      [
+        ...narrationThenTools("resp_1"),
+        userMessage(
+          "resp_2",
+          "[System: sub-agent general-purpose finished (completed) — 1 result]",
+        ),
+        userMessage(
+          "resp_3",
+          "[System: sub-agent general-purpose finished (completed) — 2 result]",
+        ),
+        answer("resp_4"),
+      ],
+      null,
+    );
+    const assistants = bubbles.filter((b) => b.kind === "assistant");
+    expect(assistants).toHaveLength(2);
+    expect(assistantAt(assistants, 0).continued).toBe(true);
+    // The answer bubble ends the turn — nothing continues it. Unmarked
+    // bubbles keep the field unset (no needless clone), so assert falsy.
+    expect(assistantAt(assistants, 1).continued).toBeFalsy();
+  });
+
+  it("does not mark a turn continued across a real user message", () => {
+    const bubbles = buildBubbles(
+      [...narrationThenTools("resp_1"), userMessage("resp_2", "Do it again"), answer("resp_3")],
+      null,
+    );
+    const assistants = bubbles.filter((b) => b.kind === "assistant");
+    expect(assistantAt(assistants, 0).continued).toBeFalsy();
+  });
+
+  it("leaves a lone trailing turn unmarked", () => {
+    const bubbles = buildBubbles(narrationThenTools("resp_1"), null);
+    const assistants = bubbles.filter((b) => b.kind === "assistant");
+    expect(assistantAt(assistants, 0).continued).toBeFalsy();
+  });
+
+  it("bubblesEqual distinguishes a bubble whose continuation just landed", () => {
+    // The memo comparator must see the flip, or the fold never appears
+    // when the continuation bubble arrives.
+    const before = buildBubbles(narrationThenTools("resp_1"), null);
+    const after = buildBubbles([...narrationThenTools("resp_1"), answer("resp_2")], null);
+    expect(bubblesEqual(before[0]!, after[0]!)).toBe(false);
+  });
+});

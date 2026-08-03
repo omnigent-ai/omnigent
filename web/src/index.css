@@ -2032,3 +2032,44 @@
     radial-gradient(ellipse at 80% 20%, rgba(94, 129, 172, 0.08) 0%, transparent 45%),
     linear-gradient(160deg, #434c5e 0%, #2e3440 60%, #2e3440 100%);
 }
+
+/* Turn "Worked for …" process fold (BlockRenderer TurnWorkedFold).
+   The trace collapses with a height animation instead of disappearing in
+   one frame — an instant swap of a tall block read as a page reload. The
+   from/to heights need Radix's measured custom property, so this can't be
+   expressed as a Tailwind utility. */
+@keyframes turn-fold-expand {
+  from {
+    height: 0;
+    opacity: 0;
+  }
+  to {
+    height: var(--radix-collapsible-content-height);
+    opacity: 1;
+  }
+}
+@keyframes turn-fold-collapse {
+  from {
+    height: var(--radix-collapsible-content-height);
+    opacity: 1;
+  }
+  to {
+    height: 0;
+    opacity: 0;
+  }
+}
+.turn-fold-content {
+  overflow: hidden;
+}
+.turn-fold-content[data-state="open"] {
+  animation: turn-fold-expand 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.turn-fold-content[data-state="closed"] {
+  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-fold-content[data-state="open"],
+  .turn-fold-content[data-state="closed"] {
+    animation: none;
+  }
+}

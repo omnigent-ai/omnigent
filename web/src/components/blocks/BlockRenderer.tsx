@@ -25,7 +25,7 @@
 //    bubbles) keeps its trace expanded.
 
 import type { ReactNode } from "react";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { defaultRemarkPlugins } from "streamdown";
@@ -316,6 +316,13 @@ interface BlockRendererProps {
   turnLifecycle?: ActiveResponse["state"];
   /** Wall-clock seconds the turn worked (`Bubble.workedForS`). */
   workedForS?: number;
+  /**
+   * The turn continues in a later assistant bubble (`Bubble.continued`)
+   * — it yielded mid-task (e.g. awaiting sub-agents), so the answer
+   * lands elsewhere. Such a bubble folds its whole trace despite having
+   * no trailing answer of its own.
+   */
+  continued?: boolean;
 }
 
 type ToolRunFragment =
@@ -335,21 +342,32 @@ export function BlockRenderer({
   canApprove = true,
   turnLifecycle,
   workedForS,
+  continued = false,
 }: BlockRendererProps) {
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
   const isTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
 
+  // Did this turn settle under the user's eyes on THIS render (rather
+  // than mounting already-settled from history)? Only then is there a
+  // visible trace to animate away — see `TurnWorkedFold`.
+  const wasLiveRef = useRef(isTurnLive);
+  const justSettled = wasLiveRef.current && !isTurnLive;
+  useEffect(() => {
+    wasLiveRef.current = isTurnLive;
+  });
+
   if (!isTurnLive) {
     const { process, exempt, final, finalStart } = partitionTurn(items);
-    // Fold only a turn that both did work and produced an answer: the
-    // trace collapses behind the "Worked for" row, exempt cards stay
-    // visible after it, and the answer renders last at full style. A
-    // turn missing either half renders expanded — there is nothing to
-    // demarcate.
-    if (process.length > 0 && final.length > 0) {
+    // Fold a turn that did work AND either answered here or continues in
+    // a later bubble: the trace collapses behind the "Worked for" row,
+    // exempt cards stay visible after it, and the answer (when this
+    // bubble carries one) renders last at full style. A turn that did no
+    // work, or that dead-ends with no answer anywhere, renders expanded —
+    // there is nothing to demarcate.
+    if (process.length > 0 && (final.length > 0 || continued)) {
       return (
         <>
-          <TurnWorkedFold workedForS={workedForS}>
+          <TurnWorkedFold workedForS={workedForS} animateCollapse={justSettled}>
             {renderSequence(process, { liveEdge: false, canApprove })}
           </TurnWorkedFold>
           {exempt.map(({ item, index }) => renderItem(item, index, false, false, canApprove))}
@@ -508,16 +526,39 @@ function isPendingElicitation(item: RenderItem): boolean {
  * "Worked for Xs" row with a hairline rule, so the final answer below
  * is unambiguously where reading starts. Expanding replays the trace
  * inline.
+ *
+ * `animateCollapse` marks the render where the turn settled while the
+ * user was watching. The fold then MOUNTS OPEN — showing exactly the
+ * trace that was already on screen — and closes on the next frame, so
+ * the steps visibly fold into the summary row. Swapping straight to the
+ * collapsed row instead made a tall block vanish in one frame, which
+ * read as a partial page reload. Settled history mounts closed: there
+ * was never an expanded trace to animate away.
  */
-function TurnWorkedFold({ workedForS, children }: { workedForS?: number; children: ReactNode }) {
+function TurnWorkedFold({
+  workedForS,
+  animateCollapse,
+  children,
+}: {
+  workedForS?: number;
+  animateCollapse: boolean;
+  children: ReactNode;
+}) {
   const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
+  const [open, setOpen] = useState(animateCollapse);
+  useEffect(() => {
+    if (!animateCollapse) return;
+    const frame = requestAnimationFrame(() => setOpen(false));
+    return () => cancelAnimationFrame(frame);
+  }, [animateCollapse]);
   return (
     // Named `group/turn-fold` so only this collapsible's own chevron
     // rotates (inner tool cards carry unnamed `.group` rotations that a
     // bare `group` class here would incorrectly trigger).
     <Collapsible
       key="turn-worked-fold"
-      defaultOpen={false}
+      open={open}
+      onOpenChange={setOpen}
       className="group/turn-fold not-prose w-full"
       data-testid="turn-worked-fold"
     >
@@ -526,7 +567,10 @@ function TurnWorkedFold({ workedForS, children }: { workedForS?: number; childre
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
         <span aria-hidden className="ml-1 flex-1 border-border border-t" />
       </CollapsibleTrigger>
-      <CollapsibleContent className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
+      {/* Height animation lives in index.css (it needs Radix's measured
+          --radix-collapsible-content-height) and is disabled under
+          prefers-reduced-motion. */}
+      <CollapsibleContent className="turn-fold-content">
         <div className="flex flex-col gap-2 border-border border-b py-2">{children}</div>
       </CollapsibleContent>
     </Collapsible>

@@ -3457,6 +3457,7 @@ function AssistantBubble({
             canApprove={canApprove}
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
+            continued={bubble.continued}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (

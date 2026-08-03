@@ -19,6 +19,7 @@
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
 import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import { isSystemUserContent } from "./systemMessage";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -148,6 +149,14 @@ export type Bubble =
        * reloaded history spans the items' server `created_at` stamps.
        */
       workedForS?: number;
+      /**
+       * The turn's work continues in a LATER assistant bubble: this one
+       * yielded mid-task (e.g. dispatching sub-agents and awaiting their
+       * results), so the answer lands under a different response id. Lets
+       * the renderer fold this bubble's trace even though it carries no
+       * trailing answer of its own.
+       */
+      continued?: boolean;
     }
   | { kind: "compaction_loading"; itemId: string }
   | { kind: "compaction"; itemId: string }
@@ -236,7 +245,9 @@ export function buildBubbles(
 ): Bubble[] {
   const interruptedResponses = new Set(interruptedResponseIds);
   if (cache === undefined) {
-    return walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map()).bubbles;
+    return markContinuedTurns(
+      walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map()).bubbles,
+    );
   }
 
   // Nothing changed since the last call — hand back the same array.
@@ -269,9 +280,9 @@ export function buildBubbles(
     cache.blocks = blocks;
     cache.activeResponse = activeResponse;
     cache.interruptedResponseIds = interruptedResponseIds;
-    cache.bubbles = rest.bubbles;
+    cache.bubbles = markContinuedTurns(rest.bubbles);
     cache.lastBubbleStart = rest.lastBubbleStart;
-    return rest.bubbles;
+    return cache.bubbles;
   }
 
   // Cache miss (session switch, history prepend, in-place edit) — full rebuild.
@@ -279,9 +290,54 @@ export function buildBubbles(
   cache.blocks = blocks;
   cache.activeResponse = activeResponse;
   cache.interruptedResponseIds = interruptedResponseIds;
-  cache.bubbles = full.bubbles;
+  cache.bubbles = markContinuedTurns(full.bubbles);
   cache.lastBubbleStart = full.lastBubbleStart;
-  return full.bubbles;
+  return cache.bubbles;
+}
+
+/**
+ * Flag assistant bubbles whose turn continues in a later assistant
+ * bubble, so the renderer can fold a trace that carries no answer of
+ * its own.
+ *
+ * A turn that dispatches sub-agents must END to await their results;
+ * the inbox wake then starts a NEW turn (new response id) that carries
+ * the answer. That splits one logical turn across bubbles: the first
+ * holds narration + tool calls and no answer, the second holds the
+ * answer and no work. Neither half satisfies the fold's "did work AND
+ * answered" rule on its own, so the process trace stayed expanded.
+ *
+ * Runtime `[System: …]` markers (the sub-agent-result wakes, timers)
+ * are the await itself, not a new human turn, so scanning looks past
+ * them; a real user message ends the turn and stops the scan.
+ *
+ * Returns the same array when nothing changed; bubbles that flip are
+ * REPLACED (never mutated) so `bubblesEqual` sees a difference and the
+ * memoized bubble actually re-renders.
+ */
+function markContinuedTurns(bubbles: Bubble[]): Bubble[] {
+  let out: Bubble[] | null = null;
+  for (let i = 0; i < bubbles.length; i += 1) {
+    const bubble = bubbles[i]!;
+    if (bubble.kind !== "assistant") continue;
+    const continued = hasAssistantContinuation(bubbles, i);
+    if (continued === Boolean(bubble.continued)) continue;
+    if (out === null) out = bubbles.slice();
+    out[i] = { ...bubble, continued };
+  }
+  return out ?? bubbles;
+}
+
+/** Whether a later assistant bubble continues the turn started at `from`. */
+function hasAssistantContinuation(bubbles: Bubble[], from: number): boolean {
+  for (let i = from + 1; i < bubbles.length; i += 1) {
+    const next = bubbles[i]!;
+    if (next.kind === "assistant") return true;
+    // A real user turn ends this one; system markers do not.
+    if (next.kind === "user" && !isSystemUserContent(next.content)) return false;
+    // Compaction / routing markers are mid-turn events — keep scanning.
+  }
+  return false;
 }
 
 /**
@@ -914,7 +970,13 @@ function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): b
 export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "assistant" && b.kind === "assistant") {
-    if (a.stableId !== b.stableId || a.lifecycle !== b.lifecycle || a.error !== b.error) {
+    if (
+      a.stableId !== b.stableId ||
+      a.lifecycle !== b.lifecycle ||
+      a.error !== b.error ||
+      // Flips when a later bubble continues this turn — the fold depends on it.
+      Boolean(a.continued) !== Boolean(b.continued)
+    ) {
       return false;
     }
     if (a.items.length !== b.items.length) return false;
