@@ -290,6 +290,60 @@ def test_max_effort_is_rejected_unbilled(tool_ctx: ToolContext) -> None:
 
 
 @respx.mock
+def test_non_string_use_case_is_rejected_unbilled(tool_ctx: ToolContext) -> None:
+    """A non-string use_case is a clear tool error, not a TypeError from the
+    frozenset membership test (an unhashable list), and issues no request."""
+    out = _invoke(_config(), tool_ctx, args={"task": "x", "use_case": []})
+    assert out == "Error: 'use_case' must be research, enrichment, or dataset_building."
+    assert respx.calls.call_count == 0
+
+
+def test_response_validation_error_on_create_warns_do_not_resubmit(
+    tool_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 2xx create whose body fails SDK validation raises outside
+    APIStatusError/APIConnectionError; the run may exist and be billed, so the
+    error must carry the do-not-resubmit guidance and point at run history."""
+    import nimble_python
+
+    err = nimble_python.APIResponseValidationError(
+        response=httpx.Response(202, request=httpx.Request("POST", f"{_BASE}/v2/agents/runs")),
+        body={},
+    )
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            def _raise(*args: Any, **kw: Any) -> Any:
+                raise err
+
+            class _Agents:
+                run = staticmethod(_raise)
+
+                class runs:
+                    create = staticmethod(_raise)
+
+            self.agents = _Agents()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(nimble_python, "Nimble", _FakeClient)
+    out = _invoke(_config(), tool_ctx, args={"task": "x"})
+    assert "Do not retry or resubmit this task automatically" in out
+    assert "run history" in out
+
+
+def test_request_timeout_clamps_to_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single HTTP call never outlives the tool's overall deadline."""
+    monkeypatch.setattr(nimble_research_mod, "_monotonic", lambda: 100.0)
+    assert nimble_research_mod._request_timeout(105.0) == 5.0
+    assert nimble_research_mod._request_timeout(1000.0) == 30.0
+    assert nimble_research_mod._request_timeout(99.0) == 0.001
+
+
+@respx.mock
 def test_missing_sdk_names_the_nimble_extra_unbilled(
     tool_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:

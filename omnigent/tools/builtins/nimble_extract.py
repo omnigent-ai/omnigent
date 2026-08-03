@@ -57,6 +57,9 @@ _MAX_TIMEOUT_S = 600.0
 
 # Cap the returned JSON so a large extraction cannot blow the model context.
 _MAX_CONTENT_CHARS = 50_000
+# Per-string cap for any API-supplied value reflected into an error message,
+# so an oversized error body cannot bloat the tool result either.
+_MAX_FIELD_CHARS = 2_000
 
 _DESCRIPTION = (
     "Run the configured Nimble extract template against the live web and "
@@ -97,6 +100,11 @@ def _truncate(text: str) -> str:
     return text
 
 
+def _cap_field(value: str) -> str:
+    """Cap a single API-supplied string reflected into an error message."""
+    return value if len(value) <= _MAX_FIELD_CHARS else value[:_MAX_FIELD_CHARS] + "…"
+
+
 def _error_detail(resp: httpx.Response) -> str:
     """
     A `` : <message> (task: ...)`` suffix built from an error response body,
@@ -114,14 +122,14 @@ def _error_detail(resp: httpx.Response) -> str:
     message = body.get("message") or body.get("msg")
     if not isinstance(message, str) or not message.strip():
         return ""
-    return f": {message.strip()}{_task_suffix(body)}"
+    return f": {_cap_field(message.strip())}{_task_suffix(body)}"
 
 
 def _task_suffix(payload: dict[str, Any]) -> str:
     """A `` (task: ...)`` suffix for support-friendly messages, when known."""
     task_id = payload.get("task_id")
     if isinstance(task_id, str) and task_id:
-        return f" (task: {task_id})"
+        return f" (task: {_cap_field(task_id)})"
     return ""
 
 
@@ -148,7 +156,7 @@ def _format_extract(payload: dict[str, Any], template: str) -> str:
             detail = error if isinstance(error, str) and error else "unknown parsing error"
             return (
                 f"Nimble extract error: template {template!r} parsing failed: "
-                f"{detail}{_task_suffix(payload)}"
+                f"{_cap_field(detail)}{_task_suffix(payload)}"
             )
         entities = parsing.get("entities")
         if entities or (parsing_status == "success" and isinstance(entities, dict | list)):
@@ -162,7 +170,7 @@ def _format_extract(payload: dict[str, Any], template: str) -> str:
     status = payload.get("status", "unknown")
     return (
         f"No structured data returned by the Nimble extract run "
-        f"(status: {status}){_task_suffix(payload)}."
+        f"(status: {_cap_field(str(status))}){_task_suffix(payload)}."
     )
 
 

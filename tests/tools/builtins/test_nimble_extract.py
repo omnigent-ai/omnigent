@@ -364,6 +364,21 @@ def test_5xx_surfaces_server_message_and_task_id(tool_ctx: ToolContext) -> None:
 
 
 @respx.mock
+def test_oversized_error_body_is_capped(tool_ctx: ToolContext) -> None:
+    """API-supplied error strings are capped so an oversized error body
+    cannot bloat the tool result the way success payloads cannot."""
+    respx.post(_RUN_URL).mock(
+        return_value=httpx.Response(
+            500,
+            json={"message": "m" * 10_000, "task_id": "t" * 10_000},
+        )
+    )
+    out = _invoke(_config(), tool_ctx)
+    assert len(out) < 2 * 2_100
+    assert out.count("…") == 2
+
+
+@respx.mock
 def test_timeout_returns_error_string(tool_ctx: ToolContext) -> None:
     """A network timeout surfaces as a readable error string."""
     respx.post(_RUN_URL).mock(side_effect=httpx.TimeoutException("read timed out"))

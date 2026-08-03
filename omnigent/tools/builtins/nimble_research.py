@@ -404,7 +404,9 @@ def _resolve_controls(parsed: dict[str, Any]) -> tuple[dict[str, Any] | None, st
 
     use_case = parsed.get("use_case")
     if use_case is not None:
-        if use_case not in _VALID_USE_CASES:
+        # isinstance first: a list/dict operand would make the frozenset
+        # membership test raise TypeError (unhashable) instead of erroring.
+        if not isinstance(use_case, str) or use_case not in _VALID_USE_CASES:
             return None, ("Error: 'use_case' must be research, enrichment, or dataset_building.")
         controls["use_case"] = use_case
 
@@ -432,6 +434,17 @@ def _retry_after_seconds(resp: httpx.Response) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if value >= 0 else None
+
+
+def _request_timeout(deadline: float) -> float:
+    """
+    Per-request HTTP timeout, clamped to the time left before *deadline* so a
+    single call cannot overrun the tool's overall budget.
+
+    :param deadline: Absolute ``_monotonic()`` deadline.
+    :returns: Seconds for this request, at most ``_HTTP_TIMEOUT_S``.
+    """
+    return min(_HTTP_TIMEOUT_S, max(deadline - _monotonic(), 0.001))
 
 
 def _http_error_detail(resp: httpx.Response) -> str:
@@ -486,6 +499,7 @@ def _start_run(
     task: str,
     effort: str | None,
     controls: dict[str, Any],
+    deadline: float,
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """
     Start a run, on whichever create route the caller's identity selects:
@@ -506,6 +520,8 @@ def _start_run(
     :param controls: Validated SDK 1.2 per-run controls (``input_data``,
         ``output_schema``, ``sources``, ``agent_name``, ``skill``, and
         ``use_case``) to forward unchanged.
+    :param deadline: Absolute ``_monotonic()`` deadline; clamps the create
+        request's timeout so it cannot outlive the tool's budget.
     :returns: ``(run, agent_id, None)`` with a validated ``task_run_...`` id
         and the agent id to address the rest of the lifecycle to, or
         ``(None, None, error_message)``.
@@ -513,7 +529,7 @@ def _start_run(
     # Lazy: nimble-python is the optional `nimble` extra, so the base install
     # never needs it. Checked before anything is sent, so nothing is billed.
     try:
-        from nimble_python import APIConnectionError, APIStatusError, Nimble
+        from nimble_python import APIConnectionError, APIError, APIStatusError, Nimble
     except ImportError:
         return (
             None,
@@ -537,10 +553,11 @@ def _start_run(
     )
     created: Any
     try:
+        request_timeout = _request_timeout(deadline)
         if agent_id:
-            created = client.agents.runs.create(agent_id, **body, timeout=_HTTP_TIMEOUT_S)
+            created = client.agents.runs.create(agent_id, **body, timeout=request_timeout)
         else:
-            created = client.agents.run(**body, timeout=_HTTP_TIMEOUT_S)
+            created = client.agents.run(**body, timeout=request_timeout)
     except APIStatusError as exc:
         code = exc.status_code
         if code in (401, 403):
@@ -582,6 +599,11 @@ def _start_run(
     except APIConnectionError as exc:
         # Includes timeouts: the request may have been received and started a
         # run even though no response came back.
+        return None, None, _unresolved_create_error(f"Nimble research error: {exc}")
+    except APIError as exc:
+        # e.g. APIResponseValidationError: a 2xx arrived but its body failed
+        # the SDK's validation, so the run may exist and be billed with
+        # nothing durable to reconcile against except the account history.
         return None, None, _unresolved_create_error(f"Nimble research error: {exc}")
     finally:
         client.close()
@@ -683,7 +705,7 @@ def _poll_until_terminal(
             resp = httpx.get(
                 f"{base}/v2/agents/{agent_id}/runs/{run_id}",
                 headers=headers,
-                timeout=_HTTP_TIMEOUT_S,
+                timeout=_request_timeout(deadline),
             )
         except httpx.InvalidURL as exc:
             return None, (
@@ -763,7 +785,7 @@ def _fetch_result(
             resp = httpx.get(
                 f"{base}/v2/agents/{agent_id}/runs/{run_id}/result",
                 headers=headers,
-                timeout=_HTTP_TIMEOUT_S,
+                timeout=_request_timeout(deadline),
             )
         except (httpx.RequestError, httpx.InvalidURL) as exc:
             return None, (
@@ -1027,7 +1049,9 @@ def _run_lifecycle(
     :param timeout_s: Total budget, used in the timeout message.
     :returns: The JSON envelope, or an error message. Never raises.
     """
-    run, agent_id, error = _start_run(base, headers, configured_agent_id, task, effort, controls)
+    run, agent_id, error = _start_run(
+        base, headers, configured_agent_id, task, effort, controls, deadline
+    )
     if error is not None or run is None or agent_id is None:
         return error or "Nimble research error: run creation returned no data."
     run_id = str(run.get("id"))
