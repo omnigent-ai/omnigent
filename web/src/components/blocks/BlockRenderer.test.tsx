@@ -343,6 +343,28 @@ describe("BlockRenderer dispatch", () => {
       expect(normalizeExplicitMathDelimiters(doubleTick)).toBe(doubleTick);
     });
 
+    it("escapes currency dollar amounts so prose isn't parsed as inline math", () => {
+      // With single-dollar math enabled, "it costs $5 or $10" would otherwise
+      // parse "5 or " as inline math. Escaping the digit-led `$` renders literal
+      // dollar figures and stops the run from flipping the math toggle.
+      expect(normalizeExplicitMathDelimiters("it costs $5 or $10")).toBe(
+        String.raw`it costs \$5 or \$10`,
+      );
+      // Delimiters after the currency text still normalize — the toggle didn't flip.
+      expect(normalizeExplicitMathDelimiters(String.raw`$5 then \(x\)`)).toBe(
+        String.raw`\$5 then $x$`,
+      );
+    });
+
+    it("does not double-escape an already-escaped dollar", () => {
+      expect(normalizeExplicitMathDelimiters(String.raw`\$5`)).toBe(String.raw`\$5`);
+    });
+
+    it("detects indented code fences per CommonMark", () => {
+      const indentedFence = ["   ```", String.raw`\(\sqrt{x}\)`, "   ```"].join("\n");
+      expect(normalizeExplicitMathDelimiters(indentedFence)).toBe(indentedFence);
+    });
+
     it("loads required Streamdown and KaTeX styles at the app entrypoint", () => {
       // KaTeX's DOM is mostly positioned spans. Without its stylesheet, radicals
       // and fractions can leave only the root bar/outer shell visible while the

@@ -1,3 +1,8 @@
+// Optional 1–3 space indent + a fence run, per CommonMark. Matching the full
+// run (not just the first three chars) also keeps a ````-fenced block from
+// leaking its fourth backtick into inline-code tracking.
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
+
 /**
  * LLMs often emit TeX delimiters (`\(...\)` and `\[...\]`), while remark-math
  * parses dollar delimiters. Convert them to `$`/`$$`, but only where doing so
@@ -7,8 +12,14 @@
  * - Not inside an already `$`/`$$`-delimited math span, so a LaTeX line break
  *   (`\\[1em]`) inside `$$\begin{aligned}…\end{aligned}$$` isn't mistaken for a
  *   display-math opener and turned into `\$$1em]`.
- * - A literal `\\` (escaped backslash / LaTeX line break) is copied verbatim so
- *   its trailing `\[`/`\(` isn't read as an explicit delimiter.
+ * - A literal `\\` or `\$` is copied verbatim so its trailing `\[`/`\(` isn't
+ *   read as an explicit delimiter and an escaped dollar isn't re-toggled.
+ *
+ * A single `$` immediately before a digit reads as currency ($5), not an inline
+ * math opener, so it's escaped and doesn't flip the math span — otherwise, with
+ * single-dollar math enabled, prose like "it costs $5 or $10" renders as a
+ * garbled formula. (Genuine inline math that starts with a digit, e.g. `$3x$`,
+ * is the rare casualty; digit-led currency in prose is far more common.)
  */
 export function normalizeExplicitMathDelimiters(text: string): string {
   let result = "";
@@ -24,15 +35,14 @@ export function normalizeExplicitMathDelimiters(text: string): string {
     const char = text[i];
     const atLineStart = i === 0 || text[i - 1] === "\n";
 
-    if (
-      !inlineCodeTicks &&
-      atLineStart &&
-      (text.startsWith("```", i) || text.startsWith("~~~", i))
-    ) {
-      inFence = !inFence;
-      result += text.slice(i, i + 3);
-      i += 2;
-      continue;
+    if (!inlineCodeTicks && atLineStart) {
+      const fence = FENCE_RE.exec(text.slice(i));
+      if (fence) {
+        inFence = !inFence;
+        result += fence[0];
+        i += fence[0].length - 1;
+        continue;
+      }
     }
     if (inFence) {
       result += char;
@@ -56,8 +66,8 @@ export function normalizeExplicitMathDelimiters(text: string): string {
       continue;
     }
 
-    if (char === "\\" && text[i + 1] === "\\") {
-      result += "\\\\";
+    if (char === "\\" && (text[i + 1] === "\\" || text[i + 1] === "$")) {
+      result += text.slice(i, i + 2);
       i += 1;
       continue;
     }
@@ -65,6 +75,11 @@ export function normalizeExplicitMathDelimiters(text: string): string {
     if (char === "$") {
       let run = 1;
       while (text[i + run] === "$") run += 1;
+      const isCurrency = run === 1 && !inMath && /\d/.test(text[i + 1] ?? "");
+      if (isCurrency) {
+        result += "\\$";
+        continue;
+      }
       inMath = !inMath;
       result += text.slice(i, i + run);
       i += run - 1;
