@@ -79,7 +79,10 @@ def _ensure_chat_view(page: Page) -> None:
     view_mode = page.get_by_test_id("view-mode-toggle")
     if view_mode.count() == 0:
         return
-    view_mode.click()
+    # Keyboard-open the dropdown so a lingering tooltip from the prior
+    # Terminal selection cannot immediately consume the pointer click.
+    view_mode.focus()
+    view_mode.press("Enter")
     chat_item = page.get_by_role("menuitemradio", name="Chat")
     expect(chat_item).to_be_visible(timeout=30_000)
     chat_item.click()
