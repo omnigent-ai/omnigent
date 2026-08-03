@@ -94,7 +94,7 @@ class PolicyVerdict:
         when the policy did not return a replacement.
     """
 
-    action: Literal["allow", "deny", "ask"]
+    action: Literal["allow", "deny", "ask", "defer"]
     deny_text: str | None = None
     policy_name: str | None = None
     reason: str | None = None
@@ -319,6 +319,13 @@ class RunnerToolPolicyGate:
                     deny_text=format_deny_text(gated.name, result.reason),
                     policy_name=gated.name,
                     reason=result.reason,
+                )
+            if result.action == PolicyAction.DEFER:
+                return PolicyVerdict(
+                    action="defer",
+                    policy_name=gated.name,
+                    reason=result.reason,
+                    data=result.data,
                 )
             if result.data is not None:
                 composed_data = result.data

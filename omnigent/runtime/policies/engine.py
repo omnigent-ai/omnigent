@@ -333,6 +333,8 @@ class PolicyEngine:
         accumulated_state: list[StateUpdate] = []
         ask_reasons: list[str] = []
         deciding_ask_policies: list[str] = []
+        defer_reasons: list[str] = []
+        deciding_defer_policies: list[str] = []
         # Sequentially accumulated data: each policy that returns data
         # has its output fed back into ctx.content so the next policy
         # in the chain transforms the already-transformed payload rather
@@ -378,6 +380,11 @@ class PolicyEngine:
                     f"{policy.spec.name}: {result.reason or 'approval required'}",
                 )
                 deciding_ask_policies.append(policy.spec.name)
+            elif result.action == PolicyAction.DEFER:
+                defer_reasons.append(
+                    f"{policy.spec.name}: {result.reason or 'deferred approval required'}",
+                )
+                deciding_defer_policies.append(policy.spec.name)
 
         if ask_reasons:
             # DO NOT apply label writes or state updates here — the ASK
@@ -391,6 +398,15 @@ class PolicyEngine:
                 set_labels=dict(accumulated) if accumulated else None,
                 state_updates=list(accumulated_state) if accumulated_state else None,
                 deciding_policies=deciding_ask_policies,
+                data=composed_data,
+            )
+        if defer_reasons:
+            return PolicyResult(
+                action=PolicyAction.DEFER,
+                reason="; ".join(defer_reasons),
+                set_labels=dict(accumulated) if accumulated else None,
+                state_updates=list(accumulated_state) if accumulated_state else None,
+                deciding_policies=deciding_defer_policies,
                 data=composed_data,
             )
         if not read_only:

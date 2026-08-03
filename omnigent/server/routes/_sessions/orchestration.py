@@ -61,6 +61,7 @@ from omnigent.runtime import (
     pending_elicitations,
     pending_inputs,
 )
+from omnigent.runtime.deferred.manager import DeferredActionManager
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import (
     build_elicitation_request_event,
@@ -6393,6 +6394,38 @@ async def _handle_mcp_tools_call(
                 rpc_id,
                 -32000,
                 f"Denied by policy: {call_result.reason or 'no reason given'}",
+            )
+
+        if call_result.action == PolicyAction.DEFER:
+            manager = DeferredActionManager()
+            deferred_action = await manager.freeze(
+                tool=namespaced_name,
+                arguments=arguments,
+                base_hash=session_id,
+                session_id=session_id,
+                deciding_policy=call_result.deciding_policy,
+                reason=call_result.reason,
+            )
+            return JSONResponse(
+                content={
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {
+                                        "status": "deferred",
+                                        "deferred_id": deferred_action.id,
+                                        "message": f"Action deferred for out-of-band approval: {call_result.reason or 'approval required'}",
+                                    }
+                                ),
+                            }
+                        ],
+                        "isError": False,
+                    },
+                }
             )
 
         if call_result.action == PolicyAction.ASK:
