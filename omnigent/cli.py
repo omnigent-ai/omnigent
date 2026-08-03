@@ -4217,6 +4217,92 @@ def _upgrade_vcs_install(
     click.echo("Re-pulled the git ref. Run `omni upgrade --check` to confirm.")
 
 
+def _upgrade_to_nightly(info: _InstalledWheelInfo, *, check_only: bool, force: bool) -> None:
+    """Move this install onto the newest nightly build (``--nightly``).
+
+    Nightlies are ``vX.Y.Z.devYYYYMMDD`` git tags cut from the newest green
+    commit on main; they never reach the package index. So "is there
+    something newer" is answered by the repo's tags, and the upgrade is a
+    git-pinned reinstall regardless of how omnigent was first installed:
+    a registry install hops onto the channel, an older nightly moves
+    forward, and a same-version rerun no-ops.
+
+    :param info: Installed-distribution metadata.
+    :param check_only: Only report; exit non-zero when running without
+        ``--check`` would change the install.
+    :param force: Stop in-flight sessions immediately instead of draining.
+    """
+    import importlib.metadata
+
+    from packaging.version import InvalidVersion, Version
+
+    from omnigent.update_check import (
+        _build_nightly_upgrade_suggestion,
+        _latest_nightly_version,
+        _probe_installed_distribution,
+        _run_upgrade_command,
+    )
+
+    current = importlib.metadata.version("omnigent")
+    target = _latest_nightly_version()
+    if target is None:
+        raise click.ClickException(
+            "Couldn't find a nightly tag. Check your connection to github.com "
+            "(nightlies are git tags, not index releases); if the nightly lane "
+            "only just landed, the first tag appears after the next 04:30 UTC cut."
+        )
+
+    try:
+        up_to_date = Version(current) == Version(target)
+    except InvalidVersion:
+        up_to_date = current == target
+    if up_to_date:
+        click.echo(f"omnigent is already on the newest nightly (v{current}).")
+        return
+
+    click.echo(f"Newest nightly: v{target} (currently v{current}).")
+    if check_only:
+        # Non-zero means "running --nightly would change the install", the
+        # same contract as the release path's --check. SystemExit rather than
+        # ctx.exit for the standalone_mode=False reason documented there.
+        raise SystemExit(1)
+
+    suggestion = _build_nightly_upgrade_suggestion(info, target)
+    if not suggestion.runnable:
+        raise click.ClickException(
+            f"No automatic upgrade command is known for this install. {suggestion.command}."
+        )
+
+    _drain_and_stop_local_server(force=force)
+
+    console = Console()
+    code = _run_upgrade_command(suggestion.command, console)
+    if code != 0:
+        raise click.ClickException(
+            f"Upgrade command exited with status {code}; your previous install is intact."
+        )
+
+    # Same trust-the-disk verification as the release path: re-read the
+    # version in a fresh subprocess instead of believing the exit code.
+    new_version, _ = _probe_installed_distribution()
+    if new_version == target:
+        click.echo(
+            f"✓ Upgraded to nightly v{target}. Re-run your command; the local "
+            "server will start on the new version."
+        )
+        return
+    if new_version is None:
+        click.echo(
+            "Ran the upgrade command, but couldn't confirm the installed version. "
+            "Run `omni upgrade --nightly --check` to verify."
+        )
+        return
+    raise click.ClickException(
+        f"The upgrade command ran but omnigent is still v{new_version} (expected "
+        f"v{target}). Try the command directly: {suggestion.command}"
+    )
+
+
 @cli.command("upgrade")
 @click.option(
     "--check",
@@ -4237,7 +4323,14 @@ def _upgrade_vcs_install(
     help="Consider pre-releases (e.g. release candidates), and pass the "
     "installer's allow-pre-releases flag. Useful for validating a TestPyPI rc.",
 )
-def upgrade(check_only: bool, force: bool, pre: bool) -> None:
+@click.option(
+    "--nightly",
+    is_flag=True,
+    help="Upgrade to the newest nightly build: a vX.Y.Z.devYYYYMMDD git tag "
+    "installed straight from GitHub with your installer (needs git, plus "
+    "Node 22 and pnpm to build the web UI). Skips the package index.",
+)
+def upgrade(check_only: bool, force: bool, pre: bool, nightly: bool) -> None:
     """Upgrade the omnigent CLI to the latest release on PyPI.
 
     Detects how omnigent was installed (uv / pip / pipx / poetry), checks
@@ -4250,13 +4343,19 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
     In-flight agent sessions are waited on by default; pass ``--force`` to
     stop them immediately. Pass ``--pre`` to consider pre-releases (rc /
     beta) — handy for validating a TestPyPI candidate against your
-    configured index. Source checkouts / editable installs are not upgraded
-    here — update those with ``git pull``.
+    configured index. Pass ``--nightly`` to move onto the newest nightly
+    build instead: nightlies are git tags that never reach the index, so
+    that path reinstalls from GitHub pinned to the tag (``--pre`` has no
+    effect there, and ``--check`` composes as usual). Source checkouts /
+    editable installs are not upgraded here — update those with
+    ``git pull``.
 
     :param check_only: Only report availability; do not upgrade. Exits
         with status 1 when a newer release exists.
     :param force: Stop in-flight sessions immediately rather than draining.
     :param pre: Consider pre-releases and allow the installer to fetch them.
+    :param nightly: Upgrade to the newest nightly git tag instead of the
+        latest index release.
     :returns: None.
     """
     import importlib.metadata
@@ -4288,6 +4387,14 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
         raise click.ClickException(
             "This is an editable install — update it with `git pull`, not `omni upgrade`."
         )
+
+    # Nightly channel: resolved from git tags, not the index, and applies to
+    # every install shape, so it dispatches before the VCS-vs-registry split
+    # (a VCS install pinned to an older nightly tag must move tags, not
+    # re-pull its pinned ref).
+    if nightly:
+        _upgrade_to_nightly(info, check_only=check_only, force=force)
+        return
 
     # A git/VCS install tracks a moving git ref, not a PyPI release. Its
     # version string (a frozen ``0.1.0`` on an unbumped ``main``, say) is NOT
