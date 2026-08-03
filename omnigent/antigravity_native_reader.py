@@ -1429,6 +1429,7 @@ async def _process_committed_step(
     if key not in state.seen:
         if _is_settled(step):
             state.seen.add(key)
+        step_index = _step_index(step)
         state.turn_active = await _emit_step(
             step,
             client=client,
@@ -1436,6 +1437,9 @@ async def _process_committed_step(
             cascade_id=cascade_id,
             allocator=state.allocator,
             turn_active=state.turn_active,
+            reasoning_text=(
+                state.reasoning_prefixes.get(step_index) if step_index is not None else None
+            ),
         )
         # Telemetry: model-change detection on USER_INPUT (design §10.4).
         await _maybe_emit_model_change(
@@ -1555,9 +1559,8 @@ async def _process_stream_step(
         state=state,
         on_pending_interaction=on_pending_interaction,
     )
-    # Once committed, the live block is retired by the committed message; drop both
-    # prefix trackers so a later same-index step (e.g. an agy timeout-retry reusing
-    # the slot) starts a fresh delta stream rather than diffing against stale text.
+    # Once committed, the live blocks have durable counterparts; drop both prefix
+    # trackers so a later same-index step starts fresh instead of diffing stale text.
     idx = _step_index(step)
     if idx is not None:
         state.prefixes.pop(idx, None)
@@ -1737,6 +1740,7 @@ async def _emit_step(
     cascade_id: str,
     allocator: _ToolCallIdAllocator,
     turn_active: bool,
+    reasoning_text: str | None = None,
 ) -> bool:
     """
     Emit one new step's status edges + mapped conversation items.
@@ -1758,7 +1762,12 @@ async def _emit_step(
         turn_active = True
         await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
 
-    for event in map_step_to_events(step, conversation_id=cascade_id, allocator=allocator):
+    for event in map_step_to_events(
+        step,
+        conversation_id=cascade_id,
+        allocator=allocator,
+        reasoning_text=reasoning_text,
+    ):
         await _post_event(client, session_id, event)
 
     if _is_turn_close_step(step) and turn_active:

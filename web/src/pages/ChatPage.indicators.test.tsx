@@ -19,7 +19,7 @@ import {
 afterEach(() => {
   // Several tests poke sandboxStatus into the global zustand store; reset it
   // so a leftover launch band can't bleed into the next test.
-  useChatStore.setState({ sandboxStatus: null });
+  useChatStore.setState({ sandboxStatus: null, sessionStatus: "idle" });
   cleanup();
 });
 
@@ -174,6 +174,20 @@ describe("BubbleView dispatch", () => {
     items: [{ kind: "text", itemId: "i1", text, final: true }],
   });
 
+  const assistantReasoning = (
+    responseId: string,
+    lifecycle: AssistantBubble["lifecycle"],
+  ): AssistantBubble => ({
+    kind: "assistant",
+    responseId,
+    stableId: responseId,
+    lifecycle,
+    error: null,
+    items: [
+      { kind: "reasoning", itemId: null, text: `${responseId} reasoning`, duration: undefined },
+    ],
+  });
+
   it("renders a plain user message as a user bubble", () => {
     // WHY: the user branch of the dispatcher — text content renders inside a
     // user-role bubble.
@@ -199,6 +213,20 @@ describe("BubbleView dispatch", () => {
     expect(bubble).toHaveAttribute("data-role", "assistant");
     expect(bubble).toHaveTextContent("the answer is 42");
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+  });
+
+  it("animates reasoning only for the streaming assistant response", () => {
+    useChatStore.setState({ sessionStatus: "running" });
+
+    render(
+      <>
+        <BubbleView bubble={assistantReasoning("resp_completed", "completed")} />
+        <BubbleView bubble={assistantReasoning("resp_streaming", "streaming")} />
+      </>,
+    );
+
+    expect(screen.getAllByText("Thinking...")).toHaveLength(1);
+    expect(screen.getByText("Thought for a few seconds")).toBeInTheDocument();
   });
 
   it("marks a cancelled assistant turn as Interrupted", () => {

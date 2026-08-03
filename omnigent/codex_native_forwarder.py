@@ -4277,6 +4277,40 @@ async def _handle_completed_item(
     if item_type == "plan":
         await _post_plan_item(client, session_id, params, item)
         return
+    if item_type == "reasoning":
+        raw_summary = item.get("summary")
+        summary = (
+            [
+                {"type": "summary_text", "text": text}
+                for text in raw_summary
+                if isinstance(text, str) and text
+            ]
+            if isinstance(raw_summary, list)
+            else []
+        )
+        raw_content = item.get("content")
+        content = (
+            [
+                {"type": "reasoning_text", "text": text}
+                for text in raw_content
+                if isinstance(text, str) and text
+            ]
+            if isinstance(raw_content, list)
+            else []
+        )
+        if summary or content:
+            await _post_external_item(
+                client,
+                session_id,
+                item_type="reasoning",
+                item_data={
+                    "agent": _AGENT_NAME,
+                    "summary": summary,
+                    "content": content,
+                },
+                response_id=_response_id(params),
+            )
+        return
     if item_type in _REVIEW_MODE_ITEM_TYPES:
         await _post_review_mode_marker(client, session_id, params, item)
         return
@@ -6017,12 +6051,12 @@ async def _handle_reasoning_delta(
     Forward one live Codex reasoning (chain-of-thought) delta to AP.
 
     Codex emits ``item/reasoning/textDelta`` and
-    ``item/reasoning/summaryTextDelta`` while it thinks. Omnigent has no
-    completed reasoning conversation item — the reasoning block is
-    transient and is finalized when the turn's assistant message arrives —
-    so this only publishes a transient ``external_output_reasoning_delta``
-    so the web UI paints a live "thinking" block, matching the in-process
-    executor's wire shape (#1254). The first delta of a reasoning item
+    ``item/reasoning/summaryTextDelta`` while it thinks. These deltas stay
+    transient; the matching ``item/completed`` reasoning record is persisted
+    separately by :func:`_handle_completed_item`. This publishes an
+    ``external_output_reasoning_delta`` so the web UI paints a live "thinking"
+    block, matching the in-process executor's wire shape (#1254). The first delta
+    of a reasoning item
     opens the block (``started=True`` → ``response.reasoning.started``).
 
     :param client: HTTP client for Omnigent event posts.

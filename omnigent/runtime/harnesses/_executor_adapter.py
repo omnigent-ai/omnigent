@@ -392,6 +392,7 @@ class ExecutorAdapter(HarnessApp):
                     )
 
                 response_text: str | None = None
+                reasoning_blocks: list[dict[str, list[str]]] = []
                 async for event in executor.run_turn(
                     messages=messages,
                     tools=tools,
@@ -435,8 +436,41 @@ class ExecutorAdapter(HarnessApp):
                                 # aggregate visibility.
                                 record_llm_usage(agent_span, event.usage)
                     # --- End tracing ---
+                    if isinstance(event, ReasoningChunk):
+                        if event.event_type == "reasoning_started" or not reasoning_blocks:
+                            reasoning_blocks.append({"summary": [], "content": []})
+                        if event.event_type == "reasoning_summary" and event.delta:
+                            reasoning_blocks[-1]["summary"].append(event.delta)
+                        elif event.event_type == "reasoning_text" and event.delta:
+                            reasoning_blocks[-1]["content"].append(event.delta)
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):
+                        for block in reasoning_blocks:
+                            summary_text = "".join(block["summary"])
+                            content_text = "".join(block["content"])
+                            if not summary_text and not content_text:
+                                continue
+                            ctx.emit(
+                                OutputItemDoneEvent(
+                                    type="response.output_item.done",
+                                    item={
+                                        "id": f"reasoning_{uuid.uuid4().hex[:12]}",
+                                        "type": "reasoning",
+                                        "status": "completed",
+                                        "agent": request.model or self._harness_label,
+                                        "summary": (
+                                            [{"type": "summary_text", "text": summary_text}]
+                                            if summary_text
+                                            else []
+                                        ),
+                                        "content": (
+                                            [{"type": "reasoning_text", "text": content_text}]
+                                            if content_text
+                                            else []
+                                        ),
+                                    },
+                                )
+                            )
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(agent_span, response=response_text)
                             agent_span = None

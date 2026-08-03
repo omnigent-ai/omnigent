@@ -193,6 +193,9 @@ class OpenCodeNativeForwarder:
         # the cumulative reasoning text on each ``part.updated``; we forward only
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
+        # reasoning part id -> (assistant message id, latest full text), flushed
+        # once when the step/turn completes so reconnects can rebuild the block.
+        self._pending_reasoning: dict[str, tuple[str | None, str]] = {}
         # The in-flight turn's assistant messageID (its per-turn ``response_id``),
         # captured from ``message.updated`` and stamped on the running/idle status
         # edges so the web chat renders this turn's tool calls live — the mirrored
@@ -482,6 +485,7 @@ class OpenCodeNativeForwarder:
         # can't grow across a long-lived session (the next turn's reasoning
         # parts carry fresh ids anyway).
         self._reasoning_posted.clear()
+        self._pending_reasoning.clear()
         # Stamp the terminal edge with the id the ``running`` edge actually went
         # out with (``_running_response_id``), then merge any caller-supplied
         # fields on top. If a turn produced more than one assistant messageID,
@@ -552,8 +556,9 @@ class OpenCodeNativeForwarder:
         elif part_type == "step-start":
             await self._begin_turn_if_needed()
         elif part_type == "step-finish":
-            # A step's assistant text is complete once the step closes; flush
-            # it so text and tool items land in the chat in step order.
+            # Reasoning precedes assistant text in the stream, so preserve that
+            # order when both become durable at the step boundary.
+            await self._flush_pending_reasoning()
             await self._flush_pending_text()
 
     def _accumulate_text_part(self, part: _JsonMapping) -> None:
@@ -642,14 +647,14 @@ class OpenCodeNativeForwarder:
             )
 
     async def _handle_reasoning_part(self, part: _JsonMapping) -> None:
-        """Forward an opencode ``reasoning`` part as transient reasoning deltas.
+        """Stream an opencode ``reasoning`` part and retain its final snapshot.
 
         opencode carries the cumulative chain-of-thought text on each
         ``part.updated`` (like text parts). We forward only the new suffix as an
         ``external_output_reasoning_delta`` so the web paints one growing
         reasoning block, with ``started`` set on the first chunk of each part
-        (the codex-native reasoning contract). Reasoning is transient — not
-        persisted as a chat item — so nothing is flushed on step end.
+        (the codex-native reasoning contract). The latest cumulative snapshot is
+        persisted once when the step or turn completes.
         """
         part_id = part.get("id")
         text = part.get("text")
@@ -659,6 +664,11 @@ class OpenCodeNativeForwarder:
         # to a user message, but guard anyway to match the text path.
         if self._msg_role.get(str(part.get("messageID"))) == "user":
             return
+        message_id = part.get("messageID")
+        self._pending_reasoning[part_id] = (
+            message_id if isinstance(message_id, str) else None,
+            text,
+        )
         posted = self._reasoning_posted.get(part_id, 0)
         if len(text) <= posted:
             return
@@ -669,6 +679,25 @@ class OpenCodeNativeForwarder:
             {"delta": delta, "started": posted == 0},
         )
         self._reasoning_posted[part_id] = len(text)
+
+    async def _flush_pending_reasoning(self) -> None:
+        """Persist each completed reasoning part once."""
+        for part_id, (message_id, text) in list(self._pending_reasoning.items()):
+            self._pending_reasoning.pop(part_id, None)
+            if not text or not self.state.mark(self._key("reasoning-final", part_id)):
+                continue
+            await self._post_event(
+                _EXTERNAL_ITEM,
+                {
+                    "item_type": "reasoning",
+                    "item_data": {
+                        "agent": _AGENT_NAME,
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": text}],
+                    },
+                    "response_id": self._response_id(message_id),
+                },
+            )
 
     async def _handle_file_part(self, part: _JsonMapping) -> None:
         """Mirror an opencode ``file`` part — images as image blocks, else a note.
@@ -733,6 +762,7 @@ class OpenCodeNativeForwarder:
     async def _on_session_idle(self, event: OpenCodeEvent) -> None:
         """Handle ``session.idle`` — finalize text, post usage, end the turn."""
         del event
+        await self._flush_pending_reasoning()
         await self._flush_pending_text()
         await self._post_session_usage()
         await self._end_turn()

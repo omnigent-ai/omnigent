@@ -1514,6 +1514,64 @@ async def test_executor_adapter_builds_config_from_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_executor_adapter_emits_completed_reasoning_item() -> None:
+    """Wrapped harness reasoning deltas are committed once at turn completion."""
+    import asyncio
+
+    from omnigent.inner.executor import (
+        Executor,
+        ExecutorConfig,
+        Message,
+        ReasoningChunk,
+        ToolSpec,
+        TurnComplete,
+    )
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _ReasoningExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            yield ReasoningChunk(delta="", event_type="reasoning_started")
+            yield ReasoningChunk(delta="think ", event_type="reasoning_text")
+            yield ReasoningChunk(delta="carefully", event_type="reasoning_text")
+            yield ReasoningChunk(delta="brief summary", event_type="reasoning_summary")
+            yield TurnComplete(response="ok")
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _ReasoningExecutor())
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext(response_id="resp_reason", event_queue=queue, cancelled=asyncio.Event())
+    await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hi"), ctx)
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    reasoning_items = [
+        event.item
+        for event in events
+        if getattr(event, "type", None) == "response.output_item.done"
+        and event.item.get("type") == "reasoning"
+    ]
+    assert len(reasoning_items) == 1
+    assert reasoning_items == [
+        {
+            "id": reasoning_items[0]["id"],
+            "type": "reasoning",
+            "status": "completed",
+            "agent": "test-agent",
+            "summary": [{"type": "summary_text", "text": "brief summary"}],
+            "content": [{"type": "reasoning_text", "text": "think carefully"}],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_executor_adapter_forwards_model_override_to_config() -> None:
     """``request.model_override`` is threaded into ``ExecutorConfig.model``.
 

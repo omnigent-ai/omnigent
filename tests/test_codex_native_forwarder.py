@@ -1289,6 +1289,47 @@ async def test_completed_context_compaction_item_clears_spinner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_completed_reasoning_item_is_persisted() -> None:
+    """A completed Codex reasoning item becomes durable conversation history."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._handle_completed_item(
+        client,
+        "conv_x",
+        {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {
+                "type": "reasoning",
+                "id": "item_r",
+                "summary": ["Short summary"],
+                "content": ["Detailed reasoning"],
+            },
+        },
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "reasoning",
+                    "item_data": {
+                        "agent": "codex-native-ui",
+                        "summary": [{"type": "summary_text", "text": "Short summary"}],
+                        "content": [{"type": "reasoning_text", "text": "Detailed reasoning"}],
+                    },
+                    "response_id": "codex_turn_1",
+                },
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_reasoning_delta_opens_block_then_continues() -> None:
     """
     Codex reasoning deltas mirror as external_output_reasoning_delta (#1254).

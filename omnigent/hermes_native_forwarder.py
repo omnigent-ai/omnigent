@@ -525,9 +525,9 @@ def _message_to_items(
 ) -> list[_MirrorItem]:
     """Convert one ``messages`` row to mirror items.
 
-    An assistant row with reasoning emits a one-shot
-    ``external_output_reasoning_delta`` item first, then a ``function_call``
-    item per call, followed by a ``message`` item if it also has prose content.
+    An assistant row with reasoning emits a one-shot live delta that is also
+    persisted as a completed reasoning item, then a ``function_call`` item per
+    call, followed by a ``message`` item if it also has prose content.
     A tool row emits a ``function_call_output`` item. Returns an empty list to
     skip.
     """
@@ -571,8 +571,9 @@ def _message_to_items(
                 _MirrorItem(
                     msg_id=msg_id,
                     item_type=_EXTERNAL_OUTPUT_REASONING_DELTA,
-                    item_data={"delta": thinking, "started": True},
+                    item_data={"delta": thinking, "started": True, "agent": agent_name},
                     response_id=response_id,
+                    role="assistant",
                 )
             )
         # Emit the prose FIRST, then the tool calls. An assistant row's text is
@@ -894,16 +895,33 @@ async def _post_conversation_item(
 ) -> None:
     """POST one mirrored item as the appropriate session event.
 
-    Reasoning items post a transient ``external_output_reasoning_delta`` (the
-    web finalizes the block when the assistant message lands); all others post
-    an ``external_conversation_item``.
+    Reasoning items post the live delta followed by one durable reasoning item;
+    all others post an ``external_conversation_item``.
     """
     if item.item_type == _EXTERNAL_OUTPUT_REASONING_DELTA:
+        delta = item.item_data.get("delta")
+        agent = item.item_data.get("agent")
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
             json={
                 "type": _EXTERNAL_OUTPUT_REASONING_DELTA,
-                "data": item.item_data,
+                "data": {"delta": delta, "started": True},
+            },
+        )
+        resp.raise_for_status()
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "reasoning",
+                    "item_data": {
+                        "agent": agent,
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": delta}],
+                    },
+                    "response_id": item.response_id,
+                },
             },
         )
         resp.raise_for_status()

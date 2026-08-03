@@ -280,16 +280,27 @@ async def test_session_error_generic_posts_failed_without_reauth() -> None:
 
 
 async def test_session_error_message_aborted_takes_idle_path() -> None:
-    """A MessageAbortedError is a user interrupt → the normal idle path."""
+    """An aborted turn drops unfinished reasoning and takes the idle path."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": "partial"},
+        )
+    )
     await fwd.handle_event(
         _event("session.error", error={"name": "MessageAbortedError", "data": {}})
     )
-    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
+    status = [b["data"] for _u, b in server.posts if b["type"] == "external_session_status"][-1]
     assert status["status"] == "idle"
     assert "reauth_required" not in status
     assert "output" not in status
+    assert not any(
+        body["type"] == "external_conversation_item" and body["data"]["item_type"] == "reasoning"
+        for _url, body in server.posts
+    )
 
 
 def _status_edges(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -773,7 +784,7 @@ async def test_model_switched_mirrors_to_omnigent_and_dedupes() -> None:
 
 
 async def test_reasoning_part_streams_suffix_deltas() -> None:
-    """opencode reasoning parts → transient reasoning deltas (suffix-only)."""
+    """Reasoning streams suffix deltas and persists once at completion."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
     await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
@@ -800,6 +811,33 @@ async def test_reasoning_part_streams_suffix_deltas() -> None:
     # First snapshot opens the block (started); second posts only the new suffix.
     assert deltas[0] == {"delta": "Let me", "started": True}
     assert deltas[1] == {"delta": " think", "started": False}
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={"id": "step_1", "messageID": "msg_1", "type": "step-finish"},
+        )
+    )
+    await fwd.handle_event(_event("session.idle"))
+    reasoning_items = [
+        body
+        for _url, body in server.posts
+        if body["type"] == "external_conversation_item"
+        and body["data"]["item_type"] == "reasoning"
+    ]
+    assert reasoning_items == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "reasoning",
+                "item_data": {
+                    "agent": "opencode",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "Let me think"}],
+                },
+                "response_id": "msg_1",
+            },
+        }
+    ]
 
 
 async def test_reasoning_part_no_repost_when_unchanged() -> None:

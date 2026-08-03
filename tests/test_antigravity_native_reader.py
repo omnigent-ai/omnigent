@@ -1686,16 +1686,15 @@ async def test_stream_generating_emits_incremental_reasoning_deltas(
 
 
 @pytest.mark.asyncio
-async def test_stream_reasoning_precedes_text_and_has_no_committed_item(
+async def test_stream_reasoning_precedes_text_and_commits_reasoning_item(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """Reasoning deltas precede text deltas (§10.2); DONE commits ONE message only.
+    """Reasoning deltas precede text deltas; DONE commits reasoning and message.
 
     Asserts the §10.2 ordering (thinking before response) within the frame and
-    that reasoning, unlike text, never produces a committed conversation item —
-    only the assistant ``message`` is committed on DONE.
+    that the accumulated reasoning becomes durable on DONE.
     """
     thinking = "First, parse intent. Then answer."
     text = "Sure — here is the answer."
@@ -1723,14 +1722,14 @@ async def test_stream_reasoning_precedes_text_and_has_no_committed_item(
     assert first_reasoning < first_text
     # Reasoning deltas concatenate to the full thinking text.
     assert "".join(cast(str, r["delta"]) for r in sink.reasonings()) == thinking
-    # Exactly ONE committed item — the assistant message; NO committed reasoning.
-    assert sink.item_types() == ["message"]
-    # Every reasoning post is a delta (transient); none is a conversation item.
-    assert all(
-        event_type != "external_conversation_item"
-        or cast(dict[str, Any], data).get("item_type") != "reasoning"
+    assert sink.item_types() == ["reasoning", "message"]
+    reasoning_item = next(
+        cast(dict[str, Any], data)
         for event_type, data in sink.posts
+        if event_type == "external_conversation_item"
+        and cast(dict[str, Any], data).get("item_type") == "reasoning"
     )
+    assert reasoning_item["item_data"]["content"] == [{"type": "reasoning_text", "text": thinking}]
 
 
 @pytest.mark.asyncio
