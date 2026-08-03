@@ -31,6 +31,7 @@ import {
   GitBranchIcon,
   InboxIcon,
   ListChecksIcon,
+  ListFilterIcon,
   LaptopIcon,
   Loader2Icon,
   MailIcon,
@@ -137,7 +138,12 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import {
+  getSessionState,
+  matchesSessionStatusFilter,
+  type SessionState,
+  type SessionStatusFilter,
+} from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -423,6 +429,95 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored]);
 }
 
+const SESSION_STATUS_FILTER_OPTIONS: { value: SessionStatusFilter; label: string }[] = [
+  { value: "all", label: "All sessions" },
+  { value: "active", label: "Active" },
+  { value: "completed", label: "Completed" },
+];
+
+/**
+ * Header-row status filter (All/Active/Completed), opened on hover.
+ *
+ * Built on `HoverCard` — the same primitive (and `openDelay`/`closeDelay`
+ * pairing) the row-level project flyout and Cursor-style agent card already
+ * use elsewhere in this file — rather than hand-rolling hover-open state on
+ * top of `DropdownMenu`. `DropdownMenu` only opens on click/keyboard, so
+ * driving it from raw `onMouseEnter`/`onMouseLeave` meant racing our own
+ * open/close timers against Radix's animated, portaled content; depending on
+ * exactly when the pointer crossed into the content mid-animation, the two
+ * could disagree and the menu would flicker shut under a pointer that never
+ * actually left it. `HoverCard`'s hover tracking is Radix's own internals,
+ * not reimplemented here, so it doesn't have that race — and reusing it
+ * keeps this control's interaction model consistent with the rest of the
+ * sidebar instead of introducing a one-off pattern.
+ *
+ * The content itself is a plain button list (not `DropdownMenuRadioItem`s
+ * inside an ARIA `menu`) since `HoverCard` is a generic hover-content
+ * primitive, not a menu — the checkmark plays the same role as the
+ * `DropdownMenuRadioItem` indicator did.
+ *
+ * @param value - The current filter.
+ * @param onChange - Called with the newly selected filter.
+ */
+function SessionStatusFilterMenu({
+  value,
+  onChange,
+}: {
+  value: SessionStatusFilter;
+  onChange: (filter: SessionStatusFilter) => void;
+}) {
+  return (
+    <HoverCard openDelay={150} closeDelay={100}>
+      <HoverCardTrigger asChild>
+        <Button
+          type="button"
+          variant={value !== "all" ? "secondary" : "ghost"}
+          size="icon-xs"
+          aria-label="Filter sessions by status"
+          className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+          data-testid="sidebar-status-filter-button"
+        >
+          <ListFilterIcon className="size-4" />
+        </Button>
+      </HoverCardTrigger>
+      {/* align="end": this trigger sits near the sidebar's right edge, so
+          the default left-aligned popup would spill past the sidebar
+          boundary into the main content — anchoring the content's right
+          edge to the trigger's keeps it contained. w-auto min-w-32:
+          HoverCardContent defaults to a fixed w-64 sized for a text
+          preview card; this is a short option list, so it should size to
+          its content like the DropdownMenu-based menus elsewhere instead
+          of leaving a wide empty margin. */}
+      <HoverCardContent align="end" className="w-auto min-w-32 p-1">
+        <div role="menu" aria-label="Filter sessions by status">
+          {SESSION_STATUS_FILTER_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="menuitemradio"
+              aria-checked={value === option.value}
+              data-testid={`sidebar-status-filter-${option.value}`}
+              onClick={() => onChange(option.value)}
+              // sidebar-compact-text + font-normal: matches the nav rows'
+              // own type scale (New session, Automations, Inbox) rather than
+              // the DropdownMenu default `text-sm`, which reads a size larger
+              // next to them.
+              className="sidebar-compact-text relative flex w-full cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-left font-normal outline-hidden select-none hover:bg-accent hover:text-accent-foreground"
+            >
+              {option.label}
+              {value === option.value && (
+                <span className="pointer-events-none absolute right-2 flex items-center justify-center">
+                  <CheckIcon className="size-4" />
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      </HoverCardContent>
+    </HoverCard>
+  );
+}
+
 export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
@@ -434,6 +529,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // Projects / Chats structure; "shared" is a flat list of sessions others
   // shared with the viewer.
   const [activeTab, setActiveTab] = useState<SidebarTab>("mine");
+  // Client-side status filter (all/active/completed) applied to the already-
+  // loaded conversation list — see ConversationList's `sections` useMemo,
+  // which is where it's actually applied (same spot "archived" is peeled off).
+  const [statusFilter, setStatusFilter] = useState<SessionStatusFilter>("all");
   // The "Shared with me" tab only makes sense when sessions can be shared with
   // other people at all — i.e. a multi-user server. A loopback-only local
   // server has just the one user (mirrors the disabled Share affordance; see
@@ -724,6 +823,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Search</TooltipContent>
               </Tooltip>
+              <SessionStatusFilterMenu value={statusFilter} onChange={setStatusFilter} />
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
@@ -891,6 +991,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               onRowClick={onNavClick}
               searchQuery=""
               activeTab={multiUser ? activeTab : "mine"}
+              statusFilter={statusFilter}
               pinnedConversationIds={pinnedConversationIds}
               pinnedConversations={pinnedConversations}
               onTogglePinned={togglePinnedConversation}
@@ -1124,6 +1225,9 @@ interface ConversationListProps {
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
   activeTab: SidebarTab;
+  /** Client-side status filter, applied to `allConversations` before it
+   *  feeds into `sections` (see the `sections` useMemo below). */
+  statusFilter: SessionStatusFilter;
   pinnedConversationIds: string[];
   // The server-authoritative pinned sessions, so a pinned session that sits
   // outside the loaded pagination window still renders in the Pinned section.
@@ -1189,6 +1293,7 @@ function ConversationList({
   onRowClick,
   searchQuery,
   activeTab,
+  statusFilter,
   pinnedConversationIds,
   pinnedConversations,
   onTogglePinned,
@@ -1278,7 +1383,12 @@ function ConversationList({
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
     const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
-    const notArchived = allWithPinned.filter((c) => c.archived !== true);
+    const notArchived = allWithPinned
+      .filter((c) => c.archived !== true)
+      // Status filter applies uniformly across Pinned / Projects / Chats —
+      // "Active only" hides a pinned-but-idle session just like an unpinned
+      // one, matching the single filter control's plain-language meaning.
+      .filter((c) => matchesSessionStatusFilter(c, statusFilter));
     // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
     // "shared" is the ones others shared with them. The Pinned / Projects /
     // Sessions structure is then built from that slice, so both tabs reuse the
@@ -1349,6 +1459,7 @@ function ConversationList({
     projects,
     activeTab,
     viewerId,
+    statusFilter,
   ]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
