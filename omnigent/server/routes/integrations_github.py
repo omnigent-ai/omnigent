@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from urllib.parse import urlencode
 
 import jwt
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from httpx import HTTPError
 from starlette.responses import RedirectResponse
 
@@ -27,6 +28,7 @@ from omnigent.server.github_app import (
     build_authorize_url,
 )
 from omnigent.server.github_app_client import GitHubAppClient
+from omnigent.server.github_identity import resolve_access_token
 from omnigent.server.github_store import GithubConnectionStore
 from omnigent.server.routes._auth_helpers import require_user
 
@@ -40,6 +42,17 @@ _STATE_ALG = "HS256"
 # Fallback landing after connect/disconnect when no (safe) return_to is
 # supplied. The SPA renders the integrations panel in Settings.
 _DEFAULT_RETURN_TO = "/settings"
+
+# GitHub owner / repo name charset, enforced before either reaches the
+# branches URL so a caller can never smuggle a path or query. A dot is allowed
+# but a dot-run (``..``) is not, so ``owner``/``repo`` can never be a traversal
+# segment.
+_GITHUB_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _valid_github_name(name: str) -> bool:
+    """Whether *name* is a safe GitHub owner/repo segment (no ``..``)."""
+    return bool(_GITHUB_NAME_RE.match(name)) and ".." not in name
 
 
 def _sanitize_return_to(raw: str | None) -> str:
@@ -130,6 +143,49 @@ def create_integrations_github_router(
             "connected_at": connection.created_at if connection is not None else None,
             "install_url": config.install_url,
         }
+
+    @router.get("/integrations/github/repos")
+    async def repos(request: Request) -> dict[str, object]:
+        """List repos the connected user can access, for the new-chat picker.
+
+        ``connected: false`` (with an empty list) when the caller hasn't
+        linked GitHub, so the UI can fall back to a free-text repo URL.
+        ``truncated: true`` when the page cap was hit and more repos exist than
+        are returned, so the UI can say the list is partial.
+        """
+        user_id = _current_user(request)
+        token = await resolve_access_token(user_id, store=store, client=api)
+        if token is None:
+            return {"connected": False, "repos": [], "truncated": False}
+        try:
+            repo_list, truncated = await api.list_repos(token)
+        except GitHubAppError as exc:
+            _logger.warning("GitHub repo list failed for %s: %s", user_id, exc)
+            raise HTTPException(
+                status_code=502, detail="Failed to list GitHub repositories"
+            ) from exc
+        return {"connected": True, "repos": repo_list, "truncated": truncated}
+
+    @router.get("/integrations/github/repos/{owner}/{repo}/branches")
+    async def repo_branches(request: Request, owner: str, repo: str) -> dict[str, object]:
+        """List branch names for ``owner/repo``, for the per-repo branch picker.
+
+        ``connected: false`` (empty list) when the caller hasn't linked
+        GitHub. Owner/repo are charset-validated before they reach the
+        GitHub URL so a caller cannot smuggle a path.
+        """
+        user_id = _current_user(request)
+        if not _valid_github_name(owner) or not _valid_github_name(repo):
+            raise HTTPException(status_code=400, detail="Invalid repository name")
+        token = await resolve_access_token(user_id, store=store, client=api)
+        if token is None:
+            return {"connected": False, "branches": []}
+        try:
+            branches = await api.list_branches(token, f"{owner}/{repo}")
+        except GitHubAppError as exc:
+            _logger.warning("GitHub branch list failed for %s/%s: %s", owner, repo, exc)
+            raise HTTPException(status_code=502, detail="Failed to list GitHub branches") from exc
+        return {"connected": True, "branches": branches}
 
     @router.get("/integrations/github/connect")
     async def connect(request: Request, return_to: str | None = None) -> RedirectResponse:
