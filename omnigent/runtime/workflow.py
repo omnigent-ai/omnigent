@@ -1548,10 +1548,14 @@ def _build_acp_spawn_env(
             isinstance(name, str) and name.strip() and isinstance(command, str) and command.strip()
         ):
             raise ValueError("executor acp_agent requires non-empty string name and command")
+        omnigent_mcp = embedded.get("omnigent_mcp", True)
+        if not isinstance(omnigent_mcp, bool):
+            raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),
             command=command.strip(),
+            omnigent_mcp=omnigent_mcp,
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None

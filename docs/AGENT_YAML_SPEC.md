@@ -183,7 +183,7 @@ use its own tools, routing, memory, and channels:
 acp:
   agents:
     - name: OpenClaw
-      command: openclaw acp --url <gateway-url> --token <token>
+      command: openclaw acp --url <gateway-url> --token-file <token-file>
       omnigent_mcp: false
 ```
 

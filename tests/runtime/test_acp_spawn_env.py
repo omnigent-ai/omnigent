@@ -133,9 +133,30 @@ def test_omnigent_mcp_flag_forwarded(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
 
 
+def test_embedded_omnigent_mcp_flag_forwarded() -> None:
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:openclaw",
+            acp_agent={
+                "name": "OpenClaw",
+                "command": "openclaw acp",
+                "omnigent_mcp": False,
+            },
+        )
+    )
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+
 @pytest.mark.parametrize(
     "acp_agent",
-    [None, "not-a-mapping", {}, {"name": "Helper"}, {"name": "Helper", "command": " "}],
+    [
+        None,
+        "not-a-mapping",
+        {},
+        {"name": "Helper"},
+        {"name": "Helper", "command": " "},
+        {"name": "Helper", "command": "helper", "omnigent_mcp": "false"},
+    ],
 )
 def test_malformed_embedded_agent_fails_loudly(acp_agent: object) -> None:
     with pytest.raises(ValueError, match="executor acp_agent"):
