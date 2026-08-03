@@ -485,6 +485,20 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
     setSelectionMode(true);
   }, []);
 
+  // Switch the visible scope tab. Selection is a single global set while the
+  // tabs show disjoint, ownership-scoped slices, so leaving selection mode on
+  // switch keeps the bulk-action count honest with the visible tab (the viewer
+  // re-enters per tab) instead of carrying stale rows across. Every path that
+  // changes the tab must go through here — not a bare setActiveTab — or the
+  // selection cleanup is skipped (e.g. the "New session" snap-back below).
+  const switchTab = useCallback(
+    (tab: SidebarTab) => {
+      if (selectionMode) exitSelectionMode();
+      setActiveTab(tab);
+    },
+    [selectionMode, exitSelectionMode],
+  );
+
   // One paginated session list — sessions are no longer split by
   // connection state, so the sidebar fetches a single undifferentiated
   // list. Archived sessions are included (`includeArchived: true`) and
@@ -777,7 +791,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               <Link
                 to="/"
                 onClick={(e) => {
-                  setActiveTab("mine");
+                  switchTab("mine");
                   onNavClick(e);
                 }}
               >
@@ -836,13 +850,13 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
           {/* Session-scope tabs: split the viewer's own sessions ("My
           sessions") from ones shared with them ("Shared with me"). Sits above
           the scrolling list (non-scrolling) so it stays put while the list
-          scrolls. Hidden during selection mode to keep the strip quiet while
-          the bulk-action bar sits under the Sessions header. */}
-          {multiUser && !selectionMode && (
+          scrolls. Stays visible during selection mode so the viewer can still
+          switch scopes while bulk-selecting. */}
+          {multiUser && (
             <div className="px-2 pb-2">
               <Tabs
                 value={activeTab}
-                onValueChange={(v) => setActiveTab(v as SidebarTab)}
+                onValueChange={(v) => switchTab(v as SidebarTab)}
                 className="w-full"
               >
                 <TabsList className="w-full">
