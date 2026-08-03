@@ -99,12 +99,14 @@ class CompressedText(TypeDecorator[str]):
     impl = LargeBinary
     cache_ok = True
 
-    def process_bind_param(self, value: str | None, _dialect: object) -> bytes | None:
+    def process_bind_param(self, value: str | None, dialect: object) -> bytes | None:
         """Compress on the way into the database."""
+        del dialect
         return encode(value)
 
     def process_result_value(
-        self, value: bytes | str | memoryview | None, _dialect: object
+        self, value: bytes | str | memoryview | None, dialect: object
     ) -> str | None:
         """Decompress on the way out of the database."""
+        del dialect
         return decode(value)
