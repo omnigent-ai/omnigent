@@ -568,11 +568,10 @@ describe("chatStore — switchTo", () => {
     await revisit;
   });
 
-  it("does not re-cache a superseded transcript during redirect navigation", async () => {
-    seedSession("conv_superseded_cache", [userMessage("cache_superseded", "old")]);
+  it("keeps a superseded conversation cacheable after redirect navigation", async () => {
+    const items = [userMessage("cache_superseded", "old")];
+    seedSession("conv_superseded_cache", items);
     seedSession("conv_other", []);
-    await useChatStore.getState().switchTo("conv_superseded_cache");
-    await useChatStore.getState().switchTo("conv_other");
     await useChatStore.getState().switchTo("conv_superseded_cache");
 
     handleSessionEvent({
@@ -584,8 +583,10 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_other");
 
     const revisit = useChatStore.getState().switchTo("conv_superseded_cache");
-    expect(useChatStore.getState().loadingConversation).toBe(true);
-    expect(useChatStore.getState().blocks).toEqual([]);
+    expect(useChatStore.getState().loadingConversation).toBe(false);
+    expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual(
+      items.map((item) => item.id),
+    );
     await revisit;
   });
 

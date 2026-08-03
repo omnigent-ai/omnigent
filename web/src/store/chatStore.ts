@@ -676,8 +676,6 @@ interface CachedTranscript {
 // Module-scope LRU because only one conversation is active at a time.
 const TRANSCRIPT_CACHE_MAX = 10;
 const transcriptCache = new Map<string, CachedTranscript>();
-// Prevent a later switch-away from resurrecting explicitly evicted sessions.
-const uncacheableTranscriptIds = new Set<string>();
 
 /** Read a conversation's cached transcript, or `null` when not cached. */
 function readTranscriptCache(id: string): CachedTranscript | null {
@@ -686,7 +684,6 @@ function readTranscriptCache(id: string): CachedTranscript | null {
 
 /** Cache committed blocks only; live and itemId-less state is rebound on revisit. */
 function writeTranscriptCache(id: string, state: ChatState): void {
-  if (uncacheableTranscriptIds.has(id)) return;
   const committed = state.blocks.filter((b) => Boolean(b.ctx.itemId) && !isLiveProvisionalBlock(b));
   if (committed.length === 0) {
     transcriptCache.delete(id);
@@ -705,10 +702,9 @@ function writeTranscriptCache(id: string, state: ChatState): void {
   }
 }
 
-/** Evict a conversation from the transcript cache (deleted / superseded). */
+/** Evict a deleted conversation from the transcript cache. */
 export function evictTranscriptCache(id: string): void {
   transcriptCache.delete(id);
-  uncacheableTranscriptIds.add(id);
 }
 
 // Catalogs that resolved while their bind snapshot was still hydrating.
@@ -832,7 +828,6 @@ export function initChatStore(client: QueryClient): void {
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
   transcriptCache.clear();
-  uncacheableTranscriptIds.clear();
   // Reset the POST-ordering chain so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
   sendChain = Promise.resolve();
@@ -4617,8 +4612,6 @@ export function handleSessionEvent(event: StreamEvent): void {
         // stash) since the turn is over; resuming starts a fresh one.
         const { [event.conversationId]: _removedStash, ...pendingByConversation } =
           s.pendingByConversation;
-        // Never repaint a superseded session before its redirect is handled.
-        evictTranscriptCache(event.conversationId);
         return {
           redirectToConversationId: event.targetConversationId,
           pendingUserMessages: [],
