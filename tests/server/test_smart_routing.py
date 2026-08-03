@@ -139,39 +139,31 @@ def _catalog_client() -> MagicMock:
 # ── test catalog fixtures ───────────────────────────────────────────
 
 
-def test_models_fixture_claude_sdk() -> None:
-    """claude-sdk returns the claude model list."""
+@pytest.mark.parametrize(
+    ("harness", "contains"),
+    [
+        ("claude-sdk", ("haiku", "opus")),
+        ("claude-native", ()),
+        ("codex-native", ()),
+        ("codex", ("gpt",)),
+        ("openai-agents", ()),
+        # pi is multi-model — both Claude and GPT.
+        ("pi", ("haiku", "gpt")),
+    ],
+)
+def test_models_fixture_returns_family_models(harness: str, contains: tuple[str, ...]) -> None:
+    models = _models_for(harness)
+    assert models is not None
+    for token in contains:
+        assert any(token in m for m in models)
+
+
+def test_models_fixture_claude_ordered_cheapest_first() -> None:
     models = _models_for("claude-sdk")
     assert models is not None
-    assert any("haiku" in m for m in models)
-    assert any("opus" in m for m in models)
-    # Ordered cheapest → most powerful
     haiku_idx = next(i for i, m in enumerate(models) if "haiku" in m)
     opus_idx = next(i for i, m in enumerate(models) if "opus" in m)
     assert haiku_idx < opus_idx
-
-
-def test_models_fixture_native_harnesses() -> None:
-    assert _models_for("claude-native") is not None
-    assert _models_for("codex-native") is not None
-
-
-def test_models_fixture_codex() -> None:
-    models = _models_for("codex")
-    assert models is not None
-    assert any("gpt" in m for m in models)
-
-
-def test_models_fixture_openai_agents() -> None:
-    assert _models_for("openai-agents") is not None
-
-
-def test_models_fixture_pi() -> None:
-    """pi is multi-model — both Claude and GPT."""
-    models = _models_for("pi")
-    assert models is not None
-    assert any("haiku" in m for m in models)
-    assert any("gpt" in m for m in models)
 
 
 def test_model_lists_cover_current_claude_generations() -> None:
@@ -181,23 +173,50 @@ def test_model_lists_cover_current_claude_generations() -> None:
     assert "databricks-claude-sonnet-5" in models
 
 
-def test_every_router_arm_has_a_substitution_chain() -> None:
-    """An arm with no chain can only be applied where its own endpoint exists."""
-    from omnigent.server.smart_routing import _ARM_SUBSTITUTES, TASK_V1_MENUS
+def test_substitute_model_applies_the_pick_when_the_catalog_serves_it() -> None:
+    from omnigent.server.smart_routing import substitute_model
 
-    for scenario, arms in TASK_V1_MENUS.items():
-        for arm in arms:
-            assert arm in _ARM_SUBSTITUTES, f"{scenario}: {arm} has no substitution chain"
-            # The arm itself leads, so a workspace serving it applies it exactly.
-            assert _ARM_SUBSTITUTES[arm][0] == arm
+    catalog = ["databricks-claude-opus-4-8", "databricks-claude-sonnet-5"]
+    assert substitute_model("claude-opus-4-8", catalog, prefixes=("databricks-",)) == (
+        "databricks-claude-opus-4-8"
+    )
 
 
-def test_substitution_chains_stay_in_the_arms_family() -> None:
-    """A chain crossing families would route a turn onto an unrunnable model."""
-    from omnigent.server.smart_routing import _ARM_SUBSTITUTES, _model_family
+def test_substitute_model_falls_back_within_family() -> None:
+    from omnigent.server.smart_routing import substitute_model
 
-    for arm, chain in _ARM_SUBSTITUTES.items():
-        assert {_model_family(m) for m in chain} == {_model_family(arm)}, arm
+    prefixes = ("databricks-",)
+    # claude pick the workspace does not serve → the sonnet fallback arm.
+    claude_catalog = ["databricks-claude-sonnet-5", "databricks-claude-haiku-4-5"]
+    assert substitute_model("claude-opus-4-8", claude_catalog, prefixes=prefixes) == (
+        "databricks-claude-sonnet-5"
+    )
+    # gpt and glm both fall back to luna (glm reads as the gpt family).
+    gpt_catalog = ["databricks-gpt-5-6-luna", "databricks-gpt-5-6-sol"]
+    assert substitute_model("gpt-5-6-terra", gpt_catalog, prefixes=prefixes) == (
+        "databricks-gpt-5-6-luna"
+    )
+    assert substitute_model("glm-5-2", gpt_catalog, prefixes=prefixes) == (
+        "databricks-gpt-5-6-luna"
+    )
+
+
+def test_substitute_model_declines_when_no_fallback_is_servable() -> None:
+    from omnigent.server.smart_routing import substitute_model
+
+    prefixes = ("databricks-",)
+    # The family fallback (luna) is absent from the catalog → honest decline.
+    assert substitute_model("gpt-5-6-terra", ["databricks-gpt-5-6-sol"], prefixes=prefixes) is None
+    # A barred fallback is skipped, not applied.
+    assert (
+        substitute_model(
+            "claude-opus-4-8",
+            ["databricks-claude-sonnet-5"],
+            prefixes=prefixes,
+            barred=("databricks-claude-sonnet-5",),
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -287,58 +306,39 @@ def test_build_rubric_shows_harness_names() -> None:
 # ── LLMRoutingClient ───────────────────────────────────────────────
 
 
+# The judge's verdict resolves to (model, harness). A harness the model does not
+# belong to — whether a real other harness or a hallucinated one — re-resolves to
+# the harness that owns the picked model.
 @pytest.mark.asyncio
-async def test_llm_routing_client_returns_result() -> None:
-    verdict = {
-        "harness": "claude-sdk",
-        "model": "databricks-claude-opus-4-8",
-        "rationale": "hard refactor",
-    }
-    client = LLMRoutingClient(_FakeLLMClient(verdict))
+@pytest.mark.parametrize(
+    ("verdict_harness", "verdict_model", "available", "expect_harness"),
+    [
+        ("claude-sdk", "databricks-claude-opus-4-8", None, "claude-sdk"),
+        (
+            "codex",
+            "databricks-claude-opus-4-8",
+            {"codex": ["databricks-gpt-5-4"]},
+            "claude-sdk",
+        ),
+        ("hallucinated-harness", "databricks-claude-haiku-4-5", None, "claude-sdk"),
+    ],
+)
+async def test_llm_routing_client_resolves_harness_to_the_model_owner(
+    verdict_harness: str,
+    verdict_model: str,
+    available: dict[str, list[str]] | None,
+    expect_harness: str,
+) -> None:
     models = _models_for("claude-sdk")
     assert models is not None
-    result = await client.route("refactor auth", {"claude-sdk": models})
-    assert result is not None
-    assert result.model == "databricks-claude-opus-4-8"
-    assert result.rationale == "hard refactor"
-    assert result.harness == "claude-sdk"
-
-
-@pytest.mark.asyncio
-async def test_llm_routing_client_harness_mismatch_re_resolves() -> None:
-    """If the judge picks a harness that doesn't own the model, fall back."""
-    claude_models = _models_for("claude-sdk")
-    assert claude_models is not None
-    verdict = {
-        "harness": "codex",  # codex doesn't have claude models
-        "model": "databricks-claude-opus-4-8",
-        "rationale": "deep reasoning",
-    }
+    catalog = {"claude-sdk": models, **(available or {})}
+    verdict = {"harness": verdict_harness, "model": verdict_model, "rationale": "r"}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
-    result = await client.route(
-        "hard task", {"claude-sdk": claude_models, "codex": ["databricks-gpt-5-4"]}
-    )
+    result = await client.route("task", catalog)
     assert result is not None
-    assert result.model == "databricks-claude-opus-4-8"
-    # harness re-resolved to the one that owns the model
-    assert result.harness == "claude-sdk"
-
-
-@pytest.mark.asyncio
-async def test_llm_routing_client_unknown_harness_re_resolves() -> None:
-    """If the judge returns an unrecognised harness, fall back to model ownership."""
-    models = _models_for("claude-sdk")
-    assert models is not None
-    verdict = {
-        "harness": "hallucinated-harness",
-        "model": "databricks-claude-haiku-4-5",
-        "rationale": "simple task",
-    }
-    client = LLMRoutingClient(_FakeLLMClient(verdict))
-    result = await client.route("hello", {"claude-sdk": models})
-    assert result is not None
-    assert result.model == "databricks-claude-haiku-4-5"
-    assert result.harness == "claude-sdk"
+    assert result.model == verdict_model
+    assert result.harness == expect_harness
+    assert result.rationale == "r"
 
 
 @pytest.mark.asyncio
@@ -1488,10 +1488,21 @@ _CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("router_name", "catalog", "pick", "present", "absent", "exact_menu", "first_offered"),
+    (
+        "router_name",
+        "catalog",
+        "pick",
+        "present",
+        "absent",
+        "exact_menu",
+        "first_offered",
+        "expect_resolved",
+    ),
     [
         # A codex-only session offers the codex menu and none of the claude
         # arms — the router must not be able to pick an unspawnable harness.
+        # glm has no endpoint here and its fallback (luna) is not served either,
+        # so the pick declines — the menu still followed the vocabulary.
         (
             "task_v1",
             _CODEX_CATALOG_ONLY,
@@ -1501,7 +1512,10 @@ _CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
             None,
             # The caller's own catalog id leads; the router tolerates the extra.
             "gpt-5-4",
+            False,
         ),
+        # sonnet-5 has no endpoint here and the claude fallback is sonnet-5
+        # itself, so the pick declines.
         (
             "task_v1",
             _CLAUDE_CATALOG_ONLY,
@@ -1510,8 +1524,10 @@ _CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
             _CODEX_ARMS,
             None,
             None,
+            False,
         ),
-        # Both harnesses spawnable: every arm of both menus is on offer.
+        # Both harnesses spawnable: every arm of both menus is on offer. opus
+        # is unserved and the claude fallback (sonnet-5) is absent too → decline.
         (
             "task_v1",
             {**_CLAUDE_CATALOG_ONLY, **_CODEX_CATALOG_ONLY},
@@ -1520,8 +1536,10 @@ _CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
             (),
             None,
             None,
+            False,
         ),
-        # A router version with no menu entry gets exactly the caller's catalog.
+        # A router version with no menu entry gets exactly the caller's catalog;
+        # the pick is served exactly, so it resolves.
         (
             "task_v0",
             _CODEX_CATALOG_ONLY,
@@ -1530,6 +1548,7 @@ _CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
             (),
             ["gpt-5-4"],
             None,
+            True,
         ),
     ],
 )
@@ -1541,6 +1560,7 @@ async def test_task_v1_menu_follows_the_session_vocabulary(
     absent: Sequence[str],
     exact_menu: list[str] | None,
     first_offered: str | None,
+    expect_resolved: bool,
 ) -> None:
     import httpx
 
@@ -1558,8 +1578,13 @@ async def test_task_v1_menu_follows_the_session_vocabulary(
         assert arm in offered
     for arm in absent:
         assert arm not in offered
-    assert result is not None
-    assert result.harness == pick["harness"]
+    # The menu is the invariant; the result resolves only when the pick or its
+    # family fallback is servable, else it declines (a sanctioned outcome).
+    if expect_resolved:
+        assert result is not None
+        assert result.harness == pick["harness"]
+    else:
+        assert result is None
 
 
 @pytest.mark.asyncio
@@ -1586,7 +1611,7 @@ async def test_task_v1_partial_menu_error_surfaces_last_error() -> None:
 
 @pytest.mark.asyncio
 async def test_task_v1_unservable_arm_maps_to_servable_id() -> None:
-    """gpt-5-6-sol has no endpoint here; the pick lands on the nearest one."""
+    """gpt-5-6-sol has no endpoint here; the pick lands on the gpt family fallback."""
     import httpx
 
     captured: dict[str, Any] = {}
@@ -1596,10 +1621,12 @@ async def test_task_v1_unservable_arm_maps_to_servable_id() -> None:
             _capturing_handler(captured, {"model": "gpt-5-6-sol", "harness": "codex"})
         )
     ):
-        result = await client.route("hi", {"codex": ["databricks-gpt-5-4", "databricks-gpt-5-5"]})
+        result = await client.route(
+            "hi", {"codex": ["databricks-gpt-5-4", "databricks-gpt-5-6-luna"]}
+        )
 
     assert result is not None
-    assert result.model == "databricks-gpt-5-5"
+    assert result.model == "databricks-gpt-5-6-luna"  # the gpt family fallback
     assert result.raw_model == "gpt-5-6-sol"  # what the router actually said
     assert result.harness == "codex"
 
@@ -1621,13 +1648,16 @@ async def test_task_v1_ignores_echoed_harness_and_derives_from_arm() -> None:
         result = await client.route(
             "refactor",
             {
-                "claude-sdk": ["databricks-claude-haiku-4-5"],
+                "claude-sdk": ["databricks-claude-haiku-4-5", "databricks-claude-sonnet-5"],
                 "codex": ["databricks-gpt-5-4"],
             },
         )
 
+    # opus has no endpoint here, so it lands on the claude fallback (sonnet-5) —
+    # and the harness derives from the arm's family, never the nonsense echo.
     assert result is not None
     assert result.harness == "claude-sdk"
+    assert result.model == "databricks-claude-sonnet-5"
     assert result.raw_model == "claude-opus-4-8"
 
 
@@ -1737,36 +1767,34 @@ def test_route_option_source_redirects_excluded_pick_off_pi() -> None:
 
 
 def test_resolve_selection_never_leaves_the_offered_harnesses() -> None:
-    """pi alone on offer: a barred pick is substituted, never redirected away.
+    """pi alone on offer: a barred pick is substituted or declined, never redirected away.
 
     The redirect targets (codex / claude-sdk) are not candidates here, so
     choosing one would hand a child a harness its parent's family forbids.
     """
+    # pi (not a routed harness, plan 3k) declines when the fallback is barred —
+    # the session keeps its default.
     from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
 
     source = TaskV1RouteOptionSource()
     catalog = {"pi": list(infer_models("pi") or ())}
-    for pick in ("databricks-claude-haiku-4-5", "gpt-5-6-luna"):
-        resolved = source.resolve_selection(RoutePick(model=pick), ["pi"], catalog)
-        assert resolved is not None, pick
-        assert resolved.harness == "pi", pick
-        assert not harness_bars_model("pi", resolved.model), (pick, resolved.model)
+    # haiku's claude fallback (sonnet-5) is servable and unbarred on pi.
+    haiku = source.resolve_selection(
+        RoutePick(model="databricks-claude-haiku-4-5"), ["pi"], catalog
+    )
+    assert haiku is not None
+    assert haiku.harness == "pi"
+    assert not harness_bars_model("pi", haiku.model)
+    # luna's gpt fallback is luna itself, which pi bars → honest decline (None).
+    # A decline never returns a harness outside the offer, so the invariant holds.
+    luna = source.resolve_selection(RoutePick(model="gpt-5-6-luna"), ["pi"], catalog)
+    assert luna is None
 
 
-# ── Substitution for unservable arms ───────────────────────────────────────
+# ── GLM arm resolves to the gateway's model-route spelling ─────────────────
 #
-# A live ucode workspace lists codex endpoints roughly alphabetically, so the
-# substitution must come from the arm's own table, not from catalog position.
-
-_UCODE_CODEX_CATALOG: tuple[str, ...] = (
-    "gpt-5-1-codex-max",
-    "gpt-5-1-codex-mini",
-    "gpt-5-2",
-    "gpt-5-3-codex",
-    "gpt-5-5",
-    "gpt-5-mini",
-    "gpt-5-nano",
-)
+# glm has no local codex endpoint; the arm resolves through apply_servable_alias
+# to the ``system.ai.glm-5-2`` model route the gateway actually serves.
 
 
 def _substitute(arm: str, models: Sequence[str], harness: str = "codex") -> str:
@@ -1777,100 +1805,6 @@ def _substitute(arm: str, models: Sequence[str], harness: str = "codex") -> str:
     assert resolved is not None, f"{arm} resolved to nothing"
     assert resolved.raw_model == arm
     return resolved.model
-
-
-_CLAUDE_TIERS = (
-    "databricks-claude-haiku-4-5",
-    "databricks-claude-sonnet-4-6",
-    "databricks-claude-opus-4-8",
-)
-
-
-@pytest.mark.parametrize(
-    ("arm", "catalog", "harness", "expected"),
-    [
-        # sol is task_v1's anchor arm, so it must not land on a nano endpoint.
-        ("gpt-5-6-sol", _UCODE_CODEX_CATALOG, "codex", "gpt-5-5"),
-        # luna is the cheap arm: a mini endpoint, not gpt-5-5 and not nano.
-        ("gpt-5-6-luna", _UCODE_CODEX_CATALOG, "codex", "gpt-5-mini"),
-        # Its chain names nothing on offer: the strongest same-family id wins.
-        ("gpt-5-6-luna", ("gpt-5-nano",), "codex", "gpt-5-nano"),
-        # glm-5-2 has no local endpoint, and its chain escalates like sol's.
-        ("glm-5-2", _UCODE_CODEX_CATALOG, "codex", "gpt-5-5"),
-        # A workspace that serves GLM resolves the glm arm to that endpoint,
-        # under the gateway's own model-route spelling.
-        (
-            "glm-5-2",
-            (*_UCODE_CODEX_CATALOG, "databricks-glm-5-2"),
-            "codex",
-            "system.ai.glm-5-2",
-        ),
-        # The prefix-restore path is untouched: a servable arm is applied as-is.
-        (
-            "gpt-5-5",
-            ("databricks-gpt-5-nano", "databricks-gpt-5-5", "databricks-gpt-5-mini"),
-            "codex",
-            "databricks-gpt-5-5",
-        ),
-        # Claude arms are unaffected when the workspace serves them exactly.
-        (
-            "claude-sonnet-5",
-            ("databricks-claude-sonnet-5", "databricks-claude-opus-4-8"),
-            "claude-sdk",
-            "databricks-claude-sonnet-5",
-        ),
-        (
-            "claude-opus-4-8",
-            ("databricks-claude-sonnet-5", "databricks-claude-opus-4-8"),
-            "claude-sdk",
-            "databricks-claude-opus-4-8",
-        ),
-        # An unservable opus takes the most capable Claude on offer.
-        (
-            "claude-opus-4-8",
-            (
-                "databricks-claude-haiku-4-5",
-                "databricks-claude-sonnet-4-6",
-                "databricks-claude-opus-4-7",
-            ),
-            "claude-sdk",
-            "databricks-claude-opus-4-7",
-        ),
-        # An unservable cheap Claude arm avoids the flagship.
-        (
-            "claude-sonnet-5",
-            ("databricks-claude-opus-4-7", "databricks-claude-sonnet-4-6"),
-            "claude-sdk",
-            "databricks-claude-sonnet-4-6",
-        ),
-        # A sonnet-class arm takes the older sonnet, not the cheapest real model.
-        ("claude-sonnet-5", _CLAUDE_TIERS, "claude-sdk", "databricks-claude-sonnet-4-6"),
-        # Nothing cheaper on offer: the chain ends on the older flagship.
-        (
-            "claude-sonnet-5",
-            ("databricks-claude-opus-4-7", "databricks-claude-opus-4-8"),
-            "claude-sdk",
-            "databricks-claude-opus-4-7",
-        ),
-        # The live-catalog case: exact prefix restore, no substitution at all.
-        (
-            "claude-sonnet-5",
-            (
-                "databricks-claude-haiku-4-5",
-                "databricks-claude-sonnet-4-6",
-                "databricks-claude-sonnet-5",
-                "databricks-claude-opus-4-8",
-            ),
-            "claude-sdk",
-            "databricks-claude-sonnet-5",
-        ),
-    ],
-)
-def test_unservable_arm_substitutes_from_its_own_chain(
-    arm: str, catalog: Sequence[str], harness: str, expected: str
-) -> None:
-    """An arm the workspace can't serve resolves down its substitution chain."""
-    assert _substitute(arm, catalog, harness) == expected
 
 
 @pytest.mark.parametrize(
@@ -1908,17 +1842,6 @@ def test_aliased_glm_pick_reports_no_substitution() -> None:
     assert resolved is not None
     assert resolved.model == "system.ai.glm-5-2"
     assert _bare_id(resolved.model) == _bare_id(resolved.raw_model) == "glm-5-2"
-
-
-def test_substitution_is_independent_of_catalog_order() -> None:
-    import random
-
-    shuffled = list(_UCODE_CODEX_CATALOG)
-    picks = set()
-    for seed in range(25):
-        random.Random(seed).shuffle(shuffled)
-        picks.add((_substitute("gpt-5-6-sol", shuffled), _substitute("gpt-5-6-luna", shuffled)))
-    assert picks == {("gpt-5-5", "gpt-5-mini")}
 
 
 # ── routing_settings / routing_last_error accessors ───────────────────────
@@ -2233,72 +2156,61 @@ async def test_route_session_harness_falls_back_by_model_when_harness_absent() -
 # ── Single resolution authority (no double-resolution) ─────────────────────
 
 
+# The client owns resolution; the server must not re-resolve its pick (a second
+# pass with a different prefix list once downgraded routed gpt-5-6-luna to
+# gpt-5-4-mini). A router pick spelled bare is the same model, not a divergent raw.
 @pytest.mark.asyncio
-async def test_route_session_harness_keeps_the_clients_harness() -> None:
-    """A client-resolved verdict still yields a harness, not a routing failure."""
+@pytest.mark.parametrize(
+    ("harness", "model", "raw_model", "catalog_models"),
+    [
+        (
+            "claude-native",
+            "databricks-claude-opus-4-8",
+            "claude-opus-4-8",
+            ["databricks-claude-opus-4-8", "databricks-claude-sonnet-5"],
+        ),
+        (
+            "codex-native",
+            "databricks-gpt-5-6-luna",
+            "gpt-5-6-luna",
+            ["databricks-gpt-5-4-mini", "databricks-gpt-5-6-luna"],
+        ),
+    ],
+)
+async def test_route_session_harness_applies_the_clients_pick_verbatim(
+    harness: str, model: str, raw_model: str, catalog_models: list[str]
+) -> None:
     expected = RoutingResult(
-        model="databricks-claude-opus-4-8",
-        rationale="escalate up to claude-opus-4-8",
-        harness="claude-native",
-        raw_model="claude-opus-4-8",
-    )
-    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
-    catalog = {"claude-native": ["databricks-claude-opus-4-8", "databricks-claude-sonnet-5"]}
-    with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, verdict, error = await route_session_harness(
-            "add a --dry-run flag",
-            harness_candidates=("claude-native",),
-            catalog=catalog,
-        )
-    assert harness == "claude-native"
-    assert model == "databricks-claude-opus-4-8"
-    # Same model, only spelled bare by the router: not a divergent raw pick.
-    assert verdict is not None and "raw_model" not in verdict
-    assert error is None
-
-
-@pytest.mark.asyncio
-async def test_route_session_harness_applies_the_clients_model_verbatim() -> None:
-    """The client owns resolution; the server must not re-resolve its pick.
-
-    A second pass with a different prefix list downgraded the pick on the
-    zero-config Databricks path (routed gpt-5-6-luna applying gpt-5-4-mini).
-    """
-    expected = RoutingResult(
-        model="databricks-gpt-5-6-luna",
-        rationale="cheap arm",
-        harness="codex-native",
-        raw_model="gpt-5-6-luna",
+        model=model, rationale="client-resolved", harness=harness, raw_model=raw_model
     )
     caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, verdict, error = await route_session_harness(
-            "rename a variable",
-            harness_candidates=("codex-native",),
-            catalog={"codex-native": ["databricks-gpt-5-4-mini", "databricks-gpt-5-6-luna"]},
+        got_harness, got_model, verdict, error = await route_session_harness(
+            "do the thing",
+            harness_candidates=(harness,),
+            catalog={harness: catalog_models},
         )
-    assert (harness, model) == ("codex-native", "databricks-gpt-5-6-luna")
+    assert (got_harness, got_model) == (harness, model)
     assert error is None
-    # Applied exactly, so the card shows no divergent raw pick.
     assert verdict is not None and "raw_model" not in verdict
 
 
 @pytest.mark.asyncio
 async def test_route_turn_substitutes_a_model_the_harness_gateway_bars() -> None:
-    """A turn cannot change harness, so a barred pick moves to a runnable id."""
+    """A turn cannot change harness, so a barred pick moves to its family fallback."""
     client = FakeRoutingClient(
         RoutingResult(
-            model="databricks-gpt-5-6-luna",
+            model="databricks-claude-haiku-4-5",
             rationale="cheap arm",
             harness="pi",
-            raw_model="gpt-5-6-luna",
+            raw_model="claude-haiku-4-5",
         )
     )
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
         model, verdict = await route_turn("pi", "quick lookup")
-    # luna 400s on pi's completions path; the next id in its chain does not.
-    assert model == "databricks-gpt-5-4-mini"
-    assert verdict is not None and verdict["raw_model"] == "gpt-5-6-luna"
+    # haiku 400s on pi's completions path; the claude fallback (sonnet-5) does not.
+    assert model == "databricks-claude-sonnet-5"
+    assert verdict is not None and verdict["raw_model"] == "claude-haiku-4-5"
 
 
 @pytest.mark.asyncio
@@ -2358,41 +2270,6 @@ def test_dotless_system_ai_prefix_still_offers_routable_arms() -> None:
     assert not any(option.model.startswith(".") for option in options)
 
 
-# ── A barred pick never escalates cost ─────────────────────────────────────
-#
-# The substitution fallback used to take the most capable same-family candidate,
-# so every SIMPLE pi turn (haiku is barred on pi) escalated to opus.
-
-
-def test_a_barred_cheap_pick_does_not_become_the_most_expensive_candidate() -> None:
-    from omnigent.server.smart_routing import _HARNESS_EXCLUDED_MODELS, substitute_model
-
-    candidates = infer_models("pi") or []
-    substitute = substitute_model(
-        "databricks-claude-haiku-4-5",
-        candidates,
-        barred=_HARNESS_EXCLUDED_MODELS["pi"],
-    )
-    assert substitute == "databricks-claude-sonnet-4-6", (
-        f"the cheapest Claude on pi must step to the next tier up, not to {substitute}"
-    )
-
-
-@pytest.mark.parametrize(
-    ("pick", "expected"),
-    [
-        # The nearest tier, biased down — never the flagship.
-        ("databricks-gpt-5-4-nano", "databricks-gpt-5-4-mini"),
-        ("databricks-claude-haiku-4-5", "databricks-claude-sonnet-4-6"),
-    ],
-)
-def test_chain_miss_substitutes_the_nearest_candidate(pick: str, expected: str) -> None:
-    from omnigent.server.smart_routing import substitute_model
-
-    candidates = infer_models("pi") or []
-    assert substitute_model(pick, candidates, barred=[pick]) == expected
-
-
 @pytest.mark.asyncio
 async def test_route_turn_never_offers_pi_a_model_its_gateway_bars() -> None:
     """The barred rows are pruned before the router ever sees them."""
@@ -2433,8 +2310,8 @@ _DOTTED_CODEX_CATALOG: list[str] = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5", "g
     [
         ("gpt-5-6-sol", "gpt-5.6-sol"),
         ("gpt-5-6-luna", "gpt-5.6-luna"),
-        # glm has no local endpoint; its chain names sol, which this pane serves.
-        ("glm-5-2", "gpt-5.6-sol"),
+        # glm has no local endpoint; it falls back to luna, which this pane serves.
+        ("glm-5-2", "gpt-5.6-luna"),
     ],
 )
 def test_dot_spelled_picker_rows_match_the_router_arms(arm: str, expected: str) -> None:
@@ -2466,15 +2343,23 @@ def test_dot_spelled_rows_are_not_offered_twice() -> None:
 @pytest.mark.parametrize("model", ["databricks-claude-haiku-4-5", "databricks-gpt-5-5"])
 async def test_route_session_harness_keeps_a_pi_child_on_pi(model: str) -> None:
     """``allowed_family="pi"`` must never yield codex or claude-sdk."""
+    # A pi child either stays on pi or declines (harness None) — a decline is
+    # acceptable and never cross-harness. haiku steps to its servable claude
+    # fallback (sonnet-5) and stays on pi; gpt-5-5 is barred on pi and its gpt
+    # fallback (luna) is barred too with no pi fallback, so it declines.
     client = FakeRoutingClient(RoutingResult(model=model, rationale="x", harness="pi"))
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
         harness, routed, _verdict, error = await route_session_harness(
             "do it", allowed_family="pi"
         )
-    assert harness == "pi", f"a pi child must stay on pi, got {harness!r}"
-    if routed is not None:
-        assert not harness_bars_model("pi", routed), routed
-    assert error is None
+    assert harness in ("pi", None), f"a pi child must stay on pi or decline, got {harness!r}"
+    if harness == "pi":
+        assert routed is not None and not harness_bars_model("pi", routed), routed
+        assert error is None
+    else:
+        # A decline hands back nothing (never a non-pi harness), with a reason.
+        assert routed is None
+        assert error is not None
 
 
 @pytest.mark.asyncio

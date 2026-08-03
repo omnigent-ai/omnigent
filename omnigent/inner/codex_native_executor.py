@@ -40,7 +40,7 @@ from omnigent.inner.native_attachments import (
     parse_data_uri,
     unresolved_attachment_marker,
 )
-from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.reasoning_effort import CODEX_EFFORTS, effort_for_model_switch, validate_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -379,6 +379,12 @@ def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
         # current effort rather than failing the whole dispatch.
         _logger.warning("Ignoring unsupported codex reasoning effort: %r", raw_effort)
         effort = None
+    model_str = model if isinstance(model, str) and model else None
+    # A model switch inherits config.toml's effort (the user's xhigh default),
+    # which the switched-to model may reject (GLM has no xhigh). Guard the live
+    # turn: clamp an explicit effort, and when none was requested but the model
+    # caps below the codex default, send that ceiling so the turn does not 400.
+    effort = effort_for_model_switch(effort, model_str)
     if effort:
         overrides["effort"] = effort
     return overrides

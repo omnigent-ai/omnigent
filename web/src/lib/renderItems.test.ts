@@ -1702,6 +1702,25 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
     expect(bubbles).toEqual(buildBubbles(next, null));
   });
 
+  it("reused cache: a shorter block array than the cached one rebuilds, never reads off the end", () => {
+    // A stale cache (session switch, history reload) can carry a
+    // lastBubbleStart pointing past a now-shorter array. chipPendingBeforeRegion
+    // must not index off the end — doing so read `undefined.type` and blanked
+    // the whole page. The shorter frame must rebuild and match from-scratch.
+    const cache = createBubbleCache();
+    const long: AnyBlock[] = [
+      chipBlock("rd_1", "resp_1", "turn"),
+      userBlock("u1", "resp_1"),
+      doneBlock("a1", "resp_1", "answer"),
+    ];
+    buildBubbles(long, null, cache);
+    // Now hand it a strictly shorter array (only the chip survives).
+    const shorter = [chipBlock("rd_1", "resp_1", "turn")];
+    const bubbles = buildBubbles(shorter, null, cache);
+    expect(kinds(bubbles)).toEqual(["routing_decision"]);
+    expect(bubbles).toEqual(buildBubbles(shorter, null));
+  });
+
   it("live stream: frame-by-frame native order always matches a from-scratch rebuild", () => {
     expectFrameByFrameStable(
       [

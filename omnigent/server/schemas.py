@@ -1887,12 +1887,6 @@ class SessionResponse(BaseModel):
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
     last_task_error: dict[str, str] | None = None
-    # Session-scoped degraded-but-running conditions at snapshot time,
-    # each ``{"code", "harness", "reason"}`` — e.g. a harness whose
-    # router hook never fired, so native sub-agent spawns aren't gated.
-    # Rendered by the chat header's warning banner. Empty when nothing
-    # is wrong (the common case).
-    warnings: list[dict[str, Any]] = Field(default_factory=list)
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     pending_elicitations: list[dict[str, Any]] = Field(default_factory=list)

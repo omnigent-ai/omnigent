@@ -464,14 +464,18 @@ function reusablePrefix(
     return null;
   }
   const startBlock = cache.lastBubbleStart;
+  // The new array must be at least as long as the finalized prefix region.
+  // Checked BEFORE any indexing below: a stale cache whose start points past
+  // a now-shorter block array (session switch, history reload) must bail to a
+  // full rebuild, not read off the end (crashes chipPendingBeforeRegion).
+  if (blocks.length < startBlock) return null;
   // A chip separated from its message by skippable blocks (claude-native's
   // injected `/model` echo) sits BEFORE the re-walk region, because the echo
   // opened its own bubble in between. Rebuild in full so the arriving message
   // can still pick the chip up.
   if (chipPendingBeforeRegion(blocks, startBlock)) return null;
-  // The new array must be at least as long, and the finalized prefix
-  // region must be byte-for-byte (reference-for-reference) unchanged.
-  if (blocks.length < startBlock) return null;
+  // The finalized prefix region must be byte-for-byte (reference-for-
+  // reference) unchanged.
   for (let j = 0; j < startBlock; j += 1) {
     if (blocks[j] !== cache.blocks[j]) return null;
   }
@@ -521,7 +525,9 @@ function reusablePrefix(
  * streaming turn is not rebuilt frame after frame).
  */
 function chipPendingBeforeRegion(blocks: AnyBlock[], startBlock: number): boolean {
-  let k = startBlock - 1;
+  // Clamp into bounds: a stale cache can hand us a startBlock past the end of
+  // a now-shorter array, and blocks[k] would be undefined (blank-page crash).
+  let k = Math.min(startBlock, blocks.length) - 1;
   while (k >= 0 && isChipPairingSkippable(blocks[k]!)) k -= 1;
   if (k < 0) return false;
   const chip = blocks[k]!;

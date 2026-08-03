@@ -227,24 +227,6 @@ export interface ModelUsage {
   totalCostUsd: number | null;
 }
 
-/**
- * Session-scoped warning published on the session-status channel — a
- * degraded-but-running condition the UI surfaces in the header banner
- * (e.g. `subagent_routing_unenforced`, when a harness's router hook
- * never fired so sub-agent routing isn't enforced).
- *
- * Field names match the wire (`code`, plus the per-code payload keys), so
- * the snapshot mapper passes them through unchanged.
- */
-export interface SessionWarning {
-  /** Warning identifier, e.g. `"subagent_routing_unenforced"`. */
-  code: string;
-  /** Harness the warning is about, e.g. `"codex-native"`. */
-  harness?: string | null;
-  /** Human-readable cause, shown as the banner's detail line. */
-  reason?: string | null;
-}
-
 export interface Session {
   id: string;
   agentId: string;
@@ -370,12 +352,6 @@ export interface Session {
    * have been emitted before the web client subscribed.
    */
   lastTaskError?: { code: string; message: string } | null;
-  /**
-   * Session-scoped warnings (degraded-but-running conditions) as of the
-   * snapshot. Empty/absent when nothing is wrong. Rendered by the header's
-   * warning banner.
-   */
-  warnings?: SessionWarning[];
   /**
    * Outstanding `response.elicitation_request` event payloads on
    * the snapshot. Replayed into the chat as ApprovalCard blocks on

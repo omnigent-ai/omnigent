@@ -247,41 +247,28 @@ def test_create_keeps_the_session_when_no_model_was_picked() -> None:
     assert "did not pick a model" in decision.notice
 
 
+# A create that is rejected, unreachable, or missing a session id never blocks
+# the launch: it returns no session and a notice.
 @respx.mock
-def test_create_fails_open_on_a_server_error() -> None:
-    """A rejected create (e.g. no native CLI for the auto route) never blocks."""
-    respx.post(f"{_BASE}/v1/sessions").mock(return_value=httpx.Response(400, text="no native CLI"))
+@pytest.mark.parametrize(
+    ("mock_kwargs", "harness", "notice_contains"),
+    [
+        ({"return_value": httpx.Response(400, text="no native CLI")}, None, "400"),
+        ({"side_effect": httpx.ConnectError("refused")}, "claude-native", "could not reach"),
+        ({"return_value": httpx.Response(201, json={})}, "claude-native", None),
+    ],
+)
+def test_create_fails_open(
+    mock_kwargs: dict[str, Any], harness: str | None, notice_contains: str | None
+) -> None:
+    respx.post(f"{_BASE}/v1/sessions").mock(**mock_kwargs)
 
-    decision = create_smart_routing_session(base_url=_BASE, prompt="hello", harness=None)
+    decision = create_smart_routing_session(base_url=_BASE, prompt="hello", harness=harness)
 
     assert (decision.session_id, decision.harness, decision.model) == (None, None, None)
     assert decision.notice is not None
-    assert "400" in decision.notice
-
-
-@respx.mock
-def test_create_fails_open_when_the_server_is_unreachable() -> None:
-    respx.post(f"{_BASE}/v1/sessions").mock(side_effect=httpx.ConnectError("refused"))
-
-    decision = create_smart_routing_session(
-        base_url=_BASE, prompt="hello", harness="claude-native"
-    )
-
-    assert decision.session_id is None
-    assert decision.notice is not None
-    assert "could not reach" in decision.notice
-
-
-@respx.mock
-def test_create_fails_open_when_the_response_has_no_session_id() -> None:
-    respx.post(f"{_BASE}/v1/sessions").mock(return_value=httpx.Response(201, json={}))
-
-    decision = create_smart_routing_session(
-        base_url=_BASE, prompt="hello", harness="claude-native"
-    )
-
-    assert decision.session_id is None
-    assert decision.notice is not None
+    if notice_contains is not None:
+        assert notice_contains in decision.notice
 
 
 # ── dispatch ─────────────────────────────────────────────────────────────

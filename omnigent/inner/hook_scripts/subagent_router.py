@@ -58,13 +58,6 @@ NATIVE_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 AGENT_TOOL_NAMES = ("Agent", "Task")
 AGENT_TOOL_MATCHER = "|".join(AGENT_TOOL_NAMES)
 
-# Subagent types that inherit the caller's context instead of starting
-# fresh. Routing a fork would price a task whose real cost is dominated
-# by inherited context, so v1 reports them and lets the server exempt
-# them.
-FORK_SUBAGENT_TYPES = frozenset({"fork"})
-_FORK_SUFFIXES = ("-fork", "_fork", ":fork")
-
 # Hosts an advertised router URL may name. The advertisement lives in an
 # agent-writable directory, so anything else is a self-approval or
 # exfiltration target rather than our own runner.
@@ -313,24 +306,6 @@ def spawn_task_name(
     return ""
 
 
-def is_fork_spawn(
-    tool_input: dict[str, Any],  # type: ignore[explicit-any]
-    task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
-) -> bool:
-    """
-    Detect a context-inheriting (fork-typed) spawn.
-
-    :param tool_input: ``tool_input`` from the hook payload.
-    :param task_keys: Extra name keys to try when ``subagent_type`` is
-        absent, e.g. codex's ``task_name``.
-    :returns: ``True`` when the requested subagent type inherits the
-        caller's context.
-    """
-    keys = dict.fromkeys(("subagent_type", *task_keys))
-    normalized = spawn_task_name(tool_input, tuple(keys)).strip().lower()
-    return normalized in FORK_SUBAGENT_TYPES or normalized.endswith(_FORK_SUFFIXES)
-
-
 def build_route_request(
     tool_input: dict[str, Any],  # type: ignore[explicit-any]
     *,
@@ -356,7 +331,6 @@ def build_route_request(
         "harness": harness,
         "task_name": spawn_task_name(tool_input, task_keys),
         "prompt": prompt if isinstance(prompt, str) and prompt else None,
-        "fork": is_fork_spawn(tool_input, task_keys),
         "parent_model": parent_model,
     }
 

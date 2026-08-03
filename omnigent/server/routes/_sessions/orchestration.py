@@ -68,7 +68,6 @@ from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
     auto_harness_session,
     harness_family,
-    subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
@@ -76,7 +75,6 @@ from omnigent.runtime import (
     inflight_text,
     pending_elicitations,
     pending_inputs,
-    session_warnings,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import (
@@ -914,43 +912,6 @@ def _publish_subtree_cost_to_ancestors(
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
-def _visible_session_warnings(
-    conv: Conversation, parent_cost_control_mode: str | None
-) -> list[dict[str, Any]]:
-    """
-    Filter recorded warnings down to the ones that still apply.
-
-    The routing hooks and their advertisement are installed on every
-    native session so the setting can be flipped mid-session, so the
-    publisher (a runner-side forwarder that cannot see server state) posts
-    ``subagent_routing_unenforced`` whenever the canary is missing —
-    including on sessions where subagent routing is switched off and
-    nothing was ever meant to be gated. Re-evaluating the effective gate
-    here, at the one place warnings reach a client, keeps a mid-session
-    toggle honest in both directions with no re-post: turning routing on
-    reveals the already-recorded warning, turning it off hides it.
-
-    :param conv: The persisted conversation entity.
-    :param parent_cost_control_mode: The parent session's
-        ``cost_control_mode_override`` for a sub-agent, or ``None``.
-    :returns: Warning payloads to put on the snapshot.
-    """
-    warnings = session_warnings.snapshot_for(conv.id)
-    if not warnings:
-        return warnings
-    if subagent_routing_enabled(
-        conv.subagent_routing_override,
-        cost_control_mode=conv.cost_control_mode_override,
-        parent_cost_control_mode=parent_cost_control_mode,
-    ):
-        return warnings
-    return [
-        warning
-        for warning in warnings
-        if warning.get("code") != session_warnings.SUBAGENT_ROUTING_UNENFORCED
-    ]
-
-
 def _build_session_response(
     conv: Conversation,
     items: list[ConversationItem],
@@ -971,7 +932,6 @@ def _build_session_response(
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
     viewer_id: str | None = None,
-    parent_cost_control_mode: str | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1040,11 +1000,6 @@ def _build_session_response(
     :param model_options: Runner-owned native model picker options,
         e.g. ``[{"id": "gpt-5.5", "displayName": "GPT-5.5"}]``.
         ``None`` is treated as ``[]``.
-    :param parent_cost_control_mode: The parent session's
-        ``cost_control_mode_override``, used to resolve a sub-agent's
-        inherited subagent-routing state when filtering warnings (see
-        :func:`_visible_session_warnings`). ``None`` for a top-level
-        session or a caller with no parent loaded.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1109,10 +1064,6 @@ def _build_session_response(
         # when no per-model usage was recorded.
         usage_by_model=_usage_by_model_for_display(display_usage),
         last_task_error=last_task_error,
-        # Replay session-scoped warnings so a client that connects after
-        # the condition was observed still sees the header banner, minus
-        # any that no longer apply to the session's current settings.
-        warnings=_visible_session_warnings(conv, parent_cost_control_mode),
         external_session_id=conv.external_session_id,
         terminal_launch_args=conv.terminal_launch_args,
         # Replay outstanding approval prompts into the snapshot.
@@ -3486,16 +3437,13 @@ async def _ensure_native_terminal_ready(
     response or transport failure fails this user turn quickly with a
     durable error item; a 2xx response preserves the normal boot grace
     because the runner has accepted responsibility for terminal startup.
-    A 2xx response may also carry ``policy_hook_disabled_reason`` — a
-    one-shot, non-fatal notice that policy enforcement is inactive — which
-    is returned as ``policy_notice`` for the caller to surface as a banner.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conv: Conversation row used to identify the native harness.
-    :returns: The probe outcome — a definitive ``error`` (terminal could
-        not start) and/or a non-fatal ``policy_notice``.
+    :returns: The probe outcome — a definitive ``error`` when the terminal
+        could not start, else ``error=None``.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
@@ -3523,13 +3471,9 @@ async def _ensure_native_terminal_ready(
         )
         return _NativeTerminalEnsureOutcome(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
-            policy_notice=None,
         )
     if resp.status_code < 400:
-        return _NativeTerminalEnsureOutcome(
-            error=None,
-            policy_notice=_policy_notice_from_ensure_response(resp),
-        )
+        return _NativeTerminalEnsureOutcome(error=None)
     _logger.warning(
         "%s terminal ensure failed definitively for session=%s status=%s body=%s",
         display_name,
@@ -3539,7 +3483,6 @@ async def _ensure_native_terminal_ready(
     )
     return _NativeTerminalEnsureOutcome(
         error=_native_terminal_failure_from_runner_response(resp, display_name=display_name),
-        policy_notice=None,
     )
 
 
@@ -4755,7 +4698,7 @@ async def _dispatch_session_event_to_runner_impl(
         # inputs should still fail locally without creating terminals.
         _build_native_terminal_message_event(conv, body)
         ensure_outcome = (
-            _NativeTerminalEnsureOutcome(error=None, policy_notice=None)
+            _NativeTerminalEnsureOutcome(error=None)
             if native_terminal_ready
             else await _ensure_native_terminal_ready(
                 runner_client,
@@ -4774,14 +4717,6 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
             )
             return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
-        if ensure_outcome.policy_notice is not None:
-            # Terminal is up but policy enforcement is off (fail-open). Post
-            # a durable, non-fatal banner; the user message still forwards.
-            await _persist_native_policy_notice(
-                session_id,
-                conversation_store,
-                ensure_outcome.policy_notice,
-            )
         # Record the optimistic bubble before forwarding so it's known
         # server-side immediately (replayed into the snapshot). Roll it
         # back on any failure/cancellation so a message the TUI never
@@ -6977,8 +6912,7 @@ async def _create_session_from_existing_agent(
             # leaking user-defined agent names.
             _NAMED_AGENTS = {"polly", "debby"}
             _tel_agent_name = agent.name if agent.name in _NAMED_AGENTS else None
-            # Routing state at creation; mid-session toggles arrive as
-            # RoutingSettingChangedEvent.
+            # Routing state at creation time.
             _tel_routing_on = conv.cost_control_mode_override == "on"
             _tel_emit(
                 _TelSessionCreatedEvent(
@@ -7995,16 +7929,6 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
-    # A sub-agent inherits its parent's routing state, so deciding whether
-    # its routing warnings still apply needs the parent's mode. One indexed
-    # read, gated to sessions that have a parent.
-    parent_cost_control_mode: str | None = None
-    if conv.parent_conversation_id is not None:
-        parent_conv = await asyncio.to_thread(
-            conv_store.get_conversation, conv.parent_conversation_id
-        )
-        if parent_conv is not None:
-            parent_cost_control_mode = parent_conv.cost_control_mode_override
     return _build_session_response(
         conv,
         items,
@@ -8029,7 +7953,6 @@ async def _get_session_snapshot(
         ),
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
-        parent_cost_control_mode=parent_cost_control_mode,
     )
 
 

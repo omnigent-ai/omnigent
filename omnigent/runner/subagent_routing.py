@@ -57,8 +57,6 @@ if TYPE_CHECKING:
 
     from omnigent.entities.conversation import RoutingDecisionData
 
-from omnigent.telemetry import record_routing_decision
-
 _logger = logging.getLogger(__name__)
 
 #: Bridge-dir file that advertises the loopback endpoint to hook scripts.
@@ -250,8 +248,8 @@ class SubagentRouteDecision:
     :param harness: Target harness; set for redirect.
     :param raw_model: Router-vocabulary pick before resolution.
     :param rationale: One-line explanation, surfaced to the model and UI.
-    :param decision_id: Identity shared by the response, the transcript
-        item and telemetry.
+    :param decision_id: Identity shared by the response and the transcript
+        item.
     """
 
     action: Literal["allow", "rewrite", "redirect", "deny"]
@@ -515,21 +513,6 @@ async def resolve_subagent_route(
         caps = get_caps()
 
     decision = await _decide(session_id, req, caps, available_models, catalog, cross_harness)
-    # ``task_name`` is deliberately not reported: it is free-form text the
-    # calling agent wrote, so it stays in the transcript only.
-    record_routing_decision(
-        session_id,
-        scope=_SCOPE,
-        harness=decision.harness or req.harness,
-        action=decision.action,
-        applied=decision.action in ("rewrite", "redirect"),
-        model=decision.model,
-        raw_model=decision.raw_model,
-        # The spawn hook does not report the model the calling agent asked
-        # for, so an override cannot be detected on this path.
-        overrode_agent_model=False,
-        decision_id=decision.decision_id,
-    )
     if persist is not None:
         try:
             await persist(decision_record(req, decision))
@@ -603,7 +586,7 @@ def _decision_from_result(
     model = result.model
     rationale = getattr(result, "rationale", "") or ""
     # Only report a raw pick that actually differs from the resolved model, so
-    # the telemetry field means "the router asked for something else". A
+    # the raw_model field means "the router asked for something else". A
     # prefix-only spelling difference is the same arm, not a substitution.
     from omnigent.server.smart_routing import _bare_id
 

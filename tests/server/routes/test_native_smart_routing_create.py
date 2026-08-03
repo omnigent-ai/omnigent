@@ -233,16 +233,31 @@ async def test_fixed_native_harness_create_routes_the_model(
     assert created.json()["harness"] == snapshot.json()["harness"]
 
 
-async def test_fixed_harness_create_does_not_pin_an_unrunnable_pick(
+# A create that cannot pin the pick still opens the terminal on the CLI's own
+# default, records an unapplied decision naming why, and joins no decision label.
+# Two causes: an unrunnable cross-family pick (harness is not negotiable here),
+# and a router that is down.
+@pytest.mark.parametrize(
+    ("harness", "routing_client_factory", "rationale_contains"),
+    [
+        (
+            "claude-native",
+            lambda: FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change")),
+            GPT_MODEL,
+        ),
+        ("codex-native", lambda: None, "not configured"),
+    ],
+)
+async def test_fixed_harness_create_does_not_pin_an_unrunnable_or_absent_pick(
     client: httpx.AsyncClient,
     db_uri: str,
+    harness: str,
+    routing_client_factory: Any,
+    rationale_contains: str,
 ) -> None:
     wrappers = await _native_wrappers(client, db_uri)
-    # A gpt pick for a Claude terminal: the harness is not negotiable here, so
-    # nothing is pinned and the card says so.
-    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
     created = await _create_fixed_harness_session(
-        client, wrappers["claude-native"], routing_client
+        client, wrappers[harness], routing_client_factory()
     )
     assert created.status_code == 201, created.text
     session_id = created.json()["id"]
@@ -255,28 +270,7 @@ async def test_fixed_harness_create_does_not_pin_an_unrunnable_pick(
     decisions = _routing_decision_items(db_uri, session_id)
     assert len(decisions) == 1
     assert decisions[0]["applied"] is False
-    assert GPT_MODEL in decisions[0]["rationale"]
-
-
-async def test_fixed_harness_create_fails_open_when_the_router_is_down(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    wrappers = await _native_wrappers(client, db_uri)
-    created = await _create_fixed_harness_session(client, wrappers["codex-native"], None)
-    assert created.status_code == 201, created.text
-    session_id = created.json()["id"]
-
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None
-    # The session still opens a terminal, on the CLI's own default model.
-    assert conv.model_override is None
-    assert ROUTING_DECISION_LABEL_KEY not in conv.labels
-
-    decisions = _routing_decision_items(db_uri, session_id)
-    assert len(decisions) == 1
-    assert decisions[0]["applied"] is False
-    assert "not configured" in decisions[0]["rationale"]
+    assert rationale_contains in decisions[0]["rationale"]
 
 
 @pytest.mark.parametrize(

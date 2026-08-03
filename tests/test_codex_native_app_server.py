@@ -844,9 +844,7 @@ def test_write_codex_policy_hooks_file_merges_router_hooks(tmp_path: Path) -> No
     commands = [h["command"] for entry in hooks["PreToolUse"] for h in entry["hooks"]]
     assert any("codex_router_hook" in c and "--session-id conv_abc" in c for c in commands)
     assert any("codex_policy_hook" in c or "policy" in c for c in commands)
-    # The routing canary / audit events and the user's own hook survive.
-    assert "SessionStart" in hooks
-    assert "SubagentStart" in hooks
+    # The user's own hook survives alongside our route-subagent gate.
     assert hooks["Stop"][0]["hooks"][0]["command"] == "echo bye"
 
 
@@ -1297,16 +1295,12 @@ class TestPinCodexConfigModel:
 # --- Subagent-routing hook trust ---------------------------------------
 #
 # Empirically (codex-cli 0.145.0) ``--dangerously-bypass-hook-trust`` does
-# NOT make hooks run under ``codex app-server``: an untrusted SessionStart
-# hook stayed silent with the flag and fired only once its
+# NOT make hooks run under ``codex app-server``: an untrusted routing hook
+# stayed silent with the flag and fired only once its
 # ``hooks.state.<key>.trusted_hash`` was persisted. The routing hooks
 # therefore need their own trust pass; the policy pass filters by module
 # and would leave them untrusted (a silent fail-open on the spawn gate).
 
-_ROUTER_CANARY_COMMAND = (
-    "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
-    "session-canary --bridge-dir /b"
-)
 _ROUTER_GATE_COMMAND = (
     "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
     "route-subagent --bridge-dir /b --harness codex-native"
@@ -1318,7 +1312,6 @@ async def test_router_hooks_are_trusted_via_batchwrite() -> None:
     client = _FakeCodexClient(
         hooks=[
             _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
-            _hook("canary", _ROUTER_CANARY_COMMAND, "untrusted", "sha256:canary"),
         ]
     )
     assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
@@ -1329,7 +1322,6 @@ async def test_router_hooks_are_trusted_via_batchwrite() -> None:
     assert edit["keyPath"] == "hooks.state"
     assert edit["value"] == {
         "gate": {"trusted_hash": "sha256:gate"},
-        "canary": {"trusted_hash": "sha256:canary"},
     }
     assert writes[0].params["reloadUserConfig"] is True
 

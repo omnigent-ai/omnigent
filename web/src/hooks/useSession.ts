@@ -43,10 +43,8 @@ export interface UseSessionOptions {
    * the query long-lived (chatStore-refreshed) as before.
    *
    * Some snapshot fields are DISCOVERED after the snapshot the UI cached and
-   * have no event channel of their own — `warnings` (e.g.
-   * `subagent_routing_unenforced`) is recorded by a server-side watcher while
-   * the session runs, so the surface rendering it has to re-ask or the banner
-   * would only ever appear after a hard reload.
+   * have no event channel of their own, so the surface rendering them has to
+   * re-ask or they would only ever appear after a hard reload.
    */
   refetchIntervalMs?: number;
   /**

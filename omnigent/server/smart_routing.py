@@ -605,35 +605,16 @@ TASK_V1_MENUS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     }
 )
 
-# What to run when the workspace serves no endpoint for a picked arm (or when
-# the session's harness bars it), in preference order — the arm itself first,
-# so a workspace that does serve it applies it exactly. Bare ids; the first
-# entry the candidate set serves wins.
-_ARM_SUBSTITUTES: Mapping[str, tuple[str, ...]] = MappingProxyType(
+# One fixed fallback per family, used only when the workspace serves no endpoint
+# for the picked arm (or the session's harness bars it). Bare ids. The claude
+# fallback is the sonnet arm from _TASK_V1_CLAUDE_ARMS (the sonnet pin), never a
+# hardcoded id; gpt and glm both land on luna, itself a frozen arm that serves
+# codex-side, so a glm fallback never leaves its harness. glm resolves to the
+# "gpt" family (model_family_token), so one gpt entry covers it.
+_FAMILY_FALLBACK: Mapping[str, str] = MappingProxyType(
     {
-        "gpt-5-6-sol": ("gpt-5-6-sol", "gpt-5-5", "gpt-5-4", "gpt-5-3-codex", "gpt-5-2"),
-        "gpt-5-6-luna": (
-            "gpt-5-6-luna",
-            "gpt-5-4-mini",
-            "gpt-5-mini",
-            "gpt-5-1-codex-mini",
-            "gpt-5-4",
-        ),
-        "glm-5-2": ("glm-5-2", "gpt-5-6-sol", "gpt-5-5", "gpt-5-4", "gpt-5-3-codex"),
-        "claude-opus-4-8": (
-            "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-sonnet-5",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-        ),
-        "claude-sonnet-5": (
-            "claude-sonnet-5",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-            "claude-opus-4-7",
-            "claude-opus-4-8",
-        ),
+        "claude": "claude-sonnet-5",
+        "gpt": "gpt-5-6-luna",
     }
 )
 
@@ -777,32 +758,6 @@ def _model_family(model: str) -> str:
     return "gpt" if token == "openai" else token
 
 
-def _cost_position(
-    model: str,
-    candidates: Sequence[str],
-    prefixes: Sequence[str] | None,
-) -> int | None:
-    """Where *model* sits in the cost-ordered *candidates*.
-
-    Exact when the candidates serve the pick (a barred-but-servable model);
-    otherwise read off the curated family ordering and counted back onto the
-    candidate list. ``None`` when neither knows the id.
-    """
-    bare = _bare_id(model, prefixes)
-    bares = [_bare_id(candidate, prefixes) for candidate in candidates]
-    if bare in bares:
-        return bares.index(bare)
-    family = _model_family(model)
-    order = [
-        _bare_id(m, prefixes)
-        for m in (*MODEL_LISTS.get(family, ()), *_CURRENT_GENERATION_MODELS.get(family, ()))
-    ]
-    if bare not in order:
-        return None
-    cheaper = set(order[: order.index(bare)])
-    return sum(1 for candidate in bares if candidate in cheaper)
-
-
 def substitute_model(
     model: str,
     candidates: Sequence[str],
@@ -812,42 +767,29 @@ def substitute_model(
 ) -> str | None:
     """Find something in *candidates* to run in place of *model*.
 
-    Walks *model*'s :data:`_ARM_SUBSTITUTES` chain first; when it names none of
-    the candidates, takes the same-family candidate nearest the pick's own cost
-    position, resolving ties toward the cheaper end — a barred cheap pick must
-    never escalate to the flagship.
+    The pick itself first, so a workspace that serves it applies it exactly;
+    otherwise the pick's family fallback (:data:`_FAMILY_FALLBACK`) when the
+    candidates serve it. No cost walk: an unservable pick lands on one fixed
+    per-family model or declines, never slides down a cost ladder.
 
     :param model: The router's pick, in either vocabulary.
-    :param candidates: Servable model ids, cheapest first.
+    :param candidates: Servable model ids.
     :param prefixes: Catalog prefixes to strip before comparing ids; ``None``
         uses this deployment's configured ones.
     :param barred: Bare ids to skip, e.g. models the harness's gateway 400s on.
     :returns: A servable candidate id (through :func:`apply_servable_alias`),
-        or ``None`` when nothing fits.
+        or ``None`` when neither the pick nor its family fallback is servable.
     """
     local: dict[str, str] = {}
     for candidate in candidates:
         local.setdefault(_bare_id(candidate, prefixes), candidate)
     skip = {_bare_id(m, prefixes) for m in barred}
-    for substitute in _ARM_SUBSTITUTES.get(_bare_id(model, prefixes), ()):
-        if substitute in skip:
+    for target in (_bare_id(model, prefixes), _FAMILY_FALLBACK.get(_model_family(model))):
+        if target is None or target in skip:
             continue
-        if substitute in local:
-            return apply_servable_alias(local[substitute], prefixes)
-    family = _model_family(model)
-    ranked = [
-        (index, candidate)
-        for index, candidate in enumerate(candidates)
-        if _model_family(candidate) == family and _bare_id(candidate, prefixes) not in skip
-    ]
-    if not ranked:
-        return None
-    target = _cost_position(model, candidates, prefixes)
-    if target is None:
-        # Nothing places the pick on the cost curve; stay at the cheap end.
-        return apply_servable_alias(ranked[0][1], prefixes)
-    nearest = min(ranked, key=lambda entry: (abs(entry[0] - target), entry[0]))[1]
-    return apply_servable_alias(nearest, prefixes)
+        if target in local:
+            return apply_servable_alias(local[target], prefixes)
+    return None
 
 
 def natural_harness_for_model(

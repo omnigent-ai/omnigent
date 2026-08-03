@@ -20,7 +20,7 @@ const getSessionSlimMock = vi.mocked(getSessionSlim);
 const POLL_MS = 30_000;
 
 function session(id: string): Session {
-  return { id, warnings: undefined } as unknown as Session;
+  return { id } as unknown as Session;
 }
 
 function wrapper() {

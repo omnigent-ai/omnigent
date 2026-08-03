@@ -221,6 +221,11 @@ def _codex_mcp_server_config_section(
     )
 
 
+# Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
+# it can be clamped to one the pinned model accepts. Tolerates a trailing comment.
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
+
+
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     """
     Write *model* as the top-level ``model`` key in the session config.toml.
@@ -237,6 +242,8 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param model: Validated model id to pin.
     """
+    from omnigent.reasoning_effort import clamp_effort_for_model
+
     config_path = codex_home / "config.toml"
     # Same symlink-materialization dance as the MCP injection: never edit
     # the user's real config.toml through the link.
@@ -257,7 +264,15 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
         if re.match(r"^model\s*=", line):
             lines[i] = pin_line
             replaced = True
-            break
+            continue
+        # The config copies the user's default effort (e.g. xhigh), which the
+        # pinned model may reject (GLM has no xhigh). Clamp it to a value the
+        # model accepts rather than 400 the turn.
+        effort_match = _EFFORT_KEY_RE.match(line)
+        if effort_match:
+            clamped = clamp_effort_for_model(effort_match.group(2), model)
+            if clamped and clamped != effort_match.group(2):
+                lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
     if not replaced:
         lines.insert(0, pin_line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -991,7 +1006,7 @@ class CodexNativeAppServer:
             # Routing hooks live in the same generated file but under a
             # different module, so they need their own trust pass. Best
             # effort: a routing-trust failure must not disable the policy
-            # gate, and the canary watcher surfaces it as a session warning.
+            # gate, so it is logged instead of raised.
             if self.router_hooks_registered:
                 try:
                     await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
@@ -1423,14 +1438,12 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
     ``--dangerously-bypass-hook-trust`` flag covers the interactive /
     ``exec`` paths, not this one), so the handshake is the only way in.
 
-    The routing gate (``PreToolUse`` on the spawn tool), the
-    ``SessionStart`` canary and the ``SubagentStart`` audit live in the
-    same generated ``hooks.json`` as the policy hook but under a different
-    module, so the policy trust pass leaves them ``untrusted``. Same
+    The routing gate (``PreToolUse`` on the spawn tool) lives in the same
+    generated ``hooks.json`` as the policy hook but under a different
+    module, so the policy trust pass leaves it ``untrusted``. Same
     ``hooks/list`` → ``config/batchWrite`` flow, but best-effort: a
     routing-trust failure must not disable policy enforcement, so it is
-    reported instead of raised (the canary watcher then surfaces the
-    session warning).
+    reported instead of raised.
 
     :param request: Bound app-server JSON-RPC request coroutine, e.g.
         ``client.request`` (or the SDK executor's ``_request``).

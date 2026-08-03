@@ -15,20 +15,14 @@ from omnigent.inner import codex_executor
 from omnigent.inner.codex_executor import (
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
-    SUBAGENT_ROUTING_UNENFORCED_WARNING,
     _CodexAppServerSession,
     _populate_codex_home_config,
     codex_router_bridge_dir,
-    codex_router_canary_fired,
     codex_router_hooks_settings,
     codex_router_session_id,
     merge_codex_user_hooks,
-    read_codex_spawn_audit,
-    reconcile_spawn_audit,
-    subagent_routing_unenforced_warning,
     write_codex_router_hooks_file,
 )
-from omnigent.inner.hook_scripts.codex_router_hook import AUDIT_FILENAME, CANARY_FILENAME
 from omnigent.inner.hook_scripts.subagent_router import REQUEST_TIMEOUT_S
 
 _USER_HOOKS = {
@@ -49,7 +43,7 @@ def _write_user_home(tmp_path: Path, *, hooks: dict[str, object] | None = None) 
     return source
 
 
-def test_router_hooks_settings_registers_three_events(tmp_path: Path) -> None:
+def test_router_hooks_settings_registers_the_pretooluse_gate(tmp_path: Path) -> None:
     payload = codex_router_hooks_settings(
         tmp_path / "bridge",
         session_id="conv_abc",
@@ -57,7 +51,7 @@ def test_router_hooks_settings_registers_three_events(tmp_path: Path) -> None:
     )
 
     hooks = payload["hooks"]
-    assert set(hooks) == {"PreToolUse", "SessionStart", "SubagentStart"}
+    assert set(hooks) == {"PreToolUse"}
     (pre_entry,) = hooks["PreToolUse"]
     # Regex, never the flattened literal ``collaborationspawn_agent``.
     assert pre_entry["matcher"] == r".*spawn_agent"
@@ -70,9 +64,6 @@ def test_router_hooks_settings_registers_three_events(tmp_path: Path) -> None:
     assert "--session-id conv_abc" in pre_hook["command"]
     assert "--harness codex" in pre_hook["command"]
     assert f"--bridge-dir {tmp_path / 'bridge'}" in pre_hook["command"]
-    assert "session-canary" in hooks["SessionStart"][0]["hooks"][0]["command"]
-    assert "record-subagent" in hooks["SubagentStart"][0]["hooks"][0]["command"]
-    assert "matcher" not in hooks["SessionStart"][0]
 
 
 def test_router_hooks_settings_omits_session_flag_when_unknown(tmp_path: Path) -> None:
@@ -180,32 +171,6 @@ def test_router_env_discovery(tmp_path: Path) -> None:
     assert codex_router_session_id({}) is None
 
 
-def test_canary_detection(tmp_path: Path) -> None:
-    assert not codex_router_canary_fired(tmp_path)
-
-    (tmp_path / CANARY_FILENAME).write_text(json.dumps({"session_id": "conv_abc"}))
-
-    assert codex_router_canary_fired(tmp_path)
-
-
-def test_read_spawn_audit_skips_malformed_lines(tmp_path: Path) -> None:
-    assert read_codex_spawn_audit(tmp_path) == []
-    (tmp_path / AUDIT_FILENAME).write_text(
-        '{"agent_id": "a1", "model": "claude-sonnet-5"}\n'
-        "not json\n"
-        "\n"
-        '{"agent_id": "a2", "model": "gpt-5-6-sol"}\n'
-        "[1, 2]\n"
-    )
-
-    records = read_codex_spawn_audit(tmp_path)
-
-    assert [(r["agent_id"], r["model"]) for r in records] == [
-        ("a1", "claude-sonnet-5"),
-        ("a2", "gpt-5-6-sol"),
-    ]
-
-
 class _HooksSnapshot:
     def __init__(self, path: Path) -> None:
         self.is_symlink = path.is_symlink()
@@ -279,110 +244,6 @@ def test_app_server_keeps_symlinked_hooks_when_routing_off(
     assert hooks.is_symlink
 
 
-def test_unenforced_warning_payload() -> None:
-    warning = subagent_routing_unenforced_warning("canary did not fire")
-
-    assert warning == {
-        "code": SUBAGENT_ROUTING_UNENFORCED_WARNING,
-        "harness": "codex-native",
-        "reason": "canary did not fire",
-    }
-
-
-def test_reconcile_spawn_audit_flags_a_model_the_router_never_approved() -> None:
-    warnings = reconcile_spawn_audit(
-        [
-            {"agent_id": "a1", "task_name": "reviewer", "model": "gpt-5-6-luna"},
-            {"agent_id": "a2", "task_name": "tester", "model": "glm-5-2"},
-        ],
-        [
-            {"action": "rewrite", "model": "glm-5-2", "task_name": "reviewer"},
-            {"action": "rewrite", "model": "glm-5-2", "task_name": "tester"},
-        ],
-    )
-
-    assert len(warnings) == 1
-    assert warnings[0]["code"] == SUBAGENT_ROUTING_UNENFORCED_WARNING
-    assert "gpt-5-6-luna" in warnings[0]["reason"]
-    assert "glm-5-2" in warnings[0]["reason"]
-
-
-def test_reconcile_spawn_audit_accepts_a_different_spelling_of_a_routed_model() -> None:
-    """Codex's own spelling of an approved model is not a violation.
-
-    The audit reports whatever id codex ran with, which differs from the
-    router's catalog id by prefix / case. Comparing raw strings posted an
-    ``unenforced`` banner every 30s on a perfectly healthy session.
-    """
-    assert (
-        reconcile_spawn_audit(
-            [{"agent_id": "a1", "task_name": "reviewer", "model": "GPT-5-5"}],
-            [{"action": "rewrite", "model": "databricks-gpt-5-5", "task_name": "reviewer"}],
-        )
-        == []
-    )
-
-
-def test_reconcile_spawn_audit_is_silent_without_routed_models() -> None:
-    assert reconcile_spawn_audit([{"model": "gpt-5-6-luna"}], []) == []
-
-
-def test_reconcile_spawn_audit_ignores_a_spawn_routing_was_toggled_off_for() -> None:
-    """A session mixing routed and unrouted spawns must flag neither.
-
-    Routing toggled off mid-session (or a router outage) relays a verdict
-    that approves no model, so that spawn runs on the inherited model. The
-    all-or-nothing compare flagged every such spawn as "unenforced".
-    """
-    warnings = reconcile_spawn_audit(
-        [
-            {"agent_id": "a1", "task_name": "routed", "model": "glm-5-2"},
-            {"agent_id": "a2", "task_name": "unrouted", "model": "gpt-5-6-luna"},
-        ],
-        [
-            {"action": "rewrite", "model": "glm-5-2", "task_name": "routed"},
-            # Routing off for this spawn: relayed, but no model approved.
-            {"action": "allow", "model": None, "task_name": "unrouted"},
-        ],
-    )
-    assert warnings == []
-
-
-def test_reconcile_spawn_audit_still_flags_the_routed_spawn_in_a_mixed_session() -> None:
-    warnings = reconcile_spawn_audit(
-        [{"agent_id": "a1", "task_name": "routed", "model": "gpt-5-6-luna"}],
-        [
-            {"action": "rewrite", "model": "glm-5-2", "task_name": "routed"},
-            {"action": "allow", "model": None, "task_name": "unrouted"},
-        ],
-    )
-    assert [w["reason"] for w in warnings] == [
-        "spawned model gpt-5-6-luna != routed model glm-5-2"
-    ]
-
-
-def test_reconcile_spawn_audit_skips_unjoinable_records_in_a_mixed_session() -> None:
-    """Without a task name, "unrouted" cannot be told from "ignored"."""
-    assert (
-        reconcile_spawn_audit(
-            [{"agent_id": "a1", "model": "gpt-5-6-luna"}],
-            [
-                {"action": "rewrite", "model": "glm-5-2", "task_name": "routed"},
-                {"action": "allow", "model": None, "task_name": "unrouted"},
-            ],
-        )
-        == []
-    )
-
-
-def test_reconcile_spawn_audit_falls_back_session_wide_when_every_spawn_was_routed() -> None:
-    warnings = reconcile_spawn_audit(
-        [{"agent_id": "a1", "model": "gpt-5-6-luna"}],
-        [{"action": "rewrite", "model": "glm-5-2", "task_name": "routed"}],
-    )
-    assert len(warnings) == 1
-
-
 def test_router_hook_commands_run_python_isolated(tmp_path: Path) -> None:
     """Every routing hook command passes ``-I`` before ``-m``.
 
@@ -392,8 +253,7 @@ def test_router_hook_commands_run_python_isolated(tmp_path: Path) -> None:
     of all — then shadows the installed package and the hook dies on
     ``ModuleNotFoundError``. Codex discards the failure, so the routing gate
     fails open in total silence. Observed live: a session whose cwd was a
-    second omnigent checkout ran with all three hooks *trusted* and none of
-    them working.
+    second omnigent checkout ran with the hook *trusted* but not working.
     """
     hooks = codex_router_hooks_settings(
         tmp_path, session_id="conv_abc", python_executable="/venv/bin/python"
@@ -406,11 +266,13 @@ def test_router_hook_commands_run_python_isolated(tmp_path: Path) -> None:
 
 
 def test_router_hook_survives_a_shadowing_workspace(tmp_path: Path) -> None:
-    """The canary hook works when cwd holds a decoy ``omnigent`` package.
+    """The routing hook runs when cwd holds a decoy ``omnigent`` package.
 
     The end-to-end guard for the isolation flag: runs the real generated
-    command from a workspace that shadows the installed package, exactly
-    the live failure. Without ``-I`` this exits non-zero and writes nothing.
+    ``route-subagent`` command from a workspace that shadows the installed
+    package, exactly the live failure. Without ``-I`` the decoy package
+    imports and the hook dies on the decoy's ``AssertionError``; with it the
+    process starts cleanly, finds no router advertisement, and exits 0.
     """
     workspace = tmp_path / "workspace"
     decoy = workspace / "omnigent"
@@ -421,15 +283,16 @@ def test_router_hook_survives_a_shadowing_workspace(tmp_path: Path) -> None:
     hooks = codex_router_hooks_settings(
         bridge_dir, session_id="conv_abc", python_executable=sys.executable
     )["hooks"]
-    command = hooks["SessionStart"][0]["hooks"][0]["command"]
+    command = hooks["PreToolUse"][0]["hooks"][0]["command"]
 
     result = subprocess.run(
         shlex.split(command),
         cwd=str(workspace),
+        input="{}",
         capture_output=True,
         text=True,
         timeout=120,
     )
 
     assert result.returncode == 0, result.stderr
-    assert codex_router_canary_fired(bridge_dir), result.stderr
+    assert "decoy package imported" not in result.stderr, result.stderr

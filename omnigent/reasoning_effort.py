@@ -47,6 +47,56 @@ def unsupported_effort_message(effort: str, provider: str, supported: Iterable[s
     )
 
 
+# Some models served through a harness reject the harness's full effort ladder.
+# GLM on the codex/Responses wire accepts only up to ``high`` (no ``xhigh``), so
+# a user default of ``xhigh``/``max`` 400s the turn. Map such a model to the
+# effort to use instead of failing — GLM falls back to ``medium``.
+_MODEL_EFFORT_FALLBACK: dict[str, str] = {"glm-5-2": "medium"}
+# Efforts a fallback model cannot accept, so a pinned high value coerces down.
+_MODEL_EFFORT_UNSUPPORTED: dict[str, frozenset[str]] = {"glm-5-2": frozenset({"xhigh", "max"})}
+
+
+def _bare_model(model: str) -> str:
+    """Strip a catalog/gateway prefix and fold to the comparison spelling."""
+    bare = model.rsplit("/", 1)[-1]
+    for prefix in ("databricks-", "system.ai."):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix) :]
+    return bare.replace(".", "-").lower()
+
+
+def clamp_effort_for_model(effort: str | None, model: str | None) -> str | None:
+    """Coerce *effort* to one *model* accepts, keeping the user's pick otherwise.
+
+    A model whose backend rejects a high effort (e.g. GLM has no ``xhigh``)
+    falls back to a supported value rather than 400-ing the turn. Any other
+    model, or an already-accepted effort, is returned unchanged.
+    """
+    if effort is None or model is None:
+        return effort
+    key = _bare_model(model)
+    unsupported = _MODEL_EFFORT_UNSUPPORTED.get(key)
+    if unsupported is not None and effort in unsupported:
+        return _MODEL_EFFORT_FALLBACK.get(key, effort)
+    return effort
+
+
+def effort_for_model_switch(effort: str | None, model: str | None) -> str | None:
+    """Effort to send when switching to *model*, guarding a rejected default.
+
+    Like :func:`clamp_effort_for_model` for an explicit *effort*. When *effort*
+    is ``None`` (no effort requested), a model that caps its ladder still needs
+    guarding, because the switched-to thread inherits the config's default
+    (which may be too high): return that model's fallback so the live turn does
+    not 400. A model with no cap and no requested effort returns ``None``.
+    """
+    if effort is not None:
+        return clamp_effort_for_model(effort, model)
+    if model is None:
+        return None
+    return _MODEL_EFFORT_FALLBACK.get(_bare_model(model))
+
+
 def validate_effort(effort: object, provider: str, supported: Iterable[str]) -> str | None:
     """Validate *effort* against *supported*, returning a string or None.
 

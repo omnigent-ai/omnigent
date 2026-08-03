@@ -93,36 +93,29 @@ def test_build_route_request_never_sends_the_encrypted_prompt() -> None:
         "harness": "codex-native",
         "task_name": "refactor-tests",
         "prompt": None,
-        "fork": False,
         "parent_model": "gpt-5-6-sol",
     }
     assert _ENCRYPTED_MESSAGE not in json.dumps(body)
 
 
 @pytest.mark.parametrize(
-    ("tool_input", "expected_task_name", "expected_fork"),
+    ("tool_input", "expected_task_name"),
     [
         # Codex names the spawn ``agent_name`` on some paths, ``task_name`` on
         # others; the explicit ``task_name`` wins when both are present.
-        ({"agent_name": "doc-writer", "message": _ENCRYPTED_MESSAGE}, "doc-writer", False),
-        ({"task_name": "refactor-tests", "agent_name": "doc-writer"}, "refactor-tests", False),
+        ({"agent_name": "doc-writer", "message": _ENCRYPTED_MESSAGE}, "doc-writer"),
+        ({"task_name": "refactor-tests", "agent_name": "doc-writer"}, "refactor-tests"),
         # The server supplies the placeholder task; the hook does not invent one.
-        ({"message": _ENCRYPTED_MESSAGE}, "", False),
-        # Fork is detected from the task name, never from a field codex does
-        # not send — a stray boolean must not be trusted.
-        ({"task_name": "planner-fork"}, "planner-fork", True),
-        ({"fork": True, "task_name": "refactor-tests"}, "refactor-tests", False),
+        ({"message": _ENCRYPTED_MESSAGE}, ""),
     ],
 )
-def test_build_route_request_derives_task_name_and_fork(
+def test_build_route_request_derives_task_name(
     tool_input: dict[str, Any],  # type: ignore[explicit-any]
     expected_task_name: str,
-    expected_fork: bool,
 ) -> None:
     body = _build(tool_input)
 
     assert body["task_name"] == expected_task_name
-    assert body["fork"] is expected_fork
     # The encrypted message is never forwarded on any of these paths.
     assert body["prompt"] is None
 
@@ -309,18 +302,6 @@ def test_non_spawn_tool_is_ignored(
     assert router.calls == []
 
 
-def test_fork_spawn_reported(
-    tmp_path: Path,
-    router: _Router,
-) -> None:
-    advertise_router(tmp_path)
-    router.response = {"action": "allow"}
-
-    _route(_payload(task_name="planner-fork"), router_dir=tmp_path)
-
-    assert router.calls[0]["body"]["fork"] is True
-
-
 def test_parent_model_falls_back_to_payload_model(
     tmp_path: Path,
     router: _Router,
@@ -359,43 +340,6 @@ def test_route_subagent_tolerates_unknown_flags(
 
     assert hook.main(["route-subagent", "--unknown-flag", "x", "--bridge-dir", str(tmp_path)]) == 0
     assert router.calls[0]["session_id"] == "conv_abc"
-
-
-def test_session_canary_subcommand_writes_file(tmp_path: Path) -> None:
-    assert hook.main(["session-canary", "--bridge-dir", str(tmp_path), "--session-id", "c1"]) == 0
-
-    record = json.loads(hook.canary_path(tmp_path).read_text())
-    assert record["session_id"] == "c1"
-
-
-def test_session_canary_without_a_bridge_dir_is_a_no_op(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert hook.main(["session-canary"]) == 0
-    assert "needs --bridge-dir" in capsys.readouterr().err
-
-
-def test_record_subagent_subcommand_appends_jsonl(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    for agent_id, model in (("a1", "claude-sonnet-5"), ("a2", "gpt-5-6-sol")):
-        monkeypatch.setattr(
-            hook.sys,
-            "stdin",
-            _Stdin(json.dumps({"agent_id": agent_id, "model": model, "task_name": "t"})),
-        )
-        assert hook.main(["record-subagent", "--bridge-dir", str(tmp_path)]) == 0
-
-    lines = hook.audit_path(tmp_path).read_text().splitlines()
-    assert [json.loads(line)["agent_id"] for line in lines] == ["a1", "a2"]
-    assert json.loads(lines[0])["model"] == "claude-sonnet-5"
-
-
-def test_record_subagent_without_a_bridge_dir_is_a_no_op(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert hook.main(["record-subagent"]) == 0
-    assert "needs --bridge-dir" in capsys.readouterr().err
 
 
 def test_unknown_subcommand_is_a_no_op(capsys: pytest.CaptureFixture[str]) -> None:

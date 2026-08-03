@@ -65,7 +65,6 @@ import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { ChatHeader } from "./ChatHeader";
-import { SessionWarningBanner } from "./SessionWarningBanner";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
@@ -94,8 +93,8 @@ import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
 
 /**
- * How often the open session's snapshot is re-asked. Matched to the server's
- * enforcement-watcher tick, which is what discovers `warnings` mid-session.
+ * How often the open session's snapshot is re-asked, to pick up
+ * server-side changes that have no SSE channel of their own.
  */
 export const SESSION_SNAPSHOT_POLL_MS = 30_000;
 
@@ -334,9 +333,8 @@ export function AppShell() {
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
-  // Polled while a session is open: `warnings` (the header banner) is recorded
-  // server-side while the session runs, with no SSE channel of its own, so
-  // without re-asking the banner could only ever appear after a hard reload.
+  // Polled while a session is open so snapshot-only fields (with no SSE
+  // channel of their own) stay fresh without a hard reload.
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId, {
     refetchIntervalMs: SESSION_SNAPSHOT_POLL_MS,
   });
@@ -1474,9 +1472,6 @@ export function AppShell() {
                     onOpenMainExecutionLog: openMainExecutionLog,
                   }}
                 />
-                {/* Overlays the top of the chat column (like the header) so a
-                    warning arriving mid-session never shifts the messages. */}
-                <SessionWarningBanner warnings={activeSession?.warnings} />
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />
                 </main>

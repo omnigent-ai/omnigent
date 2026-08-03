@@ -35,6 +35,9 @@ MCP_STARTUP_CANCELLED = "cancelled"
 MCP_STARTUP_STATES = frozenset(
     {MCP_STARTUP_STARTING, MCP_STARTUP_READY, MCP_STARTUP_FAILED, MCP_STARTUP_CANCELLED}
 )
+# Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
+# a model switch can clamp it to one the new model accepts (GLM has no xhigh).
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 # Must match ``_CONFIG_FILE`` in ``claude_native_bridge.py`` because
 # ``serve-mcp`` reads this filename for the token.
 _MCP_CONFIG_FILE = "bridge.json"
@@ -365,6 +368,8 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
     :param model: Model id to record, e.g. ``"gpt-5.6-luna"``.
     :returns: ``True`` when the file was updated.
     """
+    from omnigent.reasoning_effort import clamp_effort_for_model
+
     config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
     pin_line = f"model = {json.dumps(model)}"
     try:
@@ -378,7 +383,16 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
             if re.match(r"^model\s*=", line):
                 lines[i] = pin_line
                 replaced = True
-                break
+                continue
+            # The config keeps the launch model's effort (e.g. the user's
+            # xhigh default), which the switched-to model may reject (GLM has
+            # no xhigh). Clamp it to a value the new model accepts so the next
+            # turn does not 400 on reasoning.effort.
+            effort_match = _EFFORT_KEY_RE.match(line)
+            if effort_match:
+                clamped = clamp_effort_for_model(effort_match.group(2), model)
+                if clamped and clamped != effort_match.group(2):
+                    lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
         if not replaced:
             lines.insert(0, pin_line)
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -430,25 +444,13 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     its current transport and thread instead of injecting into stale
     state.
 
-    The subagent-routing canary and spawn audit are cleared for the same
-    reason: both are evidence about *this* launch, checked against the
-    routing decisions this launch's endpoint relayed. A canary left by an
-    earlier launch would mask a genuine fail-open (codex skipping
-    untrusted hooks), and a leftover audit line — whose approving decision
-    lives in the previous launch's router — reads as a spawn the router
-    never approved.
-
     :param bridge_dir: Native Codex bridge directory.
     :returns: None.
     """
-    from omnigent.inner.hook_scripts.codex_router_hook import AUDIT_FILENAME, CANARY_FILENAME
-
     for name in (
         _STATE_FILE,
         _STARTUP_ERROR_FILE,
         _MCP_STARTUP_FILE,
-        CANARY_FILENAME,
-        AUDIT_FILENAME,
     ):
         try:
             (bridge_dir / name).unlink()

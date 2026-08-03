@@ -243,7 +243,7 @@ def test_allow_emits_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert out is None
 
 
-def test_fork_typed_spawn_reports_fork_true(
+def test_fork_typed_spawn_routes_like_any_other(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     router_dir = advertise_router(tmp_path)
@@ -258,7 +258,6 @@ def test_fork_typed_spawn_reports_fork_true(
         "harness": "claude-native",
         "task_name": "fork",
         "prompt": "review the diff",
-        "fork": True,
         "parent_model": None,
     }
 
@@ -474,18 +473,3 @@ async def test_sdk_callback_allows_unchanged_when_router_down(
     assert options.hooks is not None
     callback = options.hooks["PreToolUse"][0].hooks[0]
     assert await callback(_payload(), None, {"signal": None}) == {}
-
-
-@pytest.mark.parametrize(
-    ("subagent_type", "expected"),
-    [
-        ("fork", True),
-        ("Fork", True),
-        ("research-fork", True),
-        ("plugin:fork", True),
-        ("code-reviewer", False),
-        ("", False),
-    ],
-)
-def test_fork_detection(subagent_type: str, expected: bool) -> None:
-    assert subagent_router.is_fork_spawn({"subagent_type": subagent_type}) is expected

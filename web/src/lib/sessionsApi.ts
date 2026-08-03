@@ -25,7 +25,6 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
-  SessionWarning,
   SkillSummary,
 } from "./types";
 
@@ -161,13 +160,6 @@ interface SessionResponseWire {
    */
   usage_by_model?: Record<string, ModelUsageWire> | null;
   last_task_error?: { code: string; message: string } | null;
-  /**
-   * Session-scoped warnings on the status channel, e.g.
-   * ``[{code: "subagent_routing_unenforced", harness: "codex-native",
-   * reason: "hook canary never fired"}]``. Absent on servers that don't
-   * publish warnings yet — the header banner then stays hidden.
-   */
-  warnings?: SessionWarning[] | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
    * moment the snapshot was built. The live SSE stream has no
@@ -316,9 +308,6 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     totalCostUsd: wire.total_cost_usd,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
-    // Left undefined (not []) when the server sends nothing, so snapshot
-    // consumers can tell "no warnings" from "server doesn't publish them".
-    warnings: wire.warnings ?? undefined,
     pendingElicitations: wire.pending_elicitations ?? [],
     pendingInputs: (wire.pending_inputs ?? []).map((p) => ({
       pendingId: p.pending_id,

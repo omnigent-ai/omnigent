@@ -63,16 +63,9 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
 )
-from .hook_scripts.codex_router_hook import AUDIT_FILENAME as _CODEX_SPAWN_AUDIT_FILENAME
-from .hook_scripts.codex_router_hook import CANARY_FILENAME as _CODEX_ROUTER_CANARY_FILENAME
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
-
-# Session-scoped warning emitted when the generated codex routing hooks did
-# not run (untrusted hooks are silently skipped), so in-harness subagent
-# spawns are not being enforced.
-SUBAGENT_ROUTING_UNENFORCED_WARNING = "subagent_routing_unenforced"
 
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is unset.
@@ -899,8 +892,6 @@ _CODEX_SPAWN_AGENT_MATCHER = r".*spawn_agent"
 # outermost bound: the hook fails open on its timeout, codex only steps in
 # if the hook itself wedged.
 _CODEX_ROUTER_HOOK_TIMEOUT_SECONDS = int(_ROUTER_REQUEST_TIMEOUT_S) + 10
-# Canary / audit hooks only touch a file; they must never delay a session.
-_CODEX_AUDIT_HOOK_TIMEOUT_SECONDS = 10
 
 
 def _codex_router_hook_command(
@@ -923,7 +914,7 @@ def _codex_router_hook_command(
 
     :param subcommand: Hook-script subcommand, e.g. ``"route-subagent"``.
     :param bridge_dir: Session bridge directory holding the router
-        advertisement and the canary / audit files.
+        advertisement.
     :param session_id: Omnigent session id, or ``None`` when the
         advertisement is expected to carry it.
     :param python_executable: Python to run; ``None`` uses
@@ -956,11 +947,9 @@ def codex_router_hooks_settings(
     """
     Build the Omnigent half of a routing ``hooks.json`` payload.
 
-    Three events: a ``PreToolUse`` gate on the spawn tool (matched by
-    regex because codex flattens the name), a ``SessionStart`` canary
-    proving the hooks were trusted and actually ran, and a
-    ``SubagentStart`` audit writer recording the ``agent_id`` / ``model``
-    codex really started.
+    One event: a ``PreToolUse`` gate on the spawn tool (matched by regex
+    because codex flattens the name) that asks the runner which model the
+    spawn may use and rewrites / denies accordingly.
 
     :param bridge_dir: Session bridge directory.
     :param session_id: Omnigent session id baked into the commands.
@@ -995,12 +984,6 @@ def codex_router_hooks_settings(
                         )
                     ],
                 }
-            ],
-            "SessionStart": [
-                {"hooks": [hook("session-canary", _CODEX_AUDIT_HOOK_TIMEOUT_SECONDS)]}
-            ],
-            "SubagentStart": [
-                {"hooks": [hook("record-subagent", _CODEX_AUDIT_HOOK_TIMEOUT_SECONDS)]}
             ],
         }
     }
@@ -1155,160 +1138,6 @@ def codex_router_session_id(env: Mapping[str, str] | None = None) -> str | None:
     """
     source = os.environ if env is None else env
     return (source.get(CODEX_ROUTER_SESSION_ID_ENV_VAR) or "").strip() or None
-
-
-def codex_router_canary_fired(bridge_dir: Path) -> bool:
-    """
-    Report whether the ``SessionStart`` canary hook ran.
-
-    An untrusted hook is silently skipped by codex, so an absent canary
-    means enforcement is off — the caller emits the
-    ``subagent_routing_unenforced`` warning instead of failing open
-    invisibly.
-
-    :param bridge_dir: Session bridge directory.
-    :returns: ``True`` when the canary file exists.
-    """
-    return (bridge_dir / _CODEX_ROUTER_CANARY_FILENAME).is_file()
-
-
-def read_codex_spawn_audit(bridge_dir: Path) -> list[dict[str, Any]]:
-    """
-    Parse the ``SubagentStart`` audit records codex wrote.
-
-    :param bridge_dir: Session bridge directory.
-    :returns: One dict per well-formed JSON line (``agent_id``,
-        ``model``, ...); malformed lines are skipped, a missing file
-        yields ``[]``.
-    """
-    path = bridge_dir / _CODEX_SPAWN_AUDIT_FILENAME
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    records: list[dict[str, Any]] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
-
-
-def subagent_routing_unenforced_warning(
-    reason: str, *, harness: str = "codex-native"
-) -> dict[str, Any]:
-    """
-    Build the session-scoped warning for unenforced subagent routing.
-
-    The payload shape is the frozen contract the web UI renders (keyed by
-    ``code``, the field the header banner reads). This helper is the
-    single place it is built so both sides stay in step. Posted on the
-    session's ``external_session_warning`` channel by the codex forwarder.
-
-    :param reason: Human-readable cause, e.g. ``"SessionStart canary did
-        not fire; codex skipped the generated hooks (untrusted)."``.
-    :param harness: Harness the warning is about, e.g. ``"codex-native"``.
-    :returns: Warning payload ``{"code", "harness", "reason"}``.
-    """
-    return {
-        "code": SUBAGENT_ROUTING_UNENFORCED_WARNING,
-        "harness": harness,
-        "reason": reason,
-    }
-
-
-def reconcile_spawn_audit(
-    records: Iterable[Mapping[str, Any]],
-    relayed: Iterable[Mapping[str, Any]],
-    *,
-    harness: str = "codex-native",
-) -> list[dict[str, Any]]:
-    """
-    Compare ``SubagentStart`` audit records against the relayed verdicts.
-
-    The audit is the only place codex reports the model it *actually*
-    started a subagent on, so a rewrite the harness ignored shows up here
-    and nowhere else. Reconciled **per spawn**, joined on ``task_name``:
-    a session can mix routed and unrouted spawns (routing toggled off
-    mid-session, or a router outage), and comparing every audit record
-    against the session-wide set of approved models flagged each
-    inherited-model spawn as a violation. A spawn is only a violation when
-    the router demonstrably approved a *different* model for that same
-    spawn.
-
-    Records the ledger cannot be joined to are reconciled against the
-    whole session's approved models, but only when every relayed verdict
-    routed the spawn — otherwise "unrouted" is indistinguishable from
-    "ignored the rewrite".
-
-    Ids are compared normalized: codex reports its own spelling of the
-    model, which differs from the router's catalog id by prefix or case
-    without being a different model.
-
-    :param records: Audit records from :func:`read_codex_spawn_audit`.
-    :param relayed: Verdicts the runner relayed for the session
-        (``{action, model, task_name, ...}``), from
-        ``omnigent.runner.subagent_routing.relayed_decisions``. Empty means
-        nothing was routed, so there is nothing to contradict.
-    :param harness: Harness label for the emitted warnings.
-    :returns: Warning payloads, one per mismatching record.
-    """
-    from omnigent.claude_model_vocabulary import normalized_model_id
-
-    def _task_key(entry: Mapping[str, Any]) -> str:
-        name = entry.get("task_name")
-        return name.strip() if isinstance(name, str) else ""
-
-    per_task: dict[str, set[str]] = {}
-    session_wide: set[str] = set()
-    every_spawn_routed = True
-    for verdict in relayed:
-        model = verdict.get("model")
-        routed = model if verdict.get("action") in ("rewrite", "allow") and model else None
-        key = _task_key(verdict)
-        if key:
-            bucket = per_task.setdefault(key, set())
-            if isinstance(routed, str):
-                bucket.add(routed)
-        if isinstance(routed, str):
-            session_wide.add(routed)
-        else:
-            every_spawn_routed = False
-    if not session_wide:
-        return []
-
-    warnings: list[dict[str, Any]] = []
-    for record in records:
-        spawned = record.get("model")
-        if not isinstance(spawned, str) or not spawned:
-            continue
-        key = _task_key(record)
-        if key in per_task:
-            approved = per_task[key]
-        elif every_spawn_routed:
-            approved = session_wide
-        else:
-            # Some spawn in this session was relayed but not routed, so an
-            # unjoinable audit record cannot be told apart from one of them.
-            continue
-        if not approved or normalized_model_id(spawned) in {
-            normalized_model_id(model) for model in approved
-        }:
-            continue
-        expected = ", ".join(sorted(approved))
-        warnings.append(
-            subagent_routing_unenforced_warning(
-                f"spawned model {spawned} != routed model {expected}",
-                harness=harness,
-            )
-        )
-    return warnings
 
 
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating

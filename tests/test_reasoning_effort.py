@@ -15,6 +15,8 @@ from omnigent.reasoning_effort import (
     ANTHROPIC_EFFORTS,
     CODEX_EFFORTS,
     EFFORT_VALUES,
+    clamp_effort_for_model,
+    effort_for_model_switch,
     validate_effort,
 )
 
@@ -61,3 +63,62 @@ def test_none_and_empty_clear_effort() -> None:
     """``None`` / empty string still mean "no explicit effort"."""
     assert validate_effort(None, "codex", CODEX_EFFORTS) is None
     assert validate_effort("", "codex", CODEX_EFFORTS) is None
+
+
+# ── Per-model effort ceiling: GLM has no xhigh ──────────────────────────────
+#
+# GLM serves through the codex/Responses wire but rejects the top of the codex
+# ladder: its only efforts are (disabled/none/minimal/low/medium/high). A user
+# default of xhigh/max 400s the turn, so a routed GLM pick clamps down to
+# medium. GLM appears in several catalog/gateway spellings and all must clamp.
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["glm-5-2", "databricks-glm-5-2", "system.ai.glm-5-2", "GLM-5-2", "system.ai.glm-5.2"],
+)
+@pytest.mark.parametrize("effort", ["xhigh", "max"])
+def test_glm_clamps_unsupported_effort_to_medium(model: str, effort: str) -> None:
+    """Every GLM spelling coerces xhigh/max down to medium."""
+    assert clamp_effort_for_model(effort, model) == "medium"
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high"])
+def test_glm_keeps_efforts_it_supports(effort: str) -> None:
+    """GLM's own supported ladder passes through unchanged."""
+    assert clamp_effort_for_model(effort, "system.ai.glm-5-2") == effort
+
+
+@pytest.mark.parametrize("effort", ["xhigh", "max", "high", "medium", "low", None])
+def test_non_glm_models_are_never_clamped(effort: str | None) -> None:
+    """A model with no ceiling keeps whatever effort it was given, incl. xhigh."""
+    for model in ("databricks-gpt-5-6-sol", "gpt-5-6-luna", "databricks-claude-opus-4-8"):
+        assert clamp_effort_for_model(effort, model) == effort
+
+
+def test_clamp_is_a_noop_without_a_model() -> None:
+    """No model to key on ⇒ the effort is returned untouched."""
+    assert clamp_effort_for_model("xhigh", None) == "xhigh"
+    assert clamp_effort_for_model(None, "system.ai.glm-5-2") is None
+
+
+def test_switch_to_glm_forces_medium_when_no_effort_requested() -> None:
+    """Switching to GLM with no explicit effort still guards the live turn.
+
+    Regression: a routed GLM turn sends ``thread/settings/update`` with a model
+    but no effort, so the thread inherits config.toml's xhigh and 400s. The
+    switch helper supplies GLM's fallback so the turn does not fail.
+    """
+    assert effort_for_model_switch(None, "system.ai.glm-5-2") == "medium"
+
+
+def test_switch_to_glm_clamps_an_explicit_effort() -> None:
+    """An explicit xhigh on a GLM switch still coerces to medium."""
+    assert effort_for_model_switch("xhigh", "glm-5-2") == "medium"
+    assert effort_for_model_switch("high", "glm-5-2") == "high"
+
+
+def test_switch_to_uncapped_model_without_effort_stays_none() -> None:
+    """A model with no ceiling and no requested effort sends no override."""
+    assert effort_for_model_switch(None, "databricks-gpt-5-6-sol") is None
+    assert effort_for_model_switch(None, None) is None

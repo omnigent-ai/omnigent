@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import httpx
 import pytest
 
 from omnigent.entities.conversation import Conversation
@@ -168,41 +167,6 @@ def test_unknown_wrapper_session_does_not_use_native_bypass() -> None:
     conv = _conversation_with_wrapper("regular-chat")
 
     assert sessions_routes._is_native_terminal_session(conv) is False
-
-
-@pytest.mark.parametrize(
-    "response,expected",
-    [
-        # Runner attached a degrade reason → it becomes the banner notice.
-        (
-            httpx.Response(200, json={"policy_hook_disabled_reason": "codex too old"}),
-            "codex too old",
-        ),
-        # Healthy session: no key → no notice (enforcement active).
-        (httpx.Response(200, json={"resource": "view"}), None),
-        # Whitespace-only reason is treated as absent (would fail ErrorData).
-        (httpx.Response(200, json={"policy_hook_disabled_reason": "   "}), None),
-        # Non-dict body (defensive) → no notice.
-        (httpx.Response(200, json=["not", "a", "dict"]), None),
-        # Non-JSON 2xx body must not crash the readiness probe.
-        (httpx.Response(200, text="<<not json>>"), None),
-    ],
-)
-def test_policy_notice_from_ensure_response(
-    response: httpx.Response, expected: str | None
-) -> None:
-    """
-    The ensure-response parser fires a banner only for a real reason.
-
-    This gate decides whether a non-fatal "policy not enforced" banner is
-    posted. It must return the reason verbatim when present, and ``None``
-    (no banner) for a healthy session, a blank reason, a non-dict body, or
-    a non-JSON 2xx body — the last of which must not turn a successful
-    readiness probe into a crash.
-    """
-    from omnigent.server.routes import sessions as sessions_routes
-
-    assert sessions_routes._policy_notice_from_ensure_response(response) == expected
 
 
 # ── native routing is harness-driven, not presentation-driven ────────

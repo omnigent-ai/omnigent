@@ -1770,18 +1770,6 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
-        if subagent_routing_override is not None or clear_subagent_routing:
-            from omnigent.telemetry import (
-                SETTING_SUBAGENT_ROUTING,
-                record_routing_setting_changed,
-            )
-
-            record_routing_setting_changed(
-                session_id,
-                setting=SETTING_SUBAGENT_ROUTING,
-                value=updated.subagent_routing_override or "default",
-                user_id=user_id,
-            )
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
