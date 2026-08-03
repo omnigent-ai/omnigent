@@ -74,6 +74,7 @@ from omnigent.runtime.compaction import (
     count_tokens,
 )
 from omnigent.runtime.content_resolver import resolve_content_references
+from omnigent.runtime.memory import cognee_framework_instructions
 from omnigent.runtime.prompt import (
     SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
     build_instructions,
@@ -2263,7 +2264,7 @@ def _prepare_messages(
         (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
         if shared_message_attribution_enabled() and history_has_multiple_authors(resolved)
         else ()
-    )
+    ) + cognee_framework_instructions(spec)
     sys_instructions = build_instructions(
         spec,
         instructions,
