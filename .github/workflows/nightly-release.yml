@@ -12,16 +12,17 @@
 # version), and there is no benchmark gate (benchmark.yml already measures
 # main nightly). Downstream is already quiet for dev tags: github-release.yml
 # and draft-release-notes.yml skip `*dev[0-9]*` tags, update-check ignores
-# dev releases (`omni upgrade --pre` opts in), a default `pip install` never
-# resolves them, and oss-publish-images.yml publishes the immutable
+# dev releases, a default `pip install` never resolves them, and
+# oss-publish-images.yml publishes the immutable
 # `:vX.Y.Z.devYYYYMMDD` image (only `:latest-rc` follows it, by design).
 #
 # The datestamp is FIXED-WIDTH (YYYYMMDD, one nightly per UTC day): PEP 440
 # compares the dev segment as a plain integer, so a longer stamp would sort
 # above every shorter one forever. A same-day re-run finds the tag and no-ops.
 #
-# PyPI publishing does not happen here — the secure release repo picks the
-# tag up on its own schedule (see RELEASING.md).
+# Nightlies are NOT published to PyPI. Consumers install straight from the
+# tag with uv (scripts/update_nightly.sh resolves and installs the newest
+# one), which pins all lockstep packages to the tagged commit.
 name: Nightly Release
 
 on:
