@@ -35,6 +35,7 @@ import threading
 import time
 from pathlib import Path
 
+from omnigent.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
 
 logger = logging.getLogger(__name__)
@@ -192,10 +193,17 @@ class ZygoteManager:
                 log_fh = stack.enter_context(open(self._log_path, "ab", buffering=0))
                 stdio["stdout"] = log_fh
                 stdio["stderr"] = log_fh
+            # Forward the --log-to-stderr terminal fd so runners forked by the
+            # zygote can mirror to the daemon's TTY exactly like the direct-Popen
+            # path. The helper dups the fd, rewrites env[LOG_TTY_FD] to the duped
+            # number, and yields it in pass_fds; the zygote then propagates that
+            # (zygote-local) number into each forked child's env.
+            tty_kwargs = stack.enter_context(child_logging_popen_kwargs(env))
+            pass_fds = (child_fd, *tty_kwargs.get("pass_fds", ()))
             return subprocess.Popen(
                 [self._python, "-m", "omnigent.runner._zygote"],
                 env=env,
-                pass_fds=(child_fd,),
+                pass_fds=pass_fds,
                 **stdio,  # type: ignore[arg-type]
             )
 

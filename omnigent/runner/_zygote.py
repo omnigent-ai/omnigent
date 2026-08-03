@@ -50,6 +50,8 @@ import sys
 import threading
 from typing import Any
 
+from omnigent.process_logging import LOG_TTY_FD_ENV_VAR
+
 # Env var the daemon sets to the inherited control-socket fd number.
 ZYGOTE_CONTROL_FD_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD"
 # Env var gating zygote use in the daemon (read there, documented here).
@@ -110,6 +112,12 @@ def _run_child(control_sock: socket.socket, request: dict[str, Any]) -> None:
     """
     with contextlib.suppress(OSError):
         control_sock.close()
+    # The terminal-mirror fd (--log-to-stderr) is only valid as the number it
+    # holds in THIS process — the fd the zygote inherited — not the daemon-side
+    # number the payload env carries. Capture the zygote's own value before the
+    # env is replaced, and restore it below so the child mirrors to the right fd.
+    inherited_tty_fd = os.environ.get(LOG_TTY_FD_ENV_VAR)
+
     # The child owns a clean env: replace, don't merge, so a stale var from a
     # previous fork's payload can never leak into this session.
     env = request.get("env") or {}
@@ -118,6 +126,12 @@ def _run_child(control_sock: socket.socket, request: dict[str, Any]) -> None:
     # Drop the control-fd hint so nothing downstream mistakes the child for a
     # zygote or tries to reuse the (now closed) fd.
     os.environ.pop(ZYGOTE_CONTROL_FD_ENV_VAR, None)
+    # Point the child at the zygote-local terminal fd (or clear a stale payload
+    # value when the zygote has no terminal mirror).
+    if inherited_tty_fd is not None:
+        os.environ[LOG_TTY_FD_ENV_VAR] = inherited_tty_fd
+    else:
+        os.environ.pop(LOG_TTY_FD_ENV_VAR, None)
 
     _wire_child_stdio(request.get("log_path"))
 
@@ -128,6 +142,7 @@ def _run_child(control_sock: socket.socket, request: dict[str, Any]) -> None:
     test_exit = os.environ.get(_ZYGOTE_TEST_CHILD_EXIT_ENV_VAR)
     if test_exit is not None:
         sys.stdout.write(f"marker={os.environ.get('OMNIGENT_ZYGOTE_MARKER', '')}\n")
+        sys.stdout.write(f"tty_fd={os.environ.get(LOG_TTY_FD_ENV_VAR, '')}\n")
         sys.stdout.flush()
         os._exit(int(test_exit))
 

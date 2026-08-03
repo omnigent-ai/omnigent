@@ -206,6 +206,24 @@ def test_child_env_is_isolated_between_forks(manager: ZygoteManager, tmp_path) -
     assert "marker=bbb" in log_b.read_text()
 
 
+def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_path) -> None:
+    """A daemon-side OMNIGENT_LOG_TTY_FD in the payload never leaks as-is.
+
+    The terminal-mirror fd is only valid as its zygote-local number. With no
+    terminal mirror on the zygote, a stale payload value must be cleared in the
+    child rather than passed through (a wrong fd number would misdirect writes).
+
+    :param manager: The started manager fixture (no terminal mirror).
+    :param tmp_path: Temp dir for the child's log.
+    """
+    env = _fork_env(0)
+    env["OMNIGENT_LOG_TTY_FD"] = "999"  # bogus daemon-side number
+    log = tmp_path / "runner.log"
+    proc = manager.fork_runner(env, str(log))
+    assert _wait_exit(proc) == 0
+    assert "tty_fd=\n" in log.read_text()
+
+
 def test_unstarted_manager_reports_not_running() -> None:
     """A manager that was never started is not running and has no pid."""
     mgr = ZygoteManager()
