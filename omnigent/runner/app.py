@@ -8096,9 +8096,9 @@ def create_runner_app(
                             }
                         },
                     )
-                try:
-                    from omnigent.tools.mcp import McpElicitationRequired
+                from omnigent.tools.mcp import McpElicitationRequired
 
+                try:
                     if input_responses is not None:
                         route = mcp_manager._resolve_tool_route(spec, tool_name)
                         if route is None:
