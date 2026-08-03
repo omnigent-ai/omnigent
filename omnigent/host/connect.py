@@ -23,7 +23,7 @@ from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import IS_LINUX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -71,6 +71,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -92,9 +93,11 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     configure_process_logging,
+    env_truthy,
     open_process_log_file,
     process_log_dir,
 )
+from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
@@ -697,7 +700,7 @@ class _RunnerHandle:
         connecting its tunnel.
     """
 
-    proc: subprocess.Popen[bytes]
+    proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
 
 
@@ -757,6 +760,13 @@ class HostProcess:
         # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
         # because both the mutation and the reaper run on the event loop.
         self._owned_subprocess_ops = 0
+        # Copy-on-write runner forkserver, started on first launch when
+        # OMNIGENT_RUNNER_ZYGOTE is set (Linux only). Instantiated cheaply here
+        # (no process yet — start() spawns it, idempotent under its own lock);
+        # disabled permanently on any failure so the daemon falls back to the
+        # direct Popen path. The zygote is an optimization, never required.
+        self._zygote_enabled = IS_LINUX and env_truthy(os.environ.get(ZYGOTE_ENABLED_ENV_VAR))
+        self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -1175,40 +1185,20 @@ class HostProcess:
             initial_auth_token=initial_auth_token,
         )
 
-        try:
-            # Embed the session id so operators can find all logs for a
-            # session with `omnigent debug logs --session <id>`. Cap at 32
-            # chars to keep filenames manageable; strip anything non-word to
-            # guard against unexpected id shapes from older servers.
-            import re
+        # Embed the session id so operators can find all logs for a session
+        # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep
+        # filenames manageable; strip anything non-word to guard against
+        # unexpected id shapes from older servers.
+        import re
 
-            _session_slug = (
-                re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
-            )
-            log_path, _log_fh = open_process_log_file(
-                "runner",
-                prefix=f"runner-{_session_slug}",
-            )
-            env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
-            try:
-                with child_logging_popen_kwargs(env) as logging_kwargs:
-                    proc: subprocess.Popen[bytes] = subprocess.Popen(
-                        [sys.executable, "-m", "omnigent.runner._entry"],
-                        env=env,
-                        # Runners are WS-tunnel clients with no interactive input.
-                        # Give them a clean /dev/null stdin instead of inheriting the
-                        # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
-                        # can end up with a closed or recycled stdin fd, and an
-                        # inherited bad fd makes the runner die at interpreter startup
-                        # with "init_sys_streams: Bad file descriptor" — it never
-                        # connects, so the session fails with "runner did not connect".
-                        stdin=subprocess.DEVNULL,
-                        stdout=_log_fh,
-                        stderr=_log_fh,
-                        **logging_kwargs,
-                    )
-            finally:
-                _log_fh.close()
+        _session_slug = (
+            re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
+        )
+
+        # Spawning blocks (log-file open, plus the zygote's one-time import on
+        # first launch), so run it off the event loop.
+        try:
+            proc, log_path = await asyncio.to_thread(self._spawn_runner_proc, env, _session_slug)
         except OSError as exc:
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1251,6 +1241,67 @@ class HostProcess:
             status="launched",
             runner_id=runner_id,
         )
+
+    def _spawn_runner_proc(
+        self,
+        env: dict[str, str],
+        session_slug: str,
+    ) -> tuple[subprocess.Popen[bytes] | ZygoteRunnerProc, Path]:
+        """Open the session log and spawn the runner, via zygote or direct Popen.
+
+        Runs on a worker thread (blocking log open + first-launch zygote import).
+        When the zygote is enabled it forks the runner there — sharing the import
+        graph copy-on-write — and rewrites ``RUNNER_PARENT_PID`` to the zygote's
+        pid so the runner's orphan watchdog (which compares ``os.getppid()``)
+        stays correct across the extra process hop. Any zygote failure disables
+        it for the rest of the daemon's life and falls back to a direct Popen.
+
+        :param env: Runner environment from :func:`_build_runner_env` (its
+            ``RUNNER_PARENT_PID`` is the daemon pid; overridden on the zygote path).
+        :param session_slug: Sanitized session id fragment for the log filename.
+        :returns: ``(process_handle, log_path)`` — the handle quacks like Popen.
+        :raises OSError: If the log file or a direct Popen spawn fails.
+        """
+        log_path, log_fh = open_process_log_file("runner", prefix=f"runner-{session_slug}")
+        try:
+            env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
+
+            zygote = self._zygote
+            if zygote is not None:
+                try:
+                    zygote.start()
+                    # The runner's OS parent will be the zygote, so its
+                    # getppid()-based orphan check must watch the zygote pid.
+                    zygote_env = dict(env)
+                    zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
+                    return zygote.fork_runner(zygote_env, str(log_path)), log_path
+                except ZygoteUnavailable as exc:
+                    _logger.warning(
+                        "Runner zygote unavailable (%s); falling back to direct spawn", exc
+                    )
+                    self._zygote = None
+                    with contextlib.suppress(Exception):
+                        zygote.stop()
+
+            with child_logging_popen_kwargs(env) as logging_kwargs:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "omnigent.runner._entry"],
+                    env=env,
+                    # Runners are WS-tunnel clients with no interactive input.
+                    # Give them a clean /dev/null stdin instead of inheriting the
+                    # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
+                    # can end up with a closed or recycled stdin fd, and an
+                    # inherited bad fd makes the runner die at interpreter startup
+                    # with "init_sys_streams: Bad file descriptor" — it never
+                    # connects, so the session fails with "runner did not connect".
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_fh,
+                    stderr=log_fh,
+                    **logging_kwargs,
+                )
+            return proc, log_path
+        finally:
+            log_fh.close()
 
     def _handle_stop(
         self,
@@ -2272,6 +2323,12 @@ class HostProcess:
             # runners via Popen, so any of their still-orphaned tool
             # grandchildren are now reapable and no tracked pid can be stolen.
             self._reap_orphans_once()
+            # Stop the runner zygote last: its forked children were just
+            # terminated above, and closing its control socket lets it exit.
+            if self._zygote is not None:
+                with contextlib.suppress(Exception):
+                    self._zygote.stop()
+                self._zygote = None
 
     def _cleanup_runners(self) -> None:
         """Terminate all live runners on shutdown.
