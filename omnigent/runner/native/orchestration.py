@@ -92,7 +92,8 @@ class _EnsureCommentRelay(Protocol):
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
-    ) -> None: ...
+    ) -> None:
+        pass
 
 
 def _publish_tmux_target_for_bridge(
@@ -7061,11 +7062,13 @@ class ResolvedSpec:
 
 
 @overload
-def _unwrap_resolved_spec(entry: AgentSpec | ResolvedSpec) -> AgentSpec: ...
+def _unwrap_resolved_spec(entry: AgentSpec | ResolvedSpec) -> AgentSpec:
+    pass
 
 
 @overload
-def _unwrap_resolved_spec(entry: object) -> AgentSpec | None: ...
+def _unwrap_resolved_spec(entry: object) -> AgentSpec | None:
+    pass
 
 
 def _unwrap_resolved_spec(entry: object) -> AgentSpec | None:
