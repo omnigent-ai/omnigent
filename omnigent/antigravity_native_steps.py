@@ -530,14 +530,13 @@ def output_reasoning_delta_event(
     frames just like ``modifiedResponse``. The streaming reader prefix-diffs it
     and emits a *suffix* delta per frame so the SPA paints a live reasoning block
     (``sse.ts`` maps ``response.reasoning_text.delta`` → its ``reasoning_delta``).
-    Reasoning streams BEFORE the response (§10.2 ordering), and — unlike text —
-    has no committed conversation item: the SPA finalizes the reasoning block when
-    the committed assistant ``message`` arrives. The in-process antigravity
-    executor reaches the same SPA state by a different route: it emits only the
+    Reasoning streams BEFORE the response (§10.2 ordering). The deltas stay
+    transient; the DONE planner later persists one completed reasoning item. The
+    in-process antigravity executor reaches the same SPA state by a different
+    route: it emits only the
     ``reasoning_text`` deltas and relies on an IMPLICIT reasoning-start (the SPA
     opens the block on the first ``reasoning_delta``), whereas this path emits an
-    EXPLICIT ``response.reasoning.started`` first; both end with no committed
-    reasoning item. The SPA's
+    EXPLICIT ``response.reasoning.started`` first. The SPA's
     reasoning block is not keyed by a per-step id (unlike the text deltas'
     ``message_id``), so this carries no conversation id — only ``started`` and the
     growth ``delta``; ``step_index`` rides on the envelope for ordering/debug.
@@ -559,6 +558,28 @@ def output_reasoning_delta_event(
         data={
             "delta": delta,
             "started": started,
+        },
+        step_index=step_idx,
+    )
+
+
+def _reasoning_event(
+    *,
+    conversation_id: str,
+    step_idx: int,
+    text: str,
+) -> OutboundEvent:
+    """Build one completed reasoning conversation item."""
+    return OutboundEvent(
+        event_type="external_conversation_item",
+        data={
+            "item_type": "reasoning",
+            "item_data": {
+                "agent": _AGENT_NAME,
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": text}],
+            },
+            "response_id": _response_id(conversation_id, step_idx),
         },
         step_index=step_idx,
     )
@@ -878,13 +899,14 @@ def map_step_to_events(
     *,
     conversation_id: str,
     allocator: _ToolCallIdAllocator,
+    reasoning_text: str | None = None,
 ) -> list[OutboundEvent]:
     """
     Map one agy RPC step to Omnigent conversation-item events.
 
     This is the pure, no-delta mapping layer for the RPC-based read path. It
-    produces ``external_conversation_item`` events
-    (``message`` / ``function_call`` / ``function_call_output``) and emits no
+    produces ``external_conversation_item`` events (``reasoning`` / ``message`` /
+    ``function_call`` / ``function_call_output``) and emits no
     ``external_output_text_delta``. The user turn IS mirrored here (see below) —
     nothing else commits it on the TUI-inject write path.
 
@@ -896,9 +918,10 @@ def map_step_to_events(
       user turn, so without this the user message would never be committed
       (#1155). The reader dedups USER_INPUT by its per-turn ``executionId``, so
       this commits exactly once. An empty user turn → ``[]``.
-    * ``CORTEX_STEP_TYPE_PLANNER_RESPONSE`` **at status DONE** → one ``message``
-      item (role assistant) when ``plannerResponse.modifiedResponse`` (or
-      ``response``) is non-empty, then one ``function_call`` item per
+    * ``CORTEX_STEP_TYPE_PLANNER_RESPONSE`` **at status DONE** → one ``reasoning``
+      item when completed thinking is available, one ``message`` item
+      (role assistant) when ``plannerResponse.modifiedResponse`` (or ``response``)
+      is non-empty, then one ``function_call`` item per
       ``plannerResponse.toolCalls`` entry. A non-DONE (GENERATING) planner → ``[]``
       here; its partial text is conveyed only via the streaming reader's
       ``output_text_delta`` events, so committing a message pre-DONE would
@@ -932,6 +955,8 @@ def map_step_to_events(
         call ids).
     :param allocator: Fallback tool-call id allocator, used only when a step
         lacks the real agy ``id`` field (resume-mid-turn case).
+    :param reasoning_text: Completed reasoning accumulated by the streaming
+        reader when the terminal planner frame omits ``thinking``.
     :returns: Ordered events to POST for this step (possibly empty).
     """
     step_type = step.get("type")
@@ -965,9 +990,9 @@ def map_step_to_events(
     # incremental ``output_text_delta`` events; committing a message for it here too
     # would double-render — and on the poll path (which does NOT intercept GENERATING)
     # a step caught GENERATING then DONE would post TWO messages. Gating on DONE
-    # (symmetric with the tool-result gate below) yields exactly one committed message,
-    # with the FINAL text, on both the stream and poll paths. ERROR/other non-DONE →
-    # no committed item (any partial already streamed as deltas).
+    # (symmetric with the tool-result gate below) yields one completed reasoning
+    # item when available plus the final message, on both stream and poll paths.
+    # ERROR/other non-DONE → no committed reasoning item.
     if step_type == _TYPE_PLANNER_RESPONSE:
         if status == _STATUS_ERROR:
             # A model/turn ERROR (safety block, rate-limit, provider overload,
@@ -991,6 +1016,17 @@ def map_step_to_events(
         events: list[OutboundEvent] = []
         planner = step.get("plannerResponse")
         if isinstance(planner, dict):
+            final_reasoning = planner.get("thinking")
+            if not isinstance(final_reasoning, str) or not final_reasoning:
+                final_reasoning = reasoning_text
+            if isinstance(final_reasoning, str) and final_reasoning:
+                events.append(
+                    _reasoning_event(
+                        conversation_id=conversation_id,
+                        step_idx=step_idx,
+                        text=final_reasoning,
+                    )
+                )
             response_text = planner.get("response")
             # modifiedResponse is the post-moderation text; prefer it over
             # response when present.  Both fields appear in live fixtures and

@@ -3425,7 +3425,6 @@ function AssistantBubble({
   // assistant-side block exists, so `items` is non-empty here in the
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
   // Getter computes the markdown lazily at click time — the hook must run
   // before the early return below (rules of hooks), but `markdownText` is
   // derived after it.
@@ -3453,7 +3452,7 @@ function AssistantBubble({
         <MessageContent className={isWide ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
-            sessionStatus={sessionStatus}
+            sessionStatus={bubble.lifecycle === "streaming" ? "running" : "idle"}
             canApprove={canApprove}
           />
         </MessageContent>

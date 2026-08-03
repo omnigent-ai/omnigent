@@ -2413,9 +2413,8 @@ def _publish_external_output_reasoning_delta(session_id: str, body: SessionEvent
     publishes the standard reasoning SSE events the SPA already renders —
     ``response.reasoning.started`` once (when ``data.started`` is true, marking a
     new reasoning block) followed by ``response.reasoning_text.delta`` — without
-    persisting anything. Reasoning has no completed conversation item; the block
-    is finalized when the assistant message is persisted via
-    ``external_conversation_item``.
+    persisting the delta itself. Native forwarders may separately persist the
+    completed block through ``external_conversation_item``.
 
     :param session_id: Session/conversation identifier.
     :param body: ``POST /events`` body whose type is
@@ -5599,7 +5598,7 @@ def _extract_persistent_item_from_sse(
     Returns a ``NewConversationItem`` for:
 
     - ``response.output_item.done`` events carrying an assistant
-      message, function_call, or function_call_output.
+      message, function_call, function_call_output, or reasoning item.
     - ``compaction`` events carrying a conversation summary from
       the runner's compaction system.
 
@@ -5638,7 +5637,7 @@ def _extract_persistent_item_from_sse(
     if not isinstance(item, dict):
         return None
     item_type = item.get("type")
-    if item_type not in ("message", "function_call", "function_call_output"):
+    if item_type not in ("message", "function_call", "function_call_output", "reasoning"):
         return None
     # Skip transient observed function_call events (status
     # ``in_progress`` / ``action_required``).  Only ``completed``

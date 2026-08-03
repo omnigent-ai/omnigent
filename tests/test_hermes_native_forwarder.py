@@ -217,7 +217,7 @@ def test_read_new_items_maps_roles_and_strips_attachments(tmp_path: Path) -> Non
 
 
 def test_read_new_items_mirrors_reasoning_before_message(tmp_path: Path) -> None:
-    """An assistant row with reasoning posts a one-shot reasoning delta before the message."""
+    """An assistant row retains the completed reasoning before the message."""
     db = tmp_path / "state.db"
     con = sqlite3.connect(db)
     con.executescript(_SCHEMA)
@@ -236,7 +236,11 @@ def test_read_new_items_mirrors_reasoning_before_message(tmp_path: Path) -> None
     items = f._read_new_items(db, "s1", 0, "hermes-native-ui")
     posted = [i for i in items if i.item_type]
     assert posted[0].item_type == "external_output_reasoning_delta"
-    assert posted[0].item_data == {"delta": "thinking hard", "started": True}  # marker stripped
+    assert posted[0].item_data == {
+        "delta": "thinking hard",
+        "started": True,
+        "agent": "hermes-native-ui",
+    }
     assert posted[1].item_type == "message"
     assert posted[1].item_data["content"] == [{"type": "output_text", "text": "done"}]
 
@@ -417,14 +421,34 @@ async def test_post_conversation_item_posts_reasoning_delta(tmp_path) -> None:
     item = f._MirrorItem(
         msg_id=6,
         item_type="external_output_reasoning_delta",
-        item_data={"delta": "let me think", "started": True},
+        item_data={"delta": "let me think", "started": True, "agent": "Hermes"},
         response_id="hermes:6",
     )
     await f._post_conversation_item(client, session_id="conv_q", item=item)
-    url, body = client.posts[0]
-    assert url == "/v1/sessions/conv_q/events"
-    assert body["type"] == "external_output_reasoning_delta"
-    assert body["data"] == {"delta": "let me think", "started": True}
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_q/events",
+            {
+                "type": "external_output_reasoning_delta",
+                "data": {"delta": "let me think", "started": True},
+            },
+        ),
+        (
+            "/v1/sessions/conv_q/events",
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "reasoning",
+                    "item_data": {
+                        "agent": "Hermes",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": "let me think"}],
+                    },
+                    "response_id": "hermes:6",
+                },
+            },
+        ),
+    ]
 
 
 async def test_forward_loop_discovers_and_mirrors_new_messages(tmp_path, monkeypatch) -> None:

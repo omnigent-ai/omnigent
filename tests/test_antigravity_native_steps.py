@@ -1193,31 +1193,23 @@ class TestOutputReasoningDeltaEvent:
         assert "message_id" not in event.data
 
 
-class TestMapStepEmitsNoReasoning:
-    """The pure mapper never emits a reasoning item — reasoning is delta-only."""
+class TestMapStepReasoning:
+    """Completed planner reasoning becomes durable history."""
 
-    def test_done_planner_with_thinking_emits_no_reasoning_item(self) -> None:
-        """
-        A DONE planner carrying ``thinking`` maps to message (+ tool calls) only.
-
-        Reasoning is surfaced solely as transient deltas by the streaming reader
-        (mirroring the in-process executor, which never commits a reasoning item).
-        The DONE-commit path must therefore not introduce a ``reasoning`` item or
-        any ``external_output_reasoning_delta``.
-        """
+    def test_done_planner_with_thinking_emits_reasoning_item(self) -> None:
         step = _load("planner_response_text")
         cast(dict[str, Any], step["plannerResponse"])["thinking"] = "internal chain of thought"
         events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
 
-        for event in events:
-            assert event.event_type != "external_output_reasoning_delta"
-            if event.event_type == "external_conversation_item":
-                assert event.data.get("item_type") != "reasoning"
-        # The committed assistant message is still produced (text unchanged).
         item_types = [
             e.data.get("item_type") for e in events if e.event_type == "external_conversation_item"
         ]
-        assert "message" in item_types
+        assert item_types[:2] == ["reasoning", "message"]
+        assert events[0].data["item_data"] == {
+            "agent": "antigravity-native-ui",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "internal chain of thought"}],
+        }
 
 
 class TestExecutionDiscriminator:

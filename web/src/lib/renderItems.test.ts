@@ -342,7 +342,8 @@ describe("buildBubbles — bubble grouping", () => {
         hasCodeBlocks: false,
       },
     ];
-    const bubbles = buildBubbles(blocks, null);
+    const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    const bubbles = buildBubbles(blocks, active);
     expect(bubbles.map((b) => b.kind)).toEqual([
       "user",
       "assistant",
@@ -359,6 +360,11 @@ describe("buildBubbles — bubble grouping", () => {
     expect(asst0.responseId).toBe("resp_1");
     expect(asst1.responseId).toBe("resp_1");
     expect(asst2.responseId).toBe("resp_1");
+    expect([asst0.lifecycle, asst1.lifecycle, asst2.lifecycle]).toEqual([
+      "completed",
+      "completed",
+      "streaming",
+    ]);
     expect(new Set([asst0.stableId, asst1.stableId, asst2.stableId]).size).toBe(3);
     // The third bubble has a text_done, so its stableId pins to the
     // canonical item id (stable across streaming → committed transition).

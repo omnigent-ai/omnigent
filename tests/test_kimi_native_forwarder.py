@@ -11,15 +11,69 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
+
 from omnigent.kimi_native_forwarder import (
     _discover_wire,
     _ForwardState,
+    _post_reasoning_item,
     _read_state,
     _row_to_item,
     _write_state,
     clear_kimi_bridge_state,
     read_kimi_wire_items,
 )
+
+
+async def test_post_reasoning_item_streams_and_persists() -> None:
+    posts: list[dict[str, object]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    item = _row_to_item(
+        5,
+        {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "content.part",
+                "uuid": "abc123",
+                "part": {"type": "think", "think": "Let me reason."},
+            },
+        },
+    )
+    assert item is not None
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await _post_reasoning_item(
+            client,
+            base_url="http://test",
+            headers={},
+            session_id="conv_1",
+            item=item,
+            agent_name="Kimi",
+        )
+
+    assert posts == [
+        {
+            "type": "external_output_reasoning_delta",
+            "data": {"delta": "Let me reason.", "started": True},
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "reasoning",
+                "item_data": {
+                    "agent": "Kimi",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "Let me reason."}],
+                },
+                "response_id": "kimi:abc123",
+            },
+        },
+    ]
 
 
 class TestRowToItem:

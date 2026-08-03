@@ -209,9 +209,9 @@ export function createBubbleCache(): BubbleCache {
  *   (text/reasoning/tool/native_tool/error/retry), and `CompactionBlock`s.
  *   Lifecycle markers (`response_start`, `response_end`) are skipped.
  * @param activeResponse - lifecycle of the most recently sent response,
- *   or `null` when idle / pre-send. The bubble whose `responseId`
- *   matches inherits `state` and `error`; all other bubbles are
- *   `"completed"`.
+ *   or `null` when idle / pre-send. Only the latest matching assistant
+ *   segment inherits `"streaming"`; terminal states apply to every
+ *   matching segment. All other bubbles are `"completed"`.
  * @param cache - optional reuse cache (see `BubbleCache`). When supplied
  *   and the call is an append-only extension of the cached one, the
  *   finalized-bubble prefix is reused by reference and only the active
@@ -366,6 +366,7 @@ function walkBubbles(
   subIndexByResp: Map<string, number>,
 ): { bubbles: Bubble[]; lastBubbleStart: number } {
   const bubbles: Bubble[] = [...seedBubbles];
+  let latestStreamingSegment: { bubbleIndex: number; blocks: AnyBlock[] } | null = null;
   // One cross-bubble result index per walk: the relay backdates a
   // delayed function_call_output to its ORIGINAL turn's response id, so
   // a result can sit outside its call's bubble; pairing is keyed
@@ -492,13 +493,20 @@ function walkBubbles(
     if (groupBlocks.length > 0 && groupBlocks.every((bk) => bk.type === "tool_result")) {
       continue;
     }
-    const lifecycle =
-      groupHasInterruptedText(groupBlocks) || interruptedResponses.has(groupResponseId)
-        ? "cancelled"
-        : activeResponse?.responseId === groupResponseId
-          ? activeResponse.state
-          : "completed";
-    const error = activeResponse?.responseId === groupResponseId ? activeResponse.error : null;
+    const interrupted =
+      groupHasInterruptedText(groupBlocks) || interruptedResponses.has(groupResponseId);
+    const matchesActiveResponse = activeResponse?.responseId === groupResponseId;
+    const isStreamingCandidate =
+      !interrupted && matchesActiveResponse && activeResponse.state === "streaming";
+    const lifecycle = interrupted
+      ? "cancelled"
+      : matchesActiveResponse && activeResponse.state !== "streaming"
+        ? activeResponse.state
+        : "completed";
+    const error =
+      !interrupted && matchesActiveResponse && activeResponse.state !== "streaming"
+        ? activeResponse.error
+        : null;
 
     const subIndex = subIndexByResp.get(groupResponseId) ?? 0;
     subIndexByResp.set(groupResponseId, subIndex + 1);
@@ -509,6 +517,7 @@ function walkBubbles(
     const stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
 
     lastBubbleStart = groupStart;
+    const bubbleIndex = bubbles.length;
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,
@@ -517,6 +526,21 @@ function walkBubbles(
       error,
       items: buildAssistantItems(groupBlocks, lifecycle, crossBubbleResults),
     });
+    if (isStreamingCandidate) {
+      latestStreamingSegment = { bubbleIndex, blocks: groupBlocks };
+    }
+  }
+
+  if (latestStreamingSegment !== null) {
+    const bubble = bubbles[latestStreamingSegment.bubbleIndex];
+    if (bubble?.kind === "assistant") {
+      bubbles[latestStreamingSegment.bubbleIndex] = {
+        ...bubble,
+        lifecycle: "streaming",
+        error: activeResponse?.error ?? null,
+        items: buildAssistantItems(latestStreamingSegment.blocks, "streaming", crossBubbleResults),
+      };
+    }
   }
 
   return { bubbles, lastBubbleStart };

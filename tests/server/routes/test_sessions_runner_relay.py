@@ -70,6 +70,33 @@ class _HeartbeatStreamResponse:
         yield "data: [DONE]\n\n"
 
 
+def test_extract_persistent_reasoning_item_from_runner_sse() -> None:
+    """The runner relay accepts completed reasoning items for persistence."""
+    from omnigent.entities.conversation import ReasoningData
+    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+
+    item = _extract_persistent_item_from_sse(
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "id": "reasoning_1",
+                "type": "reasoning",
+                "status": "completed",
+                "agent": "wrapped-harness",
+                "summary": [{"type": "summary_text", "text": "summary"}],
+                "content": [{"type": "reasoning_text", "text": "details"}],
+            },
+        },
+        response_id="resp_1",
+    )
+
+    assert item is not None
+    assert item.type == "reasoning"
+    assert item.response_id == "resp_1"
+    assert isinstance(item.data, ReasoningData)
+    assert item.data.content == [{"type": "reasoning_text", "text": "details"}]
+
+
 class _HeartbeatRunnerClient:
     """
     Fake runner client whose stream emits a ready heartbeat.
