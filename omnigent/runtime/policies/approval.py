@@ -178,22 +178,22 @@ def approval_presentation_to_dict(
 def arguments_from_preview(content_preview: str) -> dict[str, Any]:
     """Recover the tool arguments mapping from an elicitation preview.
 
-    Two preview shapes reach this helper, so both are accepted:
+    Both preview shapes a caller may hold are accepted:
 
-    * A *wrapper* object ``{"name": ..., "arguments": {...}}`` — the whole
-      tool-call event serialized as the preview. The ``arguments`` mapping
-      is returned.
-    * A *bare* arguments mapping ``{...}`` — the preview is already just the
-      arguments. The whole dict is returned.
+    * A *wrapper* object ``{"name": ..., "arguments": {...}}`` — a serialized
+      tool-call event, the shape the :func:`_await_elicitation` seam forwards
+      as its ``content_preview``. Its ``arguments`` mapping is returned.
+    * A *bare* arguments mapping — the shape ``_register_policy_elicitation``
+      is handed, its callers passing the arguments string straight through.
+      The whole dict is returned.
 
-    The whole-dict fallback is therefore deliberate, not a safety net: bare
-    previews carry no ``arguments`` key, so restricting the lookup to that
-    key would derive ``{}`` and silently filter out every declared secondary
-    argument on those paths. The cost is that a wrapper-shaped preview whose
-    ``arguments`` value is absent or not a mapping lets its own top-level
-    keys (e.g. ``name``) count as argument names; that only ever widens the
-    set of names a policy may point the approval card at, never the values
-    rendered, so it is accepted over breaking the bare shape.
+    The whole-dict fallback is deliberate, not a safety net: a bare preview
+    carries no ``arguments`` key, so restricting the lookup to that key would
+    derive ``{}`` and silently filter out every declared secondary argument on
+    those paths. The residual cost is that a wrapper preview whose
+    ``arguments`` is absent or not a mapping lets its own top-level keys (e.g.
+    ``name``) pass as argument names, so an extra name's value may reach the
+    card; the fallback never alters or invents an argument value.
 
     :param content_preview: JSON preview string from the elicitation.
     :returns: The arguments mapping, or ``{}`` when the preview is not a
