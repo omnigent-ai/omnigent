@@ -25,6 +25,7 @@ from omnigent.runner._entry import (
     _load_runner_idle_timeout_s_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
+    _ManagedMintTokenFactory,
     _mint_managed_owner_token,
     _parent_is_orphaned,
     _parent_process_is_alive,
@@ -221,7 +222,7 @@ def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
     monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
     monkeypatch.setattr(
         "omnigent.runner._entry._mint_managed_owner_token",
-        lambda mint_url, server_url, binding_token: ("managed-jwt", time.time() + 1800),
+        lambda mint_url, server_url, binding_token, **_kw: ("managed-jwt", time.time() + 1800),
     )
 
     factory = _make_auth_token_factory()
@@ -250,7 +251,7 @@ def test_make_auth_token_factory_prefers_host_delegation_over_user_credentials(
     )
     monkeypatch.setattr(
         "omnigent.runner._entry._mint_managed_owner_token",
-        lambda mint_url, server_url, binding_token: ("delegated-jwt", time.time() + 1800),
+        lambda mint_url, server_url, binding_token, **_kw: ("delegated-jwt", time.time() + 1800),
     )
 
     factory = _make_auth_token_factory()
@@ -281,12 +282,12 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     def _unexpected_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
         del args, kwargs
         mint_calls.append(1)
-        raise AssertionError("bootstrap fallback must use runner-local refresh auth")
+        raise AssertionError("SDK auth available — fallback must prefer it over managed mint")
 
+    # A host-launched runner: has an initial bearer and SDK auth, but no
+    # managed-sandbox delegation — OMNIGENT_RUNNER_DELEGATED_AUTH is absent.
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
     monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
-    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
-    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _unexpected_mint)
@@ -312,6 +313,55 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     assert mint_calls == []
 
 
+def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the host bearer is rejected, a managed runner falls back to managed mint.
+
+    When no SDK/OIDC credential is available (managed sandbox with no user
+    credential), the fallback must reach the managed-mint path rather than
+    returning None and bricking all HTTP callbacks.
+    """
+    mint_calls: list[int] = []
+
+    def _no_sdk_auth(*args: Any, **kwargs: Any) -> tuple[None, None]:
+        from omnigent.inner.databricks_executor import DatabricksAuthError
+
+        raise DatabricksAuthError("no credential configured")
+
+    def _mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        mint_calls.append(1)
+        return "managed-minted-token", time.time() + 3600
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk_auth
+    )
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert factory() == "host-bootstrap-token"
+    assert mint_calls == []
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
+    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
+    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
+
+    # After the initial bearer is rejected, the fallback must mint via the
+    # managed-mint path rather than returning None and bricking callbacks.
+    assert captured == [
+        "Bearer host-bootstrap-token",
+        "Bearer managed-minted-token",
+    ]
+    assert len(mint_calls) >= 1
+
+
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -324,7 +374,9 @@ def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
         def current_token(self) -> str:
             return "workspace-token"
 
-    def _apps_redirect(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _apps_redirect(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """Model the Apps edge intercepting the mint request before Omnigent."""
         del server_url, binding_token
         mint_calls.append(1)
@@ -398,7 +450,9 @@ def test_managed_mint_factory_caches_token_until_refresh_skew(
     """
     calls: list[int] = []
 
-    def _fake_mint(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _fake_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """Return a distinct token per call, expiring well beyond the skew."""
         calls.append(1)
         return (f"jwt-{len(calls)}", time.time() + 1800)
@@ -429,7 +483,9 @@ def test_managed_mint_factory_serves_cached_token_when_refresh_fails(
     """
     calls: list[int] = []
 
-    def _fake_mint(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _fake_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """First call mints a near-expiry token; the refresh attempt fails."""
         calls.append(1)
         if len(calls) == 1:
@@ -464,7 +520,9 @@ def test_managed_mint_factory_no_factory_when_server_definitively_refuses(
     :returns: None.
     """
 
-    def _refuses(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _refuses(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """Reject the mint the way a no-auth / header-mode server does (400)."""
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
@@ -490,7 +548,9 @@ def test_managed_mint_factory_installs_for_retry_on_transient_boot_failure(
     :returns: None.
     """
 
-    def _blip(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _blip(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """A transient failure — the endpoint is momentarily unreachable."""
         raise httpx.ConnectError("mint endpoint unreachable at boot")
 
@@ -514,7 +574,9 @@ def test_managed_mint_factory_recovers_after_transient_boot_failure(
     """
     calls: list[int] = []
 
-    def _fake_mint(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+    def _fake_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
         """Fail the boot probe once, then mint successfully."""
         calls.append(1)
         if len(calls) == 1:
@@ -549,7 +611,7 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     calls: list[int] = []
 
     def _boot_blip_then_refuse(
-        mint_url: str, server_url: str, binding_token: str
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
     ) -> tuple[str, float]:
         """Fail the boot probe with a connection error, then 400 every mint."""
         calls.append(1)
@@ -617,6 +679,68 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     assert captured["method"] == "POST"
     assert captured["binding_token"] == "the-binding-token"
     assert captured["url"].endswith("/v1/runners/runner_token_abc/token")
+
+
+def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """proxy_bearer is forwarded as Authorization so an Apps proxy lets the request through."""
+    captured: dict[str, str] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization", "")
+        captured["binding_token"] = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER, "")
+        return httpx.Response(200, json={"token": "owner-jwt", "expires_at": 1234567890})
+
+    real_client = httpx.Client
+
+    def _fake_client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr("omnigent.runner._entry.httpx.Client", _fake_client)
+
+    _mint_managed_owner_token(
+        "https://s.example.com/v1/runners/runner_token_abc/token",
+        "https://s.example.com",
+        "the-binding-token",
+        proxy_bearer="host-initial-bearer",
+    )
+
+    assert captured["authorization"] == "Bearer host-initial-bearer"
+    assert captured["binding_token"] == "the-binding-token"
+
+
+def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the first mint, the factory uses the minted JWT as proxy bearer on re-mints."""
+    mint_call_bearers: list[str | None] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        mint_call_bearers.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"token": "minted-jwt", "expires_at": time.time() + 1800})
+
+    real_client = httpx.Client
+
+    def _fake_client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr("omnigent.runner._entry.httpx.Client", _fake_client)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/runner_token_abc/token",
+        "https://s.example.com",
+        "binding-token",
+        proxy_bearer="seed-bearer",
+    )
+
+    # Force two mints by expiring the cache between calls.
+    factory()
+    factory._cached_expires_at = 0.0  # expire
+    factory()
+
+    assert mint_call_bearers[0] == "Bearer seed-bearer"
+    assert mint_call_bearers[1] == "Bearer minted-jwt"
 
 
 def test_runner_databricks_auth_injects_fresh_token_per_request() -> None:

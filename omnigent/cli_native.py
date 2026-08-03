@@ -174,7 +174,7 @@ def register_native_commands(cli: click.Group) -> None:
         #     existing Claude config.
         # :param profile_startup: When True, print startup timing marks.
         # :param claude_args: Pass-through args for ``claude``.
-        """Launch Claude Code in an Omnigent terminal.
+        """Launch Claude Code with Omnigent.
 
         \b
         Examples:
@@ -314,7 +314,7 @@ def register_native_commands(cli: click.Group) -> None:
         # :param model: Codex model id.
         # :param prompt: Optional first prompt.
         # :param codex_args: Pass-through args for ``codex`` before ``resume``.
-        """Launch Codex TUI in an Omnigent terminal.
+        """Launch Codex with Omnigent.
 
         \b
         Examples:
@@ -424,7 +424,7 @@ def register_native_commands(cli: click.Group) -> None:
         # (opencode-native resolves its binary on the runner side; if a spec/env
         # path to thread a client override through is added later, this stays
         # consistent with the other native commands' env/config override model.)
-        """Launch OpenCode TUI in an Omnigent terminal.
+        """Launch OpenCode with Omnigent.
 
         \b
         Examples:
@@ -515,7 +515,7 @@ def register_native_commands(cli: click.Group) -> None:
         session_id: str | None,
         pi_args: tuple[str, ...],
     ) -> None:
-        """Launch Pi TUI in an Omnigent terminal.
+        """Launch Pi with Omnigent.
 
         \b
         Examples:
@@ -624,7 +624,7 @@ def register_native_commands(cli: click.Group) -> None:
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
         # :param model: Cursor model id passed to cursor-agent as ``--model``.
-        """Launch the Cursor TUI in an Omnigent terminal.
+        """Launch Cursor with Omnigent.
 
         \b
         Examples:
@@ -751,7 +751,7 @@ def register_native_commands(cli: click.Group) -> None:
         prompt: str | None,
         kiro_args: tuple[str, ...],
     ) -> None:
-        """Launch the Kiro TUI in an Omnigent terminal.
+        """Launch Kiro with Omnigent.
 
         \b
         Examples:
@@ -851,7 +851,7 @@ def register_native_commands(cli: click.Group) -> None:
         session_id: str | None,
         goose_args: tuple[str, ...],
     ) -> None:
-        """Launch the Goose TUI in an Omnigent terminal.
+        """Launch Goose with Omnigent.
 
         \b
         Examples:
@@ -938,7 +938,7 @@ def register_native_commands(cli: click.Group) -> None:
         session_id: str | None,
         hermes_args: tuple[str, ...],
     ) -> None:
-        """Launch the Hermes TUI in an Omnigent terminal.
+        """Launch Hermes with Omnigent.
 
         \b
         Examples:
@@ -1027,7 +1027,7 @@ def register_native_commands(cli: click.Group) -> None:
         model: str | None,
         antigravity_args: tuple[str, ...],
     ) -> None:
-        """Launch the Antigravity (agy) TUI in an Omnigent terminal.
+        """Launch Antigravity (agy) with Omnigent.
 
         \b
         Examples:
@@ -1126,7 +1126,7 @@ def register_native_commands(cli: click.Group) -> None:
         session_id: str | None,
         qwen_args: tuple[str, ...],
     ) -> None:
-        """Launch the qwen (Qwen Code) TUI in an Omnigent terminal.
+        """Launch Qwen Code with Omnigent.
 
         \b
         Examples:
@@ -1213,7 +1213,7 @@ def register_native_commands(cli: click.Group) -> None:
         session_id: str | None,
         kimi_args: tuple[str, ...],
     ) -> None:
-        """Launch the Kimi Code TUI in an Omnigent terminal.
+        """Launch Kimi Code with Omnigent.
 
         Boots Moonshot AI's interactive ``kimi`` TUI
         (https://github.com/MoonshotAI/Kimi-Code) in a runner-owned terminal and

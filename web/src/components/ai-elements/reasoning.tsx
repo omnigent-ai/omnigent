@@ -7,6 +7,7 @@ import type { ComponentProps, ReactNode } from "react";
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
 
+import { normalizeExplicitMathDelimiters } from "./mathMarkdown";
 import { Shimmer } from "./shimmer";
 import {
   CHAT_LINK_SAFETY,
@@ -179,6 +180,7 @@ export type ReasoningContentProps = ComponentProps<typeof CollapsibleContent> & 
 
 export const ReasoningContent = memo(({ className, children, ...props }: ReasoningContentProps) => {
   const { expandable } = useReasoning();
+  const normalizedChildren = useMemo(() => normalizeExplicitMathDelimiters(children), [children]);
 
   // Non-expandable section has no content to reveal — render nothing so
   // there's no empty collapsible region under the flat header.
@@ -201,7 +203,7 @@ export const ReasoningContent = memo(({ className, children, ...props }: Reasoni
         // Block remote image fetches that can exfiltrate data through URLs.
         rehypePlugins={SECURE_STREAMDOWN_REHYPE_PLUGINS}
       >
-        {children}
+        {normalizedChildren}
       </Streamdown>
     </CollapsibleContent>
   );

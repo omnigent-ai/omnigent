@@ -168,6 +168,35 @@ does not change for a patch, and a patch never needs a new branch.
 
 ---
 
+## Nightly builds
+
+`nightly-release.yml` runs at 04:30 UTC: it finds the newest commit on `main`
+with green CI, stamps the lockstep version to `X.Y.Z.devYYYYMMDD` (today's UTC
+date on main's `X.Y.Z.dev0` line), commits that stamp detached (`main` never
+moves and no release branch is created), and pushes only the tag. Quiet nights
+and same-day re-runs no-op. The tag push publishes the immutable Docker image
+tag; no GitHub release, changelog, or homebrew automation fires for dev tags,
+and a default `pip install omnigent` never resolves them.
+
+Nightlies do not go to PyPI. Consumers install straight from the tag with uv
+(requires git, uv, Node 22+, and pnpm):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/update_nightly.sh | bash
+```
+
+The script is idempotent (cron-safe) and pins all three lockstep packages to
+one tagged commit; `omnigent --version` prints that commit. An existing
+install moves onto (or along) the channel with `omni upgrade --nightly`.
+
+A bad nightly needs no recovery: fix `main` and the next night's tag
+supersedes it. For an ad-hoc cut, dispatch `nightly-release.yml` (dry-run by
+default; `-f dry_run=false` cuts for real, and it no-ops when today's tag
+already exists). Sustained failures of the cut file a tracking issue via
+`nightly-failure-monitor.yml`.
+
+---
+
 ## One-time setup (repo admin)
 
 - **`publish-release` environment** on `omnigent-ai/omnigent` with required

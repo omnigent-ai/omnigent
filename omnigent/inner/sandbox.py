@@ -14,8 +14,9 @@ from abc import ABC, abstractmethod
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, TypeAlias, cast
+from typing import Protocol, cast
 
+from omnigent.json_types import JsonValue
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
 from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
@@ -48,10 +49,9 @@ _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
 
-# JSON-shaped payload passed across the parent/launcher boundary: the
-# SandboxPolicy serialized via `to_jsonable()` plus whatever `json.loads`
-# returns on the helper side.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+
+def _json_string_list(values: Sequence[object]) -> list[JsonValue]:
+    return cast(list[JsonValue], [str(value) for value in values])
 
 
 @dataclass
@@ -201,30 +201,36 @@ class SandboxPolicy:
             "backend_type": self.backend_type,
             "active": self.active,
             "read_roots": (
-                [str(root) for root in self.read_roots] if self.read_roots is not None else None
+                _json_string_list(self.read_roots) if self.read_roots is not None else None
             ),
-            "write_roots": [str(root) for root in self.write_roots],
-            "write_files": [str(path) for path in self.write_files],
+            "write_roots": _json_string_list(self.write_roots),
+            "write_files": _json_string_list(self.write_files),
             "allow_network": self.allow_network,
             "cwd_allow_hidden": (
-                list(self.cwd_allow_hidden) if self.cwd_allow_hidden is not None else None
+                _json_string_list(self.cwd_allow_hidden)
+                if self.cwd_allow_hidden is not None
+                else None
             ),
             "cwd_hidden_scan_max_entries": self.cwd_hidden_scan_max_entries,
             "cwd_hidden_scan_overflow": self.cwd_hidden_scan_overflow,
             "cwd_hidden_scan_recursive": self.cwd_hidden_scan_recursive,
             "mask_paths": (
-                [str(path) for path in self.mask_paths] if self.mask_paths is not None else None
+                _json_string_list(self.mask_paths) if self.mask_paths is not None else None
             ),
             "env_passthrough": (
-                list(self.env_passthrough) if self.env_passthrough is not None else None
+                _json_string_list(self.env_passthrough)
+                if self.env_passthrough is not None
+                else None
             ),
             "spawn_env_allowlist": (
-                list(self.spawn_env_allowlist) if self.spawn_env_allowlist is not None else None
+                _json_string_list(self.spawn_env_allowlist)
+                if self.spawn_env_allowlist is not None
+                else None
             ),
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
             "deny_unix_socket_paths": (
-                [str(path) for path in self.deny_unix_socket_paths]
+                _json_string_list(self.deny_unix_socket_paths)
                 if self.deny_unix_socket_paths is not None
                 else None
             ),
@@ -799,14 +805,14 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         # tempdir root, which the profile only granted a subpath of —
         # ``FileNotFoundError: No usable temporary directory`` on
         # seatbelt (bwrap masked it via its ``--tmpfs /tmp`` fallback).
-        tmpdir = create_private_tmpdir()
+        host_tmpdir = create_private_tmpdir()
         try:
-            sandbox = with_additional_write_roots(sandbox, [tmpdir])
-            set_temp_env(os.environ, tmpdir)
+            sandbox = with_additional_write_roots(sandbox, [host_tmpdir])
+            set_temp_env(os.environ, host_tmpdir)
             encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
             # Name the dir for the in-wrap pass: it adopts this exact
             # path (no second mint) and owns the cleanup on exit.
-            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(tmpdir)
+            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(host_tmpdir)
             # Re-invoke run_launcher via an INLINE python -c script
             # rather than re-running the launcher tempfile. Reason:
             # bwrap mounts ``/tmp`` as a fresh tmpfs, so the host's
@@ -851,7 +857,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # ``except`` only fires if the wrap/exec never handed off.
             os.execvp(wrapped[0], wrapped)
         except BaseException:
-            cleanup_private_tmpdir(tmpdir)
+            cleanup_private_tmpdir(host_tmpdir)
             raise
 
     tmpdir: Path | None = None

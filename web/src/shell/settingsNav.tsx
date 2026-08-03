@@ -224,7 +224,7 @@ export function SettingsSidebarBody({
           but we keep the overlay OPEN so mobile lands on that list rather than
           closing onto the content behind it. On desktop onNavClick is a no-op
           (persistent card), so dropping it changes nothing there. */}
-          <Link to={settingsReturnPath}>
+          <Link to={settingsReturnPath} componentId="settings.back_to_omnigent">
             <ArrowLeftIcon className="size-4" />
             Back to Omnigent
           </Link>

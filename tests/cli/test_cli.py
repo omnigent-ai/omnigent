@@ -135,7 +135,7 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
 
     assert "Usage: python -m omnigent [OPTIONS] COMMAND [ARGS]..." in result.stdout
     assert "Commands:" in result.stdout
-    assert "run" in result.stdout and "Attach the REPL to a LIVE session" in result.stdout
+    assert "run" in result.stdout and "Attach the REPL to a live session" in result.stdout
     assert "Omnigent quick chat" not in result.stdout
 
 
@@ -950,6 +950,71 @@ def test_kiro_command_is_registered_in_click_help() -> None:
     assert result.exit_code == 0, result.output
     assert "kiro" in _CLICK_SUBCOMMANDS
     assert "kiro" in result.output
+
+
+def test_help_groups_harnesses_and_other_commands() -> None:
+    """``--help`` lists a ``Harnesses`` section separate from ``Commands``."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "Harnesses:" in result.output
+    assert "Commands:" in result.output
+    # A harness launcher lands under Harnesses; a management command
+    # lands under Commands (both after their respective headings).
+    harnesses_at = result.output.index("Harnesses:")
+    commands_at = result.output.index("Commands:", harnesses_at)
+    assert harnesses_at < result.output.index("claude") < commands_at
+    assert commands_at < result.output.index("server")
+
+
+def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
+    """The ``update`` alias is omitted from --help but stays registered."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "upgrade" in result.output
+    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
+    assert "\n  update " not in result.output
+    # ...but it's still a real, invokable command.
+    assert cli.commands["update"] is cli.commands["upgrade"]
+
+
+def test_help_hides_extras_gated_harness_when_sdk_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor/antigravity drop out of the harness list; a notice replaces them."""
+    monkeypatch.setattr(
+        "omnigent.cli._harness_extra_checks",
+        lambda: {"cursor": lambda: False, "antigravity": lambda: False},
+    )
+
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    # Not listed as launchable harnesses...
+    assert "Launch Cursor with Omnigent" not in result.output
+    assert "Launch Antigravity" not in result.output
+    # ...but a generic notice points at setup instead.
+    assert "Some harnesses need an optional extra" in result.output
+    # Still a real, registered command — only the listing is suppressed.
+    assert "cursor" in _CLICK_SUBCOMMANDS
+
+
+def test_help_shows_extras_gated_harness_when_sdk_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor/antigravity appear in --help once their extra is importable."""
+    monkeypatch.setattr(
+        "omnigent.cli._harness_extra_checks",
+        lambda: {"cursor": lambda: True, "antigravity": lambda: True},
+    )
+
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "cursor" in result.output
+    assert "antigravity" in result.output
+    assert "Some harnesses need an optional extra" not in result.output
 
 
 def test_kiro_command_parses_native_options_and_prompt(

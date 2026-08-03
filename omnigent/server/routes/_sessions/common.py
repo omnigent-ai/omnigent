@@ -875,8 +875,8 @@ __all__ = [
 # sibling ``_sessions`` modules resolve the names in their OWN namespace, so a
 # facade-level patch would miss them. These proxies resolve the facade attribute
 # lazily on every access, so a patch on the facade is honoured everywhere the
-# siblings import the name from here. Deliberately NOT in ``__all__`` so the
-# facade's ``import *`` never overwrites its real runtime bindings.
+# siblings import the name from here. Deliberately NOT in ``__all__`` or the
+# facade's explicit imports, preserving its real runtime bindings.
 
 
 def _sessions_facade() -> Any:

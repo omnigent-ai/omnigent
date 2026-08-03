@@ -4,6 +4,7 @@ import * as Slot from "radix-ui/slot";
 
 import { cn } from "@/lib/utils";
 import { Spinner } from "@/components/ui/spinner";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 
 // The pressed-state nudge uses the `transform` property (not translate-y-px)
 // so it composes with `translate`-based positioning: a caller centering the
@@ -59,6 +60,10 @@ const Button = React.forwardRef<
       // keeping its width — the label stays in flow but hidden, so a
       // submitting button doesn't grow and shove its neighbours.
       loading?: boolean;
+      // Opt-in analytics id. When set, a click is reported to the host sink
+      // (see `lib/analytics.ts`); when absent the button emits nothing, so
+      // un-instrumented call sites are unchanged.
+      componentId?: string;
     }
 >(function Button(
   {
@@ -68,12 +73,21 @@ const Button = React.forwardRef<
     asChild = false,
     loading = false,
     disabled,
+    componentId,
+    onClick,
     children,
     ...props
   },
   ref,
 ) {
   const Comp = asChild ? Slot.Root : "button";
+  const { trackClick } = useOmnigentAnalytics();
+  const handleClick = componentId
+    ? (e: React.MouseEvent<HTMLButtonElement>) => {
+        trackClick(componentId, "button");
+        onClick?.(e);
+      }
+    : onClick;
 
   // With asChild the child is the rendered element (e.g. a Radix trigger or an
   // <a>); we can't inject an overlay without breaking Slot's single-child
@@ -86,9 +100,11 @@ const Button = React.forwardRef<
       data-slot="button"
       data-variant={variant}
       data-size={size}
+      data-component-id={componentId}
       className={cn(buttonVariants({ variant, size, className }))}
       disabled={disabled || showLoading}
       aria-busy={showLoading || undefined}
+      onClick={handleClick}
       {...props}
     >
       {showLoading ? (

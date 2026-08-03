@@ -27,6 +27,7 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 import httpx
 
 from omnigent import model_catalog
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
@@ -72,7 +73,6 @@ _EMPTY_TURN_MAX_ATTEMPTS = 2
 # retried.
 _NON_OUTPUT_ITEM_TYPES: frozenset[str] = frozenset({"reasoning_item", "compaction_item"})
 
-_JsonObject: TypeAlias = dict[str, object]
 
 # Replay items persisted to the SDK Session — heterogeneous Responses-API
 # input items (function_call / function_call_output / message / etc.).

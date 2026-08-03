@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TypedDict
 
 from fastapi import (
     APIRouter,
@@ -44,13 +45,14 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _announce_session_added,
+)
 from omnigent.server.schemas import (
     AgentObject,
     GrantPermissionRequest,
@@ -65,6 +67,11 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+
+class _PermissionListResponse(TypedDict):
+    permissions: list[PermissionObject]
+    next_cursor: str | None
 
 
 def register_permissions_routes(
@@ -287,7 +294,7 @@ def register_permissions_routes(
         session_id: str,
         limit: int = Query(default=100, ge=1, le=1000),
         after: str | None = Query(default=None, description="Cursor: user_id to start after"),
-    ) -> dict:
+    ) -> _PermissionListResponse:
         """List permission grants on a session with cursor pagination.
 
         Requires manage-level access.
@@ -324,8 +331,6 @@ def register_permissions_routes(
             ],
             "next_cursor": next_cursor,
         }
-
-    return router
 
 
 def _policy_type(spec: PolicySpec) -> str:

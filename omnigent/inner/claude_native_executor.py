@@ -7,7 +7,6 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 from omnigent.claude_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
@@ -18,6 +17,7 @@ from omnigent.claude_native_bridge import (
     read_launch_model,
 )
 from omnigent.inner.executor import (
+    EnqueuedContent,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -75,7 +75,7 @@ class ClaudeNativeExecutor(Executor):
         """:returns: ``True`` because messages can be injected mid-turn."""
         return True
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
         Inject a live steering message into the Claude terminal.
 
@@ -272,7 +272,7 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     return ""
 
 
-def _content_to_text(content: Any, bridge_dir: Path) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """
     Normalize executor content into plain text.
 

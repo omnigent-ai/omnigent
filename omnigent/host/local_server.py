@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import click
-import psutil
+import psutil  # type: ignore[import-untyped]
 
 from omnigent.config import global_config_path
 from omnigent.inner import _proc
@@ -648,7 +648,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
 
     try:
         with child_logging_popen_kwargs(child_env) as logging_kwargs:
-            proc = subprocess.Popen(
+            proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",

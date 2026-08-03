@@ -50,6 +50,15 @@ def test_resolve_hook_resolves_populated_hook() -> None:
     assert run_native.__name__ == "run_pi_native"
 
 
+def test_resolve_hook_rejects_non_callable_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = hp.native_provider_for_key("pi")
+    assert provider is not None
+    monkeypatch.setattr("omnigent.pi_native.run_pi_native", object())
+
+    with pytest.raises(TypeError, match="is not callable"):
+        native_dispatch.resolve_hook(provider, "run_native")
+
+
 def test_resolve_hook_for_key() -> None:
     run_native = native_dispatch.resolve_hook_for_key("codex", "run_native")
     assert callable(run_native)
