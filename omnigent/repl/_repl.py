@@ -59,7 +59,6 @@ from omnigent_ui_sdk import (
 from omnigent_ui_sdk.terminal._completer import FileMentionCompleter
 from omnigent_ui_sdk.terminal._formatter import FormattedItem
 from omnigent_ui_sdk.terminal._theme import LIGHT_THEME, get_theme
-from omnigent_ui_sdk.terminal._tool_renderers import TerminalToolRendererRegistry
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion, merge_completers
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import StyleAndTextTuples
@@ -675,29 +674,7 @@ def _humanize_agent_name(agent_name: str) -> str:
 class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
     """Shows final elapsed time after response completes."""
 
-    def __init__(
-        self,
-        *,
-        accent_color: str = "#F43BA6",
-        code_theme: str | None = None,
-        max_result_lines: int = 30,
-        max_result_chars: int = 2000,
-        show_agent_labels: bool = False,
-        show_tool_output: bool = False,
-        tool_renderers: TerminalToolRendererRegistry | None = None,
-        theme: TerminalTheme | str = LIGHT_THEME,
-    ) -> None:
-        super().__init__(
-            accent_color=accent_color,
-            code_theme=code_theme,
-            max_result_lines=max_result_lines,
-            max_result_chars=max_result_chars,
-            show_agent_labels=show_agent_labels,
-            show_tool_output=show_tool_output,
-            tool_renderers=tool_renderers,
-            theme=theme,
-        )
-        self._start_time: float | None = None
+    _start_time: float | None = None
 
     def format_response_start(self, block: ResponseStartBlock) -> list[FormattedItem]:
         self._start_time = block.ctx.timestamp
