@@ -73,17 +73,32 @@ environment. The default `sandbox` base already ships `python3`, `git`, and
 `curl` (runs as user `tenki`, `$HOME=/home/tenki`), so the script mainly adds
 Omnigent; adapt it to your base image.
 
+> [!IMPORTANT]
+> Two constraints on the setup script, both from the default base image running
+> as the unprivileged `tenki` user:
+>
+> - It **cannot write `/opt` or `/etc`** without `sudo` (passwordless on the
+>   default base), so the venv creation and the profile drop-in need it.
+> - The venv must end up **writable by that same session user**. The CLI
+>   bootstrap overlays your local wheels with `pip install`, which fails with
+>   `Permission denied: 'RECORD'` against a root-owned venv — hence the
+>   `chown`. (Installing into `$HOME` sidesteps both, as long as the venv's
+>   `pip` is still first on `PATH` for every session.)
+
 ```bash
 # 1. Define the template — prints the template id (adapt the setup script)
 tenki sandbox template create \
   --name omnigent-host \
   --setup-script '
     set -eux
-    python3 -m venv /opt/venv
-    /opt/venv/bin/pip install --upgrade pip
-    /opt/venv/bin/pip install omnigent
+    sudo python3 -m venv /opt/venv
+    sudo /opt/venv/bin/pip install --upgrade pip
+    sudo /opt/venv/bin/pip install omnigent
+    # The CLI bootstrap pip-installs your wheels here, so the session user
+    # must own the venv.
+    sudo chown -R tenki:tenki /opt/venv
     # Put the venv first on PATH for every session started from this template.
-    echo "export PATH=/opt/venv/bin:\$PATH" >> /etc/profile.d/omnigent.sh
+    echo "export PATH=/opt/venv/bin:\$PATH" | sudo tee /etc/profile.d/omnigent.sh
   '
 
 # 2. Build it — waits until READY by default (no --wait flag); add
@@ -262,6 +277,13 @@ in-sandbox host forwards the same standard set to its runners, and
   the resources exceed Tenki's bounds (vCPU 1–16, memory 128–65536 MB, disk
   5–100 GB), or the account quota is exhausted. The message carries Tenki's
   reason verbatim.
+- **`pip install` fails with `Permission denied: 'RECORD'`** during `omnigent
+  sandbox create` — the image's Python environment is owned by root but sessions
+  run as `tenki`, so the wheel overlay cannot write to it. Rebuild the template
+  with the venv chowned to the session user (see
+  [the host template](#build-the-host-template-one-time)).
+- **`Permission denied: '/opt/venv'`** while *building* the template — the setup
+  script runs unprivileged; prefix the `/opt` and `/etc` writes with `sudo`.
 - **"managed host did not come online within 120s"** — the sandbox couldn't dial
   back to `server_url`. Confirm it's a public HTTPS URL reachable from Tenki's
   cloud (not `localhost`), and check `/tmp/omnigent-host.log` inside the sandbox.
