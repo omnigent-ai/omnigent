@@ -321,6 +321,7 @@ class _InitialAuthTokenFactory:
         :param server_url: Omnigent server URL used by the fallback resolver.
         """
         self._initial_token: str | None = token
+        self._last_initial_token: str = token  # retained for managed-mint proxy auth
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
         self._fallback_resolved = False
@@ -335,6 +336,7 @@ class _InitialAuthTokenFactory:
                 self._fallback_factory = _make_auth_token_factory(
                     self._server_url,
                     _allow_initial_token=False,
+                    _proxy_bearer=self._last_initial_token,
                 )
                 self._fallback_resolved = True
             if self._fallback_factory is None:
@@ -356,6 +358,7 @@ def _make_auth_token_factory(
     *,
     _allow_initial_token: bool = True,
     _allow_delegated_mint: bool = True,
+    _proxy_bearer: str | None = None,
 ) -> Callable[[], str | None] | None:
     """Build a callable that mints fresh auth tokens.
 
@@ -422,7 +425,9 @@ def _make_auth_token_factory(
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
     binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
-        delegated_factory = _make_managed_mint_factory(resolved_server_url, binding_token)
+        delegated_factory = _make_managed_mint_factory(
+            resolved_server_url, binding_token, proxy_bearer=_proxy_bearer
+        )
         if delegated_factory is not None:
             return delegated_factory
 
@@ -522,6 +527,8 @@ def _make_auth_token_factory(
 def _make_managed_mint_factory(
     server_url: str,
     binding_token: str,
+    *,
+    proxy_bearer: str | None = None,
 ) -> Callable[[], str | None] | None:
     """Build a token factory that mints a managed runner's owner JWT.
 
@@ -541,6 +548,10 @@ def _make_managed_mint_factory(
         ``"https://omnigent.example.com"``.
     :param binding_token: The runner's tunnel binding token (the sandbox's
         only credential), presented to the mint endpoint.
+    :param proxy_bearer: Optional bearer to include on the mint request so
+        an Apps proxy lets it through. Used when a host-injected initial
+        bearer is available (the minted JWT takes over on subsequent
+        refreshes).
     :returns: A sync callable returning a fresh owner JWT, or ``None`` only
         when the server *definitively* will not mint for this runner (HTTP
         400 no-auth/header mode, 404 older server without the endpoint, or a
@@ -566,7 +577,9 @@ def _make_managed_mint_factory(
     # transient failure (network blip, 5xx, timeout) installs it anyway so the
     # next callback re-mints, rather than leaving the runner unauthenticated
     # until process restart.
-    factory = _ManagedMintTokenFactory(mint_url, server_url, binding_token)
+    factory = _ManagedMintTokenFactory(
+        mint_url, server_url, binding_token, proxy_bearer=proxy_bearer
+    )
     factory()
     if factory.declined:
         return None
@@ -588,15 +601,27 @@ class _ManagedMintTokenFactory:
     factory, then the first real mint learns the server never mints).
     """
 
-    def __init__(self, mint_url: str, server_url: str, binding_token: str) -> None:
+    def __init__(
+        self,
+        mint_url: str,
+        server_url: str,
+        binding_token: str,
+        *,
+        proxy_bearer: str | None = None,
+    ) -> None:
         """
         :param mint_url: Fully-qualified ``/v1/runners/{id}/token`` URL.
         :param server_url: Omnigent server base URL.
         :param binding_token: The runner's tunnel binding token.
+        :param proxy_bearer: Optional bearer for the Apps proxy. Seeded with
+            the host's initial bearer; replaced by the minted JWT after the
+            first successful mint so the proxy sees a valid credential on
+            every subsequent refresh.
         """
         self._mint_url = mint_url
         self._server_url = server_url
         self._binding_token = binding_token
+        self._proxy_bearer = proxy_bearer
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
         self.declined = False
@@ -618,7 +643,10 @@ class _ManagedMintTokenFactory:
             return self._cached_token
         try:
             token, expires_at = _mint_managed_owner_token(
-                self._mint_url, self._server_url, self._binding_token
+                self._mint_url,
+                self._server_url,
+                self._binding_token,
+                proxy_bearer=self._proxy_bearer,
             )
         except httpx.HTTPStatusError as exc:
             response = exc.response
@@ -635,6 +663,9 @@ class _ManagedMintTokenFactory:
             return self._still_valid_cached_token(now)
         self._cached_token = token
         self._cached_expires_at = expires_at
+        # Promote the minted JWT to proxy bearer so subsequent refreshes
+        # through the Apps proxy are authenticated with a valid credential.
+        self._proxy_bearer = token
         return token
 
     def _still_valid_cached_token(self, now: float) -> str | None:
@@ -652,6 +683,8 @@ def _mint_managed_owner_token(
     mint_url: str,
     server_url: str,
     binding_token: str,
+    *,
+    proxy_bearer: str | None = None,
 ) -> tuple[str, float]:
     """Mint one managed-runner owner JWT from the server.
 
@@ -660,6 +693,10 @@ def _mint_managed_owner_token(
         routing header (``X-Databricks-Org-Id``) when applicable.
     :param binding_token: The runner's tunnel binding token, sent as the
         ``X-Omnigent-Runner-Tunnel-Token`` header to authenticate the mint.
+    :param proxy_bearer: Optional bearer for a Databricks Apps proxy sitting
+        in front of the Omnigent server. The proxy requires a valid
+        ``Authorization`` header even on unauthenticated-to-Omnigent
+        endpoints; the binding token alone is not enough to pass it.
     :returns: ``(jwt, expires_at_epoch_seconds)``.
     :raises httpx.HTTPError: On network failure or a non-2xx response.
     :raises KeyError: If the response is missing the expected fields.
@@ -673,7 +710,7 @@ def _mint_managed_owner_token(
     headers = {
         "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
         RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
-        **databricks_request_headers(server_url),
+        **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
     with httpx.Client(timeout=10.0) as client:
         response = client.post(mint_url, headers=headers)
