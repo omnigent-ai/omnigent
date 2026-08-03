@@ -230,13 +230,10 @@ import { useChatStore } from "@/store/chatStore";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
- * The production view toggle now lives inside ChatPage's
- * ConnectionIndicator; these tests are scoped to the shell's state
- * machine, so we use a probe component with the exact same
- * `aria-label`s as the production pill ("Chat" / "Terminal" — see
- * ConnectedTerminalFirstPill in ChatPage.tsx) to drive `setView`. If
- * the production labels ever change, these tests fail loudly instead
- * of drifting silently.
+ * The production view toggle lives in the header (ViewModeToggle); these
+ * tests are scoped to the shell's state machine, so we use a probe
+ * component with its own "Chat" / "Terminal" buttons to drive `setView`
+ * and read the context's derived flags off data attributes.
  */
 function TerminalFirstViewProbe() {
   const ctx = useTerminalFirst();

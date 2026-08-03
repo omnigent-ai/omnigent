@@ -25,11 +25,9 @@ import {
   GitForkIcon,
   ImageIcon,
   Loader2Icon,
-  MessageSquareIcon,
   PaperclipIcon,
   SettingsIcon,
   SquareIcon,
-  TerminalIcon,
   WifiOffIcon,
   XIcon,
 } from "lucide-react";
@@ -2788,15 +2786,11 @@ export function ConnectionIndicator({
     );
   }
 
-  // Terminal-first sessions own the Chat/Terminal toggle for EVERY
-  // reachable state — `online`, `unknown` (pre-poll), `starting`
-  // (spinning up / relaunching), AND `runner_asleep` (stopped, host
-  // alive). Only the unreachable states above replace it with the banner.
-  // Keeping the pill visible through `runner_asleep` is why stopping a
-  // runner no longer makes the toggle vanish: the pill stays, and the
-  // next send (or a fresh launch) drives its own terminal-pending spinner
-  // as the runner comes back. The strict `runner_online` still gates the
-  // inline PTY *view* (it needs a live tunnel) — but not the toggle.
+  // Terminal-first sessions: the Chat/Terminal toggle lives in the header
+  // (ViewModeToggle) for every reachable state — only the unreachable
+  // states above replace this band with the reconnect banner. In the iOS
+  // shell the toggle is the native Liquid Glass bar, so this band still
+  // reserves a spacer for its footprint.
   if (terminalFirst?.isTerminalFirst) {
     // In the iOS shell the toggle is the native bar (driven above). Render only
     // a spacer reserving its fixed footprint so the composer clears it — and
@@ -2814,13 +2808,10 @@ export function ConnectionIndicator({
         />
       ) : null;
     }
-    // A rail-opened shell owns the main view chrome-free — no pill: a
-    // "Chat" option under someone else's shell misreads as the shell
-    // being the agent. The shell view carries its own close affordance
-    // (MainTerminalView's X) back to chat.
-    if (terminalFirst.isShellView) return null;
-    if (keyboardVisible) return null;
-    return <ConnectedTerminalFirstPill ctx={terminalFirst} />;
+    // Outside the iOS shell the Chat/Terminal switcher lives in the header
+    // (ViewModeToggle) — this band renders nothing for terminal-first
+    // sessions now that the in-page pill is gone.
+    return null;
   }
 
   // A regular (non-terminal-first) session whose runner is still spinning
@@ -3057,80 +3048,6 @@ function useNativeChatTerminalBar(
     if (!native) return;
     return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
   }, [native]);
-}
-
-/**
- * Chat/Terminal segmented control for terminal-first sessions. Status
- * lives in the sidebar — this band is purely a view toggle.
- *
- * Only rendered outside the iOS shell; inside it the switcher is drawn natively
- * (Liquid Glass) over the web view — see {@link useNativeChatTerminalBar}.
- */
-function ConnectedTerminalFirstPill({
-  ctx,
-}: {
-  ctx: NonNullable<ReturnType<typeof useTerminalFirst>>;
-}) {
-  // `terminalStartingUp` is the single loading signal — AppShell folds the
-  // launch (liveness `starting`) and PTY-creation (`terminalPending`)
-  // sources into it. The button is disabled whenever no terminal is
-  // reachable: greyed-and-spinning reads as "loading", greyed-and-static as
-  // "no terminal / stopped".
-  const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
-
-  return (
-    <div
-      className={cn(
-        "terminal-first-switcher-container mx-auto flex w-full items-center justify-center px-6 pb-1.5",
-        CHAT_COLUMN_WIDTH,
-      )}
-    >
-      <div
-        role="group"
-        aria-label="View mode"
-        className="terminal-first-switcher flex items-center gap-1 rounded-full border border-border bg-card/90 p-1 text-xs shadow-sm"
-      >
-        <div className="flex items-center gap-0.5">
-          <button
-            type="button"
-            aria-pressed={view === "chat"}
-            aria-label="Chat"
-            onClick={() => setView("chat")}
-            className={cn(
-              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors",
-              view === "chat"
-                ? "bg-muted text-foreground"
-                : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-            )}
-          >
-            <MessageSquareIcon className="size-3.5 shrink-0" />
-            <span>Chat</span>
-          </button>
-          <button
-            type="button"
-            aria-pressed={view === "terminal"}
-            aria-label="Terminal"
-            disabled={!terminalsAvailable}
-            title={terminalStartingUp ? "Terminal is starting up…" : undefined}
-            onClick={() => setView("terminal")}
-            className={cn(
-              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-              view === "terminal"
-                ? "bg-muted text-foreground"
-                : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-            )}
-          >
-            {terminalStartingUp ? (
-              <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-            ) : (
-              <TerminalIcon className="size-3.5 shrink-0" />
-            )}
-            <span>Terminal</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 /**
