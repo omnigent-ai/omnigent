@@ -92,20 +92,36 @@ uses B and only claude uses A; if it fails, both use A. Claude has no
 in-place equivalent (a hook cannot type `/model`), so A is claude's only
 deterministic option.
 
-### 3c. What this REPLACES vs. keeps (Bryan's question 1)
+### 3c. What this ADDS vs. keeps — RESOLVED conservative (Bryan, 2026-08-03)
+
+Bryan's ruling: **be conservative — keep both paths.** The existing
+server/create-time path is the UI path and it matters most; the hook path is
+**additive**, closing the bare-launch gap (input omnigent did not deliver).
+Full replacement of the server trigger happens **only if the hook path proves
+deterministic in live use** (the spikes below are that evidence), and is a
+separate later decision. Rationale for keeping the outside path permanently:
+it shares its machinery with cross-harness selection —
+`_resolve_fixed_native_model_routing` calls the same `route_session_harness`
+seam the auto path uses (one-harness candidate list vs. many), so the
+"outside" code is not a parallel implementation, it IS the cross-harness code.
 
 | Piece | Fate |
 | --- | --- |
-| Server turn-gate model routing for composer turns (native) | **Replaced as the trigger** — the hook becomes the single trigger for both TUI-typed and web-composer prompts (hooks fire on injected input too). The *logic* (router call, resolution, fallback, decision record, apply) stays server-side in the `route-turn` endpoint — one implementation, two entry points collapse to one. |
-| Create-time model routing when a prompt exists (web `smart_routing_message`, CLI `--smart-routing -p`) | **Keep.** Routing at launch beats a switch when the prompt is already known (no mid-session mutation at all). It composes with the hook via the marker: create-routed sessions have `model_override` set, so the hook no-ops. |
+| Create-time model routing (web `smart_routing_message`, CLI `--smart-routing -p`) | **Keep — primary path.** Routing at launch beats a switch when the prompt is already known. Composes with the hook via the marker: create-routed sessions have `model_override` set, so the hook no-ops. |
+| Server turn-gate model routing for composer turns | **Keep.** The UI path stays exactly as verified. The hook covers only what this path cannot see: a prompt typed directly into the TUI. The marker (`model_override`) arbitrates so the two triggers never double-route. |
+| NEW: in-harness `UserPromptSubmit` → `route-turn` hook | **Add**, both harnesses. Fires only when nothing routed yet (bare launch + first TUI-typed message). |
 | Cross-harness routing (Smart Routing harness / `auto`) | **Stays outside**, unchanged — a harness must be picked before any harness exists to hook. |
 | Subagent routing (`route-subagent`) | Unchanged — already in-harness; `route-turn` is its sibling and shares transport, persistence, and trust machinery. |
+| CLI tier-2 entry machinery (`--smart-routing` preflight/create contract) | **Unchanged for now.** Once hook routing is proven deterministic, the tier-2 create machinery becomes removable — `omni codex` with the session toggle on routes on its first message with no special CLI path. Retire it then, not before. |
 | SDK harnesses (claude-sdk, codex exec-mode) | Out of scope — their turns are omnigent-owned already; the existing server path stays. |
 
-Net architecture after this lands: **all model routing for a running harness
-triggers in-harness via hooks (turn + subagent); everything outside is
-create-time (prompt-ful launches) and cross-harness selection.** Web UI and
-TUI behave identically because both funnel through the same hook + endpoint.
+Net architecture: **one decision seam** (router call, resolution, fallback,
+chip, marker) with **three triggers** — create-time (prompt-ful launches),
+the composer turn gate (web), and the new in-harness hook (TUI-typed on a
+bare launch) — arbitrated by `model_override` so exactly one ever fires per
+session. The maximal collapse (hook as sole trigger, CLI entry deleted) is
+recorded as a **possible later phase gated on determinism evidence**, not
+part of this work.
 
 ### 3d. Claude determinism (Bryan's question 2)
 
@@ -159,20 +175,22 @@ product call after the spike.
   fail-open path when the endpoint is unreachable (allow, unrouted — same
   posture as `route-subagent`).
 
-## 5. Phasing
+## 5. Phasing (conservative — per 3c)
 
-0. Spikes S1–S4 on the live stack (no product code).
+0. Spikes S1–S4 on the live stack (no product code). These double as the
+   **determinism evidence** any later collapse decision is gated on.
 1. **Codex end-to-end**: `route-turn` endpoint (+ decision chip persistence,
    marker, model_override pin), codex hook command, apply variant per S1,
-   unit + live verification (R1/R3 on a bare `omni codex` launch).
+   unit + live verification (R1/R3 on a bare `omni codex` launch). The web
+   path is untouched.
 2. **Claude**: block-and-replay per S3; live verification (R1/R2 pane
    capture: `/model` echo then the replayed prompt, banner on the routed
-   model).
-3. **Collapse the web-composer trigger** onto the hook path (per S2) and
-   retire the server-side turn-gate trigger for native sessions; the gate
-   logic itself lives on in the `route-turn` endpoint.
-4. Docs + registry rows (new CUJ rows: bare-launch TUI routing, claude and
+   model). The web path is untouched.
+3. Docs + registry rows (new CUJ rows: bare-launch TUI routing, claude and
    codex).
+4. **(Deferred, separate decision)** If phases 1–2 hold up deterministic in
+   live use: collapse the composer trigger onto the hook path, retire the
+   CLI tier-2 create machinery. Requires Bryan's explicit go; not scheduled.
 
 ## 6. Risks & traps (transcribe, don't rediscover — plan 0d)
 
