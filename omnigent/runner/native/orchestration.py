@@ -3627,7 +3627,7 @@ async def _auto_create_codex_terminal(
     # separate subprocess that POSTs tool calls to /policies/evaluate, so
     # it reads a one-shot token snapshot from policy_hook.json — same as
     # the claude-native PermissionRequest hook on this host-spawned path.
-    from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     _policy_auth_factory = _make_auth_token_factory()
     _policy_auth_token = _policy_auth_factory() if _policy_auth_factory is not None else None
@@ -3778,6 +3778,12 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
+                auth_token_factory=(
+                    server_client.auth._factory  # type: ignore[union-attr]
+                    if server_client is not None
+                    and isinstance(server_client.auth, _RunnerDatabricksAuth)
+                    else None
+                ),
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -3814,6 +3820,7 @@ async def _codex_discover_thread_and_forward(
     codex_home: Path,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    auth_token_factory: Callable[[], str | None] | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -3838,6 +3845,9 @@ async def _codex_discover_thread_and_forward(
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param auth_token_factory: Runner's auth token factory. When provided,
+        reused so the PATCH and forwarder share the runner's existing proxy
+        bearer rather than minting a fresh credential.
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
@@ -3889,8 +3899,22 @@ async def _codex_discover_thread_and_forward(
             ),
         )
 
+        # Mirror the discovered Codex thread id onto the Omnigent session as its
+        # external_session_id, the same way claude-native records its
+        # captured session id. This is what makes the session forkable with
+        # history: fork_conversation stamps
+        # ``omnigent.fork.source_external_session_id`` from
+        # external_session_id, and the forked clone's runner clones this
+        # thread's rollout from it (see _clone_codex_rollout). Without it a
+        # host-spawned codex session has no recorded thread id, so a fork
+        # would resume fresh. Best-effort: a transient Omnigent failure here still
+        # leaves chat streaming working — only fork-history carry-over
+        # degrades.
         server_url = _required_runner_env("RUNNER_SERVER_URL")
-        auth_factory = _make_auth_token_factory()
+        # Reuse the runner's existing auth factory (including proxy bearer for
+        # Apps deployments) when the caller passes one; fall back to a fresh
+        # factory only when called without one (e.g. tests).
+        auth_factory = auth_token_factory or _make_auth_token_factory()
         auth_token = auth_factory() if auth_factory is not None else None
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
 
