@@ -1195,19 +1195,11 @@ def test_pi_gateway_default_pi_scope_unresolved_credential_names_var(
 ) -> None:
     """A ``kind: gateway`` provider with ``default: pi`` names the missing env var on failure.
 
-    Issue #3788: when a ``kind: gateway`` provider is the pi default via an
-    explicit ``default: pi`` scope and its ``api_key_ref: env:VAR`` cannot
-    resolve (the env var is unset in the runner), the error must name the
-    missing variable rather than emitting the generic "set the api_key env
-    var for its 'anthropic' or 'openai' family" message that omits the name.
-
-    Failure before the fix: error message was
-    "provider 'my-gateway' configures no family whose credentials resolve —
-    set the api_key env var for its 'anthropic' or 'openai' family in your
-    shell, then retry." with no mention of MY_GATEWAY_TOKEN.
-
-    Fixed: the original credential resolution error (naming MY_GATEWAY_TOKEN)
-    is now surfaced so the user knows which env var to export.
+    When a ``kind: gateway`` provider is the pi default via an explicit
+    ``default: pi`` scope and its ``api_key_ref: env:VAR`` cannot resolve
+    (the env var is unset in the runner), the error must name the missing
+    variable. The original credential-resolution error from ``resolve_secret``
+    is surfaced rather than a generic message that omits the variable name.
     """
     from omnigent.errors import OmnigentError
 
@@ -1238,9 +1230,9 @@ def test_pi_gateway_default_pi_scope_resolved_credential_succeeds(
 ) -> None:
     """A ``kind: gateway`` provider with ``default: pi`` routes pi when the credential resolves.
 
-    Issue #3788 success path: the same setup as the failure test above, but
-    with MY_GATEWAY_TOKEN exported — ``_build_pi_spawn_env`` must populate
-    the openai family's gateway transport vars correctly.
+    When ``MY_GATEWAY_TOKEN`` is exported, ``_build_pi_spawn_env`` must
+    populate the openai family's gateway transport vars correctly for a
+    provider that only claims the ``pi`` default scope (not ``openai``).
     """
     monkeypatch.setenv("MY_GATEWAY_TOKEN", "sk-gw-secret")
     config: dict[str, object] = {

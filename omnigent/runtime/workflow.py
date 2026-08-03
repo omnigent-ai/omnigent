@@ -802,7 +802,7 @@ def _apply_provider_to_openai_agents(env: dict[str, str], family: FamilyConfig) 
 
 def _optional_provider_family(
     entry: ProviderEntry, family_name: str
-) -> tuple[FamilyConfig, None] | tuple[None, OmnigentError | None]:
+) -> tuple[FamilyConfig | None, OmnigentError | None]:
     """Attempt to resolve a provider family, returning success or failure info.
 
     For the ``pi`` harness, which carries a single credential but probes
@@ -810,16 +810,15 @@ def _optional_provider_family(
     unavailable rather than fatal, so e.g. a user who only exported
     ``ANTHROPIC_API_KEY`` can still run pi on the anthropic family.
 
-    The only :class:`OmnigentError` raised at family-access time comes from
-    the deferred ``$VAR`` expansion (structural validation already happened
-    at parse time). A ``keychain:`` ref raises ``ValueError`` (deferred —
-    see :func:`resolve_secret`); that propagates so the user sees the clear
-    "not yet supported" message rather than a silent skip.
+    All credential resolution failures (unresolved ``env:`` var, missing
+    keychain secret) raise :class:`OmnigentError` at family-access time
+    (structural validation already happened at parse time). They are caught
+    here so the other family can be tried; the error is returned to the
+    caller so it can be surfaced when no family succeeds.
 
-    Returns a two-tuple ``(family, error)`` so the caller can surface the
-    credential resolution error when no family succeeds, rather than
-    emitting a generic "no family resolves" message without naming the
-    missing variable.
+    Returns a two-tuple ``(family, error)`` so the caller can include the
+    original resolution error in its failure message, naming the missing
+    variable instead of emitting a generic "no family resolves" message.
 
     :param entry: The resolved provider entry.
     :param family_name: Family key, e.g. ``"openai"`` or ``"anthropic"``.
