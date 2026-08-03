@@ -12,7 +12,6 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-import omnigent.server.routes._sessions.orchestration as _sessions_orchestration_module
 from omnigent.entities import (
     Agent,
 )

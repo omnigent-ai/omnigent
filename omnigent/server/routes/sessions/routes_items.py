@@ -10,8 +10,6 @@ from fastapi import (
     Request,
 )
 
-import omnigent.server.routes._sessions.common as _sessions_common_module
-import omnigent.server.routes._sessions.helpers as _sessions_helpers_module
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
