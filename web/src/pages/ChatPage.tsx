@@ -82,7 +82,7 @@ import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
-import type { MessageContentBlock } from "@/lib/blocks";
+import type { AnyBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   derivePermissionLevel,
   isOwnerLevel,
@@ -107,6 +107,7 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
+import type { ActiveResponse } from "@/store/types";
 import { isNativeTerminalSession, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import {
   buildMentionPreamble,
@@ -890,6 +891,13 @@ export function ChatPage() {
     runnerOnline,
     backgroundTaskCount,
   });
+  const showPendingAssistantSkeleton = shouldShowPendingAssistantSkeleton(
+    showsWorking,
+    sessionStatus,
+    activeResponse,
+    blocks,
+    bubbles,
+  );
 
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
@@ -1113,6 +1121,7 @@ export function ChatPage() {
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
+      showPendingAssistantSkeleton={showPendingAssistantSkeleton}
       runnerOnline={runnerOnline}
       liveness={liveness}
       agentsError={agentsError}
@@ -1330,6 +1339,8 @@ interface MainAgentSurfaceProps {
   /** Display-only main-chat indicator after elicitation/offline gates.
    *  Never includes child-session activity and never gates Stop/Interrupt. */
   showsWorking: boolean;
+  /** Show a provisional assistant bubble until the active turn paints content. */
+  showPendingAssistantSkeleton: boolean;
   /**
    * Strict runner-tunnel liveness, used only to gate the inline terminal
    * view (the PTY dies the moment the runner tunnel drops). The reconnect
@@ -1427,6 +1438,7 @@ function MainAgentSurface({
   status,
   isWorking,
   showsWorking,
+  showPendingAssistantSkeleton,
   runnerOnline,
   liveness,
   agentsError,
@@ -1672,7 +1684,8 @@ function MainAgentSurface({
   // tool runs, and reasoning gaps — including after a reload that hydrates
   // `running` before any bubbles exist locally. Only a trailing compaction
   // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
+  const showWorkingStatus = shouldShowWorkingIndicator(showsWorking, bubbles);
+  const showWorkingIndicator = showWorkingStatus && !showPendingAssistantSkeleton;
 
   if (showTerminal && conversationId) {
     return (
@@ -1774,6 +1787,7 @@ function MainAgentSurface({
                     </MessageContent>
                   </Message>
                 ))}
+                {showPendingAssistantSkeleton && <PendingAssistantSkeleton />}
                 {/* Working… shimmer, lit for the whole busy turn so the user
                     always sees the session is still going. Suppressed when the
                     last bubble is a compaction spinner — that bubble already
@@ -1787,7 +1801,7 @@ function MainAgentSurface({
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                {!showWorkingStatus && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native): renders while the
                     harness boots its MCP servers and, after startup settles,
                     when servers failed or were cancelled. Independent of the
@@ -1806,7 +1820,7 @@ function MainAgentSurface({
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
+          <WorkingStatusPin show={showWorkingStatus} suppress={subAgentLabel != null} />
           <UserMessageNavConnected
             goPrev={nav.goPrev}
             goNext={nav.goNext}
@@ -2640,6 +2654,40 @@ function WorkingIndicator() {
         </div>
       </MessageContent>
     </Message>
+  );
+}
+
+function PendingAssistantSkeleton() {
+  return (
+    <Message from="assistant" data-testid="pending-assistant-skeleton" aria-hidden="true">
+      <MessageContent>
+        <div className="flex w-full max-w-md animate-pulse flex-col gap-2 py-1">
+          <div className="h-3 w-4/5 rounded-full bg-muted-foreground/15" />
+          <div className="h-3 w-3/5 rounded-full bg-muted-foreground/10" />
+        </div>
+      </MessageContent>
+    </Message>
+  );
+}
+
+/** Show a provisional assistant bubble until the active turn paints content. */
+export function shouldShowPendingAssistantSkeleton(
+  showsWorking: boolean,
+  sessionStatus: SessionStatus,
+  activeResponse: ActiveResponse | null,
+  blocks: AnyBlock[],
+  bubbles: Bubble[],
+): boolean {
+  if (!showsWorking) return false;
+  if (sessionStatus !== "running" && activeResponse?.state !== "streaming") return false;
+  if (bubbles.at(-1)?.kind === "compaction_loading") return false;
+  if (blocks.some((block) => block.ctx.itemId?.startsWith("live:"))) return false;
+  if (activeResponse?.state !== "streaming") return true;
+  return !bubbles.some(
+    (bubble) =>
+      bubble.kind === "assistant" &&
+      bubble.responseId === activeResponse.responseId &&
+      bubble.items.length > 0,
   );
 }
 
