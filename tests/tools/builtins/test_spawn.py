@@ -101,7 +101,16 @@ def test_plain_string_args_validate() -> None:
     _validate("just a message")
 
 
+def test_object_args_with_reasoning_effort_validate() -> None:
+    _validate({"input": "go", "reasoning_effort": "high"})
+
+
 # ── Errors ────────────────────────────────────────────
+
+
+def test_unknown_reasoning_effort_rejected() -> None:
+    with pytest.raises(jsonschema.ValidationError):
+        _validate({"input": "go", "reasoning_effort": "unbounded"})
 
 
 def test_file_ids_string_rejected() -> None:

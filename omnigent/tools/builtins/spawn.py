@@ -288,7 +288,8 @@ def _build_sys_session_send_schema(
             "The user-input message to send to the sub-agent. The sub-agent "
             "treats this as the first user turn in its conversation. Pass a "
             "plain string for the normal contract, or pass "
-            "{input, purpose, model, harness, cost_budget} when a spec-level "
+            "{input, purpose, model, reasoning_effort, harness, cost_budget} "
+            "when a spec-level "
             "policy requires explicit dispatch metadata, a per-dispatch model "
             "override, an allowlisted harness override, or a per-subagent "
             "cost budget."
@@ -298,7 +299,8 @@ def _build_sys_session_send_schema(
             "The user-input message to send to the sub-agent. The sub-agent "
             "treats this as the first user turn in its conversation. Pass a "
             "plain string for the normal contract, or pass "
-            "{input, purpose, model, cost_budget} when a spec-level policy "
+            "{input, purpose, model, reasoning_effort, cost_budget} when a "
+            "spec-level policy "
             "requires explicit dispatch metadata, a per-dispatch model "
             "override, or a per-subagent cost budget."
         )
@@ -355,6 +357,24 @@ def _build_sys_session_send_schema(
                                             "Applies only when this send "
                                             "CREATES the sub-agent session; "
                                             "omitted = the harness default."
+                                        ),
+                                    },
+                                    "reasoning_effort": {
+                                        "type": "string",
+                                        "enum": [
+                                            "none",
+                                            "minimal",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max",
+                                        ],
+                                        "description": (
+                                            "Optional reasoning effort for the "
+                                            "sub-agent session. Applies only when "
+                                            "this send CREATES the session; omitted "
+                                            "= the agent or harness default."
                                         ),
                                     },
                                     "file_ids": {
@@ -930,6 +950,15 @@ class SysSessionCreateTool(Tool):
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                            "description": (
+                                "Optional reasoning effort for the child session. "
+                                "Sets the effort at session creation; omit to use "
+                                "the agent or harness default."
                             ),
                         },
                     },

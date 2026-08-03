@@ -1141,6 +1141,16 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
+    """Extract the optional create-time reasoning effort from a named send."""
+    from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
+
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    return validate_effort(raw_message.get("reasoning_effort"), "Omnigent", EFFORT_VALUES)
+
+
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -1608,6 +1618,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'model': {exc}"
 
     try:
+        reasoning_effort = _subagent_reasoning_effort_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
+
+    try:
         file_ids = _subagent_file_ids_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'file_ids': {exc}"
@@ -1639,6 +1654,13 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'model' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'model' to continue "
+                f"session {target_session_id!r}."
+            )
+        if reasoning_effort is not None:
+            return (
+                "Error: sys_session_send 'reasoning_effort' applies only when a "
+                "sub-agent session is first created; it cannot change an existing "
+                f"session. Re-send without 'reasoning_effort' to continue "
                 f"session {target_session_id!r}."
             )
         if file_ids:
@@ -1734,6 +1756,15 @@ async def _execute_subagent_tool(
                 f"{child_session_id}. Re-send without 'model' to continue "
                 "it, or sys_session_close it first to spawn a fresh "
                 "session on the requested model."
+            )
+        if reasoning_effort is not None:
+            return (
+                f"Error: sys_session_send 'reasoning_effort' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} "
+                f"title {session_name!r} already exists as "
+                f"{child_session_id}. Re-send without 'reasoning_effort' to "
+                "continue it, or sys_session_close it first to spawn a fresh "
+                "session on the requested effort."
             )
         if file_ids:
             return (
@@ -1876,6 +1907,8 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
+        if reasoning_effort is not None:
+            create_body["reasoning_effort"] = reasoning_effort
         resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
@@ -2197,6 +2230,7 @@ def _build_session_create_body(
     title: Any,
     message: Any,
     model: Any = None,
+    reasoning_effort: Any = None,
 ) -> dict[str, Any]:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2225,6 +2259,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2375,6 +2411,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2540,6 +2577,9 @@ async def _upload_config_bundle(
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
+    reasoning_effort = args.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        metadata["reasoning_effort"] = reasoning_effort
     try:
         resp = await server_client.post(
             "/v1/sessions",
