@@ -302,3 +302,18 @@ def test_native_tui_harnesses_declare_shell_tool_provocation() -> None:
         assert capability.shell_tool_name, harness
         assert capability.shell_tool_prompt, harness
         assert "omnigent-bench-ok" in capability.shell_tool_prompt, harness
+
+
+def test_databricks_genie_declarations_match_the_executor() -> None:
+    """Genie's declared capabilities match what DatabricksGenieExecutor implements.
+
+    ``resume`` must stay NONE until the conversation id is persisted or history
+    is replayed (neither happens today: one user message per turn, id lives on
+    the in-process executor). ``interrupt`` is True because interrupt_session()
+    closes the live response stream; ``streaming`` is True because output items
+    arrive progressively over SSE.
+    """
+    caps = harness_capabilities()["databricks-genie"]
+    assert caps.resume is Resume.NONE
+    assert caps.interrupt is True
+    assert caps.streaming is True

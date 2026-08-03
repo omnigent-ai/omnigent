@@ -55,7 +55,7 @@ of the agent YAML.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, databricks-genie, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -149,10 +149,69 @@ shell, declare a key/gateway provider in `~/.omnigent/config.yaml`, or use
 `executor.auth: {type: databricks, profile: …}` and let Omnigent resolve
 the workspace.
 
+### Databricks Genie Spaces
+
+`harness: databricks-genie` (alias `genie`) registers a remote Databricks
+**AI/BI Genie space** as the agent's harness (`pip install
+"omnigent[databricks]"`). Each turn is posted to the space's Genie **Agent-mode
+Responses API** (`POST /api/2.0/genie/agents/{space_id}/responses`) and streamed
+back over SSE as each step of the turn completes — whole items, not
+token-by-token deltas. Genie's planning arrives as reasoning and each SQL query
+it runs shows up as a tool call while the turn is still running; the report text
+lands when Genie finishes writing it, with result rows re-rendered as Markdown
+tables (capped at 50 rows). Follow-up turns continue the same Genie
+conversation.
+
+Genie Agent mode is a Databricks **Beta** API gated on a workspace preview
+toggle. Until a workspace admin turns it on, the endpoint answers 404
+`FEATURE_DISABLED` and the turn fails saying exactly that.
+
+A Genie space is the conversational unit, so its **space id** is carried in
+`executor.model`. Authentication reuses the Databricks CLI: run
+`databricks auth login --host <workspace>` once (writes `~/.databrickscfg`), then
+name the profile under `executor.auth`.
+
+```yaml
+executor:
+  harness: databricks-genie      # alias: genie
+  model: "01ef…"                 # the Genie space id (from the room URL)
+  auth:
+    type: databricks
+    profile: DEFAULT             # ~/.databrickscfg profile; omit to use defaults
+```
+
+Two Genie-specific knobs:
+
+- **`enable_viz`** (default `false`) asks Genie to attach visualizations to its
+  answer; left off, the field is omitted from the request entirely. It is read
+  from `executor.config`, so it belongs in a bundle spec such as
+  [`examples/genie/config.yaml`](../examples/genie/config.yaml) — the
+  single-file format above has no `config:` block. For a single-file spec, set
+  `HARNESS_DATABRICKS_GENIE_ENABLE_VIZ=true` in the environment instead. The
+  chart itself renders in the Genie room — follow the citation link in the
+  answer; Omnigent's own output stays text and tables.
+- **`HARNESS_DATABRICKS_GENIE_TIMEOUT`** overrides the stream idle timeout in
+  seconds (default `900`). It bounds each silent gap in the streamed response —
+  one long warehouse query is a single gap — not the turn's total length. The
+  harness subprocess's idle watchdog (`HARNESS_TURN_TIMEOUT_S`) is sized just
+  above it automatically unless you set that variable yourself.
+
+Unlike the gateway-backed harnesses, Genie talks to the workspace directly with
+the credentials the Databricks SDK resolves from your profile — every request
+carries a freshly minted bearer token, so a long turn survives OAuth token
+expiry — not through the Databricks AI gateway. It also dispatches no Omnigent
+tools: the space runs its own SQL, so those calls are surfaced as observations.
+See [`examples/genie`](../examples/genie).
+
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
 `executor.auth` block or your `omnigent setup` provider config — there is
-no profile flag.
+no profile flag. `databricks-genie` is the exception on the provider half: it
+takes the profile from the spec alone (`executor.auth.profile`, or the legacy
+`executor.profile` / `executor.config.profile`), so a default provider from
+`omnigent setup` does not apply to it; with no profile in the spec it falls back
+to the Databricks SDK's own resolution (`DATABRICKS_CONFIG_PROFILE` env var /
+`[DEFAULT]` section).
 
 ## Qwen Code
 

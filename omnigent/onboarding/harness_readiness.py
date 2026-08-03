@@ -74,7 +74,7 @@ from omnigent.onboarding.provider_config import (
 _logger = logging.getLogger(__name__)
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
+    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity", "databricks-genie"}
 )
 
 # Families whose CLIs authenticate via file-based credentials rather than a CLI

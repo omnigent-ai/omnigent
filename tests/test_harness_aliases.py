@@ -30,6 +30,9 @@ from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
         ("agy", "antigravity"),
         ("google-antigravity", "antigravity"),
         ("antigravity", "antigravity"),
+        # Databricks Genie Spaces harness: short alias → canonical id.
+        ("genie", "databricks-genie"),
+        ("databricks-genie", "databricks-genie"),
         # Unknown names return unchanged so callers keep their own errors.
         ("bogus", "bogus"),
         (None, None),
@@ -71,6 +74,9 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("claude", False),
         # cursor is a headless ACP harness, not a native CLI bridge.
         ("cursor", False),
+        # databricks-genie is an in-process SDK harness, not a native CLI bridge.
+        ("databricks-genie", False),
+        ("genie", False),
         ("some-unknown-harness", False),
         (None, False),
     ],
@@ -125,3 +131,15 @@ def test_native_terminal_name(harness: str | None, expected: str | None) -> None
     wrong pane or silently skip a harness.
     """
     assert native_terminal_name(harness) == expected
+
+
+def test_harness_choices_help_names_the_genie_harness() -> None:
+    """The ``--harness`` help string names both genie spellings.
+
+    ``--harness`` accepts any registered harness, so the help text is the only
+    place a CLI user discovers the id — an omission reads as "not runnable".
+    """
+    from omnigent.cli import _HARNESS_CHOICES_HELP
+
+    assert "databricks-genie" in _HARNESS_CHOICES_HELP
+    assert "'genie'" in _HARNESS_CHOICES_HELP
