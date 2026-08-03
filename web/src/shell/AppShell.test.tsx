@@ -3,7 +3,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
