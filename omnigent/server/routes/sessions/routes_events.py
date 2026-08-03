@@ -25,6 +25,9 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    WORKSPACE_NOT_FOUND_ERROR_CODE as _WORKSPACE_NOT_FOUND_ERROR_CODE,
+)
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -1255,23 +1258,37 @@ def register_events_routes(
                         _host_reg,
                         _host_conn,
                     )
+                    host_error_code: str | None = None
+                    host_error: str | None = None
                     if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
-                        # The host refused: the agent's harness isn't
-                        # configured there. This message was the real
-                        # runner-start attempt, so consume it and record a
-                        # transcript error (the host's message names the
-                        # fix, `omnigent setup`) the web renders as a
-                        # banner — instead of timing out into a generic
-                        # RUNNER_UNAVAILABLE. The binding stays so a later
-                        # message relaunches once setup is done.
+                        host_error_code = _HARNESS_NOT_CONFIGURED_ERROR_CODE
+                        host_error = launch_attempt.error
+                    else:
+                        workspace_error = f"workspace path does not exist: {conv.workspace}"
+                        if launch_attempt.error_code == _WORKSPACE_NOT_FOUND_ERROR_CODE or (
+                            # Rolling upgrade: older hosts send this exact
+                            # categorical reason without an error_code.
+                            launch_attempt.error_code is None
+                            and launch_attempt.error == workspace_error
+                        ):
+                            host_error_code = _WORKSPACE_NOT_FOUND_ERROR_CODE
+                            # Rebuild from the authorized session row instead
+                            # of reflecting arbitrary host-provided text.
+                            host_error = workspace_error
+                    if host_error_code is not None:
+                        # No runner can connect after either safe categorical
+                        # refusal. Consume the message and record the actionable
+                        # reason instead of waiting into a generic unavailable
+                        # response. The binding stays for a later retry.
                         item_id = await _persist_host_launch_failure_turn(
                             session_id,
                             conv,
                             body,
                             conversation_store,
-                            launch_attempt.error,
+                            host_error,
                             runner_router,
                             created_by=created_by,
+                            host_error_code=host_error_code,
                         )
                         return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id
