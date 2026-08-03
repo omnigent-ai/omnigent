@@ -198,8 +198,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse the
-    relay/MCP implementation but keep bridge files below their own bridge roots.
+    Codex-, Pi-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse
+    the relay/MCP implementation but keep bridge files below their own bridge roots.
     All roots use the same owner-only ancestor validation; only the trusted
     anchor differs.
 
@@ -223,6 +223,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         trusted_parent = codex_root.parent
         if codex_root.name == "codex-native" and codex_root.parent.name == ".omnigent":
             trusted_parent = codex_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
+    from omnigent.pi_native_bridge import bridge_root as pi_bridge_root
+
+    pi_root = _absolute_syntactic_path(pi_bridge_root())
+    if target.is_relative_to(pi_root):
+        # Pi-native uses the same $HOME/.omnigent/<harness>-native layout as
+        # Codex-native. Trust $HOME in production, while allowing tests to
+        # monkeypatch the bridge root to a different shape.
+        trusted_parent = pi_root.parent
+        if pi_root.name == "pi-native" and pi_root.parent.name == ".omnigent":
+            trusted_parent = pi_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
     from omnigent.cursor_native_bridge import bridge_root as cursor_bridge_root
@@ -297,7 +309,7 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
 
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
+        f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
         f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
         f"{kiro_root!s}, {acp_root!s})"
     )

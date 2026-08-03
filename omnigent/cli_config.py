@@ -3778,7 +3778,10 @@ def _run_configure_harnesses_interactive() -> None:
             openclaw_agents_to_acp_entries,
         )
 
-        acp_summary = acp_config_summary()
+        try:
+            acp_summary = acp_config_summary()
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid acp.agents configuration: {exc}") from exc
         for agent in acp_summary.agents:
             rows.append(
                 (

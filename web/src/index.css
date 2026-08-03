@@ -635,10 +635,6 @@
     padding-bottom: 0.25rem;
   }
 
-  [data-ios-native] .terminal-first-switcher-container {
-    padding-bottom: calc(0.35rem + var(--omnigent-safe-bottom));
-  }
-
   /* Reserve room for the native Liquid Glass switcher that floats over the web
      view (the in-page pill is suppressed in the iOS shell). Height is the
      shared bottom inset — the native bar footprint (sourced from the shell, see
@@ -650,70 +646,6 @@
   [data-ios-native] .omnigent-native-bottom-spacer--chat {
     height: var(--omnigent-inset-bottom);
     flex: none;
-  }
-
-  [data-ios-native] .terminal-first-switcher {
-    min-height: 46px;
-    gap: 0.25rem;
-    padding: 0.25rem;
-    border-color: color-mix(in srgb, var(--border) 72%, transparent);
-    background: color-mix(in srgb, var(--card) 88%, transparent);
-    -webkit-backdrop-filter: saturate(180%) blur(18px);
-    backdrop-filter: saturate(180%) blur(18px);
-    box-shadow:
-      0 12px 28px rgb(0 0 0 / 0.13),
-      0 1px 0 rgb(255 255 255 / 0.55) inset;
-    font-size: 16px;
-    line-height: 1;
-  }
-
-  [data-ios-native] .terminal-first-switcher > div {
-    gap: 0.25rem;
-  }
-
-  [data-ios-native] .terminal-first-switcher-option {
-    min-height: 38px;
-    gap: 0.45rem;
-    padding: 0 0.85rem;
-    font-size: 16px;
-    font-weight: 500;
-    letter-spacing: 0;
-    transition:
-      background-color 160ms ease,
-      color 160ms ease,
-      box-shadow 160ms ease,
-      transform 160ms ease;
-  }
-
-  [data-ios-native] .terminal-first-switcher-option:active:not(:disabled) {
-    transform: scale(0.97);
-  }
-
-  [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
-    background: color-mix(in srgb, var(--background) 82%, white 18%);
-    box-shadow:
-      0 3px 10px rgb(0 0 0 / 0.1),
-      0 1px 0 rgb(255 255 255 / 0.72) inset;
-  }
-
-  [data-ios-native] .terminal-first-switcher-option svg {
-    width: 1.15rem;
-    height: 1.15rem;
-  }
-
-  .dark [data-ios-native] .terminal-first-switcher {
-    border-color: color-mix(in srgb, var(--border) 82%, transparent);
-    background: color-mix(in srgb, var(--card) 78%, transparent);
-    box-shadow:
-      0 14px 30px rgb(0 0 0 / 0.35),
-      0 1px 0 rgb(255 255 255 / 0.1) inset;
-  }
-
-  .dark [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
-    background: color-mix(in srgb, var(--muted) 82%, white 6%);
-    box-shadow:
-      0 3px 12px rgb(0 0 0 / 0.28),
-      0 1px 0 rgb(255 255 255 / 0.12) inset;
   }
 
   :is([data-ios-native], [data-android-native])

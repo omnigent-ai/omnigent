@@ -122,6 +122,8 @@ from omnigent.runner.native.orchestration import (
     _terminal_lookup_miss_reason,
     _terminal_tmux_pane,
     _unwrap_resolved_spec,
+    teardown_all_codex_native_app_servers,
+    teardown_codex_native_app_server,
 )
 
 __all__ = [
@@ -247,4 +249,6 @@ __all__ = [
     "_terminal_lookup_miss_reason",
     "_terminal_tmux_pane",
     "_unwrap_resolved_spec",
+    "teardown_all_codex_native_app_servers",
+    "teardown_codex_native_app_server",
 ]

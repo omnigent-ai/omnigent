@@ -31,13 +31,18 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
-    from omnigent.spec.types import AgentSpec
+    from omnigent.spec.types import AgentSpec, SkillSpec
+    from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
 
@@ -61,7 +66,7 @@ from omnigent.session_lifecycle import (
     title_without_closed_marker,
 )
 from omnigent.tools import ToolManager
-from omnigent.tools.base import ToolContext
+from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
@@ -128,6 +133,32 @@ def _string_object_dict(value: object) -> _JsonObject | None:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         return None
     return cast("_JsonObject", value)
+
+
+def _optional_string(value: object) -> str | None:
+    """Return *value* when it is a string, otherwise ``None``."""
+    return value if isinstance(value, str) else None
+
+
+def _json_object_list(value: object) -> list[_JsonObject]:
+    """Return the object entries from a JSON array."""
+    if not isinstance(value, list):
+        return []
+    objects: list[_JsonObject] = []
+    for entry in value:
+        parsed = _string_object_dict(entry)
+        if parsed is not None:
+            objects.append(parsed)
+    return objects
+
+
+def _string_mapping(value: object) -> dict[str, str] | None:
+    """Return the string entries from a mapping-like JSON object."""
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: item for key, item in value.items() if isinstance(key, str) and isinstance(item, str)
+    }
 
 
 _INBOX_OUTPUT_MAX_CHARS = 12000
@@ -1553,13 +1584,13 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
 
 
 async def _execute_subagent_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
-    agent_spec: Any | None = None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    agent_spec: AgentSpec | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
 ) -> str:
     """
     Dispatch a sub-agent tool call (``sys_session_send``).
@@ -1677,7 +1708,7 @@ async def _execute_subagent_tool(
     # Named mode: (agent, title) spawn-or-continue.
     sub_agent_name = args.get("agent")
     session_name = args.get("title")
-    if not sub_agent_name:
+    if not isinstance(sub_agent_name, str) or not sub_agent_name:
         return "Error: sys_session_send requires 'agent' (or 'session_id')"
     if not session_name or not isinstance(session_name, str):
         return "Error: sys_session_send requires non-empty 'title' string"
@@ -1842,7 +1873,7 @@ async def _execute_subagent_tool(
         # Create child session on the server (no initial items —
         # those go via a separate POST so the server forwards them
         # to the runner and triggers a turn).
-        create_body: dict[str, Any] = {
+        create_body: _JsonObject = {
             "agent_id": parent_agent_id,
             "parent_session_id": conversation_id,
             "title": f"{sub_agent_name}:{session_name}",
@@ -1879,9 +1910,11 @@ async def _execute_subagent_tool(
         resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
-        child_data = resp.json()
+        child_data = _string_object_dict(resp.json())
+        if child_data is None:
+            return "Error: server returned malformed child session data"
         child_session_id = child_data.get("session_id") or child_data.get("id")
-        if not child_session_id:
+        if not isinstance(child_session_id, str) or not child_session_id:
             return "Error: server did not return child session_id"
         child_wrapper_label = _session_wrapper_label(child_data)
         created_child = True
@@ -2060,7 +2093,7 @@ async def _send_to_existing_session(
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
     created_by: str | None = None,
 ) -> str:
     """
@@ -2194,10 +2227,10 @@ async def _send_to_existing_session(
 def _build_session_create_body(
     agent_id: str,
     conversation_id: str,
-    title: Any,
-    message: Any,
-    model: Any = None,
-) -> dict[str, Any]:
+    title: object,
+    message: object,
+    model: object = None,
+) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
@@ -2217,7 +2250,7 @@ def _build_session_create_body(
         written as ``model_override`` on the session.
     :returns: The JSON request body.
     """
-    body: dict[str, Any] = {
+    body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
     }
@@ -2236,12 +2269,12 @@ def _build_session_create_body(
 
 
 def _finalize_created_session(
-    data: dict[str, Any],
+    data: _JsonObject,
     *,
     conversation_id: str,
     agent_id: str,
-    title: Any,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
+    title: object,
+    publish_event: Callable[[str, _JsonObject], None] | None,
 ) -> str:
     """
     Register fan-out, emit ``session.created``, and build the handle.
@@ -2264,13 +2297,17 @@ def _finalize_created_session(
     from omnigent.runner import app as _runner_app
     from omnigent.server.schemas import SessionCreatedEvent
 
-    child_id = data["id"]
+    child_id = data.get("id")
+    if not isinstance(child_id, str) or not child_id:
+        return json.dumps({"error": "server did not return child session id"})
+    agent_name = data.get("agent_name")
+    agent_label = agent_name if isinstance(agent_name, str) and agent_name else "agent"
     label = title if isinstance(title, str) else ""
     _runner_app.register_child_session(
         child_id,
         parent_session_id=conversation_id,
         title=label,
-        tool=data.get("agent_name") or "agent",
+        tool=agent_label,
         session_name=label,
     )
     evt = SessionCreatedEvent(
@@ -2295,12 +2332,12 @@ def _finalize_created_session(
 
 
 async def _execute_session_create(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
-    agent_spec: Any | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None,
+    agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
 ) -> str:
     """
@@ -2495,13 +2532,13 @@ async def _post_child_first_message(
 
 async def _upload_config_bundle(
     config_path: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
-) -> dict[str, Any] | str:
+) -> _JsonObject | str:
     """
     Resolve, bundle, and upload a local agent config as a child session.
 
@@ -2523,6 +2560,7 @@ async def _upload_config_bundle(
         JSON error string otherwise.
     """
     os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    assert os_spec.cwd is not None
     resolved_cwd = Path(os_spec.cwd).resolve()
     source = (resolved_cwd / config_path).resolve()
     if not source.is_relative_to(resolved_cwd):
@@ -2536,7 +2574,7 @@ async def _upload_config_bundle(
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
-    metadata: dict[str, Any] = {"parent_session_id": conversation_id}
+    metadata: _JsonObject = {"parent_session_id": conversation_id}
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
@@ -2555,18 +2593,18 @@ async def _upload_config_bundle(
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
         )
-    data: dict[str, Any] = resp.json()
+    data: _JsonObject = resp.json()
     return data
 
 
 async def _session_create_from_config_path(
     config_path: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
-    agent_spec: Any | None,
+    publish_event: Callable[[str, _JsonObject], None] | None,
+    agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
 ) -> str:
     """
@@ -2637,14 +2675,14 @@ async def _session_create_from_config_path(
 
 
 async def _execute_web_fetch_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     task_id: str | None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
 ) -> str:
     """
     Dispatch a ``web_fetch`` tool call.
@@ -2703,7 +2741,7 @@ async def _execute_web_fetch_tool(
     )
 
 
-def _web_search_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+def _web_search_config_from_spec(agent_spec: AgentSpec | None) -> dict[str, str]:
     """
     Return the ``web_search`` builtin's config dict from the parent spec.
 
@@ -2727,9 +2765,9 @@ def _web_search_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
 
 
 async def _execute_web_search_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -2780,7 +2818,7 @@ async def _execute_web_search_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
-def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
+def _hindsight_config_from_spec(agent_spec: AgentSpec | None, tool_name: str) -> dict[str, str]:
     """
     Return a Hindsight builtin's config dict from the parent spec.
 
@@ -2803,10 +2841,10 @@ def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[
 
 
 async def _execute_hindsight_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     tool_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -2844,7 +2882,7 @@ async def _execute_hindsight_tool(
 
 def _has_subagent(
     sub_agent_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
 ) -> bool:
     """
     Check whether a sub-agent name exists in the parent spec.
@@ -2879,7 +2917,7 @@ def _has_subagent(
 
 
 async def _execute_timer_set(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
@@ -2986,7 +3024,7 @@ async def _timer_loop(
 
 
 async def _execute_timer_cancel(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     conversation_id: str | None = None,
 ) -> str:
@@ -3038,32 +3076,33 @@ async def _execute_comment_tool(
         return json.dumps({"error": f"{tool_name} requires a session id"})
 
     try:
-        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
     base = f"/v1/sessions/{conversation_id}/comments"
 
     if tool_name == ListCommentsTool.name():
         params: dict[str, str] = {}
-        if args.get("path"):
-            params["path"] = args["path"]
+        path = args.get("path")
+        if isinstance(path, str) and path:
+            params["path"] = path
         try:
             resp = await server_client.get(base, params=params, timeout=30.0)
             if resp.status_code != 200:
                 return json.dumps({"error": f"list_comments returned {resp.status_code}"})
-            all_comments: list[dict[str, Any]] = resp.json()
+            all_comments: list[_JsonObject] = resp.json()
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"error": f"list_comments failed: {exc}"})
         # The server's GET endpoint only supports ?path= filtering;
         # apply status filter client-side.
-        status_filter: str | None = args.get("status")
+        status_filter = _optional_string(args.get("status"))
         if status_filter is not None:
             all_comments = [c for c in all_comments if c.get("status") == status_filter]
         return json.dumps({"comments": all_comments})
 
     # update_comment
-    comment_id: str | None = args.get("comment_id")
-    status: str | None = args.get("status")
+    comment_id = _optional_string(args.get("comment_id"))
+    status = _optional_string(args.get("status"))
     if not comment_id:
         return json.dumps({"error": "missing required argument: comment_id"})
     if not status:
@@ -3090,7 +3129,7 @@ async def _execute_comment_tool(
 
 async def _execute_browser_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
@@ -3183,7 +3222,7 @@ async def _execute_policy_tool(
         return json.dumps({"error": f"{tool_name} requires a session id"})
 
     try:
-        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
@@ -3210,7 +3249,7 @@ async def _execute_list_policies(
 
 
 async def _execute_add_policy(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
@@ -3231,7 +3270,7 @@ async def _execute_add_policy(
         return json.dumps(
             {"error": "sys_add_policy requires 'handler' (dotted path from sys_policy_registry)"}
         )
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "name": args.get("name", ""),
         "type": "python",
         "handler": handler,
@@ -3327,7 +3366,7 @@ async def _execute_scheduled_task_tool(
     if server_client is None:
         return json.dumps({"error": f"{tool_name} requires server access"})
     try:
-        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
@@ -3421,7 +3460,7 @@ def _truncate_activity(text: str | None) -> str | None:
     return text[:_ACTIVITY_MAX_CHARS] + " [truncated]"
 
 
-def _text_from_api_content(content: Any) -> str:
+def _text_from_api_content(content: object) -> str:
     """
     Join the text blocks of an API message ``content`` array.
 
@@ -3439,7 +3478,7 @@ def _text_from_api_content(content: Any) -> str:
     return " ".join(parts)
 
 
-def _project_api_item(item: dict[str, Any]) -> dict[str, str | None]:
+def _project_api_item(item: _JsonObject) -> _JsonObject:
     """
     Project a REST API conversation item into the compact peek shape.
 
@@ -3454,12 +3493,12 @@ def _project_api_item(item: dict[str, Any]) -> dict[str, str | None]:
         ``{type, output}`` for tool results, ``{type, role, text}`` for
         messages.
     """
-    itype = item.get("type")
+    itype = _optional_string(item.get("type"))
     if itype == "function_call":
         return {
             "type": "function_call",
-            "tool": item.get("name"),
-            "args": _truncate_activity(item.get("arguments")),
+            "tool": _optional_string(item.get("name")),
+            "args": _truncate_activity(_optional_string(item.get("arguments"))),
         }
     if itype == "function_call_output":
         output = item.get("output")
@@ -3468,7 +3507,7 @@ def _project_api_item(item: dict[str, Any]) -> dict[str, str | None]:
     if itype == "message":
         return {
             "type": "message",
-            "role": item.get("role"),
+            "role": _optional_string(item.get("role")),
             "text": _truncate_activity(_text_from_api_content(item.get("content"))),
         }
     return {"type": itype}
@@ -3480,7 +3519,7 @@ async def _execute_session_query_tool(
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Runner-local handler for ``sys_session_get_history`` / ``sys_session_list`` /
@@ -3528,7 +3567,7 @@ async def _execute_session_query_tool(
     if conversation_id is None:
         return json.dumps({"error": f"{tool_name} requires a session id"})
     try:
-        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
@@ -3572,7 +3611,7 @@ async def _runner_online_or_none(
 
 
 async def _session_get_info_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
@@ -3615,8 +3654,11 @@ async def _session_get_info_via_rest(
         return json.dumps({"error": "access_denied", "session_id": raw_target})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_session_get_info returned {resp.status_code}"})
-    snap: dict[str, Any] = resp.json()
-    pending = snap.get("pending_elicitations") or []
+    snap: _JsonObject = resp.json()
+    pending_value = snap.get("pending_elicitations")
+    pending = pending_value if isinstance(pending_value, list) else []
+    snap_agent_name = _optional_string(snap.get("agent_name"))
+    snap_runner_id = _optional_string(snap.get("runner_id"))
     return json.dumps(
         {
             "session_id": snap.get("id"),
@@ -3628,9 +3670,9 @@ async def _session_get_info_via_rest(
             # so the internal ``-native-ui`` wrapper name never leaks to the
             # model answering "what agent are you?". Non-wrapper names are
             # unchanged.
-            "agent_name": public_agent_name(snap.get("agent_name")),
+            "agent_name": public_agent_name(snap_agent_name),
             "runner_id": snap.get("runner_id"),
-            "runner_online": await _runner_online_or_none(snap.get("runner_id"), server_client),
+            "runner_online": await _runner_online_or_none(snap_runner_id, server_client),
             "host_id": snap.get("host_id"),
             "parent_session_id": snap.get("parent_session_id"),
             "sub_agent_name": snap.get("sub_agent_name"),
@@ -3682,10 +3724,10 @@ def _omnigent_error_message(resp: httpx.Response) -> str | None:
 
 
 async def _session_share_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
 ) -> str:
     """
     Grant a user access to a session via ``PUT /v1/sessions/{id}/permissions``.
@@ -3794,10 +3836,10 @@ async def _session_share_via_rest(
 
 async def _execute_agent_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
 ) -> str:
@@ -3882,7 +3924,7 @@ async def _agent_get_via_rest(
         return json.dumps({"error": "access_denied", "session_id": session_id})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_agent_get returned {resp.status_code}"})
-    agent: dict[str, Any] = resp.json()
+    agent: _JsonObject = resp.json()
     return json.dumps(
         {
             "session_id": session_id,
@@ -3898,7 +3940,7 @@ async def _agent_get_via_rest(
 
 
 def _agent_bundle_filename(
-    dest_filename: Any,
+    dest_filename: object,
     agent_name: str,
     agent_version: str,
 ) -> str | None:
@@ -3932,10 +3974,10 @@ def _agent_bundle_filename(
 
 async def _agent_download_via_rest(
     session_id: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     server_client: httpx.AsyncClient,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
 ) -> str:
@@ -3987,6 +4029,7 @@ async def _agent_download_via_rest(
             {"error": "sys_agent_download dest_filename must be a bare filename, not a path"}
         )
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    assert spec.cwd is not None
     cwd = Path(spec.cwd)
     await asyncio.to_thread(cwd.mkdir, parents=True, exist_ok=True)
     # Resolve symlinks on the realized cwd and confirm the destination
@@ -4014,7 +4057,7 @@ async def _agent_download_via_rest(
 async def _agent_list_fetch(
     path: str,
     server_client: httpx.AsyncClient,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """
     Fetch one page of a paginated list endpoint, returning its ``data``.
 
@@ -4038,11 +4081,11 @@ async def _agent_list_fetch(
         return []
     if resp.status_code != 200:
         return []
-    data = resp.json().get("data", [])
-    return data if isinstance(data, list) else []
+    body = _string_object_dict(resp.json())
+    return _json_object_list(body.get("data")) if body is not None else []
 
 
-def _scan_local_agent_configs(configs_dir: Path) -> list[dict[str, str | None]]:
+def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
     """
     Scan a directory for locally-authored agent config YAMLs.
 
@@ -4060,7 +4103,7 @@ def _scan_local_agent_configs(configs_dir: Path) -> list[dict[str, str | None]]:
 
     if not configs_dir.is_dir():
         return []
-    entries: list[dict[str, str | None]] = []
+    entries: list[_JsonObject] = []
     for path in sorted(configs_dir.glob("*.yaml")):
         try:
             loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -4081,7 +4124,7 @@ def _scan_local_agent_configs(configs_dir: Path) -> list[dict[str, str | None]]:
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
 ) -> str:
@@ -4112,16 +4155,17 @@ async def _agent_list_via_rest(
     builtins_raw = await _agent_list_fetch("/v1/agents", server_client)
     sessions_raw = await _agent_list_fetch("/v1/sessions", server_client)
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
     local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
     return json.dumps(_project_agent_list(builtins_raw, sessions_raw, local_configs))
 
 
 def _project_agent_list(
-    builtins_raw: list[dict[str, Any]],
-    sessions_raw: list[dict[str, Any]],
-    local_configs: list[dict[str, str | None]],
-) -> dict[str, list[dict[str, Any]]]:
+    builtins_raw: list[_JsonObject],
+    sessions_raw: list[_JsonObject],
+    local_configs: list[_JsonObject],
+) -> dict[str, list[_JsonObject]]:
     """
     Project the three raw ``sys_agent_list`` sources into the tool result.
 
@@ -4136,7 +4180,7 @@ def _project_agent_list(
     :param local_configs: Entries from :func:`_scan_local_agent_configs`.
     :returns: ``{builtins, session_agents, local_configs}``.
     """
-    builtins = [
+    builtins: list[_JsonObject] = [
         {
             "agent_id": a.get("id"),
             "name": a.get("name"),
@@ -4145,7 +4189,7 @@ def _project_agent_list(
         }
         for a in builtins_raw
     ]
-    session_agents = [
+    session_agents: list[_JsonObject] = [
         {
             "session_id": s.get("id"),
             "agent_id": s.get("agent_id"),
@@ -4164,7 +4208,7 @@ def _project_agent_list(
 async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
-    agent_name: Any = None,
+    agent_name: object = None,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4190,7 +4234,7 @@ async def _session_list_via_rest(
 
 
 async def _rename_current_session_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
 ) -> str:
@@ -4288,7 +4332,7 @@ async def _collect_sub_agents(
 
 
 async def _resolve_runner_online_map(
-    rows: list[dict[str, Any]],
+    rows: list[_JsonObject],
     server_client: httpx.AsyncClient,
 ) -> dict[str, bool | None]:
     """
@@ -4321,8 +4365,8 @@ async def _resolve_runner_online_map(
 
 async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
-    agent_name: Any,
-) -> list[dict[str, Any]]:
+    agent_name: object,
+) -> list[_JsonObject]:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
@@ -4339,7 +4383,7 @@ async def _collect_global_sessions(
         non-empty string.
     :returns: The projected global session entries.
     """
-    params: dict[str, Any] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
+    params: dict[str, str | int] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     try:
@@ -4348,9 +4392,10 @@ async def _collect_global_sessions(
         return []
     if resp.status_code != 200:
         return []
-    rows = resp.json().get("data", [])
-    if not isinstance(rows, list):
+    body = _string_object_dict(resp.json())
+    if body is None:
         return []
+    rows = _json_object_list(body.get("data"))
     online = await _resolve_runner_online_map(rows, server_client)
     return [
         {
@@ -4359,11 +4404,11 @@ async def _collect_global_sessions(
             # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
             # ``sys_session_get_info``. The server-side ``agent_name`` filter
             # above still receives the caller's raw argument unchanged.
-            "agent_name": public_agent_name(r.get("agent_name")),
+            "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
             "title": r.get("title"),
             "status": r.get("status"),
             "runner_id": r.get("runner_id"),
-            "runner_online": online.get(r.get("runner_id")),
+            "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
             "parent_session_id": r.get("parent_session_id"),
         }
         for r in rows
@@ -4371,7 +4416,7 @@ async def _collect_global_sessions(
 
 
 def _child_rows_to_entries(
-    rows: list[dict[str, Any]],
+    rows: list[_JsonObject],
 ) -> list[dict[str, str | None]]:
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
@@ -4385,14 +4430,15 @@ def _child_rows_to_entries(
     """
     entries: list[dict[str, str | None]] = []
     for row in rows:
-        title = row.get("title")
-        if not title or ":" not in title or is_session_closed(row.get("labels"), title):
+        title = _optional_string(row.get("title"))
+        labels = _string_mapping(row.get("labels"))
+        if not title or ":" not in title or is_session_closed(labels, title):
             continue
         entries.append(
             {
-                "agent": row.get("tool"),
-                "title": row.get("session_name"),
-                "conversation_id": row.get("id"),
+                "agent": _optional_string(row.get("tool")),
+                "title": _optional_string(row.get("session_name")),
+                "conversation_id": _optional_string(row.get("id")),
             }
         )
     return entries
@@ -4424,7 +4470,7 @@ async def _session_parent_id(
 
 
 async def _session_get_history_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     server_client: httpx.AsyncClient,
 ) -> str:
     """
@@ -4465,10 +4511,10 @@ async def _session_get_history_via_rest(
         return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_session_get_history returned {resp.status_code}"})
-    data: list[dict[str, Any]] = resp.json().get("data", [])
+    data: list[_JsonObject] = resp.json().get("data", [])
     # ``order="desc"`` returns newest-first; reverse to chronological so
     # the LLM reads top-to-bottom (matches the in-process peek).
-    items: list[dict[str, Any]] = [_project_api_item(it) for it in reversed(data)]
+    items: list[_JsonObject] = [_project_api_item(it) for it in reversed(data)]
     meta = await _fetch_peek_meta(target_id, server_client)
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
@@ -4490,7 +4536,7 @@ async def _session_get_history_via_rest(
 async def _fetch_close_target(
     target_id: str,
     server_client: httpx.AsyncClient,
-) -> dict[str, Any] | str:
+) -> _JsonObject | str:
     """
     Fetch + status-classify the close target's session snapshot.
 
@@ -4511,11 +4557,14 @@ async def _fetch_close_target(
         return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
     if snap.status_code != 200:
         return json.dumps({"error": f"sys_session_close returned {snap.status_code}"})
-    return snap.json()
+    body = _string_object_dict(snap.json())
+    if body is None:
+        return json.dumps({"error": "sys_session_close returned malformed session data"})
+    return body
 
 
 async def _close_tree_scope_error(
-    target_snap: dict[str, Any],
+    target_snap: _JsonObject,
     caller_conversation_id: str,
     target_id: str,
     server_client: httpx.AsyncClient,
@@ -4566,7 +4615,7 @@ async def _close_tree_scope_error(
 
 
 async def _session_close_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
@@ -4613,7 +4662,7 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(target_snap.get("title"))
+    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
     if parsed.agent is None or parsed.title is None:
         return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
     new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
@@ -4658,7 +4707,7 @@ class _PeekMeta:
 
     agent: str | None
     title: str | None
-    pending_elicitations: list[dict[str, Any]]
+    pending_elicitations: list[_JsonObject]
 
 
 async def _fetch_peek_meta(
@@ -4685,12 +4734,12 @@ async def _fetch_peek_meta(
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
     if snap.status_code != 200:
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
-    body = snap.json()
-    parsed = _parse_session_title(body.get("title"))
+    body = _string_object_dict(snap.json())
+    if body is None:
+        return _PeekMeta(agent=None, title=None, pending_elicitations=[])
+    parsed = _parse_session_title(_optional_string(body.get("title")))
     raw_pending = body.get("pending_elicitations")
-    pending = (
-        [e for e in raw_pending if isinstance(e, dict)] if isinstance(raw_pending, list) else []
-    )
+    pending = _json_object_list(raw_pending)
     return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)
 
 
@@ -4699,19 +4748,19 @@ async def execute_tool(
     tool_name: str,
     arguments: str,
     server_client: httpx.AsyncClient | None = None,
-    terminal_registry: Any | None = None,
-    resource_registry: Any | None = None,
-    agent_spec: Any | None = None,
+    terminal_registry: TerminalRegistry | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
+    agent_spec: AgentSpec | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
-    mcp_manager: Any | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    mcp_manager: RunnerMcpManager | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
     harness_client: httpx.AsyncClient | None = None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
 ) -> str:
     """
@@ -4751,6 +4800,8 @@ async def execute_tool(
             # /mcp endpoint, which enforces TOOL_CALL and TOOL_RESULT
             # policies centrally before forwarding to the runner's
             # /mcp/execute. No runner-side policy gate needed.
+            if agent_spec is None:
+                return "Error: agent_spec not available for MCP dispatch"
             output = await mcp_manager.call_tool(agent_spec, tool_name, args)
         elif tool_name in _OS_ENV_TOOLS:
             output = await _execute_os_env_tool(
@@ -4976,7 +5027,7 @@ _CHANGED_FILES_TOOLS = frozenset(
 
 def _maybe_signal_changed_files(
     conversation_id: str | None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
+    publish_event: Callable[[str, _JsonObject], None] | None,
     *,
     now: float,
 ) -> None:
@@ -5017,18 +5068,18 @@ async def dispatch_tool_locally(
     response_id: str,
     harness_client: httpx.AsyncClient,
     server_client: httpx.AsyncClient | None = None,
-    terminal_registry: Any | None = None,
-    resource_registry: Any | None = None,
-    agent_spec: Any | None = None,
+    terminal_registry: TerminalRegistry | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
+    agent_spec: AgentSpec | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
-    mcp_manager: Any | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    mcp_manager: RunnerMcpManager | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
 ) -> str:
     """Execute a tool locally and PATCH the result to the harness.
@@ -5119,7 +5170,7 @@ async def dispatch_tool_locally(
 # ── OS env tools (OSEnvironment-backed) ──────────────────
 
 
-def _clone_os_env_spec(spec: Any) -> Any:
+def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
     """Return a defensive copy of an OSEnvSpec-like object.
 
     Uses :func:`dataclasses.replace` so any field added to
@@ -5173,10 +5224,10 @@ def _runner_default_os_env_cwd(conversation_id: str | None) -> str:
 
 
 def _effective_runner_os_env_spec(
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None = None,
-) -> Any:
+) -> OSEnvSpec:
     """
     Build the OSEnvSpec used by runner-local sys_os_* dispatch.
 
@@ -5229,7 +5280,7 @@ def _effective_runner_os_env_spec(
 
 
 async def _seed_os_env_snapshot(
-    os_env: Any,
+    os_env: OSEnvironment,
     path: str,
     filesystem_registry: FilesystemRegistry,
     conversation_id: str,
@@ -5260,9 +5311,9 @@ async def _seed_os_env_snapshot(
 
 async def _execute_os_env_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
     conversation_id: str | None = None,
     runner_workspace: Path | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
@@ -5298,20 +5349,26 @@ async def _execute_os_env_tool(
 
         if tool_name == SysOsReadTool.name():
             result = await os_env.read(
-                path=args.get("path", ""),
-                offset=args.get("offset", 1),
+                path=cast("str", args.get("path", "")),
+                offset=cast("int", args.get("offset", 1)),
                 # Unspecified limit → agent-tool default (2 000 lines).
                 # None is now "unlimited" in _read_impl, so we must be explicit.
                 # Use is-None check (not `or`) so that invalid values like 0 are
                 # forwarded to os_env.read for validation rather than silently
                 # replaced with the default.
-                limit=(lv if (lv := args.get("limit")) is not None else _DEFAULT_READ_LIMIT),
+                limit=cast(
+                    "int | None",
+                    lv if (lv := args.get("limit")) is not None else _DEFAULT_READ_LIMIT,
+                ),
             )
         elif tool_name == SysOsWriteTool.name():
-            _path = args.get("path", "")
+            _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:
                 await _seed_os_env_snapshot(os_env, _path, filesystem_registry, conversation_id)
-            result = await os_env.write(path=_path, content=args.get("content", ""))
+            result = await os_env.write(
+                path=_path,
+                content=cast("str", args.get("content", "")),
+            )
             if filesystem_registry is not None and conversation_id is not None:
                 # _write_impl returns {"created": True} when the file did not
                 # previously exist, {"created": False} for an overwrite.
@@ -5319,21 +5376,21 @@ async def _execute_os_env_tool(
                 status = "created" if was_created else "modified"
                 filesystem_registry.record_change(_path, status, conversation_id)
         elif tool_name == SysOsEditTool.name():
-            _path = args.get("path", "")
+            _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:
                 await _seed_os_env_snapshot(os_env, _path, filesystem_registry, conversation_id)
             result = await os_env.edit(
                 path=_path,
-                old_text=args.get("oldText") or args.get("old_string"),
-                new_text=args.get("newText") or args.get("new_string"),
-                edits=args.get("edits"),
+                old_text=cast("str | None", args.get("oldText") or args.get("old_string")),
+                new_text=cast("str | None", args.get("newText") or args.get("new_string")),
+                edits=cast("list[dict[str, str]] | None", args.get("edits")),
             )
             if filesystem_registry is not None and conversation_id is not None:
                 filesystem_registry.record_change(_path, "modified", conversation_id)
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(
-                command=args.get("command", ""),
-                timeout=args.get("timeout"),
+                command=cast("str", args.get("command", "")),
+                timeout=cast("int | None", args.get("timeout")),
             )
         else:
             return f"Error: {tool_name} not implemented"
@@ -5352,7 +5409,7 @@ async def _execute_os_env_tool(
 
 async def _execute_rest_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     server_client: httpx.AsyncClient | None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
@@ -5426,7 +5483,7 @@ async def _execute_rest_tool(
             content = input_items
             if isinstance(content, str):
                 content = [{"type": "input_text", "text": content}]
-            event_body: dict[str, Any] = {
+            event_body: _JsonObject = {
                 "type": "message",
                 "data": {
                     "role": "user",
@@ -5477,11 +5534,11 @@ async def _execute_rest_tool(
 
 async def _execute_file_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     server_client: httpx.AsyncClient | None,
     *,
     conversation_id: str | None,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
 ) -> str:
     """
@@ -5510,7 +5567,7 @@ async def _execute_file_tool(
 
     if tool_name == UploadFileTool.name():
         path = args.get("path")
-        if not path:
+        if not isinstance(path, str) or not path:
             return "Error: sys_upload_file failed: empty path"
         # Resolve the agent-supplied path against the session workspace
         # (the same cwd the sys_os_* tools operate in) and reject any
@@ -5519,9 +5576,9 @@ async def _execute_file_tool(
         # exfiltrate arbitrary host files. Mirrors the
         # builtin UploadFileTool's safe_resolve / sys_agent_download
         # containment checks.
-        workspace = Path(
-            _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace).cwd
-        )
+        os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+        assert os_spec.cwd is not None
+        workspace = Path(os_spec.cwd)
         try:
             resolved = safe_resolve(path, workspace)
         except ValueError as exc:
@@ -5572,17 +5629,17 @@ async def _execute_file_tool(
 
 async def _execute_terminal_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    terminal_registry: Any | None,
-    resource_registry: Any | None = None,
-    agent_spec: Any | None,
+    terminal_registry: TerminalRegistry | None,
+    resource_registry: SessionResourceRegistry | None = None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     task_id: str | None,
     agent_id: str | None,
     runner_workspace: Path | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
 ) -> str:
     """Execute a terminal tool using the runner's TerminalRegistry.
 
@@ -5622,7 +5679,7 @@ async def _execute_terminal_tool(
 
     del session_inbox
     if tool_name == SysTerminalLaunchTool.name():
-        tool_instance: Any = SysTerminalLaunchTool(
+        tool_instance: Tool = SysTerminalLaunchTool(
             spec=agent_spec,
             registry=terminal_registry,
         )
@@ -5670,11 +5727,11 @@ async def _emit_terminal_resource_event(
     *,
     tool_name: str,
     output: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
-    terminal_registry: Any,
-    resource_registry: Any | None,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    terminal_registry: TerminalRegistry,
+    resource_registry: SessionResourceRegistry | None,
+    publish_event: Callable[[str, _JsonObject], None],
 ) -> None:
     """Emit a ``session.resource.{created,deleted}`` event for a terminal tool.
 
@@ -5740,9 +5797,9 @@ async def _publish_terminal_created_event(
     conversation_id: str,
     terminal_name: str,
     session_key: str,
-    terminal_registry: Any,
-    resource_registry: Any | None,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    terminal_registry: TerminalRegistry,
+    resource_registry: SessionResourceRegistry | None,
+    publish_event: Callable[[str, _JsonObject], None],
 ) -> None:
     """Build and publish ``session.resource.created`` for a fresh launch.
 
@@ -5809,14 +5866,15 @@ async def _publish_terminal_created_event(
         loop = asyncio.get_running_loop()
 
         def _on_activity() -> None:
+            event: _JsonObject = {
+                "type": "session.terminal.activity",
+                "session_id": conversation_id,
+                "terminal_id": resource_id,
+            }
             loop.call_soon_threadsafe(
                 publish_event,
                 conversation_id,
-                {
-                    "type": "session.terminal.activity",
-                    "session_id": conversation_id,
-                    "terminal_id": resource_id,
-                },
+                event,
             )
 
         instance.start_idle_watcher_thread(on_activity=_on_activity)
@@ -5827,7 +5885,7 @@ def _publish_terminal_deleted_event(
     conversation_id: str,
     terminal_name: str,
     session_key: str,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
 ) -> None:
     """Build and publish ``session.resource.deleted`` for a closed terminal.
 
@@ -5859,20 +5917,20 @@ def _publish_terminal_deleted_event(
 
 async def _execute_async_inbox_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None,
+    session_inbox: asyncio.Queue[_JsonObject] | None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     server_client: httpx.AsyncClient | None,
-    terminal_registry: Any | None,
-    resource_registry: Any | None,
-    agent_spec: Any | None,
+    terminal_registry: TerminalRegistry | None,
+    resource_registry: SessionResourceRegistry | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     task_id: str | None,
     agent_id: str | None,
     agent_name: str | None,
     runner_workspace: Path | None,
-    mcp_manager: Any | None,
+    mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
 ) -> str:
@@ -5932,7 +5990,7 @@ async def _execute_async_inbox_tool(
 
 
 def _format_terminal_idle_item(
-    payload: dict[str, Any],
+    payload: _JsonObject,
 ) -> str:
     """
     Render a terminal-idle inbox item for ``sys_read_inbox``.
@@ -5980,7 +6038,7 @@ def _truncate_inbox_output(output: object) -> str:
     )
 
 
-def _format_async_task_item(payload: dict[str, Any]) -> str:
+def _format_async_task_item(payload: _JsonObject) -> str:
     """
     Render a completed/failed/cancelled async-task inbox payload.
 
@@ -6023,7 +6081,7 @@ def _format_async_task_item(payload: dict[str, Any]) -> str:
     return f"[System: task {handle_id} {status} — {tool}: {output}]"
 
 
-def _subagent_child_id(payload: dict[str, Any]) -> str | None:
+def _subagent_child_id(payload: _JsonObject) -> str | None:
     """
     Extract the child session id from a sub-agent inbox payload.
 
@@ -6037,7 +6095,7 @@ def _subagent_child_id(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _subagent_policy_failure_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _subagent_policy_failure_payload(payload: _JsonObject) -> _JsonObject:
     """
     Return a fail-closed copy of a sub-agent inbox payload.
 
@@ -6049,9 +6107,9 @@ def _subagent_policy_failure_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _subagent_tool_result_policy_request(
-    payload: dict[str, Any],
+    payload: _JsonObject,
     output: str,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """
     Build the Omnigent policy-evaluation request for delayed child output.
 
@@ -6080,9 +6138,9 @@ async def _post_subagent_policy_verdict(
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-    payload: dict[str, Any],
+    payload: _JsonObject,
     output: str,
-) -> dict[str, Any] | None:
+) -> _JsonObject | None:
     """
     POST delayed sub-agent output to Omnigent policy evaluation.
 
@@ -6116,7 +6174,7 @@ async def _post_subagent_policy_verdict(
         )
         return None
     try:
-        return resp.json()
+        return _string_object_dict(resp.json())
     except (json.JSONDecodeError, ValueError):
         _logger.warning(
             "Sub-agent inbox TOOL_RESULT policy evaluation returned non-JSON for parent=%s",
@@ -6126,8 +6184,8 @@ async def _post_subagent_policy_verdict(
 
 
 def _apply_subagent_policy_verdict(
-    payload: dict[str, Any],
-    verdict: dict[str, Any],
+    payload: _JsonObject,
+    verdict: _JsonObject,
 ) -> _SubagentInboxEvaluation:
     """
     Apply an Omnigent policy verdict to a sub-agent inbox payload.
@@ -6169,7 +6227,7 @@ def _apply_subagent_policy_verdict(
 
 
 async def _evaluate_subagent_inbox_output(
-    payload: dict[str, Any],
+    payload: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
@@ -6209,7 +6267,7 @@ async def _evaluate_subagent_inbox_output(
     return _apply_subagent_policy_verdict(payload, verdict)
 
 
-def _cleanup_drained_subagent_work(payload: dict[str, Any]) -> None:
+def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
     """
     Remove terminal sub-agent work after its inbox item is drained.
 
@@ -6236,7 +6294,7 @@ def _cleanup_drained_subagent_work(payload: dict[str, Any]) -> None:
 
 
 async def _drain_inbox(
-    inbox: asyncio.Queue[dict[str, Any]] | None,
+    inbox: asyncio.Queue[_JsonObject] | None,
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
@@ -6256,7 +6314,7 @@ async def _drain_inbox(
     if inbox is None or inbox.empty():
         return "Inbox is empty — no completed tasks."
     items: list[str] = []
-    retry_payloads: list[dict[str, Any]] = []
+    retry_payloads: list[_JsonObject] = []
     while not inbox.empty():
         try:
             payload = inbox.get_nowait()
@@ -6316,7 +6374,7 @@ async def _evaluate_async_tool_call_policy(
     phase = "PHASE_TOOL_CALL"
     try:
         try:
-            arguments_dict: dict[str, Any] = json.loads(tool_args)
+            arguments_dict: _JsonObject = json.loads(tool_args)
             if not isinstance(arguments_dict, dict):
                 arguments_dict = {}
         except (json.JSONDecodeError, ValueError):
@@ -6329,9 +6387,11 @@ async def _evaluate_async_tool_call_policy(
             timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
         if resp.status_code == 200:
-            result = resp.json()
+            result = _string_object_dict(resp.json())
+            if result is None:
+                return False
             action = result.get("result", "POLICY_ACTION_DENY")
-            return action == "POLICY_ACTION_ALLOW" or action == "POLICY_ACTION_UNSPECIFIED"
+            return bool(action == "POLICY_ACTION_ALLOW" or action == "POLICY_ACTION_UNSPECIFIED")
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
             resp.status_code,
@@ -6347,20 +6407,20 @@ async def _evaluate_async_tool_call_policy(
 
 
 def _spawn_async_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None,
+    session_inbox: asyncio.Queue[_JsonObject] | None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     server_client: httpx.AsyncClient | None,
-    terminal_registry: Any | None,
-    resource_registry: Any | None,
-    agent_spec: Any | None,
+    terminal_registry: TerminalRegistry | None,
+    resource_registry: SessionResourceRegistry | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     task_id: str | None,
     agent_id: str | None,
     agent_name: str | None,
     runner_workspace: Path | None,
-    mcp_manager: Any | None,
+    mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
 ) -> str:
     """
@@ -6386,8 +6446,10 @@ def _spawn_async_tool(
     """
     target_tool = args.get("tool")
     target_args = args.get("args", "{}")
-    if not target_tool:
+    if not isinstance(target_tool, str) or not target_tool:
         return 'Error: sys_call_async requires "tool" argument'
+    if not isinstance(target_args, str):
+        return 'Error: sys_call_async requires string "args" argument'
     if target_tool == SysCallAsyncTool.name():
         return "Error: sys_call_async cannot dispatch itself"
     if session_inbox is None or session_async_tasks is None:
@@ -6448,14 +6510,13 @@ def _spawn_async_tool(
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
             )
-            done, pending = await asyncio.wait(
-                [
-                    asyncio.ensure_future(exec_coro),
-                    asyncio.ensure_future(cancel_event.wait()),
-                ],
+            execution_task = asyncio.create_task(exec_coro)
+            cancellation_task = asyncio.create_task(cancel_event.wait())
+            _done, pending = await asyncio.wait(
+                [execution_task, cancellation_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if cancel_event.is_set():
+            if cancellation_task.done():
                 # Drop the losing future (the tool coro). This cancels the
                 # task/coroutine but cannot interrupt an underlying
                 # asyncio.to_thread, so that thread may run to completion.
@@ -6474,7 +6535,7 @@ def _spawn_async_tool(
             # linger as a pending task for the life of the session.
             for fut in pending:
                 fut.cancel()
-            result = next(iter(done)).result()
+            result = execution_task.result()
             session_inbox.put_nowait(
                 {
                     "handle_id": handle_id,
@@ -6528,7 +6589,7 @@ def _spawn_async_tool(
 
 
 def _cancel_async_tool_result(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
 ) -> _CancelAsyncToolResult:
@@ -6545,7 +6606,7 @@ def _cancel_async_tool_result(
         is true only when no local async task matched.
     """
     handle_id = args.get("handle_id") or args.get("task_id")
-    if not handle_id:
+    if not isinstance(handle_id, str) or not handle_id:
         return _CancelAsyncToolResult('Error: sys_cancel_async requires "handle_id"')
     if session_async_tasks is None:
         return _CancelAsyncToolResult("Error: async inbox not initialized for this session")
@@ -6564,7 +6625,7 @@ def _cancel_async_tool_result(
 
 
 def _cancel_async_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
 ) -> str:
@@ -6584,7 +6645,7 @@ def _cancel_async_tool(
 
 
 async def _execute_task_lifecycle_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     conversation_id: str | None,
@@ -6620,7 +6681,7 @@ async def _execute_task_lifecycle_tool(
 
 
 async def _cancel_subagent_task(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
@@ -6732,9 +6793,9 @@ async def _cancel_subagent_task(
 
 
 def _inject_orchestrator_skills(
-    skills: list[Any],
-    agent_spec: Any | None,
-) -> list[Any]:
+    skills: list[SkillSpec],
+    agent_spec: AgentSpec | None,
+) -> list[SkillSpec]:
     """
     Auto-inject built-in platform skills for every omnigent agent.
 
@@ -6772,9 +6833,9 @@ def _inject_orchestrator_skills(
 
 def _execute_skill_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
 ) -> str:
     """
@@ -6802,6 +6863,7 @@ def _execute_skill_tool(
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
 
+    tool: Tool
     if tool_name == "load_skill":
         tool = LoadSkillTool(
             bundled_skills,
