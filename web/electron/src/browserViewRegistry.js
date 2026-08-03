@@ -33,6 +33,22 @@ function createBrowserViewRegistry({
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
+  // While true, the active view stays hidden (not detached): the native view
+  // paints ABOVE every DOM element, so an open renderer overlay (share dialog,
+  // etc.) would otherwise render underneath the page. Applied to whichever
+  // entry is (or becomes) active until cleared.
+  let overlaySuppressed = false;
+
+  /** Hide/show a view in place — never throws, no-op on stubs without setVisible. */
+  function setViewVisible(entry, visible) {
+    const view = entry && entry.view;
+    if (!view || typeof view.setVisible !== "function") return;
+    try {
+      view.setVisible(visible);
+    } catch {
+      /* destroyed */
+    }
+  }
 
   function makeEntry(conversationId, view) {
     const entry = {
@@ -176,6 +192,7 @@ function createBrowserViewRegistry({
       } catch {
         /* host gone */
       }
+      setViewVisible(entry, !overlaySuppressed);
     }
     // Signal the renderer a view now exists. On a fresh conversation the view is
     // created detached (no host-active-changed fires), so without this the pane
@@ -256,8 +273,26 @@ function createBrowserViewRegistry({
     } catch {
       /* host gone */
     }
+    // Re-apply visibility on every attach: setVisible(false) persists on the
+    // view across detach/attach, so a swap while an overlay is open must stay
+    // hidden, and a normal swap must undo any earlier suppression.
+    setViewVisible(next, !overlaySuppressed);
     next.boundsController.resync();
     sendToRenderer("browser-host-active-changed", { conversationId });
+    return { ok: true };
+  }
+
+  // Hide (suppressed=true) or restore (false) the active view while a DOM
+  // overlay is open in the renderer. Hidden, not detached: the page keeps
+  // running and the pane's bounds loop stays wired, so closing the overlay
+  // restores it instantly. The flag outlives the current active entry — a view
+  // activated while suppressed attaches hidden.
+  function setOverlaySuppressed(suppressed) {
+    overlaySuppressed = !!suppressed;
+    if (activeConversationId !== null) {
+      const entry = entries.get(activeConversationId);
+      if (entry) setViewVisible(entry, !overlaySuppressed);
+    }
     return { ok: true };
   }
 
@@ -316,10 +351,12 @@ function createBrowserViewRegistry({
     getOrCreate,
     openOrNavigate,
     setActive,
+    setOverlaySuppressed,
     close,
     closeAll,
     // Introspection
     activeConversationId: () => activeConversationId,
+    overlaySuppressed: () => overlaySuppressed,
     size: () => entries.size,
     has: (conversationId) => entries.has(conversationId),
     forEach: (fn) => entries.forEach(fn),
