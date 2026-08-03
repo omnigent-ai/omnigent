@@ -1,9 +1,12 @@
-// Scan contributor PRs opened in the last 24 hours and comment when a Bug fix,
-// Feature, or UI / frontend change is checked but no real demo (screenshot /
-// video) is provided. Runs hourly; the 24-hour window ensures every new PR is
-// checked even if it was opened just before a cron tick. Drafts and maintainer
-// PRs are skipped. Already-flagged PRs (labeled `needs-demo`) are skipped to
-// avoid duplicate comments on subsequent runs.
+// Scan contributor PRs and comment when a Bug fix, Feature, or UI / frontend
+// change is checked but no real demo (screenshot / video) is provided. Runs
+// hourly over two searches, unioned and deduped: PRs opened in the last 24
+// hours (so every new PR is seen even if opened just before a cron tick), plus
+// every open PR already labeled `needs-demo` regardless of age. Drafts and
+// maintainer PRs are skipped. While a PR carries `needs-demo` it is never
+// commented again; an already-labeled PR is re-evaluated each run and the
+// label cleared once its Demo section is satisfied (or the change type no
+// longer needs one). A PR that later regresses can be flagged afresh.
 
 const MS_PER_HOUR = 60 * 60 * 1000;
 const HOURS_TO_SCAN = 24;
@@ -132,28 +135,49 @@ module.exports = async ({ context, github, core }) => {
     const cutoff = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
     // GitHub search supports ISO 8601 timestamps for sub-day precision.
     const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
-    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
 
-    console.log(`Scanning PRs: ${searchQuery}`);
-
-    let cursor = null;
-    let hasNextPage = true;
-    const allPRs = [];
-
-    while (hasNextPage) {
-      const response = await github.graphql(QUERY, { cursor, searchQuery });
-      const { remaining, resetAt } = response.rateLimit;
-      console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
-
-      const { nodes, pageInfo } = response.search;
-      hasNextPage = pageInfo.hasNextPage;
-      cursor = pageInfo.endCursor;
-      allPRs.push(...nodes);
+    // Paginate a single ISSUE search to completion and return its PR nodes.
+    async function fetchPRs(searchQuery) {
+      console.log(`Scanning PRs: ${searchQuery}`);
+      let cursor = null;
+      let hasNextPage = true;
+      const prs = [];
+      while (hasNextPage) {
+        const response = await github.graphql(QUERY, { cursor, searchQuery });
+        const { remaining, resetAt } = response.rateLimit;
+        console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
+        const { nodes, pageInfo } = response.search;
+        hasNextPage = pageInfo.hasNextPage;
+        cursor = pageInfo.endCursor;
+        prs.push(...nodes);
+      }
+      return prs;
     }
 
-    console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
+    // Two searches, unioned and deduped by PR number:
+    //  1. Recently-opened PRs — the window that flags new PRs.
+    //  2. Every open PR already labeled needs-demo, regardless of age, so the
+    //     label can be cleared once a demo is added even on PRs older than the
+    //     scan window.
+    const recentQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
+    const labeledQuery = `repo:${owner}/${repo} is:pr is:open label:${NEEDS_DEMO_LABEL}`;
+
+    const byNumber = new Map();
+    for (const pr of await fetchPRs(recentQuery)) byNumber.set(pr.number, pr);
+    // Track which PRs the labeled search returned. Their `labels(first: 20)`
+    // list can truncate and omit needs-demo on a PR with many labels, so the
+    // search result is the source of truth for "is labeled", not that list.
+    const labeledPRs = new Set();
+    for (const pr of await fetchPRs(labeledQuery)) {
+      byNumber.set(pr.number, pr);
+      labeledPRs.add(pr.number);
+    }
+    const allPRs = [...byNumber.values()];
+
+    console.log(`Found ${allPRs.length} unique open PR(s) to evaluate`);
 
     let flaggedCount = 0;
+    let clearedCount = 0;
     let skippedCount = 0;
 
     for (const pr of allPRs) {
@@ -173,20 +197,40 @@ module.exports = async ({ context, github, core }) => {
         continue;
       }
 
-      // Skip PRs we've already flagged.
+      // Trust the labeled search over the (possibly truncated) labels list:
+      // a PR it returned is labeled even if needs-demo fell outside first: 20.
       const labels = pr.labels?.nodes?.map((l) => l.name) ?? [];
-      if (labels.includes(NEEDS_DEMO_LABEL)) {
-        skippedCount++;
+      const isLabeled = labeledPRs.has(pr.number) || labels.includes(NEEDS_DEMO_LABEL);
+      // Requires a demo (Bug fix / Feature / UI) and none is present yet.
+      const needsDemo = requiresDemo(pr.body) && !hasDemoContent(pr.body);
+
+      // Already flagged: never comment again. Clear the label once the PR
+      // satisfies the requirement — a demo was added, or the change-type box
+      // was unchecked — so the label reflects the PR's current state rather
+      // than its state at first scan.
+      if (isLabeled) {
+        if (!needsDemo) {
+          try {
+            await github.rest.issues.removeLabel({
+              owner,
+              repo,
+              issue_number: pr.number,
+              name: NEEDS_DEMO_LABEL,
+            });
+            console.log(`PR #${pr.number} (@${author}): demo satisfied — cleared '${NEEDS_DEMO_LABEL}'`);
+            clearedCount++;
+          } catch (err) {
+            // 404 = label already gone; anything else is unexpected.
+            if (err.status !== 404) {
+              core.warning(`Could not remove '${NEEDS_DEMO_LABEL}' from #${pr.number}: ${err.message}`);
+            }
+          }
+        }
         continue;
       }
 
-      // Only care about PRs that checked Bug fix, Feature, or UI / frontend change.
-      if (!requiresDemo(pr.body)) {
-        continue;
-      }
-
-      // Demo content is present — nothing to do.
-      if (hasDemoContent(pr.body)) {
+      // Not yet flagged: nothing to do unless a demo is required and missing.
+      if (!needsDemo) {
         continue;
       }
 
@@ -213,7 +257,7 @@ module.exports = async ({ context, github, core }) => {
     }
 
     console.log(
-      `Done. Flagged ${flaggedCount} PR(s); skipped ${skippedCount} (drafts / maintainers / already labeled).`
+      `Done. Flagged ${flaggedCount} PR(s); cleared ${clearedCount}; skipped ${skippedCount} (drafts / maintainers).`
     );
   } catch (error) {
     if (error.status === 429 || error.message?.includes("rate limit")) {
