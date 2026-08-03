@@ -3672,12 +3672,12 @@ async def run_repl(
                         if isinstance(call_id, str) and name is not None:
                             call_id_to_tool_metadata[call_id] = (name, arguments or {})
                     if tape_entry is not None:
-                        captured: list[object] = []
+                        captured: list[FormattedItem | None] = []
                         original_output = host.output
 
-                        def _capturing_output(it: object) -> None:
-                            captured.append(it)
-                            original_output(it)
+                        def _capturing_output(item: FormattedItem | None) -> None:
+                            captured.append(item)
+                            original_output(item)
 
                         host.output = _capturing_output
                         try:
@@ -4107,9 +4107,11 @@ async def run_repl(
     # Warp) and prompt-toolkit binds it cleanly.
     from omnigent_ui_sdk import Overlay
 
-    async def _overview_builder(target: OverlayTarget) -> RenderableType:
+    async def _overview_builder(target: OverlayTarget | None) -> RenderableType:
         from omnigent.cli_diagnostics import current_cli_log_path
 
+        if target is None:
+            return Text.from_markup("[dim]No debug target available.[/dim]")
         return await _build_debug_overview(
             target,
             client=client,
@@ -5237,10 +5239,9 @@ async def _start_new_conversation(
     """
     from rich.text import Text
 
-    starter = getattr(session, "start_new_conversation", None)
-    if callable(starter):
+    if isinstance(session, _SessionsChatReplAdapter):
         try:
-            await starter()
+            await session.start_new_conversation()
         except Exception as exc:  # noqa: BLE001 — REPL boundary
             _log.exception("New conversation failed")
             host.output(Text.from_markup(f"  [bold red]New conversation failed: {exc}[/]"))
@@ -5445,9 +5446,8 @@ async def _attach_to_conversation(
     # local REPL right away — without this, they only surface after
     # the local user sends a message and triggers the lazy bind.
     # Idempotent: a later ``send()`` short-circuits in ``_ensure_session``.
-    ensure = getattr(session, "_ensure_session", None)
-    if callable(ensure):
-        await ensure()
+    if isinstance(session, _SessionsChatReplAdapter):
+        await session._ensure_session()
 
     items = await _list_all_conversation_items(client, conversation_id)
 
@@ -8286,8 +8286,7 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
                 host: TerminalHost,
                 fmt: RichBlockFormatter,
             ) -> None:
-                send_skill = getattr(session, "send_skill_slash_command", None)
-                if not callable(send_skill):
+                if not isinstance(session, _SessionsChatReplAdapter):
                     raise RuntimeError("Skill slash commands require the sessions API adapter")
                 if arg:
                     host.output(Text.from_markup(f"  [{fmt.muted}]/{sk.name}[/{fmt.muted}]"))
@@ -8299,7 +8298,7 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
                     )
                 host.start_timer()
                 await asyncio.sleep(0)
-                async for _ in send_skill(sk.name, arg):
+                async for _ in session.send_skill_slash_command(sk.name, arg):
                     pass
 
             return _skill_handler
