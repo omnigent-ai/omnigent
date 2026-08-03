@@ -713,7 +713,7 @@ def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
 def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """After first mint the factory uses the minted JWT (not the seed bearer) for subsequent mints."""
+    """After the first mint, the factory uses the minted JWT as proxy bearer on re-mints."""
     mint_call_bearers: list[str | None] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
