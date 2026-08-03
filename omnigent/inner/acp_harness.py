@@ -28,6 +28,8 @@ Env vars read at startup:
   ``session/new`` still receives an empty ``mcpServers`` array.
 - ``HARNESS_ACP_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
   back to ``caller_process`` + ``sandbox=none``.
+- ``HARNESS_ACP_ENV_PASSTHROUGH``: JSON list of vendor credential environment
+  variable names explicitly allowed into the ACP subprocess.
 - ``HARNESS_ACP_PROMPT_TIMEOUT_S``: optional idle (time-without-progress) deadline in
   seconds for a prompt turn (default 300); must be positive and finite or the child aborts.
 """
@@ -55,6 +57,7 @@ _ENV_SEND_MODEL = "HARNESS_ACP_SEND_MODEL"
 _ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
 _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
+_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
 
 
 def _env_enabled(name: str, *, default: bool) -> bool:
@@ -112,6 +115,17 @@ def _build_acp_executor() -> Executor:
     send_model = _env_enabled(_ENV_SEND_MODEL, default=False)
     omnigent_mcp = _env_enabled(_ENV_OMNIGENT_MCP, default=True)
     cwd = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None
+    env_passthrough: tuple[str, ...] = ()
+    raw_passthrough = os.environ.get(_ENV_PASSTHROUGH, "").strip()
+    if raw_passthrough:
+        try:
+            parsed_passthrough = json.loads(raw_passthrough)
+        except json.JSONDecodeError:
+            parsed_passthrough = None
+        if isinstance(parsed_passthrough, list):
+            env_passthrough = tuple(
+                value for value in parsed_passthrough if isinstance(value, str) and value
+            )
 
     config = AcpAgentConfig(
         command=command,
@@ -120,6 +134,7 @@ def _build_acp_executor() -> Executor:
         session_id_mode=session_id_mode,
         send_model_in_session_new=send_model,
         omnigent_mcp=omnigent_mcp,
+        env_passthrough=env_passthrough,
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
 

@@ -49,6 +49,8 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
+        ("qoder", "qodercli", "@qoder-ai/qodercli"),
+        ("qoder-cn", "qoderclicn", "@qodercn-ai/qoderclicn"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
@@ -232,6 +234,9 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("native-cursor", "cursor-agent"),
         ("kiro-native", "kiro-cli"),
         ("native-kiro", "kiro-cli"),
+        ("qoder", "qodercli"),
+        ("qoder-cn", "qoderclicn"),
+        ("qodercn", "qoderclicn"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
@@ -1000,6 +1005,9 @@ def test_ui_install_key_resolves_bare_and_native_spellings() -> None:
     assert hi.ui_install_key("codex") == OPENAI_FAMILY
     assert hi.ui_install_key("codex-native") == OPENAI_FAMILY
     assert hi.ui_install_key("qwen-native") == hi.QWEN_KEY
+    assert hi.ui_install_key("qoder") == "qoder"
+    assert hi.ui_install_key("qoder-cn") == "qoder-cn"
+    assert hi.ui_install_key("qodercn") == "qoder-cn"
     assert hi.ui_install_key("claude-native") == ANTHROPIC_FAMILY
     # Non-installable (curl/OAuth/SDK) harnesses resolve to None.
     assert hi.ui_install_key("cursor") is None
@@ -1009,7 +1017,7 @@ def test_ui_install_key_resolves_bare_and_native_spellings() -> None:
 
 def test_ui_installable_harnesses_includes_native_spellings() -> None:
     installable = hi.ui_installable_harnesses()
-    assert {"claude", "codex", "pi", "opencode", "qwen"} <= installable
+    assert {"claude", "codex", "pi", "opencode", "qwen", "qoder", "qoder-cn"} <= installable
     assert {"codex-native", "qwen-native", "opencode-native"} <= installable
     assert "cursor" not in installable
     assert "claude-sdk" not in installable
@@ -1058,6 +1066,16 @@ def test_ui_setup_steps_qwen_auth_stays_untracked_setup_fallback() -> None:
     assert steps[1].action == "setup"
     assert steps[1].command == "omni setup"
     assert steps[1].status_key is None
+
+
+def test_ui_setup_steps_qoder_install_then_vendor_login() -> None:
+    for harness, command in (("qoder", "qodercli login"), ("qoder-cn", "qoderclicn login")):
+        steps = hi.ui_setup_steps(harness)
+        assert [step.kind for step in steps] == ["install", "auth"]
+        assert steps[0].action == "install"
+        assert steps[1].action == "command"
+        assert steps[1].command == command
+        assert steps[1].status_key is None
 
 
 def test_ui_setup_steps_generic_for_non_installable() -> None:

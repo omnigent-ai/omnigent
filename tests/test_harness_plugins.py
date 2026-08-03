@@ -38,6 +38,31 @@ def _install_entry_points(
     )
 
 
+def test_builtin_qoder_harnesses_are_registered() -> None:
+    """Qoder variants share ACP transport but keep distinct binaries and labels."""
+    assert {"qoder", "qoder-cn"} <= hp.valid_harnesses()
+    assert hp.harness_aliases()["qodercn"] == "qoder-cn"
+    assert hp.harness_modules()["qoder"] == "omnigent.inner.acp_harness"
+    assert hp.harness_modules()["qoder-cn"] == "omnigent.inner.acp_harness"
+    # No spawn_env_builders entries: catalog rows dispatch by ACP_CLI_HARNESSES
+    # membership in the runner (see _build_spawn_env_from_spec).
+
+    specs = hp.install_specs()
+    assert (specs["qoder"].binary, specs["qoder"].package) == (
+        "qodercli",
+        "@qoder-ai/qodercli",
+    )
+    assert (specs["qoder-cn"].binary, specs["qoder-cn"].package) == (
+        "qoderclicn",
+        "@qodercn-ai/qoderclicn",
+    )
+
+    rows = {row["id"]: row for row in hp.harness_catalog()}
+    assert rows["qoder"]["label"] == "Qoder"
+    assert rows["qoder-cn"]["label"] == "Qoder CN"
+    assert rows["qoder"]["capabilities"]["integration_mode"] == "acp-subprocess"
+
+
 def test_community_harness_contribution_is_merged(monkeypatch: pytest.MonkeyPatch) -> None:
     def _contribution() -> hp.HarnessContribution:
         return hp.HarnessContribution(

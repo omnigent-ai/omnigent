@@ -716,20 +716,20 @@ def test_repl_approve_always_caches_for_later_turns(
         # Echo line confirms the REPL parsed "a" as
         # APPROVE_ALWAYS, not as a generic non-"y" refusal.
         child.expect("approved always", timeout=5)
-        _wait_for_turn_complete(child, timeout=30)
+        # Synchronize on the deterministic mock response instead of
+        # the cosmetic PTY toolbar, which can be redrawn differently
+        # under CI load.
+        child.expect("Hello there!", timeout=30)
 
         # Drain between turns so the next buffer is clean.
         _read_pending(child, seconds=1.5)
 
         # Turn 2: the auto-approved audit line must appear
-        # AND the banner must NOT. After .expect() lands on
-        # the elapsed-time marker, ``child.before`` holds the
-        # full span from the last expect up to (but not
-        # including) the match. That's the whole turn 2
-        # output — banner (if any) + auto-approved line (if
-        # any) + LLM response + elapsed-time prefix.
+        # AND the banner must NOT. The deterministic response text
+        # marks the end of the relevant output while preserving the
+        # preceding transcript in ``child.before``.
         child.send("follow up please" + "\r")
-        _wait_for_turn_complete(child, timeout=45)
+        child.expect("Following up as requested.", timeout=45)
         turn_two_raw = child.before or ""
         if isinstance(turn_two_raw, bytes):
             turn_two_raw = turn_two_raw.decode("utf-8", errors="replace")

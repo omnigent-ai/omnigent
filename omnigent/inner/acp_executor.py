@@ -161,6 +161,8 @@ class AcpAgentConfig:
     :param omnigent_mcp: Expose Omnigent's builtin tools to the agent via
         ``session/new.mcpServers`` (the shared ``serve-mcp`` relay). On by
         default; the global ``OMNIGENT_ACP_MCP=0`` kill switch also disables it.
+    :param env_passthrough: Vendor environment variable names explicitly allowed
+        into the otherwise deny-by-default agent subprocess environment.
     """
 
     command: str
@@ -169,6 +171,7 @@ class AcpAgentConfig:
     session_id_mode: str = "server"
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
+    env_passthrough: tuple[str, ...] = ()
 
 
 class _AcpRequestError(Exception):
@@ -512,7 +515,7 @@ class AcpExecutor(Executor):
         """
         return clean_agent_env(
             allow_prefixes=(),
-            extra_allowed=declared_passthrough(self._os_env),
+            extra_allowed=(*declared_passthrough(self._os_env), *self._config.env_passthrough),
         )
 
     def _warn_initialize_failed(self, reason: str) -> None:

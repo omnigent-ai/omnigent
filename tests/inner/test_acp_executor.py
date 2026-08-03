@@ -59,9 +59,13 @@ def test_handles_tools_internally_and_streaming() -> None:
     assert ex.supports_streaming() is True
 
 
-# ---------------------------------------------------------------------------
-# session/new shapes (server- vs client-assigned id, optional model)
-# ---------------------------------------------------------------------------
+def test_vendor_env_passthrough_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QODER_PERSONAL_ACCESS_TOKEN", "qoder-token")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
+    ex = AcpExecutor(AcpAgentConfig(command="x", env_passthrough=("QODER_PERSONAL_ACCESS_TOKEN",)))
+    env = ex._build_spawn_env()
+    assert env["QODER_PERSONAL_ACCESS_TOKEN"] == "qoder-token"
+    assert "UNRELATED_SECRET" not in env
 
 
 @pytest.mark.asyncio
@@ -323,6 +327,7 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HARNESS_ACP_SEND_MODEL", "1")
     monkeypatch.setenv("HARNESS_ACP_OMNIGENT_MCP", "0")
     monkeypatch.setenv("HARNESS_ACP_MODEL", "gpt-5.3")
+    monkeypatch.setenv("HARNESS_ACP_ENV_PASSTHROUGH", '["QODER_PERSONAL_ACCESS_TOKEN", 42, ""]')
     ex = acp_harness._build_acp_executor()
     assert isinstance(ex, AcpExecutor)
     assert ex._config.command == "goose acp"
@@ -331,6 +336,19 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ex._config.send_model_in_session_new is True
     assert ex._config.omnigent_mcp is False
     assert ex._config.model == "gpt-5.3"
+    assert ex._config.env_passthrough == ("QODER_PERSONAL_ACCESS_TOKEN",)
+
+
+def test_harness_wrap_malformed_env_passthrough_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "qodercli --acp")
+    monkeypatch.setenv("HARNESS_ACP_ENV_PASSTHROUGH", "not-json")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.env_passthrough == ()
 
 
 # ---------------------------------------------------------------------------

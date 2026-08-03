@@ -260,45 +260,30 @@ async def test_concurrent_writes_to_one_host_are_serialized(
     conn = registry.get(_HOST_ID)
     assert conn is not None
 
-    arrivals: list[str] = []
-    release_first = asyncio.Event()
-    stop = asyncio.Event()
+    async def _receive_store_secret_frame(*, timeout: float) -> HostStoreSecretFrame:
+        output = await comm.receive_output(timeout=timeout)
+        assert output.get("type") == "websocket.send"
+        text = output.get("text")
+        assert isinstance(text, str)
+        frame = decode_host_frame(text)
+        assert isinstance(frame, HostStoreSecretFrame)
+        return frame
 
-    async def _drain() -> None:
-        first_seen = False
-        while not stop.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-            if output.get("type") != "websocket.send":
-                continue
-            text = output.get("text")
-            if not isinstance(text, str):
-                continue
-            frame = decode_host_frame(text)
-            if not isinstance(frame, HostStoreSecretFrame):
-                continue
-            arrivals.append(frame.kind)
-            # Hold the FIRST write's reply until released, so if the lock were
-            # missing the second frame would arrive while the first is pending.
-            if not first_seen:
-                first_seen = True
-                await release_first.wait()
-            await comm.send_input(
-                {
-                    "type": "websocket.receive",
-                    "text": encode_host_frame(
-                        HostStoreSecretResultFrame(
-                            request_id=frame.request_id,
-                            status="ok",
-                            configured_harnesses={frame.harness: True},
-                        )
-                    ),
-                }
-            )
+    async def _reply(frame: HostStoreSecretFrame) -> None:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostStoreSecretResultFrame(
+                        request_id=frame.request_id,
+                        status="ok",
+                        configured_harnesses={frame.harness: True},
+                    )
+                ),
+            }
+        )
 
-    drain_task = asyncio.create_task(_drain())
+    requests: list[asyncio.Task[Any]] = []
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             first = asyncio.create_task(
@@ -307,28 +292,33 @@ async def test_concurrent_writes_to_one_host_are_serialized(
                     json={"kind": "key", "secret": "sk-1"},
                 )
             )
+            requests.append(first)
+            first_frame = await _receive_store_secret_frame(timeout=1.0)
+            assert first_frame.kind == "key"
+
             second = asyncio.create_task(
                 client.post(
                     f"/v1/hosts/{_HOST_ID}/harnesses/codex/credential",
                     json={"kind": "gateway", "secret": "sk-2", "base_url": "https://gw/v1"},
                 )
             )
-            # Give both requests time to reach the route; only the first frame
-            # should have been forwarded (the second is blocked on the lock).
-            await asyncio.sleep(0.2)
-            assert arrivals == ["key"], f"second write leaked past the lock: {arrivals}"
-            release_first.set()
+            requests.append(second)
+
+            # The gateway request must remain behind the lock while the key
+            # request is waiting for its host reply.
+            assert await comm.receive_nothing(timeout=0.2)
+
+            await _reply(first_frame)
+            second_frame = await _receive_store_secret_frame(timeout=1.0)
+            assert second_frame.kind == "gateway"
+            await _reply(second_frame)
+
             r1, r2 = await asyncio.gather(first, second)
             assert r1.status_code == 200 and r2.status_code == 200
-            # Both eventually processed, in order — no interleave.
-            assert arrivals == ["key", "gateway"]
     finally:
-        stop.set()
-        release_first.set()
-        try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+        for request in requests:
+            request.cancel()
+        await asyncio.gather(*requests, return_exceptions=True)
 
 
 # ── Validation / gating ─────────────────────────────────
