@@ -229,6 +229,10 @@ jobs:
           uv run --no-project --python 3.12 --with packaging \
             python scripts/update_versions.py pre-release --new-version "$VERSION"
           uv lock
+          # uv may emit non-canonical lockfile fields (e.g. size on file
+          # entries); normalize like the pre-commit fixer, then hard-verify.
+          python3 scripts/normalize_uv_lock_registry.py uv.lock || true
+          python3 scripts/normalize_uv_lock_registry.py --check uv.lock
           uv run --no-project --python 3.12 --with packaging \
             python scripts/update_versions.py check --expect "$VERSION"
 
