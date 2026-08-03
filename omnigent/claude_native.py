@@ -136,6 +136,12 @@ _SignalHandler: TypeAlias = (
 class _WebSocketClient(Protocol):
     """WebSocket operations used by the native terminal bridge."""
 
+    @property
+    def close_code(self) -> int | None: ...
+
+    @property
+    def close_reason(self) -> str | None: ...
+
     def __aiter__(self) -> AsyncIterator[str | bytes]: ...
 
     async def close(self, code: int = 1000, reason: str = "") -> None: ...
@@ -4935,10 +4941,10 @@ async def _websocket_to_stdout(ws: _WebSocketClient, stdout_fd: int) -> None:
         if isinstance(message, str):
             continue
         await asyncio.to_thread(os.write, stdout_fd, bytes(message))
-    close_code = getattr(ws, "close_code", None)
+    close_code = ws.close_code
     if close_code == WS_CLOSE_TERMINAL_NOT_FOUND:
         raise ConnectionClosedError(
-            Close(close_code, getattr(ws, "close_reason", None) or ""),
+            Close(WS_CLOSE_TERMINAL_NOT_FOUND, ws.close_reason or ""),
             None,
         )
 
