@@ -3169,7 +3169,7 @@ def _start_cli_runner_process(
         env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
     try:
         with child_logging_popen_kwargs(env) as logging_kwargs:
-            runner_proc = subprocess.Popen(
+            runner_proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [sys.executable, "-m", "omnigent.runner._entry"],
                 env=env,
                 stdout=log_fh,

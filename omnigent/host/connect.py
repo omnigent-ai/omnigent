@@ -1175,7 +1175,7 @@ class HostProcess:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
             try:
                 with child_logging_popen_kwargs(env) as logging_kwargs:
-                    proc = subprocess.Popen(
+                    proc: subprocess.Popen[bytes] = subprocess.Popen(
                         [sys.executable, "-m", "omnigent.runner._entry"],
                         env=env,
                         # Runners are WS-tunnel clients with no interactive input.

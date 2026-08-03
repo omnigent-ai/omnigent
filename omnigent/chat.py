@@ -3344,7 +3344,7 @@ def _start_local_server(
 
     try:
         with child_logging_popen_kwargs(child_env) as logging_kwargs:
-            server_proc = subprocess.Popen(
+            server_proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",
