@@ -23,7 +23,7 @@ from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import IS_LINUX, WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -761,13 +761,16 @@ class HostProcess:
         # because both the mutation and the reaper run on the event loop.
         self._owned_subprocess_ops = 0
         # Copy-on-write runner forkserver, started on first launch when
-        # OMNIGENT_RUNNER_ZYGOTE is set (Linux only). Instantiated cheaply here
+        # OMNIGENT_RUNNER_ZYGOTE is set. POSIX-only (needs os.fork + AF_UNIX
+        # fd-passing); the host daemon runs on the user's own machine, most
+        # often macOS, so gating on IS_POSIX rather than IS_LINUX lets those
+        # users share the ~120MB import floor too. Instantiated cheaply here
         # (no process yet — start() spawns it, idempotent under its own lock).
         # On any failure ``_zygote_disabled`` latches so future launches take
         # the direct Popen path, while ``_zygote`` is retained so a
         # still-running zygote is reaped on daemon shutdown. The zygote is an
         # optimization, never required.
-        self._zygote_enabled = IS_LINUX and env_truthy(os.environ.get(ZYGOTE_ENABLED_ENV_VAR))
+        self._zygote_enabled = IS_POSIX and env_truthy(os.environ.get(ZYGOTE_ENABLED_ENV_VAR))
         self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
         self._zygote_disabled = False
 
@@ -1277,7 +1280,13 @@ class HostProcess:
                     # getppid()-based orphan check must watch the zygote pid.
                     zygote_env = dict(env)
                     zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
-                    return zygote.fork_runner(zygote_env, str(log_path)), log_path
+                    proc = zygote.fork_runner(zygote_env, str(log_path))
+                    _logger.info(
+                        "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
+                        zygote.pid,
+                        proc.pid,
+                    )
+                    return proc, log_path
                 except ZygoteUnavailable as exc:
                     # Disable the zygote for FUTURE launches, but do NOT stop it
                     # here: healthy runners already forked from it would see
