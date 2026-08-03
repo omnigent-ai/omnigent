@@ -21,7 +21,7 @@ import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, overload
+from typing import TYPE_CHECKING, Any, Protocol
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -7061,20 +7061,9 @@ class ResolvedSpec:
         return getattr(self.spec, name)
 
 
-@overload
-def _unwrap_resolved_spec(entry: AgentSpec | ResolvedSpec) -> AgentSpec:
-    pass
-
-
-@overload
-def _unwrap_resolved_spec(entry: object) -> AgentSpec | None:
-    pass
-
-
-def _unwrap_resolved_spec(entry: object) -> AgentSpec | None:
-    if isinstance(entry, ResolvedSpec):
-        return entry.spec
-    return entry if isinstance(entry, AgentSpec) else None
+def _unwrap_resolved_spec(entry: object) -> Any:  # type: ignore[explicit-any]
+    """Unwrap cached specs without rejecting legacy or test resolver objects."""
+    return entry.spec if isinstance(entry, ResolvedSpec) else entry
 
 
 def _forward_harness_response(resp: httpx.Response) -> Response:
