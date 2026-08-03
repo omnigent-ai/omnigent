@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorIcon,
   MonitorCloudIcon,
@@ -68,6 +68,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
+import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { attachmentKey } from "@/lib/attachments";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -772,6 +773,62 @@ export function deriveRepoName(url: string): string | null {
   const last = t.split(/[/:]/).pop() ?? "";
   const name = last.endsWith(".git") ? last.slice(0, -4) : last;
   return name === "" ? null : name;
+}
+
+/**
+ * Branch ``<select>`` for the connected-GitHub repo picker.
+ *
+ * Lazily fetches the chosen repo's branches. The empty value is the
+ * "default branch" sentinel: leaving it selected appends no ``#branch``
+ * fragment, so the server clones the repo's default branch.
+ *
+ * @param fullName The chosen repo's ``owner/name``.
+ * @param value The currently selected branch ("" = default).
+ * @param defaultBranch The repo's default branch, for the sentinel label.
+ * @param onChange Called with the newly selected branch.
+ */
+function SandboxRepoBranchSelect({
+  fullName,
+  value,
+  defaultBranch,
+  onChange,
+}: {
+  fullName: string;
+  value: string;
+  defaultBranch: string | null;
+  onChange: (branch: string) => void;
+}): ReactNode {
+  const { data } = useQuery({
+    queryKey: ["github-branches", fullName],
+    queryFn: () => fetchGithubBranches(fullName),
+    staleTime: 5 * 60_000,
+  });
+  const branches = data?.connected ? data.branches : [];
+  const defaultLabel = defaultBranch ? `Default (${defaultBranch})` : "Default branch";
+  // Options: the fetched branches minus the default (represented by the
+  // empty-value sentinel). Include the current value even before the list
+  // loads (e.g. a draft-restored branch) so the controlled select always
+  // has a matching option.
+  const options = branches.filter((b) => b !== defaultBranch);
+  if (value !== "" && !options.includes(value)) {
+    options.unshift(value);
+  }
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      aria-label={`Branch for ${fullName}`}
+      className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+      data-testid="new-chat-landing-repo-branch-select"
+    >
+      <option value="">{defaultLabel}</option>
+      {options.map((b) => (
+        <option key={b} value={b}>
+          {b}
+        </option>
+      ))}
+    </select>
+  );
 }
 
 /**
@@ -1995,6 +2052,20 @@ export function NewChatLandingScreen() {
   const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
     () => landingDraft?.sandboxRepoBranch ?? "",
   );
+  // When the server advertises the GitHub App and the caller has connected
+  // their account, offer a picker over their repos instead of only the
+  // free-text URL. The /repos endpoint returns `connected: false` when the
+  // account isn't linked, so gating the query on `github_app_enabled` and
+  // reading `connected` off the payload doubles as the connection check.
+  const githubReposEnabled = info !== "loading" && info.github_app_enabled === true;
+  const { data: sandboxRepoData } = useQuery({
+    queryKey: ["github-repos"],
+    queryFn: fetchGithubRepos,
+    enabled: githubReposEnabled,
+    staleTime: 5 * 60_000,
+  });
+  const sandboxRepoPickerConnected = sandboxRepoData?.connected ?? false;
+  const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
@@ -3144,6 +3215,13 @@ export function NewChatLandingScreen() {
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
   const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
+  // The connected-GitHub repo (if any) whose clone URL matches the current
+  // free-text value, so the picker <select> stays in sync with the URL field
+  // and we can offer the matching branch list.
+  const selectedSandboxRepo = sandboxRepos.find(
+    (r) => (r.clone_url ?? `https://github.com/${r.full_name}.git`) === sandboxRepoUrl.trim(),
+  );
+  const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
   const sandboxRepoLabel = sandboxRepoName
     ? sandboxRepoBranch.trim()
       ? `${sandboxRepoName}#${sandboxRepoBranch.trim()}`
@@ -4265,6 +4343,50 @@ export function NewChatLandingScreen() {
                           </Tooltip>
                         )}
                       </div>
+                      {/* Connected-GitHub picker: choose one of the caller's
+                        repos + a branch, which fills the same URL/branch state
+                        the free-text inputs below drive. Only shown when the
+                        server advertises the GitHub App and the account is
+                        linked; otherwise the free-text URL is the only path. */}
+                      {showGithubRepoPicker && (
+                        <>
+                          <select
+                            value={selectedSandboxRepo?.full_name ?? ""}
+                            onChange={(e) => {
+                              const repo = sandboxRepos.find((r) => r.full_name === e.target.value);
+                              setSandboxRepoUrl(
+                                repo
+                                  ? (repo.clone_url ?? `https://github.com/${repo.full_name}.git`)
+                                  : "",
+                              );
+                              // A new repo has its own branches — reset so a
+                              // stale branch never rides along.
+                              setSandboxRepoBranch("");
+                            }}
+                            aria-label="GitHub repository"
+                            className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                            data-testid="new-chat-landing-repo-select"
+                          >
+                            <option value="">Choose a repository…</option>
+                            {sandboxRepos.map((r: GithubRepo) => (
+                              <option key={r.full_name} value={r.full_name}>
+                                {r.full_name}
+                              </option>
+                            ))}
+                          </select>
+                          {selectedSandboxRepo && (
+                            <SandboxRepoBranchSelect
+                              fullName={selectedSandboxRepo.full_name}
+                              value={sandboxRepoBranch}
+                              defaultBranch={selectedSandboxRepo.default_branch}
+                              onChange={setSandboxRepoBranch}
+                            />
+                          )}
+                          <p className="text-xs text-muted-foreground">
+                            or paste a repository URL:
+                          </p>
+                        </>
+                      )}
                       <input
                         id="landing-repo-url"
                         type="text"

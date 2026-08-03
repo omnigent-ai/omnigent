@@ -3,7 +3,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -2032,6 +2032,79 @@ describe("NewChatLandingScreen", () => {
     );
     expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+  });
+
+  it("offers a GitHub repo picker that fills the sandbox repo URL + branch", async () => {
+    // github_app_enabled + a connected /repos response → the picker renders
+    // inside the repo chip and drives the same URL/branch state as the
+    // free-text fields.
+    authenticatedFetchMock.mockImplementation(((input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/integrations/github/repos") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            connected: true,
+            repos: [
+              {
+                full_name: "octo/hello",
+                clone_url: "https://github.com/octo/hello.git",
+                default_branch: "main",
+                private: false,
+                pushed_at: "2026-07-28T00:00:00Z",
+              },
+            ],
+          }),
+        } as unknown as Response);
+      }
+      if (url.startsWith("/v1/integrations/github/repos/octo/hello/branches")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ connected: true, branches: ["main", "dev"] }),
+        } as unknown as Response);
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response);
+    }) as unknown as typeof authenticatedFetch);
+
+    renderLanding({ managed_sandboxes_enabled: true, github_app_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    const repoSelect = (await screen.findByTestId(
+      "new-chat-landing-repo-select",
+    )) as HTMLSelectElement;
+    fireEvent.change(repoSelect, { target: { value: "octo/hello" } });
+
+    // Picking the repo composes the clone URL into the shared URL field.
+    expect((screen.getByTestId("new-chat-landing-repo-input") as HTMLInputElement).value).toBe(
+      "https://github.com/octo/hello.git",
+    );
+
+    // Its branches load into the branch select; choosing one fills the branch.
+    const branchSelect = (await screen.findByTestId(
+      "new-chat-landing-repo-branch-select",
+    )) as HTMLSelectElement;
+    // Wait for the async branch list before selecting a non-default option.
+    await waitFor(() =>
+      expect(within(branchSelect).getByRole("option", { name: "dev" })).toBeTruthy(),
+    );
+    fireEvent.change(branchSelect, { target: { value: "dev" } });
+    expect(
+      (screen.getByTestId("new-chat-landing-repo-branch-input") as HTMLInputElement).value,
+    ).toBe("dev");
+  });
+
+  it("hides the GitHub repo picker when the GitHub App is disabled", async () => {
+    renderLanding({ managed_sandboxes_enabled: true, github_app_enabled: false });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    // The free-text URL input is present; the connected-account picker is not.
+    await screen.findByTestId("new-chat-landing-repo-input");
+    expect(screen.queryByTestId("new-chat-landing-repo-select")).toBeNull();
   });
 
   it("creates a managed session without host_id/workspace and no provisioning subtext", async () => {
