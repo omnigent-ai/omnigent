@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ChevronDownIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { isIOSShell } from "@/lib/nativeBridge";
-import { useTerminalFirst } from "./TerminalFirstContext";
+import { type TerminalFirstView, useTerminalFirst } from "./TerminalFirstContext";
 
 /**
  * Header Chat/Terminal switcher for terminal-first sessions. A
@@ -33,6 +33,11 @@ export function ViewModeToggle() {
   // one Button merges two Slots and the tooltip's listeners can get dropped.
   // Suppress it while the menu is open so it never overlaps the dropdown.
   const [hovered, setHovered] = useState(false);
+  // Tracks how the last menu interaction ended so close-focus handling can tell
+  // a pointer close (suppress refocus — a restored ghost-button focus ring reads
+  // as a stuck highlight) from a keyboard close (restore focus so keyboard/AT
+  // users keep their place).
+  const closedByPointerRef = useRef(false);
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
 
   const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
@@ -78,14 +83,21 @@ export function ViewModeToggle() {
       <DropdownMenuContent
         align="end"
         className="min-w-40"
-        // Don't snap focus back to the trigger on close — a ghost button keeps
-        // its focus-visible highlight lit until the next click, reading as a
-        // stuck "selected" state after picking a view or clicking away.
-        onCloseAutoFocus={(e) => e.preventDefault()}
+        // On a pointer close, don't snap focus back to the trigger: a ghost
+        // button keeps its focus ring lit until the next click, reading as a
+        // stuck "selected" state. On a keyboard close, let focus return so
+        // keyboard/AT users keep their place.
+        onCloseAutoFocus={(e) => {
+          if (closedByPointerRef.current) e.preventDefault();
+          closedByPointerRef.current = false;
+        }}
+        onPointerDownCapture={() => {
+          closedByPointerRef.current = true;
+        }}
       >
         <DropdownMenuRadioGroup
           value={view}
-          onValueChange={(next) => setView(next as "chat" | "terminal")}
+          onValueChange={(next) => setView(next as TerminalFirstView)}
         >
           <DropdownMenuRadioItem value="chat" className="gap-2">
             <MessagesSquareIcon className="size-4" />
