@@ -114,14 +114,11 @@ def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -
 
 
 def _retry_payload(retry: RetryPolicy | None) -> object:
-    """Return a stable JSON payload for a retry policy-like object."""
+    """Return a stable JSON payload for a retry policy."""
     if retry is None:
         return None
-    to_json = getattr(retry, "to_json", None)
-    if callable(to_json):
-        payload: object = json.loads(to_json())
-        return payload
-    return repr(retry)
+    payload: object = json.loads(retry.to_json())
+    return payload
 
 
 def compute_server_hash(config: MCPServerConfig, cwd: Path | None = None) -> str:
