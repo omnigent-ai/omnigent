@@ -600,6 +600,10 @@ jobs:
             uv run --no-project --python 3.12 --with packaging \
               python scripts/update_versions.py pre-release --new-version "$VERSION"
             uv lock
+            # uv may emit non-canonical lockfile fields (e.g. size on file
+            # entries); normalize like the pre-commit fixer, then hard-verify.
+            python3 scripts/normalize_uv_lock_registry.py uv.lock || true
+            python3 scripts/normalize_uv_lock_registry.py --check uv.lock
           fi
           uv run --no-project --python 3.12 --with packaging \
             python scripts/update_versions.py check --expect "$VERSION"
@@ -615,8 +619,10 @@ jobs:
           git config user.name "omnigent-ci[bot]"
           git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
 
-          git add pyproject.toml sdks/python-client/pyproject.toml sdks/ui/pyproject.toml \
-            omnigent/version.py uv.lock
+          # Stage everything the stamp touched: update_versions.py owns the
+          # file set, and a hand-kept path list here goes stale whenever a
+          # package joins the lockstep (bump-version.yml stages the same way).
+          git add -A
           if git diff --cached --quiet; then
             echo "No version changes to commit (already stamped)."
           else

@@ -219,6 +219,10 @@ hindsight = ["hindsight-client>=0.4.0"]
 # TODO(0.70): remove this `memory` alias extra — it exists only to keep the
 # pre-rename install command working during the deprecation window.
 memory = ["hindsight-client>=0.4.0"]
+# Nimble research runs (the `nimble_research` builtin). The tool imports the
+# nimble-python client lazily, so only users who enable nimble_research need
+# this extra. nimble_extract talks raw httpx and needs no extra.
+nimble = ["nimble-python>=1.2.0,<2"]
 # Slack integration (`omni integration slack`). The @omnigent socket-mode bot
 # lives in the separate `omnigent-slack` package (heavy deps — slack_bolt /
 # aiohttp — kept out of the baseline install). The CLI launches it as a
@@ -266,6 +270,9 @@ dev = [
     # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
     # memory tool tests import + mock it, so keep it in the dev set.
     "hindsight-client>=0.4.0",
+    # nimble-python is opt-in (the `nimble` extra), but the nimble_research
+    # tests drive the real client against respx, so keep it in the dev set.
+    "nimble-python>=1.2.0,<2",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
@@ -666,6 +673,12 @@ ignore_missing_imports = true
 # hindsights tools import it lazily so the base install never needs it.
 [[tool.mypy.overrides]]
 module = "hindsight_client.*"
+ignore_missing_imports = true
+
+# nimble-python is an optional dep (the `nimble` extra); nimble_research
+# imports it lazily so the base install never needs it.
+[[tool.mypy.overrides]]
+module = "nimble_python.*"
 ignore_missing_imports = true
 
 # cwsandbox is an optional dep (the `cwsandbox` extra); same lazy-import

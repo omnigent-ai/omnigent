@@ -16,6 +16,8 @@ exclude-newer-span = "P7D"
 cwsandbox = "2026-06-12T00:00:00Z"
 google-antigravity = "2026-06-12T00:00:00Z"
 cryptography = "2026-06-26T00:00:00Z"
+nimble-python = "2026-07-29T00:00:00Z"
+gitpython = "2026-07-24T00:00:00Z"
 pydantic-settings = "2026-06-26T00:00:00Z"
 
 [[package]]
@@ -3042,6 +3044,23 @@ wheels = [
 ]
 
 [[package]]
+name = "nimble-python"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6b/bd/0aab3fe4693997625d88184a468e1a2d84c702c263c987c743fdaad0b96d/nimble_python-1.2.0.tar.gz", hash = "sha256:c79a543399629400bc0acfdee4b8951d03393aef2c6bc8879a3bdca95db84c18", upload-time = "2026-07-28T09:22:11.952Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/df/2045d4c3c58a064eabf9870dd80af8cc40f77f4c95fec14b7b7c1d676685/nimble_python-1.2.0-py3-none-any.whl", hash = "sha256:d1e9bf33f73babc0906fc37ad2be14b167d91fc8ebc880e29c18f01ec61883e3", upload-time = "2026-07-28T09:22:13.299Z" },
+]
+
+[[package]]
 name = "nodeenv"
 version = "1.10.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3262,6 +3281,7 @@ dev = [
     { name = "hindsight-client" },
     { name = "moto", extra = ["s3"] },
     { name = "mypy" },
+    { name = "nimble-python" },
     { name = "pathspec" },
     { name = "pre-commit" },
     { name = "pyrefly" },
@@ -3304,6 +3324,9 @@ memory = [
 ]
 modal = [
     { name = "modal" },
+]
+nimble = [
+    { name = "nimble-python" },
 ]
 openshell = [
     { name = "openshell" },
@@ -3363,6 +3386,8 @@ requires-dist = [
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0,<2" },
     { name = "moto", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=5,<6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
+    { name = "nimble-python", marker = "extra == 'dev'", specifier = ">=1.2.0,<2" },
+    { name = "nimble-python", marker = "extra == 'nimble'", specifier = ">=1.2.0,<2" },
     { name = "numpy", marker = "extra == 'dictation'", specifier = ">=1.24,<3" },
     { name = "omnigent-client", editable = "sdks/python-client" },
     { name = "omnigent-slack", marker = "extra == 'slack'", editable = "integrations/slack" },
@@ -3417,7 +3442,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "memory", "slack", "databricks", "loadtest", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "memory", "nimble", "slack", "databricks", "loadtest", "dev"]
 
 [[package]]
 name = "omnigent-client"
