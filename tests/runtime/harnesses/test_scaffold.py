@@ -1444,6 +1444,74 @@ async def test_resolve_elicitation_duplicate_returns_204_not_404() -> None:
     assert exc_info.value.code == ErrorCode.NOT_FOUND
 
 
+
+@pytest.mark.asyncio
+async def test_complete_elicitation_after_cancel_is_not_idempotent() -> None:
+    """Cancelled Future (interrupt) must not get completed-approval treatment.
+
+    Interrupt cancels parked elicitations without delivering a verdict.
+    A later stale approval for that id must not return True / tombstone the
+    way a real duplicate-after-complete does — only successful set_result
+    deliveries are idempotent.
+    """
+    from omnigent.server.schemas import ElicitationResult
+
+    ctx = TurnContext("resp_elicit_cancel", asyncio.Queue(), asyncio.Event())
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    eid = "elicit_cancelled_before_verdict"
+    ctx._pending_elicitations[eid] = future
+    future.cancel()
+    assert future.done() and future.cancelled()
+
+    stale = ElicitationResult(action="accept", content=None)
+    assert ctx._complete_elicitation(eid, stale) is False, (
+        "stale approval after cancel must not count as successful delivery"
+    )
+    assert eid not in ctx._completed_elicitations, (
+        "cancel must not tombstone an id as completed approval"
+    )
+    # elicit() finally cleanup after cancelled wait unwinds
+    ctx._pending_elicitations.pop(eid, None)
+    assert ctx._complete_elicitation(eid, stale) is False
+    assert eid not in ctx._completed_elicitations
+
+
+@pytest.mark.asyncio
+async def test_resolve_elicitation_after_cancel_returns_404_not_204() -> None:
+    """HarnessApp: approval after interrupt-cancel is 404, not idempotent 204."""
+    from omnigent.server.schemas import ElicitationResult
+
+    class _Stub(HarnessApp):
+        async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+            del request, ctx
+
+    app = _Stub()
+    ctx = TurnContext("resp_resolve_cancel", asyncio.Queue(), asyncio.Event())
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    eid = "elicit_resolve_cancelled"
+    ctx._pending_elicitations[eid] = future
+    app._in_flight[ctx.response_id] = ctx
+
+    # Same path interrupt uses: cancel parked futures without set_result.
+    ctx._cancel_pending()
+    assert future.cancelled()
+
+    with pytest.raises(OmnigentError) as exc_info:
+        await app._resolve_elicitation(eid, ElicitationResult(action="accept"))
+    assert exc_info.value.code == ErrorCode.NOT_FOUND
+    assert eid not in app._completed_elicitations
+    assert eid not in ctx._completed_elicitations
+
+    # After pop/teardown, still never-completed → 404 (not 204).
+    ctx._pending_elicitations.pop(eid, None)
+    app._in_flight.clear()
+    with pytest.raises(OmnigentError) as exc_info2:
+        await app._resolve_elicitation(eid, ElicitationResult(action="accept"))
+    assert exc_info2.value.code == ErrorCode.NOT_FOUND
+
+
 async def test_session_approval_accept_once_duplicate_idempotent(
     use_elicitation: None,
     manager: HarnessProcessManager,

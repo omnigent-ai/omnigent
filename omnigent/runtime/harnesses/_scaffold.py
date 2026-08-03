@@ -600,16 +600,18 @@ class TurnContext:
         """
         Internal: resolve a pending elicitation Future.
 
-        Completed ids are tombstoned so a duplicate ``approval``
-        delivery (after ``elicit`` pops the Future) still returns
-        success to the resolve path. Never-seen ids return False
-        so the route can 404.
+        Tombstones only after a real approval verdict is delivered
+        via ``set_result``. Cancelled / abandoned Futures (interrupt)
+        are done without a verdict and must not become idempotent
+        204s — a later stale approval for that id stays unknown (404).
+        Duplicate delivery after a real complete still returns True.
 
         :param elicitation_id: The id from the URL path.
         :param result: The MCP-shaped reply body.
         :returns: ``True`` if this id was newly resolved or was
-            already completed (idempotent), ``False`` if the id
-            was never registered on this turn.
+            already completed with a real verdict (idempotent),
+            ``False`` if the id was never registered, or only
+            cancelled without delivery.
         """
         if elicitation_id in self._completed_elicitations:
             return True
@@ -617,7 +619,17 @@ class TurnContext:
         if future is None:
             return False
         if future.done():
-            # Race: resolved elsewhere, not yet tombstoned.
+            # Interrupt/cancel abandons are done() without a verdict.
+            # Only a successful set_result delivery is idempotent.
+            if future.cancelled():
+                return False
+            try:
+                exc = future.exception()
+            except asyncio.CancelledError:
+                return False
+            if exc is not None:
+                return False
+            # Race: real result already set, tombstone not yet recorded.
             self._completed_elicitations.add(elicitation_id)
             return True
         future.set_result(result)
