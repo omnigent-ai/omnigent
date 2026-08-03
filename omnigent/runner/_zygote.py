@@ -66,9 +66,7 @@ def _import_runner_graph() -> None:
     this is the whole point of the zygote. Kept in sync with what
     ``omnigent.runner._entry.main`` pulls in on a cold start.
     """
-    import omnigent.runner._entry
-    import omnigent.runner.app
-    import omnigent.runner.native  # noqa: F401
+    from omnigent.runner import _entry, app, native  # noqa: F401
 
 
 def _wire_child_stdio(log_path: str | None) -> None:

@@ -252,6 +252,10 @@ class ZygoteManager:
                         self._proc.wait(timeout=5.0)
                     except subprocess.TimeoutExpired:
                         self._proc.kill()
+                        # Reap after SIGKILL so the zygote doesn't linger as a
+                        # zombie until the daemon exits / the Popen is GC'd.
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            self._proc.wait(timeout=5.0)
                 self._proc = None
 
     def _exchange(self, request: dict[str, object]) -> dict[str, object]:

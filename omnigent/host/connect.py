@@ -762,11 +762,14 @@ class HostProcess:
         self._owned_subprocess_ops = 0
         # Copy-on-write runner forkserver, started on first launch when
         # OMNIGENT_RUNNER_ZYGOTE is set (Linux only). Instantiated cheaply here
-        # (no process yet — start() spawns it, idempotent under its own lock);
-        # disabled permanently on any failure so the daemon falls back to the
-        # direct Popen path. The zygote is an optimization, never required.
+        # (no process yet — start() spawns it, idempotent under its own lock).
+        # On any failure ``_zygote_disabled`` latches so future launches take
+        # the direct Popen path, while ``_zygote`` is retained so a
+        # still-running zygote is reaped on daemon shutdown. The zygote is an
+        # optimization, never required.
         self._zygote_enabled = IS_LINUX and env_truthy(os.environ.get(ZYGOTE_ENABLED_ENV_VAR))
         self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
+        self._zygote_disabled = False
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -1267,7 +1270,7 @@ class HostProcess:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
 
             zygote = self._zygote
-            if zygote is not None:
+            if zygote is not None and not self._zygote_disabled:
                 try:
                     zygote.start()
                     # The runner's OS parent will be the zygote, so its
@@ -1276,12 +1279,17 @@ class HostProcess:
                     zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
                     return zygote.fork_runner(zygote_env, str(log_path)), log_path
                 except ZygoteUnavailable as exc:
+                    # Disable the zygote for FUTURE launches, but do NOT stop it
+                    # here: healthy runners already forked from it would see
+                    # their parent die and self-terminate via the orphan
+                    # watchdog, so one failed fork must not tear down unrelated
+                    # live sessions. The still-running zygote is retained and
+                    # reaped on daemon shutdown (see run()'s finally); this
+                    # launch falls back to a direct Popen below.
                     _logger.warning(
                         "Runner zygote unavailable (%s); falling back to direct spawn", exc
                     )
-                    self._zygote = None
-                    with contextlib.suppress(Exception):
-                        zygote.stop()
+                    self._zygote_disabled = True
 
             with child_logging_popen_kwargs(env) as logging_kwargs:
                 proc = subprocess.Popen(

@@ -76,16 +76,17 @@ def test_import_graph_is_single_threaded() -> None:
     which carries its own fixture/timeout threads) so the check reflects only
     the import graph — exactly the state the zygote forks from.
     """
-    result = subprocess.run(
+    probe = "\n".join(
         [
-            sys.executable,
-            "-c",
-            "from omnigent.runner._zygote import _import_runner_graph;"
-            "import threading;"
-            "_import_runner_graph();"
-            "print(threading.active_count());"
+            "from omnigent.runner._zygote import _import_runner_graph",
+            "import threading",
+            "_import_runner_graph()",
+            "print(threading.active_count())",
             "print([t.name for t in threading.enumerate()])",
-        ],
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
         timeout=120,
