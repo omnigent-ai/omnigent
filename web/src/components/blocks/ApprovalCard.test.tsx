@@ -52,6 +52,10 @@ describe("ApprovalCard - policy-supplied presentation", () => {
     expect(link.getAttribute("rel")).toBe("noopener noreferrer");
     expect(screen.getByTestId("approval-target-hostname").textContent).toBe("github.com");
 
+    const mainPreview = screen.getByText(/"repository_owner": "acme"/);
+    expect(mainPreview.textContent).not.toContain("grant_id");
+    expect(mainPreview.textContent).not.toContain("idempotency_key");
+    expect(mainPreview.textContent).not.toContain("retry_count");
     const secondary = screen.getByTestId("approval-secondary-args");
     expect(secondary.textContent).toContain("grant_id");
     expect(secondary.textContent).toContain('"scope": "merge"');
@@ -60,6 +64,56 @@ describe("ApprovalCard - policy-supplied presentation", () => {
     expect(secondary.textContent).toContain("optional_note:null");
     expect(secondary.textContent).not.toContain("unknown_name");
     expect(secondary.textContent).not.toContain("[object Object]");
+  });
+
+  it("fails open when a preview containing a secondary name is truncated", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_truncated"
+        message="Merge this pull request?"
+        phase="tool_call"
+        policyName="repository_write_gate"
+        contentPreview={'repo_merge_pr({"repository_owner":"acme","grant_id":"visible secret'}
+        requestedSchema={{}}
+        approval={{
+          title: "acme/widgets #123",
+          href: "https://github.com/acme/widgets/pull/123",
+          secondaryArguments: ["grant_id"],
+        }}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    expect(screen.getByText(/"grant_id":"visible secret/).textContent).toContain(
+      '"grant_id":"visible secret',
+    );
+    expect(screen.queryByTestId("approval-secondary-args")).toBeNull();
+  });
+
+  it("preserves a tool wrapper when its closing parenthesis was capped", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_capped_wrapper"
+        message="Merge this pull request?"
+        phase="tool_call"
+        policyName="repository_write_gate"
+        contentPreview={'repo_merge_pr({"repository_owner":"acme","grant_id":"grant-1"}'}
+        requestedSchema={{}}
+        approval={{
+          title: "acme/widgets #123",
+          href: "https://github.com/acme/widgets/pull/123",
+          secondaryArguments: ["grant_id"],
+        }}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    const mainPreview = screen.getByText(/repo_merge_pr/);
+    expect(mainPreview.textContent).toBe('repo_merge_pr({\n  "repository_owner": "acme"\n}');
+    expect(mainPreview.textContent).not.toContain("grant_id");
+    expect(screen.getByTestId("approval-secondary-args").textContent).toContain("grant_id:grant-1");
   });
 
   it("renders a repository target when no pull request number exists", () => {
@@ -108,7 +162,9 @@ describe("ApprovalCard - policy-supplied presentation", () => {
 
     expect(screen.queryByTestId("approval-target")).toBeNull();
     expect(screen.queryByTestId("approval-secondary-args")).toBeNull();
-    expect(screen.getByText(/PROJ-1234/)).toBeDefined();
+    expect(screen.getByText(/PROJ-1234/).textContent).toBe(
+      '{\n  "issueIdOrKey": "PROJ-1234",\n  "transition": {\n    "id": "31"\n  }\n}',
+    );
     expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
   });

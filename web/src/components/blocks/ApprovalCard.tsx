@@ -77,31 +77,53 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
   return enumValues.filter((v): v is string => typeof v === "string" && v.length > 0);
 }
 
-/** Extract argument values only when a presentation names secondary fields. */
-function parseApprovalArguments(raw: string): Record<string, unknown> | null {
-  let jsonText = raw;
-  const hookMatch = raw.trim().match(/^[A-Za-z0-9_.:-]+\((\{[\s\S]*\})\)$/);
-  if (hookMatch) jsonText = hookMatch[1];
+interface ParsedApprovalPreview {
+  parsed: Record<string, unknown>;
+  args: Record<string, unknown>;
+  wrapper: string | null;
+  closed: boolean;
+}
 
-  let parsed: unknown;
+/** Parse object arguments while retaining the producer's wrapper form. */
+function parseApprovalPreview(raw: string): ParsedApprovalPreview | null {
+  const trimmed = raw.trim();
+  const hookMatch = /^([A-Za-z0-9_.:-]+)\((.*)$/s.exec(trimmed);
+  const wrapper = hookMatch?.[1] ?? null;
+  let jsonText = hookMatch?.[2] ?? trimmed;
+  const closed = wrapper !== null && jsonText.endsWith(")");
+  if (closed) jsonText = jsonText.slice(0, -1);
+
+  let parsedValue: unknown;
   try {
-    parsed = JSON.parse(jsonText);
+    parsedValue = JSON.parse(jsonText);
   } catch {
     return null;
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) return null;
 
-  const record = parsed as Record<string, unknown>;
+  const parsed = parsedValue as Record<string, unknown>;
+  let args = parsed;
   if (
-    typeof record.name === "string" &&
-    record.arguments &&
-    typeof record.arguments === "object" &&
-    !Array.isArray(record.arguments) &&
-    Object.keys(record).every((key) => key === "name" || key === "arguments")
+    typeof parsed.name === "string" &&
+    parsed.arguments &&
+    typeof parsed.arguments === "object" &&
+    !Array.isArray(parsed.arguments) &&
+    Object.keys(parsed).every((key) => key === "name" || key === "arguments")
   ) {
-    return record.arguments as Record<string, unknown>;
+    args = parsed.arguments as Record<string, unknown>;
   }
-  return record;
+  return { parsed, args, wrapper, closed };
+}
+
+function formatApprovalPreview(preview: ParsedApprovalPreview, secondaryNames: string[]): string {
+  const filteredArgs = Object.fromEntries(
+    Object.entries(preview.args).filter(([name]) => !secondaryNames.includes(name)),
+  );
+  const filtered =
+    preview.args === preview.parsed ? filteredArgs : { ...preview.parsed, arguments: filteredArgs };
+  const json = JSON.stringify(filtered);
+  const raw = preview.wrapper ? `${preview.wrapper}(${json}${preview.closed ? ")" : ""}` : json;
+  return formatPreview(raw);
 }
 
 function ApprovalArgumentValue({ value }: { value: unknown }) {
@@ -374,20 +396,22 @@ export function ApprovalCard({
   // button mode (the buttons render the choices). Codex command
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
+  const secondaryNames = approval?.secondaryArguments ?? [];
+  const parsedApprovalPreview =
+    secondaryNames.length > 0 ? parseApprovalPreview(contentPreview) : null;
+  const secondaryArgs = parsedApprovalPreview
+    ? Object.fromEntries(
+        secondaryNames
+          .filter((name) => Object.hasOwn(parsedApprovalPreview.args, name))
+          .map((name) => [name, parsedApprovalPreview.args[name]]),
+      )
+    : {};
   const formattedPreview =
     isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
       ? ""
-      : formatPreview(contentPreview);
-  const secondaryArgs = (() => {
-    if (!approval || approval.secondaryArguments.length === 0) return {};
-    const args = parseApprovalArguments(contentPreview);
-    if (!args) return {};
-    return Object.fromEntries(
-      approval.secondaryArguments
-        .filter((name) => Object.hasOwn(args, name))
-        .map((name) => [name, args[name]]),
-    );
-  })();
+      : parsedApprovalPreview
+        ? formatApprovalPreview(parsedApprovalPreview, Object.keys(secondaryArgs))
+        : formatPreview(contentPreview);
   const execPolicyAmendment =
     codexCommand?.execPolicyAmendment && codexCommand.execPolicyAmendment.length > 0
       ? codexCommand.execPolicyAmendment
