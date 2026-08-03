@@ -21,7 +21,6 @@ _TOOL_CLASSES: dict[str, tuple[str, str]] = {
     "export_agent": ("omnigent.tools.builtins.export_agent", "ExportAgentTool"),
     "list_files": ("omnigent.tools.builtins.list_files", "ListFilesTool"),
     "nimble_extract": ("omnigent.tools.builtins.nimble_extract", "NimbleExtractTool"),
-    "nimble_research": ("omnigent.tools.builtins.nimble_research", "NimbleResearchTool"),
     "search_conversations": (
         "omnigent.tools.builtins.search_conversations",
         "SearchConversationsTool",
@@ -37,6 +36,23 @@ def _hindsight_available() -> bool:
     import importlib.util
 
     return importlib.util.find_spec("hindsight_client") is not None
+
+
+def _nimble_research_available() -> bool:
+    """Return True when the optional ``nimble-python`` SDK is installed."""
+    import importlib.util
+
+    return importlib.util.find_spec("nimble_python") is not None
+
+
+# nimble_research needs the `nimble` extra's SDK; advertised only when it is
+# installed, so the assistant never recommends an unusable tool.
+# nimble_extract talks raw httpx and stays unconditional.
+if _nimble_research_available():
+    _TOOL_CLASSES["nimble_research"] = (
+        "omnigent.tools.builtins.nimble_research",
+        "NimbleResearchTool",
+    )
 
 
 # Hindsight memory tools (optional ``hindsight`` extra). Advertised only when

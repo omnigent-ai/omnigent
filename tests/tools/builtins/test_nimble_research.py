@@ -13,6 +13,7 @@ pacing and deadlines without lengthening the suite. The runtime default is
 from __future__ import annotations
 
 import json
+import sys
 
 # Any: fixtures mirror Nimble's JSON payloads — heterogeneous dicts with
 # string keys and mixed value types.
@@ -285,6 +286,19 @@ def test_max_effort_is_rejected_unbilled(tool_ctx: ToolContext) -> None:
     assert "nothing was sent and no run was created" in out
     assert "explicitly choose x-high" in out
     assert "https://www.nimbleway.com/contact" in out
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_missing_sdk_names_the_nimble_extra_unbilled(
+    tool_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without nimble-python installed (optional `nimble` extra), the tool
+    names the extra to install and issues no request, so nothing is billed."""
+    monkeypatch.setitem(sys.modules, "nimble_python", None)
+    out = _invoke(_config(), tool_ctx, args={"task": "x"})
+    assert "nimble-python client is not installed" in out
+    assert "omnigent[nimble]" in out
     assert respx.calls.call_count == 0
 
 

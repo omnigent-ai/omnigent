@@ -48,6 +48,10 @@ custom-budget capability and is not offered as a selectable tier. If supplied
 directly, it stops before create with product-team guidance and is never
 silently substituted.
 
+Requires the optional ``nimble`` extra (``pip install 'omnigent[nimble]'``);
+the nimble-python client is imported lazily, so the base install never
+needs it.
+
 Configured in the agent spec::
 
     tools:
@@ -86,7 +90,6 @@ import time
 from typing import Any
 
 import httpx
-from nimble_python import APIConnectionError, APIStatusError, Nimble
 
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -507,6 +510,20 @@ def _start_run(
         and the agent id to address the rest of the lifecycle to, or
         ``(None, None, error_message)``.
     """
+    # Lazy: nimble-python is the optional `nimble` extra, so the base install
+    # never needs it. Checked before anything is sent, so nothing is billed.
+    try:
+        from nimble_python import APIConnectionError, APIStatusError, Nimble
+    except ImportError:
+        return (
+            None,
+            None,
+            (
+                "Nimble research error: the nimble-python client is not "
+                "installed. Install the 'nimble' extra (e.g. "
+                "pip install 'omnigent[nimble]') to use nimble_research."
+            ),
+        )
     body: dict[str, Any] = {"input": task}
     if effort is not None:
         body["effort"] = effort

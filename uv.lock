@@ -3207,7 +3207,6 @@ dependencies = [
     { name = "json5" },
     { name = "keyring" },
     { name = "mcp" },
-    { name = "nimble-python" },
     { name = "omnigent-client" },
     { name = "omnigent-ui-sdk" },
     { name = "openai" },
@@ -3282,6 +3281,7 @@ dev = [
     { name = "hindsight-client" },
     { name = "moto", extra = ["s3"] },
     { name = "mypy" },
+    { name = "nimble-python" },
     { name = "pathspec" },
     { name = "pre-commit" },
     { name = "pyrefly" },
@@ -3324,6 +3324,9 @@ memory = [
 ]
 modal = [
     { name = "modal" },
+]
+nimble = [
+    { name = "nimble-python" },
 ]
 openshell = [
     { name = "openshell" },
@@ -3383,7 +3386,8 @@ requires-dist = [
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0,<2" },
     { name = "moto", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=5,<6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
-    { name = "nimble-python", specifier = ">=1.2.0,<2" },
+    { name = "nimble-python", marker = "extra == 'dev'", specifier = ">=1.2.0,<2" },
+    { name = "nimble-python", marker = "extra == 'nimble'", specifier = ">=1.2.0,<2" },
     { name = "numpy", marker = "extra == 'dictation'", specifier = ">=1.24,<3" },
     { name = "omnigent-client", editable = "sdks/python-client" },
     { name = "omnigent-slack", marker = "extra == 'slack'", editable = "integrations/slack" },
@@ -3438,7 +3442,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "memory", "slack", "databricks", "loadtest", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "memory", "nimble", "slack", "databricks", "loadtest", "dev"]
 
 [[package]]
 name = "omnigent-client"
