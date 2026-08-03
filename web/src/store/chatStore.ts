@@ -2317,15 +2317,25 @@ async function bindStream(
     let historyPage = page;
     let replaceCachedWindow = false;
     if (cachedItemIds !== null) {
-      const bridged = await backfillItemsUntilCovered(id, page, cachedItemIds, cacheHydrationStale);
-      if (bridged === "stale") {
-        if (!cacheHydrationStale()) set({ loadingMoreHistory: false });
-        return;
-      }
-      if (bridged === "uncovered") {
-        replaceCachedWindow = true;
-      } else {
-        historyPage = bridged;
+      try {
+        const bridged = await backfillItemsUntilCovered(
+          id,
+          page,
+          cachedItemIds,
+          cacheHydrationStale,
+        );
+        if (bridged === "stale") {
+          if (!cacheHydrationStale()) set({ loadingMoreHistory: false });
+          return;
+        }
+        if (bridged === "uncovered") {
+          replaceCachedWindow = true;
+        } else {
+          historyPage = bridged;
+        }
+      } catch (err) {
+        console.warn(`Failed to backfill cached transcript for session ${id}:`, err);
+        historyPage = { items: [], hasMore: page.hasMore };
       }
       if (cacheHydrationStale()) return;
     }
@@ -2975,12 +2985,7 @@ async function backfillItemsUntilCovered(
   ) {
     const cursor = items[0]?.id;
     if (!cursor) break;
-    let older: SessionItemsPage;
-    try {
-      older = await fetchSessionItemsPage(id, { olderThan: cursor });
-    } catch {
-      return "stale";
-    }
+    const older = await fetchSessionItemsPage(id, { olderThan: cursor });
     if (stale()) return "stale";
     items = [...older.items, ...items];
     hasMore = older.hasMore;
@@ -3071,7 +3076,12 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
   }
   if (stale()) return;
 
-  const bridged = await backfillItemsUntilCovered(id, page, preGapIds, stale);
+  let bridged: Awaited<ReturnType<typeof backfillItemsUntilCovered>>;
+  try {
+    bridged = await backfillItemsUntilCovered(id, page, preGapIds, stale);
+  } catch {
+    return;
+  }
   if (bridged === "stale") return;
   if (bridged === "uncovered") {
     await rehydrateWindowOnReconnect(id, session, preGapIds, preGapElicitations, set, get);

@@ -516,6 +516,49 @@ describe("chatStore — switchTo", () => {
     expect(state.hasMoreHistory).toBe(true);
   });
 
+  it("keeps cached history and applies session metadata when a later backfill page fails", async () => {
+    const before = Array.from({ length: 30 }, (_, i) =>
+      userMessage(`cache_error_before_${i}`, `before ${i}`),
+    );
+    const gap = Array.from({ length: 45 }, (_, i) =>
+      userMessage(`cache_error_gap_${i}`, `gap ${i}`),
+    );
+    seedSession("conv_cached_error", before);
+    seedSession("conv_other", []);
+
+    await useChatStore.getState().switchTo("conv_cached_error");
+    const cachedBlockIds = useChatStore.getState().blocks.map((block) => block.ctx.itemId);
+    await useChatStore.getState().switchTo("conv_other");
+
+    seedSession("conv_cached_error", [...before, ...gap]);
+    sessionCostControlOverrides.set("conv_cached_error", "on");
+    let itemFetches = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cached_error/items?")) {
+        itemFetches += 1;
+        if (itemFetches === 3) {
+          return mockResponse({ error: "boom" }, { ok: false, status: 500 });
+        }
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      await useChatStore.getState().switchTo("conv_cached_error");
+    } finally {
+      warn.mockRestore();
+    }
+
+    const state = useChatStore.getState();
+    expect(itemFetches).toBe(3);
+    expect(state.blocks.map((block) => block.ctx.itemId)).toEqual(cachedBlockIds);
+    expect(state.costControlModeOverride).toBe("on");
+    expect(state.loadingMoreHistory).toBe(false);
+    expect(state.conversationLoadError).toBeNull();
+  });
+
   it("replaces the cached window when the gap exceeds the backfill cap", async () => {
     const before = Array.from({ length: 30 }, (_, i) =>
       userMessage(`cache_cap_before_${i}`, `before ${i}`),
