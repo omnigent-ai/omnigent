@@ -35,7 +35,6 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
-  cancelRunNowPoll: vi.fn(),
 }));
 
 const showToast = vi.fn();

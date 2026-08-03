@@ -30,7 +30,6 @@ import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import {
-  cancelRunNowPoll,
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
@@ -62,26 +61,28 @@ export function TaskDetailPage() {
   const navigate = useNavigate();
   const now = useNow();
 
+  // "Awaiting new run row" loading state for the Run now button. The button
+  // stays in its loading state after the POST returns 202 until a new run row
+  // arrives (newest id changes) or the safety cap fires. Declared BEFORE the
+  // runs query because it also keeps that query's refetchInterval alive across
+  // the gap between the 202 and the server writing the row.
+  const [awaitingRunRow, setAwaitingRunRow] = useState(false);
+  const preFireNewestIdRef = useRef<string | null>(null);
+  const awaitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const { data: task, isLoading, isError } = useScheduledTask(taskId);
   // Run history only fetches once we have a real id.
   const {
     data: runs,
     isLoading: runsLoading,
     isError: runsError,
-  } = useScheduledTaskRuns(taskId, taskId !== "");
+  } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
   const runNowMutation = useRunScheduledTaskNow();
 
   const [editOpen, setEditOpen] = useState(false);
-
-  // "Awaiting new run row" loading state for the Run now button. The button
-  // stays in its loading state after the POST returns 202 until the accelerated
-  // poll delivers a new run row (newest id changes) or the 20s safety cap fires.
-  const [awaitingRunRow, setAwaitingRunRow] = useState(false);
-  const preFireNewestIdRef = useRef<string | null>(null);
-  const awaitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Clear the awaiting flag and its safety timer (shared by the effect and
   // the timer callback so neither leaks).
@@ -103,14 +104,13 @@ export function TaskDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runs, awaitingRunRow]);
 
-  // Unmount cleanup so neither the local safety timer nor the module-global
-  // run-now poller fires into / refetches for an unmounted page.
+  // Unmount cleanup for the local safety timer so it can't fire into an
+  // unmounted page. The run-history refresh needs no cleanup here: it's a
+  // `refetchInterval` on `useScheduledTaskRuns`, which TanStack Query tears
+  // down automatically when this page unmounts.
   useEffect(() => {
     return () => {
       if (awaitingTimerRef.current != null) clearTimeout(awaitingTimerRef.current);
-      // Stop the accelerated run-now poll this page kicked off (self-scheduling
-      // setTimeout chain in useRunScheduledTaskNow) once we navigate away.
-      if (taskId !== "") cancelRunNowPoll(taskId);
     };
   }, [taskId]);
 
@@ -225,9 +225,13 @@ export function TaskDetailPage() {
     runNowMutation.mutate(task!.id, {
       onSuccess: () => {
         showToast("Run started");
-        // Keep the button in loading state until the new run row appears (~1s).
+        // Keep the button in loading state until the new run row appears, and —
+        // because the row is written a few seconds AFTER this 202 — keep the run
+        // history polling across that gap so the row is picked up at all.
         setAwaitingRunRow(true);
-        // Safety cap: clear after 20s even if no row ever shows up.
+        // Safety cap: clear after 20s even if no row ever shows up. Generous
+        // next to the observed few-second write, and only this window is
+        // unconditional — once the row lands, run status drives the polling.
         if (awaitingTimerRef.current != null) clearTimeout(awaitingTimerRef.current);
         awaitingTimerRef.current = setTimeout(clearAwaitingRunRow, 20_000);
       },
