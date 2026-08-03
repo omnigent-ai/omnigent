@@ -188,6 +188,38 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
         )
 
 
+async def teardown_codex_native_app_server(session_id: str) -> None:
+    """
+    Tear down a host-spawned codex-native session's app-server subprocess.
+
+    Only the ``DELETE /v1/sessions`` teardown runs the full native cleanup;
+    the codex TUI pane can also disappear on its own — the idle pane reaper
+    closes the tmux pane after the idle window, and an unexpected TUI exit
+    (crash / OOM / host recycle) evicts it — neither of which cancels the
+    forwarder. Left alone, the per-session ``codex app-server`` (and its
+    forwarder) survives with no TUI, so long-lived multi-session runners
+    (e.g. Polly, which dispatches every ``codex`` sub-agent this way)
+    accumulate orphaned ``codex`` processes.
+
+    Cancelling the forwarder closes the app-server via the forwarder's own
+    ``finally`` (see :func:`_codex_discover_thread_and_forward`); the pop
+    below is the belt-and-suspenders close for the discovery-failed case
+    where no forwarder ever adopted the server. No-op for a session that
+    has no registered codex app-server, so this is safe to call from the
+    shared pane-teardown paths regardless of harness.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: None.
+    """
+    if session_id not in _AUTO_CODEX_APP_SERVERS:
+        return
+    await _cancel_auto_forwarder_task(session_id)
+    leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+    if leftover_app_server is not None:
+        with contextlib.suppress(Exception):
+            await leftover_app_server.close()
+
+
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.

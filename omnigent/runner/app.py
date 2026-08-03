@@ -2156,6 +2156,15 @@ def create_runner_app(
                 "session_id": event.session_id,
             },
         )
+        # A codex TUI pane that exits on its own (crash / OOM / host recycle)
+        # never runs the DELETE-session cleanup, so its per-session app-server
+        # + forwarder would linger with no TUI. Tear them down here; no-op for
+        # any session without a registered codex app-server.
+        _teardown_task = asyncio.create_task(
+            _native_runtime.teardown_codex_native_app_server(event.session_id)
+        )
+        _teardown_task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_teardown_task)
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
@@ -8440,6 +8449,11 @@ def create_runner_app(
         async def _reap_native_pane(pane: PaneRef) -> None:
             try:
                 await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
+                # Closing the codex TUI pane leaves its per-session app-server
+                # (and forwarder) running — no-op for other harnesses. Tear it
+                # down too so an idle-reaped codex session doesn't orphan a
+                # ``codex app-server`` process for the runner's lifetime.
+                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
             finally:
                 _publish_terminal_deleted_event(
                     conversation_id=pane.conversation_id,
