@@ -384,7 +384,7 @@ export function ApprovalCard({
     if (!args) return {};
     return Object.fromEntries(
       approval.secondaryArguments
-        .filter((name) => Object.prototype.hasOwnProperty.call(args, name))
+        .filter((name) => Object.hasOwn(args, name))
         .map((name) => [name, args[name]]),
     );
   })();

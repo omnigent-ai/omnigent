@@ -8,6 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
+import type { ApprovalPresentation } from "./events";
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type { RememberScope, Response } from "./types";
 
@@ -431,7 +432,7 @@ export interface ElicitationBlock {
   /** Truncated snapshot of the gated content. */
   contentPreview: string;
   /** Policy-supplied target hierarchy for this approval. */
-  approval?: import("./events").ApprovalPresentation | null;
+  approval?: ApprovalPresentation | null;
   /** A restricted-JSON-Schema form. `{}` for a binary accept/decline. */
   requestedSchema: Record<string, unknown>;
   /** Standalone approval page URL when ``mode === "url"``. */

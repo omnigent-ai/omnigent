@@ -90,6 +90,7 @@ def coerce_approval_presentation(value: object) -> ApprovalPresentation | None:
     :param value: Candidate dataclass or mapping.
     :returns: A normalized presentation, or ``None`` when malformed.
     """
+    title: object
     if isinstance(value, ApprovalPresentation):
         title = value.title
         href = value.href
