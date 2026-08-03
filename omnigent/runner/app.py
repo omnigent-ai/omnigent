@@ -5585,6 +5585,7 @@ def create_runner_app(
                             else:
                                 event = None
 
+                            _defer_publish = False
                             if event is not None:
                                 if event.get("type") == "response.created":
                                     resp_obj = event.get("response") or {}
@@ -5593,8 +5594,6 @@ def create_runner_app(
                                         _resp_to_conv[_response_id] = conv_id
                                         _live_response_id[conv_id] = _response_id
                                         manager.mark_in_flight(conv_id, _response_id)
-
-                                _defer_publish = False
 
                                 _overflow = _is_context_overflow_error(event)
                                 if _overflow is not None:
@@ -5802,6 +5801,9 @@ def create_runner_app(
                                     )
                                     continue
 
+                            if event is None:
+                                yield raw_sse_bytes
+                                continue
                             if not _defer_publish and event.get("type") != "response.created":
                                 _publish_event(conv_id, event)
                             if dispatch is not None and event.get(_RUNNER_DISPATCHED_FIELD):
