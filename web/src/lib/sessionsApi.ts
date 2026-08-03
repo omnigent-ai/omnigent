@@ -788,7 +788,7 @@ export async function getSessionSlim(
 export interface SessionItemsPage {
   /** Items oldest-to-newest, ready to feed `itemsToBlocks`. */
   items: ConversationItem[];
-  /** True when more items exist in the helper's pagination direction. */
+  /** True when older items exist before the first item in this page. */
   hasMore: boolean;
 }
 
@@ -818,27 +818,6 @@ export async function fetchSessionItemsPage(
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
   return { items: [...page.data].reverse(), hasMore: page.has_more };
-}
-
-/**
- * Fetch committed items after a known item, oldest-to-newest.
- *
- * Cache and reconnect reconciliation already know the newest item the
- * client rendered. Scanning forward from that cursor returns only the
- * missing suffix instead of fetching the newest page and walking backwards
- * until the two windows overlap.
- */
-export async function fetchSessionItemsAfter(
-  sessionId: string,
-  after: string,
-  limit = SESSION_HISTORY_PAGE_SIZE,
-): Promise<SessionItemsPage> {
-  const params = new URLSearchParams({ limit: String(limit), order: "asc", after });
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
-  );
-  const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
-  return { items: page.data, hasMore: page.has_more };
 }
 
 /** Pages allowed while looking for the previous user-message boundary. */
