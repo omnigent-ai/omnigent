@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import filecmp
-import re
 import shutil
 import subprocess
 import sys
@@ -44,20 +43,6 @@ _OUTPUTS = (
     Path("omnigent/api/routing/v1/routing_pb2.py"),
     Path("omnigent/api/routing/v1/routing_pb2.pyi"),
 )
-
-_MESSAGE_BASE = re.compile(r"^(class \w+\(_message\.Message\):)$", re.MULTILINE)
-
-
-def _patch_stub(out_dir: Path) -> None:
-    """Make protoc's stub compatible with the project's strict mypy settings."""
-    stub = out_dir / _OUTPUTS[1]
-    source = stub.read_text(encoding="utf-8")
-    source = _MESSAGE_BASE.sub(
-        r"\1  # type: ignore[misc]  # protobuf base is untyped",
-        source,
-    )
-    source = source.replace("_Mapping]", "_Mapping[str, object]]")
-    stub.write_text(source, encoding="utf-8")
 
 
 def _run_protoc(out_dir: Path) -> None:
@@ -78,7 +63,6 @@ def _run_protoc(out_dir: Path) -> None:
             "grpc_tools.protoc not found. Install the dev dependencies first:\n"
             "  uv sync --extra dev"
         ) from None
-    _patch_stub(out_dir)
 
 
 def _generate() -> int:

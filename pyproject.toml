@@ -731,6 +731,12 @@ ignore_missing_imports = true
 module = "google.*"
 ignore_missing_imports = true
 
+# protoc owns the checked-in routing stub. Its built-in pyi generator emits an
+# untyped Message base and bare Mapping hints that application code cannot fix.
+[[tool.mypy.overrides]]
+module = "omnigent.api.routing.v1.routing_pb2"
+disable_error_code = ["misc", "type-arg"]
+
 [[tool.mypy.overrides]]
 module = "opentelemetry.instrumentation.*"
 ignore_missing_imports = true
