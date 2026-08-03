@@ -50,6 +50,7 @@ from omnigent.db.enum_codecs import (
     encode_item_type,
     encode_session_live_status,
 )
+from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
@@ -483,16 +484,17 @@ def _fetch_labels(
     :returns: Mapping from label key to value (string-typed).
         Empty dict when no rows match.
     """
-    rows = (
-        session.execute(
-            select(SqlConversationLabel.key, SqlConversationLabel.value).where(
-                SqlConversationLabel.workspace_id == current_workspace_id(),
-                SqlConversationLabel.conversation_id == conversation_id,
+    with query_name_scope("omnigent.conversation_store.select_conversation_labels"):
+        rows = (
+            session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                )
             )
+            .tuples()
+            .all()
         )
-        .tuples()
-        .all()
-    )
     return dict(rows)
 
 
@@ -759,7 +761,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch the metadata row for a conversation from the Omnigent DB.
         """
-        with self._session() as meta_sess:
+        with (
+            self._session() as meta_sess,
+            query_name_scope("omnigent.conversation_store.select_conversation_metadata_by_id"),
+        ):
             return meta_sess.get(
                 SqlConversationMetadata, (current_workspace_id(), conversation_id)
             )
@@ -906,9 +911,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             root_id = new_id
             if parent_conversation_id is not None:
                 with self._conv_session() as ap_sess:
-                    parent_row = ap_sess.get(
-                        SqlConversation, (current_workspace_id(), parent_conversation_id)
-                    )
+                    with query_name_scope(
+                        "omnigent.conversation_store.select_parent_conversation"
+                    ):
+                        parent_row = ap_sess.get(
+                            SqlConversation,
+                            (current_workspace_id(), parent_conversation_id),
+                        )
                     if parent_row is None:
                         raise ConversationNotFoundError(
                             f"parent conversation {parent_conversation_id!r} does not exist"
@@ -927,15 +936,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # the runner's find-or-create pre-check, so this fires only on a
                 # genuine collision).
                 if parent_conversation_id is not None:
-                    duplicate = ap_sess.execute(
-                        select(SqlConversation.id)
-                        .where(
-                            SqlConversation.workspace_id == current_workspace_id(),
-                            SqlConversation.parent_conversation_id == parent_conversation_id,
-                            SqlConversation.title == (title or ""),
-                        )
-                        .limit(1)
-                    ).first()
+                    with query_name_scope(
+                        "omnigent.conversation_store.select_duplicate_child_title"
+                    ):
+                        duplicate = ap_sess.execute(
+                            select(SqlConversation.id)
+                            .where(
+                                SqlConversation.workspace_id == current_workspace_id(),
+                                SqlConversation.parent_conversation_id == parent_conversation_id,
+                                SqlConversation.title == (title or ""),
+                            )
+                            .limit(1)
+                        ).first()
                     if duplicate is not None:
                         raise NameAlreadyExistsError(
                             f"sub-agent name already exists under parent "
@@ -951,6 +963,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     agent_id=agent_id,
                 )
                 ap_sess.add(row)
+                with query_name_scope("omnigent.conversation_store.insert_conversation"):
+                    ap_sess.flush()
             meta = SqlConversationMetadata(
                 id=new_id,
                 kind=encode_conversation_kind(kind),
@@ -965,6 +979,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             with self._session() as meta_sess:
                 meta_sess.add(meta)
+                with query_name_scope("omnigent.conversation_store.insert_conversation_metadata"):
+                    meta_sess.flush()
             return _to_conversation(row, meta)
         except IntegrityError as exc:
             # Translate a caller-supplied-id PK collision into a clean exception
@@ -1008,7 +1024,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``.
         """
         with self._conv_session() as session:
-            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            with query_name_scope("omnigent.conversation_store.select_conversation_by_id"):
+                row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 return None
             meta = self._get_meta(session, conversation_id)
