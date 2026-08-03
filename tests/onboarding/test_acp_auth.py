@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from omnigent.onboarding.acp_auth import acp_agents, acp_agents_settings
 
 
@@ -42,3 +44,21 @@ def test_omnigent_mcp_round_trips_only_when_disabled() -> None:
             ]
         }
     }
+
+
+@pytest.mark.parametrize("value", ["false", None, 0, 1])
+def test_omnigent_mcp_requires_boolean(value: object) -> None:
+    with pytest.raises(ValueError, match="omnigent_mcp must be a boolean"):
+        acp_agents(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "OpenClaw",
+                            "command": "openclaw acp",
+                            "omnigent_mcp": value,
+                        }
+                    ]
+                }
+            }
+        )
