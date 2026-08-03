@@ -93,6 +93,15 @@ AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness"
 
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
+#: Task label scored for a codex spawn that carries no prompt and no
+#: task/agent name. Codex encrypts the spawn message, so such a spawn has
+#: nothing of its own to score; rather than skip the router and let it
+#: inherit the parent's — possibly expensive — model, route it on this
+#: placeholder so it lands on the router's floor arm. Mirrors ucode PR 251's
+#: ``default_task_label`` ("Codex subagent task"). Every unnamed spawn scores
+#: the same string, so they share one (floor) arm — a cheap default, not
+#: per-spawn intelligence.
+_PLACEHOLDER_TASK = "Codex subagent task"
 #: Agent-authored, so bounded before it is stored or echoed anywhere.
 _TASK_NAME_CAP = 200
 #: Ledger entries kept per session; a long-running session can spawn
@@ -444,19 +453,25 @@ def candidate_models(
     return result
 
 
-def _routing_task(req: SubagentRouteRequest) -> str | None:
+def _routing_task(req: SubagentRouteRequest) -> str:
     """Return the task text the router should score.
 
+    Precedence: a real prompt (claude) beats the ``task_name`` /
+    ``agent_name`` label (both fold into ``task_name`` in the hook), which
+    beats the placeholder. A codex spawn with neither prompt nor name still
+    routes — on :data:`_PLACEHOLDER_TASK` — so it lands on the router's floor
+    arm instead of inheriting the parent's model.
+
     :param req: Spawn request.
-    :returns: Task text, or ``None`` when the spawn carries no signal of
-        its own to score.
+    :returns: Task text; never empty.
     """
     if req.prompt:
         return req.prompt[:_PROMPT_CAP]
-    # Codex encrypts the spawn message, so ``task_name`` is the only signal.
+    # Codex encrypts the spawn message, so ``task_name`` is the only real
+    # signal; ``agent_name`` already folds into it in the hook.
     if req.task_name:
         return req.task_name[:_PROMPT_CAP]
-    return None
+    return _PLACEHOLDER_TASK
 
 
 def _unavailable_decision(reason: str) -> SubagentRouteDecision:
@@ -536,21 +551,14 @@ async def _decide(
             model=req.parent_model,
         )
 
+    # Always a task to score: a codex spawn with no prompt and no name routes
+    # on the placeholder (see ``_routing_task``) so it lands on the router's
+    # floor arm rather than inheriting the parent's — possibly expensive —
+    # model. Mirrors ucode PR 251's ``default_task_label``. This reverses the
+    # earlier skip-the-router-and-inherit verdict: scoring the placeholder is
+    # a cheap-default win over an unbounded inherit, and the recorded
+    # ``raw_model`` / ``applied`` stay truthful to whatever the router picks.
     task = _routing_task(req)
-    if task is None:
-        # Codex encrypts the spawn message, so an unnamed codex subagent
-        # carries nothing to score. Calling the router with an empty task
-        # earns an "HTTP 400: task.prompt is required" that reads on the chip
-        # as an outage; this is a deliberate verdict, so say so. Naming the
-        # parent model also keeps the SubagentStart audit from flagging it.
-        return SubagentRouteDecision(
-            action="allow",
-            rationale=(
-                "No routable signal (encrypted prompt, no task name); "
-                "subagent inherits the session model"
-            ),
-            model=req.parent_model,
-        )
 
     client = getattr(caps, "routing_client", None)
     if client is None:

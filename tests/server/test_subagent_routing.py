@@ -266,23 +266,55 @@ async def test_fork_is_exempt_and_never_calls_router() -> None:
     assert client.calls == []
 
 
-async def test_no_routable_signal_allows_the_spawn_unchanged() -> None:
-    """A spawn with no prompt and no task name is not routed at all.
-
-    Codex encrypts the spawn message, so an unnamed subagent carries nothing
-    to score; calling the router with an empty task earns an HTTP 400 that
-    reads on the chip as an outage.
-    """
-    client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="cheap arm fits"))
+async def test_unnamed_codex_spawn_routes_on_the_placeholder_task() -> None:
+    # A codex spawn with no prompt and no task/agent name still reaches the
+    # router: it scores ucode's placeholder label and lands on the floor arm,
+    # instead of skipping the router to inherit the parent's (pricier) model.
+    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="floor arm"))
     decision = await resolve_subagent_route(
         "conv_1",
-        _request(prompt=None, task_name=""),
+        _request(
+            harness="codex-native",
+            prompt=None,
+            task_name="",
+            parent_model="databricks-gpt-5-6-luna",
+        ),
         caps=FakeCaps(routing_client=client),
+        available_models={"codex-native": [GPT_MODEL]},
     )
-    assert client.calls == []
-    assert decision.action == "allow"
-    assert decision.model == PARENT_MODEL
-    assert "No routable signal" in decision.rationale
+    assert client.calls[0][0] == "Codex subagent task"
+    assert decision.action == "rewrite"
+    assert decision.model == GPT_MODEL
+    assert "No routable signal" not in decision.rationale
+
+
+async def test_named_codex_spawn_routes_on_its_task_name() -> None:
+    # A codex spawn carries no prompt (encrypted), but a task/agent name is
+    # scored per-name, so named spawns already route individually — the
+    # placeholder only kicks in when there is no name.
+    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="named arm"))
+    await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native", prompt=None, task_name="doc-writer"),
+        caps=FakeCaps(routing_client=client),
+        available_models={"codex-native": [GPT_MODEL]},
+    )
+    assert client.calls[0][0] == "doc-writer"
+
+
+async def test_every_unnamed_codex_spawn_scores_the_same_placeholder() -> None:
+    # All unnamed spawns share one placeholder, so they route to the same
+    # (floor) arm: a cheap default, not per-spawn intelligence.
+    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="floor arm"))
+    caps = FakeCaps(routing_client=client)
+    for _ in range(2):
+        await resolve_subagent_route(
+            "conv_1",
+            _request(harness="codex-native", prompt=None, task_name=""),
+            caps=caps,
+            available_models={"codex-native": [GPT_MODEL]},
+        )
+    assert [call[0] for call in client.calls] == ["Codex subagent task", "Codex subagent task"]
 
 
 @pytest.mark.parametrize(
