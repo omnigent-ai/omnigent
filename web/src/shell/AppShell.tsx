@@ -1494,6 +1494,7 @@ export function AppShell() {
                     onFlatViewChange={handleFilesFlatViewChange}
                     filesPanelShowHidden={filesPanelShowHidden}
                     onShowHiddenChange={setFilesPanelShowHidden}
+                    liveness={liveness}
                   />
                 )}
               </div>

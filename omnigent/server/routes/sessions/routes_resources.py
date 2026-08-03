@@ -684,6 +684,20 @@ def register_resources_routes(
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )
+        # A session whose runner merely went to sleep (host still up, or a
+        # resumable managed sandbox) is transparently reconnected here, so
+        # opening a shell from the web wakes it instead of dead-ending on a
+        # 502 — the same relaunch the next chat message would trigger. Only
+        # the wakeable states recover; a non-host-bound stranded session or an
+        # offline external host still falls through to the 502 below (the CLI
+        # reconnect path owns those).
+        _runner_client, conv = await ensure_runner_connected(
+            session_id=session_id,
+            conv=conv,
+            app_state=request.app.state,
+            conversation_store=conversation_store,
+            runner_router=runner_router or get_server_runner_router(),
+        )
         path = f"/v1/sessions/{session_id}/resources/terminals"
         status, payload = await _proxy_post_to_runner(
             session_id,

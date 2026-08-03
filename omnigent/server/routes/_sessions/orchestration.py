@@ -2572,6 +2572,119 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     )
 
 
+async def ensure_runner_connected(
+    *,
+    session_id: str,
+    conv: Conversation,
+    app_state: Any,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> tuple[httpx.AsyncClient | None, Conversation]:
+    """
+    Bring a wakeable session's runner online for out-of-band resource access.
+
+    Mirrors the message-dispatch relaunch ladder in ``post_event`` — wake a
+    stale resumable managed sandbox, launch a runner on a live host, or
+    relaunch a dead managed sandbox — but without any of the message-specific
+    side effects (failed-turn persistence, session-init handshake, sub-agent
+    binding heal). It answers one question: "is a live runner reachable, and
+    if not, can we wake one right now?"
+
+    Used by resource routes (e.g. shell create) so a user acting on a session
+    whose runner merely went to sleep transparently reconnects it, instead of
+    dead-ending on a 502. Only the wakeable states recover here:
+
+    * runner already connected → returned as-is (the common fast path);
+    * host online, runner dead → ``_launch_runner_on_host`` + connect wait;
+    * host tunnel gone but managed/resumable → ``_maybe_relaunch_managed_sandbox``
+      / ``_maybe_wake_stale_resumable_managed_sandbox``.
+
+    Non-wakeable states (external host offline, not host-bound with a dead
+    runner) return ``(None, conv)`` — the caller keeps its existing
+    unavailable handling (the CLI reconnect path owns those).
+
+    :param session_id: Session/conversation identifier.
+    :param conv: Current session row.
+    :param app_state: ``request.app.state`` — supplies the registries,
+        managed-launch tracker, host store, and sandbox config.
+    :param conversation_store: Store holding the session row.
+    :param runner_router: The ``RunnerRouter``, or ``None`` for in-process.
+    :returns: ``(runner_client, conv)`` — the client is ``None`` when no
+        runner is reachable and none is wakeable; ``conv`` is re-read after
+        any wake/relaunch so the caller sees the rebound row.
+    :raises OmnigentError: 503 when a managed relaunch/wake failed or timed
+        out (propagated from ``_maybe_relaunch_managed_sandbox``).
+    """
+
+    from omnigent.server.routes import sessions as _facade
+
+    async def _reread() -> Conversation:
+        refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        return refreshed if refreshed is not None else conv
+
+    # Fast path: a live runner tunnel is already reachable.
+    runner_client = await _get_runner_client(session_id, runner_router)
+    if runner_client is not None:
+        return runner_client, conv
+
+    tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
+    host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
+
+    # A resumable managed host whose persisted liveness has gone stale wakes
+    # in place; re-read the row and re-resolve, since the wake may have
+    # relaunched the runner and rebound the session.
+    if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
+        session_id=session_id,
+        conv=conv,
+        app_state=app_state,
+        conversation_store=conversation_store,
+    ):
+        conv = await _reread()
+        runner_client = await _get_runner_client(session_id, runner_router)
+        if runner_client is not None:
+            return runner_client, conv
+
+    # Host-bound but no runner: ask the still-online host to spawn one, or
+    # relaunch a managed sandbox whose host tunnel is gone. Mirrors the
+    # gating in post_event — host presence, then managed relaunch fallback.
+    if runner_client is None and conv.host_id is not None:
+        host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+        relaunched_runner_id: str | None = None
+        if host_conn is not None:
+            launch_attempt = await _launch_runner_on_host(
+                conv,
+                conversation_store,
+                host_registry,
+                host_conn,
+            )
+            # A harness-not-configured refusal is a real host-side error, but
+            # out of band there's no turn to persist it against — leave the
+            # binding and let the caller surface the transport failure.
+            if launch_attempt.error_code != _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+                relaunched_runner_id = launch_attempt.runner_id
+        elif await _maybe_relaunch_managed_sandbox(
+            session_id=session_id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conversation_store,
+        ):
+            conv = await _reread()
+            runner_client = await _get_runner_client(session_id, runner_router)
+
+        if runner_client is None:
+            runner_client = await _wait_for_runner_client(
+                session_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=relaunched_runner_id,
+                timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
+            )
+            conv = await _reread()
+
+    return runner_client, conv
+
+
 def _kick_managed_relaunch(
     *,
     session_id: str,
@@ -6811,4 +6924,5 @@ __all__ = [
     "_wait_for_host_bound_runner_client",
     "_wake_parent_for_blocked_child",
     "configure_subagent_block_notifier",
+    "ensure_runner_connected",
 ]

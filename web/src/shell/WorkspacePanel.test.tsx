@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
+import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
@@ -85,6 +86,7 @@ function renderWorkspace(
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
+    liveness?: SessionLiveness;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -131,6 +133,7 @@ function renderWorkspace(
         onFlatViewChange={vi.fn()}
         filesPanelShowHidden={false}
         onShowHiddenChange={vi.fn()}
+        liveness={overrides.liveness}
       />
     </TooltipProvider>,
   );
@@ -474,6 +477,61 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
 
     window.localStorage.removeItem("omnigent:preferred-shell");
+  });
+
+  it("keeps Shell enabled on a wakeable session — the server reconnects on create", async () => {
+    // A runner merely asleep (host up) is reconnected transparently by the
+    // server on create, so the item stays clickable and launches as normal.
+    declaresShell();
+    const mutate = vi.fn();
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    renderWorkspace({ liveness: { kind: "runner_asleep" } });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const shell = await screen.findByRole("menuitem", { name: /shell/i });
+    expect(shell).not.toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(shell);
+    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+  });
+
+  it("shows 'Reconnecting…' while a create is in flight on a wakeable session", async () => {
+    declaresShell();
+    useCreateTerminalMock.mockReturnValue({
+      mutate: vi.fn(),
+      isPending: true,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    renderWorkspace({ liveness: { kind: "host_asleep" } });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(await screen.findByRole("menuitem", { name: /reconnecting/i })).toBeInTheDocument();
+  });
+
+  it("disables Shell and labels it Offline when the session can't be reconnected from the web", async () => {
+    // host_offline / local_stranded need a CLI reconnect — the browser can't
+    // wake them, so the item is disabled and marked Offline.
+    declaresShell();
+    const mutate = vi.fn();
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    renderWorkspace({ liveness: { kind: "local_stranded" } });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const shell = await screen.findByRole("menuitem", { name: /shell/i });
+    expect(shell).toHaveTextContent(/offline/i);
+    expect(shell).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(shell);
+    expect(mutate).not.toHaveBeenCalled();
   });
 });
 
