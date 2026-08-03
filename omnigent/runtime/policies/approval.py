@@ -37,6 +37,7 @@ full task_store + SSE stack. See POLICIES.md §7, §13.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import unicodedata
@@ -129,7 +130,7 @@ def validate_approval_presentation(
     # Newlines manipulate line structure, C0/C1/DEL carry control behavior, and bidi
     # marks can falsify the primary line and visible hostname. Reject to keep declared
     # and rendered text identical; the policy that evaluated the values owns hygiene.
-    if _has_disallowed_title_character(approval.title):
+    if _has_disallowed_title_character(title):
         _log_invalid_approval("unsafe title characters")
         return None
 
@@ -174,8 +175,30 @@ def approval_presentation_to_dict(
     }
 
 
-def _arguments_from_preview(content_preview: str) -> dict[str, Any]:
-    """Recover top-level tool arguments from an elicitation preview."""
+def arguments_from_preview(content_preview: str) -> dict[str, Any]:
+    """Recover the tool arguments mapping from an elicitation preview.
+
+    Two preview shapes reach this helper, so both are accepted:
+
+    * A *wrapper* object ``{"name": ..., "arguments": {...}}`` — the whole
+      tool-call event serialized as the preview. The ``arguments`` mapping
+      is returned.
+    * A *bare* arguments mapping ``{...}`` — the preview is already just the
+      arguments. The whole dict is returned.
+
+    The whole-dict fallback is therefore deliberate, not a safety net: bare
+    previews carry no ``arguments`` key, so restricting the lookup to that
+    key would derive ``{}`` and silently filter out every declared secondary
+    argument on those paths. The cost is that a wrapper-shaped preview whose
+    ``arguments`` value is absent or not a mapping lets its own top-level
+    keys (e.g. ``name``) count as argument names; that only ever widens the
+    set of names a policy may point the approval card at, never the values
+    rendered, so it is accepted over breaking the bare shape.
+
+    :param content_preview: JSON preview string from the elicitation.
+    :returns: The arguments mapping, or ``{}`` when the preview is not a
+        JSON object.
+    """
     try:
         content = json.loads(content_preview)
     except (TypeError, ValueError):
@@ -188,8 +211,6 @@ def _arguments_from_preview(content_preview: str) -> dict[str, Any]:
 
 def _log_invalid_approval(reason: str) -> None:
     """Log a presentation fallback without changing the policy verdict."""
-    import logging
-
     logging.getLogger(__name__).debug(
         "Dropping invalid approval presentation at elicitation boundary: %s",
         reason,
@@ -249,7 +270,7 @@ async def _await_elicitation(
     elicitation_id = f"elicit_{secrets.token_hex(16)}"
     approval = validate_approval_presentation(
         result.approval,
-        _arguments_from_preview(content_preview),
+        arguments_from_preview(content_preview),
     )
     elicitation = ElicitationRequest(
         message=result.reason or "",
@@ -493,6 +514,7 @@ def _truncate(text: str, *, limit: int) -> str:
 __all__ = [
     "ELICITATION_PENDING_TOOL_NAME",
     "_await_elicitation",
+    "arguments_from_preview",
     "build_elicitation_params_json",
     "build_elicitation_request_event",
     "resolve_ask_timeout",

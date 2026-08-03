@@ -80,6 +80,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import (
     approval_presentation_to_dict,
+    arguments_from_preview,
     build_elicitation_request_event,
     resolve_ask_timeout,
     validate_approval_presentation,
@@ -6364,12 +6365,9 @@ async def _register_policy_elicitation(
         e.g. ``"elicit_a1b2c3..."``.
     """
     elicitation_id = f"elicit_{secrets.token_hex(16)}"
-    try:
-        preview_value = json.loads(arguments_preview)
-    except (TypeError, ValueError):
-        preview_value = {}
-    arguments = preview_value if isinstance(preview_value, dict) else {}
-    approval = validate_approval_presentation(result.approval, arguments)
+    approval = validate_approval_presentation(
+        result.approval, arguments_from_preview(arguments_preview)
+    )
     elicitation = ElicitationRequest(
         message=result.reason or "Approval required",
         requested_schema={},
