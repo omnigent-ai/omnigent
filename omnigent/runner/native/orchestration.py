@@ -3889,17 +3889,6 @@ async def _codex_discover_thread_and_forward(
             ),
         )
 
-        # Mirror the discovered Codex thread id onto the Omnigent session as its
-        # external_session_id, the same way claude-native records its
-        # captured session id. This is what makes the session forkable with
-        # history: fork_conversation stamps
-        # ``omnigent.fork.source_external_session_id`` from
-        # external_session_id, and the forked clone's runner clones this
-        # thread's rollout from it (see _clone_codex_rollout). Without it a
-        # host-spawned codex session has no recorded thread id, so a fork
-        # would resume fresh. Best-effort: a transient Omnigent failure here still
-        # leaves chat streaming working — only fork-history carry-over
-        # degrades.
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
         auth_token = auth_factory() if auth_factory is not None else None

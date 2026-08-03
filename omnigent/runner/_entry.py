@@ -381,19 +381,6 @@ def _make_auth_token_factory(
     _allow_delegated_mint: bool = True,
     _proxy_bearer: str | None = None,
 ) -> Callable[[], str | None] | None:
-    # Return the runner-process singleton when it has been set and no
-    # caller-specific overrides are requested. This ensures every harness
-    # setup or terminal-creation call made after runner startup reuses the
-    # factory that already has the proxy bearer, rather than constructing a
-    # fresh one after RUNNER_INITIAL_AUTH_TOKEN has been popped from env.
-    if (
-        _runner_auth_factory is not None
-        and _allow_initial_token
-        and _allow_delegated_mint
-        and _proxy_bearer is None
-        and server_url is None
-    ):
-        return _runner_auth_factory
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
@@ -428,6 +415,19 @@ def _make_auth_token_factory(
     :returns: A sync callable returning a bearer token string, or
         ``None`` when no refresh mechanism is available.
     """
+    # Return the runner-process singleton when it has been set and no
+    # caller-specific overrides are requested. This ensures every harness
+    # setup or terminal-creation call made after runner startup reuses the
+    # factory that already has the proxy bearer, rather than constructing a
+    # fresh one after RUNNER_INITIAL_AUTH_TOKEN has been popped from env.
+    if (
+        _runner_auth_factory is not None
+        and _allow_initial_token
+        and _allow_delegated_mint
+        and _proxy_bearer is None
+        and server_url is None
+    ):
+        return _runner_auth_factory
     resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
     # Consume the host bearer before any credential discovery. Removing it
@@ -1267,11 +1267,15 @@ async def _run_tunnel_from_env() -> None:
 
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
-    # Use the setter so the singleton is written to the canonical module even
-    # when this file runs as __main__ (which has a separate module object).
-    import omnigent.runner._entry as _self_module
+    # Write the singleton to the canonical module via sys.modules so it is
+    # visible to all importers even when this file runs as __main__ (which
+    # Python treats as a separate module object from omnigent.runner._entry).
+    import sys as _sys
 
-    _self_module._set_runner_auth_factory(auth_token_factory)
+    _canonical = _sys.modules.get("omnigent.runner._entry")
+    if _canonical is not None:
+        _canonical._set_runner_auth_factory(auth_token_factory)
+    _set_runner_auth_factory(auth_token_factory)
     auth_token = auth_token_factory() if auth_token_factory is not None else None
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()
