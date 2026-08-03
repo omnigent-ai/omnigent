@@ -20,6 +20,8 @@ _TOOL_CLASSES: dict[str, tuple[str, str]] = {
     "download_file": ("omnigent.tools.builtins.download_file", "DownloadFileTool"),
     "export_agent": ("omnigent.tools.builtins.export_agent", "ExportAgentTool"),
     "list_files": ("omnigent.tools.builtins.list_files", "ListFilesTool"),
+    "nimble_extract": ("omnigent.tools.builtins.nimble_extract", "NimbleExtractTool"),
+    "nimble_research": ("omnigent.tools.builtins.nimble_research", "NimbleResearchTool"),
     "search_conversations": (
         "omnigent.tools.builtins.search_conversations",
         "SearchConversationsTool",
