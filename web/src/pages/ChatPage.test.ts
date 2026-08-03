@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
-import type { AnyBlock, ToolExecution } from "@/lib/blocks";
+import type { ToolExecution } from "@/lib/blocks";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -22,7 +22,6 @@ import {
   readOnlyReasonForSessionLabels,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
-  shouldShowPendingAssistantSkeleton,
   shouldShowAuthorBadge,
   shouldShowWorkingIndicator,
   shouldShowTerminalSurface,
@@ -731,66 +730,6 @@ describe("shouldShowWorkingIndicator", () => {
     ];
 
     expect(shouldShowWorkingIndicator(true, bubbles)).toBe(true);
-  });
-});
-
-describe("shouldShowPendingAssistantSkeleton", () => {
-  it("shows before a running turn has painted assistant content", () => {
-    expect(shouldShowPendingAssistantSkeleton(true, "running", null, [], [])).toBe(true);
-  });
-
-  it("stays hidden when the working affordance is gated off", () => {
-    expect(shouldShowPendingAssistantSkeleton(false, "running", null, [], [])).toBe(false);
-  });
-
-  it("gives way to the active response's rendered content", () => {
-    const activeResponse = { responseId: "resp_live", state: "streaming", error: null } as const;
-    const bubbles: Bubble[] = [
-      {
-        kind: "assistant",
-        responseId: "resp_live",
-        stableId: "resp_live",
-        lifecycle: "streaming",
-        error: null,
-        items: [{ kind: "text", itemId: null, text: "partial", final: false }],
-      },
-    ];
-    expect(shouldShowPendingAssistantSkeleton(true, "running", activeResponse, [], bubbles)).toBe(
-      false,
-    );
-  });
-
-  it("gives way to a native live preview", () => {
-    const liveBlock: AnyBlock = {
-      type: "text_done",
-      ctx: {
-        agent: null,
-        depth: 0,
-        turn: 0,
-        timestamp: 0,
-        responseId: "live:message_1",
-        itemId: "live:message_1",
-      },
-      fullText: "partial",
-      hasCodeBlocks: false,
-    };
-    expect(shouldShowPendingAssistantSkeleton(true, "running", null, [liveBlock], [])).toBe(false);
-  });
-
-  it("does not treat background-only waiting as a pending reply", () => {
-    expect(shouldShowPendingAssistantSkeleton(true, "waiting", null, [], [])).toBe(false);
-  });
-
-  it("lets a trailing compaction spinner own the pending slot", () => {
-    expect(
-      shouldShowPendingAssistantSkeleton(
-        true,
-        "running",
-        null,
-        [],
-        [{ kind: "compaction_loading", itemId: "cmp_1" }],
-      ),
-    ).toBe(false);
   });
 });
 
