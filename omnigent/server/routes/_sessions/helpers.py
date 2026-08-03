@@ -5793,8 +5793,8 @@ def _error_item_from_sse(
     :param event: Parsed runner SSE event.
     :param response_id: Current response id, e.g. ``"resp_abc123"``.
         ``None`` means no turn is active.
-    :returns: A ``type="error"`` item, or ``None`` when the event has
-        no structured error payload or is not tied to a turn.
+    :returns: A ``type="error"`` item, or ``None`` when the event is not
+        tied to a turn. A malformed ``response.failed`` gets a fallback.
     """
     evt_type = event.get("type")
     raw_error: Any
@@ -5817,13 +5817,19 @@ def _error_item_from_sse(
         return None
     if response_id is None:
         return None
-    if not isinstance(raw_error, dict):
-        return None
-    raw_code = raw_error.get("code")
-    raw_message = raw_error.get("message")
-    if not isinstance(raw_code, str) or not raw_code.strip():
-        return None
-    if not isinstance(raw_message, str) or not raw_message.strip():
+    raw_code = raw_error.get("code") if isinstance(raw_error, dict) else None
+    raw_message = raw_error.get("message") if isinstance(raw_error, dict) else None
+    if evt_type == "response.failed":
+        if not isinstance(raw_code, str) or not raw_code.strip():
+            raw_code = "response_failed"
+        if not isinstance(raw_message, str) or not raw_message.strip():
+            raw_message = "The harness failed without providing error details."
+    elif (
+        not isinstance(raw_code, str)
+        or not raw_code.strip()
+        or not isinstance(raw_message, str)
+        or not raw_message.strip()
+    ):
         return None
     if source not in ("llm", "execution", "tool"):
         return None
@@ -5847,10 +5853,8 @@ async def _relay_persist_error_once(
     Persist a runner error item unless the same error already exists.
 
     Native terminal startup can fail again on every runner reconnect.
-    Dedupe by the visible payload ``(source, code, message)`` only
-    when no user message has appeared since the matching error. That
-    suppresses reconnect spam while still recording a new error for a
-    user-initiated retry against the same broken terminal.
+    Until the next user message, dedupe matching visible payloads and
+    suppress a generic fallback when a specific error already exists.
 
     :param conversation_store: Store instance, or ``None`` to skip.
     :param session_id: Session/conversation identifier, e.g.
@@ -5865,6 +5869,7 @@ async def _relay_persist_error_once(
         return "skipped"
     if not isinstance(item.data, ErrorData):
         return "skipped"
+    is_fallback = item.data.code == "response_failed"
     try:
         recent = await asyncio.to_thread(
             conversation_store.list_items,
@@ -5881,7 +5886,7 @@ async def _relay_persist_error_once(
                 break
             if existing.type != "error" or not isinstance(existing.data, ErrorData):
                 continue
-            if (
+            if is_fallback or (
                 existing.data.source == item.data.source
                 and existing.data.code == item.data.code
                 and existing.data.message == item.data.message

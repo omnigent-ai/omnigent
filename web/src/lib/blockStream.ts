@@ -160,6 +160,8 @@ interface ReducerState {
   agent: string | null;
   turn: number;
   started: boolean;
+  // Suppress a generic terminal failure after a specific error.
+  responseErrorShown: boolean;
   // Active server-assigned response id, set on each `response.created`.
   // Stamped onto every emitted block's `ctx.responseId`.
   responseId: string;
@@ -183,6 +185,7 @@ function createState(flushThreshold: number): ReducerState {
     agent: null,
     turn: 0,
     started: false,
+    responseErrorShown: false,
     responseId: "",
   };
 }
@@ -324,6 +327,7 @@ function* beginResponse(state: ReducerState, response: Response): Generator<AnyB
   // reuse must render independently (see migration plan §4.4).
   state.seenCallIds.clear();
   state.seenResultCallIds.clear();
+  state.responseErrorShown = false;
   // Bump `turn` after the first task so blocks carry their task index.
   if (state.started) state.turn += 1;
   state.started = true;
@@ -770,6 +774,9 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // Pass `code` through too — renderers need it as a fallback
       // label when `message` is empty (otherwise the error panel
       // shows just `[llm]` with no hint as to what went wrong).
+      if (event.responseId === undefined || event.responseId === state.responseId) {
+        state.responseErrorShown = true;
+      }
       yield {
         type: "error",
         ctx: ctx(state, event.itemId ?? null, event.responseId ?? null),
@@ -797,17 +804,22 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
     case "response_cancelled": {
       yield* closeReasoning(state);
       yield* closeText(state);
-      // Surface the error message from a failed response as an
-      // inline ErrorBlock so the conversation view renders it.
-      // Without this, a policy DENY that fires before any text
-      // delta leaves the user staring at an empty bubble.
-      if (event.type === "response_failed" && event.response.error) {
+      // A failed response must always explain itself, even when a harness
+      // violates the schema and omits or malforms its error payload.
+      if (event.type === "response_failed" && (event.response.error || !state.responseErrorShown)) {
+        const error = event.response.error;
+        const code =
+          typeof error?.code === "string" && error.code.trim() ? error.code : "response_failed";
+        const message =
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message
+            : "The harness failed without providing error details.";
         yield {
           type: "error",
           ctx: ctx(state),
-          message: event.response.error.message ?? "",
-          source: "",
-          code: event.response.error.code ?? "response_failed",
+          message,
+          source: "execution",
+          code,
         } satisfies ErrorBlock;
       }
       yield {

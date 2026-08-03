@@ -3418,7 +3418,8 @@ async def test_relay_persists_in_turn_response_error_once_from_runner() -> None:
     Once a ``response.in_progress`` frame establishes the active turn,
     a following ``response.error`` is transcript-scoped. The relay
     persists that visible error payload so refresh shows the banner, but
-    still dedupes identical frames so history is not spammed.
+    still dedupes identical frames and the following bare terminal failure
+    so history is not spammed.
     """
     from omnigent.server.routes.sessions import _relay_runner_stream
 
@@ -3449,6 +3450,12 @@ async def test_relay_persists_in_turn_response_error_once_from_runner() -> None:
                         "code": "native_terminal_start_failed",
                         "message": "Native Codex requires the 'codex' CLI on PATH.",
                     },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "response": {"id": "resp_turn", "status": "failed"},
                 }
             ),
             "data: [DONE]\n\n",
@@ -4402,7 +4409,6 @@ async def test_relay_flushes_partial_text_on_failed_turn_before_error_item() -> 
                     "response": {
                         "id": "resp_fail",
                         "model": "nessie",
-                        "error": {"code": "llm_error", "message": "LLM exploded"},
                     },
                 }
             ),
@@ -4426,8 +4432,8 @@ async def test_relay_flushes_partial_text_on_failed_turn_before_error_item() -> 
         # Both items share the failed turn's id so they group in one bubble.
         assert message.response_id == "resp_fail"
         assert error.response_id == "resp_fail"
-        assert error.data.code == "llm_error"
-        assert error.data.message == "LLM exploded"
+        assert error.data.code == "response_failed"
+        assert error.data.message == "The harness failed without providing error details."
         # Populated before the terminal: proves the clear below is a real
         # transition, not "the index was never fed".
         assert inflight_after_deltas == [

@@ -30,26 +30,48 @@ interface ErrorBannerProps {
 }
 
 /**
- * Loud destructive banner for `error` blocks. Falls back to `code` when
- * `message` is empty (matches the reducer's intent — never show a blank
- * panel even when the LLM error payload omits the message).
+ * Full-width transcript alert. A runner disconnect explains automatic
+ * recovery; other failures keep their message and diagnostics separate.
  */
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
+  const disconnected = code === "runner_disconnected";
   const display = message || code || "Unknown error";
+  const details = [source ? `Source: ${source}` : "", code ? `Code: ${code}` : ""]
+    .filter(Boolean)
+    .join(" · ");
+
   return (
     <Alert
-      variant="destructive"
-      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
+      variant={disconnected ? "default" : "destructive"}
+      className={cn(
+        "min-w-0 max-w-full overflow-hidden border-[0.5px] has-[>svg]:grid-cols-[auto_minmax(0,1fr)]",
+        disconnected && "py-1.5",
+      )}
     >
-      <AlertCircleIcon />
-      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
-        Error{source ? ` · ${source}` : ""}
-        {code && message ? ` · ${code}` : ""}
+      <AlertCircleIcon className={cn(disconnected && "text-amber-700 dark:text-amber-300")} />
+      <AlertTitle
+        className={cn(
+          "min-w-0 break-words [overflow-wrap:anywhere]",
+          disconnected && "text-amber-700 dark:text-amber-300",
+        )}
+      >
+        {disconnected ? "Runner disconnected" : "Error"}
       </AlertTitle>
-      <AlertDescription className="min-w-0 max-w-full overflow-hidden">
-        <span className="block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]">
-          {display}
+      <AlertDescription
+        className={cn("min-w-0 max-w-full overflow-hidden", disconnected && "text-foreground")}
+      >
+        <span
+          className={cn(
+            "max-w-full",
+            !disconnected &&
+              "block whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]",
+          )}
+        >
+          {disconnected ? "Send another message to reconnect automatically." : display}
         </span>
+        {!disconnected && details && (
+          <span className="mt-2 block font-mono text-xs text-destructive/70">{details}</span>
+        )}
       </AlertDescription>
     </Alert>
   );
