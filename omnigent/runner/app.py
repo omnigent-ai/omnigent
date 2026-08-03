@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.codex_native_bridge import CodexNativeBridgeState
+    from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.terminals.registry import TerminalListEntry
 
 import click
@@ -51,6 +52,7 @@ from omnigent.harness_aliases import (
 )
 from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
 from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -370,7 +372,7 @@ def _get_runner_llm_client() -> Any:
 _RUNNER_DISPATCHED_FIELD = "omnigent_runner_dispatched"
 
 
-def _encode_sse_event(event: dict[str, Any]) -> bytes:
+def _encode_sse_event(event: Mapping[str, object]) -> bytes:
     """Re-encode an SSE event as a single ``data:`` frame."""
     import json as _json
 
@@ -384,7 +386,7 @@ async def _evaluate_policy_via_omnigent(
     conversation_id: str,
     evaluation_id: str,
     phase: str,
-    data: dict[str, Any],
+    data: _JsonObject,
 ) -> None:
     """
     Proxy a policy evaluation request from the harness to the Omnigent server.
@@ -434,7 +436,7 @@ async def _evaluate_policy_via_omnigent(
         if _fail_closed
         else None
     )
-    verdict_data: dict[str, Any] | None = None
+    verdict_data: _JsonObject | None = None
 
     try:
         ap_resp = await server_client.post(
@@ -484,7 +486,7 @@ async def _evaluate_policy_via_omnigent(
 
     # Post the verdict back to the harness as a policy_verdict event.
     try:
-        verdict_body: dict[str, Any] = {
+        verdict_body: _JsonObject = {
             "type": "policy_verdict",
             "evaluation_id": evaluation_id,
             "action": verdict_action,
@@ -676,7 +678,7 @@ class TurnDispatch:
     client_side_tool_names: frozenset[str] = frozenset()
 
 
-def _wrap_as_message_event(body: dict[str, Any]) -> dict[str, Any]:
+def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
     """
     Adapt a ``CreateResponseRequest``-shaped body into a
     :class:`MessageEvent` body for the harness's discriminated
@@ -730,7 +732,7 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 )
 
 
-def _is_context_overflow_error(event: dict[str, Any]) -> tuple[int, int] | None:
+def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     """
     Check if a ``response.failed`` SSE event indicates a context-window overflow.
 
@@ -739,7 +741,7 @@ def _is_context_overflow_error(event: dict[str, Any]) -> tuple[int, int] | None:
     """
     if event.get("type") != "response.failed":
         return None
-    error = event.get("error", {})
+    error = cast(_JsonObject, event.get("error", {}))
     msg = str(error.get("message", "")).lower()
     if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
         return None
@@ -755,7 +757,7 @@ def _is_context_overflow_error(event: dict[str, Any]) -> tuple[int, int] | None:
     return 128000, 128001
 
 
-def _response_failed_event(error: dict[str, Any]) -> bytes:
+def _response_failed_event(error: Mapping[str, object]) -> bytes:
     """
     Encode one ``response.failed`` SSE frame.
 
@@ -772,11 +774,11 @@ def _response_failed_event(error: dict[str, Any]) -> bytes:
 
 
 async def _resolve_forwarded_message_content(
-    content: list[dict[str, Any]],
+    content: list[_JsonObject],
     *,
     session_id: str,
     server_client: httpx.AsyncClient,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """Resolve server-uploaded ``file_id`` blocks inside the runner.
 
     Remote Omnigent servers can forward session messages with raw file IDs
@@ -788,7 +790,7 @@ async def _resolve_forwarded_message_content(
     if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
         return content
 
-    resolved: list[dict[str, Any]] = []
+    resolved: list[_JsonObject] = []
     changed = False
     for block in content:
         new_block = None
@@ -806,8 +808,8 @@ async def _resolve_forwarded_message_content(
 
 
 def _inject_mcp_schemas(
-    event_body: dict[str, Any],
-    mcp_schemas: list[dict[str, Any]],
+    event_body: _JsonObject,
+    mcp_schemas: list[_JsonObject],
 ) -> None:
     """Append *mcp_schemas* to ``event_body["tools"]`` in place.
 
@@ -820,13 +822,13 @@ def _inject_mcp_schemas(
     """
     if not mcp_schemas:
         return
-    existing = event_body.get("tools") or []
+    existing = cast(list[_JsonObject], event_body.get("tools") or [])
     existing_names = {t.get("name") for t in existing if t.get("name")}
     new_schemas = [s for s in mcp_schemas if s.get("name") not in existing_names]
     event_body["tools"] = list(existing) + new_schemas
 
 
-def _schema_tool_name(schema: dict[str, Any]) -> str | None:
+def _schema_tool_name(schema: _JsonObject) -> str | None:
     """
     Extract a tool's function name from its OpenAI-format schema.
 
@@ -843,9 +845,9 @@ def _schema_tool_name(schema: dict[str, Any]) -> str | None:
 
 
 def _merge_request_client_tools(
-    spec_tools: list[dict[str, Any]],
-    client_tools: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    spec_tools: list[_JsonObject],
+    client_tools: list[_JsonObject],
+) -> list[_JsonObject]:
     """
     Append request-supplied client-side tools to the spec tool schemas.
 
@@ -878,7 +880,7 @@ def _merge_request_client_tools(
         for t in spec_tools
         if isinstance(t, dict) and (name := _schema_tool_name(t)) is not None
     }
-    merged: list[dict[str, Any]] = list(spec_tools)
+    merged: list[_JsonObject] = list(spec_tools)
     for tool in client_tools:
         if not isinstance(tool, dict):
             continue
@@ -1561,7 +1563,7 @@ def _session_status_to_task_status(status: object) -> str | None:
     return None
 
 
-def _normalize_turn_error(error: dict[str, Any]) -> dict[str, str]:
+def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     """
     Coerce a turn-failure ``error`` dict into a ``{code, message}`` shape.
 
@@ -1678,7 +1680,7 @@ _session_agent_ids_ref: dict[str, str] = {}
 
 # Module-level ref to _session_histories. Populated inside
 # create_runner_app; used by tests to inspect in-memory history.
-_session_histories_ref: dict[str, list[dict[str, Any]]] = {}
+_session_histories_ref: dict[str, list[_JsonObject]] = {}
 
 # Module-level ref to _session_event_queues. Populated inside
 # create_runner_app; used by tests to inspect the queue an SSE
@@ -1686,11 +1688,11 @@ _session_histories_ref: dict[str, list[dict[str, Any]]] = {}
 # ``_publish_event`` are visible by the time the producer's await
 # call returns, so tests don't need to subscribe to the HTTP
 # ``/stream`` endpoint just to assert on emitted events).
-_session_event_queues_ref: dict[str, asyncio.Queue[dict[str, Any] | None]] = {}
+_session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 
 # Module-level ref to _session_inboxes. Populated inside create_runner_app;
 # used by the sub-agent work registry to deliver completions to the parent.
-_session_inboxes_ref: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+_session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
 
 
 def get_session_agent_id(session_id: str) -> str | None:
@@ -1721,10 +1723,10 @@ class _BodyRequest:
     constructing a real ASGI ``Request``. Not a general Request substitute.
     """
 
-    def __init__(self, body: dict[str, Any]) -> None:
+    def __init__(self, body: _JsonObject) -> None:
         self._body = body
 
-    async def json(self) -> dict[str, Any]:
+    async def json(self) -> _JsonObject:
         return self._body
 
 
@@ -1866,7 +1868,7 @@ def create_runner_app(
 
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
-    _session_tool_schemas: dict[str, list[dict[str, Any]]] = {}  # session_id → cached tool schemas
+    _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, Any] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -1884,7 +1886,7 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     _native_pane_status: dict[str, str] = {}
-    _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
+    _session_message_buffers: dict[str, list[_JsonObject]] = {}
     _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
@@ -1925,17 +1927,18 @@ def create_runner_app(
 
     app.state.drain_session_streams = _drain_session_streams
 
-    def _publish_event(session_id: str, event: dict[str, Any]) -> None:
+    def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
+        event_body = cast(_JsonObject, event)
         queue = _session_event_queues.get(session_id)
         if queue is None:
             queue = asyncio.Queue()
             _session_event_queues[session_id] = queue
-        queue.put_nowait(event)
-        if event.get("type") == "session.status":
-            _status_value = event.get("status")
+        queue.put_nowait(event_body)
+        if event_body.get("type") == "session.status":
+            _status_value = event_body.get("status")
             if isinstance(_status_value, str):
                 _native_pane_status[session_id] = _status_value
-        _fan_out_child_delta_to_parent(session_id, event)
+        _fan_out_child_delta_to_parent(session_id, event_body)
 
     def _child_preview_from_status(
         session_id: str,
@@ -1961,7 +1964,7 @@ def create_runner_app(
         *,
         error: dict[str, str] | None = None,
         include_error: bool = False,
-    ) -> dict[str, Any]:
+    ) -> _JsonObject:
         busy = status in ("running", "waiting")
         child = {
             "id": session_id,
@@ -1977,7 +1980,7 @@ def create_runner_app(
 
     def _child_error_from_status_event(
         status: str | None,
-        event: dict[str, Any],
+        event: _JsonObject,
     ) -> dict[str, str] | None:
         if status != "failed":
             return None
@@ -2000,7 +2003,7 @@ def create_runner_app(
         error: dict[str, str] | None = None,
         latest_assistant_text: str | None = None,
         allow_history_preview_fallback: bool = True,
-    ) -> dict[str, Any] | None:
+    ) -> _JsonObject | None:
         if status in ("running", "waiting"):
             mark_subagent_work_started(session_id)
         busy = status in ("running", "waiting")
@@ -2040,7 +2043,7 @@ def create_runner_app(
 
     def _fan_out_child_delta_to_parent(
         session_id: str,
-        event: dict[str, Any],
+        event: _JsonObject,
         *,
         latest_assistant_text: str | None = None,
         allow_history_preview_fallback: bool = True,
@@ -2311,7 +2314,7 @@ def create_runner_app(
         return None
 
     async def _load_session_init_context(
-        body: dict[str, Any],
+        body: _JsonObject,
         *,
         session_id: str,
         agent_id: str,
@@ -2436,18 +2439,17 @@ def create_runner_app(
             )
 
         sub_agent_name = body.sub_agent_name or await _recover_sub_agent_name(conversation_id)
-        resolver_kwargs: dict[str, Any] = {
-            "agent_id": body.agent_id or _session_agent_ids.get(conversation_id),
-            "spec_resolver": spec_resolver,
-            "session_id": conversation_id,
-            "model_override": body.model_override,
-            "harness_override": body.harness_override,
-            "sub_agent_name": sub_agent_name,
-            "cwd": await _session_runtime_cwd(conversation_id),
-        }
+        resolver_agent_id = body.agent_id or _session_agent_ids.get(conversation_id)
+        resolver_cwd = await _session_runtime_cwd(conversation_id)
         try:
             effective_harness, spawn_env = await _resolve_harness_config(
-                **resolver_kwargs,
+                agent_id=resolver_agent_id,
+                spec_resolver=spec_resolver,
+                session_id=conversation_id,
+                model_override=body.model_override,
+                harness_override=body.harness_override,
+                sub_agent_name=sub_agent_name,
+                cwd=resolver_cwd,
             )
             generator_spec = generator_spec_for_harness(effective_harness)
             if generator_spec is None:
@@ -2455,7 +2457,13 @@ def create_runner_app(
             resolver_harness = generator_spec.resolver_harness or effective_harness
             if resolver_harness != effective_harness:
                 resolved_harness, spawn_env = await _resolve_harness_config(
-                    **(resolver_kwargs | {"harness_override": resolver_harness}),
+                    agent_id=resolver_agent_id,
+                    spec_resolver=spec_resolver,
+                    session_id=conversation_id,
+                    model_override=body.model_override,
+                    harness_override=resolver_harness,
+                    sub_agent_name=sub_agent_name,
+                    cwd=resolver_cwd,
                 )
                 if resolved_harness != resolver_harness:
                     return BackgroundSessionTitleResponse(status="unsupported")
@@ -2473,7 +2481,7 @@ def create_runner_app(
             harness=effective_harness,
             spawn_env=dict(spawn_env or {}),
             process_manager=process_manager,
-            cwd=resolver_kwargs["cwd"],
+            cwd=resolver_cwd,
             model_override=body.model_override,
             session_spec=_session_spec_cache.get(conversation_id),
         )
@@ -2514,7 +2522,7 @@ def create_runner_app(
             title=" ".join(title.split()),
         )
 
-    async def _initialize_session(body: dict[str, Any]) -> JSONResponse:
+    async def _initialize_session(body: _JsonObject) -> JSONResponse:
         if process_manager is None:
             return JSONResponse(
                 status_code=501,
@@ -2533,6 +2541,8 @@ def create_runner_app(
                     "detail": ("'session_id' and 'agent_id' required."),
                 },
             )
+        session_id = cast(str, session_id)
+        agent_id = cast(str, agent_id)
 
         try:
             init_context = await _load_session_init_context(
@@ -2565,7 +2575,8 @@ def create_runner_app(
             spec_entry = spec
             if isinstance(spec_entry, ResolvedSpec):
                 spec = _unwrap_resolved_spec(spec_entry)
-            _sa_name_assign = body.get("sub_agent_name")
+            raw_sub_agent_name = body.get("sub_agent_name")
+            _sa_name_assign = cast(str | None, raw_sub_agent_name)
             if _sa_name_assign:
                 from omnigent.runtime.workflow import _find_spec_by_name
 
@@ -2636,7 +2647,8 @@ def create_runner_app(
             _session_inboxes[session_id] = asyncio.Queue()
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
-        _sa_name = body.get("sub_agent_name")
+        raw_sub_agent_name = body.get("sub_agent_name")
+        _sa_name = cast(str | None, raw_sub_agent_name)
         if _sa_name:
             _session_sub_agent_names[session_id] = _sa_name
 
@@ -2906,7 +2918,7 @@ def create_runner_app(
         _suppress_recovery = (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
-        history: list[dict[str, Any]]
+        history: list[_JsonObject]
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
@@ -2999,7 +3011,7 @@ def create_runner_app(
         response = await asyncio.shield(task)
         return JSONResponse(
             status_code=response.status_code,
-            content=json.loads(response.body),
+            content=json.loads(bytes(response.body)),
         )
 
     @app.get("/v1/sessions/{session_id}/stream")
@@ -3225,8 +3237,8 @@ def create_runner_app(
     async def _load_history_as_input(
         session_id: str,
         drop_item_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        all_items: list[dict[str, Any]] = []
+    ) -> list[_JsonObject]:
+        all_items: list[_JsonObject] = []
         after_cursor: str | None = None
         while True:
             params: dict[str, str] = {
@@ -3285,17 +3297,17 @@ def create_runner_app(
         return converted
 
     def _convert_raw_items_to_input(
-        items: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+        items: list[_JsonObject],
+    ) -> list[_JsonObject]:
         compaction_idx: int | None = None
         for i, item in enumerate(items):
             if item.get("type") == "compaction":
                 compaction_idx = i
 
-        result: list[dict[str, Any]] = []
+        result: list[_JsonObject] = []
         if compaction_idx is not None:
             c = items[compaction_idx]
-            _compacted = c.get("compacted_messages")
+            _compacted = cast(list[_JsonObject] | None, c.get("compacted_messages"))
             if _compacted:
                 result.extend(_compacted)
             else:
@@ -3368,7 +3380,7 @@ def create_runner_app(
                     }
                 )
             elif item_type == "error":
-                message = item.get("message")
+                error_message = item.get("message")
                 code = item.get("code")
                 source = item.get("source")
                 result.append(
@@ -3377,7 +3389,9 @@ def create_runner_app(
                         "source": source if isinstance(source, str) and source else "execution",
                         "code": code if isinstance(code, str) and code else "error",
                         "message": (
-                            message if isinstance(message, str) and message else "unknown error"
+                            error_message
+                            if isinstance(error_message, str) and error_message
+                            else "unknown error"
                         ),
                     }
                 )
@@ -3416,11 +3430,11 @@ def create_runner_app(
 
     async def _handle_harness_compaction(
         conv: str,
-        event: dict[str, Any],
+        event: _JsonObject,
     ) -> None:
-        summary: str = event.get("summary", "")
-        token_count: int = event.get("total_tokens") or 0
-        model: str | None = event.get("summary_model")
+        summary = cast(str, event.get("summary", ""))
+        token_count = cast(int, event.get("total_tokens") or 0)
+        model = cast(str | None, event.get("summary_model"))
         last_item_id = _last_server_item_id.get(conv)
 
         if not last_item_id:
@@ -3431,8 +3445,8 @@ def create_runner_app(
             )
             return
 
-        compacted_messages = event.get("compacted_messages")
-        compaction_event: dict[str, Any] = {
+        compacted_messages = cast(list[_JsonObject] | None, event.get("compacted_messages"))
+        compaction_event: _JsonObject = {
             "type": "compaction",
             "summary": summary,
             "last_item_id": last_item_id,
@@ -3501,7 +3515,7 @@ def create_runner_app(
         history = _session_histories.get(conv_id, [])
 
         call_ids_with_output: set[str] = set()
-        dangling_calls: list[dict[str, Any]] = []
+        dangling_calls: list[_JsonObject] = []
         for item in history:
             itype = item.get("type")
             if itype == "function_call":
@@ -3511,10 +3525,10 @@ def create_runner_app(
             elif itype == "function_call_output":
                 cid = item.get("call_id")
                 if cid:
-                    call_ids_with_output.add(cid)
+                    call_ids_with_output.add(cast(str, cid))
 
-        items_to_persist: list[dict[str, Any]] = []
-        synthetic_items: list[dict[str, Any]] = []
+        items_to_persist: list[_JsonObject] = []
+        synthetic_items: list[_JsonObject] = []
         cached_spec_entry = _session_spec_cache.get(conv_id)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         agent_name = cached_spec.name if cached_spec else "unknown"
@@ -3524,7 +3538,7 @@ def create_runner_app(
                 fc_for_db = dict(fc)
                 fc_for_db.setdefault("agent", agent_name)
                 items_to_persist.append(fc_for_db)
-                synthetic_output = {
+                synthetic_output: _JsonObject = {
                     "type": "function_call_output",
                     "call_id": call_id,
                     "output": _CANCELLATION_TOOL_OUTPUT,
@@ -3532,7 +3546,7 @@ def create_runner_app(
                 synthetic_items.append(synthetic_output)
                 items_to_persist.append(synthetic_output)
 
-        marker = {
+        marker: _JsonObject = {
             "type": "message",
             "role": "user",
             "content": [
@@ -3557,7 +3571,7 @@ def create_runner_app(
 
     async def _persist_cancellation_items(
         conv_id: str,
-        items: list[dict[str, Any]],
+        items: list[_JsonObject],
     ) -> None:
         import uuid as _uuid
 
@@ -3630,7 +3644,7 @@ def create_runner_app(
     def _publish_turn_status(
         conv_id: str,
         status: str,
-        error: dict[str, Any] | None = None,
+        error: Mapping[str, object] | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -3650,7 +3664,7 @@ def create_runner_app(
             return
         if status == "idle" and harness in {"codex-native", "antigravity-native"}:
             return
-        event: dict[str, Any] = {"type": "session.status", "status": status}
+        event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
             event["error"] = error
         _publish_event(conv_id, event)
@@ -3702,7 +3716,7 @@ def create_runner_app(
 
     async def _handle_codex_native_settings_update(
         conv_id: str,
-        settings: dict[str, Any],
+        settings: _JsonObject,
     ) -> Response:
         from omnigent.codex_native_app_server import client_for_transport
 
@@ -3819,7 +3833,7 @@ def create_runner_app(
             },
         )
 
-    async def _codex_native_model_options(conv_id: str) -> list[dict[str, Any]]:
+    async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
         from omnigent.codex_native_app_server import (
             client_for_transport,
             list_codex_model_options,
@@ -4125,7 +4139,7 @@ def create_runner_app(
             await client.aclose()
         return Response(status_code=200)
 
-    async def _opencode_native_model_options(conv_id: str) -> list[dict[str, Any]]:
+    async def _opencode_native_model_options(conv_id: str) -> list[_JsonObject]:
         from omnigent.opencode_native_app_server import (
             filtered_server_env,
             list_opencode_cli_model_options,
@@ -4514,7 +4528,7 @@ def create_runner_app(
     def _on_proxy_stream_end(
         conv_id: str,
         *,
-        error: dict[str, Any] | None = None,
+        error: Mapping[str, object] | None = None,
     ) -> None:
 
         _active_turns.pop(conv_id, None)
@@ -4613,7 +4627,7 @@ def create_runner_app(
             )
         await _cancel_active_turn(conv_id, expected_task=target)
 
-    def _history_message_from_body(body: dict[str, Any]) -> dict[str, Any]:
+    def _history_message_from_body(body: _JsonObject) -> _JsonObject:
         message = {
             "type": "message",
             "role": body.get("role", "user"),
@@ -4623,7 +4637,7 @@ def create_runner_app(
             message["created_by"] = body["created_by"]
         return message
 
-    def _note_message_author(session_id: str, body: dict[str, Any]) -> None:
+    def _note_message_author(session_id: str, body: _JsonObject) -> None:
         if session_id in _author_attribution_sessions:
             return
         if body.get("author_attribution_required") is True:
@@ -4641,10 +4655,10 @@ def create_runner_app(
             _author_attribution_sessions.add(session_id)
 
     def _message_body_for_harness(
-        body: dict[str, Any],
+        body: _JsonObject,
         *,
         force_author_attribution: bool,
-    ) -> dict[str, Any]:
+    ) -> _JsonObject:
         event = {
             key: value
             for key, value in body.items()
@@ -4837,19 +4851,19 @@ def create_runner_app(
             return
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-        relay_schemas: list[dict[str, Any]] = build_native_relay_tool_schemas(relay_spec)
+        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
 
         _captured_session_id = session_id
 
         async def _relay_tool_executor(
             name: str,
-            arguments: dict[str, Any],
-        ) -> dict[str, Any]:
+            arguments: _JsonObject,
+        ) -> _JsonObject:
             result_str = await ProxyMcpManager(
                 _captured_session_id, server_client, publish_event=_publish_event
             ).call_tool(None, name, arguments)
             try:
-                return _json.loads(result_str)
+                return cast(_JsonObject, _json.loads(result_str))
             except _json.JSONDecodeError:
                 return {"result": result_str}
 
@@ -4890,7 +4904,7 @@ def create_runner_app(
             _notify_task.add_done_callback(_background_tasks.discard)
 
     async def _run_turn_bg(
-        msg_body: dict[str, Any],
+        msg_body: _JsonObject,
         conv: str,
     ) -> None:
         _subagent_wake_pending.discard(conv)
@@ -4915,10 +4929,10 @@ def create_runner_app(
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
 
     async def _run_turn_bg_setup_and_stream(
-        msg_body: dict[str, Any],
+        msg_body: _JsonObject,
         conv: str,
     ) -> None:
-        _dispatched_agent_id = msg_body.get("agent_id")
+        _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         _prior_agent_id = _session_agent_ids.get(conv)
         if (
             _dispatched_agent_id
@@ -4946,7 +4960,7 @@ def create_runner_app(
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
         if cached_spec is None and spec_resolver is not None:
-            _aid = msg_body.get("agent_id")
+            _aid = _dispatched_agent_id
             if _aid:
                 try:
                     resolved = await spec_resolver(_aid, conv)
@@ -5002,7 +5016,7 @@ def create_runner_app(
         instructions: str | None = None
         if cached_spec is not None:
             h = (
-                msg_body.get("harness_override")
+                cast(str | None, msg_body.get("harness_override"))
                 or cached_spec.executor.config.get("harness")
                 or cached_spec.executor.type
             )
@@ -5019,10 +5033,10 @@ def create_runner_app(
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
-                harness_name,
+                cast(str, harness_name),
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
-                model_override=msg_body.get("model_override"),
+                model_override=cast(str | None, msg_body.get("model_override")),
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -5039,7 +5053,7 @@ def create_runner_app(
             )
 
         ctx = TurnDispatch(
-            agent_id=msg_body.get("agent_id"),
+            agent_id=_dispatched_agent_id,
             harness=harness_name,
             spawn_env=spawn_env,
             has_mcp_servers=(
@@ -5049,7 +5063,7 @@ def create_runner_app(
             instructions=instructions,
         )
 
-        harness_body: dict[str, Any] = {
+        harness_body: _JsonObject = {
             "type": "message",
             "role": "user",
             "model": msg_body.get("model", ""),
@@ -5068,17 +5082,17 @@ def create_runner_app(
                 "content",
                 [],
             )
-        _content = harness_body.get("content", [])
+        _content = cast(list[object], harness_body.get("content", []))
         _content_summary = []
         for _ci in _content:
             if isinstance(_ci, dict):
                 _ct = _ci.get("type", "?")
                 if _ct == "message":
-                    _blocks = _ci.get("content", [])
+                    _blocks = cast(list[object], _ci.get("content", []))
                     _block_types = [b.get("type") for b in _blocks if isinstance(b, dict)]
                     _content_summary.append(f"msg({_ci.get('role', '?')}, blocks={_block_types})")
                 else:
-                    _content_summary.append(_ct)
+                    _content_summary.append(str(_ct))
         _logger.info(
             "_run_turn_bg: conv=%s history_msgs=%d content_summary=%s",
             conv,
@@ -5090,7 +5104,7 @@ def create_runner_app(
             harness_body["instructions"] = instructions
 
         if conv not in _session_tool_schemas:
-            all_tools: list[dict[str, Any]] = []
+            all_tools: list[_JsonObject] = []
             if cached_spec is not None:
                 try:
                     from omnigent.tools.manager import (
@@ -5119,7 +5133,7 @@ def create_runner_app(
 
             _mcp_hash = compute_spec_hash(list(cached_spec.mcp_servers))
             if _mcp_hash != _session_mcp_spec_hash.get(conv):
-                _session_mcp_proxy: Any = ProxyMcpManager(conv, server_client)
+                _session_mcp_proxy = ProxyMcpManager(conv, server_client)
                 try:
                     mcp_result = await _session_mcp_proxy.schemas_for(
                         cached_spec,
@@ -5127,7 +5141,11 @@ def create_runner_app(
                     _builtin_tools = [
                         t
                         for t in _session_tool_schemas.get(conv, [])
-                        if not (isinstance(t, dict) and "__" in (t.get("name") or ""))
+                        if not (
+                            isinstance(t, dict)
+                            and isinstance(t.get("name"), str)
+                            and "__" in cast(str, t.get("name"))
+                        )
                     ]
                     _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
                     _session_mcp_spec_hash[conv] = _mcp_hash
@@ -5143,7 +5161,7 @@ def create_runner_app(
                     )
 
         _spec_tools = _session_tool_schemas.get(conv) or []
-        _client_tools = msg_body.get("tools") or []
+        _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
             harness_body["tools"] = merged_tools
@@ -5237,7 +5255,7 @@ def create_runner_app(
                     UnicodeDecodeError,
                     AttributeError,
                 ):
-                    err_detail = response.body.decode(
+                    err_detail = bytes(response.body).decode(
                         "utf-8",
                     )[:200]
             _logger.error(
@@ -5277,24 +5295,27 @@ def create_runner_app(
             )
 
     async def _stream_message_to_harness(
-        body: dict[str, Any],
+        body: _JsonObject,
         conv_id: str,
         dispatch: TurnDispatch | None = None,
-    ) -> Any:
-        harness_name = dispatch.harness if dispatch else body.get("harness")
-        spawn_env = dispatch.spawn_env if dispatch else body.get("spawn_env")
+    ) -> Response:
+        manager = cast(HarnessProcessManager, process_manager)
+        harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
+        spawn_env = (
+            dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
+        )
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
-            _agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
+            _agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
             _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
                 harness_name, spawn_env = await _resolve_harness_config(
                     agent_id=_agent_id,
                     spec_resolver=spec_resolver,
                     session_id=conv_id,
-                    model_override=body.get("model_override"),
-                    harness_override=body.get("harness_override"),
+                    model_override=cast(str | None, body.get("model_override")),
+                    harness_override=cast(str | None, body.get("harness_override")),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
                 )
@@ -5314,10 +5335,12 @@ def create_runner_app(
                 optional_labels=startup_labels,
             )
 
-        agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
+        agent_version = (
+            dispatch.agent_version if dispatch else cast(int | None, body.get("agent_version"))
+        )
         if agent_version is not None and conv_id in _version_cache:
             if agent_version > _version_cache[conv_id]:
-                await process_manager.release(conv_id)
+                await manager.release(conv_id)
         if agent_version is not None:
             _version_cache[conv_id] = agent_version
 
@@ -5350,7 +5373,7 @@ def create_runner_app(
                 )
 
         try:
-            client = await process_manager.get_client(conv_id, harness_name, env=spawn_env)
+            client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,
@@ -5360,12 +5383,12 @@ def create_runner_app(
                 },
             )
 
-        _turn_agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
+        _turn_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
         _has_mcp_hint = dispatch.has_mcp_servers if dispatch else body.get("has_mcp_servers")
-        _turn_spec: Any = None
-        _turn_spec_entry: Any = None
+        _turn_spec: object | None = None
+        _turn_spec_entry: object | None = None
         _turn_spec_resolved = False
-        _mcp_schemas: list[dict[str, Any]] = []
+        _mcp_schemas: list[_JsonObject] = []
         _mcp_tool_names: set[str] = set()
         _eager_spec_error: tuple[str, str] | None = None
         if _has_mcp_hint is True and _turn_agent_id:
@@ -5395,10 +5418,10 @@ def create_runner_app(
                         _spec_cache[_turn_agent_id] = _resolved_turn_spec
                         _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
-            _turn_mcp: Any = ProxyMcpManager(conv_id, server_client)
+            _turn_mcp = ProxyMcpManager(conv_id, server_client)
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
-                    _mcp = await _turn_mcp.schemas_for(_turn_spec)
+                    _mcp = await _turn_mcp.schemas_for(cast(AgentSpec, _turn_spec))
                     _mcp_schemas = _mcp.schemas
                     _mcp_tool_names = _mcp.tool_names
                     for _srv, _err in _mcp.failures.items():
@@ -5406,7 +5429,7 @@ def create_runner_app(
                 except Exception:
                     _logger.exception("runner mcp_manager.schemas_for failed")
 
-        async def _resolve_turn_spec_lazy() -> tuple[Any, tuple[str, str] | None]:
+        async def _resolve_turn_spec_lazy() -> tuple[object | None, tuple[str, str] | None]:
             nonlocal _turn_spec, _turn_spec_entry, _turn_spec_resolved
             if _turn_spec_resolved:
                 return _turn_spec_entry or _turn_spec, None
@@ -5501,11 +5524,11 @@ def create_runner_app(
                         return
 
                     _response_id: str | None = None
-                    _omnigent_task_id: str | None = body.get("task_id")
+                    _omnigent_task_id = cast(str | None, body.get("task_id"))
                     _buffer = ""
-                    _dispatch_tasks: list[_asyncio.Task[str]] = []
+                    _dispatch_tasks: list[_asyncio.Task[object]] = []
                     _text_acc: list[str] = []
-                    _stream_failed_error: dict[str, Any] | None = None
+                    _stream_failed_error: _JsonObject | None = None
                     async for chunk in harness_resp.aiter_text():
                         _buffer += chunk
                         while "\n\n" in _buffer:
@@ -5531,7 +5554,7 @@ def create_runner_app(
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
                                         _live_response_id[conv_id] = _response_id
-                                        process_manager.mark_in_flight(conv_id, _response_id)
+                                        manager.mark_in_flight(conv_id, _response_id)
 
                                 _defer_publish = False
 
@@ -5685,8 +5708,10 @@ def create_runner_app(
                                         )
                                         event[_RUNNER_DISPATCHED_FIELD] = True
                                         raw_sse_bytes = _encode_sse_event(event)
-                                        _agent_id_for_dispatch = body.get("agent_id")
-                                        _dispatch_mcp: Any = ProxyMcpManager(
+                                        _agent_id_for_dispatch = cast(
+                                            str | None, body.get("agent_id")
+                                        )
+                                        _dispatch_mcp = ProxyMcpManager(
                                             conv_id,
                                             server_client,
                                             publish_event=_publish_event,
@@ -5706,9 +5731,11 @@ def create_runner_app(
                                                     conversation_id=conv_id,
                                                     task_id=_omnigent_task_id or _response_id,
                                                     agent_id=_agent_id_for_dispatch,
-                                                    agent_name=body.get("model"),
+                                                    agent_name=cast(str | None, body.get("model")),
                                                     runner_workspace=_dispatch_workdir,
-                                                    mcp_manager=_dispatch_mcp,
+                                                    mcp_manager=cast(
+                                                        "RunnerMcpManager", _dispatch_mcp
+                                                    ),
                                                     session_inbox=_session_inboxes.get(conv_id),
                                                     session_async_tasks=_session_async_tasks.get(
                                                         conv_id
@@ -7919,7 +7946,7 @@ def create_runner_app(
                 content={"error": {"code": -32700, "message": "Parse error: invalid JSON"}},
             )
         method: str = body.get("method") or ""
-        params: dict[str, Any] = body.get("params") or {}
+        params: _JsonObject = body.get("params") or {}
 
         if method == "tools/list":
             if mcp_manager is None:
@@ -7979,10 +8006,10 @@ def create_runner_app(
 
             from omnigent.runner.tool_dispatch import execute_tool
 
-            tool_name: str = params.get("name") or ""
-            arguments: dict[str, Any] = params.get("arguments") or {}
-            input_responses: dict[str, Any] | None = params.get("inputResponses")
-            request_state: str | None = params.get("requestState")
+            tool_name = cast(str, params.get("name") or "")
+            arguments = cast(_JsonObject, params.get("arguments") or {})
+            input_responses = cast(_JsonObject | None, params.get("inputResponses"))
+            request_state = cast(str | None, params.get("requestState"))
             if not tool_name:
                 return JSONResponse(
                     status_code=200,
@@ -8283,7 +8310,7 @@ def create_runner_app(
         return JSONResponse(content={"text": summary_text, "token_count": token_count})
 
     @app.post("/v1/elicitations/{elicitation_id}")
-    async def elicitation(elicitation_id: str, request: Request) -> JSONResponse:
+    async def elicitation(elicitation_id: str, request: Request) -> Response:
         if process_manager is None:
             return JSONResponse(
                 status_code=501,
@@ -8344,7 +8371,7 @@ def create_runner_app(
                 continue
             try:
                 after_id = _last_server_item_id.get(session_id)
-                all_new: list[dict[str, Any]] = []
+                all_new: list[_JsonObject] = []
                 while True:
                     params: dict[str, str] = {
                         "limit": "100",
@@ -8384,7 +8411,7 @@ def create_runner_app(
                     _active_turns[session_id] = None
                     _publish_turn_status(session_id, "running")
                     agent_id = _session_agent_ids.get(session_id)
-                    msg_body = {
+                    msg_body: _JsonObject = {
                         "agent_id": agent_id,
                         "model": agent_id or "",
                     }
@@ -8734,7 +8761,7 @@ async def _evaluate_agent_start_gate(
     if gate.is_empty:
         return None
 
-    sandbox_dict: dict[str, Any] | None = None
+    sandbox_dict: _JsonObject | None = None
     if spec.os_env is not None and spec.os_env.sandbox is not None:
         sandbox_dict = dataclasses.asdict(spec.os_env.sandbox)
 
