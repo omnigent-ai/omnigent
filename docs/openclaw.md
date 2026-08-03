@@ -99,15 +99,25 @@ servers.
 
 ### Compatibility status
 
-The protocol-level path matches for initialization, session creation, prompts,
-cancellation, and streaming updates. Manual validation against a live Gateway
-has also confirmed the configured worktree, native shell/filesystem tools, and
-Omni conversation resume. Bidirectional synchronization with the OpenClaw
-Control UI and per-session Omnigent MCP are not supported by this integration.
+This integration has been validated end-to-end against a live OpenClaw Gateway.
+The full turn cycle works: initialization, session creation, prompts,
+cancellation, and **streaming assistant replies** (final messages arrive in the
+Omni conversation). Live validation also confirmed the configured worktree,
+native shell/filesystem tool execution, ACP permission requests (approvals route
+through ACP rather than OpenClaw's chat), and Omni conversation resume after
+close.
+
+Known limitation: bidirectional synchronization with the OpenClaw Control UI is
+not supported. Omni owns the outer conversation; the Control UI is a separate
+Gateway client, so messages entered there while Omni is offline are not imported
+into the Omni conversation. Per-session Omnigent MCP is also unsupported (see
+[Why `omnigent_mcp` must be false](#why-omnigent_mcp-must-be-false)).
+
 OpenClaw cannot be installed or run in the project's managed development and CI
-environments.
+environments, so this path is not exercised by automated CI; changes to the ACP
+client should be re-validated manually against a Gateway.
 
 If session creation reports that `mcpServers` is unsupported, confirm that the
-entry contains `omnigent_mcp: false` and restart the Omnigent session. If the
-turn reaches OpenClaw but no final reply appears, capture both Omnigent and
-OpenClaw logs and report the behavior before relying on the integration.
+entry contains `omnigent_mcp: false` and restart the Omnigent session. If a turn
+reaches OpenClaw but no final reply appears, capture both Omnigent and OpenClaw
+logs and file an issue.
