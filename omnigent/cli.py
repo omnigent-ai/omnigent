@@ -3908,7 +3908,11 @@ def _internal_write_ledger(from_env: bool) -> None:
 @click.option(
     "--server",
     default=None,
-    help="Server URL to read the server version and auth mode from (GET /v1/info).",
+    help=(
+        "Trusted server URL to read the server version and auth mode from "
+        "(GET /v1/info). Stored/ambient credentials may be attached to the "
+        "request, so point it only at a server you trust."
+    ),
 )
 @click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
 def diagnose(server: str | None, json_output: bool) -> None:
@@ -3916,8 +3920,11 @@ def diagnose(server: str | None, json_output: bool) -> None:
 
     Reports the CLI version, OS/Python, and the server auth mode. Pass
     ``--server <url>`` to also read the server version and its real auth mode
-    (so version skew between CLI and server is visible). Contains no secrets —
-    safe to paste into an issue.
+    (so version skew between CLI and server is visible). The output contains no
+    secrets — safe to paste into an issue. ``--server`` should point only at a
+    server you trust: reaching a managed server may attach your stored/ambient
+    credentials to the request (the same behavior as ``session export`` / ``run
+    --server``).
     """
     from omnigent.diagnostics import collect_snapshot
 

@@ -23,6 +23,28 @@ from __future__ import annotations
 
 import platform
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+
+def _redact_url(url: str | None) -> str | None:
+    """Strip userinfo and query/fragment from a URL so it's safe to print.
+
+    A ``--server`` value could carry embedded basic-auth (``https://user:pass@h``)
+    or a query token; the snapshot is meant to be pasted into a bug report, so
+    keep only scheme + host + port + path.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.scheme and not parts.netloc:
+        return url  # not URL-shaped (e.g. a bare host); leave as-is
+    # ``hostname``/``port`` drop any ``user:pass@`` userinfo; query+fragment cleared.
+    host = parts.hostname or ""
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _local_version() -> str:
@@ -131,7 +153,7 @@ def collect_snapshot(*, server_url: str | None = None, timeout: float = 5.0) -> 
     return {
         "cli_version": _local_version(),
         "server_version": server_version,
-        "server_url": server_url,
+        "server_url": _redact_url(server_url),
         "auth_source": auth_source,
         "auth_source_origin": auth_source_origin,
         "os": platform.platform(),

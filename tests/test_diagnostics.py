@@ -95,3 +95,25 @@ def test_snapshot_contains_no_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-appear")
     blob = repr(collect_snapshot(server_url=None))
     assert "sk-should-not-appear" not in blob
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("http://user:pass@host:6767/api", "http://host:6767/api"),
+        ("https://tok@example.com/path?token=abc#frag", "https://example.com/path"),
+        ("http://localhost:6767", "http://localhost:6767"),
+        ("localhost:6767", "localhost:6767"),  # not URL-shaped; left as-is
+        (None, None),
+    ],
+)
+def test_redact_url(raw: str | None, expected: str | None) -> None:
+    assert diagnostics._redact_url(raw) == expected
+
+
+def test_snapshot_redacts_server_url_userinfo(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A --server URL with embedded creds must not survive into the snapshot.
+    monkeypatch.setattr(diagnostics, "_fetch_server_info", lambda url, *, timeout: None)
+    snap = collect_snapshot(server_url="https://user:secretpw@host:6767/")
+    assert snap["server_url"] == "https://host:6767/"
+    assert "secretpw" not in repr(snap)
