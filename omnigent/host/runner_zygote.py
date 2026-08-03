@@ -28,6 +28,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -99,11 +100,11 @@ class ZygoteRunnerProc:
 
     def terminate(self) -> None:
         """Send ``SIGTERM`` to the runner (best-effort)."""
-        self._signal(15)
+        self._signal(signal.SIGTERM)
 
     def kill(self) -> None:
         """Send ``SIGKILL`` to the runner (best-effort)."""
-        self._signal(9)
+        self._signal(getattr(signal, "SIGKILL", signal.SIGTERM))
 
     def _signal(self, sig: int) -> None:
         """Signal the runner pid, ignoring an already-exited process.
@@ -173,9 +174,17 @@ class ZygoteManager:
             self._proc = proc
             self._sock = parent_sock
 
-        # Confirm the zygote is answering before the caller relies on it.
-        reply = self._exchange({"cmd": "ping"})
-        if not reply.get("pong"):
+        # Confirm the zygote is answering before the caller relies on it. Any
+        # failure here (bad pong, or the exchange itself raising on a timeout /
+        # EOF) must tear down the partially-started zygote so a failed start
+        # never leaks a process + socket.
+        try:
+            reply = self._exchange({"cmd": "ping"})
+            answered = bool(reply.get("pong"))
+        except ZygoteUnavailable:
+            self.stop()
+            raise
+        if not answered:
             self.stop()
             raise ZygoteUnavailable("runner zygote did not answer ping")
 

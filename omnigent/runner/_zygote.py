@@ -50,7 +50,7 @@ import sys
 import threading
 from typing import Any
 
-from omnigent.process_logging import LOG_TTY_FD_ENV_VAR
+from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
 
 # Env var the daemon sets to the inherited control-socket fd number.
 ZYGOTE_CONTROL_FD_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD"
@@ -59,6 +59,9 @@ ZYGOTE_ENABLED_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE"
 # Test-only seam: when present in a fork payload, the child exits with this code
 # instead of running the real runner. Never set in production launches.
 _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_EXIT"
+# Test-only seam: raise SystemExit(code) rather than os._exit, to exercise the
+# child guard's SystemExit-code preservation. Never set in production launches.
+_ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
 
 
 def _import_runner_graph() -> None:
@@ -90,8 +93,10 @@ def _wire_child_stdio(log_path: str | None) -> None:
     if log_path is None:
         return
     # Append + per-write (line-free) so interleaved runner output is not lost;
-    # matches open_process_log_file's unbuffered "ab" handle.
-    logfd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    # matches open_process_log_file's unbuffered "ab" handle. 0o600 because
+    # runner logs can carry secrets (tokens, prompts) — matches
+    # create_process_log_path, not a world-readable default.
+    logfd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.dup2(logfd, 1)
         os.dup2(logfd, 2)
@@ -138,12 +143,16 @@ def _run_child(control_sock: socket.socket, request: dict[str, Any]) -> None:
     # Test seam: exercise fork/reap/poll without booting a real runner. Honored
     # only when set in the fork payload's env (never in production launches).
     # Echoes this child's view of a marker var to stdout (its log) so a test can
-    # prove one fork's env never leaks into another's.
+    # prove one fork's env never leaks into another's. When the raise variant is
+    # set it raises SystemExit instead of os._exit-ing, so the _handle_fork
+    # guard's SystemExit-code preservation can be tested end-to-end.
     test_exit = os.environ.get(_ZYGOTE_TEST_CHILD_EXIT_ENV_VAR)
     if test_exit is not None:
         sys.stdout.write(f"marker={os.environ.get('OMNIGENT_ZYGOTE_MARKER', '')}\n")
         sys.stdout.write(f"tty_fd={os.environ.get(LOG_TTY_FD_ENV_VAR, '')}\n")
         sys.stdout.flush()
+        if env_truthy(os.environ.get(_ZYGOTE_TEST_CHILD_RAISE_ENV_VAR)):
+            raise SystemExit(int(test_exit))
         os._exit(int(test_exit))
 
     from omnigent.runner._entry import main
@@ -225,6 +234,12 @@ def _handle_fork(control_sock: socket.socket, request: dict[str, Any], live: set
         # the accept loop (that would fork-bomb the zygote).
         try:
             _run_child(control_sock, request)
+        except SystemExit as exc:
+            # Preserve `python -m omnigent.runner._entry` semantics: main()
+            # raises SystemExit (e.g. code 1 on a tunnel rejection). Exit with
+            # the same code instead of flattening it to a traceback + code 1.
+            code = exc.code
+            os._exit(code if isinstance(code, int) else (0 if code is None else 1))
         except BaseException:  # noqa: BLE001 — last-resort child guard
             import traceback
 

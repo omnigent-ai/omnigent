@@ -23,6 +23,10 @@ from omnigent.host.runner_zygote import (
 )
 from omnigent.runner._zygote import _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR
 
+# The zygote is POSIX-only: these tests exercise os.fork() and pass_fds, which
+# do not exist on Windows.
+pytestmark = pytest.mark.posix_only
+
 
 def _fork_env(exit_code: int) -> dict[str, str]:
     """A fork payload env whose child exits with *exit_code* via the test seam.
@@ -125,6 +129,22 @@ def test_fork_runner_nonzero_exit_is_reported(manager: ZygoteManager, tmp_path) 
     """
     proc = manager.fork_runner(_fork_env(7), str(tmp_path / "runner.log"))
     assert _wait_exit(proc) == 7
+
+
+def test_child_systemexit_code_is_preserved(manager: ZygoteManager, tmp_path) -> None:
+    """A child raising SystemExit(N) reports code N, not a flattened 1.
+
+    Mirrors ``python -m omnigent.runner._entry`` semantics: main() raises
+    SystemExit on a tunnel rejection, and the fork guard must preserve the code
+    rather than turning it into a traceback + exit 1.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the child's log.
+    """
+    env = _fork_env(5)
+    env["OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"] = "1"
+    proc = manager.fork_runner(env, str(tmp_path / "runner.log"))
+    assert _wait_exit(proc) == 5
 
 
 def test_zygote_serves_multiple_forks(manager: ZygoteManager, tmp_path) -> None:
