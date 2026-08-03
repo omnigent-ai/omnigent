@@ -1997,7 +1997,7 @@ def create_runner_app(
         include_error: bool = False,
     ) -> _JsonObject:
         busy = status in ("running", "waiting")
-        child = {
+        child: _JsonObject = {
             "id": session_id,
             "title": meta.title,
             "tool": meta.tool,
