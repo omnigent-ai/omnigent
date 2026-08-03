@@ -144,8 +144,8 @@ function ZoomableMarkdownImage({ src, alt, ...props }: React.ComponentProps<"img
   return <ZoomableImage {...props} src={resolvedSrc} alt={alt ?? ""} />;
 }
 
-// Stable module-level override map so MessageResponse's memo (which ignores
-// `components` changes) never sees a new identity.
+// Stable module-level override map so MessageResponse's shallow prop compare
+// never sees a new `components` identity and re-parses needlessly.
 const FILE_PATH_AWARE_COMPONENTS = {
   inlineCode: WorkspacePathInlineCode,
   img: ZoomableMarkdownImage,

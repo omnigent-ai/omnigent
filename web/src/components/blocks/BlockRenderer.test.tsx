@@ -326,6 +326,23 @@ describe("BlockRenderer dispatch", () => {
       ).toBe(["```", String.raw`\(\sqrt{x}\)`, "```"].join("\n"));
     });
 
+    it("leaves LaTeX line breaks inside existing display math untouched", () => {
+      // `\\[1em]` is a spaced line break, not an explicit display-math opener;
+      // converting its `\[` to `$$` would corrupt the already-`$$`-delimited block.
+      const aligned = String.raw`$$\begin{aligned} a &= b \\[1em] c &= d \end{aligned}$$`;
+      expect(normalizeExplicitMathDelimiters(aligned)).toBe(aligned);
+    });
+
+    it("does not convert delimiters already inside a dollar-math span", () => {
+      const inline = String.raw`$\[x\]$`;
+      expect(normalizeExplicitMathDelimiters(inline)).toBe(inline);
+    });
+
+    it("skips normalization inside multi-backtick inline code", () => {
+      const doubleTick = "``" + String.raw`\(x\)` + "``";
+      expect(normalizeExplicitMathDelimiters(doubleTick)).toBe(doubleTick);
+    });
+
     it("loads required Streamdown and KaTeX styles at the app entrypoint", () => {
       // KaTeX's DOM is mostly positioned spans. Without its stylesheet, radicals
       // and fractions can leave only the root bar/outer shell visible while the
