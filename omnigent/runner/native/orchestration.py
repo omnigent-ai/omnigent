@@ -1805,10 +1805,8 @@ async def _auto_create_pi_terminal(
     try:
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-        if agent_spec is not None:
-            spec_for_tools = _unwrap_resolved_spec(agent_spec)
-            if spec_for_tools is not None:
-                pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        spec_for_tools = _unwrap_resolved_spec(agent_spec)
+        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
     except Exception:  # noqa: BLE001 — tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s; "
