@@ -19,6 +19,7 @@
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
 import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import type { ApprovalPresentation } from "./events";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -97,7 +98,7 @@ export type RenderItem =
       phase: string;
       policyName: string;
       contentPreview: string;
-      approval?: import("./events").ApprovalPresentation | null;
+      approval?: ApprovalPresentation | null;
       requestedSchema: Record<string, unknown>;
       url?: string | null;
       status: "pending" | "responded";
