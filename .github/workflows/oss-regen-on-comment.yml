@@ -189,6 +189,10 @@ jobs:
           else
             uv lock
           fi
+          # uv may emit non-canonical lockfile fields (e.g. size on file
+          # entries); normalize like the pre-commit fixer, then hard-verify.
+          python3 scripts/normalize_uv_lock_registry.py uv.lock || true
+          python3 scripts/normalize_uv_lock_registry.py --check uv.lock
           rm -f pnpm-lock.yaml
           pnpm install --lockfile-only
 
