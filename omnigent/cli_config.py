@@ -3867,7 +3867,7 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_cursor_harness()
         elif selected_target == COPILOT_KEY:
             _manage_copilot_harness()
-        elif selected_target in families:
+        elif isinstance(selected_target, str) and selected_target in families:
             _manage_harness_providers(selected_target)
         elif selected_target == _ANTIGRAVITY:
             _manage_antigravity_harness()

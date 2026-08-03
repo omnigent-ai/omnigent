@@ -6515,9 +6515,12 @@ async def _handle_mcp_tools_call(
         for eid, req_entry in input_requests.items():
             req_params = req_entry.get("params", {}) if isinstance(req_entry, dict) else {}
             elicit_params = ElicitationRequestParams(
-                mode=req_params.get("mode", "form"),
+                mode=cast(Literal["form", "url"], req_params.get("mode", "form")),
                 message=req_params.get("message", "Approval required"),
-                requestedSchema=req_params.get("requestedSchema"),
+                requestedSchema=cast(
+                    Mapping[str, Any] | None,
+                    req_params.get("requestedSchema"),
+                ),
             )
             elicit_result = await _publish_and_wait_for_harness_elicitation(
                 request,

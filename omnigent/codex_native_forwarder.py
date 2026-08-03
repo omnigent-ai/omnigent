@@ -3247,7 +3247,9 @@ async def _handle_mcp_startup_status(
     """
     name = params.get("name")
     status = params.get("status")
-    if not (isinstance(name, str) and name and status in MCP_STARTUP_STATES):
+    if not (
+        isinstance(name, str) and name and isinstance(status, str) and status in MCP_STARTUP_STATES
+    ):
         _logger.info("Codex forwarder ignored malformed MCP startup update: %r", params)
         return
     error = params.get("error")

@@ -50,6 +50,10 @@ _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
 
 
+def _json_string_list(values: Sequence[object]) -> list[JsonValue]:
+    return cast(list[JsonValue], [str(value) for value in values])
+
+
 @dataclass
 class SandboxPolicy:
     """
@@ -197,30 +201,36 @@ class SandboxPolicy:
             "backend_type": self.backend_type,
             "active": self.active,
             "read_roots": (
-                [str(root) for root in self.read_roots] if self.read_roots is not None else None
+                _json_string_list(self.read_roots) if self.read_roots is not None else None
             ),
-            "write_roots": [str(root) for root in self.write_roots],
-            "write_files": [str(path) for path in self.write_files],
+            "write_roots": _json_string_list(self.write_roots),
+            "write_files": _json_string_list(self.write_files),
             "allow_network": self.allow_network,
             "cwd_allow_hidden": (
-                list(self.cwd_allow_hidden) if self.cwd_allow_hidden is not None else None
+                _json_string_list(self.cwd_allow_hidden)
+                if self.cwd_allow_hidden is not None
+                else None
             ),
             "cwd_hidden_scan_max_entries": self.cwd_hidden_scan_max_entries,
             "cwd_hidden_scan_overflow": self.cwd_hidden_scan_overflow,
             "cwd_hidden_scan_recursive": self.cwd_hidden_scan_recursive,
             "mask_paths": (
-                [str(path) for path in self.mask_paths] if self.mask_paths is not None else None
+                _json_string_list(self.mask_paths) if self.mask_paths is not None else None
             ),
             "env_passthrough": (
-                list(self.env_passthrough) if self.env_passthrough is not None else None
+                _json_string_list(self.env_passthrough)
+                if self.env_passthrough is not None
+                else None
             ),
             "spawn_env_allowlist": (
-                list(self.spawn_env_allowlist) if self.spawn_env_allowlist is not None else None
+                _json_string_list(self.spawn_env_allowlist)
+                if self.spawn_env_allowlist is not None
+                else None
             ),
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
             "deny_unix_socket_paths": (
-                [str(path) for path in self.deny_unix_socket_paths]
+                _json_string_list(self.deny_unix_socket_paths)
                 if self.deny_unix_socket_paths is not None
                 else None
             ),

@@ -300,6 +300,7 @@ dev = [
     "filelock>=3.0",
     "ruff>=0.6",
     "mypy>=1.10",
+    "pyrefly==1.1.1",
     "pre-commit>=3.5",
     "types-PyYAML>=6.0",
     "filelock>=3.0",

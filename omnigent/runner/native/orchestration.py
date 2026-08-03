@@ -3995,7 +3995,7 @@ async def _codex_discover_thread_and_forward(
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
         auth_token = auth_factory() if auth_factory is not None else None
-        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        headers: dict[str, str] = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
 
         # Mirror the discovered Codex thread id onto the Omnigent session as its
         # external_session_id, the same way claude-native records its

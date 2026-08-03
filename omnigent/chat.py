@@ -2910,7 +2910,7 @@ def _should_inject_openai_env_auth_for_executor(
         present and no explicit auth/profile/provider declaration
         should take precedence.
     """
-    if harness not in _OPENAI_AGENTS_HARNESSES:
+    if harness is None or harness not in _OPENAI_AGENTS_HARNESSES:
         return False
     if not os.environ.get(_OPENAI_API_KEY_ENV_VAR):
         return False

@@ -1922,6 +1922,7 @@ class HostProcess:
                     if listing.source == "openai-compatible"
                     else None
                 )
+                models: list[dict[str, object]]
                 if provider is not None and is_direct_openai_provider(provider):
                     available_ids = {model.id for model in listing.models}
                     models = []

@@ -3454,7 +3454,7 @@ def _start_http_ingress(
     handler_cls = _handler_factory(token, notification_queue)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     host, port = _http_server_host_port(httpd)
-    server_info = {
+    server_info: _JsonObject = {
         "url": f"http://{host}:{port}",
         "token": token,
         "pid": os.getpid(),
