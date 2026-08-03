@@ -744,7 +744,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
     if not isinstance(raw, dict):
         raise ValueError("server config 'sandbox' must be a mapping")
     provider = raw.get("provider")
-    if provider not in SUPPORTED_SANDBOX_PROVIDERS:
+    if not isinstance(provider, str) or provider not in SUPPORTED_SANDBOX_PROVIDERS:
         supported = ", ".join(sorted(SUPPORTED_SANDBOX_PROVIDERS))
         raise ValueError(
             f"server config 'sandbox.provider' must be one of: {supported} (got {provider!r})"

@@ -87,6 +87,20 @@ async def test_session_new_server_mode_adopts_returned_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_new_sends_empty_mcp_servers_when_omnigent_mcp_disabled() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    captured: dict = {}
+
+    async def fake_rpc(method, params, timeout=30.0):
+        captured["params"] = params
+        return {"result": {"sessionId": "srv-42"}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+    assert captured["params"]["mcpServers"] == []
+
+
+@pytest.mark.asyncio
 async def test_session_new_client_mode_generates_and_sends_id() -> None:
     ex = AcpExecutor(
         AcpAgentConfig(
@@ -311,6 +325,7 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HARNESS_ACP_NAME", "Goose")
     monkeypatch.setenv("HARNESS_ACP_SESSION_ID_MODE", "client")
     monkeypatch.setenv("HARNESS_ACP_SEND_MODEL", "1")
+    monkeypatch.setenv("HARNESS_ACP_OMNIGENT_MCP", "0")
     monkeypatch.setenv("HARNESS_ACP_MODEL", "gpt-5.3")
     monkeypatch.setenv("HARNESS_ACP_ENV_PASSTHROUGH", '["QODER_PERSONAL_ACCESS_TOKEN", 42, ""]')
     ex = acp_harness._build_acp_executor()
@@ -319,6 +334,7 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ex._config.name == "Goose"
     assert ex._config.session_id_mode == "client"
     assert ex._config.send_model_in_session_new is True
+    assert ex._config.omnigent_mcp is False
     assert ex._config.model == "gpt-5.3"
     assert ex._config.env_passthrough == ("QODER_PERSONAL_ACCESS_TOKEN",)
 
@@ -533,7 +549,7 @@ async def test_acp_session_new_carries_mcp_servers() -> None:
 
 @pytest.mark.asyncio
 async def test_acp_session_new_omnigent_mcp_disabled_per_agent() -> None:
-    """`omnigent_mcp=False` on the agent config → no mcpServers in session/new."""
+    """`omnigent_mcp=False` disables relay setup but preserves ACP's field."""
     ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
     ex._tool_executor = lambda n, a: None  # type: ignore[assignment]
     ex._omnigent_tools = [{"name": "sys_agent_list"}]

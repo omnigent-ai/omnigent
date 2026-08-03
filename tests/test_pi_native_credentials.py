@@ -256,6 +256,33 @@ def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
     assert (agent_dir / "models.json").exists()
 
 
+def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
+    tmp_path: Path,
+) -> None:
+    """A model id containing '/' is passed as 'provider/model' to avoid mis-routing.
+
+    Pi's arg parser treats 'provider/model' in --model as a provider override.
+    When the model id itself contains a slash (e.g. an OpenRouter-namespaced
+    id like 'moonshotai/kimi-k2.5'), passing it bare as --model causes Pi to
+    route to the builtin 'moonshotai' provider (which has no API key) rather
+    than our custom 'omnigent' provider. The fix qualifies the arg as
+    'omnigent/moonshotai/kimi-k2.5' so Pi's findExactModelReferenceMatch
+    finds the canonical form under our provider.
+    """
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://openrouter.ai/api/v1",
+        api="openai-completions",
+        model="moonshotai/kimi-k2.5",
+        api_key="sk-or-secret",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "pi-agent"
+    _env, args = creds.pi_native_provider_launch(agent_dir, provider)
+
+    assert args == ["--provider", "omnigent", "--model", "omnigent/moonshotai/kimi-k2.5"]
+
+
 def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.MonkeyPatch) -> None:
     """An OpenAI family with wire_api: chat → openai-completions API.
 

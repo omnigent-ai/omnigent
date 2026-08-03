@@ -1239,12 +1239,12 @@ def prepare_tight_cli_process_path(
             exc,
         )
         return real_cli_path
-
-    if not sandbox.active:
-        return real_cli_path
-    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-    return create_exec_launcher(real_cli_path, sandbox)
+    else:
+        if not sandbox.active:
+            return real_cli_path
+        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+        return create_exec_launcher(real_cli_path, sandbox)
 
 
 @dataclass(frozen=True)

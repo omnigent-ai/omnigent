@@ -254,6 +254,13 @@ databricks = [
     # fresh install on Python 3.14 tries (and fails) to build it from source.
     "databricks-ai-bridge>=0.19",
 ]
+# Load testing (dev/loadtest/). Locust drives the concurrency; the test also
+# needs the `dev` + `agents-sdk` extras (BenchEnvironment boots the stack and the
+# openai-agents harness runs the mocked turns). Opt-in — only load-test users
+# need it.
+loadtest = [
+    "locust>=2.30,<3",
+]
 dev = [
     "pytest>=7.0",
     # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
@@ -300,6 +307,7 @@ dev = [
     "filelock>=3.0",
     "ruff>=0.6",
     "mypy>=1.10",
+    "pyrefly==1.1.1",
     "pre-commit>=3.5",
     "types-PyYAML>=6.0",
     "filelock>=3.0",
@@ -571,15 +579,11 @@ known-first-party = ["omnigent"]
 "integrations/slack/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
-# The sessions route is a facade over an implementation package: the public
-# ``sessions.py`` re-exports its impl modules with ``import *``, and each impl
-# module layers on the ones below it the same way (common → helpers →
-# orchestration). Star re-export is the point of the facade, so F403 (star
-# import) and F405 (name may be from star import) are expected here and can't
-# be resolved without enumerating hundreds of re-exports by hand.
-"omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401", "F403", "F405"]
-"omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401", "F403", "F405"]
-"omnigent/server/routes/_sessions/*.py" = ["F403", "F405"]
+# The sessions route is a facade over an implementation package. Its explicit
+# imports intentionally re-export implementation names and load route modules
+# for registration, so F401 remains expected in this package.
+"omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
+"omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -730,6 +734,12 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "google.*"
 ignore_missing_imports = true
+
+# protoc owns the checked-in routing stub. Its built-in pyi generator emits an
+# untyped Message base and bare Mapping hints that application code cannot fix.
+[[tool.mypy.overrides]]
+module = "omnigent.api.routing.v1.routing_pb2"
+disable_error_code = ["misc", "type-arg"]
 
 [[tool.mypy.overrides]]
 module = "opentelemetry.instrumentation.*"

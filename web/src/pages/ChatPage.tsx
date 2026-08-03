@@ -25,11 +25,9 @@ import {
   GitForkIcon,
   ImageIcon,
   Loader2Icon,
-  MessageSquareIcon,
   PaperclipIcon,
   SettingsIcon,
   SquareIcon,
-  TerminalIcon,
   WifiOffIcon,
   XIcon,
 } from "lucide-react";
@@ -291,6 +289,7 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 const CHAT_COLUMN_WIDTH = "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-5xl";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
+const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
 
 function isMarkdownTableRow(line: string): boolean {
   return line.trim().includes("|");
@@ -309,6 +308,10 @@ export function containsMarkdownTable(items: RenderItem[]): boolean {
         isMarkdownTableRow(lines[index + 1] ?? ""),
     );
   });
+}
+
+export function containsDisplayMath(items: RenderItem[]): boolean {
+  return items.some((item) => item.kind === "text" && DISPLAY_MATH_RE.test(item.text));
 }
 
 /**
@@ -890,7 +893,6 @@ export function ChatPage() {
     runnerOnline,
     backgroundTaskCount,
   });
-
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
   // bound — so it identifies the source (for the picker's prefill) but is
@@ -1672,7 +1674,8 @@ function MainAgentSurface({
   // tool runs, and reasoning gaps — including after a reload that hydrates
   // `running` before any bubbles exist locally. Only a trailing compaction
   // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
+  const showWorkingStatus = shouldShowWorkingIndicator(showsWorking, bubbles);
+  const showWorkingIndicator = showWorkingStatus;
 
   if (showTerminal && conversationId) {
     return (
@@ -1787,7 +1790,7 @@ function MainAgentSurface({
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                {!showWorkingStatus && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native): renders while the
                     harness boots its MCP servers and, after startup settles,
                     when servers failed or were cancelled. Independent of the
@@ -1806,7 +1809,7 @@ function MainAgentSurface({
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
+          <WorkingStatusPin show={showWorkingStatus} suppress={subAgentLabel != null} />
           <UserMessageNavConnected
             goPrev={nav.goPrev}
             goNext={nav.goNext}
@@ -2788,15 +2791,11 @@ export function ConnectionIndicator({
     );
   }
 
-  // Terminal-first sessions own the Chat/Terminal toggle for EVERY
-  // reachable state — `online`, `unknown` (pre-poll), `starting`
-  // (spinning up / relaunching), AND `runner_asleep` (stopped, host
-  // alive). Only the unreachable states above replace it with the banner.
-  // Keeping the pill visible through `runner_asleep` is why stopping a
-  // runner no longer makes the toggle vanish: the pill stays, and the
-  // next send (or a fresh launch) drives its own terminal-pending spinner
-  // as the runner comes back. The strict `runner_online` still gates the
-  // inline PTY *view* (it needs a live tunnel) — but not the toggle.
+  // Terminal-first sessions: the Chat/Terminal toggle lives in the header
+  // (ViewModeToggle) for every reachable state — only the unreachable
+  // states above replace this band with the reconnect banner. In the iOS
+  // shell the toggle is the native Liquid Glass bar, so this band still
+  // reserves a spacer for its footprint.
   if (terminalFirst?.isTerminalFirst) {
     // In the iOS shell the toggle is the native bar (driven above). Render only
     // a spacer reserving its fixed footprint so the composer clears it — and
@@ -2814,13 +2813,10 @@ export function ConnectionIndicator({
         />
       ) : null;
     }
-    // A rail-opened shell owns the main view chrome-free — no pill: a
-    // "Chat" option under someone else's shell misreads as the shell
-    // being the agent. The shell view carries its own close affordance
-    // (MainTerminalView's X) back to chat.
-    if (terminalFirst.isShellView) return null;
-    if (keyboardVisible) return null;
-    return <ConnectedTerminalFirstPill ctx={terminalFirst} />;
+    // Outside the iOS shell the Chat/Terminal switcher lives in the header
+    // (ViewModeToggle) — this band renders nothing for terminal-first
+    // sessions now that the in-page pill is gone.
+    return null;
   }
 
   // A regular (non-terminal-first) session whose runner is still spinning
@@ -3057,80 +3053,6 @@ function useNativeChatTerminalBar(
     if (!native) return;
     return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
   }, [native]);
-}
-
-/**
- * Chat/Terminal segmented control for terminal-first sessions. Status
- * lives in the sidebar — this band is purely a view toggle.
- *
- * Only rendered outside the iOS shell; inside it the switcher is drawn natively
- * (Liquid Glass) over the web view — see {@link useNativeChatTerminalBar}.
- */
-function ConnectedTerminalFirstPill({
-  ctx,
-}: {
-  ctx: NonNullable<ReturnType<typeof useTerminalFirst>>;
-}) {
-  // `terminalStartingUp` is the single loading signal — AppShell folds the
-  // launch (liveness `starting`) and PTY-creation (`terminalPending`)
-  // sources into it. The button is disabled whenever no terminal is
-  // reachable: greyed-and-spinning reads as "loading", greyed-and-static as
-  // "no terminal / stopped".
-  const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
-
-  return (
-    <div
-      className={cn(
-        "terminal-first-switcher-container mx-auto flex w-full items-center justify-center px-6 pb-1.5",
-        CHAT_COLUMN_WIDTH,
-      )}
-    >
-      <div
-        role="group"
-        aria-label="View mode"
-        className="terminal-first-switcher flex items-center gap-1 rounded-full border border-border bg-card/90 p-1 text-xs shadow-sm"
-      >
-        <div className="flex items-center gap-0.5">
-          <button
-            type="button"
-            aria-pressed={view === "chat"}
-            aria-label="Chat"
-            onClick={() => setView("chat")}
-            className={cn(
-              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors",
-              view === "chat"
-                ? "bg-muted text-foreground"
-                : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-            )}
-          >
-            <MessageSquareIcon className="size-3.5 shrink-0" />
-            <span>Chat</span>
-          </button>
-          <button
-            type="button"
-            aria-pressed={view === "terminal"}
-            aria-label="Terminal"
-            disabled={!terminalsAvailable}
-            title={terminalStartingUp ? "Terminal is starting up…" : undefined}
-            onClick={() => setView("terminal")}
-            className={cn(
-              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-              view === "terminal"
-                ? "bg-muted text-foreground"
-                : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-            )}
-          >
-            {terminalStartingUp ? (
-              <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-            ) : (
-              <TerminalIcon className="size-3.5 shrink-0" />
-            )}
-            <span>Terminal</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 /**
@@ -3440,7 +3362,8 @@ function AssistantBubble({
   // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
-  const isWide = hasElicitation || containsMarkdownTable(bubble.items);
+  const isWide =
+    hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
 
   return (
     <>
@@ -5212,6 +5135,7 @@ export function Composer({
             <Button
               type="submit"
               size="icon"
+              componentId="chat.composer.send"
               variant={showInterruptButton ? "destructive" : "default"}
               // Send button fades more decisively when there's no draft —
               // overrides the base 50% disabled-opacity so the affordance

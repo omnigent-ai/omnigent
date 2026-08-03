@@ -66,6 +66,38 @@ def _build_blocking_app(
 
 
 @pytest.mark.asyncio
+async def test_proxy_stream_relays_non_json_sse_frame() -> None:
+    """A non-data SSE frame is relayed without entering JSON event handling."""
+    harness_client = _ScriptedHarnessClient(
+        [
+            "event: heartbeat\n\n",
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/49ed0bd1f0cae058f05f48057e9f98cf/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness": "openai-agents",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "event: heartbeat\n\n" in response.text
+    assert '"response.completed"' in response.text
+
+
+@pytest.mark.asyncio
 async def test_turn_sequencing_buffers_concurrent_message() -> None:
     """Second message during an active turn returns 202 (buffered)."""
     import asyncio as _aio

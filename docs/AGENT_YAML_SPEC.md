@@ -169,6 +169,7 @@ executor:
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
 
+<<<<<<< HEAD
 ## Qoder and Qoder CN
 
 The first-class `qoder` and `qoder-cn` harnesses run the vendor CLIs through
@@ -200,6 +201,29 @@ executor:
 These launch `qodercli --acp` and `qoderclicn --acp`. Qoder owns model selection
 and authentication for these sessions, so no Omnigent `model` or `auth` block is
 required.
+=======
+## Custom ACP agents
+
+`harness: acp:<slug>` runs any configured Agent Client Protocol server command.
+Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
+derived from the agent name.
+
+OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
+`mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
+use its own tools, routing, memory, and channels:
+
+```yaml
+acp:
+  agents:
+    - name: OpenClaw
+      command: openclaw acp --url <gateway-url> --token-file <token-file>
+      omnigent_mcp: false
+```
+
+Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
+app. See the [OpenClaw integration guide](openclaw.md) for registry import,
+Gateway setup, and compatibility details.
+>>>>>>> origin/feat/acp-cli-catalog
 
 ## Local OS access
 

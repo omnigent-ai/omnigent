@@ -1,6 +1,5 @@
-# Pre-commit hooks for this repository: ruff (format + check) plus standard
-# file-hygiene checks. Heavier validation (typing, lockfile freshness,
-# OpenAPI drift) runs in CI rather than as commit-time hooks.
+# Pre-commit hooks for this repository: ruff, Pyrefly, project-specific lint,
+# and standard file-hygiene checks.
 #
 # A built web-UI bundle may be committed at this path (vendored, minified
 # JS/CSS) — never lint or "fix" it.
@@ -19,6 +18,13 @@ repos:
         language: system
         entry: .venv/bin/python -m ruff check --fix --force-exclude
         types: [python]
+
+      - id: pyrefly
+        name: pyrefly
+        language: system
+        entry: .venv/bin/pyrefly check
+        pass_filenames: false
+        files: ^(omnigent/.*\.pyi?|pyproject\.toml|pyrefly\.toml|uv\.lock)$
 
       # Project-specific test-quality lint rules (dev/lint/). Run on test
       # files only — the patterns never occur in production code.

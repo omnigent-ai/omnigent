@@ -33,6 +33,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
 
@@ -698,6 +699,6 @@ def create_auth_provider() -> AuthProvider:
 # Backwards-compatible re-export of forward-referenced config
 # types — both are imported lazily inside `create_auth_provider`
 # to keep startup cost off the import path that doesn't use them.
-if False:  # TYPE_CHECKING equivalent without the import
+if TYPE_CHECKING:
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig

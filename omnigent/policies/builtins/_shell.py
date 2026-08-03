@@ -19,6 +19,23 @@ from __future__ import annotations
 
 import re
 
+# Every harness's shell / terminal tool, all of which surface the command as a
+# string ``command`` argument. This is the default gated surface for every
+# shell-surface policy — a policy that defaults to a narrower set is silently
+# inert on the harnesses it omits, which is the least-safe default for a
+# security gate. Keep in sync with the per-harness tool-name families in
+# ``safety.py`` (which maps the same six for ``ask_on_os_tools``).
+SHELL_TOOLS: frozenset[str] = frozenset(
+    {
+        "sys_os_shell",  # Omnigent built-in (SDK harnesses)
+        "Bash",  # Claude Code / Codex native
+        "bash",  # pi / opencode native
+        "Shell",  # Cursor
+        "terminal",  # Hermes
+        "developer__shell",  # Goose
+    }
+)
+
 # Leading tokens to skip when finding the real command in a segment — command
 # wrappers that take the real command as their trailing arguments. These take
 # no options of their own in the forms we gate, so the wrapper word is simply

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 from tests.e2e._harness_probes import (
@@ -171,12 +172,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``HARNESS_QWEN_GATEWAY_AUTH_COMMAND`` instead. Its live round-trip is
     covered by the dedicated ``test_per_harness_qwen.py`` suite.
 
-    ``qoder`` and ``qoder-cn`` are excluded for the same reason as ``qwen`` /
-    ``goose``: each launches its vendor CLI in ACP mode and uses Qoder-owned
-    authentication/model configuration rather than this matrix's Databricks
-    gateway wiring. Their ACP command, credential isolation, streaming, and
-    completion path is covered by ``tests/e2e/test_qoder_harness_e2e.py``.
-
     ``goose`` (headless ACP) is excluded for the same reason as ``qwen``: it
     authenticates from Goose's own config (``goose configure``), not the shared
     gateway/profile probe wiring, so ``_build_goose_spawn_env`` emits no
@@ -231,6 +226,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
+    for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
+    spawn env carries no gateway/profile probe vars for this matrix to drive.
+    Their shared wiring is covered by ``tests/test_acp_cli_harnesses.py`` and
+    the ``tests/inner/test_acp_executor.py`` suite.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "acp",
@@ -245,8 +246,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "copilot",
         "qwen",
         "qwen-native",
-        "qoder",
-        "qoder-cn",
         "goose",
         "goose-native",
         "kiro-native",
@@ -254,5 +253,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        *ACP_CLI_HARNESSES,
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

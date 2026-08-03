@@ -500,7 +500,7 @@ def cost_budget(
             a new soft checkpoint is newly crossed; ALLOW otherwise.
         """
         phase = event.get("type")
-        if phase not in _GATED_PHASES:
+        if not isinstance(phase, str) or phase not in _GATED_PHASES:
             return _ALLOW
         context = event.get("context") or {}
         if _usage_is_unpriced(context.get("usage") or {}):
@@ -679,7 +679,7 @@ def user_daily_cost_budget(
             otherwise.
         """
         phase = event.get("type")
-        if phase not in _GATED_PHASES:
+        if not isinstance(phase, str) or phase not in _GATED_PHASES:
             return _ALLOW
         context = event.get("context") or {}
         if _usage_is_unpriced(context.get("usage") or {}):
@@ -823,7 +823,7 @@ def subagent_cost_budget(
             a new soft checkpoint is newly crossed; ALLOW otherwise.
         """
         phase = event.get("type")
-        if phase not in _GATED_PHASES:
+        if not isinstance(phase, str) or phase not in _GATED_PHASES:
             return _ALLOW
         context = event.get("context") or {}
         if _usage_is_unpriced(context.get("subtree_usage") or {}):

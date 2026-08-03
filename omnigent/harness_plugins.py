@@ -30,6 +30,7 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_capabilities import (
     AuthModel,
     EffortFamily,
@@ -591,28 +592,6 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
-    "qoder": _C(
-        _IM.ACP_SUBPROCESS,
-        _EL.SSE_PERMISSION,
-        _RS.COLD_ONLY,
-        _EF.NONE,
-        _MF.MULTI,
-        _AU.OWN_AUTH,
-        subagents=False,
-        interrupt=True,
-        streaming=True,
-    ),
-    "qoder-cn": _C(
-        _IM.ACP_SUBPROCESS,
-        _EL.SSE_PERMISSION,
-        _RS.COLD_ONLY,
-        _EF.NONE,
-        _MF.MULTI,
-        _AU.OWN_AUTH,
-        subagents=False,
-        interrupt=True,
-        streaming=True,
-    ),
     "kimi": _C(
         _IM.CLI_SUBPROCESS,
         _EL.NONE,
@@ -664,6 +643,11 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
     ),
 }
 
+# Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) run through the
+# same generic wrap as the "acp" harness, so they share its declared profile.
+for _acp_cli_name in ACP_CLI_HARNESSES:
+    _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
+
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
@@ -691,13 +675,16 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "opencode-native",
             "pi",
             "pi-native",
-            "qoder",
-            "qoder-cn",
             "qwen",
             "qwen-native",
         }
+        # Builtin ACP CLI harnesses derive from the declarative catalog; a new
+        # vendor CLI is one row there, not another entry in each set below.
+        | set(ACP_CLI_HARNESSES)
     ),
     harness_modules={
+        # Every catalog row runs the shared generic ACP wrap.
+        **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
@@ -719,12 +706,11 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "opencode-native": "omnigent.inner.opencode_native_harness",
         "pi": "omnigent.inner.pi_harness",
         "pi-native": "omnigent.inner.pi_native_harness",
-        "qoder": "omnigent.inner.acp_harness",
-        "qoder-cn": "omnigent.inner.acp_harness",
         "qwen": "omnigent.inner.qwen_harness",
         "qwen-native": "omnigent.inner.qwen_native_harness",
     },
     aliases={
+        **{alias: name for name, row in ACP_CLI_HARNESSES.items() for alias in row.aliases},
         "agy": "antigravity",
         "claude": "claude-sdk",
         "github-copilot": "copilot",
@@ -740,7 +726,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "native-qwen": "qwen-native",
         "opencode": "opencode-native",
         "openai-agents-sdk": "openai-agents",
-        "qodercn": "qoder-cn",
         "qwen-code": "qwen",
     },
     native_harnesses=frozenset(
@@ -783,28 +768,13 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         HERMES_NATIVE_CODING_AGENT,
     ),
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
-    install_specs={
-        "qoder": HarnessInstallSpec(
-            "Qoder",
-            "qodercli",
-            "@qoder-ai/qodercli",
-            login_args=("login",),
-        ),
-        "qoder-cn": HarnessInstallSpec(
-            "Qoder CN",
-            "qoderclicn",
-            "@qodercn-ai/qoderclicn",
-            login_args=("login",),
-        ),
-    },
+    # Catalog rows gate readiness on their vendor binary; the install spec also
+    # feeds setup steps and (for npm rows) the one-click install path.
+    install_specs={name: row.install for name, row in ACP_CLI_HARNESSES.items()},
     harness_install_keys={
-        "qoder": "qoder",
-        "qoder-cn": "qoder-cn",
-        "qodercn": "qoder-cn",
-    },
-    spawn_env_builders={
-        "qoder": "omnigent.runtime.workflow:_build_qoder_spawn_env",
-        "qoder-cn": "omnigent.runtime.workflow:_build_qoder_cn_spawn_env",
+        spelling: name
+        for name, row in ACP_CLI_HARNESSES.items()
+        for spelling in (name, *row.aliases)
     },
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",
@@ -844,8 +814,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
-        "qoder": "Qoder",
-        "qoder-cn": "Qoder CN",
+        **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,
 )

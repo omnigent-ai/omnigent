@@ -33,6 +33,11 @@ _INBOX_DIR = "inbox"
 _SESSIONS_DIR = "sessions"
 
 
+def bridge_root() -> Path:
+    """Return the root directory used for native Pi bridge files."""
+    return _BRIDGE_ROOT
+
+
 def bridge_dir_for_session_id(session_id: str) -> Path:
     """
     Return the bridge directory for a native Pi session.
@@ -128,7 +133,7 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
     :returns: Opaque message id.
     """
     message_id = f"msg_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": message_id,
         "type": "user_message",
         "content": content,
@@ -151,7 +156,7 @@ def enqueue_interrupt(bridge_dir: Path) -> str:
     :returns: Opaque interrupt id.
     """
     interrupt_id = f"interrupt_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": interrupt_id,
         "type": "interrupt",
         "created_at": time.time(),
@@ -208,7 +213,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     :returns: Opaque model-change id.
     """
     model_change_id = f"model_change_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": model_change_id,
         "type": "model_change",
         "model": model,

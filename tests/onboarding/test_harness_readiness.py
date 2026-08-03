@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
@@ -131,9 +132,13 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "goose-native",
         "native-goose",
         "hermes",
-        "qoder",
-        "qoder-cn",
-        "qodercn",
+        # Builtin ACP CLI harnesses gate on their vendor binary; every catalog
+        # row (and alias) joins automatically.
+        *sorted(
+            spelling
+            for name, row in ACP_CLI_HARNESSES.items()
+            for spelling in (name, *row.aliases)
+        ),
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -333,10 +338,6 @@ def test_configured_harness_map_covers_all_spellings(
         "qwen-code",
         "qwen-native",
         "native-qwen",
-        # Qoder ACP harnesses + the compact CN alias; each gates on its vendor CLI.
-        "qoder",
-        "qoder-cn",
-        "qodercn",
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
@@ -348,6 +349,13 @@ def test_configured_harness_map_covers_all_spellings(
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
         # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
         "acp",
+        # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
+        # row never needs to touch this list.
+        *(
+            spelling
+            for name, row in ACP_CLI_HARNESSES.items()
+            for spelling in (name, *row.aliases)
+        ),
     }
     assert set(result) == expected_keys
 
@@ -391,10 +399,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "goose-native",
         "native-goose",
         "qwen",
-        "qoder",
-        "qoder-cn",
-        "qodercn",
         "hermes",
+        *sorted(ACP_CLI_HARNESSES),
     ):
         assert result[cli] is not True, f"{cli} should be gated on its CLI binary"
     # Auth-aware harnesses (codex, claude, opencode, cursor, pi) carry a

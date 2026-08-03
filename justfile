@@ -10,6 +10,7 @@ DEVICE := env("OMNIGENT_IOS_SIMULATOR", "iPhone 17 Pro")
 
 _check-uv:
     uv run --no-sync ruff --version
+    uv run --no-sync pyrefly --version
     uv run --no-sync pre-commit --version
 
 _ensure-uv:
@@ -91,6 +92,10 @@ lint: _ensure-uv
 [group('lint')]
 lint-all: _ensure-uv
     uv run pre-commit run --all-files
+
+[group('lint')]
+typecheck-python: _ensure-uv
+    uv run --no-sync pyrefly check
 
 [group('lint')]
 lint-ts:

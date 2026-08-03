@@ -113,13 +113,58 @@ from omnigent.server.routes._session_create_validation import (
 # Shared constants, state, and small dataclasses live in the _sessions.common
 # leaf module; import them here so this module and its re-exporters see the same
 # objects. The mutable caches are shared by reference across the package.
-from omnigent.server.routes._sessions.common import *
-
 # Runtime bindings that tests patch on the historical ``sessions`` facade are
-# imported from common as facade-delegating proxies (kept out of common's
-# ``__all__`` so the star import above never overwrites them). Resolving them
-# here means a facade-level monkeypatch is honoured in this module too.
+# imported from common as facade-delegating proxies. They stay out of common's
+# ``__all__`` and the facade's explicit re-exports, preserving its real runtime
+# bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
+    _CLAUDE_NATIVE_MODEL,
+    _CLAUDE_NATIVE_UI_LABEL_KEY,
+    _CLAUDE_NATIVE_UI_LABEL_VALUE,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+    _CODEX_NATIVE_MODEL,
+    _CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
+    _EXTERNAL_SESSION_STATUS_TYPE,
+    _FENCE_EXEMPT_EVENT_TYPES,
+    _LAST_CONTEXT_TOKENS_LABEL_KEY,
+    _LAST_CONTEXT_WINDOW_LABEL_KEY,
+    _MANAGED_RESUMABLE_TUNNEL_STALE_S,
+    _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
+    _MODEL_TOKEN_KEYS,
+    _PI_NATIVE_WRAPPER_LABEL_VALUE,
+    _RUNNER_FORWARD_TIMEOUT,
+    _RUNNER_RELAY_READY_TIMEOUT_S,
+    _RUNNER_SESSION_INIT_TIMEOUT_S,
+    _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
+    _TERMINAL_RESPONSE_EVENT_TYPES,
+    _TURN_ACTOR_LABEL,
+    _deferred_elicitation_clear_tasks,
+    _intentional_stop_sessions,
+    _interrupt_fenced_sessions,
+    _logger,
+    _managed_launch_tasks,
+    _MirroredToolCall,
+    _model_options_cache,
+    _model_options_inflight,
+    _model_options_stale,
+    _native_popup_forward_tasks,
+    _pending_policy_ask_writes,
+    _PendingPolicyAskWrites,
+    _pushed_model_options_cache,
+    _recent_mirrored_tool_calls,
+    _RelayHandle,
+    _runner_relay_tasks,
+    _runner_skills_cache,
+    _runner_skills_inflight,
+    _session_active_response_cache,
+    _session_background_task_count_cache,
+    _session_mcp_startup_cache,
+    _session_sandbox_status_cache,
+    _session_status_cache,
+    _session_terminal_pending_cache,
+    _session_todos_cache,
     get_caps,
     get_server_runner_router,
     session_stream,
@@ -128,7 +173,111 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
-from omnigent.server.routes._sessions.helpers import *
+from omnigent.server.routes._sessions.helpers import (
+    SessionLiveness,
+    _ancestor_session_ids,
+    _approval_access_from_grants,
+    _await_settled_managed_launch,
+    _build_new_item,
+    _build_policy_engine_from_spec,
+    _child_session_summary_from_conversation,
+    _codex_subagent_labels_from_body,
+    _coerce_cumulative_field,
+    _collect_descendant_conversation_ids,
+    _consume_pre_resolved_harness_elicitation,
+    _create_and_publish_codex_child,
+    _create_session_worktree,
+    _delete_stored_session_bundle_after_failure,
+    _derive_terminal_launch_args_from_spec,
+    _emit_server_routing_decision,
+    _error_item_from_sse,
+    _extract_claude_native_runner_failure,
+    _extract_persistent_item_from_sse,
+    _extract_user_text_for_routing,
+    _extract_user_text_from_event,
+    _find_codex_native_subagent_child,
+    _flush_relay_text,
+    _forward_approval_to_runner,
+    _forward_session_change_to_runner,
+    _get_runner_client,
+    _handle_advise_models_mcp,
+    _invalidate_runner_backed_snapshot_state,
+    _is_codex_native_subagent,
+    _is_kiro_native_session,
+    _last_task_error_from_labels,
+    _latest_assistant_text_from_store,
+    _latest_message_preview,
+    _launch_runner_on_host,
+    _load_agent_spec_for_session,
+    _load_model_options,
+    _load_model_options_from_host,
+    _load_runner_skills,
+    _mcp_error_response,
+    _mcp_input_required_response,
+    _mcp_ok_response,
+    _merge_pending_file_blocks,
+    _message_text,
+    _model_usage_bucket,
+    _native_coding_agent_for_session,
+    _native_subagent_wrapper_labels_from_spec,
+    _native_terminal_ensure_transport_error,
+    _native_terminal_failure_from_runner_response,
+    _native_terminal_name_for_harness,
+    _NativeTerminalEnsureOutcome,
+    _owner_from_grants,
+    _parse_external_conversation_item,
+    _pending_elicitation_snapshot_for_session,
+    _permission_level_from_grants,
+    _persist_native_policy_notice,
+    _persist_session_status_error_labels,
+    _persist_stored_session_bundle,
+    _policy_notice_from_ensure_response,
+    _poll_request_disconnect,
+    _priced_cost_for_display,
+    _provision_managed_sandbox,
+    _prune_pre_resolved_harness_elicitations,
+    _publish_elicitation_request_to_ancestors,
+    _publish_elicitation_resolved,
+    _publish_elicitation_resolved_to_ancestors,
+    _publish_error_event,
+    _publish_external_conversation_item,
+    _publish_input_consumed,
+    _publish_sandbox_status,
+    _publish_status,
+    _publish_terminal_pending,
+    _query_host_runner_status,
+    _read_state_entry,
+    _record_daily_cost,
+    _reject_reserved_cost_control_label_seed,
+    _reject_server_reserved_label_seed,
+    _relay_persist,
+    _relay_persist_error_once,
+    _remove_session_worktree_best_effort,
+    _require_declared_subagent,
+    _require_external_status_forward,
+    _resolve_harness,
+    _resolve_llm_model,
+    _resolve_subagent_spec,
+    _resource_event_item_from_sse,
+    _routing_decision_item_from_sse,
+    _RunnerForwardResult,
+    _seed_missing_title_from_user_message,
+    _session_status_from_cache,
+    _session_status_with_child_rollup,
+    _SessionEventDispatchResult,
+    _signal_terminal_resolved_harness_elicitation,
+    _spec_harness,
+    _stop_session_via_runner,
+    _strip_pending_author_prefix,
+    _usage_by_model_for_display,
+    _validate_session_workspace,
+    _validate_terminal_launch_args,
+    _validated_cost_control_mode_override,
+    _validated_harness_override,
+    _validated_harness_override_executor_type,
+    _wait_for_managed_runner_tunnel,
+    _wait_for_runner_client,
+)
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
     ChildSessionSummary,
@@ -1051,7 +1200,7 @@ def _persist_native_cumulative_usage(
         return None
 
     conv = conversation_store.get_conversation(session_id)
-    current = dict(conv.session_usage) if conv and conv.session_usage else {}
+    current: dict[str, Any] = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
     # cumulative + enforcement costs before the fields below overwrite them.
@@ -2572,6 +2721,146 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     )
 
 
+async def ensure_runner_connected(
+    *,
+    session_id: str,
+    conv: Conversation,
+    app_state: Any,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> tuple[httpx.AsyncClient | None, Conversation]:
+    """
+    Bring a wakeable session's runner online for out-of-band resource access.
+
+    Mirrors the message-dispatch relaunch ladder in ``post_event`` — wake a
+    stale resumable managed sandbox, launch a runner on a live host, or
+    relaunch a dead managed sandbox — but without any of the message-specific
+    side effects (failed-turn persistence, session-init handshake, sub-agent
+    binding heal). It answers one question: "is a live runner reachable, and
+    if not, can we wake one right now?"
+
+    Used by resource routes (e.g. shell create) so a user acting on a session
+    whose runner merely went to sleep transparently reconnects it, instead of
+    dead-ending on a 502. Only the wakeable states recover here:
+
+    * runner already connected → returned as-is (the common fast path);
+    * host online, pinned runner still booting → wait the connect grace
+      (``_HOST_BOUND_RUNNER_CONNECT_GRACE_S``, racing a ``host.runner_status``
+      query) before treating it as dead, so a booting runner isn't orphaned
+      by an eager relaunch;
+    * host online, runner truly dead → ``_launch_runner_on_host`` + connect wait;
+    * host tunnel gone but managed/resumable → ``_maybe_relaunch_managed_sandbox``
+      / ``_maybe_wake_stale_resumable_managed_sandbox``.
+
+    Non-wakeable states (external host offline, not host-bound with a dead
+    runner) return ``(None, conv)`` — the caller keeps its existing
+    unavailable handling (the CLI reconnect path owns those).
+
+    :param session_id: Session/conversation identifier.
+    :param conv: Current session row.
+    :param app_state: ``request.app.state`` — supplies the registries,
+        managed-launch tracker, host store, and sandbox config.
+    :param conversation_store: Store holding the session row.
+    :param runner_router: The ``RunnerRouter``, or ``None`` for in-process.
+    :returns: ``(runner_client, conv)`` — the client is ``None`` when no
+        runner is reachable and none is wakeable; ``conv`` is re-read after
+        any wake/relaunch so the caller sees the rebound row.
+    :raises OmnigentError: 503 when a managed relaunch/wake failed or timed
+        out (propagated from ``_maybe_relaunch_managed_sandbox``).
+    """
+
+    from omnigent.server.routes import sessions as _facade
+
+    async def _reread() -> Conversation:
+        refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        return refreshed if refreshed is not None else conv
+
+    # Fast path: a live runner tunnel is already reachable.
+    runner_client = await _get_runner_client(session_id, runner_router)
+    if runner_client is not None:
+        return runner_client, conv
+
+    tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
+    host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
+
+    # A resumable managed host whose persisted liveness has gone stale wakes
+    # in place; re-read the row and re-resolve, since the wake may have
+    # relaunched the runner and rebound the session.
+    if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
+        session_id=session_id,
+        conv=conv,
+        app_state=app_state,
+        conversation_store=conversation_store,
+    ):
+        conv = await _reread()
+        runner_client = await _get_runner_client(session_id, runner_router)
+        if runner_client is not None:
+            return runner_client, conv
+
+    # Host-bound but no runner: ask the still-online host to spawn one, or
+    # relaunch a managed sandbox whose host tunnel is gone. Mirrors the
+    # gating in post_event — host presence, then managed relaunch fallback.
+    if runner_client is None and conv.host_id is not None:
+        host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+        relaunched_runner_id: str | None = None
+        if host_conn is not None:
+            # A session whose runner is merely booting already has a runner_id
+            # before its tunnel registers. Mirror post_event's connect grace:
+            # wait briefly for that pinned runner (racing a host.runner_status
+            # query, which cuts the wait short if the host reports it truly
+            # gone) before relaunching — otherwise we'd spawn a second runner
+            # and orphan the one still coming up.
+            if (
+                conv.runner_id is not None
+                and host_registry is not None
+                and _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0
+            ):
+                runner_client = await _wait_for_host_bound_runner_client(
+                    session_id,
+                    runner_router,
+                    tunnel_registry,
+                    runner_id=conv.runner_id,
+                    timeout_s=_facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+                    runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
+                    host_conn=host_conn,
+                    host_registry=host_registry,
+                )
+                if runner_client is not None:
+                    return runner_client, await _reread()
+            launch_attempt = await _launch_runner_on_host(
+                conv,
+                conversation_store,
+                host_registry,
+                host_conn,
+            )
+            # A harness-not-configured refusal is a real host-side error, but
+            # out of band there's no turn to persist it against — leave the
+            # binding and let the caller surface the transport failure.
+            if launch_attempt.error_code != _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+                relaunched_runner_id = launch_attempt.runner_id
+        elif await _maybe_relaunch_managed_sandbox(
+            session_id=session_id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conversation_store,
+        ):
+            conv = await _reread()
+            runner_client = await _get_runner_client(session_id, runner_router)
+
+        if runner_client is None:
+            runner_client = await _wait_for_runner_client(
+                session_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=relaunched_runner_id,
+                timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
+            )
+            conv = await _reread()
+
+    return runner_client, conv
+
+
 def _kick_managed_relaunch(
     *,
     session_id: str,
@@ -2834,7 +3123,7 @@ async def _run_managed_wake(
     except HTTPException as exc:
         tracker.fail(session_id, str(exc.detail))
         _publish_sandbox_status(session_id, "failed", str(exc.detail))
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Fire-and-forget task — settle the tracker (else a waiting message
         # POST hangs to its timeout) and never escape as an unhandled-task
         # traceback. A failed wake leaves the sandbox intact for a retry.
@@ -4479,7 +4768,7 @@ async def _relay_runner_stream(
                                 conversation_store.append, session_id, [routing_item]
                             )
                             _persisted_id: str | None = persisted[0].id if persisted else None
-                        except Exception:
+                        except Exception:  # noqa: BLE001
                             _logger.exception(
                                 "Relay: routing_decision persist failed for session=%s; "
                                 "publishing the live chip without a durable id",
@@ -6226,9 +6515,12 @@ async def _handle_mcp_tools_call(
         for eid, req_entry in input_requests.items():
             req_params = req_entry.get("params", {}) if isinstance(req_entry, dict) else {}
             elicit_params = ElicitationRequestParams(
-                mode=req_params.get("mode", "form"),
+                mode=cast(Literal["form", "url"], req_params.get("mode", "form")),
                 message=req_params.get("message", "Approval required"),
-                requestedSchema=req_params.get("requestedSchema"),
+                requestedSchema=cast(
+                    Mapping[str, Any] | None,
+                    req_params.get("requestedSchema"),
+                ),
             )
             elicit_result = await _publish_and_wait_for_harness_elicitation(
                 request,
@@ -6811,4 +7103,5 @@ __all__ = [
     "_wait_for_host_bound_runner_client",
     "_wake_parent_for_blocked_child",
     "configure_subagent_block_notifier",
+    "ensure_runner_connected",
 ]
