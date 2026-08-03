@@ -201,6 +201,39 @@ def test_substitute_model_falls_back_within_family() -> None:
     )
 
 
+def test_substitute_model_honors_the_tier_over_the_family_fallback() -> None:
+    from omnigent.server.smart_routing import substitute_model
+
+    prefixes = ("databricks-",)
+    # task_v1 names the frozen opus arm claude-opus-4-8, but this workspace
+    # serves opus-5 for the opus line. The router meant "escalate to opus", so
+    # the servable opus wins over the sonnet family fallback (the reported bug:
+    # an escalate pick was collapsed to sonnet-5).
+    catalog = [
+        "databricks-claude-opus-5",
+        "databricks-claude-sonnet-5",
+        "databricks-claude-haiku-4-5",
+    ]
+    assert substitute_model("claude-opus-4-8", catalog, prefixes=prefixes) == (
+        "databricks-claude-opus-5"
+    )
+    # The newest model of the tier wins when several are servable.
+    two_opus = ["databricks-claude-opus-4-7", "databricks-claude-opus-5"]
+    assert substitute_model("claude-opus-4-8", two_opus, prefixes=prefixes) == (
+        "databricks-claude-opus-5"
+    )
+    # A same-tier match never crosses the tier down: only when no opus is
+    # servable does it fall to the sonnet family default.
+    assert (
+        substitute_model(
+            "claude-opus-4-8",
+            ["databricks-claude-sonnet-5", "databricks-claude-haiku-4-5"],
+            prefixes=prefixes,
+        )
+        == "databricks-claude-sonnet-5"
+    )
+
+
 def test_substitute_model_declines_when_no_fallback_is_servable() -> None:
     from omnigent.server.smart_routing import substitute_model
 

@@ -758,6 +758,32 @@ def _model_family(model: str) -> str:
     return "gpt" if token == "openai" else token
 
 
+def _model_tier(model: str, prefixes: Sequence[str] | None = None) -> str | None:
+    """The model-line codename a router arm encodes, e.g. ``opus`` / ``sol``.
+
+    task_v1's frozen arms name a *tier*, not a specific servable id:
+    ``claude-opus-4-8`` is the opus tier, ``gpt-5-6-sol`` the sol tier. When
+    the workspace serves a different model of the same tier
+    (``claude-opus-5`` for an ``claude-opus-4-8`` pick), that model is the arm
+    the router meant, so it substitutes ahead of the family default. The tier
+    is the id's last alphabetic segment; ``None`` for a bare generation id
+    (``gpt-5-5``) whose only alpha segment is the family root and so carries no
+    model line.
+    """
+    segments = _bare_id(model, prefixes).split("-")
+    tier = next((s for s in reversed(segments) if s.isalpha()), None)
+    return None if tier in ("gpt", "claude") else tier
+
+
+def _version_key(model: str, prefixes: Sequence[str] | None = None) -> tuple[int, ...]:
+    """Numeric version of *model*, higher = newer, to rank within a tier.
+
+    ``claude-opus-5`` → ``(5,)`` and ``claude-opus-4-8`` → ``(4, 8)``, so
+    ``(5,) > (4, 8)`` picks opus-5 as the best opus.
+    """
+    return tuple(int(s) for s in _bare_id(model, prefixes).split("-") if s.isdigit())
+
+
 def substitute_model(
     model: str,
     candidates: Sequence[str],
@@ -767,10 +793,14 @@ def substitute_model(
 ) -> str | None:
     """Find something in *candidates* to run in place of *model*.
 
-    The pick itself first, so a workspace that serves it applies it exactly;
-    otherwise the pick's family fallback (:data:`_FAMILY_FALLBACK`) when the
-    candidates serve it. No cost walk: an unservable pick lands on one fixed
-    per-family model or declines, never slides down a cost ladder.
+    Three steps, honoring what the router actually named. The pick itself
+    first, so a workspace that serves it applies it exactly. Otherwise the best
+    servable model of the pick's own *tier* — task_v1 arms name a model line
+    (``claude-opus-4-8`` is the opus tier), so a workspace that serves a
+    different opus (``claude-opus-5``) gets the arm the router meant, not the
+    family default. Only when no same-tier model is servable does it fall to
+    the family fallback (:data:`_FAMILY_FALLBACK`), then decline. No cost walk:
+    an unservable pick never slides down to a cheaper tier.
 
     :param model: The router's pick, in either vocabulary.
     :param candidates: Servable model ids.
@@ -778,17 +808,38 @@ def substitute_model(
         uses this deployment's configured ones.
     :param barred: Bare ids to skip, e.g. models the harness's gateway 400s on.
     :returns: A servable candidate id (through :func:`apply_servable_alias`),
-        or ``None`` when neither the pick nor its family fallback is servable.
+        or ``None`` when nothing servable matches the pick, its tier, or its
+        family fallback.
     """
     local: dict[str, str] = {}
     for candidate in candidates:
         local.setdefault(_bare_id(candidate, prefixes), candidate)
     skip = {_bare_id(m, prefixes) for m in barred}
-    for target in (_bare_id(model, prefixes), _FAMILY_FALLBACK.get(_model_family(model))):
-        if target is None or target in skip:
-            continue
-        if target in local:
-            return apply_servable_alias(local[target], prefixes)
+    family = _model_family(model)
+
+    # 1. The exact pick, when the workspace serves it.
+    bare = _bare_id(model, prefixes)
+    if bare not in skip and bare in local:
+        return apply_servable_alias(local[bare], prefixes)
+
+    # 2. The best servable model of the pick's own tier (opus/sonnet/sol/luna).
+    tier = _model_tier(model, prefixes)
+    if tier is not None:
+        same_tier = [
+            orig
+            for cand_bare, orig in local.items()
+            if cand_bare not in skip
+            and _model_family(cand_bare) == family
+            and _model_tier(cand_bare, prefixes) == tier
+        ]
+        if same_tier:
+            best = max(same_tier, key=lambda m: _version_key(m, prefixes))
+            return apply_servable_alias(best, prefixes)
+
+    # 3. The family fallback, then decline.
+    fallback = _FAMILY_FALLBACK.get(family)
+    if fallback is not None and fallback not in skip and fallback in local:
+        return apply_servable_alias(local[fallback], prefixes)
     return None
 
 
