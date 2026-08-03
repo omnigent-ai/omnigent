@@ -18,13 +18,14 @@ The managed config dir is per-session (like codex-native's managed
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
-import shlex
 import subprocess
+import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
@@ -422,9 +423,16 @@ def _databricks_openai_provider(
 def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None:
     """Run *auth_command* and return its stdout as a bearer token.
 
-    Used to obtain a short-lived token at session-create time for the
-    one-shot model-catalog API call. Returns ``None`` on any failure so
-    callers can fall back gracefully.
+    Used to obtain a short-lived token at session-create time — for the
+    one-shot model-catalog API call and to check the credential is actually
+    usable before Pi launches. Returns ``None`` on any failure so callers can
+    fall back gracefully.
+
+    Runs through ``/bin/sh -c`` because auth commands are shell strings: the
+    codex config's is usually a simple ``jq -r .access_token <file>``, but the
+    Databricks CLI one we generate is a compound ``if …; then …; fi`` script.
+    Pi itself resolves a ``!command`` apiKey through a shell, so this executes
+    the credential exactly as Pi will.
 
     :param auth_command: Shell command string, e.g.
         ``"jq -r .access_token /path/token.json"``.
@@ -434,7 +442,7 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
     """
     try:
         result = subprocess.run(
-            shlex.split(auth_command),
+            ["/bin/sh", "-c", auth_command],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -444,6 +452,165 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         return result.stdout.strip() or None
     except Exception:  # noqa: BLE001 — any subprocess failure should just return None
         return None
+
+
+def _token_expired(token: str, *, skew_seconds: float = 60.0) -> bool:
+    """Return whether *token* is a JWT whose ``exp`` claim has passed.
+
+    ucode-style auth commands (``jq -r .access_token <file>``) print a token
+    cached on disk and never refresh it, so a workstation that hasn't re-run
+    ``ucode configure`` for a day hands Pi a dead bearer — every turn then dies
+    with the gateway's opaque ``401 Invalid Token``. Reading the unverified
+    ``exp`` claim detects that offline, before the session launches.
+
+    Signature verification is deliberately skipped: we are not trusting the
+    token, only reading its stated lifetime to decide whether to re-mint.
+
+    :param token: Bearer token printed by an auth command.
+    :param skew_seconds: Treat a token expiring within this window as expired.
+    :returns: ``True`` only when the token is a JWT with a past/imminent
+        ``exp``; ``False`` for opaque tokens (e.g. a PAT) with no readable
+        expiry, so a working credential is never discarded.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:  # noqa: BLE001 — unparseable payload: treat as usable
+        return False
+    expiry = claims.get("exp") if isinstance(claims, dict) else None
+    if not isinstance(expiry, int | float) or isinstance(expiry, bool):
+        return False
+    return float(expiry) <= time.time() + skew_seconds
+
+
+def _databrickscfg_profile_for_host(workspace_url: str) -> str | None:
+    """Return a ``~/.databrickscfg`` profile whose host is *workspace_url*.
+
+    Host-exact matching keeps the re-mint on the gateway's own workspace: the
+    machine may hold profiles for several workspaces (and an environment
+    pointing at yet another one, e.g. wherever the Omnigent server is hosted),
+    and a token minted anywhere else is rejected by this gateway.
+
+    :param workspace_url: Workspace origin behind the gateway, e.g.
+        ``"https://workspace.cloud.databricks.com"``.
+    :returns: Profile name usable as ``databricks auth token --profile <name>``,
+        or ``None`` when no profile targets that workspace.
+    """
+    import configparser
+
+    target = (urlparse(workspace_url).hostname or "").lower()
+    if not target:
+        return None
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    if not cfg_path.exists():
+        return None
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(cfg_path)
+    except Exception:  # noqa: BLE001 — a malformed config just disables the fallback
+        return None
+    # Named profiles first: they are explicit, and [DEFAULT] is often a
+    # leftover pointing at whichever workspace was set up first.
+    candidates: list[tuple[str, dict[str, str]]] = [
+        (name, dict(parser[name])) for name in parser.sections()
+    ]
+    candidates.append(("DEFAULT", dict(parser.defaults())))
+    for name, section in candidates:
+        host = (urlparse(section.get("host", "")).hostname or "").lower()
+        if host and host == target:
+            return name
+    return None
+
+
+def _revive_gateway_transport(
+    transport: CodexConfigTransport,
+    *,
+    entry_name: str,
+) -> tuple[CodexConfigTransport, str | None, str | None]:
+    """Re-mint *transport*'s credential when its cached token has expired.
+
+    The codex config table a cli-config provider pins usually authenticates by
+    printing a token file ucode wrote. That file is static: once it expires,
+    Pi's per-request ``!command`` apiKey keeps printing the dead token and the
+    gateway answers ``401 Invalid Token`` on every turn. When a
+    ``~/.databrickscfg`` profile targets the *same* workspace, swap in the
+    profile-pinned ``databricks auth token`` command, which refreshes itself —
+    so the session self-heals instead of failing until the user re-runs ucode.
+
+    :param transport: Transport resolved from the codex provider table.
+    :param entry_name: Provider entry name, for log/warning context.
+    :returns: ``(transport, token, warning)`` — the transport to use (possibly
+        re-pointed at the profile command), a usable bearer token when one was
+        obtained (for the model-list call), and a user-facing warning when the
+        credential is dead and could not be re-minted.
+    """
+    token = _run_auth_command(transport.auth_command) if transport.auth_command else None
+    if token and not _token_expired(token):
+        return transport, token, None
+    # Only re-mint against a workspace the gateway URL itself names. A
+    # dedicated ``*.ai-gateway.*`` subdomain hides its workspace host, and the
+    # ambient Databricks environment often points at an unrelated workspace
+    # (e.g. the one hosting the Omnigent server), whose token this gateway
+    # would reject just as opaquely — better to tell the user to re-auth.
+    workspace_url = _gateway_workspace_url_from_hostname(transport.base_url)
+    profile = _databrickscfg_profile_for_host(workspace_url) if workspace_url else None
+    if workspace_url and profile:
+        from omnigent.inner.codex_executor import _databricks_codex_auth_command
+
+        candidate = _databricks_codex_auth_command(workspace_url, profile)
+        minted = _run_auth_command(candidate)
+        if minted and not _token_expired(minted):
+            _LOGGER.info(
+                "pi-native: cli-config provider %r had an expired cached gateway token; "
+                "re-minting from the Databricks profile %r for %s",
+                entry_name,
+                profile,
+                workspace_url,
+            )
+            return replace(transport, auth_command=candidate), minted, None
+    _LOGGER.warning(
+        "pi-native: cli-config provider %r has no usable Databricks AI Gateway "
+        "credential (cached token expired or missing, no matching profile for %s)",
+        entry_name,
+        workspace_url or transport.base_url,
+    )
+    return transport, token, _stale_gateway_warning(workspace_url or transport.base_url)
+
+
+def _gateway_workspace_url_from_hostname(base_url: str) -> str | None:
+    """Return the workspace origin *base_url* itself names, if it does.
+
+    Workspace-hosted gateways (``<workspace>/ai-gateway/…``) carry the
+    workspace hostname, so the workspace behind them is known with certainty.
+    Dedicated ``<id>.ai-gateway.<domain>`` subdomains do not, and resolving one
+    ambiently can name a different workspace entirely.
+
+    :param base_url: The gateway base URL from the codex provider table.
+    :returns: The workspace origin, or ``None`` for a dedicated gateway
+        subdomain (workspace unknown from the URL alone).
+    """
+    hostname = (urlparse(base_url).hostname or "").lower()
+    if not hostname or _DATABRICKS_AI_GATEWAY_LABEL in hostname.split("."):
+        return None
+    return f"https://{hostname}"
+
+
+def _stale_gateway_warning(workspace_url: str) -> str:
+    """User-facing notice for an expired Databricks AI Gateway credential.
+
+    :param workspace_url: Workspace (or gateway) URL whose token is dead.
+    :returns: A short message naming the workspace and how to re-authenticate.
+    """
+    return (
+        "The cached Databricks AI Gateway token for "
+        f"{workspace_url} has expired, so this Pi session can't reach the model "
+        "and won't reply. Re-authenticate by running "
+        f"`databricks auth login --host {workspace_url}` (or re-running `ucode "
+        "configure` for that workspace), then start a new Pi session."
+    )
 
 
 def _fetch_pi_model_lists(
@@ -685,6 +852,13 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     transport = _cli_config_databricks_transport(entry)
     if transport is None:
         return None
+    # A ucode-written auth command prints a *static* cached token; when it has
+    # expired, re-point the transport at a profile-pinned Databricks CLI
+    # command for the same workspace (which refreshes) so the session doesn't
+    # 401 on every turn, and carry a warning when nothing can be re-minted.
+    transport, gateway_token, credential_warning = _revive_gateway_transport(
+        transport, entry_name=entry.name
+    )
     api_key = f"!{transport.auth_command}"
     # The AI Gateway hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``)
     # is NOT the workspace hostname — stripping ``ai-gateway.`` produces an
@@ -704,16 +878,15 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
             "pi-native: cli-config path could not resolve workspace URL "
             "for model listing; Pi will show only the selected model"
         )
-    if real_workspace_url and transport.auth_command:
-        token = _run_auth_command(transport.auth_command)
-        if token:
-            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                real_workspace_url, token
-            )
-        else:
-            _LOGGER.info(
-                "pi-native: auth command produced no token; Pi will show only the selected model"
-            )
+    if real_workspace_url and gateway_token:
+        claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
+            real_workspace_url, gateway_token
+        )
+    elif real_workspace_url:
+        _LOGGER.info(
+            "pi-native: auth command produced no usable token; "
+            "Pi will show only the selected model"
+        )
     # Derive the AI Gateway codex URL for the openai-responses provider. For
     # workspace-hosted URLs the transport base is already the codex path;
     # for dedicated-subdomain URLs we build it from the workspace URL.
@@ -758,6 +931,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         auth_header=True,
         extra_models=claude_models,
         additional_providers=additional,
+        credential_warning=credential_warning,
     )
 
 

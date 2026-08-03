@@ -1153,3 +1153,201 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
     assert gpt == []
     assert completions == []
     assert gemini == []
+
+
+# ── Expired ucode gateway token (self-heal) ───────────────────────────────
+#
+# A cli-config provider's auth command usually prints a token file ucode
+# wrote. That file is static: once it expires, Pi's per-request "!command"
+# apiKey keeps printing the dead token and every turn dies with the gateway's
+# opaque "401 Invalid Token". These cover the re-mint + the warning.
+
+_WORKSPACE_GATEWAY_CONFIG = """
+model_provider = "Databricks"
+
+[model_providers.Databricks]
+name = "Databricks AI Gateway"
+base_url = "https://dbc-abc123.cloud.databricks.com/ai-gateway/codex/v1"
+wire_api = "responses"
+
+[model_providers.Databricks.auth]
+command = "jq"
+args = ["-r", ".access_token", "/Users/me/.databricks/model-serving-token.json"]
+timeout_ms = 5000
+"""
+
+_UCODE_AUTH_COMMAND = "jq -r .access_token /Users/me/.databricks/model-serving-token.json"
+
+
+def _jwt(expires_in: float) -> str:
+    """Return a JWT-shaped token whose ``exp`` is *expires_in* seconds away."""
+    import base64
+    import time
+
+    def _segment(payload: dict[str, object]) -> str:
+        raw = json.dumps(payload).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return f"{_segment({'alg': 'RS256'})}.{_segment({'exp': time.time() + expires_in})}.sig"
+
+
+def _write_databrickscfg(home: Path, sections: dict[str, str]) -> None:
+    """Write a ``~/.databrickscfg`` under *home* mapping profile → host."""
+    body = "".join(f"[{name}]\nhost = {host}\n\n" for name, host in sections.items())
+    (home / ".databrickscfg").write_text(body, encoding="utf-8")
+
+
+def test_token_expired_reads_jwt_expiry_and_ignores_opaque_tokens() -> None:
+    """Expiry detection is JWT-only; an opaque token is never discarded.
+
+    Failure meaning: a false positive would throw away a working PAT and a
+    false negative would hand Pi a dead bearer (silent 401 on every turn).
+    """
+    assert creds._token_expired(_jwt(-60)) is True
+    # Within the refresh skew — treated as expired so the turn doesn't race it.
+    assert creds._token_expired(_jwt(5)) is True
+    assert creds._token_expired(_jwt(3600)) is False
+    assert creds._token_expired("dapi-static-personal-access-token") is False
+    assert creds._token_expired("not.a.jwt") is False
+
+
+def test_databrickscfg_profile_for_host_matches_exact_host_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Profile lookup is host-exact, so a token is never minted elsewhere.
+
+    The gateway workspace is routinely NOT the workspace hosting the Omnigent
+    server, so matching anything but the gateway's own host would mint a token
+    that workspace rejects.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+    _write_databrickscfg(
+        tmp_path,
+        {
+            "other": "https://dbc-other.cloud.databricks.com",
+            "gateway-ws": "https://dbc-abc123.cloud.databricks.com/",
+        },
+    )
+
+    assert (
+        creds._databrickscfg_profile_for_host("https://dbc-abc123.cloud.databricks.com")
+        == "gateway-ws"
+    )
+    assert creds._databrickscfg_profile_for_host("https://dbc-nope.cloud.databricks.com") is None
+
+
+def test_cli_config_expired_token_remints_from_matching_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An expired ucode token is re-minted from the same workspace's profile.
+
+    Failure meaning: Pi keeps the static ``jq`` apiKey, the gateway answers
+    ``401 Invalid Token`` on every turn, and the session never replies.
+    """
+    _write_codex_config(tmp_path, _WORKSPACE_GATEWAY_CONFIG)
+    _write_databrickscfg(tmp_path, {"gateway-ws": "https://dbc-abc123.cloud.databricks.com"})
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+
+    def _fake_auth(command: str, *, timeout: float = 15.0) -> str | None:
+        return _jwt(-60) if command == _UCODE_AUTH_COMMAND else _jwt(3600)
+
+    monkeypatch.setattr(creds, "_run_auth_command", _fake_auth)
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *a, **kw: ([], [], [], []))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    # Re-pointed at the self-refreshing, profile-pinned Databricks CLI command.
+    assert provider.api_key.startswith("!")
+    assert 'databricks auth token --profile "gateway-ws"' in provider.api_key
+    assert _UCODE_AUTH_COMMAND not in provider.api_key
+    assert provider.base_url == "https://dbc-abc123.cloud.databricks.com/ai-gateway/anthropic"
+
+
+def test_cli_config_expired_token_without_profile_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No re-mintable profile → keep the command but tell the user to re-auth.
+
+    Failure meaning: the session launches, 401s on every turn, and the user
+    sees only Pi's opaque model error with no way to know their gateway login
+    expired.
+    """
+    _write_codex_config(tmp_path, _WORKSPACE_GATEWAY_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command, **kw: _jwt(-60))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.api_key == f"!{_UCODE_AUTH_COMMAND}"
+    assert provider.credential_warning is not None
+    assert "dbc-abc123.cloud.databricks.com" in provider.credential_warning
+    assert "databricks auth login" in provider.credential_warning
+
+
+def test_cli_config_live_token_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A still-valid ucode token keeps its own auth command (no profile swap).
+
+    ucode's credential is the intended one; the profile re-mint is strictly a
+    recovery path for a dead token.
+    """
+    _write_codex_config(tmp_path, _WORKSPACE_GATEWAY_CONFIG)
+    _write_databrickscfg(tmp_path, {"gateway-ws": "https://dbc-abc123.cloud.databricks.com"})
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command, **kw: _jwt(3600))
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *a, **kw: ([], [], [], []))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.api_key == f"!{_UCODE_AUTH_COMMAND}"
+    assert provider.credential_warning is None
+
+
+def test_run_auth_command_executes_compound_shell_commands() -> None:
+    """Auth commands run through a shell, so compound scripts work.
+
+    The Databricks CLI command we generate is an ``if …; then …; fi`` script;
+    splitting it on whitespace (the old behavior) ran ``if`` as a binary and
+    produced no token, so the model list silently emptied.
+    """
+    assert creds._run_auth_command('if true; then printf "%s\\n" tok-123; fi') == "tok-123"
+    assert creds._run_auth_command("exit 1") is None
+
+
+def test_cli_config_dedicated_gateway_subdomain_never_cross_mints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dedicated ``*.ai-gateway.*`` gateway warns instead of cross-minting.
+
+    The gateway workspace is frequently not the workspace the machine's
+    ambient Databricks environment points at, and that URL shape doesn't name
+    its workspace — so re-minting there could send another workspace's token
+    (rejected just as opaquely). Warn and keep the configured command.
+    """
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)  # dedicated subdomain
+    _write_databrickscfg(tmp_path, {"unrelated": "https://dbc-other.cloud.databricks.com"})
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+    minted: list[str] = []
+
+    def _fake_auth(command: str, **_: object) -> str | None:
+        minted.append(command)
+        return _jwt(-60)
+
+    monkeypatch.setattr(creds, "_run_auth_command", _fake_auth)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.api_key == f"!{_UCODE_AUTH_COMMAND}"
+    assert provider.credential_warning is not None
+    assert all("databricks auth token" not in command for command in minted)
