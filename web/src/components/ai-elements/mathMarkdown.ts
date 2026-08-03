@@ -36,7 +36,7 @@ export function normalizeExplicitMathDelimiters(text: string): string {
     const atLineStart = i === 0 || text[i - 1] === "\n";
 
     if (!inlineCodeTicks && atLineStart) {
-      const fence = FENCE_RE.exec(text.slice(i));
+      const fence = text.slice(i).match(FENCE_RE);
       if (fence) {
         inFence = !inFence;
         result += fence[0];
