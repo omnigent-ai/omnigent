@@ -49,6 +49,7 @@ from omnigent.runtime.policies.approval import (
     _is_explicit_decline,
     _parse_verdict,
     _truncate,
+    arguments_from_preview,
     validate_approval_presentation,
 )
 from omnigent.runtime.policies.approval import (
@@ -410,6 +411,62 @@ def test_python_presentation_preserves_clean_titles(title: str) -> None:
     """Clean LTR and RTL titles pass without rewriting."""
     candidate = ApprovalPresentation(title=title)
     assert validate_approval_presentation(candidate, {}) == candidate
+
+
+def test_boundary_validates_the_stored_title_not_the_raw_one() -> None:
+    """A disallowed character the cap removes cannot drop the card.
+
+    The check must run on the capped/stripped value that is actually
+    returned, so the string validated and the string rendered agree.
+    """
+    candidate = ApprovalPresentation(title="x" * 256 + "‮" + "y" * 20)
+    result = validate_approval_presentation(candidate, {})
+    assert result is not None
+    assert result.title == "x" * 256
+    assert "‮" not in result.title
+
+
+def test_boundary_validates_the_stripped_title() -> None:
+    """Whitespace the strip removes cannot drop the card either."""
+    result = validate_approval_presentation(ApprovalPresentation(title="target\n"), {})
+    assert result is not None
+    assert result.title == "target"
+
+
+def test_boundary_still_drops_disallowed_characters_inside_the_cap() -> None:
+    """Truncating the title must not become an escape hatch."""
+    candidate = ApprovalPresentation(title="a‮b" + "x" * 300)
+    assert validate_approval_presentation(candidate, {}) is None
+
+
+# ── arguments_from_preview — both preview shapes ──────
+
+
+def test_arguments_from_preview_unwraps_the_wrapper_shape() -> None:
+    """A whole tool-call preview yields its ``arguments`` mapping."""
+    preview = json.dumps({"name": "merge_pr", "arguments": {"grant_id": "g", "pr": 451}})
+    assert arguments_from_preview(preview) == {"grant_id": "g", "pr": 451}
+
+
+def test_arguments_from_preview_accepts_the_bare_shape() -> None:
+    """A preview that is already the arguments mapping is used as-is.
+
+    The relay paths pass the arguments string straight through, so the
+    whole-dict fallback is what lets their secondary arguments resolve.
+    """
+    preview = json.dumps({"grant_id": "g", "pr": 451})
+    assert arguments_from_preview(preview) == {"grant_id": "g", "pr": 451}
+
+
+def test_arguments_from_preview_keeps_bare_name_arguments() -> None:
+    """``name`` is a legal argument name on the bare shape."""
+    assert arguments_from_preview(json.dumps({"name": "release-1.2"})) == {"name": "release-1.2"}
+
+
+@pytest.mark.parametrize("preview", ["not json", "[1, 2]", '"text"', "null", ""])
+def test_arguments_from_preview_rejects_non_objects(preview: str) -> None:
+    """Anything that is not a JSON object resolves no argument names."""
+    assert arguments_from_preview(preview) == {}
 
 
 def test_elicitation_request_event_url_mode(monkeypatch: pytest.MonkeyPatch) -> None:
