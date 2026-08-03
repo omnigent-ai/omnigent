@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from dataclasses import dataclass, field
@@ -232,6 +233,27 @@ def _launcher(**kwargs) -> TenkiSandboxLauncher:
 
 
 # ── prepare ─────────────────────────────────────────────────
+
+
+def test_prepare_quiets_grpc_info_logging(sdk: _State, monkeypatch: pytest.MonkeyPatch) -> None:
+    """gRPC's INFO tier is silenced so the bootstrap output stays readable.
+
+    The SDK's gRPC core logs at INFO whenever a process holding a channel
+    forks, so the wheel build's subprocesses would otherwise spray "FD from
+    fork parent still in poll list" through ``sandbox create``.
+    """
+    monkeypatch.delenv("GRPC_VERBOSITY", raising=False)
+    _launcher().prepare()
+    assert os.environ["GRPC_VERBOSITY"] == "ERROR"
+
+
+def test_prepare_keeps_explicit_grpc_verbosity(
+    sdk: _State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator debugging the transport keeps the verbosity they asked for."""
+    monkeypatch.setenv("GRPC_VERBOSITY", "DEBUG")
+    _launcher().prepare()
+    assert os.environ["GRPC_VERBOSITY"] == "DEBUG"
 
 
 def test_prepare_requires_credentials(sdk: _State, monkeypatch: pytest.MonkeyPatch) -> None:

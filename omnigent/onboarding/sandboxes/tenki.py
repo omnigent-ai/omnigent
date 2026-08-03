@@ -124,6 +124,13 @@ def _ensure_sdk() -> None:
     :raises click.ClickException: When the ``tenki`` package is not
         installed.
     """
+    # The SDK talks gRPC, whose core logs at INFO when a process holding a
+    # channel forks — so the wheel build's subprocesses spray "FD from fork
+    # parent still in poll list" across the bootstrap output. Quiet the
+    # informational tier only: real transport failures log at ERROR and still
+    # surface, and an explicit GRPC_VERBOSITY from the operator wins. Must
+    # precede the import that initializes the gRPC core.
+    os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
     try:
         import tenki  # noqa: F401  # presence probe only
     except ImportError as exc:
