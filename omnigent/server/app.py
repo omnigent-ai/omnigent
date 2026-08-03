@@ -1655,7 +1655,7 @@ def create_app(
         # lookup's own missing-row terminal.
         _missing = SessionLiveness(runner_online=True, host_online=None)
         if session_id is not None:
-            single = liveness.get(session_id, _missing)
+            single = liveness.get(session_id) or _missing
             result["session"] = {
                 "id": session_id,
                 "runner_online": single.runner_online,
@@ -1665,7 +1665,7 @@ def create_app(
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
-                    "runner_online": (sl := liveness.get(sid, _missing)).runner_online,
+                    "runner_online": (sl := liveness.get(sid) or _missing).runner_online,
                     "host_online": sl.host_online,
                     "host_version": sl.host_version,
                 }
