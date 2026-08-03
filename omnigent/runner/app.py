@@ -22,7 +22,7 @@ import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, cast, overload
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
@@ -313,6 +313,21 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
 SpecResolver: TypeAlias = Callable[[str, str | None], Awaitable[_SpecEntry | None]]
 _ResourceType: TypeAlias = Literal["environment", "terminal", "file"]
+
+
+@overload
+def _unwrap_spec_entry(entry: None) -> None: ...
+
+
+@overload
+def _unwrap_spec_entry(entry: _SpecEntry) -> AgentSpec: ...
+
+
+def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
+    """Return the agent spec from a runner app cache entry."""
+    return entry.spec if isinstance(entry, ResolvedSpec) else entry
+
+
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
@@ -2499,10 +2514,7 @@ def create_runner_app(
             process_manager=process_manager,
             cwd=resolver_cwd,
             model_override=body.model_override,
-            session_spec=cast(
-                AgentSpec | None,
-                _unwrap_resolved_spec(_session_spec_cache.get(conversation_id)),
-            ),
+            session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
         )
         try:
             title = await run_background_title(context)
@@ -2592,7 +2604,7 @@ def create_runner_app(
                     },
                 )
         if spec_entry is not None:
-            spec = cast(AgentSpec, _unwrap_resolved_spec(spec_entry))
+            spec = _unwrap_spec_entry(spec_entry)
             raw_sub_agent_name = body.get("sub_agent_name")
             _sa_name_assign = cast(str | None, raw_sub_agent_name)
             if _sa_name_assign:
@@ -7427,7 +7439,7 @@ def create_runner_app(
 
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
         entry = await _resolve_session_spec_entry(session_id)
-        return cast(AgentSpec, _unwrap_resolved_spec(entry)) if entry is not None else None
+        return _unwrap_spec_entry(entry)
 
     async def _resolve_session_agent_spec_or_none(session_id: str) -> AgentSpec | None:
         """Resolve the session agent spec, tolerating resolution failure.
