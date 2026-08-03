@@ -420,12 +420,16 @@ def _make_auth_token_factory(
     # setup or terminal-creation call made after runner startup reuses the
     # factory that already has the proxy bearer, rather than constructing a
     # fresh one after RUNNER_INITIAL_AUTH_TOKEN has been popped from env.
+    # Also match when the caller explicitly passes the same URL the runner
+    # was started with — in-runner helpers like native_policy_hook pass
+    # server_url explicitly but still want the shared factory.
+    _runner_url = os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
     if (
         _runner_auth_factory is not None
         and _allow_initial_token
         and _allow_delegated_mint
         and _proxy_bearer is None
-        and server_url is None
+        and (server_url is None or server_url == _runner_url)
     ):
         return _runner_auth_factory
     resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
