@@ -110,6 +110,12 @@ def test_snapshot_contains_no_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
         # IPv6 literals must keep their required [...] brackets.
         ("http://[::1]:6767/x", "http://[::1]:6767/x"),
         ("https://u:p@[2001:db8::1]:443/api?t=x", "https://[2001:db8::1]:443/api"),
+        # Malformed URL (urlsplit would raise) must still drop userinfo, never
+        # fall back to the raw string.
+        ("http://user:pass@[::1", "http://[::1"),
+        # Scheme-less inputs must also drop query/fragment, not just userinfo.
+        ("user:pass@host?token=abc#frag", "host"),
+        ("host:6767/p?token=xyz#f", "host:6767/p"),
         (None, None),
     ],
 )

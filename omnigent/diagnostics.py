@@ -22,8 +22,8 @@ explicit install marker).
 from __future__ import annotations
 
 import platform
+import re
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 
 def _redact_url(url: str | None) -> str | None:
@@ -33,34 +33,32 @@ def _redact_url(url: str | None) -> str | None:
     or a query token; the snapshot is meant to be pasted into a bug report, so
     keep only scheme + host + port + path.
 
-    Redacts userinfo by dropping the ``user:pass@`` prefix of the authority
-    directly, rather than rebuilding it from ``hostname``/``port`` — the latter
-    lowercases the host and, for IPv6 literals, loses the required ``[...]``
-    brackets. Also handles scheme-less ``user:pass@host`` inputs, which
-    ``urlsplit`` misparses (the ``user:`` looks like a scheme), by scrubbing the
-    raw string when an ``@`` precedes any ``/``.
+    Operates on the raw string with no ``urlsplit`` — that would (a) raise
+    ``ValueError`` on a malformed IPv6 URL, leaving a fallback that leaks the
+    credentials, and (b) misparse scheme-less ``user:pass@host`` inputs. String
+    surgery instead scrubs uniformly regardless of shape:
+
+    1. cut everything from the first ``?`` or ``#`` (query + fragment);
+    2. drop a ``user:pass@`` prefix from the authority (the part before the
+       first ``/`` after any scheme), preserving IPv6 ``[...]`` brackets and
+       host casing.
     """
     if not url:
         return url
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return url
 
-    if parts.scheme and parts.netloc:
-        # Well-formed URL: drop userinfo from the authority, keep host[:port] as
-        # written (preserves IPv6 brackets), clear query + fragment.
-        netloc = parts.netloc.rsplit("@", 1)[-1]
-        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    # 1. Drop query + fragment (works on well-formed and scheme-less inputs).
+    without_qf = re.split(r"[?#]", url, maxsplit=1)[0]
 
-    # Scheme-less or otherwise not cleanly split. If there's userinfo (an ``@``
-    # before the first ``/``), strip it so credentials never survive; otherwise
-    # leave the value as the user typed it.
-    authority = url.split("/", 1)[0]
-    if "@" in authority:
-        rest = url[len(authority) :]
-        return authority.rsplit("@", 1)[-1] + rest
-    return url
+    # 2. Split an optional ``scheme://`` prefix, then strip userinfo from the
+    #    authority (up to the next ``/``). Also handles a scheme-less authority.
+    m = re.match(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)?(?P<rest>.*)", without_qf, re.DOTALL)
+    assert m is not None  # the pattern always matches
+    scheme = m.group("scheme") or ""
+    rest = m.group("rest")
+
+    authority, sep, path = rest.partition("/")
+    authority = authority.rsplit("@", 1)[-1]  # drop ``user:pass@`` if present
+    return f"{scheme}{authority}{sep}{path}"
 
 
 def _local_version() -> str:
