@@ -341,7 +341,7 @@ def test_scheduled_task_row_run_controls(
     """Run controls: relative next-run label, and Run now → a run is recorded.
 
     LLM-free. The seeded task pins no host, so a manual Run now resolves no online
-    host and records a ``failed`` run. This exercises the real
+    host and records a ``skipped`` run. This exercises the real
     POST /v1/scheduled-tasks/{id}/run path (the ⋯-menu action) end-to-end and
     confirms the run row is written, without ever dispatching an agent turn. The
     completion pill was removed from the row UI, so completion is asserted via the
@@ -370,19 +370,19 @@ def test_scheduled_task_row_run_controls(
     page.get_by_test_id("task-run-now").click()
 
     # The manual fire runs through the shared fire path and records a run row.
-    # With no online host it resolves to a ``failed`` run. Poll the history until
+    # With no online host it resolves to a ``skipped`` run. Poll the history until
     # the background fire lands (the POST returns 202 before the run is written).
-    def _has_failed_run() -> bool:
+    def _has_skipped_run() -> bool:
         runs = httpx.get(f"{live_server}/v1/scheduled-tasks/{task_id}/runs", timeout=10.0).json()[
             "runs"
         ]
-        return len(runs) == 1 and runs[0]["status"] == "failed"
+        return len(runs) == 1 and runs[0]["status"] == "skipped"
 
     deadline = 0
-    while not _has_failed_run() and deadline < 100:
+    while not _has_skipped_run() and deadline < 100:
         page.wait_for_timeout(200)
         deadline += 1
-    assert _has_failed_run(), "Run now did not record a failed run within the timeout"
+    assert _has_skipped_run(), "Run now did not record a skipped run within the timeout"
 
 
 # ── Model + reasoning-effort selectors (PR #3331) ──────────────────────────

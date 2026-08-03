@@ -116,6 +116,139 @@ function pluralize(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
+/**
+ * Format the wall-clock time a run FIRED (or was scheduled) as a short absolute
+ * label for the run-history list, e.g. `Today, 8:00 AM`, `Yesterday, 2:30 PM`,
+ * or `Jul 26, 8:00 AM` for anything older. The date is relative to `now` by
+ * calendar day (viewer-local), so "Today"/"Yesterday" track midnight rather than
+ * a rolling 24h window.
+ *
+ * @param epochSeconds The run's `firedAt ?? scheduledAt` (epoch SECONDS, matching
+ *   the server's `_run_to_response`), or `null`.
+ * @param now Injectable clock for deterministic tests; defaults to `new Date()`.
+ * @returns The label, or `null` for a null / non-finite input so the caller
+ *   renders nothing.
+ */
+export function formatRunTimestamp(
+  epochSeconds: number | null | undefined,
+  now: Date = new Date(),
+): string | null {
+  if (epochSeconds == null || !Number.isFinite(epochSeconds)) return null;
+  const date = new Date(epochSeconds * 1000);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const dayDelta = calendarDayDelta(date, now);
+  if (dayDelta === 0) return `Today, ${time}`;
+  if (dayDelta === 1) return `Yesterday, ${time}`;
+  // Older (or a future-dated run, e.g. a scheduled-but-not-fired row): show an
+  // absolute month/day. Include the year only when it differs from `now`'s so a
+  // run from a prior year isn't ambiguous.
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const datePart = date.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(sameYear ? {} : { year: "numeric" }),
+  });
+  return `${datePart}, ${time}`;
+}
+
+/**
+ * Whole-calendar-day difference (viewer-local) between `date` and `now`:
+ * `0` = same day, `1` = `date` was yesterday, negative = `date` is in the
+ * future. Compares local midnights so it ignores time-of-day.
+ */
+function calendarDayDelta(date: Date, now: Date): number {
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  return Math.round((startOfDay(now) - startOfDay(date)) / DAY_MS);
+}
+
+/**
+ * Format a run's elapsed wall-clock duration (`finishedAt − firedAt`) as a
+ * compact `1m 42s` / `3s` / `2h 5m` label for the run-history list.
+ *
+ * Both inputs are epoch SECONDS (server `_run_to_response`). Returns `null` when
+ * either bound is missing (the run hasn't finished, or never fired) or the
+ * arithmetic is nonsensical (finished before fired / non-finite), so the caller
+ * simply omits the duration rather than showing `0s` or a negative value.
+ *
+ * Units: shows the two most-significant non-zero units, largest first — `h`+`m`
+ * for hour-scale runs, `m`+`s` for minute-scale, bare `s` under a minute. A
+ * sub-second run rounds up to `1s` (a run that fired and finished always took
+ * *some* time; `0s` reads as "didn't run").
+ */
+export function formatRunDuration(
+  firedAt: number | null | undefined,
+  finishedAt: number | null | undefined,
+): string | null {
+  if (firedAt == null || finishedAt == null) return null;
+  if (!Number.isFinite(firedAt) || !Number.isFinite(finishedAt)) return null;
+  const seconds = finishedAt - firedAt;
+  if (seconds < 0) return null;
+  const total = Math.max(1, Math.round(seconds));
+
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  return `${s}s`;
+}
+
+/**
+ * Human-readable, one-line explanation for a run that did not succeed, derived
+ * from the server's machine-readable `errorCode` (see the fire path's
+ * `_CannotLaunchScheduledFire` codes in `omnigent/server/scheduled/fire.py` and
+ * the reconciler's `incomplete`). Used as the run's detail line for
+ * `skipped` / `failed` runs — never fabricated summary text.
+ *
+ * Unknown / null codes fall back to a generic message keyed on the run status
+ * so a new server-side code still renders something honest rather than blank.
+ *
+ * @param errorCode The run's `errorCode`, or `null`.
+ * @param status The run's status, used only for the fallback wording.
+ */
+export function describeRunError(
+  errorCode: string | null | undefined,
+  status: "skipped" | "failed" | (string & {}),
+): string {
+  switch (errorCode) {
+    case "no_online_host":
+      return "Host was offline at fire time. Run skipped.";
+    case "host_offline":
+      return "The pinned host was offline. Run skipped.";
+    case "host_not_found":
+      return "The pinned host no longer exists. Run skipped.";
+    case "host_not_owned":
+      return "The pinned host isn't available to you. Run skipped.";
+    case "host_registry_unavailable":
+      return "No host was reachable at fire time. Run skipped.";
+    case "default_workspace_unresolved":
+      return "Couldn't resolve a workspace on the host. Run skipped.";
+    // Permanent misconfiguration codes — the stored task spec fails every
+    // occurrence (recorded as "failed", not "skipped"). Copy points the user at
+    // fixing the task's configuration rather than waiting for a host.
+    case "invalid_input":
+      return "This task's model or workspace is invalid. Edit the task to fix it.";
+    case "missing_workspace":
+    case "missing_host_id":
+    case "missing_execution_input":
+      return "This task is missing its host or workspace. Edit the task to fix it.";
+    case "unsupported_target":
+      return "This task's target can't be run automatically";
+    case "session_create_failed":
+      return "Couldn't start the agent session";
+    case "owner_grant_failed":
+      return "Couldn't authorize the agent session";
+    case "launch_failed":
+      return "The agent session failed to launch";
+    case "incomplete":
+      return "The host went away mid-run. Run left incomplete.";
+    default:
+      return status === "skipped" ? "Run skipped" : "Run failed";
+  }
+}
+
 /** Parse an RRULE string into an `RRule`, or `null` if it can't be parsed. */
 function tryParse(rrule: string): RRule | null {
   try {

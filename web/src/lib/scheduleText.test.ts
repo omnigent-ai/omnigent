@@ -6,7 +6,15 @@
 
 import { describe, expect, it } from "vitest";
 import { RRule, rrulestr } from "rrule";
-import { describeSchedule, formatClockTime, formatNextRunAt, nextRunAtMs } from "./scheduleText";
+import {
+  describeRunError,
+  describeSchedule,
+  formatClockTime,
+  formatNextRunAt,
+  formatRunDuration,
+  formatRunTimestamp,
+  nextRunAtMs,
+} from "./scheduleText";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
@@ -418,5 +426,114 @@ describe("formatNextRunAt (relative delta from the server's next-run, full words
   it("bucket boundaries: 60m → hours, 24h → days", () => {
     expect(formatNextRunAt(iso(60 * MIN), NOW)).toBe("in 1 hour");
     expect(formatNextRunAt(iso(24 * HR), NOW)).toBe("in 1 day");
+  });
+});
+
+describe("formatRunDuration", () => {
+  it("formats sub-minute runs in bare seconds", () => {
+    expect(formatRunDuration(1000, 1003)).toBe("3s");
+    expect(formatRunDuration(1000, 1059)).toBe("59s");
+  });
+
+  it("formats minute-scale runs as 'Nm Ss', dropping a zero seconds", () => {
+    // 1m 42s.
+    expect(formatRunDuration(1000, 1000 + 102)).toBe("1m 42s");
+    // Exactly 2 minutes → no trailing seconds.
+    expect(formatRunDuration(1000, 1000 + 120)).toBe("2m");
+  });
+
+  it("formats hour-scale runs as 'Nh Mm', dropping a zero minutes", () => {
+    expect(formatRunDuration(0, 3600 + 5 * 60)).toBe("1h 5m"); // 1h 5m 0s
+    expect(formatRunDuration(0, 2 * 3600)).toBe("2h"); // exactly 2h
+  });
+
+  it("rounds a sub-second (but non-zero) run up to 1s", () => {
+    expect(formatRunDuration(1000, 1000.4)).toBe("1s");
+  });
+
+  it("returns null when the run hasn't finished or never fired", () => {
+    expect(formatRunDuration(1000, null)).toBeNull();
+    expect(formatRunDuration(null, 1000)).toBeNull();
+    expect(formatRunDuration(undefined, undefined)).toBeNull();
+  });
+
+  it("returns null for a negative or non-finite span", () => {
+    expect(formatRunDuration(2000, 1000)).toBeNull();
+    expect(formatRunDuration(Number.NaN, 1000)).toBeNull();
+  });
+});
+
+describe("formatRunTimestamp", () => {
+  // A fixed viewer-local reference. formatRunTimestamp works in local time, so
+  // build the run instants relative to NOW's local midnight to stay
+  // zone-independent.
+  const NOW = new Date("2026-07-27T15:30:00");
+
+  function atLocal(daysAgo: number, hour: number, minute: number): number {
+    const d = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate() - daysAgo, hour, minute, 0);
+    return Math.floor(d.getTime() / 1000);
+  }
+
+  it("labels a same-day run 'Today, <time>'", () => {
+    expect(formatRunTimestamp(atLocal(0, 8, 0), NOW)).toBe("Today, 8:00 AM");
+  });
+
+  it("labels a previous-calendar-day run 'Yesterday, <time>'", () => {
+    expect(formatRunTimestamp(atLocal(1, 14, 30), NOW)).toBe("Yesterday, 2:30 PM");
+  });
+
+  it("labels an older same-year run 'Mon D, <time>' without a year", () => {
+    const label = formatRunTimestamp(atLocal(10, 8, 0), NOW)!;
+    expect(label).toMatch(/^Jul \d{1,2}, 8:00 AM$/);
+    expect(label).not.toContain("2026");
+  });
+
+  it("includes the year for a run from a different year", () => {
+    const priorYear = Math.floor(new Date(2025, 11, 25, 9, 0, 0).getTime() / 1000);
+    const label = formatRunTimestamp(priorYear, NOW)!;
+    expect(label).toContain("2025");
+  });
+
+  it("returns null for a null / non-finite timestamp", () => {
+    expect(formatRunTimestamp(null, NOW)).toBeNull();
+    expect(formatRunTimestamp(undefined, NOW)).toBeNull();
+    expect(formatRunTimestamp(Number.NaN, NOW)).toBeNull();
+  });
+});
+
+describe("describeRunError", () => {
+  it("maps known fire-path error codes to human copy", () => {
+    expect(describeRunError("no_online_host", "skipped")).toBe(
+      "Host was offline at fire time. Run skipped.",
+    );
+    expect(describeRunError("incomplete", "failed")).toBe(
+      "The host went away mid-run. Run left incomplete.",
+    );
+    expect(describeRunError("launch_failed", "failed")).toBe("The agent session failed to launch");
+  });
+
+  it("maps permanent-misconfig codes to config-fixing copy (now recorded as failed)", () => {
+    expect(describeRunError("invalid_input", "failed")).toBe(
+      "This task's model or workspace is invalid. Edit the task to fix it.",
+    );
+    const missingCopy = "This task is missing its host or workspace. Edit the task to fix it.";
+    expect(describeRunError("missing_workspace", "failed")).toBe(missingCopy);
+    expect(describeRunError("missing_host_id", "failed")).toBe(missingCopy);
+    expect(describeRunError("missing_execution_input", "failed")).toBe(missingCopy);
+  });
+
+  it("keeps host-availability codes as skipped copy", () => {
+    expect(describeRunError("host_offline", "skipped")).toBe(
+      "The pinned host was offline. Run skipped.",
+    );
+    expect(describeRunError("default_workspace_unresolved", "skipped")).toBe(
+      "Couldn't resolve a workspace on the host. Run skipped.",
+    );
+  });
+
+  it("falls back to a status-keyed generic for an unknown / null code", () => {
+    expect(describeRunError("some_new_code", "skipped")).toBe("Run skipped");
+    expect(describeRunError(null, "failed")).toBe("Run failed");
+    expect(describeRunError(undefined, "skipped")).toBe("Run skipped");
   });
 });

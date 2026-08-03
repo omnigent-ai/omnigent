@@ -19,6 +19,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
+  cancelRunNowPoll: vi.fn(),
 }));
 
 // Stub the create dialog — its internals are covered separately; here we only

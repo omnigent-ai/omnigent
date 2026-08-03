@@ -499,6 +499,8 @@ async def test_launch_failure_is_swallowed() -> None:
 
 @pytest.mark.asyncio
 async def test_validation_failure_records_failed_without_session() -> None:
+    """A bad model_override is a PERMANENT misconfig (fails every occurrence), so
+    it records a FAILED run — not skipped — signalling the user to fix the task."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(model_override="--danger")})
 
@@ -516,6 +518,33 @@ async def test_validation_failure_records_failed_without_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "invalid_input"
+    assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_connected_host_input_records_failed_without_session() -> None:
+    """A blank pinned host_id is a PERMANENT misconfig — the stored spec can never
+    launch a connected-host run — so gate (c) records a FAILED run (not skipped),
+    unlike the host-availability misses which stay skipped."""
+    conv_store = FakeConversationStore()
+    # host_id="" (not None) is left untouched by _resolve_effective_task but is
+    # rejected by _validate_connected_host_inputs as missing_host_id.
+    store = FakeScheduledTaskStore(rows={"task_1": _task(host_id="", workspace="/repo")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "missing_host_id"
     assert store.runs[0]["conversation_id"] is None
 
 
@@ -599,9 +628,9 @@ async def test_unset_host_resolves_owner_online_host_and_runs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unset_host_no_online_host_records_failed() -> None:
-    """An unset host_id with no live host is an honest failure, not a no-op: it
-    records a failed run with the no_online_host code and creates no session."""
+async def test_unset_host_no_online_host_records_skipped() -> None:
+    """An unset host_id with no live host records a skipped run (the occurrence
+    didn't run because no host was available), not a failure."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
         rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
@@ -627,7 +656,7 @@ async def test_unset_host_no_online_host_records_failed() -> None:
     assert launched == []
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "no_online_host"
     assert store.runs[0]["conversation_id"] is None
 
@@ -762,17 +791,17 @@ async def test_pinned_nonowned_host_no_workspace_rejected_before_stat(
     assert resolve_calls == []
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "host_not_owned"
     assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio
-async def test_no_workspace_unresolvable_home_records_failed(
+async def test_no_workspace_unresolvable_home_records_skipped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the host can't resolve its home dir, the fire records an honest failed
-    run rather than launching with a bogus workspace."""
+    """If the host can't resolve its home dir, the fire records a skipped run
+    rather than launching with a bogus workspace."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
         rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
@@ -798,7 +827,7 @@ async def test_no_workspace_unresolvable_home_records_failed(
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "default_workspace_unresolved"
 
 
@@ -808,8 +837,8 @@ async def test_defaulted_workspace_is_boundary_validated(
 ) -> None:
     """The resolved default HOME workspace is validated against the agent's
     os_env.cwd boundary, exactly like a caller-supplied one — the check is gated
-    on the RESOLVED workspace, not the (null) stored value. A boundary failure
-    records a failed run and creates no session."""
+    on the RESOLVED workspace, not the (null) stored value. A boundary failure is
+    a permanent misconfig, so it records a FAILED run and creates no session."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
         rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
@@ -846,7 +875,7 @@ async def test_defaulted_workspace_is_boundary_validated(
     # The boundary check ran against the resolved absolute workspace.
     assert seen["validate_workspace"] is True
     assert seen["workspace"] == "/home/alice"
-    # The boundary failure was recorded honestly; no session was created.
+    # The boundary failure records a failed run; no session was created.
     assert conv_store.created == []
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
@@ -854,8 +883,8 @@ async def test_defaulted_workspace_is_boundary_validated(
 
 
 @pytest.mark.asyncio
-async def test_no_host_store_records_failed_when_host_unset() -> None:
-    """No host store/registry configured + an unset host is an honest failure."""
+async def test_no_host_store_records_skipped_when_host_unset() -> None:
+    """No host store/registry configured + an unset host records a skipped run."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace=None)})
 
@@ -867,7 +896,7 @@ async def test_no_host_store_records_failed_when_host_unset() -> None:
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "host_registry_unavailable"
     assert store.runs[0]["conversation_id"] is None
 
@@ -922,7 +951,7 @@ async def test_resolve_default_workspace_raises_when_home_missing(
 
 
 @pytest.mark.asyncio
-async def test_no_host_registry_records_failed_without_session() -> None:
+async def test_no_host_registry_records_skipped_without_session() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
 
@@ -934,13 +963,13 @@ async def test_no_host_registry_records_failed_without_session() -> None:
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "host_registry_unavailable"
     assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio
-async def test_offline_connected_host_records_failed_without_session() -> None:
+async def test_offline_connected_host_records_skipped_without_session() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
 
@@ -957,7 +986,7 @@ async def test_offline_connected_host_records_failed_without_session() -> None:
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "host_offline"
     assert store.runs[0]["conversation_id"] is None
 
