@@ -1200,7 +1200,7 @@ def _persist_native_cumulative_usage(
         return None
 
     conv = conversation_store.get_conversation(session_id)
-    current = dict(conv.session_usage) if conv and conv.session_usage else {}
+    current: dict[str, Any] = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
     # cumulative + enforcement costs before the fields below overwrite them.
