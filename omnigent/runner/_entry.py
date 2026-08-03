@@ -55,12 +55,26 @@ _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S = 15.0
 _MANAGED_MINT_REFRESH_SKEW_S = 300.0
 _logger = logging.getLogger(__name__)
 
-# Module-level singleton set by serve_runner once the runner's auth factory is
-# built. All later _make_auth_token_factory() calls (harness setup, terminal
-# creation, forwarders) return this instance so they share the proxy bearer
-# instead of constructing a new factory after RUNNER_INITIAL_AUTH_TOKEN has
-# already been popped from the environment.
+# Module-level singleton set once at runner startup. All later
+# _make_auth_token_factory() calls return this instance so every call site
+# shares the proxy bearer, even after RUNNER_INITIAL_AUTH_TOKEN has been
+# popped from the environment.
 _runner_auth_factory: Callable[[], str | None] | None = None
+
+
+def _set_runner_auth_factory(factory: Callable[[], str | None] | None) -> None:
+    """Set the runner-process auth factory singleton.
+
+    Called once at startup so every subsequent :func:`_make_auth_token_factory`
+    call returns this instance instead of building a new one. Exposed as a
+    function rather than a bare module assignment so callers (including those
+    running as ``__main__``, where the module object differs from the imported
+    ``omnigent.runner._entry``) can set it on the canonical module.
+
+    :param factory: The auth token factory to install as the singleton.
+    """
+    global _runner_auth_factory
+    _runner_auth_factory = factory
 
 
 def _server_url_from_env() -> str:
@@ -1253,12 +1267,11 @@ async def _run_tunnel_from_env() -> None:
 
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
-    # Set the singleton on the canonical module (omnigent.runner._entry) so
-    # all importers share it, even when this file runs as __main__ and creates
-    # a separate module object.
+    # Use the setter so the singleton is written to the canonical module even
+    # when this file runs as __main__ (which has a separate module object).
     import omnigent.runner._entry as _self_module
 
-    _self_module._runner_auth_factory = auth_token_factory
+    _self_module._set_runner_auth_factory(auth_token_factory)
     auth_token = auth_token_factory() if auth_token_factory is not None else None
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()
