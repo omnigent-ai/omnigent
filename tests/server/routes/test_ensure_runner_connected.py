@@ -90,6 +90,9 @@ async def test_launches_runner_on_live_host_then_connects(
         return launch_attempt
 
     monkeypatch.setattr(orchestration, "_launch_runner_on_host", _launch)
+    # Pinned runner_old is truly gone: the connect grace yields nothing, so
+    # the helper relaunches rather than reusing it.
+    monkeypatch.setattr(orchestration, "_wait_for_host_bound_runner_client", _async_return(None))
     connected = object()
     waited: dict[str, Any] = {}
 
@@ -114,6 +117,49 @@ async def test_launches_runner_on_live_host_then_connects(
     assert launched.get("called") is True
     # The connect wait must target the freshly-launched runner id.
     assert waited["runner_id"] == "runner_new"
+    assert client is connected
+
+
+@pytest.mark.asyncio
+async def test_reuses_booting_runner_within_connect_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host online + pinned runner still booting → wait the grace, don't relaunch.
+
+    Mirrors post_event's connect grace: a session whose runner_id is set but
+    whose tunnel hasn't registered yet must be given the grace to connect,
+    rather than eagerly spawning a second runner and orphaning the booting one.
+    """
+    monkeypatch.setattr(orchestration, "_get_runner_client", _async_return(None))
+    monkeypatch.setattr(
+        orchestration,
+        "_maybe_wake_stale_resumable_managed_sandbox",
+        _async_return(False),
+    )
+    # The booting runner connects within the grace window.
+    connected = object()
+    monkeypatch.setattr(
+        orchestration, "_wait_for_host_bound_runner_client", _async_return(connected)
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("must not relaunch while the pinned runner is still booting")
+
+    monkeypatch.setattr(orchestration, "_launch_runner_on_host", _boom)
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", _boom)
+
+    conv = _conv(host_id="host_1", runner_id="runner_booting", workspace="/w")
+    host_registry = SimpleNamespace(get=lambda _hid: object())
+    app_state = SimpleNamespace(host_registry=host_registry, tunnel_registry=None)
+
+    client, _ = await orchestration.ensure_runner_connected(
+        session_id="conv_1",
+        conv=conv,
+        app_state=app_state,
+        conversation_store=_Store(conv),
+        runner_router=None,
+    )
+
     assert client is connected
 
 

@@ -691,7 +691,9 @@ def register_resources_routes(
         # the wakeable states recover; a non-host-bound stranded session or an
         # offline external host still falls through to the 502 below (the CLI
         # reconnect path owns those).
-        _runner_client, conv = await ensure_runner_connected(
+        # Called for its reconnect side effect; the proxy below re-resolves the
+        # (now-live) runner client itself, so neither return value is bound.
+        await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
             app_state=request.app.state,

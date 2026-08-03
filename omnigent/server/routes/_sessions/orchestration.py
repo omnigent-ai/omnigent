@@ -2595,7 +2595,11 @@ async def ensure_runner_connected(
     dead-ending on a 502. Only the wakeable states recover here:
 
     * runner already connected → returned as-is (the common fast path);
-    * host online, runner dead → ``_launch_runner_on_host`` + connect wait;
+    * host online, pinned runner still booting → wait the connect grace
+      (``_HOST_BOUND_RUNNER_CONNECT_GRACE_S``, racing a ``host.runner_status``
+      query) before treating it as dead, so a booting runner isn't orphaned
+      by an eager relaunch;
+    * host online, runner truly dead → ``_launch_runner_on_host`` + connect wait;
     * host tunnel gone but managed/resumable → ``_maybe_relaunch_managed_sandbox``
       / ``_maybe_wake_stale_resumable_managed_sandbox``.
 
@@ -2651,6 +2655,29 @@ async def ensure_runner_connected(
         host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
         relaunched_runner_id: str | None = None
         if host_conn is not None:
+            # A session whose runner is merely booting already has a runner_id
+            # before its tunnel registers. Mirror post_event's connect grace:
+            # wait briefly for that pinned runner (racing a host.runner_status
+            # query, which cuts the wait short if the host reports it truly
+            # gone) before relaunching — otherwise we'd spawn a second runner
+            # and orphan the one still coming up.
+            if (
+                conv.runner_id is not None
+                and host_registry is not None
+                and _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0
+            ):
+                runner_client = await _wait_for_host_bound_runner_client(
+                    session_id,
+                    runner_router,
+                    tunnel_registry,
+                    runner_id=conv.runner_id,
+                    timeout_s=_facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+                    runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
+                    host_conn=host_conn,
+                    host_registry=host_registry,
+                )
+                if runner_client is not None:
+                    return runner_client, await _reread()
             launch_attempt = await _launch_runner_on_host(
                 conv,
                 conversation_store,
