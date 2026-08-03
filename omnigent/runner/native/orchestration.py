@@ -21,13 +21,20 @@ import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, overload
+
+from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.claude_native import ClaudeNativeUcodeConfig
-    from omnigent.codex_native_app_server import CodexAppServerClient
+    from omnigent.codex_native_app_server import CodexAppServerClient, CodexNativeAppServer
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.opencode_native_app_server import OpenCodeNativeServer
+    from omnigent.opencode_native_client import OpenCodeClient, OpenCodeSession
+    from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
+    from omnigent.spec.types import MCPServerConfig
 
 import click
 import httpx
@@ -72,6 +79,20 @@ _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
+
+
+class _EnsureCommentRelay(Protocol):
+    """Callable contract for starting a session's native tool relay."""
+
+    async def __call__(
+        self,
+        session_id: str,
+        *,
+        bridge_id: str | None = None,
+        explicit_bridge_dir: Path | None = None,
+        await_notify: bool = False,
+        session_labels: Mapping[str, str] | None = None,
+    ) -> None: ...
 
 
 def _publish_tmux_target_for_bridge(
@@ -124,7 +145,7 @@ def _publish_tmux_target_for_bridge(
 # codex-native runners, keyed by session id: strong references so they aren't
 # garbage-collected mid-run, and the handle for cancelling a session's previous
 # forwarder on terminal re-create (else both mirror, double-posting items).
-_AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[Any]] = {}
+_AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
 
 # Bound how long terminal (re)creation waits for a cancelled forwarder.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
@@ -166,7 +187,7 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
         )
 
 
-def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> None:
+def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.
 
@@ -184,7 +205,7 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> N
         incumbent.cancel()
     _AUTO_FORWARDER_TASKS[session_id] = task
 
-    def _evict(done_task: asyncio.Task[Any]) -> None:
+    def _evict(done_task: asyncio.Task[object]) -> None:
         """Drop the registry entry unless a successor already replaced it."""
         if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
             del _AUTO_FORWARDER_TASKS[session_id]
@@ -195,16 +216,16 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> N
 # Background tasks that re-pop a still-pending cost-budget approval on a
 # terminal client that attaches after the ASK fired. Kept referenced so
 # they aren't garbage-collected before they run.
-_COST_POPUP_REPOP_TASKS: set[asyncio.Task[Any]] = set()
+_COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 
 # Background Codex app-server instances for host-spawned codex-native
 # runners, kept referenced so they aren't garbage-collected mid-run.
-_AUTO_CODEX_APP_SERVERS: dict[str, Any] = {}
+_AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
 
 # Background OpenCode ``opencode serve`` instances for host-spawned
 # opencode-native runners, kept referenced so they aren't garbage-collected
 # mid-run (mirrors ``_AUTO_CODEX_APP_SERVERS``).
-_AUTO_OPENCODE_SERVERS: dict[str, Any] = {}
+_AUTO_OPENCODE_SERVERS: dict[str, OpenCodeNativeServer] = {}
 
 # Bound repeated terminal GET miss logs from tight client poll loops.
 _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
@@ -843,11 +864,11 @@ async def _opencode_native_launch_config(
 async def _auto_create_opencode_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """
     Auto-create an OpenCode terminal for an opencode-native session.
@@ -1166,8 +1187,8 @@ async def _auto_create_opencode_terminal(
 
 async def _supervise_opencode_forwarder(
     session_id: str,
-    server: Any,
-    forwarder: Any,
+    server: OpenCodeNativeServer,
+    forwarder: OpenCodeNativeForwarder,
 ) -> None:
     """
     Run the OpenCode SSE forwarder, closing the server when it ends.
@@ -1213,7 +1234,7 @@ def _build_opencode_policy_evaluator(
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-) -> Callable[[Mapping[str, Any]], Awaitable[Mapping[str, Any] | None]]:
+) -> Callable[[Mapping[str, object]], Awaitable[Mapping[str, object] | None]]:
     """
     Build the policy evaluator the OpenCode permission forwarder consults.
 
@@ -1240,8 +1261,8 @@ def _build_opencode_policy_evaluator(
     session_component = urllib.parse.quote(conversation_id, safe="")
     url = f"/v1/sessions/{session_component}/policies/evaluate"
 
-    async def _evaluate(normalized: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        arguments: dict[str, Any] = {
+    async def _evaluate(normalized: Mapping[str, object]) -> Mapping[str, object] | None:
+        arguments: _JsonObject = {
             key: normalized[key]
             for key in ("command", "path", "url")
             if normalized.get(key) is not None
@@ -1289,7 +1310,9 @@ def _build_opencode_policy_evaluator(
     return _evaluate
 
 
-def _opencode_native_model_from_spec(agent_spec: Any | None) -> str | None:
+def _opencode_native_model_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
     """
     Resolve the OpenCode default model from a resolved agent spec.
 
@@ -1301,14 +1324,15 @@ def _opencode_native_model_from_spec(agent_spec: Any | None) -> str | None:
     try:
         from omnigent.runtime.workflow import _resolve_spec_model
 
-        return _resolve_spec_model(getattr(agent_spec, "spec", agent_spec))
+        spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+        return _resolve_spec_model(spec)
     except Exception:  # noqa: BLE001 - model resolution is best effort.
         return None
 
 
 def _resolve_opencode_compact_model(
-    session: Any,
-    messages: list[dict[str, Any]],
+    session: OpenCodeSession | None,
+    messages: list[_JsonObject],
     model_override: str | None,
 ) -> tuple[str | None, str | None]:
     """
@@ -1363,7 +1387,9 @@ def _resolve_opencode_compact_model(
     return None, None
 
 
-def _opencode_native_profile_from_spec(agent_spec: Any | None) -> str | None:
+def _opencode_native_profile_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
     """
     Resolve the Databricks profile from a resolved agent spec, if any.
 
@@ -1373,14 +1399,16 @@ def _opencode_native_profile_from_spec(agent_spec: Any | None) -> str | None:
     if agent_spec is None:
         return None
     try:
-        spec = getattr(agent_spec, "spec", agent_spec)
+        spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
         profile = spec.executor.config.get("profile")
         return str(profile) if profile else None
     except Exception:  # noqa: BLE001 - profile resolution is best effort.
         return None
 
 
-def _opencode_native_mcp_servers_from_spec(agent_spec: Any | None) -> list[Any]:
+def _opencode_native_mcp_servers_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> list[MCPServerConfig]:
     """
     Return the resolved agent spec's MCP server declarations (or empty).
 
@@ -1390,13 +1418,13 @@ def _opencode_native_mcp_servers_from_spec(agent_spec: Any | None) -> list[Any]:
     if agent_spec is None:
         return []
     try:
-        spec = getattr(agent_spec, "spec", agent_spec)
-        return list(getattr(spec, "mcp_servers", []) or [])
+        spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+        return list(spec.mcp_servers or [])
     except Exception:  # noqa: BLE001 - best effort.
         return []
 
 
-def _render_opencode_transcript_text(items: list[Any]) -> str:
+def _render_opencode_transcript_text(items: list[object]) -> str:
     """
     Render committed Omnigent message items into a plain-text transcript.
 
@@ -1426,10 +1454,10 @@ def _render_opencode_transcript_text(items: list[Any]) -> str:
 
 async def _rehydrate_opencode_session_from_transcript(
     *,
-    opencode_client: Any,
+    opencode_client: OpenCodeClient,
     opencode_session_id: str,
     omnigent_session_id: str,
-    server_client: Any | None,
+    server_client: httpx.AsyncClient | None,
     model_override: str | None,
 ) -> bool:
     """
@@ -1710,11 +1738,11 @@ async def _resolve_pi_resume_session(
 async def _auto_create_pi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient | None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -1772,12 +1800,14 @@ async def _auto_create_pi_terminal(
     # can call Omnigent tools with centralized server-side policy enforcement
     # — parity with the other native harnesses. Best-effort: a schema-build
     # failure must not block the terminal launch, so fall back to no tools.
-    pi_tools: list[dict[str, Any]] = []
+    pi_tools: list[_JsonObject] = []
     try:
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-        spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        if agent_spec is not None:
+            spec_for_tools = _unwrap_resolved_spec(agent_spec)
+            if spec_for_tools is not None:
+                pi_tools = build_native_relay_tool_schemas(spec_for_tools)
     except Exception:  # noqa: BLE001 — tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s; "
@@ -1961,10 +1991,10 @@ async def _post_pi_native_credential_warning(
 async def _auto_create_cursor_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
@@ -2050,7 +2080,7 @@ async def _auto_create_cursor_terminal(
     # while the cleared forwarder falls back to discovery — whose recency floor
     # excludes the pre-launch store — so the relaunched chat would go unmirrored.
     # Dropping resume here starts a genuinely fresh chat that discovery can find.
-    preseeded = bool(resume_chat_id) and preseed_resume_state(
+    preseeded = resume_chat_id is not None and preseed_resume_state(
         bridge_dir, workspace, resume_chat_id, launch_epoch_ms
     )
     if not preseeded:
@@ -2248,10 +2278,10 @@ async def _auto_create_cursor_terminal(
 async def _auto_create_goose_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Goose TUI terminal for a goose-native session.
@@ -2415,10 +2445,10 @@ async def _auto_create_goose_terminal(
 async def _auto_create_hermes_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Hermes TUI terminal for a hermes-native session.
@@ -2669,10 +2699,10 @@ async def _auto_create_hermes_terminal(
 async def _auto_create_kiro_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """Auto-create the Kiro TUI terminal for a kiro-native session."""
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -2916,10 +2946,10 @@ async def _build_qwen_fork_recording(
 async def _auto_create_qwen_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the qwen TUI terminal for a qwen-native session.
@@ -3188,10 +3218,10 @@ async def _auto_create_qwen_terminal(
 async def _auto_create_kimi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
@@ -3347,13 +3377,13 @@ async def _auto_create_kimi_terminal(
 async def _auto_create_codex_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     bundle_dir: Path | None = None,
     skills_filter: str | list[str] = "all",
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -4068,7 +4098,7 @@ async def _auto_create_antigravity_terminal(
     publish_event: Callable[[str, dict[str, object]], None],
     *,
     server_client: httpx.AsyncClient | None = None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the native Antigravity (agy) terminal for a session.
@@ -4680,7 +4710,7 @@ def _terminal_tmux_pane(
 async def _session_payload_for_host_spawn_check(
     server_client: httpx.AsyncClient | None,
     session_id: str,
-) -> dict[str, Any] | None:
+) -> _JsonObject | None:
     """
     Fetch a session snapshot for Codex host-spawn detection.
 
@@ -4883,14 +4913,14 @@ def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) ->
     """
     from omnigent.cursor_native import is_valid_cursor_chat_id
 
-    if not is_valid_cursor_chat_id(chat_id):
+    if chat_id is None or not is_valid_cursor_chat_id(chat_id):
         return []
     if any(arg == "--resume" or arg.startswith("--resume=") for arg in existing_args):
         return []
     return ["--resume", chat_id]
 
 
-def _cursor_message_item_text(content: Any) -> str:
+def _cursor_message_item_text(content: object) -> str:
     """Join the text of a session message item's content blocks.
 
     :param content: A message item's ``content`` — a plain string or a list of
@@ -4919,7 +4949,7 @@ def _cursor_message_item_text(content: Any) -> str:
 _CURSOR_FORK_ROLE_LABELS = {"user": "You", "assistant": "Assistant"}
 
 
-def _cursor_fork_history_preamble(items: list[dict[str, Any]]) -> str:
+def _cursor_fork_history_preamble(items: list[_JsonObject]) -> str:
     """Render copied fork items as a readable conversation transcript.
 
     cursor's conversation is server-backed, so a fork can't seed a local store
@@ -4950,7 +4980,9 @@ def _cursor_fork_history_preamble(items: list[dict[str, Any]]) -> str:
     return "\n\n".join(turns)
 
 
-def _agent_os_env_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> Any | None:
+def _agent_os_env_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> OSEnvSpec | None:
     """
     Read the agent's ``os_env`` from a resolved agent spec.
 
@@ -5113,7 +5145,7 @@ def _claude_terminal_env_unset(
 
 
 def _publish_terminal_pending(
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     session_id: str,
     pending: bool,
 ) -> None:
@@ -5170,7 +5202,7 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
 
 
 def _publish_native_terminal_start_error(
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     session_id: str,
     runtime_name: str,
     exc: BaseException,
@@ -5261,7 +5293,7 @@ def _codex_ensure_response_with_policy_notice(
 
 def _ensure_orchestrator_skills_in_bundle(
     bundle_dir: Path,
-    agent_spec: Any,
+    agent_spec: object,
 ) -> None:
     """
     Link the ``build-omnigent`` skill into a bundle's ``skills/`` dir.
@@ -5426,7 +5458,7 @@ async def _load_claude_launch_metadata(
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient,
     bundle_dir: Path | None = None,
@@ -6035,7 +6067,7 @@ async def _auto_create_claude_terminal(
 async def _auto_create_repl_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
     *,
     server_client: httpx.AsyncClient,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
@@ -6322,6 +6354,15 @@ async def _claude_native_bridge_id_with_optional_labels(
     )
 
 
+def _typed_spawn_env(value: object) -> dict[str, str]:
+    """Validate a dynamically resolved native spawn-env hook result."""
+    if not isinstance(value, Mapping) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        raise TypeError("native spawn-env builder must return a string mapping")
+    return dict(value)
+
+
 async def _resolve_native_spawn_env(
     harness_name: str,
     session_id: str,
@@ -6357,6 +6398,8 @@ async def _resolve_native_spawn_env(
     if provider is None or provider.spawn_env_builder is None:
         return None
     builder = resolve_hook(provider, "spawn_env_builder")
+    if builder is None:
+        return None
 
     if agent.key == "claude":
         bridge_id = await _claude_native_bridge_id_with_optional_labels(
@@ -6364,7 +6407,7 @@ async def _resolve_native_spawn_env(
             session_id=session_id,
             session_labels=optional_labels,
         )
-        return builder(session_id, bridge_id=bridge_id)
+        return _typed_spawn_env(builder(session_id, bridge_id=bridge_id))
 
     if agent.key == "hermes":
         from omnigent.hermes_native_bridge import (
@@ -6374,16 +6417,18 @@ async def _resolve_native_spawn_env(
 
         server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
         write_policy_hook_config(bridge_dir_for_session_id(session_id), server_url, session_id)
-        return builder(session_id)
+        return _typed_spawn_env(builder(session_id))
 
     if provider.bridge_id_label_key is not None:
         labels = await _session_labels_for_runner_spawn(
             server_client=server_client,
             session_id=session_id,
         )
-        return builder(session_id, bridge_id=labels.get(provider.bridge_id_label_key))
+        return _typed_spawn_env(
+            builder(session_id, bridge_id=labels.get(provider.bridge_id_label_key))
+        )
 
-    return builder(session_id)
+    return _typed_spawn_env(builder(session_id))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6400,9 +6445,9 @@ class NativeLaunchContext:
 
     session_id: str
     resource_registry: SessionResourceRegistry
-    publish_event: Callable[[str, dict[str, Any]], None]
+    publish_event: Callable[[str, _JsonObject], None]
     server_client: httpx.AsyncClient | None = None
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None
+    ensure_comment_relay: _EnsureCommentRelay | None = None
     agent_spec: AgentSpec | ResolvedSpec | None = None
     bundle_dir: Path | None = None
     skills_filter: str | list[str] = "all"
@@ -6646,6 +6691,8 @@ async def _launch_native_terminal(
             return False
 
         adapter = resolve_hook(provider, "auto_create_terminal")
+        if adapter is None:
+            return None
         _publish_terminal_pending(ctx.publish_event, ctx.session_id, True)
         try:
             if build_context is not None:
@@ -6769,6 +6816,8 @@ async def _ensure_native_terminal(
                 )
 
         adapter = resolve_hook(provider, "auto_create_terminal")
+        if adapter is None:
+            return None
         try:
             if build_context is not None:
                 ctx = await build_context(ctx)
@@ -6865,7 +6914,7 @@ async def _claude_native_terminal_arrives_via_transfer(
         live ``claude:main`` terminal (transfer inbound), else ``False``.
     """
     terminal_registry = resource_registry.terminal_registry
-    if terminal_registry is None:
+    if terminal_registry is None or server_client is None:
         return False
     # Lazy import keeps claude-native out of the generic runner import graph.
     from omnigent.claude_native_bridge import (
@@ -7003,15 +7052,26 @@ async def _session_labels_for_runner_spawn(
 
 @dataclasses.dataclass
 class ResolvedSpec:
-    spec: Any
-    workdir: Path
+    spec: AgentSpec
+    workdir: Path | None
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
+        """Delegate compatibility attributes to the wrapped agent spec."""
         return getattr(self.spec, name)
 
 
-def _unwrap_resolved_spec(entry: Any) -> Any:
-    return entry.spec if isinstance(entry, ResolvedSpec) else entry
+@overload
+def _unwrap_resolved_spec(entry: AgentSpec | ResolvedSpec) -> AgentSpec: ...
+
+
+@overload
+def _unwrap_resolved_spec(entry: object) -> AgentSpec | None: ...
+
+
+def _unwrap_resolved_spec(entry: object) -> AgentSpec | None:
+    if isinstance(entry, ResolvedSpec):
+        return entry.spec
+    return entry if isinstance(entry, AgentSpec) else None
 
 
 def _forward_harness_response(resp: httpx.Response) -> Response:
@@ -7031,18 +7091,26 @@ def _forward_harness_response(resp: httpx.Response) -> Response:
     )
 
 
-def _resolved_spec_workdir(entry: Any) -> Path | None:
+def _resolved_spec_workdir(entry: object) -> Path | None:
     return entry.workdir if isinstance(entry, ResolvedSpec) else None
 
 
-def _resolved_workdir_for_spec(spec: Any, fallback: Path | None) -> Path | None:
+def _resolved_workdir_for_spec(
+    spec: object,
+    fallback: Path | None,
+) -> Path | None:
     """Return the bundle workdir for a possibly wrapped spec entry."""
     return _resolved_spec_workdir(spec) or fallback
 
 
-def _is_spec_local_native_python_tool(spec: Any, tool_name: str) -> bool:
+def _is_spec_local_native_python_tool(
+    spec: object,
+    tool_name: str,
+) -> bool:
     """Return whether *tool_name* is a spec-declared native python tool."""
     unwrapped = _unwrap_resolved_spec(spec)
+    if unwrapped is None:
+        return False
     return any(
         getattr(info, "name", None) == tool_name
         and getattr(info, "language", None) in ("python", "omnigent-python-callable")
