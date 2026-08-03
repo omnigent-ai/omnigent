@@ -2151,50 +2151,55 @@ function ProjectHeaderActions({
   const showExpandControls = !collapsed && projectNames.length > 0;
   const allExpanded =
     projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
+  // The kebab only carries the expand/collapse and "Select sessions" items; with
+  // neither applicable (e.g. no projects yet) it would open empty, so hide it.
+  const showMenu = showExpandControls || hasProjectSessions;
 
   return (
     <div className="flex items-center gap-0.5">
       <NewProjectButton onCreated={onProjectCreated} />
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Project list actions"
-            data-testid="project-list-actions"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <MoreHorizontalIcon className="size-3.5" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
-          {showExpandControls &&
-            (allExpanded ? (
-              <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
-                <Minimize2Icon className="size-3.5" />
-                Collapse to previous
-              </DropdownMenuItem>
-            ) : (
-              <DropdownMenuItem
-                data-testid="expand-all-projects"
-                onSelect={() => onExpandAll(projectNames)}
-              >
-                <Maximize2Icon className="size-3.5" />
-                Expand all
-              </DropdownMenuItem>
-            ))}
-          {hasProjectSessions && (
-            <DropdownMenuItem
-              data-testid="projects-select-sessions"
-              onSelect={() => onEnterSelectionMode()}
+      {showMenu && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Project list actions"
+              data-testid="project-list-actions"
+              onClick={(event) => event.stopPropagation()}
             >
-              <ListChecksIcon className="size-3.5" />
-              Select sessions
-            </DropdownMenuItem>
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
+              <MoreHorizontalIcon className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+            {showExpandControls &&
+              (allExpanded ? (
+                <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
+                  <Minimize2Icon className="size-3.5" />
+                  Collapse to previous
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem
+                  data-testid="expand-all-projects"
+                  onSelect={() => onExpandAll(projectNames)}
+                >
+                  <Maximize2Icon className="size-3.5" />
+                  Expand all
+                </DropdownMenuItem>
+              ))}
+            {hasProjectSessions && (
+              <DropdownMenuItem
+                data-testid="projects-select-sessions"
+                onSelect={() => onEnterSelectionMode()}
+              >
+                <ListChecksIcon className="size-3.5" />
+                Select sessions
+              </DropdownMenuItem>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
     </div>
   );
 }
