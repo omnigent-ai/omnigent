@@ -1227,6 +1227,18 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.start()
+        # Backstop for a hard host/runner death (SIGKILL / OOM / crash) that
+        # ran no graceful teardown: a codex app-server spawned in its own
+        # session outlives its runner. Reconciling the crash-safe registry at
+        # boot reaps any such orphan whose owner lock is no longer held (its
+        # runner is gone), so a fresh runner on the host cleans up what a dead
+        # predecessor left. Held owner locks (live sibling runners) are skipped.
+        from omnigent.codex_native_process_registry import (
+            reconcile_codex_native_process_registry,
+        )
+
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(reconcile_codex_native_process_registry)
 
     async def _stop_pm() -> None:
         """Stop runner-owned resources for graceful process exit.
@@ -1236,6 +1248,14 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
+        # Close host-spawned codex-native app-servers before the process exits.
+        # Each is spawned in its own session (survives the runner's death), and a
+        # host-initiated stop tears the runner down without a per-session DELETE,
+        # so without this they orphan as lingering ``codex`` processes.
+        from omnigent.runner.native import teardown_all_codex_native_app_servers
+
+        with contextlib.suppress(Exception):
+            await teardown_all_codex_native_app_servers()
         await pm.shutdown()
         await _terminal_registry.shutdown()
         if mcp_manager is not None:

@@ -460,6 +460,65 @@ async def test_teardown_codex_native_app_server_noop_without_registered_server()
 
 
 @pytest.mark.asyncio
+async def test_teardown_all_codex_native_app_servers_closes_every_session() -> None:
+    """
+    Runner shutdown closes every registered codex app-server.
+
+    A host-initiated stop SIGTERMs the runner without a per-session
+    ``DELETE /v1/sessions``, so the shutdown sweep is the only thing that
+    closes the host-spawned codex app-servers (each spawned in its own
+    session, so it outlives the runner otherwise). Every registered session
+    must be torn down, and the registry left empty.
+    """
+    session_ids = [
+        "aaaa0000aaaa0000aaaa0000aaaa0000",
+        "bbbb1111bbbb1111bbbb1111bbbb1111",
+        "cccc2222cccc2222cccc2222cccc2222",
+    ]
+    runs = [_ForwarderRun() for _ in session_ids]
+    closed: list[str] = []
+
+    def _make_parked(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    class _FakeAppServer:
+        def __init__(self, sid: str) -> None:
+            self._sid = sid
+
+        async def close(self) -> None:
+            closed.append(self._sid)
+
+    try:
+        for sid, run in zip(session_ids, runs, strict=True):
+            task = asyncio.create_task(_make_parked(run)())
+            runner_app_mod._register_auto_forwarder_task(sid, task)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS[sid] = _FakeAppServer(sid)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_all_codex_native_app_servers()
+
+        assert sorted(closed) == sorted(session_ids), "every app-server must be closed"
+        assert all(sid not in runner_app_mod._AUTO_CODEX_APP_SERVERS for sid in session_ids)
+        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
+        # Idempotent: a second sweep with an empty registry is a no-op.
+        await runner_app_mod.teardown_all_codex_native_app_servers()
+    finally:
+        for sid in session_ids:
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(sid, None)
+        await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
 async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stale_evict() -> None:
     """
     Re-registration cancels the incumbent; its done-callback can't evict the successor.
