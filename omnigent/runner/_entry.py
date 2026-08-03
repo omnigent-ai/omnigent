@@ -1267,14 +1267,14 @@ async def _run_tunnel_from_env() -> None:
 
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
-    # Write the singleton to the canonical module via sys.modules so it is
-    # visible to all importers even when this file runs as __main__ (which
-    # Python treats as a separate module object from omnigent.runner._entry).
-    import sys as _sys
+    # Write the singleton to the canonical module so it is visible to all
+    # importers even when this file runs as __main__ (which Python treats as a
+    # separate module object from omnigent.runner._entry). Importing the
+    # canonical name here ensures sys.modules registers it before any
+    # harness code tries to read it.
+    import omnigent.runner._entry as _canonical_entry
 
-    _canonical = _sys.modules.get("omnigent.runner._entry")
-    if _canonical is not None:
-        _canonical._set_runner_auth_factory(auth_token_factory)
+    _canonical_entry._set_runner_auth_factory(auth_token_factory)
     _set_runner_auth_factory(auth_token_factory)
     auth_token = auth_token_factory() if auth_token_factory is not None else None
     binding_token = _runner_tunnel_binding_token_from_env()
