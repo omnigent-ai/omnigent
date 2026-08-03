@@ -16,13 +16,11 @@ import importlib
 import importlib.metadata
 import importlib.util
 import logging
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any, Protocol, cast
 
-from omnigent.onboarding.sandboxes.base import SandboxLifecycle
-
-if TYPE_CHECKING:
-    pass
+from omnigent.onboarding.sandboxes.base import SandboxHostLauncher
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +30,11 @@ COMMUNITY_MODULE_PREFIX = "omnigent.community.sandbox."
 
 class SandboxRegistryError(Exception):
     """A provider registry operation failed."""
+
+
+class _WorkspaceHostLauncherFactory(Protocol):
+    def __call__(self, *, workspace_host: str) -> SandboxHostLauncher:
+        pass
 
 
 @dataclass(frozen=True)
@@ -91,7 +94,8 @@ def _entry_points() -> tuple[importlib.metadata.EntryPoint, ...]:
     discovered = importlib.metadata.entry_points()
     if hasattr(discovered, "select"):
         return tuple(discovered.select(group=COMMUNITY_ENTRY_POINT_GROUP))
-    return tuple(discovered.get(COMMUNITY_ENTRY_POINT_GROUP, ()))
+    legacy = cast(Mapping[str, Iterable[importlib.metadata.EntryPoint]], discovered)
+    return tuple(legacy.get(COMMUNITY_ENTRY_POINT_GROUP, ()))
 
 
 def _load_object(import_path: str) -> Any:
@@ -279,7 +283,7 @@ def instantiate(
     name: str,
     *,
     workspace_host: str | None = None,
-) -> object:
+) -> SandboxHostLauncher:
     """Import and instantiate a registered provider's launcher class.
 
     :param name: Registered provider name.
@@ -298,11 +302,12 @@ def instantiate(
         raise SandboxRegistryError(
             f"could not load sandbox provider '{name}' from {meta.launcher_class!r}: {exc}"
         ) from exc
-    if not isinstance(launcher_cls, type) or not issubclass(launcher_cls, SandboxLifecycle):
+    if not isinstance(launcher_cls, type) or not issubclass(launcher_cls, SandboxHostLauncher):
         raise SandboxRegistryError(
             f"sandbox provider '{name}' resolved to {launcher_cls!r}, "
-            f"which is not a SandboxLifecycle subclass"
+            f"which is not a SandboxHostLauncher subclass"
         )
     if name == "lakebox" and workspace_host is not None:
-        return launcher_cls(workspace_host=workspace_host)
+        launcher_factory = cast(_WorkspaceHostLauncherFactory, launcher_cls)
+        return launcher_factory(workspace_host=workspace_host)
     return launcher_cls()

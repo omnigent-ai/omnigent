@@ -231,6 +231,36 @@ def write_policy_hook_config(
             os.unlink(tmp_name)
 
 
+def update_policy_hook_auth_headers(
+    bridge_dir: Path,
+    headers: dict[str, str],
+) -> bool:
+    """Atomically replace ``ap_auth_headers`` in ``policy_hook.json``.
+
+    Returns ``True`` when the file existed and was updated.
+    """
+    path = bridge_dir / _POLICY_HOOK_FILE
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    payload["ap_auth_headers"] = dict(headers)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_POLICY_HOOK_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return True
+
+
 def read_policy_hook_config(bridge_dir: Path) -> dict[str, object] | None:
     """
     Read the Omnigent coordinates for the codex-native policy hook.
@@ -588,8 +618,16 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     thread_id = raw.get("thread_id")
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
-    required = (session_id, socket_path, thread_id, codex_home)
-    if not all(isinstance(value, str) and value for value in required):
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(socket_path, str)
+        or not socket_path
+        or not isinstance(thread_id, str)
+        or not thread_id
+        or not isinstance(codex_home, str)
+        or not codex_home
+    ):
         return None
     parsed_active_turn_id = (
         active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None

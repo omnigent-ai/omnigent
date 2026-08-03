@@ -34,8 +34,9 @@ from omnigent.entities import (
 from omnigent.env_credentials import expand_envvars_with_omnigent_prefix
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms import Client as LLMClient
+from omnigent.model_catalog import resolve_catalog_model
+from omnigent.model_resolver import ModelResolutionError
 from omnigent.onboarding.databricks_config import (
-    DATABRICKS_CLAUDE_DEFAULT_MODEL,
     get_workspace_url_for_profile,
 )
 from omnigent.onboarding.detected import (
@@ -73,7 +74,13 @@ from omnigent.runtime.compaction import (
     count_tokens,
 )
 from omnigent.runtime.content_resolver import resolve_content_references
-from omnigent.runtime.prompt import build_instructions, history_to_input_items
+from omnigent.runtime.prompt import (
+    SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
+    build_instructions,
+    history_has_multiple_authors,
+    history_to_input_items,
+    shared_message_attribution_enabled,
+)
 from omnigent.spec import AgentSpec
 from omnigent.spec.parser import check_unresolved_env_vars
 from omnigent.spec.types import (
@@ -162,13 +169,8 @@ class UcodeHarnessConfig:
     :param host_key: Harness gateway workspace host env var.
     :param auth_key: Optional harness gateway auth command env var.
     :param refresh_key: Optional harness gateway auth refresh interval env var.
-    :param databricks_default_model: Fallback model id to use on the
-        Databricks gateway path when neither the spec nor the ucode
-        state names a model, e.g. ``"databricks-claude-opus-4-8"``.
-        ``None`` for harnesses with no confirmed Databricks default.
-        Required because the Databricks AI gateway only routes
-        ``databricks-*`` endpoint names, so the CLI's own host-config
-        default (an Anthropic-direct id) is not a usable fallback there.
+    :param catalog_family: Normalized Databricks catalog family used when
+        neither the spec nor ucode state names a model.
     """
 
     agent_name: str
@@ -179,7 +181,7 @@ class UcodeHarnessConfig:
     host_key: str
     auth_key: str | None
     refresh_key: str | None
-    databricks_default_model: str | None = None
+    catalog_family: str
 
 
 _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
@@ -192,9 +194,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_CLAUDE_SDK_GATEWAY_HOST",
         auth_key="HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
-        # The executor only applies this on the profile-derived gateway path,
-        # so the producer must supply it on the ucode-cached path.
-        databricks_default_model=DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        catalog_family="claude",
     ),
     "codex": UcodeHarnessConfig(
         agent_name="codex",
@@ -205,6 +205,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_CODEX_GATEWAY_HOST",
         auth_key="HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
+        catalog_family="openai",
     ),
     "pi": UcodeHarnessConfig(
         agent_name="pi",
@@ -215,9 +216,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_PI_GATEWAY_HOST",
         auth_key="HARNESS_PI_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
-        # Same parity as claude-sdk: the executor only defaults on the
-        # profile-derived gateway path, so the producer must supply it here.
-        databricks_default_model=DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        catalog_family="claude",
     ),
     "openai-agents-sdk": UcodeHarnessConfig(
         agent_name="codex",
@@ -228,6 +227,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_OPENAI_AGENTS_GATEWAY_HOST",
         auth_key="HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND",
         refresh_key=None,
+        catalog_family="openai",
     ),
     "qwen": UcodeHarnessConfig(
         agent_name="qwen",
@@ -238,6 +238,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_QWEN_GATEWAY_HOST",
         auth_key="HARNESS_QWEN_GATEWAY_AUTH_COMMAND",
         refresh_key=None,
+        catalog_family="openai",
     ),
     # NB: ``antigravity`` is intentionally absent. Unlike the gateway
     # harnesses above, the Antigravity SDK authenticates Gemini-natively
@@ -335,10 +336,14 @@ def configure_agent_harness_with_ucode(
         refresh_key=config.refresh_key,
         workspace_url=state.workspace_host,
     )
-    # When ucode caches no model, default it so the CLI doesn't fall back to
-    # its host-config model (an Anthropic-direct id the gateway rejects).
-    if config.model_key not in env and config.databricks_default_model:
-        env[config.model_key] = config.databricks_default_model
+    # When ucode caches no model, resolve a Databricks endpoint so the CLI
+    # cannot fall back to a direct-provider model the gateway rejects.
+    if config.model_key not in env:
+        env[config.model_key] = _resolve_catalog_default_model(
+            "databricks",
+            config.catalog_family,
+            context=f"ucode {harness_type!r} gateway",
+        )
 
 
 def _inject_ucode_agent_state(
@@ -667,13 +672,32 @@ def configure_agent_harness_with_provider(
 # ``openai`` catalog), but routing through this map keeps the family→catalog
 # coupling explicit and one place to change if a family ever fans out to a
 # differently-named catalog (e.g. an openai-compatible vendor).
-_FAMILY_CATALOG_PROVIDER: dict[str, str] = {
-    ANTHROPIC_FAMILY: "anthropic",
-    OPENAI_FAMILY: "openai",
+_FAMILY_CATALOG_TARGET: dict[str, tuple[str, str]] = {
+    ANTHROPIC_FAMILY: ("anthropic", "claude"),
+    OPENAI_FAMILY: ("openai", "openai"),
 }
 
 
-def _catalog_default_model(family_name: str) -> str | None:
+def _resolve_catalog_default_model(
+    provider_name: str,
+    family: str,
+    *,
+    context: str,
+) -> str:
+    """Resolve one live catalog default or raise an actionable input error."""
+    try:
+        return resolve_catalog_model(provider_name, family=family).model_id
+    except ModelResolutionError as exc:
+        raise OmnigentError(
+            f"No default model resolved for {context}: the {provider_name!r} model "
+            f"catalog has no compatible {family!r} entry. Set 'executor.model' in "
+            "the agent YAML or a provider 'models.default', or retry when catalog "
+            "discovery is available.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
+def _catalog_default_model(family_name: str) -> str:
     """Return the bundled catalog's default model for a provider family.
 
     Used as the model-resolution fallback for a ``key`` / ``gateway`` /
@@ -688,17 +712,22 @@ def _catalog_default_model(family_name: str) -> str | None:
 
     :param family_name: The omnigent family, ``"anthropic"`` or
         ``"openai"``.
-    :returns: The catalog default model id, e.g. ``"claude-opus-4-6-20260205"``
-        or ``"gpt-5.4-2026-03-05"``, or ``None`` when the family has no
-        catalog mapping or the catalog has no chat model for it (genuinely
-        unknown — the caller then fails loud).
+    :returns: The live catalog's preferred model id.
+    :raises OmnigentError: If the family is unknown or discovery has no
+        compatible model.
     """
-    from omnigent.onboarding.providers import default_chat_model
-
-    catalog_provider = _FAMILY_CATALOG_PROVIDER.get(family_name)
-    if catalog_provider is None:
-        return None
-    return default_chat_model(catalog_provider)
+    target = _FAMILY_CATALOG_TARGET.get(family_name)
+    if target is None:
+        raise OmnigentError(
+            f"No model catalog is configured for provider family {family_name!r}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    provider_name, catalog_family = target
+    return _resolve_catalog_default_model(
+        provider_name,
+        catalog_family,
+        context=f"provider family {family_name!r}",
+    )
 
 
 def _apply_provider_family(
@@ -730,26 +759,7 @@ def _apply_provider_family(
     if cfg.model_key not in env and family.default_model:
         env[cfg.model_key] = family.default_model
     if cfg.model_key not in env:
-        # Neither the spec nor the provider names a model. On a KNOWN family
-        # (anthropic / openai) fall back to the bundled catalog's default for
-        # that vendor — a real designed default — rather than failing loud.
-        # The neutral gateway path never selects a ``databricks-*`` model;
-        # the executor's old flag-triggered ``databricks-*`` fallback is gone.
-        catalog_default = _catalog_default_model(_PROVIDER_HARNESS_FAMILY[harness_type])
-        if catalog_default is not None:
-            env[cfg.model_key] = catalog_default
-    if cfg.model_key not in env:
-        # Fail loud only when the catalog also has nothing for this family
-        # (a genuinely unknown family — should not happen for the two known
-        # ones, but keeps the resolution total).
-        raise OmnigentError(
-            f"No model resolved for the {harness_type!r} harness on a generic provider: "
-            "the agent spec sets no model, the provider's family has no "
-            "'models.default', and the bundled catalog has no default for that family. "
-            "Set 'executor.model' in the agent YAML, or add a "
-            "'models: {default: ...}' to that provider family in ~/.omnigent/config.yaml.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        env[cfg.model_key] = _catalog_default_model(_PROVIDER_HARNESS_FAMILY[harness_type])
     if harness_type == "codex":
         # Codex defaults to the Responses wire API; OpenRouter-style
         # chat-only gateways set wire_api: chat. See codex_harness.py.
@@ -783,50 +793,44 @@ def _apply_provider_to_openai_agents(env: dict[str, str], family: FamilyConfig) 
     if "HARNESS_OPENAI_AGENTS_MODEL" not in env and family.default_model:
         env["HARNESS_OPENAI_AGENTS_MODEL"] = family.default_model
     if "HARNESS_OPENAI_AGENTS_MODEL" not in env:
-        catalog_default = _catalog_default_model(OPENAI_FAMILY)
-        if catalog_default is not None:
-            env["HARNESS_OPENAI_AGENTS_MODEL"] = catalog_default
-    if "HARNESS_OPENAI_AGENTS_MODEL" not in env:
-        # Fail loud only when the catalog has no default for the openai family
-        # (genuinely unknown — should not happen for a known family).
-        raise OmnigentError(
-            "No model resolved for the 'openai-agents-sdk' harness on a generic provider: "
-            "the agent spec sets no model, the provider's 'openai' family has no "
-            "'models.default', and the bundled catalog has no default for it. "
-            "Set 'executor.model' in the agent YAML, or add a "
-            "'models: {default: ...}' to that provider family in ~/.omnigent/config.yaml.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        env["HARNESS_OPENAI_AGENTS_MODEL"] = _catalog_default_model(OPENAI_FAMILY)
     if family.wire_api is not None:
         env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = (
             "true" if family.wire_api == RESPONSES_WIRE_API else "false"
         )
 
 
-def _optional_provider_family(entry: ProviderEntry, family_name: str) -> FamilyConfig | None:
-    """Return a provider family, or ``None`` if absent *or* its key env var is unset.
+def _optional_provider_family(
+    entry: ProviderEntry, family_name: str
+) -> tuple[FamilyConfig | None, OmnigentError | None]:
+    """Attempt to resolve a provider family, returning success or failure info.
 
     For the ``pi`` harness, which carries a single credential but probes
     both families: a family whose ``$VAR`` is unresolved is treated as
     unavailable rather than fatal, so e.g. a user who only exported
     ``ANTHROPIC_API_KEY`` can still run pi on the anthropic family.
 
-    The only :class:`OmnigentError` raised at family-access time comes from
-    the deferred ``$VAR`` expansion (structural validation already happened
-    at parse time), so catching it here narrowly means "this family's
-    credential is not configured". A ``keychain:`` ref raises ``ValueError``
-    (deferred — see :func:`resolve_secret`); that propagates so the user
-    sees the clear "not yet supported" message rather than a silent skip.
+    All credential resolution failures (unresolved ``env:`` var, missing
+    keychain secret) raise :class:`OmnigentError` at family-access time
+    (structural validation already happened at parse time). They are caught
+    here so the other family can be tried; the error is returned to the
+    caller so it can be surfaced when no family succeeds.
+
+    Returns a two-tuple ``(family, error)`` so the caller can include the
+    original resolution error in its failure message, naming the missing
+    variable instead of emitting a generic "no family resolves" message.
 
     :param entry: The resolved provider entry.
     :param family_name: Family key, e.g. ``"openai"`` or ``"anthropic"``.
-    :returns: The :class:`FamilyConfig`, or ``None`` when the family is
-        absent or its credential env var is unset.
+    :returns: ``(FamilyConfig, None)`` when the family resolved, or
+        ``(None, OmnigentError)`` when resolution failed, or ``(None, None)``
+        when the family is simply not configured.
     """
     try:
-        return entry.family(family_name)
-    except OmnigentError:
-        return None
+        family = entry.family(family_name)
+        return family, None
+    except OmnigentError as exc:
+        return None, exc
 
 
 def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
@@ -840,25 +844,35 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
 
     A family whose credential env var is unset is skipped (not fatal) so a
     user who exported only one vendor's key can still run pi on that family.
-    If neither family resolves, this fails loud.
+    If neither family resolves, this fails loud, including the original
+    credential resolution error(s) so the user knows which env var to set.
 
     :param env: Mutable spawn-env dict, modified in place.
     :param entry: The resolved provider entry (at least one inline family).
     :raises OmnigentError: If no configured family's credentials resolve,
         or no model can be resolved for the chosen family.
     """
-    anthropic = _optional_provider_family(entry, ANTHROPIC_FAMILY)
-    openai = _optional_provider_family(entry, OPENAI_FAMILY)
+    anthropic, anthropic_err = _optional_provider_family(entry, ANTHROPIC_FAMILY)
+    openai, openai_err = _optional_provider_family(entry, OPENAI_FAMILY)
     base_urls: dict[str, str] = {}
     if anthropic is not None:
         base_urls[_PI_FAMILY_KEY[ANTHROPIC_FAMILY]] = anthropic.base_url
     if openai is not None:
         base_urls[_PI_FAMILY_KEY[OPENAI_FAMILY]] = openai.base_url
     if not base_urls:
+        # At least one family was configured (the provider passed parse-time
+        # validation) but its credential could not be resolved. Surface the
+        # original error(s) so the user knows which env var to set, rather
+        # than a generic "set the api_key env var" message that omits the name.
+        cred_errors = [str(err) for err in (anthropic_err, openai_err) if err is not None]
+        detail = (
+            f" ({'; '.join(cred_errors)})"
+            if cred_errors
+            else " — set the api_key env var for its 'anthropic' or 'openai' family in your shell"
+        )
         raise OmnigentError(
             f"pi harness: provider {entry.name!r} configures no family whose "
-            "credentials resolve — set the api_key env var for its 'anthropic' or "
-            "'openai' family in your shell, then retry.",
+            f"credentials resolve{detail}, then retry.",
             code=ErrorCode.INVALID_INPUT,
         )
     # pi carries a single credential: anthropic's when present, else openai's.
@@ -873,6 +887,8 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     assert auth_source is not None  # base_urls non-empty ⇒ one family resolved
     env[_HARNESS_GATEWAY_FLAG["pi"]] = "true"
     env["HARNESS_PI_GATEWAY_BASE_URLS"] = json.dumps(base_urls, sort_keys=True)
+    if openai is not None and openai.wire_api is not None:
+        env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] = openai.wire_api
     env["HARNESS_PI_GATEWAY_HOST"] = _origin_of(next(iter(base_urls.values())))
     env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] = _provider_auth_command(auth_source)
     # Model precedence: spec model > provider ``models.default`` > catalog
@@ -880,20 +896,7 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     if "HARNESS_PI_MODEL" not in env and auth_source.default_model:
         env["HARNESS_PI_MODEL"] = auth_source.default_model
     if "HARNESS_PI_MODEL" not in env:
-        catalog_default = _catalog_default_model(auth_family)
-        if catalog_default is not None:
-            env["HARNESS_PI_MODEL"] = catalog_default
-    if "HARNESS_PI_MODEL" not in env:
-        # Fail loud only when the catalog has no default for the chosen family
-        # (genuinely unknown — should not happen for a known family).
-        raise OmnigentError(
-            "No model resolved for the 'pi' harness on a generic provider: the agent "
-            "spec sets no model, the provider family has no 'models.default', and the "
-            "bundled catalog has no default for it. Set 'executor.model' in the agent "
-            "YAML, or add a 'models: {default: ...}' to that provider family in "
-            "~/.omnigent/config.yaml.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        env["HARNESS_PI_MODEL"] = _catalog_default_model(auth_family)
 
 
 def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
@@ -1551,7 +1554,7 @@ def _build_acp_spawn_env(
     )
 
     has_embedded = isinstance(cfg, dict) and "acp_agent" in cfg
-    embedded = cfg.get("acp_agent") if has_embedded else None
+    embedded = cfg.get("acp_agent") if isinstance(cfg, dict) else None
     agent: AcpAgentEntry | None = None
     if has_embedded:
         if not isinstance(embedded, dict):
@@ -1562,10 +1565,14 @@ def _build_acp_spawn_env(
             isinstance(name, str) and name.strip() and isinstance(command, str) and command.strip()
         ):
             raise ValueError("executor acp_agent requires non-empty string name and command")
+        omnigent_mcp = embedded.get("omnigent_mcp", True)
+        if not isinstance(omnigent_mcp, bool):
+            raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),
             command=command.strip(),
+            omnigent_mcp=omnigent_mcp,
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None
@@ -1579,6 +1586,7 @@ def _build_acp_spawn_env(
         env["HARNESS_ACP_SESSION_ID_MODE"] = agent.session_id_mode
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
+        env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
 
         model = _resolve_spec_model(spec)
         if model is not None and not model.startswith(("databricks-", "databricks/")):
@@ -2240,7 +2248,6 @@ def _prepare_messages(
         used to verify session-scoped file ownership.
     :returns: Tuple of (system_instructions, messages, sys_tokens).
     """
-    sys_instructions = build_instructions(spec, instructions, tool_schemas)
     file_store = get_file_store()
     artifact_store = get_artifact_store()
     resolved = history
@@ -2252,6 +2259,17 @@ def _prepare_messages(
             content_cache,
             session_id=conversation_id,
         )
+    framework_instructions = (
+        (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
+        if shared_message_attribution_enabled() and history_has_multiple_authors(resolved)
+        else ()
+    )
+    sys_instructions = build_instructions(
+        spec,
+        instructions,
+        tool_schemas,
+        framework_instructions=framework_instructions,
+    )
     messages = history_to_input_items(resolved)
     sys_tokens = count_tokens(
         [{"role": "system", "content": sys_instructions}],

@@ -1,11 +1,46 @@
 project-includes = [
-   "**/*.py"
+    "omnigent/**/*.py",
+    "omnigent/**/*.pyi",
 ]
 
 project-excludes = []
 
-search-path = []
+python-version = "3.12"
+
+search-path = ["."]
 
 disable-search-path-heuristics = true
-ignore-missing-imports = ["*"]
+
+# Optional/proprietary integrations are intentionally absent from the
+# standard development environment.
+ignore-missing-imports = [
+    "boxlite",
+    "boxlite.*",
+    "copilot",
+    "copilot.*",
+    "cursor_sdk",
+    "cursor_sdk.*",
+    "cwsandbox",
+    "cwsandbox.*",
+    "databricks",
+    "databricks.*",
+    "daytona",
+    "daytona.*",
+    "e2b",
+    "e2b.*",
+    "google.auth",
+    "google.auth.*",
+    "islo",
+    "islo.*",
+    "kubernetes",
+    "kubernetes.*",
+    "modal",
+    "modal.*",
+    "numpy",
+    "numpy.*",
+    "omnigent.onboarding.internal_beta",
+    "openshell",
+    "openshell.*",
+]
+
 ignore-errors-in-generated-code = true

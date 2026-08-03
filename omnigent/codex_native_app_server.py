@@ -9,16 +9,22 @@ import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeAlias, cast
 
 import tomlkit
 import websockets
+from cachetools import TTLCache
+from websockets.asyncio.client import ClientConnection
+
+from omnigent import model_catalog
+from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
@@ -41,7 +47,6 @@ from omnigent.inner.codex_executor import (
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
     _find_codex_cli,
-    _merge_codex_hook_trust_back,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
@@ -49,13 +54,13 @@ from omnigent.inner.databricks_executor import _databricks_gateway_host
 
 _logger = logging.getLogger(__name__)
 
-CodexMessage = dict[str, Any]
-CodexParams = dict[str, Any]
+CodexMessage: TypeAlias = _JsonObject
+CodexParams: TypeAlias = _JsonObject
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
+_MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _STDERR_CHUNK_LIMIT = 65536
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -88,6 +93,25 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # — we detect the old version up front and skip registration with a loud
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
+# Minimum codex CLI version that accepts ``--dangerously-bypass-hook-trust``.
+# Added in openai/codex PR #21768, shipped in rust-v0.131.0 (2026-05-18).
+# Below this the flag is unknown and codex exits immediately with an error,
+# so we skip it and fall back to the old behaviour (trust prompt may appear).
+_MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
+
+
+def _string_object_dict(value: object) -> _JsonObject | None:
+    """Return *value* as a string-keyed object mapping when valid."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("_JsonObject", value)
+
+
+def _object_list(value: object) -> list[object] | None:
+    """Return *value* as an object list when valid."""
+    if not isinstance(value, list):
+        return None
+    return cast("list[object]", value)
 
 
 def _format_codex_version(version: tuple[int, int, int] | None) -> str:
@@ -361,7 +385,7 @@ class CodexAppServerClient:
         self._socket_path = socket_path
         self._ws_url = ws_url
         self._client_name = client_name
-        self._ws: Any | None = None
+        self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
         self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
@@ -510,17 +534,185 @@ class CodexAppServerClient:
         async for raw in self._ws:
             if not isinstance(raw, str):
                 continue
-            message = json.loads(raw)
+            decoded: object = json.loads(raw)
+            message = _string_object_dict(decoded)
+            if message is None:
+                _logger.warning("Ignoring non-object Codex app-server message")
+                continue
             if (
                 "id" in message
                 and "method" not in message
                 and ("result" in message or "error" in message)
             ):
-                future = self._pending_requests.pop(int(message["id"]), None)
+                raw_id = message["id"]
+                request_id: int | None = None
+                if isinstance(raw_id, int):
+                    request_id = raw_id
+                elif isinstance(raw_id, str):
+                    with contextlib.suppress(ValueError):
+                        request_id = int(raw_id)
+                future = (
+                    self._pending_requests.pop(request_id, None)
+                    if request_id is not None
+                    else None
+                )
                 if future is not None and not future.done():
                     future.set_result(message)
                 continue
             await self._events.put(message)
+
+
+async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
+    """Read every visible model from an initialized Codex app-server client.
+
+    :param client: Connected Codex app-server client.
+    :returns: Raw ``model/list`` rows in Codex preference order.
+    :raises ValueError: When Codex returns a malformed response.
+    """
+    options: list[_JsonObject] = []
+    cursor: str | None = None
+    while True:
+        params: CodexParams = {"includeHidden": False}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = await client.request("model/list", params)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise ValueError("Codex model/list result must be an object")
+        data = result.get("data")
+        if not isinstance(data, list):
+            raise ValueError("Codex model/list data must be a list")
+        for raw_model in data:
+            if not isinstance(raw_model, dict):
+                raise ValueError("Codex model/list item must be an object")
+            options.append(raw_model)
+        next_cursor = result.get("nextCursor")
+        if next_cursor is None:
+            return options
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise ValueError("Codex model/list nextCursor must be a string or null")
+        cursor = next_cursor
+
+
+_model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(
+    maxsize=8,
+    ttl=_MODEL_DISCOVERY_CACHE_SECONDS,
+)
+
+
+async def discover_codex_model_options(*, codex_path: str | None = None) -> list[_JsonObject]:
+    """Query the installed Codex CLI's credential-free compatibility catalog.
+
+    Starts a short-lived app-server with an empty private ``CODEX_HOME`` and
+    no provider overrides. The resulting ``model/list`` is Codex's own curated
+    compatibility set; callers can intersect it with a provider's live
+    availability without exposing provider credentials to the subprocess.
+
+    :param codex_path: Optional Codex executable override.
+    :returns: Raw visible ``model/list`` rows in Codex preference order.
+    :raises ImportError: When the Codex CLI is unavailable.
+    :raises RuntimeError: When the discovery app-server exits before connecting.
+    :raises TimeoutError: When the discovery app-server does not become ready.
+    """
+    resolved_codex = codex_path or _find_codex_cli()
+    if not resolved_codex:
+        raise ImportError("Native Codex model discovery requires the 'codex' CLI on PATH.")
+    cached = _model_discovery_cache.get(resolved_codex)
+    if cached is not None:
+        return [dict(option) for option in cached]
+
+    with tempfile.TemporaryDirectory(prefix="omnigent-codex-model-discovery-") as raw_dir:
+        root = Path(raw_dir)
+        codex_home = root / "codex-home"
+        codex_home.mkdir(mode=0o700)
+        port = _allocate_loopback_port()
+        listen_url = f"ws://127.0.0.1:{port}"
+        env = _clean_codex_env()
+        for name in tuple(env):
+            if name.startswith("OPENAI_") or name in {
+                "DATABRICKS_BEARER",
+                "DATABRICKS_CODEX_TOKEN",
+            }:
+                env.pop(name)
+        env["CODEX_HOME"] = str(codex_home)
+        process = await _start_codex_model_discovery_process(
+            codex_path=resolved_codex,
+            listen_url=listen_url,
+            env=env,
+            cwd=root,
+        )
+        client: CodexAppServerClient | None = None
+        try:
+            await _wait_for_discovery_listener(process, port)
+            client = CodexAppServerClient(
+                ws_url=listen_url,
+                client_name="omnigent-codex-model-discovery",
+            )
+            await client.connect()
+            options = await list_codex_model_options(client)
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.close()
+            _proc.terminate_tree(process)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except TimeoutError:
+                _proc.kill_tree(process)
+                await process.wait()
+
+    _model_discovery_cache[resolved_codex] = tuple(dict(option) for option in options)
+    return options
+
+
+async def _start_codex_model_discovery_process(
+    *,
+    codex_path: str,
+    listen_url: str,
+    env: dict[str, str],
+    cwd: Path,
+) -> asyncio.subprocess.Process:
+    """Start the isolated Codex process used only for model discovery."""
+    return await asyncio.create_subprocess_exec(
+        codex_path,
+        "app-server",
+        "--listen",
+        listen_url,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=env,
+        cwd=str(cwd),
+        **_proc.spawn_kwargs(),
+    )
+
+
+def _allocate_loopback_port() -> int:
+    """Return an ephemeral TCP port on loopback for model discovery."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+async def _wait_for_discovery_listener(
+    process: asyncio.subprocess.Process,
+    port: int,
+) -> None:
+    """Wait until a discovery app-server accepts loopback connections."""
+    deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
+    while asyncio.get_running_loop().time() < deadline:
+        if process.returncode is not None:
+            raise RuntimeError(f"Codex model discovery exited early ({process.returncode})")
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+            continue
+        writer.close()
+        await writer.wait_closed()
+        del reader
+        return
+    raise TimeoutError("Timed out waiting for Codex model discovery app-server")
 
 
 @dataclass
@@ -589,6 +781,7 @@ class CodexNativeAppServer:
     pinned_model: str | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
+    codex_cli_version: tuple[int, int, int] | None = None
 
     async def start(self) -> None:
         """
@@ -625,6 +818,7 @@ class CodexNativeAppServer:
         # never silently disables enforcement — a genuine trust failure is
         # then caught below.
         codex_version = await _codex_cli_version(self.codex_path)
+        self.codex_cli_version = codex_version
         if codex_version is not None and codex_version < _MIN_POLICY_HOOK_CODEX_VERSION:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
@@ -823,14 +1017,6 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
-        # Flush any hook-trust the user accepted this session back into the
-        # global config so the next session's copy inherits it and
-        # _retarget_codex_hook_trust_keys can carry it forward without prompting.
-        _merge_codex_hook_trust_back(
-            self.codex_home / "config.toml",
-            _codex_home_config_source_from_env(),
-            self.codex_home,
-        )
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -921,9 +1107,7 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
     )
 
 
-def _codex_policy_hooks_settings(
-    bridge_dir: Path, python_executable: str | None
-) -> dict[str, Any]:
+def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
     """
     Build the ``hooks.json`` payload registering the policy hook.
 
@@ -954,11 +1138,62 @@ def _codex_policy_hooks_settings(
     }
 
 
+def _merge_user_hooks(policy_payload: _JsonObject, user_hooks_path: Path) -> _JsonObject:
+    """
+    Merge user-declared hooks into the policy hooks payload.
+
+    When a symlinked ``hooks.json`` exists in the private ``CODEX_HOME``
+    (the user's real ``~/.codex/hooks.json``), its hook entries are
+    appended after Omnigent's policy hooks for each shared event, and any
+    events declared only by the user are added wholesale. This preserves
+    all user hooks while keeping the Omnigent policy hooks in first
+    position so they always run before user hooks.
+
+    :param policy_payload: The ``hooks.json``-shaped dict built by
+        :func:`_codex_policy_hooks_settings`.
+    :param user_hooks_path: Path to the user's real ``hooks.json``; must
+        be readable.
+    :returns: Merged payload, or *policy_payload* unchanged on any read
+        or parse error (best-effort — policy enforcement must never fail
+        because the user's hooks file is malformed).
+    """
+    try:
+        decoded: object = json.loads(user_hooks_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return policy_payload
+    user_data = _string_object_dict(decoded)
+    user_hooks = _string_object_dict(user_data.get("hooks")) if user_data is not None else None
+    if not user_hooks:
+        return policy_payload
+    policy_hooks = _string_object_dict(policy_payload.get("hooks"))
+    if policy_hooks is None:
+        return policy_payload
+    merged: _JsonObject = dict(policy_payload)
+    merged_hooks: _JsonObject = dict(policy_hooks)
+    merged["hooks"] = merged_hooks
+    for event, entries in user_hooks.items():
+        user_entries = _object_list(entries)
+        if user_entries is None:
+            continue
+        existing_entries = _object_list(merged_hooks.get(event))
+        if existing_entries is not None:
+            merged_hooks[event] = existing_entries + user_entries
+        else:
+            merged_hooks[event] = user_entries
+    return merged
+
+
 def _write_codex_policy_hooks_file(
     codex_home: Path, bridge_dir: Path, python_executable: str | None
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
+
+    When ``_populate_codex_home_config`` has symlinked the user's
+    ``hooks.json`` into the private home, its entries are merged into the
+    policy hooks payload before the file is written so user hooks fire
+    alongside Omnigent's policy hooks. The symlink is replaced by a
+    regular merged file.
 
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param bridge_dir: Native Codex bridge directory for the hook command.
@@ -968,6 +1203,9 @@ def _write_codex_policy_hooks_file(
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = codex_home / _CODEX_HOOKS_FILE
     payload = _codex_policy_hooks_settings(bridge_dir, python_executable)
+    if path.is_symlink() and path.exists():
+        payload = _merge_user_hooks(payload, path.resolve())
+        path.unlink()
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_CODEX_HOOKS_FILE}.", dir=str(codex_home))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -979,7 +1217,7 @@ def _write_codex_policy_hooks_file(
             os.unlink(tmp_name)
 
 
-def _our_policy_hooks_from_list(listed: dict[str, Any], cwd: str) -> list[dict[str, Any]]:
+def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObject]:
     """
     Extract *our* policy hooks for *cwd* from a ``hooks/list`` response.
 
@@ -994,20 +1232,24 @@ def _our_policy_hooks_from_list(listed: dict[str, Any], cwd: str) -> list[dict[s
     :returns: The matching Omnigent hook metadata dicts (possibly
         empty), each with ``key``, ``currentHash``, ``trustStatus``.
     """
-    result = listed.get("result", listed)
-    data = result.get("data", []) if isinstance(result, dict) else []
-    for entry in data:
-        if isinstance(entry, dict) and entry.get("cwd") == cwd:
-            hooks = entry.get("hooks", [])
+    result = _string_object_dict(listed.get("result"))
+    if result is None:
+        result = listed
+    data = _object_list(result.get("data")) or []
+    for raw_entry in data:
+        entry = _string_object_dict(raw_entry)
+        if entry is not None and entry.get("cwd") == cwd:
+            hooks = _object_list(entry.get("hooks")) or []
             return [
-                h
-                for h in hooks
-                if isinstance(h, dict) and _POLICY_HOOK_MODULE in str(h.get("command", ""))
+                hook
+                for raw_hook in hooks
+                if (hook := _string_object_dict(raw_hook)) is not None
+                and _POLICY_HOOK_MODULE in str(hook.get("command", ""))
             ]
     return []
 
 
-def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
+def _hooks_list_diagnostics(listed: _JsonObject, cwd: str) -> str:
     """
     Summarize a ``hooks/list`` response for a discovery-failure error.
 
@@ -1030,10 +1272,12 @@ def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
         ``"hooks/list returned no hooks (codex loaded none — likely an "
         "invalid per-session config.toml)"``.
     """
-    result = listed.get("result", listed)
-    data = result.get("data", []) if isinstance(result, dict) else []
-    entries = [e for e in data if isinstance(e, dict)]
-    if not entries or all(not e.get("hooks") for e in entries):
+    result = _string_object_dict(listed.get("result"))
+    if result is None:
+        result = listed
+    data = _object_list(result.get("data")) or []
+    entries = [entry for raw in data if (entry := _string_object_dict(raw)) is not None]
+    if not entries or all(not (_object_list(entry.get("hooks")) or []) for entry in entries):
         return (
             "hooks/list returned no hooks (codex loaded none — likely an "
             "invalid per-session config.toml, so codex fell back to defaults)"
@@ -1041,18 +1285,19 @@ def _hooks_list_diagnostics(listed: dict[str, Any], cwd: str) -> str:
     matched_cwd = any(e.get("cwd") == cwd for e in entries)
     parts: list[str] = []
     for entry in entries:
-        hooks = entry.get("hooks", []) or []
+        hooks = _object_list(entry.get("hooks")) or []
         ours = sum(
             1
-            for h in hooks
-            if isinstance(h, dict) and _POLICY_HOOK_MODULE in str(h.get("command", ""))
+            for raw_hook in hooks
+            if (hook := _string_object_dict(raw_hook)) is not None
+            and _POLICY_HOOK_MODULE in str(hook.get("command", ""))
         )
         parts.append(f"cwd={entry.get('cwd')!r}: {len(hooks)} hook(s), {ours} ours")
     prefix = "" if matched_cwd else f"no entry matched queried cwd {cwd!r}; "
     return f"hooks/list returned [{prefix}{'; '.join(parts)}]"
 
 
-def _untrusted_hook_detail(hooks: list[dict[str, Any]]) -> str:
+def _untrusted_hook_detail(hooks: Sequence[_JsonObject]) -> str:
     """
     Render untrusted hook metadata for a trust-failure error.
 
@@ -1222,7 +1467,8 @@ def build_codex_native_server(
         host = host.rstrip("/")
         config_overrides.extend(
             _databricks_codex_config_overrides(
-                model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,
+                model=model
+                or model_catalog.resolve_catalog_model("databricks", family="openai").model_id,
                 base_url=_databricks_codex_base_url(host),
                 auth_command=_databricks_codex_auth_command(host, profile),
             )
@@ -1311,7 +1557,10 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     prefix = "model_provider="
     for override in launch.config_overrides:
         if override.startswith(prefix):
-            return json.loads(override.removeprefix(prefix))
+            decoded: object = json.loads(override.removeprefix(prefix))
+            if not isinstance(decoded, str):
+                raise ValueError("model_provider override must decode to a string")
+            return decoded
     if launch.profile is not None:
         return "omnigent_databricks"
     return "openai"
@@ -1829,6 +2078,7 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # flag because it MUST go, the sandbox flag for hygiene so the launched arg
 # list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+_CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
 # Granular approval/sandbox flags to drop when bypass is on. The "Full
 # access" / "Read only" approval presets emit the long ``--flag value`` form
 # (see web CODEX_NATIVE_APPROVAL_MODES), but ``terminal_launch_args`` is
@@ -1905,6 +2155,7 @@ def build_codex_remote_args(
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
     bypass_sandbox: bool = False,
+    bypass_hook_trust: bool = False,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -1954,6 +2205,14 @@ def build_codex_remote_args(
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
         the granular flags untouched. See issue #657.
+    :param bypass_hook_trust: When ``True``, emit
+        ``--dangerously-bypass-hook-trust`` so the TUI runs all enabled
+        hooks without the interactive "Hooks need review" trust prompt.
+        Intended for runner-owned headless sessions where the private
+        ``CODEX_HOME`` is provisioned by Omnigent and there is no terminal
+        user to answer the prompt. Default ``False`` for interactive
+        ``omnigent codex`` sessions where the user faces the terminal and
+        can accept hooks normally.
     :returns: Codex argv tail after the executable.
     """
     override_args: list[str] = []
@@ -1965,6 +2224,8 @@ def build_codex_remote_args(
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
         passthrough = normalize_codex_permission_launch_args(codex_args)
+    if bypass_hook_trust:
+        passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]

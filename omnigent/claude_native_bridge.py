@@ -48,14 +48,17 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, cast
 from urllib import error, request
 
 from omnigent._platform import stable_user_id
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
 if TYPE_CHECKING:
+    import httpx
+
     from omnigent.llms.context_window import ModelPricing
 
 from omnigent.inner.bundle_skills import claude_native_skill_args
@@ -172,7 +175,7 @@ _DRAFT_NEEDLE_MAX_CHARS = 24
 _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 
-ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
+ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
 
 def _absolute_syntactic_path(path: Path) -> Path:
@@ -195,8 +198,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse the
-    relay/MCP implementation but keep bridge files below their own bridge roots.
+    Codex-, Pi-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse
+    the relay/MCP implementation but keep bridge files below their own bridge roots.
     All roots use the same owner-only ancestor validation; only the trusted
     anchor differs.
 
@@ -220,6 +223,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         trusted_parent = codex_root.parent
         if codex_root.name == "codex-native" and codex_root.parent.name == ".omnigent":
             trusted_parent = codex_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
+    from omnigent.pi_native_bridge import bridge_root as pi_bridge_root
+
+    pi_root = _absolute_syntactic_path(pi_bridge_root())
+    if target.is_relative_to(pi_root):
+        # Pi-native uses the same $HOME/.omnigent/<harness>-native layout as
+        # Codex-native. Trust $HOME in production, while allowing tests to
+        # monkeypatch the bridge root to a different shape.
+        trusted_parent = pi_root.parent
+        if pi_root.name == "pi-native" and pi_root.parent.name == ".omnigent":
+            trusted_parent = pi_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
     from omnigent.cursor_native_bridge import bridge_root as cursor_bridge_root
@@ -294,7 +309,7 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
 
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
+        f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
         f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
         f"{kiro_root!s}, {acp_root!s})"
     )
@@ -325,7 +340,7 @@ class ClaudeTranscriptItem:
 
     source_id: str
     item_type: str
-    data: dict[str, Any]
+    data: _JsonObject
     response_id: str
     is_compact_summary: bool = False
 
@@ -436,7 +451,7 @@ class ClaudeHookRecord:
     clear_rotated_to: str | None = None
     fork_detected: bool = False
     fork_rotated_to: str | None = None
-    todos: list[dict[str, Any]] | None = None
+    todos: list[_JsonObject] | None = None
     task_id: str | None = None
     task_subject: str | None = None
     task_status: str | None = None
@@ -610,6 +625,11 @@ def _message_delta_from_jsonl_text(text: str | None) -> ClaudeMessageDelta | Non
     )
 
 
+def _http_server_host_port(httpd: ThreadingHTTPServer) -> tuple[str, int]:
+    """Return the IPv4 address shape requested by local bridge servers."""
+    return cast(tuple[str, int], httpd.server_address)
+
+
 class ClaudeNativeToolRelay:
     """
     HTTP relay for Claude MCP tool calls, scoped to its caller's lifetime.
@@ -659,7 +679,7 @@ class ClaudeNativeToolRelay:
         :returns: None.
         """
         relay_file = self._bridge_dir / _TOOL_RELAY_FILE
-        host, port = self._httpd.server_address
+        host, port = _http_server_host_port(self._httpd)
         # A newer relay that overwrote the file advertises a different url
         # (this relay's socket is still bound, so its port is unique), so the
         # file is left for that relay to own.
@@ -939,7 +959,7 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     _atomic_write_user_json(config_path, data)
 
 
-def _atomic_write_user_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_write_user_json(path: Path, payload: _JsonObject) -> None:
     """
     Atomically rewrite a user-owned JSON config file in place.
 
@@ -1050,7 +1070,7 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
     _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
-def read_permission_hook_config(bridge_dir: Path) -> dict[str, Any]:
+def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
     """
     Read Omnigent routing details for the permission command hook.
 
@@ -1084,7 +1104,7 @@ def update_permission_hook_auth_headers(
     return True
 
 
-def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> dict[str, Any]:
+def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> _JsonObject:
     """
     Build the Claude Code MCP config for the Omnigent bridge server.
 
@@ -1125,7 +1145,7 @@ def build_hook_settings(
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
     launch_effort: str | None = None,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
 
@@ -1193,7 +1213,7 @@ def build_hook_settings(
         "type": "command",
         "command": shlex.join(message_display_command_parts),
     }
-    hooks: dict[str, Any] = {
+    hooks: dict[str, list[_JsonObject]] = {
         "SessionStart": [{"hooks": [session_start_hook]}],
         "Stop": [{"hooks": [hook]}],
         "StopFailure": [{"hooks": [hook]}],
@@ -1265,7 +1285,7 @@ def build_hook_settings(
             "--bridge-dir",
             str(bridge_dir),
         ]
-        permission_hook: dict[str, Any] = {
+        permission_hook: _JsonObject = {
             "type": "command",
             "command": shlex.join(permission_command_parts),
             # Wait up to a day for the verdict. Claude Code's default
@@ -1289,7 +1309,7 @@ def build_hook_settings(
             "--bridge-dir",
             str(bridge_dir),
         ]
-        evaluate_policy_hook: dict[str, Any] = {
+        evaluate_policy_hook: _JsonObject = {
             "type": "command",
             "command": shlex.join(evaluate_policy_command_parts),
         }
@@ -1305,7 +1325,7 @@ def build_hook_settings(
             "--bridge-dir",
             str(bridge_dir),
         ]
-        ask_uq_hook: dict[str, Any] = {
+        ask_uq_hook: _JsonObject = {
             "type": "command",
             "command": shlex.join(ask_uq_command_parts),
             # Short timeout: if the web-UI elicitation isn't answered
@@ -1337,7 +1357,7 @@ def build_hook_settings(
         # server-side. Covers both web-UI-injected and direct-terminal
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
-    settings: dict[str, Any] = {"hooks": hooks}
+    settings: _JsonObject = {"hooks": hooks}
     if launch_model:
         settings["model"] = launch_model
     if launch_permission_mode:
@@ -1547,7 +1567,7 @@ def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str
     return args
 
 
-def record_hook_event(bridge_dir: Path, payload: dict[str, Any]) -> None:
+def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     """
     Record one Claude Code hook payload in the bridge directory.
 
@@ -2343,7 +2363,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     # Extract todos from PostToolUse/TodoWrite hook payloads. Claude Code
     # fires this hook after every TodoWrite call with ``tool_input.todos``
     # containing the updated list. Other PostToolUse events have no todos.
-    todos: list[dict[str, Any]] | None = None
+    todos: list[_JsonObject] | None = None
     task_id: str | None = None
     task_subject: str | None = None
     task_status: str | None = None
@@ -2537,7 +2557,7 @@ def write_tmux_target(
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),
@@ -3291,9 +3311,11 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
 def start_tool_relay(
     *,
     bridge_dir: Path,
-    tools: list[dict[str, Any]],
+    tools: list[_JsonObject],
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
+    policy_client: httpx.AsyncClient | None = None,
+    session_id: str | None = None,
 ) -> ClaudeNativeToolRelay:
     """
     Start a relay for Omnigent tool calls from Claude.
@@ -3303,26 +3325,39 @@ def start_tool_relay(
     whole session) and must call :meth:`ClaudeNativeToolRelay.close` when
     that scope ends.
 
+    When ``policy_client`` and ``session_id`` are provided the relay also
+    exposes ``POST /policies/evaluate``, which proxies requests to the
+    Omnigent server using the runner's refresh-capable client — so hook
+    subprocesses never need a server bearer token of their own.
+
     :param bridge_dir: Bridge directory path.
-    :param tools: Omnigent tool schemas to advertise, e.g.
-        ``[{"name": "sys_os_read", "parameters": {...}}]``.
-    :param tool_executor: Callback used to dispatch one tool call through
-        AP/runner.
+    :param tools: Omnigent tool schemas to advertise.
+    :param tool_executor: Callback used to dispatch one tool call.
     :param loop: Event loop that owns ``tool_executor``.
-    :returns: Started relay handle. Call :meth:`close` when the relay's
-        scope ends (e.g. on session delete).
+    :param policy_client: Runner's async httpx client for policy eval proxy.
+    :param session_id: Session id written into ``tool_relay.json`` so hook
+        subprocesses can construct the correct ``/policies/evaluate`` URL.
+    :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
-    handler_cls = _tool_relay_handler_factory(token, tool_executor, loop)
+    handler_cls = _tool_relay_handler_factory(
+        token,
+        tool_executor,
+        loop,
+        policy_client=policy_client,
+        session_id=session_id,
+    )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = httpd.server_address
-    relay_info = {
+    host, port = _http_server_host_port(httpd)
+    relay_info: _JsonObject = {
         "url": f"http://{host}:{port}",
         "token": token,
         "tools": _normalize_relay_tool_specs(tools),
         "pid": os.getpid(),
         "updated_at": time.time(),
     }
+    if session_id is not None:
+        relay_info["session_id"] = session_id
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -3378,7 +3413,7 @@ def _serve_mcp(bridge_dir: Path) -> None:
     if not isinstance(token, str) or not token:
         raise SystemExit("bridge config missing token")
 
-    notification_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+    notification_queue: queue.Queue[_JsonObject | None] = queue.Queue()
     stdout_lock = threading.Lock()
     httpd = _start_http_ingress(bridge_dir, token, notification_queue)
     tools, close_tools = _build_tools(config)
@@ -3401,7 +3436,7 @@ def _serve_mcp(bridge_dir: Path) -> None:
 def _start_http_ingress(
     bridge_dir: Path,
     token: str,
-    notification_queue: queue.Queue[dict[str, Any] | None],
+    notification_queue: queue.Queue[_JsonObject | None],
 ) -> ThreadingHTTPServer:
     """
     Start the localhost control HTTP server.
@@ -3418,8 +3453,8 @@ def _start_http_ingress(
     """
     handler_cls = _handler_factory(token, notification_queue)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = httpd.server_address
-    server_info = {
+    host, port = _http_server_host_port(httpd)
+    server_info: _JsonObject = {
         "url": f"http://{host}:{port}",
         "token": token,
         "pid": os.getpid(),
@@ -3437,7 +3472,7 @@ def _start_http_ingress(
 
 def _handler_factory(
     token: str,
-    notification_queue: queue.Queue[dict[str, Any] | None],
+    notification_queue: queue.Queue[_JsonObject | None],
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class bound to the MCP notification queue.
@@ -3451,7 +3486,7 @@ def _handler_factory(
     class _ControlHandler(BaseHTTPRequestHandler):
         """HTTP handler for the local MCP control endpoint."""
 
-        def log_message(self, format: str, *args: Any) -> None:
+        def log_message(self, format: str, *args: object) -> None:
             """
             Suppress default HTTP server logging.
 
@@ -3494,7 +3529,7 @@ def _handler_factory(
             )
             self._send_json({"ok": True})
 
-        def _send_json(self, payload: dict[str, Any]) -> None:
+        def _send_json(self, payload: _JsonObject) -> None:
             """
             Send a JSON response body.
 
@@ -3515,6 +3550,9 @@ def _tool_relay_handler_factory(
     token: str,
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
+    *,
+    policy_client: httpx.AsyncClient | None = None,
+    session_id: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -3523,13 +3561,16 @@ def _tool_relay_handler_factory(
     :param tool_executor: Existing harness callback used to
         dispatch one tool call.
     :param loop: Event loop that owns ``tool_executor``.
+    :param policy_client: Optional async httpx client for proxying
+        ``/policies/evaluate`` to the Omnigent server.
+    :param session_id: Session id for the ``/policies/evaluate`` path.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
     class _ToolRelayHandler(BaseHTTPRequestHandler):
         """HTTP handler for active Omnigent tool relay calls."""
 
-        def log_message(self, format: str, *args: Any) -> None:
+        def log_message(self, format: str, *args: object) -> None:
             """
             Suppress default HTTP server logging.
 
@@ -3542,11 +3583,11 @@ def _tool_relay_handler_factory(
 
         def do_POST(self) -> None:
             """
-            Accept one MCP tool call from the Claude helper process.
+            Accept one MCP tool call or policy evaluation from the Claude helper process.
 
             :returns: None.
             """
-            if self.path != "/tool":
+            if self.path not in ("/tool", "/policies/evaluate"):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             if self.headers.get("Authorization") != f"Bearer {token}":
@@ -3555,6 +3596,9 @@ def _tool_relay_handler_factory(
             payload = self._read_json_body()
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if self.path == "/policies/evaluate":
+                self._handle_policy_evaluate(payload)
                 return
             name = payload.get("name")
             arguments = payload.get("arguments")
@@ -3565,7 +3609,32 @@ def _tool_relay_handler_factory(
                 arguments = {}
             self._send_json(_run_relay_tool(tool_executor, loop, name, arguments))
 
-        def _read_json_body(self) -> dict[str, Any] | None:
+        def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
+            if policy_client is None or session_id is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            import urllib.parse as _up
+
+            session_component = _up.quote(session_id, safe="")
+            url = f"/v1/sessions/{session_component}/policies/evaluate"
+            future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
+            try:
+                resp = future.result(timeout=86400.0)
+            except Exception:  # noqa: BLE001
+                self.send_error(HTTPStatus.BAD_GATEWAY)
+                return
+            raw = resp.content
+            self.send_response(resp.status_code)
+            for header in ("Content-Type", "Content-Length"):
+                val = resp.headers.get(header)
+                if val is not None:
+                    self.send_header(header, val)
+            if "Content-Length" not in resp.headers:
+                self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _read_json_body(self) -> _JsonObject | None:
             """
             Read and decode a JSON request body.
 
@@ -3583,7 +3652,7 @@ def _tool_relay_handler_factory(
                 return None
             return payload if isinstance(payload, dict) else None
 
-        def _send_json(self, payload: dict[str, Any]) -> None:
+        def _send_json(self, payload: _JsonObject) -> None:
             """
             Send a JSON response body.
 
@@ -3604,8 +3673,8 @@ def _run_relay_tool(
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
     name: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
+    arguments: _JsonObject,
+) -> _JsonObject:
     """
     Execute one relay tool call on the harness event loop.
 
@@ -3616,7 +3685,9 @@ def _run_relay_tool(
     :param arguments: Decoded tool arguments.
     :returns: MCP tool-call response.
     """
-    future = asyncio.run_coroutine_threadsafe(tool_executor(name, arguments), loop)
+    future = asyncio.run_coroutine_threadsafe(
+        _await_tool_result(tool_executor(name, arguments)), loop
+    )
     try:
         result = future.result(timeout=_TOOL_CALL_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 - relay converts callback failures to MCP errors.
@@ -3624,7 +3695,11 @@ def _run_relay_tool(
     return _mcp_response_from_tool_result(result)
 
 
-def _mcp_response_from_tool_result(result: Any) -> dict[str, Any]:
+async def _await_tool_result(result: Awaitable[object]) -> object:
+    return await result
+
+
+def _mcp_response_from_tool_result(result: object) -> _JsonObject:
     """
     Convert a harness tool result into MCP response shape.
 
@@ -3633,7 +3708,7 @@ def _mcp_response_from_tool_result(result: Any) -> dict[str, Any]:
     :returns: MCP tool-call response.
     """
     payload = result if isinstance(result, dict) else {"result": result}
-    response: dict[str, Any] = {
+    response: _JsonObject = {
         "content": [{"type": "text", "text": json.dumps(payload)}],
     }
     if payload.get("blocked") is True or ("error" in payload and payload.get("error")):
@@ -3642,7 +3717,7 @@ def _mcp_response_from_tool_result(result: Any) -> dict[str, Any]:
 
 
 def _notification_writer(
-    notification_queue: queue.Queue[dict[str, Any] | None],
+    notification_queue: queue.Queue[_JsonObject | None],
     stdout_lock: threading.Lock,
 ) -> None:
     """
@@ -3719,7 +3794,7 @@ def _stdio_jsonrpc_loop(
         # tool, or an OSError that slipped a narrower except).
         try:
             result = _handle_mcp_request(method, message.get("params"), tools, bridge_dir)
-            response: dict[str, Any] = {
+            response: _JsonObject = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": result,
@@ -3736,10 +3811,10 @@ def _stdio_jsonrpc_loop(
 
 def _handle_mcp_request(
     method: str,
-    params: Any,
+    params: object,
     tools: dict[str, Tool],
     bridge_dir: Path,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """
     Handle one MCP request.
 
@@ -3776,7 +3851,7 @@ def _handle_mcp_request(
     return {}
 
 
-def _mcp_tool_schema(tool: Tool) -> dict[str, Any]:
+def _mcp_tool_schema(tool: Tool) -> _JsonObject:
     """
     Convert an Omnigent tool schema into MCP tool-list shape.
 
@@ -3794,7 +3869,7 @@ def _mcp_tool_schema(tool: Tool) -> dict[str, Any]:
 def _combined_mcp_tool_schemas(
     local_tools: dict[str, Tool],
     bridge_dir: Path,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """
     Return local and active-turn relay tools in MCP list shape.
 
@@ -3815,7 +3890,7 @@ def _combined_mcp_tool_schemas(
     return list(schemas.values())
 
 
-def _mcp_tool_schema_from_spec(tool_spec: dict[str, Any]) -> dict[str, Any]:
+def _mcp_tool_schema_from_spec(tool_spec: _JsonObject) -> _JsonObject:
     """
     Convert an Omnigent tool schema dict into MCP tool-list shape.
 
@@ -3834,10 +3909,10 @@ def _mcp_tool_schema_from_spec(tool_spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _call_mcp_tool(
-    params: Any,
+    params: object,
     tools: dict[str, Tool],
     bridge_dir: Path,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """
     Execute one MCP tool call.
 
@@ -3889,7 +3964,7 @@ def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
     }
 
 
-def _read_relay_tool_specs(bridge_dir: Path) -> list[dict[str, Any]]:
+def _read_relay_tool_specs(bridge_dir: Path) -> list[_JsonObject]:
     """
     Return active relay tool schemas.
 
@@ -3908,8 +3983,8 @@ def _read_relay_tool_specs(bridge_dir: Path) -> list[dict[str, Any]]:
 def _call_relay_tool(
     bridge_dir: Path,
     name: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
+    arguments: _JsonObject,
+) -> _JsonObject:
     """
     Call the active harness turn's tool relay.
 
@@ -3957,7 +4032,7 @@ def _call_relay_tool(
     return decoded
 
 
-def _mcp_error(message: str) -> dict[str, Any]:
+def _mcp_error(message: str) -> _JsonObject:
     """
     Build an MCP error-content tool result.
 
@@ -3967,7 +4042,7 @@ def _mcp_error(message: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps({"error": message})}], "isError": True}
 
 
-def _normalize_relay_tool_specs(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _normalize_relay_tool_specs(tools: list[_JsonObject]) -> list[_JsonObject]:
     """
     Normalize active-turn tool schemas before advertising them.
 
@@ -3975,7 +4050,7 @@ def _normalize_relay_tool_specs(tools: list[dict[str, Any]]) -> list[dict[str, A
         ``[{"name": "sys_os_read", "parameters": {...}}]``.
     :returns: Schemas containing only fields the MCP bridge needs.
     """
-    normalized: list[dict[str, Any]] = []
+    normalized: list[_JsonObject] = []
     for tool in tools:
         name = tool.get("name")
         if not isinstance(name, str) or not name:
@@ -3994,7 +4069,7 @@ def _normalize_relay_tool_specs(tools: list[dict[str, Any]]) -> list[dict[str, A
     return normalized
 
 
-def _empty_object_schema() -> dict[str, Any]:
+def _empty_object_schema() -> _JsonObject:
     """
     Return a minimal JSON object schema.
 
@@ -4003,7 +4078,7 @@ def _empty_object_schema() -> dict[str, Any]:
     return {"type": "object", "properties": {}}
 
 
-def _build_tools(config: dict[str, Any]) -> tuple[dict[str, Tool], Callable[[], None]]:
+def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], None]]:
     """
     Build Omnigent MCP tools served by the bridge.
 
@@ -4033,7 +4108,7 @@ def _build_tools(config: dict[str, Any]) -> tuple[dict[str, Tool], Callable[[], 
 
 
 def _write_jsonrpc(
-    payload: dict[str, Any],
+    payload: _JsonObject,
     stdout_lock: threading.Lock,
     *,
     framed: bool = False,
@@ -4057,7 +4132,7 @@ def _write_jsonrpc(
             print(raw, flush=True)
 
 
-def _model_from_transcript_entry(entry: dict[str, Any]) -> str | None:
+def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     """
     Return ``message.model`` from an assistant transcript record.
 
@@ -4079,7 +4154,7 @@ def _model_from_transcript_entry(entry: dict[str, Any]) -> str | None:
     return None
 
 
-def read_claude_context_state(bridge_dir: Path) -> dict[str, Any] | None:
+def read_claude_context_state(bridge_dir: Path) -> _JsonObject | None:
     """
     Read the most recent statusLine snapshot from ``context.json``.
 
@@ -4198,7 +4273,7 @@ def read_user_effort_level() -> str | None:
     return None
 
 
-def _usage_from_transcript_entry(entry: dict[str, Any]) -> dict[str, int] | None:
+def _usage_from_transcript_entry(entry: _JsonObject) -> dict[str, int] | None:
     """
     Extract token-usage from one Claude assistant transcript entry.
 
@@ -4271,7 +4346,7 @@ def _assistant_text_from_transcript_line(line: str) -> str | None:
 
 
 def _transcript_items_from_entry(
-    entry: dict[str, Any],
+    entry: _JsonObject,
     *,
     line_number: int,
     record_offset: int | None = None,
@@ -4342,7 +4417,7 @@ def _transcript_items_from_entry(
 
 
 def _attachment_transcript_items_from_entry(
-    entry: dict[str, Any],
+    entry: _JsonObject,
     *,
     line_number: int,
     record_offset: int | None,
@@ -4596,7 +4671,7 @@ def _is_task_notification_text(text: str) -> bool:
 
 
 def _local_command_transcript_items_from_entry(
-    entry: dict[str, Any],
+    entry: _JsonObject,
     *,
     line_number: int,
     record_offset: int | None,
@@ -4700,7 +4775,7 @@ def _terminal_command_items_from_content(
 
 
 def _user_transcript_items_from_entry(
-    entry: dict[str, Any],
+    entry: _JsonObject,
     *,
     line_number: int,
     record_offset: int | None,
@@ -4776,7 +4851,7 @@ def _user_transcript_items_from_entry(
             if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
                 return current_response_id, []
             kind = "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill"
-            data: dict[str, Any] = {
+            data: _JsonObject = {
                 "agent": agent_name,
                 "kind": kind,
                 "name": payload.name,
@@ -4848,7 +4923,7 @@ def _user_transcript_items_from_entry(
     if not isinstance(content, list):
         return current_response_id, []
 
-    user_blocks: list[dict[str, Any]] = []
+    user_blocks: list[_JsonObject] = []
     saw_user_text = False
     item_index = 0
     for block in content:
@@ -4928,7 +5003,7 @@ def _user_transcript_items_from_entry(
 
 
 def _assistant_transcript_items_from_entry(
-    entry: dict[str, Any],
+    entry: _JsonObject,
     *,
     line_number: int,
     record_offset: int | None,
@@ -5058,7 +5133,7 @@ def _assistant_message_item(
     )
 
 
-def _stripped_image_placeholder(source: dict[str, Any]) -> str:
+def _stripped_image_placeholder(source: _JsonObject) -> str:
     """
     Build the placeholder text for a stripped inline image block.
 
@@ -5078,7 +5153,7 @@ def _stripped_image_placeholder(source: dict[str, Any]) -> str:
     )
 
 
-def _strip_inline_image_data(value: Any) -> Any:
+def _strip_inline_image_data(value: object) -> object:
     """
     Replace base64 image payloads with a lightweight placeholder.
 
@@ -5105,7 +5180,7 @@ def _strip_inline_image_data(value: Any) -> Any:
     return value
 
 
-def _tool_result_output(entry: dict[str, Any], block: dict[str, Any]) -> str:
+def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:
     """
     Return the UI-facing output string for a Claude tool result.
 
@@ -5132,7 +5207,7 @@ def _tool_result_output(entry: dict[str, Any], block: dict[str, Any]) -> str:
 
 
 def _transcript_source_key(
-    entry: dict[str, Any],
+    entry: _JsonObject,
     line_number: int,
     record_offset: int | None = None,
 ) -> str:
@@ -5156,7 +5231,7 @@ def _transcript_source_key(
 
 
 def _parent_or_record_source_key(
-    entry: dict[str, Any],
+    entry: _JsonObject,
     line_number: int,
     record_offset: int | None = None,
 ) -> str:
@@ -5198,7 +5273,7 @@ def _source_id(source_key: str, item_index: int, item_type: str) -> str:
     return f"{source_key}:{item_index}:{item_type}"
 
 
-def _summary_text_from_blocks(content: Any) -> str:
+def _summary_text_from_blocks(content: object) -> str:
     """
     Join the text of a compact-summary record's content blocks.
 
@@ -5226,7 +5301,7 @@ def _summary_text_from_blocks(content: Any) -> str:
     return "\n".join(parts)
 
 
-def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, Any]:
+def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> _JsonObject:
     """
     Wait for the bridge control HTTP endpoint file.
 
@@ -5248,7 +5323,7 @@ def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, An
     )
 
 
-def _read_json_file(path: Path) -> dict[str, Any]:
+def _read_json_file(path: Path) -> _JsonObject:
     """
     Read a JSON object file.
 
@@ -5266,7 +5341,7 @@ def _read_json_file(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+def _write_json_file(path: Path, payload: _JsonObject) -> None:
     """
     Atomically write a JSON object file with owner-only permissions.
 

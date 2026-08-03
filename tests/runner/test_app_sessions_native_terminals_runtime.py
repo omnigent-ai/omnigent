@@ -413,6 +413,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -588,14 +589,15 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
-    assert launched.args[:3] == [
+    assert launched.args[0] == "--dangerously-bypass-hook-trust"
+    assert launched.args[1:4] == [
         "--config",
         "approval_policy=on-request",
         "resume",
     ]
-    assert launched.args[3] == "--remote"
-    assert launched.args[4].startswith("ws://127.0.0.1:")
-    assert launched.args[5] == thread_id
+    assert launched.args[4] == "--remote"
+    assert launched.args[5].startswith("ws://127.0.0.1:")
+    assert launched.args[6] == thread_id
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
@@ -732,6 +734,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1011,6 +1014,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1243,6 +1247,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1465,6 +1470,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         """Minimal app-server object."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""

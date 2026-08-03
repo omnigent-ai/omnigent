@@ -1,0 +1,351 @@
+"""Resolve and read Claude Code's per-session status metadata file.
+
+Claude Code writes a per-process JSON file at
+``<config_dir>/sessions/<pid>.json`` (its internal "concurrentSessions"
+registry, present since v2.1.139 — the file that also backs
+``claude agents``). For an interactive session it carries a ``status``
+field that flips ``idle`` ⇄ ``busy`` ⇄ ``waiting`` as the agent works,
+which is a cleaner running/idle signal than diffing the tmux pane.
+
+This module owns two pure pieces the claude-native status watcher builds
+on:
+
+- :func:`resolve_status_file` — find the file for a launched Claude,
+  keyed primarily by its pid (which equals the tmux ``#{pane_pid}`` on
+  the omnigent launch path), with a ``sessionId`` cross-check and a
+  bounded directory scan as fallback.
+- :func:`read_session_status` — read the file and map its interactive
+  status to the runner's ``running`` / ``idle`` vocabulary.
+
+The file is an **undocumented internal detail** of Claude Code, so the
+watcher that consumes this treats an unresolved / unreadable file as
+"fall back to the PTY watcher", never as an error.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+# Runner-side status vocabulary the file maps onto. ``busy`` and
+# ``waiting`` both mean "the turn is not finished" from the session's
+# point of view, so both map to ``running`` (Option A — ``waiting`` is
+# not yet surfaced as a distinct "needs input" state).
+RUNNING = "running"
+IDLE = "idle"
+
+# Claude interactive-session status literals (writer ``b3f`` in the
+# bundle). ``running``/``completed``/``failed`` belong to background jobs
+# and are not expected here, but map defensively rather than crash.
+_STATUS_TO_RUNNER: dict[str, str] = {
+    "busy": RUNNING,
+    "waiting": RUNNING,
+    "idle": IDLE,
+    # Background-job literals, mapped defensively for robustness.
+    "running": RUNNING,
+    "completed": IDLE,
+    "failed": IDLE,
+    "error": IDLE,
+    "done": IDLE,
+}
+
+# Only consider files touched within this window when scanning by
+# sessionId, so a heavy user's accumulated stale files (Claude does not
+# always unlink on crash) never turn resolution into an unbounded read.
+# A just-launched Claude's file is fresh by definition.
+_SCAN_FRESHNESS_WINDOW_S = 120.0
+
+
+@dataclass(frozen=True)
+class SessionStatus:
+    """A single read of the Claude session status file.
+
+    :param runner_status: Mapped runner vocabulary — :data:`RUNNING` or
+        :data:`IDLE`.
+    :param raw_status: The file's own ``status`` string, e.g. ``"busy"``,
+        ``"idle"``, ``"waiting"`` — kept for logging / future
+        "needs input" surfacing.
+    :param status_updated_at: The file's ``statusUpdatedAt`` epoch-ms
+        value, or ``None`` when absent.
+    """
+
+    runner_status: str
+    raw_status: str
+    status_updated_at: int | None
+
+
+def sessions_dir(config_dir: Path | None = None) -> Path:
+    """Return Claude Code's ``sessions`` directory.
+
+    Mirrors Claude's own resolution: ``CLAUDE_CONFIG_DIR`` when set,
+    otherwise ``~/.claude`` — matching :mod:`omnigent.session_import.local`.
+
+    :param config_dir: Explicit Claude config dir override (tests). When
+        ``None`` the environment / home default is used.
+    :returns: The ``<config_dir>/sessions`` path (not guaranteed to exist).
+    """
+    if config_dir is not None:
+        return config_dir / "sessions"
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    home = Path(configured).expanduser() if configured else Path.home() / ".claude"
+    return home / "sessions"
+
+
+def _read_json_file(path: Path) -> dict[str, object] | None:
+    """Read and parse a JSON object file, or ``None`` on any failure.
+
+    :param path: File to read.
+    :returns: The parsed object, or ``None`` when missing, unreadable, or
+        not a JSON object (a half-written file reads as ``None`` and the
+        caller simply retries next tick).
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _matches_session(
+    record: dict[str, object],
+    *,
+    expected_session_id: str | None,
+) -> bool:
+    """Whether a status record belongs to the launched Claude session.
+
+    When we know Claude's own session uuid (captured by the bridge from
+    hook events), require an exact match. When we don't yet (the first
+    hook has not fired), accept any interactive record — the pid-keyed
+    lookup already scoped it to this process.
+
+    :param record: A parsed ``<pid>.json`` object.
+    :param expected_session_id: Claude session uuid to match, or ``None``
+        to skip the cross-check.
+    :returns: ``True`` when the record is a usable match.
+    """
+    if record.get("kind") != "interactive":
+        return False
+    if expected_session_id is None:
+        return True
+    return record.get("sessionId") == expected_session_id
+
+
+def resolve_status_file(
+    *,
+    pane_pid: int | None,
+    expected_session_id: str | None,
+    config_dir: Path | None = None,
+    now: float | None = None,
+) -> Path | None:
+    """Resolve the status file for a launched Claude session.
+
+    Resolution order:
+
+    1. **Pid lookup** (``<pane_pid>.json``): on the omnigent launch path
+       tmux ``exec``s ``claude`` as the pane process, so the file's pid
+       equals ``#{pane_pid}``. This is the common O(1) case.
+    2. **SessionId scan**: if the pid file is absent or fails the
+       cross-check (e.g. a shell/sandbox wrapper sits between the pane and
+       ``claude``), scan recent files for a matching ``sessionId``. Only
+       runs when ``expected_session_id`` is known, bounded to files
+       modified within :data:`_SCAN_FRESHNESS_WINDOW_S`.
+
+    :param pane_pid: The tmux pane pid, or ``None`` when unknown.
+    :param expected_session_id: Claude session uuid from the bridge, or
+        ``None`` before the first hook reports it.
+    :param config_dir: Explicit Claude config dir override (tests).
+    :param now: Monotonic-independent wall clock override (tests); uses
+        :func:`time.time` when ``None``.
+    :returns: The resolved file path, or ``None`` when no confident match
+        exists yet (caller falls back to the PTY watcher).
+    """
+    directory = sessions_dir(config_dir)
+
+    if pane_pid is not None:
+        candidate = directory / f"{pane_pid}.json"
+        record = _read_json_file(candidate)
+        if record is not None and _matches_session(
+            record, expected_session_id=expected_session_id
+        ):
+            return candidate
+
+    if expected_session_id is None:
+        return None
+
+    clock = time.time() if now is None else now
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.suffix != ".json":
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if clock - mtime > _SCAN_FRESHNESS_WINDOW_S:
+            continue
+        record = _read_json_file(entry)
+        if record is not None and _matches_session(
+            record, expected_session_id=expected_session_id
+        ):
+            return entry
+    return None
+
+
+def read_session_status(path: Path) -> SessionStatus | None:
+    """Read a resolved status file and map it to the runner vocabulary.
+
+    :param path: A status file previously returned by
+        :func:`resolve_status_file`.
+    :returns: The mapped :class:`SessionStatus`, or ``None`` when the file
+        is missing, unreadable, or carries no recognized ``status`` (the
+        caller keeps its previous status and retries next tick).
+    """
+    record = _read_json_file(path)
+    if record is None:
+        return None
+    raw_status = record.get("status")
+    if not isinstance(raw_status, str):
+        return None
+    runner_status = _STATUS_TO_RUNNER.get(raw_status)
+    if runner_status is None:
+        return None
+    updated = record.get("statusUpdatedAt")
+    status_updated_at = updated if isinstance(updated, int) else None
+    return SessionStatus(
+        runner_status=runner_status,
+        raw_status=raw_status,
+        status_updated_at=status_updated_at,
+    )
+
+
+# Attempts to resolve the file before giving up and leaving the PTY
+# watcher authoritative for the session's lifetime. At the claude-native
+# poll cadence (~0.2s) this is a few seconds — long enough for a booting
+# Claude to write its file and for the first hook to report the session
+# id, short enough that an old Claude (pre-v2.1.139, no file) or a broken
+# config dir falls back promptly without scanning forever.
+_MAX_RESOLVE_ATTEMPTS = 40
+
+
+class SessionStatusPoller:
+    """Per-tick reader that turns the status file into status edges.
+
+    Owns the small amount of state the claude-native watcher needs across
+    ticks: the lazily-resolved file path, an mtime short-circuit so an
+    unchanged file costs one ``stat``, and edge-deduping so a status
+    callback fires only on ``running`` ⇄ ``idle`` transitions.
+
+    Lifecycle, all on the single watcher thread (no lock needed):
+
+    - **Resolving:** each :meth:`tick` retries :func:`resolve_status_file`
+      until it locks on or :data:`_MAX_RESOLVE_ATTEMPTS` is exhausted.
+      While resolving, :attr:`active` is ``False`` and the caller keeps
+      the PTY watcher authoritative for status.
+    - **Active:** once resolved, :attr:`active` is ``True`` (the caller
+      mutes PTY-derived status) and each tick reads the file and fires the
+      callback on a changed runner status.
+    - **Exhausted:** if resolution never succeeds, :attr:`active` stays
+      ``False`` permanently and the PTY watcher remains the status source.
+
+    :param on_status: Callback invoked with :data:`RUNNING` / :data:`IDLE`
+        on each status transition (and once on first read). Must not block
+        the watcher thread for long.
+    :param pane_pid_getter: Returns the terminal's current pane pid, or
+        ``None``. Called during resolution; on the omnigent launch path
+        this pid names the status file.
+    :param session_id_getter: Returns Claude's own session uuid once the
+        bridge has captured it, or ``None`` before the first hook. Used to
+        cross-check the pid file and to scan as a fallback.
+    :param config_dir: Explicit Claude config dir override (tests).
+    """
+
+    def __init__(
+        self,
+        *,
+        on_status: Callable[[str], None],
+        pane_pid_getter: Callable[[], int | None],
+        session_id_getter: Callable[[], str | None],
+        config_dir: Path | None = None,
+    ) -> None:
+        self._on_status = on_status
+        self._pane_pid_getter = pane_pid_getter
+        self._session_id_getter = session_id_getter
+        self._config_dir = config_dir
+        self._path: Path | None = None
+        self._attempts = 0
+        self._exhausted = False
+        self._last_mtime: float | None = None
+        self._last_runner_status: str | None = None
+
+    @property
+    def active(self) -> bool:
+        """Whether the file is currently the authoritative status source.
+
+        ``True`` only while a resolved file is still being read. The caller
+        reads this to decide whether to suppress the PTY-derived status
+        edges (file is authoritative) or keep them (still resolving, gave
+        up, or the file vanished). Goes back to ``False`` once the file
+        disappears — clean exit unlinks it — so the PTY watcher cleanly
+        reclaims status and exit detection.
+        """
+        return self._path is not None and not self._exhausted
+
+    def tick(self) -> None:
+        """Advance one poll: resolve if needed, then publish on change.
+
+        Safe to call every poll; a no-op once resolution is exhausted, and
+        an unchanged active file costs a single ``stat``.
+        """
+        if self._exhausted:
+            return
+        if self._path is None:
+            self._try_resolve()
+            if self._path is None:
+                return
+        self._read_and_publish()
+
+    def _try_resolve(self) -> None:
+        """Attempt one resolution, retiring to the PTY watcher on timeout."""
+        self._attempts += 1
+        path = resolve_status_file(
+            pane_pid=self._pane_pid_getter(),
+            expected_session_id=self._session_id_getter(),
+            config_dir=self._config_dir,
+        )
+        if path is not None:
+            self._path = path
+            return
+        if self._attempts >= _MAX_RESOLVE_ATTEMPTS:
+            self._exhausted = True
+
+    def _read_and_publish(self) -> None:
+        """Read the resolved file and fire the callback on a status change."""
+        assert self._path is not None
+        try:
+            mtime = self._path.stat().st_mtime
+        except OSError:
+            # File vanished (clean exit unlinks it, or a crash). Exit
+            # detection rides the PTY watcher, so just stop polling.
+            self._exhausted = True
+            return
+        if self._last_mtime is not None and mtime == self._last_mtime:
+            return
+        self._last_mtime = mtime
+        status = read_session_status(self._path)
+        if status is None:
+            return
+        if status.runner_status == self._last_runner_status:
+            return
+        self._last_runner_status = status.runner_status
+        self._on_status(status.runner_status)

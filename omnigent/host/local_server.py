@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import click
-import psutil
+import psutil  # type: ignore[import-untyped]
 
 from omnigent.config import global_config_path
 from omnigent.inner import _proc
@@ -146,7 +146,7 @@ def _pid_alive(pid: int) -> bool:
     :returns: ``True`` if the process exists and is not a zombie.
     """
     try:
-        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        return bool(psutil.Process(pid).status() != psutil.STATUS_ZOMBIE)
     except psutil.NoSuchProcess:
         # Includes psutil.ZombieProcess (a NoSuchProcess subclass), raised
         # on platforms where a zombie's status cannot be queried at all.
@@ -648,7 +648,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
 
     try:
         with child_logging_popen_kwargs(child_env) as logging_kwargs:
-            proc = subprocess.Popen(
+            proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",

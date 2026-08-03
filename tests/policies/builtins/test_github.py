@@ -26,7 +26,13 @@ from typing import Any
 
 import pytest
 
+from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins.github import _DEFAULT_SHELL_TOOLS as _github_default_shell_tools
 from omnigent.policies.builtins.github import github_policy
+from omnigent.policies.builtins.orchestration import _SHELL_TOOLS as _orchestration_shell_tools
+from omnigent.policies.builtins.working_dir import (
+    _DEFAULT_SHELL_TOOLS as _working_dir_default_shell_tools,
+)
 from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.registry import get_registry, load_registry, validate_factory_params
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
@@ -332,6 +338,34 @@ def test_shell_push_to_url_repo_denied() -> None:
     policy = github_policy(write_repos=[_REPO])
     result = policy(_sh("git push https://github.com/octo/secret main"))
     assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize("tool", sorted(SHELL_TOOLS))
+def test_shell_surface_covers_every_harness(tool: str) -> None:
+    """Every harness's shell tool is inspected by default, not just sys_os_shell.
+
+    Most ``git push`` runs on a native harness, so a default of
+    ``("sys_os_shell",)`` left this policy inspecting nothing at all on the
+    sessions that matter: an admin setting ``write_repos`` got an enforcement
+    boundary that silently did not exist. An ALLOW here means that harness's
+    shell surface is uninspected again.
+
+    :param tool: A shell tool name from the shared default set.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(tc(tool, {"command": "git push https://github.com/octo/secret main"}))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_shell_tool_defaults_match_sibling_policies() -> None:
+    """The three shell-surface policies must gate the same tool names.
+
+    They each carried their own literal and drifted: blast_radius covered all
+    six, working_dir two, github one. Fails if any of them is narrowed again.
+    """
+    assert _github_default_shell_tools is SHELL_TOOLS
+    assert _working_dir_default_shell_tools is SHELL_TOOLS
+    assert _orchestration_shell_tools is SHELL_TOOLS
 
 
 def test_shell_push_bad_branch_denied() -> None:
@@ -696,6 +730,108 @@ def test_shell_gh_ignore_groups_abstain(command: str) -> None:
     """
     policy = github_policy(read_all=False, read_repos=[_REPO], write_repos=[_REPO])
     assert policy(_sh(command)) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Layer 1 — destructive operation gating
+# ══════════════════════════════════════════════════════════════════════════════
+
+# -- MCP destructive tools --
+
+
+@pytest.mark.parametrize("tool", ["delete_file", "delete_branch", "delete_release"])
+def test_mcp_destructive_denied_by_default(tool: str) -> None:
+    """Destructive MCP tools are denied by default even on allowed repos."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(tc(f"mcp__github__{tool}", {"owner": "octo", "repo": "hello"}))
+    assert result is not None and result["result"] == "DENY"
+    assert "destructive" in result.get("reason", "").lower()
+
+
+@pytest.mark.parametrize("tool", ["delete_file", "delete_branch", "delete_release"])
+def test_mcp_destructive_allowed_when_opted_in(tool: str) -> None:
+    """allow_destructive=True lets destructive MCP tools through normal write gating."""
+    policy = github_policy(write_repos=["octo/hello"], allow_destructive=True)
+    assert policy(tc(f"mcp__github__{tool}", {"owner": "octo", "repo": "hello"})) is None
+
+
+def test_mcp_non_destructive_write_unaffected() -> None:
+    """Normal MCP writes (create_issue, push_files) are not gated by allow_destructive."""
+    policy = github_policy(write_repos=["octo/hello"])
+    assert policy(tc("mcp__github__create_issue", {"owner": "octo", "repo": "hello"})) is None
+    assert policy(tc("mcp__github__push_files", {"owner": "octo", "repo": "hello"})) is None
+
+
+# -- Shell: git push --delete / :refspec --
+
+
+def test_shell_git_push_delete_flag_denied() -> None:
+    """git push --delete is denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello --delete feature"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_shell_git_push_colon_refspec_denied() -> None:
+    """git push origin :branch (delete via empty refspec) is denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello :feature"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_shell_git_push_delete_allowed_when_opted_in() -> None:
+    """allow_destructive=True lets delete-push through."""
+    policy = github_policy(write_repos=["octo/hello"], allow_destructive=True)
+    assert policy(_sh("git push https://github.com/octo/hello --delete feature")) is None
+
+
+# -- Shell: gh CLI delete actions --
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh repo delete octo/hello --yes",
+        "gh release delete v1.0 --repo octo/hello",
+        "gh issue delete 5 --repo octo/hello",
+        "gh gist delete abc123",
+        "gh cache delete --all --repo octo/hello",
+        "gh codespace delete --repo octo/hello",
+        "gh project delete 1 --repo octo/hello",
+        "gh project item-delete 1 --repo octo/hello",
+        "gh secret delete FOO --repo octo/hello",
+        "gh label delete bug --repo octo/hello",
+        "gh run delete 123 --repo octo/hello",
+        "gh variable delete FOO --repo octo/hello",
+        "gh ssh-key delete 123",
+        "gh gpg-key delete 123",
+    ],
+)
+def test_shell_gh_delete_actions_denied_by_default(command: str) -> None:
+    """gh delete actions are denied by default even on allowed repos."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh(command))
+    assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh repo delete --repo octo/hello --yes",
+        "gh issue delete 5 --repo octo/hello",
+    ],
+)
+def test_shell_gh_delete_allowed_when_opted_in(command: str) -> None:
+    """allow_destructive=True lets gh delete actions through normal write gating."""
+    policy = github_policy(write_repos=["octo/hello"], allow_destructive=True)
+    assert policy(_sh(command)) is None
+
+
+def test_shell_gh_non_delete_write_unaffected() -> None:
+    """gh create/edit actions are not gated by allow_destructive."""
+    policy = github_policy(write_repos=["octo/hello"])
+    assert policy(_sh("gh pr create --repo octo/hello --base main")) is None
+    assert policy(_sh("gh issue create --repo octo/hello")) is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

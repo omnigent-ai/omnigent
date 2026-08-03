@@ -13,7 +13,8 @@ module at most once.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeAlias, cast
 
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -21,22 +22,24 @@ from omnigent.harness_plugins import (
     native_provider_for_key,
 )
 
-_RESOLVE_CACHE: dict[str, Any] = {}
+# Provider hooks intentionally have unrelated sync and async signatures.
+_NativeHook: TypeAlias = Callable[..., Any]  # type: ignore[explicit-any]
 
 
-def resolve(import_path: str) -> Any:
-    """Resolve a ``module:attr`` / ``module.attr`` path to its object, cached.
+def resolve(import_path: str) -> object:
+    """Resolve a ``module:attr`` / ``module.attr`` path to its object.
 
-    Thin caching wrapper over :func:`omnigent.harness_plugins.load_object`.
+    Thin wrapper over :func:`omnigent.harness_plugins.load_object`. Deliberately
+    *not* cached: native dispatch happens at most once per resume/launch/seed —
+    never in a hot loop — and the underlying ``importlib.import_module`` already
+    caches the module in ``sys.modules``, so the only repeated cost is a cheap
+    ``getattr``. Resolving fresh keeps ``monkeypatch.setattr("...:run_x", ...)``
+    working, which caching would silently defeat by pinning the pre-patch object.
     """
-    cached = _RESOLVE_CACHE.get(import_path)
-    if cached is None:
-        cached = load_object(import_path)
-        _RESOLVE_CACHE[import_path] = cached
-    return cached
+    return load_object(import_path)
 
 
-def resolve_hook(provider: NativeHarnessProvider, hook: str) -> Any | None:
+def resolve_hook(provider: NativeHarnessProvider, hook: str) -> _NativeHook | None:
     """Resolve one named hook on a provider, or ``None`` if it is unset.
 
     ``hook`` is a field name on :class:`NativeHarnessProvider` (e.g.
@@ -47,17 +50,15 @@ def resolve_hook(provider: NativeHarnessProvider, hook: str) -> Any | None:
     import_path = getattr(provider, hook)
     if import_path is None:
         return None
-    return resolve(import_path)
+    resolved = resolve(import_path)
+    if not callable(resolved):
+        raise TypeError(f"native provider hook {import_path!r} is not callable")
+    return cast(_NativeHook, resolved)
 
 
-def resolve_hook_for_key(key: str, hook: str) -> Any | None:
+def resolve_hook_for_key(key: str, hook: str) -> _NativeHook | None:
     """Resolve a hook by native-agent ``key``, or ``None`` if unknown/unset."""
     provider = native_provider_for_key(key)
     if provider is None:
         return None
     return resolve_hook(provider, hook)
-
-
-def reset_resolve_cache_for_tests() -> None:
-    """Clear the per-path resolution cache."""
-    _RESOLVE_CACHE.clear()

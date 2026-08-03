@@ -135,7 +135,7 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
 
     assert "Usage: python -m omnigent [OPTIONS] COMMAND [ARGS]..." in result.stdout
     assert "Commands:" in result.stdout
-    assert "run" in result.stdout and "Attach the REPL to a LIVE session" in result.stdout
+    assert "run" in result.stdout and "Attach the REPL to a live session" in result.stdout
     assert "Omnigent quick chat" not in result.stdout
 
 
@@ -432,7 +432,7 @@ def test_claude_command_resume_binds_session_and_passes_unknown_args(
     # there).
     assert captured["server"] == "https://example.com"
     assert captured["session_id"] == "conv_abc"
-    assert captured["claude_args"] == ("--resume", "claude-session", "-p", "say hi")
+    assert captured["extra_args"] == ("--resume", "claude-session", "-p", "say hi")
     # No picker requested when ``--resume`` carries a value.
     assert captured["resume_picker"] is False
     # Default: Databricks auth is active (``--use-native-config`` not set) —
@@ -465,7 +465,7 @@ def test_claude_command_short_r_binds_omnigent_session(
     assert result.exit_code == 0, result.output
     assert captured["session_id"] == "conv_abc"
     # ``-r <conv_id>`` consumes both tokens; no leftover claude args.
-    assert captured["claude_args"] == ()
+    assert captured["extra_args"] == ()
     assert captured["resume_picker"] is False
 
 
@@ -662,7 +662,7 @@ def test_codex_command_resume_binds_session_and_passes_unknown_args(
     assert result.exit_code == 0, result.output
     assert captured["server"] == "https://example.com"
     assert captured["session_id"] == "conv_abc"
-    assert captured["codex_args"] == ("-c", "approval_policy=on-request")
+    assert captured["extra_args"] == ("-c", "approval_policy=on-request")
     assert captured["model"] == "gpt-test"
     assert captured["prompt"] == "say hi"
     assert captured["resume_picker"] is False
@@ -876,7 +876,7 @@ def test_codex_config_args_form_base_cli_args_append(
     result = CliRunner().invoke(cli, ["codex", "--dangerously-skip-permissions"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == (
+    assert captured["extra_args"] == (
         "--config",
         "k=v",
         "--dangerously-skip-permissions",
@@ -901,7 +901,7 @@ def test_codex_config_args_only_when_no_cli_args(
     result = CliRunner().invoke(cli, ["codex"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == ("--verbose",)
+    assert captured["extra_args"] == ("--verbose",)
 
 
 def test_codex_args_no_config_is_cli_args_only(
@@ -919,7 +919,7 @@ def test_codex_args_no_config_is_cli_args_only(
     result = CliRunner().invoke(cli, ["codex", "--flag"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == ("--flag",)
+    assert captured["extra_args"] == ("--flag",)
 
 
 def test_pi_config_args_form_base_cli_args_append(
@@ -940,7 +940,7 @@ def test_pi_config_args_form_base_cli_args_append(
     result = CliRunner().invoke(cli, ["pi", "--cli-flag"])
 
     assert result.exit_code == 0, result.output
-    assert captured["pi_args"] == ("--base", "--cli-flag")
+    assert captured["extra_args"] == ("--base", "--cli-flag")
 
 
 def test_kiro_command_is_registered_in_click_help() -> None:
@@ -950,6 +950,71 @@ def test_kiro_command_is_registered_in_click_help() -> None:
     assert result.exit_code == 0, result.output
     assert "kiro" in _CLICK_SUBCOMMANDS
     assert "kiro" in result.output
+
+
+def test_help_groups_harnesses_and_other_commands() -> None:
+    """``--help`` lists a ``Harnesses`` section separate from ``Commands``."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "Harnesses:" in result.output
+    assert "Commands:" in result.output
+    # A harness launcher lands under Harnesses; a management command
+    # lands under Commands (both after their respective headings).
+    harnesses_at = result.output.index("Harnesses:")
+    commands_at = result.output.index("Commands:", harnesses_at)
+    assert harnesses_at < result.output.index("claude") < commands_at
+    assert commands_at < result.output.index("server")
+
+
+def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
+    """The ``update`` alias is omitted from --help but stays registered."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "upgrade" in result.output
+    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
+    assert "\n  update " not in result.output
+    # ...but it's still a real, invokable command.
+    assert cli.commands["update"] is cli.commands["upgrade"]
+
+
+def test_help_hides_extras_gated_harness_when_sdk_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor/antigravity drop out of the harness list; a notice replaces them."""
+    monkeypatch.setattr(
+        "omnigent.cli._harness_extra_checks",
+        lambda: {"cursor": lambda: False, "antigravity": lambda: False},
+    )
+
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    # Not listed as launchable harnesses...
+    assert "Launch Cursor with Omnigent" not in result.output
+    assert "Launch Antigravity" not in result.output
+    # ...but a generic notice points at setup instead.
+    assert "Some harnesses need an optional extra" in result.output
+    # Still a real, registered command — only the listing is suppressed.
+    assert "cursor" in _CLICK_SUBCOMMANDS
+
+
+def test_help_shows_extras_gated_harness_when_sdk_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor/antigravity appear in --help once their extra is importable."""
+    monkeypatch.setattr(
+        "omnigent.cli._harness_extra_checks",
+        lambda: {"cursor": lambda: True, "antigravity": lambda: True},
+    )
+
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "cursor" in result.output
+    assert "antigravity" in result.output
+    assert "Some harnesses need an optional extra" not in result.output
 
 
 def test_kiro_command_parses_native_options_and_prompt(
@@ -988,7 +1053,7 @@ def test_kiro_command_parses_native_options_and_prompt(
     assert captured["resume_picker"] is False
     assert captured["model"] == "auto"
     assert captured["prompt"] == "hi"
-    assert captured["kiro_args"] == (
+    assert captured["extra_args"] == (
         "--effort",
         "high",
         "--agent",
@@ -5453,57 +5518,57 @@ def test_native_terminal_dispatch_specs_cover_registered_native_agents() -> None
         (
             "claude-native",
             "omnigent.claude_native.run_claude_native",
-            {"claude_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "codex-native",
             "omnigent.codex_native.run_codex_native",
-            {"codex_args": (), "model": "native-model"},
+            {"extra_args": (), "model": "native-model"},
         ),
         (
             "pi-native",
             "omnigent.pi_native.run_pi_native",
-            {"pi_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "opencode-native",
             "omnigent.opencode_native.run_opencode_native",
-            {"opencode_args": (), "model": "native-model"},
+            {"extra_args": (), "model": "native-model"},
         ),
         (
             "cursor-native",
             "omnigent.cursor_native.run_cursor_native",
-            {"cursor_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "kimi-native",
             "omnigent.kimi_native.run_kimi_native",
-            {"kimi_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "kiro-native",
             "omnigent.kiro_native.run_kiro_native",
-            {"kiro_args": (), "model": "native-model", "prompt": None},
+            {"extra_args": (), "model": "native-model", "prompt": None},
         ),
         (
             "goose-native",
             "omnigent.goose_native.run_goose_native",
-            {"goose_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "antigravity-native",
             "omnigent.antigravity_native.run_antigravity_native",
-            {"antigravity_args": (), "model": "native-model"},
+            {"extra_args": (), "model": "native-model"},
         ),
         (
             "qwen-native",
             "omnigent.qwen_native.run_qwen_native",
-            {"qwen_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
         (
             "hermes-native",
             "omnigent.hermes_native.run_hermes_native",
-            {"hermes_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model")},
         ),
     ],
 )
@@ -5570,7 +5635,7 @@ def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
         "session_id": "conv_abc123",
         "resume_picker": False,
         "auto_open_conversation": True,
-        "cursor_args": ("--model", "composer-2.5"),
+        "extra_args": ("--model", "composer-2.5"),
     }
 
 
@@ -5600,7 +5665,7 @@ def test_dispatch_native_terminal_harness_kiro_launches_wrapper(
         "session_id": None,
         "resume_picker": True,
         "auto_open_conversation": True,
-        "kiro_args": (),
+        "extra_args": (),
         "model": "auto",
         "prompt": None,
     }
@@ -5628,9 +5693,9 @@ def test_dispatch_native_terminal_harness_kiro_forwards_prompt(
 @pytest.mark.parametrize(
     ("harness", "target", "args_param"),
     [
-        ("goose-native", "omnigent.goose_native.run_goose_native", "goose_args"),
-        ("qwen-native", "omnigent.qwen_native.run_qwen_native", "qwen_args"),
-        ("hermes-native", "omnigent.hermes_native.run_hermes_native", "hermes_args"),
+        ("goose-native", "omnigent.goose_native.run_goose_native", "extra_args"),
+        ("qwen-native", "omnigent.qwen_native.run_qwen_native", "extra_args"),
+        ("hermes-native", "omnigent.hermes_native.run_hermes_native", "extra_args"),
     ],
 )
 @pytest.mark.parametrize(

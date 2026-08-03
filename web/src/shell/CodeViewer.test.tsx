@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import { CodeViewer } from "./CodeViewer";
@@ -296,6 +296,21 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
   it("renders fenced code blocks", () => {
     const { container } = renderMd("```js\nconst x = 1;\n```");
     expect(container.querySelector("pre code")?.textContent).toContain("const x = 1;");
+  });
+
+  it("renders raw HTML pre blocks without treating them as Mermaid fences", () => {
+    const { container } = renderMd("<pre>literal raw pre</pre>");
+    expect(container.querySelector("pre")?.textContent).toBe("literal raw pre");
+    expect(screen.queryByTestId("mermaid-preview")).toBeNull();
+  });
+
+  it("renders Mermaid fences as diagrams instead of plain code", async () => {
+    const { container } = renderMd("```mermaid\nflowchart LR\n  A --> B\n```");
+    expect(screen.getByTestId("mermaid-preview")).toBeDefined();
+    expect(container.querySelector("pre > code.language-mermaid")).toBeNull();
+    await waitFor(() =>
+      expect(container.querySelector("[data-testid='mermaid-preview'] svg")).not.toBeNull(),
+    );
   });
 
   it("renders blockquotes", () => {

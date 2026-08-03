@@ -46,6 +46,7 @@ import yaml
 from click.testing import CliRunner
 
 from omnigent.cli import cli
+from omnigent.onboarding import providers as provider_catalog
 from omnigent.onboarding import secrets
 from omnigent.onboarding.configure_models import (
     add_menu_options,
@@ -134,6 +135,38 @@ def _harnesses_installed(monkeypatch):
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_logged_in",
         lambda family: True,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide deterministic live-catalog defaults for interactive setup tests."""
+    catalogs = {
+        "anthropic": {
+            "models": {
+                "claude-sonnet-4-6": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "openai": {
+            "models": {
+                "gpt-5.5": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "openrouter": {
+            "models": {
+                "moonshotai/kimi-k2.6": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "xai": {
+            "models": {
+                "grok-3": {"mode": "chat", "capabilities": {}},
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider_catalog,
+        "_fetch_provider_catalog",
+        lambda provider: catalogs.get(provider, {}),
     )
 
 
@@ -1720,6 +1753,33 @@ def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypat
     assert "Add custom ACP agent" in names
     # Once agents exist, the single opaque "Custom ACP agent" row is gone.
     assert "Custom ACP agent" not in names
+
+
+def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "OpenClaw",
+                            "command": "openclaw acp",
+                            "omnigent_mcp": "false",
+                        }
+                    ]
+                }
+            },
+            f,
+        )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+
+    assert result.exit_code != 0
+    assert (
+        "Invalid acp.agents configuration: acp agent omnigent_mcp must be a boolean"
+        in result.output
+    )
 
 
 def test_overview_always_lists_openclaw_import_row(isolated_config, monkeypatch) -> None:

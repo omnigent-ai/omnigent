@@ -81,6 +81,7 @@ import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
   useArchiveConversation,
@@ -197,6 +198,10 @@ export function SettingsPage() {
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
   const { section } = useSettingsRoute();
+  // Per-section page view: `settings.appearance`, `settings.account`, etc. The
+  // hook re-keys on pathname, so switching sections re-fires under the new id.
+  // `section` is a closed SettingsSectionId union (no PII / unbounded values).
+  useOmnigentPageView(`settings.${section}`);
 
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
@@ -1825,6 +1830,26 @@ function selectValueToProject(value: string): string | undefined {
   return value.slice(PROJECT_VALUE_PREFIX.length);
 }
 
+function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
+  const date = new Date(timestampSec * 1000);
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  const yesterday = new Date(startOfToday);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const sevenDaysAgo = new Date(startOfToday);
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+  const thirtyDaysAgo = new Date(startOfToday);
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  if (date >= startOfToday) return "Today";
+  if (date >= yesterday) return "Yesterday";
+  if (date >= sevenDaysAgo) return "Previous 7 days";
+  if (date >= thirtyDaysAgo) return "Previous 30 days";
+  return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
 function ArchivedSection() {
   // `undefined` = all projects; a name scopes the list to that project.
   const [project, setProject] = useState<string | undefined>(undefined);
@@ -1858,6 +1883,21 @@ function ArchivedSection() {
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],
   );
+
+  const groupedArchived = useMemo(() => {
+    const now = new Date();
+    const groups: { label: string; conversations: typeof archived }[] = [];
+    let currentLabel = "";
+    for (const conv of archived) {
+      const label = dateGroupLabel(conv.updated_at, now);
+      if (label !== currentLabel) {
+        currentLabel = label;
+        groups.push({ label, conversations: [] });
+      }
+      groups[groups.length - 1].conversations.push(conv);
+    }
+    return groups;
+  }, [archived]);
 
   // Keep a picked project listed even if it drops out of the option set (its
   // last archived session was just unarchived) so the trigger never shows a
@@ -1914,11 +1954,20 @@ function ArchivedSection() {
       ) : (
         <>
           {archived.length > 0 && (
-            <ul className="flex flex-col gap-0.5">
-              {archived.map((conv) => (
-                <ArchivedRow key={conv.id} conversation={conv} />
+            <div className="flex flex-col gap-4">
+              {groupedArchived.map((group) => (
+                <div key={group.label}>
+                  <h3 className="mb-1 px-3 text-xs font-medium text-muted-foreground">
+                    {group.label}
+                  </h3>
+                  <ul className="flex flex-col gap-0.5">
+                    {group.conversations.map((conv) => (
+                      <ArchivedRow key={conv.id} conversation={conv} />
+                    ))}
+                  </ul>
+                </div>
               ))}
-            </ul>
+            </div>
           )}
           {archived.length === 0 && (
             // The list fetches a mixed page (active + archived rows) and filters

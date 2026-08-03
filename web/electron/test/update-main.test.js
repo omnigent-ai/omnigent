@@ -138,7 +138,7 @@ function loadMainHarness({
   // into the menu, the IPC surface, and the before-quit install handoff.
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    '\nmodule.exports.__test = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
+    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
 
   const module = { exports: {} };
   const sandbox = {
@@ -174,14 +174,14 @@ function loadMainHarness({
   };
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
-  module.exports.__test.windows.set(win, {
+  module.exports.testApi.windows.set(win, {
     origin: "https://server.example",
     serverUrl: "https://server.example/app",
     badgeCount: 0,
   });
 
   return {
-    api: module.exports.__test,
+    api: module.exports.testApi,
     appEvents,
     autoUpdater,
     calls,
@@ -196,7 +196,9 @@ function loadMainHarness({
 }
 
 async function flushPromises() {
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => {
+    setImmediate(resolve);
+  });
 }
 
 function plain(value) {
@@ -262,13 +264,15 @@ describe("auto-update main-process wiring", () => {
       ["omnigent:update-install", []],
       ["omnigent:set-update-config", [{ mode: "manual" }]],
     ];
-    for (const [channel, args] of cases) {
-      const handler = harness.ipcHandlers.get(channel);
-      await assert.rejects(
-        Promise.resolve().then(() => handler(harness.events.unpinned, ...args)),
-        /connected server page/,
-      );
-    }
+    await Promise.all(
+      cases.map(([channel, args]) => {
+        const handler = harness.ipcHandlers.get(channel);
+        return assert.rejects(
+          Promise.resolve().then(() => handler(harness.events.unpinned, ...args)),
+          /connected server page/,
+        );
+      }),
+    );
   });
 
   it("prompts for every privileged update channel before running it", async (t) => {
@@ -305,6 +309,8 @@ describe("auto-update main-process wiring", () => {
       },
     ];
 
+    // Harnesses install process-level module mocks and must run one at a time.
+    /* oxlint-disable no-await-in-loop */
     for (const item of cases) {
       const harness = loadMainHarness({
         forceDevUpdateConfig: true,
@@ -327,6 +333,7 @@ describe("auto-update main-process wiring", () => {
       ]);
       item.assertRan(harness);
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("does not let a cached hosting grant bypass update-control consent", async (t) => {
@@ -360,6 +367,8 @@ describe("auto-update main-process wiring", () => {
       },
     ];
 
+    // Harnesses install process-level module mocks and must run one at a time.
+    /* oxlint-disable no-await-in-loop */
     for (const item of cases) {
       const harness = loadMainHarness({
         forceDevUpdateConfig: true,
@@ -382,6 +391,7 @@ describe("auto-update main-process wiring", () => {
       assert.equal(harness.calls.showMessageBox.length, 1, item.channel);
       item.assertBlocked(harness);
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("routes approved update-install through before-quit cleanup to quitAndInstall", async (t) => {
@@ -436,7 +446,9 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.appQuit, 1); // still no re-issued quit
     assert.equal(harness.calls.appExit, 0); // fallback not fired yet
 
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
     assert.equal(harness.calls.appExit, 1); // fallback forced the exit
     assert.equal(harness.calls.appQuit, 1); // never re-issued
   });
@@ -462,7 +474,9 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.appQuit, 0); // shutdown hung, no re-issued quit
     assert.equal(harness.calls.appExit, 0); // cap not fired yet
 
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
     assert.equal(harness.calls.appExit, 1); // cap forced the exit
     assert.equal(harness.calls.appQuit, 0); // never re-issued
   });

@@ -55,6 +55,10 @@ def _wheel_install(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.1.0")
     monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
     monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _uv_registry_info)
+    # Pretend a uv tool receipt exists so the install is not mistaken for uv pip.
+    monkeypatch.setattr(
+        "omnigent.update_check._uv_tool_receipt_path", lambda: Path("/dev/null/uv-receipt.toml")
+    )
     # Neutralize the process side effects unless a test opts in to assert them.
     monkeypatch.setattr(
         "omnigent.cli.local_server_status",
@@ -656,3 +660,89 @@ def test_upgrade_nightly_no_tags_is_actionable(
 
     assert result.exit_code != 0, result.output
     assert "Couldn't find a nightly tag" in result.output
+
+
+def test_nightly_suggestion_preserves_and_unions_extras() -> None:
+    """Receipt extras union with --extra overrides, as an egg fragment on the spec."""
+    info = _InstalledWheelInfo(
+        install_time_epoch=0.0,
+        installer="uv",
+        vcs_url=None,
+        commit_sha=None,
+        is_editable=False,
+        package_version="0.1.0",
+        detected_installer="uv",
+        extras=("all",),
+    )
+
+    suggestion = _build_nightly_upgrade_suggestion(
+        info, "0.9.0.dev20260804", extra_overrides=("server",)
+    )
+
+    assert suggestion.runnable
+    assert suggestion.command == (
+        "uv tool install --force "
+        "git+https://github.com/omnigent-ai/omnigent@v0.9.0.dev20260804#egg=omnigent[all,server]"
+    )
+
+
+def test_upgrade_nightly_refuses_registry_pip(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """A registry pip install → manual git command, exit 0, installer never runs."""
+    pip_info = _InstalledWheelInfo(
+        install_time_epoch=0.0,
+        installer="pip",
+        vcs_url=None,
+        commit_sha=None,
+        is_editable=False,
+        package_version="0.1.0",
+        detected_installer="pip",
+    )
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: pip_info)
+    monkeypatch.setattr(
+        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+    )
+
+    def _must_not_run(*_a: object, **_k: object) -> int:
+        raise AssertionError("refused install shape must not run the installer")
+
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+
+    result = CliRunner().invoke(cli, ["upgrade", "--nightly"])
+
+    assert result.exit_code == 0, result.output
+    assert "install the nightly manually" in result.output
+    assert "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804" in result.output
+
+
+def test_upgrade_nightly_dry_run_prints_without_running(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """``--nightly --dry-run`` prints the command and exits before any side effects."""
+    monkeypatch.setattr(
+        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+    )
+
+    def _must_not_run(*_a: object, **_k: object) -> int:
+        raise AssertionError("--dry-run must not run the upgrade")
+
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+
+    result = CliRunner().invoke(cli, ["upgrade", "--nightly", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Would run: uv tool install --force "
+        "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804" in result.output
+    )
+
+
+def test_upgrade_nightly_rejects_target_version(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """``--nightly`` and ``--target-version`` are mutually exclusive flags."""
+    result = CliRunner().invoke(cli, ["upgrade", "--nightly", "--target-version", "0.9.0"])
+
+    assert result.exit_code == 2, result.output
+    assert "mutually exclusive" in result.output

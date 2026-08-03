@@ -99,6 +99,34 @@ describe("UserBubble markdown rendering", () => {
     const cell = await screen.findByText("1", { selector: "td, td *" });
     expect(cell.closest("table")).not.toBeNull();
   });
+
+  it("renders CJK text around explicit inline math", async () => {
+    const { container } = renderBubble(userBubble(String.raw`中文 \(\sqrt{x + 1}\) 文本`));
+
+    await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+    expect(container.textContent).toContain("中文");
+    expect(container.textContent).toContain("文本");
+    const katex = container.querySelector(".katex") as HTMLElement;
+    expect(katex.querySelector(".sqrt")).not.toBeNull();
+    expect(katex.textContent).toContain("x");
+    expect(katex.textContent).toContain("1");
+  });
+});
+
+describe("UserBubble system messages", () => {
+  it("keeps hook order stable when a system message becomes a regular message", () => {
+    const { rerender } = renderBubble(userBubble("[System: timer build fired]"));
+    expect(screen.getByTestId("system-message")).toBeInTheDocument();
+
+    rerender(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={userBubble("build finished")} />
+      </FileViewerContext.Provider>,
+    );
+
+    expect(screen.queryByTestId("system-message")).toBeNull();
+    expect(screen.getByText("build finished")).toBeInTheDocument();
+  });
 });
 
 describe("AssistantBubble lifecycle rendering", () => {

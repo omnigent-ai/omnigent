@@ -36,22 +36,24 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -109,7 +111,7 @@ ToolExecutor: TypeAlias = Callable[[str, ToolArgs], Awaitable[ToolResult]]
 
 # Elicitation handler wired in by :class:`ExecutorAdapter`. Kept SDK-agnostic
 # so the adapter does not import ``claude_agent_sdk`` types.
-ElicitationHandler: TypeAlias = Callable[  # type: ignore[explicit-any]
+ElicitationHandler: TypeAlias = Callable[
     [str, ToolArgs],
     Awaitable[bool],
 ]
@@ -228,7 +230,11 @@ class _ClaudeClient(Protocol):
 
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
-    async def query(self, prompt: str, session_id: str = ...) -> None: ...
+    async def query(
+        self,
+        prompt: str | AsyncIterator[_JsonObject],
+        session_id: str = "",
+    ) -> None: ...
     async def set_model(self, model: str | None) -> None: ...
     async def interrupt(self) -> None: ...
 
@@ -281,6 +287,10 @@ class _TextBlockObj(Protocol):
     text: str
 
 
+class _ThinkingBlockObj(Protocol):
+    thinking: str
+
+
 class _ToolUseBlockObj(Protocol):
     id: str
     name: str
@@ -320,6 +330,7 @@ class _ClaudeSDK(Protocol):
     SystemMessage: type
     ResultMessage: type
     TextBlock: type
+    ThinkingBlock: type
     ToolUseBlock: type
     ToolResultBlock: type
 
@@ -389,14 +400,12 @@ def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
     return value
 
 
-def _text_block(text: str) -> dict[str, Any]:  # type: ignore[explicit-any]
+def _text_block(text: str) -> _JsonObject:
     """Build an Anthropic text content block holding *text*."""
     return {"type": "text", "text": text}
 
 
-def _coalesce_text_blocks(  # type: ignore[explicit-any]
-    blocks: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+def _coalesce_text_blocks(blocks: list[_JsonObject]) -> list[_JsonObject]:
     """
     Merge runs of adjacent text blocks into one newline-joined block.
 
@@ -406,7 +415,7 @@ def _coalesce_text_blocks(  # type: ignore[explicit-any]
     :param blocks: Anthropic content blocks in transcript order.
     :returns: The same sequence with consecutive text blocks merged.
     """
-    merged: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+    merged: list[_JsonObject] = []
     for block in blocks:
         if block.get("type") == "text" and merged and merged[-1].get("type") == "text":
             merged[-1] = _text_block(f"{merged[-1]['text']}\n{block['text']}")
@@ -415,9 +424,7 @@ def _coalesce_text_blocks(  # type: ignore[explicit-any]
     return merged
 
 
-def _structured_history_block(  # type: ignore[explicit-any]
-    block: dict[str, Any],
-) -> dict[str, Any] | None:
+def _structured_history_block(block: _JsonObject) -> _JsonObject | None:
     """
     Convert a resolved history attachment to a real Anthropic block.
 
@@ -437,9 +444,7 @@ def _structured_history_block(  # type: ignore[explicit-any]
     return converted[0] if converted else None
 
 
-def _render_prior_content_blocks(  # type: ignore[explicit-any]
-    content: Any,
-) -> list[dict[str, Any]]:
+def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
     """Render one prior message's content for the ``Conversation so far:``
     replay as Anthropic content blocks.
 
@@ -476,9 +481,10 @@ def _render_prior_content_blocks(  # type: ignore[explicit-any]
     if not isinstance(content, list):
         return [_text_block(json.dumps(_redact_inline_base64(content), ensure_ascii=True))]
 
-    rendered: list[dict[str, Any]] = []  # type: ignore[explicit-any]
-    for block in content:
-        if isinstance(block, dict):
+    rendered: list[_JsonObject] = []
+    for raw_block in content:
+        block = cast(_JsonObject, raw_block) if isinstance(raw_block, dict) else None
+        if block is not None:
             block_type = block.get("type")
             text = block.get("text")
             if block_type in ("input_text", "output_text", "text") and isinstance(text, str):
@@ -508,7 +514,9 @@ def _render_prior_content_blocks(  # type: ignore[explicit-any]
                 rendered.append(_text_block(unresolved_attachment_marker(block)))
                 continue
 
-        rendered.append(_text_block(json.dumps(_redact_inline_base64(block), ensure_ascii=True)))
+        rendered.append(
+            _text_block(json.dumps(_redact_inline_base64(raw_block), ensure_ascii=True))
+        )
     return rendered
 
 
@@ -529,8 +537,8 @@ def _parse_data_uri(uri: str) -> tuple[str, str]:
 
 
 def _to_anthropic_content_blocks(
-    blocks: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    blocks: Sequence[object],
+) -> list[_JsonObject]:
     """
     Convert Responses API content blocks to Anthropic Messages
     API content block format.
@@ -546,8 +554,11 @@ def _to_anthropic_content_blocks(
     :param blocks: Responses API content block dicts.
     :returns: Anthropic API content block dicts.
     """
-    result: list[dict[str, Any]] = []
-    for block in blocks:
+    result: list[_JsonObject] = []
+    for raw_block in blocks:
+        if not isinstance(raw_block, dict):
+            raise ValueError("Anthropic content blocks must be objects")
+        block = cast(_JsonObject, raw_block)
         block_type = block.get("type")
         if block_type in ("input_text", "output_text", "text"):
             result.append({"type": "text", "text": block["text"]})
@@ -621,10 +632,10 @@ def _to_anthropic_content_blocks(
 
 
 async def _multimodal_message_iter(
-    content_blocks: list[dict[str, Any]],
+    content_blocks: list[_JsonObject],
     *,
     session_id: str,
-) -> AsyncIterator[dict[str, Any]]:
+) -> AsyncIterator[_JsonObject]:
     """
     Yield a single structured user message dict for the Claude
     SDK's ``AsyncIterable[dict]`` query path.
@@ -741,8 +752,6 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 # Default model for the Databricks-profile gateway path (no gateway base URL
 # supplied directly), used when no spec/cfg model is set. On the ucode-cached
 # path the Omnigent producer resolves the model instead (see workflow.py).
-_DATABRICKS_CLAUDE_DEFAULT_MODEL = DATABRICKS_CLAUDE_DEFAULT_MODEL
-
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
@@ -1230,12 +1239,12 @@ def prepare_tight_cli_process_path(
             exc,
         )
         return real_cli_path
-
-    if not sandbox.active:
-        return real_cli_path
-    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-    return create_exec_launcher(real_cli_path, sandbox)
+    else:
+        if not sandbox.active:
+            return real_cli_path
+        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+        return create_exec_launcher(real_cli_path, sandbox)
 
 
 @dataclass(frozen=True)
@@ -1563,9 +1572,10 @@ class ClaudeSDKExecutor(Executor):
             self._extra_env[_CLAUDE_API_KEY_HELPER_ENV_KEY] = api_key_helper
 
     def __del__(self) -> None:
-        if getattr(self, "_cli_wrapper_path", None):
+        wrapper_path = getattr(self, "_cli_wrapper_path", None)
+        if isinstance(wrapper_path, str):
             with suppress(Exception):
-                pathlib.Path(self._cli_wrapper_path).unlink(missing_ok=True)
+                pathlib.Path(wrapper_path).unlink(missing_ok=True)
 
     async def _route_options_through_gateway_shim(self, options: SdkOptions) -> None:
         """
@@ -1782,26 +1792,14 @@ class ClaudeSDKExecutor(Executor):
 
     async def enqueue_session_message(
         self,
-        session_key: str,
-        content: str | Message,
+        session_key: str,  # noqa: ARG002
+        content: str | Message,  # noqa: ARG002
     ) -> bool:
-        state = self._clients.get(session_key)
-        if state is None:
-            return False
-        try:
-            if isinstance(content, str):
-                prompt = content
-            else:
-                prompt = json.dumps(content, ensure_ascii=True)
-            await state.client.query(prompt, session_id=session_key)
-            return True
-        except Exception as exc:  # noqa: BLE001 — enqueue returns False on any SDK failure
-            logger.warning(
-                "Claude SDK live message enqueue failed for session %s: %s",
-                session_key,
-                exc,
-            )
-            return False
+        # query() queues a NEW turn on the SDK's stdin; it does not inject
+        # into the turn already running. Returning False lets the adapter's
+        # buffer hold the message and re-deliver it as a continuation turn
+        # once the active turn ends, preserving in-order delivery.
+        return False
 
     @staticmethod
     async def _force_close_client(client: _ClaudeClient) -> None:
@@ -1886,7 +1884,9 @@ class ClaudeSDKExecutor(Executor):
         return True
 
     def supports_live_message_queue(self) -> bool:
-        return True
+        # The SDK has no API to inject into an active turn; claiming this
+        # capability caused the one-turn-behind desync described in #3472.
+        return False
 
     def supports_tool_boundary_interrupt(self) -> bool:
         return True
@@ -1908,8 +1908,8 @@ class ClaudeSDKExecutor(Executor):
         self,
         tool_name: str,
         tool_input: ToolArgs,
-        perm_ctx: Any,  # type: ignore[explicit-any]  # ToolPermissionContext — avoid hard sdk import
-    ) -> Any:  # type: ignore[explicit-any]  # PermissionResult
+        perm_ctx: object,
+    ) -> object:
         """
         Route a Claude SDK permission request through the Omnigent elicitation system.
 
@@ -1955,7 +1955,7 @@ class ClaudeSDKExecutor(Executor):
         self,
         tool_name: str,
         tool_input: ToolArgs,
-    ) -> Any:  # type: ignore[explicit-any]  # PermissionResult | None
+    ) -> object | None:
         """
         Run a pre-execution TOOL_CALL policy evaluation for one tool call.
 
@@ -2050,8 +2050,8 @@ class ClaudeSDKExecutor(Executor):
         self,
         tool_name: str,
         tool_input: ToolArgs,
-        perm_ctx: Any,  # type: ignore[explicit-any]  # ToolPermissionContext
-    ) -> Any:  # type: ignore[explicit-any]  # PermissionResult
+        perm_ctx: object,
+    ) -> object:
         """
         Unified ``options.can_use_tool`` callback for the claude-sdk path.
 
@@ -2183,7 +2183,12 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = _DATABRICKS_CLAUDE_DEFAULT_MODEL
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="claude",
+            )
+            model = resolution.model_id
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
@@ -2405,13 +2410,13 @@ class ClaudeSDKExecutor(Executor):
             if isinstance(prompt, str):
                 _last_user_msg = prompt[:500]
             elif isinstance(prompt, list):
-                _parts = [
-                    b.get("text", "")
-                    for b in prompt
-                    if isinstance(b, dict) and b.get("type") in ("text", "input_text")
-                ]
+                _parts: list[str] = []
+                for block in prompt:
+                    text = block.get("text")
+                    if block.get("type") in ("text", "input_text") and isinstance(text, str):
+                        _parts.append(text)
                 _last_user_msg = " ".join(_parts)[:500]
-            _req_data: dict[str, Any] = {
+            _req_data: _JsonObject = {
                 "model": model,
                 "messages_count": len(prompt) if isinstance(prompt, list) else 1,
                 "tools_count": len(tools),
@@ -2426,7 +2431,7 @@ class ClaudeSDKExecutor(Executor):
 
         try:
             try:
-                sdk_prompt: str | AsyncIterator[dict[str, Any]]
+                sdk_prompt: str | AsyncIterator[_JsonObject]
                 if isinstance(prompt, list):
                     # Multimodal content blocks — send as a
                     # structured message via the SDK's dict path.
@@ -2586,15 +2591,16 @@ class ClaudeSDKExecutor(Executor):
                                     response_text += text_block.text
                                     yield TextChunk(text=text_block.text)
                                 elif isinstance(block, sdk.ThinkingBlock):
+                                    thinking_block = cast(_ThinkingBlockObj, block)
                                     # Non-streaming counterpart of the
                                     # ``thinking_delta`` path above.
-                                    if block.thinking:
+                                    if thinking_block.thinking:
                                         yield ReasoningChunk(
                                             delta="",
                                             event_type="reasoning_started",
                                         )
                                         yield ReasoningChunk(
-                                            delta=block.thinking,
+                                            delta=thinking_block.thinking,
                                             event_type="reasoning_text",
                                         )
                                 elif isinstance(block, sdk.ToolUseBlock):
@@ -2837,7 +2843,7 @@ class ClaudeSDKExecutor(Executor):
         # Evaluate after the stream completes but before TurnComplete
         # so a DENY prevents the response from being persisted.
         if _policy_eval is not None:
-            _resp_data: dict[str, Any] = {
+            _resp_data: _JsonObject = {
                 "model": model,
                 "text_preview": (response_text[:500] if response_text else ""),
                 "tool_calls_count": len(pending_tools),
@@ -2861,7 +2867,7 @@ class ClaudeSDKExecutor(Executor):
             # Read the post-compaction session messages so the runner
             # can persist them for session resume in ephemeral
             # environments where the CLI's own transcript is lost.
-            _compacted: list[dict[str, Any]] | None = None
+            _compacted: list[_JsonObject] | None = None
             try:
                 from claude_agent_sdk import get_session_messages
 
@@ -2905,7 +2911,7 @@ class ClaudeSDKExecutor(Executor):
         messages: list[Message],
         *,
         resume_session: bool,
-    ) -> str | list[dict[str, Any]]:
+    ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
 
@@ -2930,7 +2936,7 @@ class ClaudeSDKExecutor(Executor):
             present in the latest user message.
         """
         if resume_session:
-            return ClaudeSDKExecutor._extract_latest_user_content(messages)
+            return ClaudeSDKExecutor._extract_trailing_user_content(messages)
 
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         if len(messages) <= 1 or len(user_messages) <= 1:
@@ -2943,9 +2949,7 @@ class ClaudeSDKExecutor(Executor):
         latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
         prior = messages[:-1] if messages else []
 
-        prior_blocks: list[dict[str, Any]] = [  # type: ignore[explicit-any]
-            _text_block("Conversation so far:")
-        ]
+        prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         for msg in prior:
             role = str(msg.get("role", "user")).replace("_", " ")
             raw_content = msg.get("content")
@@ -2979,7 +2983,7 @@ class ClaudeSDKExecutor(Executor):
     @staticmethod
     def _extract_latest_user_content(
         messages: list[Message],
-    ) -> str | list[dict[str, Any]]:
+    ) -> str | list[_JsonObject]:
         """
         Extract the latest user message content for the SDK.
 
@@ -3004,3 +3008,75 @@ class ClaudeSDKExecutor(Executor):
                     return _to_anthropic_content_blocks(content)
                 return str(content)
         return ""
+
+    @staticmethod
+    def _extract_trailing_user_content(
+        messages: list[Message],
+    ) -> str | list[_JsonObject]:
+        """
+        Extract the trailing run of consecutive user messages for the SDK.
+
+        On a resumed SDK session the client already has all prior turns
+        cached, so only the *new* user input is sent. Normally that is a
+        single user message, but when the runner batches several buffered
+        steered messages into one continuation turn (see
+        ``_check_and_start_next_turn``), the tail of history holds more than
+        one brand-new user message the SDK has never seen. Sending only the
+        last (as :meth:`_extract_latest_user_content` does) silently drops
+        the earlier ones. This collects every user message after the last
+        non-user (assistant / tool) message and concatenates them so all
+        newly-buffered input reaches the model.
+
+        Text messages are joined with blank lines. If any message in the
+        trailing run carries multimodal content blocks, the whole run is
+        returned as a single list of Anthropic content blocks so the bytes
+        survive.
+
+        :param messages: Conversation history.
+        :returns: A string prompt, or a list of Anthropic content
+            block dicts when the trailing run is multimodal.
+        """
+        trailing: list[Message] = []
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                trailing.append(msg)
+            else:
+                break
+        trailing.reverse()
+        if not trailing:
+            return ""
+        if len(trailing) == 1:
+            return ClaudeSDKExecutor._extract_latest_user_content(trailing)
+
+        # Convert each trailing user message to Anthropic content blocks.
+        # If any block is non-text (image/document), keep the structured
+        # list so the bytes reach the model; otherwise join the text.
+        block_runs: list[list[_JsonObject]] = []
+        has_non_text = False
+        for msg in trailing:
+            content = msg.get("content")
+            if content is None:
+                block_runs.append([])
+            elif isinstance(content, str):
+                block_runs.append([_text_block(content)])
+            elif isinstance(content, list):
+                converted = _to_anthropic_content_blocks(content)
+                block_runs.append(converted)
+                if any(b.get("type") != "text" for b in converted):
+                    has_non_text = True
+            else:
+                block_runs.append([_text_block(str(content))])
+
+        if has_non_text:
+            merged: list[_JsonObject] = []
+            for run in block_runs:
+                merged.extend(run)
+            return merged
+
+        texts: list[str] = []
+        for run in block_runs:
+            for block in run:
+                text = block.get("text")
+                if block.get("type") == "text" and isinstance(text, str) and text:
+                    texts.append(text)
+        return "\n\n".join(texts)

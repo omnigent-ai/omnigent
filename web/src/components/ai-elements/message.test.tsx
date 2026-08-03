@@ -28,6 +28,20 @@ describe("MessageResponse", () => {
     expect(document.querySelector('img[src^="https://attacker.example"]')).toBeNull();
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
   });
+
+  it("re-renders when rendering props change even if the text is unchanged", async () => {
+    const { container, rerender } = render(
+      <MessageResponse className="math-config-a">same text</MessageResponse>,
+    );
+
+    expect(container.firstElementChild).toHaveClass("math-config-a");
+
+    rerender(<MessageResponse className="math-config-b">same text</MessageResponse>);
+
+    await waitFor(() => {
+      expect(container.firstElementChild).toHaveClass("math-config-b");
+    });
+  });
 });
 
 describe("MessageResponse code-block copy", () => {

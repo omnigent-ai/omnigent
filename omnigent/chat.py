@@ -57,7 +57,10 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
+from omnigent.model_catalog import resolve_catalog_model
+from omnigent.model_resolver import ModelResolutionError
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
@@ -102,15 +105,6 @@ _SERVER_READY_FAST_POLL_WINDOW_SECONDS = 1.0
 # leaving zombie codex/claude processes.
 _REMOTE_RUNNER_STOP_GRACE_SECONDS = 8.0
 
-# Fallback model when the YAML declares neither ``executor.model``
-# nor ``executor.harness`` AND no ``--model`` / ``--harness``
-# override is supplied. Mirrors the legacy argparse CLI's
-# ``_DEFAULT_AD_HOC_MODEL`` so ``omnigent run examples/hello_world.yaml``
-# (a spec with no executor block) launches cleanly instead of
-# failing the strict omnigent validator with a cryptic
-# "executor.config.harness: required" error.
-_DEFAULT_AD_HOC_MODEL = "databricks-gpt-5-4"
-
 # How many of the NEWEST transcript items ``_persisted_turn_text``
 # fetches when reconciling a headless ``-p`` turn against the durable
 # store. The current turn's items are always the newest, and no single
@@ -145,20 +139,23 @@ def _default_cli_model() -> str:
     """
     Return the model used when neither YAML nor CLI flag picks one.
 
-    Reads ``OMNIGENT_MODEL`` from the environment with
-    :data:`_DEFAULT_AD_HOC_MODEL` as the final fallback. The read
-    happens at YAML-materialization time so the resolved model
-    gets baked into the bundle's executor block — the materialized
-    spec is self-contained and independent of any later env state.
+    Reads ``OMNIGENT_MODEL`` first, then resolves the Databricks OpenAI-family
+    default from the provider catalog. Resolution happens during materialization
+    so the bundle remains self-contained on its eventual runner.
 
-    Mirrors :func:`omnigent.inner.cli._default_cli_model` so
-    legacy and Omnigent paths agree on the env-var contract.
-
-    :returns: The default model identifier, e.g.
-        ``"databricks-gpt-5-4"`` or whatever the user pinned in
-        ``OMNIGENT_MODEL``.
+    :returns: The explicit environment model or discovered catalog default.
+    :raises click.ClickException: If no explicit or catalog model is available.
     """
-    return os.environ.get(_OMNIGENT_MODEL_ENV_VAR, _DEFAULT_AD_HOC_MODEL)
+    configured = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
+    if configured is not None:
+        return configured
+    try:
+        return resolve_catalog_model("databricks", family="openai").model_id
+    except ModelResolutionError as exc:
+        raise click.ClickException(
+            "No default model is available for this ad-hoc agent. Pass --model, "
+            "set OMNIGENT_MODEL, or retry when Databricks catalog discovery is available."
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -1054,55 +1051,27 @@ def _redirect_native_resume_if_needed(
     native_agent = native_coding_agent_for_wrapper_label(wrapper_label)
     if native_agent is None:
         return False
-    if native_agent.key == "claude":
-        _run_claude_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "codex":
-        _run_codex_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "pi":
-        _run_pi_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "kiro":
-        _run_kiro_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "cursor":
-        _run_cursor_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "kimi":
-        _run_kimi_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    return False
+    run_native = resolve_hook_for_key(native_agent.key, "run_native")
+    if run_native is None:
+        return False
+    # The native TUI owns the turns; resuming through the Omnigent REPL would run
+    # an Omnigent turn per message *and* let the transcript forwarder mirror the
+    # same message from the native store, double-posting each user turn. Redirect
+    # to `omnigent <key> --resume`'s direct tmux attach instead — the wrapper
+    # label is `<key>-native` and the CLI command is `<key>`.
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name=native_agent.harness,
+        native_command=native_agent.key,
+    )
+    run_native(
+        server=base_url,
+        session_id=conversation_id,
+        extra_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+    return True
 
 
 def _finish_native_redirect_progress(
@@ -1130,208 +1099,6 @@ def _finish_native_redirect_progress(
             f"session — redirecting to `omnigent {native_command} --resume`.\n"
         ),
         err=True,
-    )
-
-
-def _run_claude_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a claude-native conversation back to ``omnigent claude``.
-
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricksapps.com"``.
-    :param conversation_id: Omnigent conversation id, e.g.
-        ``"conv_abc123"``.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="claude-native",
-        native_command="claude",
-    )
-    from omnigent.claude_native import run_claude_native
-
-    run_claude_native(
-        server=base_url,
-        session_id=conversation_id,
-        claude_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_codex_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a codex-native conversation back to ``omnigent codex``.
-
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricksapps.com"``.
-    :param conversation_id: Omnigent conversation id, e.g.
-        ``"conv_abc123"``.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="codex-native",
-        native_command="codex",
-    )
-    from omnigent.codex_native import run_codex_native
-
-    run_codex_native(
-        server=base_url,
-        session_id=conversation_id,
-        codex_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_pi_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a pi-native conversation back to ``omnigent pi``.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="pi-native",
-        native_command="pi",
-    )
-    from omnigent.pi_native import run_pi_native
-
-    run_pi_native(
-        server=base_url,
-        session_id=conversation_id,
-        pi_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_kiro_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """Hand a kiro-native conversation back to ``omnigent kiro``."""
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="kiro-native",
-        native_command="kiro",
-    )
-    from omnigent.kiro_native import run_kiro_native
-
-    run_kiro_native(
-        server=base_url,
-        session_id=conversation_id,
-        kiro_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_cursor_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a cursor-native conversation back to ``omnigent cursor``.
-
-    The cursor-native session is driven by the ``cursor-agent`` TUI in a
-    runner-owned tmux pane, and the forwarder mirrors that transcript back
-    into the conversation. Resuming through the Omnigent REPL would instead
-    run an Omnigent turn per message (which persists its own user item) *and*
-    leave the forwarder mirroring the same message from the cursor store —
-    recording each user message twice. Redirecting to ``omnigent cursor``'s
-    direct tmux attach keeps the TUI the single source of turns.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="cursor-native",
-        native_command="cursor",
-    )
-    from omnigent.cursor_native import run_cursor_native
-
-    run_cursor_native(
-        server=base_url,
-        session_id=conversation_id,
-        cursor_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_kimi_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a kimi-native conversation back to ``omnigent kimi``.
-
-    The kimi-native session is driven by the ``kimi`` TUI in a runner-owned
-    tmux pane. Resuming through the Omnigent REPL would run an Omnigent turn
-    per message instead of attaching to the live TUI; redirecting to
-    ``omnigent kimi``'s direct tmux attach keeps the TUI the single source of
-    turns. Mirrors :func:`_run_cursor_native_resume_redirect`.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="kimi-native",
-        native_command="kimi",
-    )
-    from omnigent.kimi_native import run_kimi_native
-
-    run_kimi_native(
-        server=base_url,
-        session_id=conversation_id,
-        kimi_args=(),
-        auto_open_conversation=auto_open_conversation,
     )
 
 
@@ -2900,8 +2667,8 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
     Also materializes when the spec is a single-file YAML with no
     ``executor.harness`` AND no ``executor.model`` — the strict
     omnigent validator rejects that shape, and the legacy
-    argparse CLI used to paper over it by injecting
-    :data:`_DEFAULT_AD_HOC_MODEL`. This preserves that behavior so
+    argparse CLI used to paper over it by injecting a model. This preserves
+    that behavior through catalog resolution so
     ``omnigent run examples/hello_world.yaml`` (minimal spec) still
     launches cleanly.
 
@@ -3030,9 +2797,8 @@ def _spec_declares_harness_or_model(raw: _YamlMapping) -> bool:
     Recognizes the harness in either shape: a flat ``executor.harness``
     or the bundle-style nested ``executor.config.harness`` (e.g.
     ``examples/polly``). Without the nested check, an unpinned bundle
-    that declares its harness only under ``config`` would look
-    harness-less and get force-fed :data:`_DEFAULT_AD_HOC_MODEL` — a
-    GPT endpoint the claude-sdk harness can't speak.
+    that declares its harness only under ``config`` would look harness-less
+    and get paired with an unrelated model family.
 
     :param raw: Parsed top-level YAML mapping.
     :returns: True if ``executor.harness``, ``executor.model``, or
@@ -3144,7 +2910,7 @@ def _should_inject_openai_env_auth_for_executor(
         present and no explicit auth/profile/provider declaration
         should take precedence.
     """
-    if harness not in _OPENAI_AGENTS_HARNESSES:
+    if harness is None or harness not in _OPENAI_AGENTS_HARNESSES:
         return False
     if not os.environ.get(_OPENAI_API_KEY_ENV_VAR):
         return False
@@ -3239,6 +3005,9 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
             llm_block = raw.get("llm")
             if isinstance(llm_block, dict):
                 llm_block.pop("model", None)
+            env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
+            if env_model is not None:
+                executor_block["model"] = env_model
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)
@@ -3246,12 +3015,7 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     # the Databricks FM API rejects for Claude-typed entities.
     # Uses ``_spec_declares_harness_or_model`` — must agree with the
     # ``needs_fallback`` gate in :func:`_materialize_override_bundle`.
-    # Uses ``_default_cli_model`` (env-var-aware) instead of
-    # ``_DEFAULT_AD_HOC_MODEL`` directly so ``OMNIGENT_MODEL=foo``
-    # is honored on the ``omnigent/cli.py`` → ``run_chat`` direct
-    # path. Without this, that env var was silently dropped on the
-    # Omnigent path invoked through the ``omnigent`` console
-    # script (see ``designs/RUN_OMNIGENT_REPL_PARITY.md``).
+    # Resolve once before bundling so the runner receives a self-contained spec.
     if not _spec_declares_harness_or_model(raw):
         executor_block["model"] = _default_cli_model()
     _inject_openai_env_auth_if_needed(raw)
@@ -3580,7 +3344,7 @@ def _start_local_server(
 
     try:
         with child_logging_popen_kwargs(child_env) as logging_kwargs:
-            server_proc = subprocess.Popen(
+            server_proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",

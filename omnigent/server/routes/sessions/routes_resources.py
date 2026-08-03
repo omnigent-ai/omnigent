@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import urllib.parse
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import httpx
 from fastapi import (
@@ -55,14 +55,25 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _ancestor_session_ids,
+    _attachment_disposition,
+    _get_runner_client_for_resource_access,
+    _load_agent_spec_for_session,
+    _proxy_get_session_resources_to_runner,
+    _publish_and_persist_resource_event,
+    _publish_changed_files_invalidated,
+    _read_upload_capped,
+    _stored_file_to_resource,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    ensure_runner_connected,
+)
 from omnigent.server.schemas import (
     CopiedFile,
     CopyFilesRequest,
@@ -251,20 +262,34 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
+        try:
+            response_payload = resp.json()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned invalid JSON"
+            ) from exc
         if resp.status_code == 404:
+            message = "Resource not found"
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    message = error["message"]
             raise OmnigentError(
-                resp.json().get("error", {}).get("message", "Resource not found"),
+                message,
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
-            try:
-                body = resp.json()
-                error = body.get("error", {})
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
-            except Exception:
+            else:
                 msg = "runner resource endpoint failed"
             raise HTTPException(status_code=502, detail=msg)
-        return resp.json()
+        if not isinstance(response_payload, dict):
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned non-object JSON"
+            )
+        return cast(dict[str, Any], response_payload)
 
     async def _fs_get_with_host_fallback(
         session_id: str,
@@ -670,6 +695,22 @@ def register_resources_routes(
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )
+        # A session whose runner merely went to sleep (host still up, or a
+        # resumable managed sandbox) is transparently reconnected here, so
+        # opening a shell from the web wakes it instead of dead-ending on a
+        # 502 — the same relaunch the next chat message would trigger. Only
+        # the wakeable states recover; a non-host-bound stranded session or an
+        # offline external host still falls through to the 502 below (the CLI
+        # reconnect path owns those).
+        # Called for its reconnect side effect; the proxy below re-resolves the
+        # (now-live) runner client itself, so neither return value is bound.
+        await ensure_runner_connected(
+            session_id=session_id,
+            conv=conv,
+            app_state=request.app.state,
+            conversation_store=conversation_store,
+            runner_router=runner_router or get_server_runner_router(),
+        )
         path = f"/v1/sessions/{session_id}/resources/terminals"
         status, payload = await _proxy_post_to_runner(
             session_id,

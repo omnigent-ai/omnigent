@@ -44,9 +44,12 @@ source .venv/bin/activate    # or prefix commands with `uv run`
 
 Common checks:
 
+Pyrefly is the canonical Python type checker for the repository.
+
 ```bash
 uv run pytest                      # Python tests (e2e/live skipped by default)
 uv run ruff check . && uv run ruff format --check .
+uv run --no-sync pyrefly check     # Python type checking (omnigent/)
 uv run pre-commit run --all-files
 ```
 

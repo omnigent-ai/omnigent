@@ -267,6 +267,9 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
+its coding agents or drive a live OpenClaw Gateway session over ACP.
+
 #### 🐙 Polly and 🟠🔵 Debby
 
 Two example agents ship with the repo, and they make good first sessions:
@@ -413,6 +416,11 @@ and they're in. Signup is invite-only.
   ```bash
   omnigent run --fork <session_id>
   ```
+
+Shared sessions identify model-visible messages with `[account]:` labels by
+default. Set `OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED=0` to hide those
+labels. This does not change stored authors, UI avatars, or who may approve or
+run privileged actions.
 
 > [!TIP]
 > Want your team to sign in with the logins they already have (**Google,

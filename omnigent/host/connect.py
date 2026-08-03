@@ -18,6 +18,7 @@ import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
 
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
@@ -113,9 +114,20 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+
+
+class _WaitidInfo(Protocol):
+    si_pid: int
+
+
+def _coerce_int(value: object) -> int:
+    """Convert a validated JSON scalar with the standard ``int`` semantics."""
+    return int(cast(str | bytes | bytearray | SupportsInt | SupportsIndex, value))
+
 
 # Binary appearance is cheap to probe, so new CLI installs surface quickly.
 HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
@@ -580,7 +592,24 @@ def _build_runner_env(
         for name in base_env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
         if name.strip()
     }
-    forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names
+    # Forward env vars that the providers config references via
+    # ``api_key_ref: env:VAR`` or ``api_key: $VAR``. Without this, a user
+    # who configures a gateway provider with a custom env var (e.g.
+    # ``api_key_ref: env:MY_TOKEN``) would need to manually add it to
+    # OMNIGENT_RUNNER_ENV_PASSTHROUGH — their credential resolves fine in
+    # the CLI/daemon but silently drops before reaching the runner subprocess.
+    from omnigent.errors import OmnigentError as _OmnigentError
+
+    try:
+        from omnigent.onboarding.provider_config import (
+            load_config,
+            provider_credential_env_vars,
+        )
+
+        config_env_vars = provider_credential_env_vars(load_config())
+    except (OSError, _OmnigentError):
+        config_env_vars = frozenset()
+    forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names | config_env_vars
     env = {
         key: value
         for key, value in base_env.items()
@@ -818,6 +847,10 @@ class HostProcess:
             # acceptable, since the leak this guards against accrues over hours,
             # not a two-minute worst case.
             return 0
+        if not hasattr(os, "WNOHANG"):
+            # Windows: no child reparenting to a subreaper and no ``WNOHANG`` /
+            # ``waitpid(-1, ...)`` — nothing to reap and the calls would raise.
+            return 0
         if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
             return self._reap_orphans_waitid()
         return self._reap_orphans_waitpid()
@@ -851,9 +884,14 @@ class HostProcess:
         """
         reaped = 0
         tracked = self._tracked_runner_pids()
+        waitid = cast(
+            "Callable[[object, int, int], _WaitidInfo | None]",
+            vars(os)["waitid"],
+        )
+        p_all = vars(os)["P_ALL"]
         while True:
             try:
-                info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                info = waitid(p_all, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             except (ChildProcessError, OSError):
                 break
             if info is None:
@@ -1154,7 +1192,7 @@ class HostProcess:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
             try:
                 with child_logging_popen_kwargs(env) as logging_kwargs:
-                    proc = subprocess.Popen(
+                    proc: subprocess.Popen[bytes] = subprocess.Popen(
                         [sys.executable, "-m", "omnigent.runner._entry"],
                         env=env,
                         # Runners are WS-tunnel clients with no interactive input.
@@ -1702,7 +1740,7 @@ class HostProcess:
         elif frame.kind in ("key", "gateway"):
             result = store_harness_credential(
                 family=family,
-                kind=frame.kind,
+                kind=cast(Literal["key", "gateway"], frame.kind),
                 secret=frame.secret_value or "",
                 base_url=frame.base_url,
                 default_model=frame.default_model,
@@ -1839,7 +1877,112 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
-        if canonicalize_harness(frame.harness) != "claude-native":
+        harness = canonicalize_harness(frame.harness) or frame.harness
+        if harness == "codex-native":
+            try:
+                from omnigent.codex_native_app_server import (
+                    discover_codex_model_options,
+                    resolve_native_codex_launch,
+                )
+                from omnigent.model_catalog import (
+                    is_direct_openai_provider,
+                    list_models_for_worker,
+                    resolve_catalog_model,
+                    resolve_model_provider,
+                )
+                from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+                launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+                spec = AgentSpec(
+                    spec_version=1,
+                    name="codex-native-prelaunch",
+                    executor=ExecutorSpec(
+                        type="omnigent",
+                        config={
+                            "harness": "codex-native",
+                            **({"profile": launch.profile} if launch.profile else {}),
+                        },
+                    ),
+                )
+                listing = await asyncio.to_thread(list_models_for_worker, spec, "codex-native")
+                default_model = launch.model
+                if default_model is None and launch.profile is not None:
+                    default_model = (
+                        await asyncio.to_thread(
+                            resolve_catalog_model,
+                            "databricks",
+                            family="openai",
+                        )
+                    ).model_id
+                default_id = (
+                    default_model if default_model in {m.id for m in listing.models} else None
+                )
+                provider = (
+                    resolve_model_provider(spec, "codex-native")
+                    if listing.source == "openai-compatible"
+                    else None
+                )
+                models: list[dict[str, object]]
+                if provider is not None and is_direct_openai_provider(provider):
+                    available_ids = {model.id for model in listing.models}
+                    models = []
+                    seen: set[str] = set()
+                    selected_default = False
+                    try:
+                        codex_options = await discover_codex_model_options()
+                    except Exception:
+                        _logger.exception("Failed to discover Codex-compatible pre-launch models")
+                        codex_options = []
+                    for option in codex_options:
+                        raw_id = option.get("model") or option.get("id")
+                        if (
+                            not isinstance(raw_id, str)
+                            or raw_id not in available_ids
+                            or raw_id in seen
+                        ):
+                            continue
+                        seen.add(raw_id)
+                        display_name = option.get("displayName")
+                        is_default = raw_id == default_id or (
+                            default_model is None
+                            and not selected_default
+                            and option.get("isDefault") is True
+                        )
+                        selected_default = selected_default or is_default
+                        models.append(
+                            {
+                                "id": raw_id,
+                                "displayName": (
+                                    display_name
+                                    if isinstance(display_name, str) and display_name
+                                    else raw_id
+                                ),
+                                **({"isDefault": True} if is_default else {}),
+                            }
+                        )
+                else:
+                    models = [
+                        {
+                            "id": model.id,
+                            "displayName": model.id,
+                            **({"isDefault": True} if model.id == default_id else {}),
+                        }
+                        for model in listing.models
+                    ]
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Codex model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Codex model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=models,
+            )
+
+        if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -1890,7 +2033,7 @@ class HostProcess:
         if op == "list_or_read":
             return r.list_or_read(
                 str(params.get("path", "")),
-                limit=int(params.get("limit", 20)),
+                limit=_coerce_int(params.get("limit", 20)),
                 after=cast("str | None", params.get("after")),
                 before=cast("str | None", params.get("before")),
                 order=str(params.get("order", "desc")),
@@ -1904,7 +2047,7 @@ class HostProcess:
                 str(params.get("q", "")),
                 include=cast("str | None", params.get("include")),
                 exclude=cast("str | None", params.get("exclude")),
-                limit=int(params.get("limit", 500)),
+                limit=_coerce_int(params.get("limit", 500)),
             )
         raise ValueError(f"unknown fs op: {op!r}")
 
@@ -2156,11 +2299,17 @@ class HostProcess:
         headers = self._build_connect_headers()
 
         _logger.info("Connecting to %s", url)
+        # Build a verifying SSL context from a real CA bundle for wss:// — a bare
+        # default context loads zero roots on uv / python-build-standalone Pythons
+        # (no OpenSSL default cert path), which fails handshake verification.
+        # ``ssl=None`` for ws:// is the library default (no TLS).
+        ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
+                ssl=ssl_ctx,
                 # Align the host->server tunnel's protocol keepalive to the same
                 # 90 s app-level budget as the runner tunnel (not the 20 s library
                 # default that drops a busy-but-healthy tunnel with 1011 — #1116).
@@ -2438,18 +2587,18 @@ class HostProcess:
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
-            result = await asyncio.to_thread(self._handle_install_harness, frame)
-            await ws.send(encode_host_frame(result))
+            install_result = await asyncio.to_thread(self._handle_install_harness, frame)
+            await ws.send(encode_host_frame(install_result))
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.
-            result = await asyncio.to_thread(self._handle_store_secret, frame)
-            await ws.send(encode_host_frame(result))
+            secret_result = await asyncio.to_thread(self._handle_store_secret, frame)
+            await ws.send(encode_host_frame(secret_result))
         elif isinstance(frame, HostDetectCredentialsFrame):
             # Ambient detection may probe files / a localhost socket, so run it
             # off the event loop.
-            result = await asyncio.to_thread(self._handle_detect_credentials, frame)
-            await ws.send(encode_host_frame(result))
+            credentials_result = await asyncio.to_thread(self._handle_detect_credentials, frame)
+            await ws.send(encode_host_frame(credentials_result))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
@@ -2459,8 +2608,8 @@ class HostProcess:
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.
-            result = await asyncio.to_thread(self._handle_fs_request, frame)
-            await ws.send(encode_host_frame(result))
+            fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
+            await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
 

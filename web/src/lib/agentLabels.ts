@@ -98,11 +98,11 @@ export function useBrainHarnessLabels(smartRoutingEnabled = false): Record<strin
   return { [AUTO_HARNESS_ID]: "Auto", ...base };
 }
 
-const _NO_SETUP_STEPS: Record<string, SetupStepWire[]> = {};
+const NO_SETUP_STEPS: Record<string, SetupStepWire[]> = {};
 
 /** harness id → the server's ordered setup steps (for the setup dialog). */
 export function useHarnessSetupSteps(): Record<string, SetupStepWire[]> {
-  return useHarnessCatalog((c) => c.setupSteps, _NO_SETUP_STEPS);
+  return useHarnessCatalog((c) => c.setupSteps, NO_SETUP_STEPS);
 }
 
 /**

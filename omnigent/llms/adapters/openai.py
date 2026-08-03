@@ -155,9 +155,15 @@ class OpenAICompatibleAdapter(BaseAdapter):
         # headers threaded through connection_params. MAS routes CP serving-endpoint
         # calls through the Barnacle forward proxy for CP→CP mTLS, which needs a
         # `host` header + s2s auth headers rather than a bearer token.
-        extra_headers = params.get("extra_headers")
-        if extra_headers:
-            headers = {**headers, **extra_headers}
+        extra_headers: object = params.get("extra_headers")
+        if isinstance(extra_headers, dict):
+            headers.update(
+                {
+                    key: value
+                    for key, value in extra_headers.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                }
+            )
 
         if stream:
             effective_timeout = timeout if timeout is not None else _STREAM_TIMEOUT

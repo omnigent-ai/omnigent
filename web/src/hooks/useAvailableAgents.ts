@@ -120,6 +120,8 @@ interface SessionListItemWire {
 async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
   const rows: BuiltinAgentWire[] = [];
   let after: string | null = null;
+  // Each page provides the cursor for the next request.
+  /* oxlint-disable no-await-in-loop */
   do {
     const url = after == null ? "/v1/agents" : `/v1/agents?after=${encodeURIComponent(after)}`;
     const res = await authenticatedFetch(url);
@@ -128,6 +130,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     rows.push(...body.data);
     after = body.has_more === true && body.last_id ? body.last_id : null;
   } while (after != null);
+  /* oxlint-enable no-await-in-loop */
 
   return rows.map((a) => ({
     id: a.id,
