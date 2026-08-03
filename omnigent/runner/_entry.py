@@ -1251,10 +1251,14 @@ async def _run_tunnel_from_env() -> None:
     from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
 
-    global _runner_auth_factory
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
-    _runner_auth_factory = auth_token_factory
+    # Set the singleton on the canonical module (omnigent.runner._entry) so
+    # all importers share it, even when this file runs as __main__ and creates
+    # a separate module object.
+    import omnigent.runner._entry as _self_module
+
+    _self_module._runner_auth_factory = auth_token_factory
     auth_token = auth_token_factory() if auth_token_factory is not None else None
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()

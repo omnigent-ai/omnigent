@@ -3627,7 +3627,7 @@ async def _auto_create_codex_terminal(
     # separate subprocess that POSTs tool calls to /policies/evaluate, so
     # it reads a one-shot token snapshot from policy_hook.json — same as
     # the claude-native PermissionRequest hook on this host-spawned path.
-    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+    from omnigent.runner._entry import _make_auth_token_factory
 
     _policy_auth_factory = _make_auth_token_factory()
     _policy_auth_token = _policy_auth_factory() if _policy_auth_factory is not None else None
@@ -3779,9 +3779,8 @@ async def _auto_create_codex_terminal(
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
                 auth_token_factory=(
-                    server_client.auth._factory  # type: ignore[union-attr]
+                    getattr(server_client.auth, "_factory", None)
                     if server_client is not None
-                    and isinstance(server_client.auth, _RunnerDatabricksAuth)
                     else None
                 ),
             )
