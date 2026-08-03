@@ -55,6 +55,13 @@ _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S = 15.0
 _MANAGED_MINT_REFRESH_SKEW_S = 300.0
 _logger = logging.getLogger(__name__)
 
+# Module-level singleton set by serve_runner once the runner's auth factory is
+# built. All later _make_auth_token_factory() calls (harness setup, terminal
+# creation, forwarders) return this instance so they share the proxy bearer
+# instead of constructing a new factory after RUNNER_INITIAL_AUTH_TOKEN has
+# already been popped from the environment.
+_runner_auth_factory: Callable[[], str | None] | None = None
+
 
 def _server_url_from_env() -> str:
     """Return the required Omnigent server URL from the runner environment.
@@ -360,6 +367,19 @@ def _make_auth_token_factory(
     _allow_delegated_mint: bool = True,
     _proxy_bearer: str | None = None,
 ) -> Callable[[], str | None] | None:
+    # Return the runner-process singleton when it has been set and no
+    # caller-specific overrides are requested. This ensures every harness
+    # setup or terminal-creation call made after runner startup reuses the
+    # factory that already has the proxy bearer, rather than constructing a
+    # fresh one after RUNNER_INITIAL_AUTH_TOKEN has been popped from env.
+    if (
+        _runner_auth_factory is not None
+        and _allow_initial_token
+        and _allow_delegated_mint
+        and _proxy_bearer is None
+        and server_url is None
+    ):
+        return _runner_auth_factory
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
@@ -1231,8 +1251,10 @@ async def _run_tunnel_from_env() -> None:
     from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
 
+    global _runner_auth_factory
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
+    _runner_auth_factory = auth_token_factory
     auth_token = auth_token_factory() if auth_token_factory is not None else None
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()
