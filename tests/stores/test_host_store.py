@@ -408,17 +408,16 @@ def test_set_offline_noop_for_unknown_host(
     host_store.set_offline("aababcc3941edb738172734a9ab7bb8c")
 
 
-def test_heartbeat_advances_updated_at_without_changing_status(
+def test_heartbeat_advances_updated_at(
     host_store: HostStore,
     db_uri: str,
 ) -> None:
     """
-    Verify heartbeat refreshes last-seen but leaves status alone.
+    Verify heartbeat refreshes last-seen.
 
     The ping loop calls this every interval to keep a live host fresh.
     If it doesn't advance ``updated_at``, a long-lived host would age
-    past the TTL and wrongly drop offline; if it flipped ``status``,
-    it would fight the connect/disconnect writers.
+    past the TTL and wrongly drop offline.
     """
     host_store.upsert_on_connect("12b05166b1e4ccd4dce299285b12442f", "laptop", "alice@example.com")
     # Stand last-seen well in the past, as if the last touch was long ago.
@@ -431,8 +430,32 @@ def test_heartbeat_advances_updated_at_without_changing_status(
     # Last-seen jumped back to ~now (within a generous window for clock
     # granularity), proving the heartbeat wrote a fresh timestamp.
     assert fetched.updated_at >= now_epoch() - 5
-    # Status is untouched — heartbeat only refreshes liveness.
-    assert fetched.status == "online"
+
+
+def test_heartbeat_restores_online_status(
+    host_store: HostStore,
+    db_uri: str,
+) -> None:
+    """
+    Verify heartbeat repairs a row another process flipped offline.
+
+    Registries are per-process, so a lagging teardown on one replica —
+    or a second local server sharing the data dir — can mark the row
+    offline while a tunnel elsewhere is live. Nothing but the heartbeat
+    is positioned to fix that, and only if it writes ``status``.
+    """
+    host_id = "6e5b1ac54c1e4b6ca2b9f6b0d2b7e311"
+    host_store.upsert_on_connect(host_id, "laptop", "dana@example.com")
+    host_store.set_offline(host_id)
+    _set_updated_at(db_uri, host_id, now_epoch() - 10_000)
+
+    host_store.heartbeat(host_id)
+
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.status == "online", "heartbeat must restore a wrongly-offline row"
+    assert fetched.updated_at >= now_epoch() - 5
+    assert host_is_live(fetched)
 
 
 def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:

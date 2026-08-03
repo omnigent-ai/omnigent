@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -1178,9 +1179,20 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         tracker.begin(conv.id)
         tracker.finish(conv.id)
 
-    def _deregister_host(host_id: str) -> None:
+    def _deregister_host(
+        host_id: str,
+        workspace_id: int | None = None,
+        conn: object | None = None,
+    ) -> object | None:
+        # Tracks HostRegistry.deregister's signature; nothing type-checks
+        # this stub, so update it whenever that signature changes.
+        del workspace_id
         host_deregistered.append(host_id)
+        # The wake path guards on the connection it read.
+        assert conn is fresh_host_conn
+        removed = host_registry_state["conn"]
         host_registry_state["conn"] = None
+        return removed
 
     monkeypatch.setattr(sessions_module, "_kick_managed_wake", _finish_wake)
     app_state = SimpleNamespace(
@@ -1210,6 +1222,132 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     assert calls == ["wake"]
     assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
     assert runner_deregistered == ["runner_stale_tunnel"]
+
+
+async def test_resumable_managed_wake_keeps_a_tunnel_that_reconnected_mid_decision(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake must not drop a host tunnel that registered while it decided.
+
+    The wake path reads the host connection, then awaits several liveness
+    checks in worker threads. A fresh tunnel can land in that window;
+    dropping it would strand a host that had just come back and leave the
+    session waiting on a tunnel nobody serves.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_id = "0b0c1a4e1f2d4f8ba7c6d5e4f3021988"
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-reconnect-race",
+        user_id=RESERVED_USER_LOCAL,
+        token="tok-reconnect-race",
+        provider="islo",
+        sandbox_id="sb-reconnect-race",
+        token_expires_at=9_999_999_999,
+    )
+    host_store.upsert_on_connect(
+        host_id=host_id,
+        name="managed-reconnect-race",
+        user_id=RESERVED_USER_LOCAL,
+    )
+    conv = conv_store.create_conversation(
+        agent_id=None,
+        host_id=host_id,
+        workspace="/root/workspace",
+    )
+    conv_store.set_runner_id(conv.id, "runner_reconnect_race")
+    conv = conv_store.get_conversation(conv.id)
+    assert conv is not None
+
+    hello = HostHelloFrame(
+        version="0.1.0-test",
+        frame_protocol_version=1,
+        name="managed-reconnect-race",
+    )
+    registry = HostRegistry()
+    stale_conn = registry.register(host_id, cast(Any, SimpleNamespace()), hello, owner=None)
+    # The reconnect that lands while the wake decision is still in flight.
+    fresh_conn = registry.register(host_id, cast(Any, SimpleNamespace()), hello, owner=None)
+    # Guards seen by deregister, so the test can prove it reached that line
+    # rather than passing by bailing out at an earlier gate.
+    guards: list[object] = []
+
+    class _StaleReadRegistry:
+        """Registry view whose first ``get`` returns the replaced connection.
+
+        Stands in for the real timeline: the wake path captures the
+        connection before its awaits, a newer tunnel takes the slot
+        during them, and every later read sees the truth.
+        """
+
+        def __init__(self) -> None:
+            self._served_stale = False
+
+        def get(self, host_id_: str) -> object:
+            """Serve the pre-await capture once, then the real registry."""
+            if not self._served_stale:
+                self._served_stale = True
+                return stale_conn
+            return registry.get(host_id_)
+
+        @staticmethod
+        def deregister(
+            host_id_: str,
+            workspace_id: int | None = None,
+            conn: object | None = None,
+        ) -> object | None:
+            """Delegate to the real registry so the guard actually runs."""
+            guards.append(conn)
+            return registry.deregister(host_id_, workspace_id, conn=cast(Any, conn))
+
+    fake = FakeSandboxLauncher(can_resume=True)
+    fake.provider = "islo"  # type: ignore[misc]
+    fake.is_running = lambda _sandbox_id: False  # type: ignore[method-assign]
+    config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=3600,
+        provider="islo",
+    )
+    tracker = ManagedLaunchTracker()
+    calls: list[str] = []
+
+    def _finish_wake(**kwargs: object) -> None:
+        del kwargs
+        calls.append("wake")
+        tracker.begin(conv.id)
+        tracker.finish(conv.id)
+
+    monkeypatch.setattr(sessions_module, "_kick_managed_wake", _finish_wake)
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        sandbox_config=config,
+        managed_launches=tracker,
+        host_registry=_StaleReadRegistry(),
+        tunnel_registry=SimpleNamespace(
+            get=lambda _runner_id: None,
+            deregister=lambda _runner_id: None,
+        ),
+    )
+
+    woke = await sessions_module._maybe_wake_stale_resumable_managed_sandbox(
+        session_id=conv.id,
+        conv=conv,
+        app_state=app_state,
+        conversation_store=conv_store,
+    )
+
+    # Reached the teardown at all — otherwise everything below is vacuous.
+    assert len(guards) == 1, "the wake never reached its host-registry teardown"
+    assert registry.get(host_id) is fresh_conn, "the wake dropped a freshly reconnected tunnel"
+    assert guards == [stale_conn], "the teardown must be guarded on the captured connection"
+    # With its tunnel intact the host needs no wake, so nothing was kicked.
+    assert woke is False
+    assert calls == []
 
 
 async def test_managed_wake_fails_when_runner_never_reconnects(

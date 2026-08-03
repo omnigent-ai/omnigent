@@ -2545,8 +2545,11 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     ):
         return False
 
-    if host_registry is not None:
-        host_registry.deregister(conv.host_id)
+    if host_registry is not None and host_conn is not None:
+        # Guarded on the connection this wake decision was made about: a
+        # fresh tunnel can register during the liveness awaits above, and
+        # dropping that one would strand a host that just came back.
+        host_registry.deregister(conv.host_id, conn=host_conn)
     if tunnel_registry is not None and conv.runner_id is not None:
         tunnel_registry.deregister(conv.runner_id)
 

@@ -523,8 +523,13 @@ class HostStore:
         Bumps ``updated_at`` to now so the liveness freshness gate
         (see :data:`HOST_LIVENESS_TTL_S`) keeps treating the host as
         online. Called from the host tunnel's ping loop every
-        ``PING_INTERVAL_S``. Does not change ``status`` — a host whose
-        ping loop is running is, by construction, still ``"online"``.
+        ``PING_INTERVAL_S``.
+
+        Also rewrites ``status`` to ``"online"``, repairing a row that a
+        peer process flipped offline — a replica whose socket teardown
+        lags a reconnect elsewhere, or a second local server sharing one
+        data dir. Registries are per-process, so nothing here can see
+        that write; this converges the row in one ``PING_INTERVAL_S``.
 
         No-op if the host does not exist.
 
@@ -541,7 +546,7 @@ class HostStore:
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                 )
-                .values(updated_at=now_epoch())
+                .values(status=encode_host_status("online"), updated_at=now_epoch())
             )
 
     def is_online(self, host_id: str) -> bool:
