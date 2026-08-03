@@ -598,8 +598,9 @@ def _build_runner_env(
     # ``api_key_ref: env:MY_TOKEN``) would need to manually add it to
     # OMNIGENT_RUNNER_ENV_PASSTHROUGH — their credential resolves fine in
     # the CLI/daemon but silently drops before reaching the runner subprocess.
+    from omnigent.errors import OmnigentError as _OmnigentError
+
     try:
-        from omnigent.errors import OmnigentError as _OmnigentError
         from omnigent.onboarding.provider_config import (
             load_config,
             provider_credential_env_vars,
