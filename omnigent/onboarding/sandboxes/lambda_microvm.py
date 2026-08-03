@@ -494,6 +494,10 @@ class LambdaMicroVMSandboxLauncher(SandboxHostLauncher):
             import boto3
 
             region = self._region or os.environ.get(REGION_ENV_VAR)
+            # The bundled boto3 stubs enumerate service names as literals and
+            # predate lambda-microvms; the real client resolves it fine (the
+            # extra's >=1.43.35 floor guarantees the service model is present).
+            # pyrefly: ignore[no-matching-overload]
             self._client = boto3.client(_SERVICE_NAME, region_name=region)
         return self._client
 
