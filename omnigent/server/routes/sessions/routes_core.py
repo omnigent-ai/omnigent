@@ -48,6 +48,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
     user_session_stream,
@@ -187,6 +188,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.version import VERSION
 
 
 def register_core_routes(
@@ -325,16 +327,25 @@ def register_core_routes(
             _publish_terminal_pending(resp.id, True)
         _rc = await _get_runner_client(resp.id, runner_router)
         if _rc is not None and conv is not None:
+            # Send the full session-init envelope (not the legacy id-only body)
+            # so the runner seeds the first spawn from current session state —
+            # notably the persisted /model override — rather than relying on a
+            # best-effort reverse GET whose failure would silently reintroduce
+            # the first-turn respawn. Older runners ignore the extra
+            # ``session_init`` key and still read the top-level id fields.
             try:
-                await _rc.post(
-                    "/v1/sessions",
-                    json={
-                        "session_id": resp.id,
-                        "agent_id": conv.agent_id,
-                        "sub_agent_name": conv.sub_agent_name,
-                    },
-                    timeout=10.0,
+                init_body: dict[str, Any] = build_runner_session_init_payload(
+                    conv, server_version=VERSION
                 )
+            except ValueError:
+                # Not yet bound to an agent — fall back to the id-only body.
+                init_body = {
+                    "session_id": resp.id,
+                    "agent_id": conv.agent_id,
+                    "sub_agent_name": conv.sub_agent_name,
+                }
+            try:
+                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
                     "Failed to notify runner about session %s",
