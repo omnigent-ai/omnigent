@@ -3164,7 +3164,7 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     if current is not None:
         clear_index = len(options)
         options.append("Clear default (use OpenCode's own default)")
-    default = models.index(current) if current in models else 0
+    default = models.index(current) if current is not None and current in models else 0
     # Even filtered to reachable providers the list can exceed the screen, so
     # bound the picker to a scrolling viewport sized to the terminal (leaving
     # room for the title / status / footer / "N more" markers).
