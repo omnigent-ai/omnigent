@@ -969,7 +969,15 @@ def pi_native_provider_launch(
         if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
             model_provider_id = extra_id
             break
-    args = ["--provider", model_provider_id, "--model", provider.model]
+    # When the model id contains a "/" Pi's arg parser splits on the first
+    # slash and treats the left part as a provider name, overriding
+    # --provider. Pass the fully-qualified "provider/model" reference so Pi's
+    # findExactModelReferenceMatch matches the canonical form exactly and
+    # routes to our custom provider, not a builtin with the same model id.
+    model_arg = (
+        f"{model_provider_id}/{provider.model}" if "/" in provider.model else provider.model
+    )
+    args = ["--provider", model_provider_id, "--model", model_arg]
     # For non-Claude models on openai-completions/responses, disable thinking.
     # Gemini and other Databricks models return reasoning_tokens in their
     # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null
