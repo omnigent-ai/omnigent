@@ -251,6 +251,7 @@ class PiProviderConfig:
 
     def to_models_config(self) -> _PiModelsConfig:
         """Render this provider as a Pi ``models.json`` mapping."""
+        models: list[_PiModelEntry]
         if self.extra_models:
             # Include all known models, ensuring the selected model is present.
             # The selected model may be a newer id not yet in the static list.
