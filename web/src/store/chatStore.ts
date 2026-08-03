@@ -1589,11 +1589,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const outgoingId = get().conversationId;
     if (outgoingId !== null) writeTranscriptCache(outgoingId, get());
     const cached = conversationId !== null ? readTranscriptCache(conversationId) : null;
-    // The sidebar status lets an active cached conversation paint as busy immediately.
-    const seededStatus: SessionStatus =
-      cached !== null && conversationId !== null && sidebarRowStatus(conversationId) === "running"
-        ? "running"
-        : "idle";
 
     set((s) => {
       // Stash the OUTGOING conversation's still-in-flight optimistic
@@ -1649,7 +1644,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         activeResponse: null,
         interruptedResponseIds: [],
         status: "idle",
-        sessionStatus: seededStatus,
+        sessionStatus: "idle",
         backgroundTaskCount: 0,
         isNativeTerminalSession: false,
         nativeVendorOwnsModel: false,
@@ -4021,21 +4016,6 @@ async function refetchRunnerBackedSessionState(
       },
     );
   }
-}
-
-/** Read live status from any loaded sidebar page. */
-function sidebarRowStatus(id: string): Conversation["status"] | undefined {
-  if (queryClient === null) return undefined;
-  for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["conversations"],
-  })) {
-    for (const pg of data?.pages ?? []) {
-      for (const row of pg.data) {
-        if (row.id === id) return row.status;
-      }
-    }
-  }
-  return undefined;
 }
 
 /**

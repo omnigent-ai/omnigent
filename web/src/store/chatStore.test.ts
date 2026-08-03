@@ -467,7 +467,6 @@ describe("chatStore — switchTo", () => {
     useChatStore.setState((state) => ({ blocks: [...state.blocks, livePreview] }));
     await useChatStore.getState().switchTo("conv_other");
 
-    seedConversationsCache([conv("conv_cached", "running")]);
     let releaseItems: (() => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -483,7 +482,6 @@ describe("chatStore — switchTo", () => {
     const immediate = useChatStore.getState();
     expect(immediate.loadingConversation).toBe(false);
     expect(immediate.blocks.map((b) => b.ctx.itemId)).toEqual(cachedItems.map((item) => item.id));
-    expect(immediate.sessionStatus).toBe("running");
 
     await tick();
     expect(releaseItems).not.toBeNull();
@@ -492,7 +490,6 @@ describe("chatStore — switchTo", () => {
 
     const settled = useChatStore.getState();
     expect(settled.blocks.map((b) => b.ctx.itemId)).toEqual(cachedItems.map((item) => item.id));
-    expect(settled.sessionStatus).toBe("idle");
     expect(settled.loadingMoreHistory).toBe(false);
   });
 
