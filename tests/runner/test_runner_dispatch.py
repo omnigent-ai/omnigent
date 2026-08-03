@@ -2269,8 +2269,10 @@ class _StubTerminalInstance:
         on_idle: Callable[[], None] | None = None,
         *,
         on_activity: Callable[[], None] | None = None,
+        **kwargs: object,
     ) -> None:
         """Record the activity callback instead of polling real tmux."""
+        del kwargs
         if on_activity is not None:
             self.activity_watchers.append(on_activity)
 

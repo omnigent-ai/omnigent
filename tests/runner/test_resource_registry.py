@@ -329,11 +329,12 @@ async def test_auxiliary_terminal_exit_publishes_resource_exit_only(tmp_path: Pa
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s
         callbacks["on_exit"] = on_exit
         callbacks["replace"] = replace
 
@@ -373,6 +374,7 @@ async def _observe_native_agent_terminal_and_capture(
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -381,6 +383,7 @@ async def _observe_native_agent_terminal_and_capture(
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
+        callbacks["on_tick"] = on_tick
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
     # A status publisher is required for the native agent terminal's watcher to
@@ -394,6 +397,129 @@ async def _observe_native_agent_terminal_and_capture(
         resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
     )
     return callbacks
+
+
+class _FakeStatusPoller:
+    """Controllable stand-in for the claude-native status-file poller.
+
+    Lets a test flip :attr:`active` (file resolved vs. falling back) and
+    fire status edges through the registry's callback, without touching a
+    real ``sessions/<pid>.json``.
+    """
+
+    def __init__(self, on_status: object) -> None:
+        self._on_status = on_status
+        self.active = False
+        self.ticks = 0
+
+    def tick(self) -> None:
+        self.ticks += 1
+
+    def emit(self, status: str) -> None:
+        """Simulate the file reporting a new status."""
+        self._on_status(status)
+
+
+async def _observe_native_with_fake_poller(
+    tmp_path: Path,
+    session_id: str,
+) -> tuple[dict[str, object], list[str], list[_FakeStatusPoller]]:
+    """Observe a claude-native terminal with an injected fake poller.
+
+    :returns: ``(callbacks, statuses, pollers)`` — the wired watcher
+        callbacks, the list the status publisher appends to, and the
+        single-element list holding the injected poller (so the test can
+        drive ``active`` / ``emit``).
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
+    statuses: list[str] = []
+    pollers: list[_FakeStatusPoller] = []
+    registry.set_session_status_publisher(lambda _sid, status: statuses.append(status))
+
+    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
+        del session_id, instance
+        poller = _FakeStatusPoller(on_status)
+        pollers.append(poller)
+        return poller
+
+    registry._build_claude_native_status_poller = _fake_build  # type: ignore[method-assign]
+
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del idle_threshold_s, poll_interval_s, replace
+        callbacks["on_idle"] = on_idle
+        callbacks["on_activity"] = on_activity
+        callbacks["on_exit"] = on_exit
+        callbacks["on_tick"] = on_tick
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
+    await registry.observe_required_terminal(
+        session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    return callbacks, statuses, pollers
+
+
+@pytest.mark.asyncio
+async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
+    """The claude-native watcher is wired with an ``on_tick`` that drives
+    the status-file poller."""
+    callbacks, _statuses, pollers = await _observe_native_with_fake_poller(tmp_path, "conv_tick")
+    assert len(pollers) == 1
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    on_tick()
+    on_tick()
+    assert pollers[0].ticks == 2
+
+
+@pytest.mark.asyncio
+async def test_status_file_preempts_pty_edges_when_active(tmp_path: Path) -> None:
+    """While the poller is active, the file's status wins and PTY pane
+    edges do not publish status."""
+    callbacks, statuses, pollers = await _observe_native_with_fake_poller(tmp_path, "conv_pre")
+    poller = pollers[0]
+    poller.active = True
+
+    # File says running; PTY activity must NOT double-publish.
+    poller.emit("running")
+    callbacks["on_activity"]()
+    # File says idle; PTY idle heuristic must NOT override it.
+    poller.emit("idle")
+    callbacks["on_idle"]()
+
+    # Status edges publish via loop.call_soon_threadsafe; let them drain.
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> None:
+    """With no file (poller inactive), the PTY pane edges remain the status
+    source — the fallback path for old Claude versions."""
+    callbacks, statuses, pollers = await _observe_native_with_fake_poller(
+        tmp_path, "conv_fallback"
+    )
+    # Poller stays inactive (file never resolved).
+    assert pollers[0].active is False
+
+    callbacks["on_activity"]()  # → running
+    callbacks["on_idle"]()  # → idle
+    # Status edges publish via loop.call_soon_threadsafe; let them drain.
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
 
 
 @pytest.mark.asyncio
@@ -507,11 +633,12 @@ async def test_required_terminal_exit_without_observed_status_is_failure(tmp_pat
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
