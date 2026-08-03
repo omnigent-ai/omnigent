@@ -32,6 +32,13 @@ def _redact_url(url: str | None) -> str | None:
     A ``--server`` value could carry embedded basic-auth (``https://user:pass@h``)
     or a query token; the snapshot is meant to be pasted into a bug report, so
     keep only scheme + host + port + path.
+
+    Redacts userinfo by dropping the ``user:pass@`` prefix of the authority
+    directly, rather than rebuilding it from ``hostname``/``port`` — the latter
+    lowercases the host and, for IPv6 literals, loses the required ``[...]``
+    brackets. Also handles scheme-less ``user:pass@host`` inputs, which
+    ``urlsplit`` misparses (the ``user:`` looks like a scheme), by scrubbing the
+    raw string when an ``@`` precedes any ``/``.
     """
     if not url:
         return url
@@ -39,12 +46,21 @@ def _redact_url(url: str | None) -> str | None:
         parts = urlsplit(url)
     except ValueError:
         return url
-    if not parts.scheme and not parts.netloc:
-        return url  # not URL-shaped (e.g. a bare host); leave as-is
-    # ``hostname``/``port`` drop any ``user:pass@`` userinfo; query+fragment cleared.
-    host = parts.hostname or ""
-    netloc = f"{host}:{parts.port}" if parts.port else host
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+    if parts.scheme and parts.netloc:
+        # Well-formed URL: drop userinfo from the authority, keep host[:port] as
+        # written (preserves IPv6 brackets), clear query + fragment.
+        netloc = parts.netloc.rsplit("@", 1)[-1]
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+    # Scheme-less or otherwise not cleanly split. If there's userinfo (an ``@``
+    # before the first ``/``), strip it so credentials never survive; otherwise
+    # leave the value as the user typed it.
+    authority = url.split("/", 1)[0]
+    if "@" in authority:
+        rest = url[len(authority) :]
+        return authority.rsplit("@", 1)[-1] + rest
+    return url
 
 
 def _local_version() -> str:

@@ -103,7 +103,13 @@ def test_snapshot_contains_no_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
         ("http://user:pass@host:6767/api", "http://host:6767/api"),
         ("https://tok@example.com/path?token=abc#frag", "https://example.com/path"),
         ("http://localhost:6767", "http://localhost:6767"),
-        ("localhost:6767", "localhost:6767"),  # not URL-shaped; left as-is
+        ("localhost:6767", "localhost:6767"),  # bare host, no userinfo; left as-is
+        # Scheme-less input with userinfo: urlsplit misparses it, but creds must
+        # still be stripped (the ``user:`` looks like a scheme to urlsplit).
+        ("user:pass@host:6767", "host:6767"),
+        # IPv6 literals must keep their required [...] brackets.
+        ("http://[::1]:6767/x", "http://[::1]:6767/x"),
+        ("https://u:p@[2001:db8::1]:443/api?t=x", "https://[2001:db8::1]:443/api"),
         (None, None),
     ],
 )

@@ -1451,6 +1451,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "cursor",
         "debby",
         "debug",
+        "diagnose",
         "doctor",
         "goose",
         "hermes",
