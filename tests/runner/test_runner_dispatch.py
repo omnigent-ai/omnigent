@@ -5059,7 +5059,10 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "title": "researcher:done",
                         "tool": "researcher",
                         "session_name": "done",
-                        "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                        "labels": {
+                            CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE,
+                            "attempt": 1,
+                        },
                     },
                     {
                         "id": "c5",
@@ -5083,7 +5086,8 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed), c5 (legacy title tombstone), and c4
+    # c3 (explicitly closed despite its mixed-type label map), c5
+    # (legacy title tombstone), and c4
     # (no colon) dropped; the ui:-added child surfaces under its bound
     # agent + label.
     assert out["sub_agents"] == [

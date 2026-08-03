@@ -153,12 +153,12 @@ def _json_object_list(value: object) -> list[_JsonObject]:
 
 
 def _string_mapping(value: object) -> dict[str, str] | None:
-    """Return *value* when all keys and values are strings."""
-    if not isinstance(value, dict) or not all(
-        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
-    ):
+    """Return the string entries from a mapping-like JSON object."""
+    if not isinstance(value, dict):
         return None
-    return cast("dict[str, str]", value)
+    return {
+        key: item for key, item in value.items() if isinstance(key, str) and isinstance(item, str)
+    }
 
 
 _INBOX_OUTPUT_MAX_CHARS = 12000
