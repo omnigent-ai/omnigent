@@ -33,6 +33,11 @@ _INBOX_DIR = "inbox"
 _SESSIONS_DIR = "sessions"
 
 
+def bridge_root() -> Path:
+    """Return the root directory used for native Pi bridge files."""
+    return _BRIDGE_ROOT
+
+
 def bridge_dir_for_session_id(session_id: str) -> Path:
     """
     Return the bridge directory for a native Pi session.
