@@ -23,7 +23,10 @@ const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
  */
 export function normalizeExplicitMathDelimiters(text: string): string {
   let result = "";
-  let inFence = false;
+  // The marker (`` ``` `` / `~~~` run) that opened the current fenced block, or
+  // "" when outside a fence. CommonMark closes a fence only with the same char
+  // and a run at least as long, so a stray `~~~` inside a ``` block stays code.
+  let openFence = "";
   // Length of the backtick run that opened the current inline-code span, or 0
   // when not in inline code. Tracking the run length lets a ``…`` span close
   // only on a matching-length run, so single backticks inside it don't leak.
@@ -38,13 +41,18 @@ export function normalizeExplicitMathDelimiters(text: string): string {
     if (!inlineCodeTicks && atLineStart) {
       const fence = text.slice(i).match(FENCE_RE);
       if (fence) {
-        inFence = !inFence;
+        const marker = fence[1];
+        if (!openFence) {
+          openFence = marker;
+        } else if (marker[0] === openFence[0] && marker.length >= openFence.length) {
+          openFence = "";
+        }
         result += fence[0];
         i += fence[0].length - 1;
         continue;
       }
     }
-    if (inFence) {
+    if (openFence) {
       result += char;
       continue;
     }

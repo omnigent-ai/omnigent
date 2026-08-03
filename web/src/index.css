@@ -832,13 +832,13 @@
   overflow-wrap: break-word;
 }
 
-/* KaTeX lays out radicals/fractions with positioned spans. Display math can be
- * both wider and taller than normal prose, so give it its own scroll surface
- * instead of relying on the surrounding chat bubble to clip or wrap it. */
+/* KaTeX lays out radicals/fractions with positioned spans. Wide display math
+ * gets its own horizontal scroll surface instead of relying on the surrounding
+ * chat bubble to clip or wrap it. (No overflow-y override: with overflow-x
+ * non-visible the browser forces overflow-y to compute as auto anyway.) */
 .katex-display {
   max-width: 100%;
   overflow-x: auto;
-  overflow-y: visible;
   padding-block: 0.25rem;
 }
 

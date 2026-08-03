@@ -4,6 +4,7 @@
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
@@ -365,15 +366,24 @@ describe("BlockRenderer dispatch", () => {
       expect(normalizeExplicitMathDelimiters(indentedFence)).toBe(indentedFence);
     });
 
+    it("keeps a mismatched fence marker inside a code block as literal text", () => {
+      // A `~~~` line inside a ``` block does not close it (CommonMark requires
+      // the same fence char), so delimiters there must stay verbatim.
+      const block = ["```", "~~~", String.raw`\(\sqrt{x}\)`, "```"].join("\n");
+      expect(normalizeExplicitMathDelimiters(block)).toBe(block);
+    });
+
     it("loads required Streamdown and KaTeX styles at the app entrypoint", () => {
       // KaTeX's DOM is mostly positioned spans. Without its stylesheet, radicals
       // and fractions can leave only the root bar/outer shell visible while the
       // radicand appears missing. Keep this as a source-level guard because
-      // jsdom cannot catch visual CSS layout failures.
-      const entrypoints = ["src/main.tsx", "src/embed.tsx"].map((file) =>
-        readFileSync(path.join(process.cwd(), file), "utf8"),
+      // jsdom cannot catch visual CSS layout failures. Resolve relative to this
+      // file (not process.cwd()) so the test is independent of the runner's dir.
+      const srcDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+      const entrypoints = ["main.tsx", "embed.tsx"].map((file) =>
+        readFileSync(path.join(srcDir, file), "utf8"),
       );
-      const indexCss = readFileSync(path.join(process.cwd(), "src/index.css"), "utf8");
+      const indexCss = readFileSync(path.join(srcDir, "index.css"), "utf8");
 
       for (const source of entrypoints) {
         expect(source).toContain('import "katex/dist/katex.min.css"');
