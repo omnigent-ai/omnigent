@@ -133,11 +133,8 @@ def _build_acp_executor() -> Executor:
         model=model,
         session_id_mode=session_id_mode,
         send_model_in_session_new=send_model,
-<<<<<<< HEAD
-        env_passthrough=env_passthrough,
-=======
         omnigent_mcp=omnigent_mcp,
->>>>>>> origin/feat/acp-cli-catalog
+        env_passthrough=env_passthrough,
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
 

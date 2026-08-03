@@ -9,7 +9,7 @@ import pytest
 
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.executor import TextChunk, TurnComplete
-from omnigent.runtime.workflow import _build_qoder_spawn_env
+from omnigent.runtime.workflow import _build_acp_cli_spawn_env
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 _FAKE_QODER = r"""#!/usr/bin/env python3
@@ -64,8 +64,9 @@ async def test_qoder_harness_runs_a_real_acp_turn(
     qodercli.chmod(0o755)
     monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _binary: str(qodercli))
     monkeypatch.setenv("QODER_PERSONAL_ACCESS_TOKEN", "test-token")
+    monkeypatch.delenv("OMNIGENT_QODER_PATH", raising=False)
 
-    spawn_env = _build_qoder_spawn_env(_spec(), cwd=tmp_path)
+    spawn_env = _build_acp_cli_spawn_env(_spec(), harness="qoder", cwd=tmp_path)
     command = spawn_env["HARNESS_ACP_COMMAND"]
     assert shlex.split(command) == [str(qodercli), "--acp"]
 

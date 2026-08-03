@@ -44,8 +44,8 @@ def test_builtin_qoder_harnesses_are_registered() -> None:
     assert hp.harness_aliases()["qodercn"] == "qoder-cn"
     assert hp.harness_modules()["qoder"] == "omnigent.inner.acp_harness"
     assert hp.harness_modules()["qoder-cn"] == "omnigent.inner.acp_harness"
-    assert hp.spawn_env_builders()["qoder"].endswith(":_build_qoder_spawn_env")
-    assert hp.spawn_env_builders()["qoder-cn"].endswith(":_build_qoder_cn_spawn_env")
+    # No spawn_env_builders entries: catalog rows dispatch by ACP_CLI_HARNESSES
+    # membership in the runner (see _build_spawn_env_from_spec).
 
     specs = hp.install_specs()
     assert (specs["qoder"].binary, specs["qoder"].package) == (

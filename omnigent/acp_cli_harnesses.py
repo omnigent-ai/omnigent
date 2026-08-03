@@ -46,11 +46,15 @@ class AcpCliHarness:
     :param args: Argv appended after the binary to start the CLI's ACP stdio
         server, e.g. ``("--acp",)`` or ``("agent", "stdio")``.
     :param aliases: Accepted alternate spellings, canonicalized to the row key.
+    :param env_passthrough: Vendor credential env-var names explicitly allowed
+        into the otherwise deny-by-default ACP child environment (see
+        ``AcpAgentConfig.env_passthrough``). Keep it to the CLI's own tokens.
     """
 
     install: HarnessInstallSpec
     args: tuple[str, ...]
     aliases: tuple[str, ...] = ()
+    env_passthrough: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -72,4 +76,30 @@ class AcpCliHarness:
 
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
-ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {}
+ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
+    # Qoder (``qodercli``) and Qoder CN (``qoderclicn``) drive the vendors'
+    # supported ``--acp`` interfaces. npm-installable; auth is the CLI's own
+    # login or a personal access token forwarded, alone, into the
+    # deny-by-default child env.
+    "qoder": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Qoder",
+            "qodercli",
+            "@qoder-ai/qodercli",
+            login_args=("login",),
+        ),
+        args=("--acp",),
+        env_passthrough=("QODER_PERSONAL_ACCESS_TOKEN",),
+    ),
+    "qoder-cn": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Qoder CN",
+            "qoderclicn",
+            "@qodercn-ai/qoderclicn",
+            login_args=("login",),
+        ),
+        args=("--acp",),
+        aliases=("qodercn",),
+        env_passthrough=("QODERCN_PERSONAL_ACCESS_TOKEN",),
+    ),
+}

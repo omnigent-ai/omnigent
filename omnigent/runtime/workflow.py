@@ -1555,6 +1555,10 @@ def _build_acp_cli_spawn_env(
         "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,
     }
+    # Vendor tokens explicitly allowed into the deny-by-default ACP child env
+    # (read back by acp_harness → AcpAgentConfig.env_passthrough).
+    if row.env_passthrough:
+        env["HARNESS_ACP_ENV_PASSTHROUGH"] = json.dumps(list(row.env_passthrough))
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
     if cwd is not None:
