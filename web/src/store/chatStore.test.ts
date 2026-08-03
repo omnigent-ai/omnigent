@@ -491,9 +491,17 @@ describe("chatStore — switchTo", () => {
     const settled = useChatStore.getState();
     expect(settled.blocks.map((b) => b.ctx.itemId)).toEqual(cachedItems.map((item) => item.id));
     expect(settled.loadingMoreHistory).toBe(false);
+    const catchUpUrl = fetchMock.mock.calls
+      .map(([input]) => (typeof input === "string" ? input : input.toString()))
+      .find(
+        (url) => url.startsWith("/v1/sessions/conv_cached/items?") && url.includes("order=asc"),
+      );
+    expect(catchUpUrl).toBe(
+      `/v1/sessions/conv_cached/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=asc&after=${cachedItems.at(-1)!.id}`,
+    );
   });
 
-  it("bridges a multi-page cache gap without resetting the older-history cursor", async () => {
+  it("pages forward through a multi-page cache gap without resetting history", async () => {
     const before = Array.from({ length: 30 }, (_, i) =>
       userMessage(`cache_before_${i}`, `before ${i}`),
     );
@@ -506,6 +514,12 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_other");
 
     seedSession("conv_cached_gap", [...before, ...gap]);
+    const catchUpUrls: string[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cached_gap/items?")) catchUpUrls.push(url);
+      return defaultFetchHandler(input, init);
+    });
     await useChatStore.getState().switchTo("conv_cached_gap");
 
     const state = useChatStore.getState();
@@ -514,9 +528,57 @@ describe("chatStore — switchTo", () => {
     );
     expect(state.oldestItemId).toBe(cachedOldest);
     expect(state.hasMoreHistory).toBe(true);
+    expect(catchUpUrls).toEqual([
+      `/v1/sessions/conv_cached_gap/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=asc&after=${before.at(-1)!.id}`,
+      `/v1/sessions/conv_cached_gap/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=asc&after=${gap[SESSION_HISTORY_PAGE_SIZE - 1]!.id}`,
+      `/v1/sessions/conv_cached_gap/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=asc&after=${gap[2 * SESSION_HISTORY_PAGE_SIZE - 1]!.id}`,
+    ]);
   });
 
-  it("replaces the cached window when the gap exceeds the backfill cap", async () => {
+  it("still applies session metadata when cached catch-up fails", async () => {
+    const before = Array.from({ length: 30 }, (_, i) =>
+      userMessage(`cache_error_before_${i}`, `before ${i}`),
+    );
+    const gap = Array.from({ length: 25 }, (_, i) =>
+      userMessage(`cache_error_gap_${i}`, `gap ${i}`),
+    );
+    seedSession("conv_cached_error", before);
+    seedSession("conv_other", []);
+    await useChatStore.getState().switchTo("conv_cached_error");
+    const cachedIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    await useChatStore.getState().switchTo("conv_other");
+
+    seedSession("conv_cached_error", [...before, ...gap]);
+    sessionCostControlOverrides.set("conv_cached_error", "on");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.startsWith("/v1/sessions/conv_cached_error/items?") &&
+        url.includes(`after=${gap[SESSION_HISTORY_PAGE_SIZE - 1]!.id}`)
+      ) {
+        return mockResponse(
+          { error: { message: "temporary failure" } },
+          { ok: false, status: 500 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_cached_error");
+
+    const state = useChatStore.getState();
+    // Catch-up is transactional: a failed later page does not leave a hole,
+    // while the independently successful session snapshot still binds.
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(cachedIds);
+    expect(state.costControlModeOverride).toBe("on");
+    expect(state.loadingMoreHistory).toBe(false);
+    expect(state.conversationLoadError).toBeNull();
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("pages forward through a large cache gap", async () => {
     const before = Array.from({ length: 30 }, (_, i) =>
       userMessage(`cache_cap_before_${i}`, `before ${i}`),
     );
@@ -527,30 +589,16 @@ describe("chatStore — switchTo", () => {
     seedSession("conv_other", []);
 
     await useChatStore.getState().switchTo("conv_cached_cap");
+    const cachedOldest = useChatStore.getState().oldestItemId;
     await useChatStore.getState().switchTo("conv_other");
     seedSession("conv_cached_cap", [...before, ...gap]);
     await useChatStore.getState().switchTo("conv_cached_cap");
 
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...before.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
     );
-    await useChatStore.getState().loadMoreHistory();
-    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
-    );
-  });
-
-  it("replaces a cached transcript that no longer overlaps server history", async () => {
-    seedSession("conv_cached_replaced", [userMessage("cache_old", "old")]);
-    seedSession("conv_other", []);
-    await useChatStore.getState().switchTo("conv_cached_replaced");
-    await useChatStore.getState().switchTo("conv_other");
-
-    const replacement = userMessage("cache_new", "new");
-    seedSession("conv_cached_replaced", [replacement]);
-    await useChatStore.getState().switchTo("conv_cached_replaced");
-
-    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([replacement.id]);
+    expect(useChatStore.getState().oldestItemId).toBe(cachedOldest);
+    expect(useChatStore.getState().hasMoreHistory).toBe(true);
   });
 
   it("evicts the least-recently-written transcript after ten entries", async () => {
@@ -6902,7 +6950,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     return userMessage(`${prefix}_${idx.toString().padStart(4, "0")}`, `${prefix} ${idx}`);
   }
 
-  it("backfills a multi-page disconnect gap until it reaches the rendered transcript", async () => {
+  it("pages forward through a multi-page disconnect gap", async () => {
     // 30 committed items; the rendered window is the newest 20.
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
@@ -6936,7 +6984,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       ...windowItems.map((item) => item.id),
       ...gap.map((item) => item.id),
     ]);
-    // Backfill is not a re-hydrate: the scroll-up cursor is untouched.
+    // Catch-up does not replace the history window: scroll-up is untouched.
     expect(state.oldestItemId).toBe(windowItems[0]!.id);
     expect(state.hasMoreHistory).toBe(true);
 
@@ -6947,7 +6995,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("re-hydrates the window when the gap outruns the backfill page cap", async () => {
+  it("pages forward through a large disconnect gap", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
     seedSession("conv_bigap", preGap);
@@ -6965,8 +7013,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync();
     expect(sinks).toHaveLength(1);
 
-    // 100 gap items: 4 backfill pages (80) can't reach the rendered
-    // transcript, so reconcile must fall back to a fresh window.
+    // Large gaps keep advancing from the last rendered item until complete.
     const gap = Array.from({ length: 100 }, (_, i) => gapUser("gap", i));
     seedSessionItems("conv_bigap", [...preGap, ...gap]);
     sinks[0]!.error();
@@ -6974,19 +7021,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(sinks).toHaveLength(2);
 
     const state = useChatStore.getState();
-    // The window was replaced wholesale with the newest page, exactly as a
-    // cold bind would load it — not left with a mid-transcript hole.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...windowItems, ...gap].map((item) => item.id),
     );
-    // The cursor was rewound to the fresh window's top, so everything older
-    // (the rest of the gap included) is reachable again by paging up.
-    expect(state.oldestItemId).toBe(gap.at(-SESSION_HISTORY_PAGE_SIZE)!.id);
+    expect(state.oldestItemId).toBe(windowItems[0]!.id);
     expect(state.hasMoreHistory).toBe(true);
 
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...preGap, ...gap].map((item) => item.id),
     );
 
     const last = sinks[1]!;
@@ -7046,14 +7089,14 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("drops a stale reconcile/re-hydrate after a switch-away-and-back mid-backfill", async () => {
+  it("drops a cancelled forward catch-up after a switch-away-and-back", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("spre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
     seedSession("conv_stale", preGap);
     seedSession("conv_other", []);
-    // Route /stream opens to sinks AND hold reconcile's first backfill page.
+    // Route /stream opens to sinks AND hold reconcile's first forward page.
     const sinks: StreamSink[] = [];
-    let releaseBackfill: (() => void) | null = null;
+    let releaseCatchUp: (() => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
@@ -7061,9 +7104,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         sinks.push(sink);
         return mockResponse(null, { bodyStream: sink.stream });
       }
-      if (/\/v1\/sessions\/conv_stale\/items\?.*after=/.test(url) && releaseBackfill === null) {
+      if (/\/v1\/sessions\/conv_stale\/items\?.*after=/.test(url) && releaseCatchUp === null) {
         return new Promise<Response>((resolve) => {
-          releaseBackfill = () => resolve(defaultFetchHandler(input, init));
+          releaseCatchUp = () => resolve(defaultFetchHandler(input, init));
         });
       }
       return defaultFetchHandler(input, init);
@@ -7081,50 +7124,44 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync();
     expect(sinks).toHaveLength(1);
 
-    // 100 gap items: if the stale backfill resumed, it would outrun the
-    // page cap and fall through to the window re-hydrate.
+    // A large suffix ensures the replacement bind itself walks several pages.
     const gap = Array.from({ length: 100 }, (_, i) => gapUser("sgap", i));
     seedSessionItems("conv_stale", [...preGap, ...gap]);
     sinks[0]!.error();
     await drainAsync();
-    // Sync gate: reconcile is parked on its first deferred backfill page.
-    expect(releaseBackfill).not.toBeNull();
+    // Sync gate: reconcile is parked on its first deferred forward page.
+    expect(releaseCatchUp).not.toBeNull();
 
-    // The user leaves and comes back: the revisit hydrates a FRESH window
-    // (the newest 20 gap items) and then scrolls one page up.
+    // The user leaves and comes back: the cached revisit catches up fully.
     const away = useChatStore.getState().switchTo("conv_other");
     await drainAsync(5);
     await away;
     const back = useChatStore.getState().switchTo("conv_stale");
     await drainAsync(5);
     await back;
-    await useChatStore.getState().loadMoreHistory();
     const fresh = useChatStore.getState();
     expect(fresh.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...windowItems, ...gap].map((item) => item.id),
     );
 
     // The stale page resolves: the conversation id matches again, so only
     // the generation guard separates it from the new window.
-    releaseBackfill!();
+    releaseCatchUp!();
     await drainAsync();
 
     const state = useChatStore.getState();
-    // The stale flow must write nothing — pre-fix it ran on to the
-    // re-hydrate fallback, which rewound the scroll-up cursor to the
-    // window top and bumped the generation (voiding future legit pages).
+    // The old request must write nothing even though the conversation id
+    // matches again; only the generation guard distinguishes the two binds.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...windowItems, ...gap].map((item) => item.id),
     );
-    expect(state.oldestItemId).toBe(gap.at(-2 * SESSION_HISTORY_PAGE_SIZE)!.id);
+    expect(state.oldestItemId).toBe(windowItems[0]!.id);
     expect(state.historyGeneration).toBe(fresh.historyGeneration);
 
-    // The new window still pages older from where it left off: pre-fix the
-    // rewound cursor re-fetched the already-rendered page (all dupes) and
-    // this would still show only 40 items.
+    // The cached window still pages older from its original cursor.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-3 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...preGap, ...gap].map((item) => item.id),
     );
 
     // Unpark the orphaned pump so the awaited loop can exit.
@@ -7133,7 +7170,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("re-hydrate keeps pending elicitation and synthetic error blocks in the tail", async () => {
+  it("forward catch-up preserves pending elicitation and synthetic error blocks", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("kpre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
     seedSession("conv_keep", preGap);
@@ -7191,7 +7228,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync();
     expect(sinks).toHaveLength(1);
 
-    // 100 gap items: the backfill cap is outrun, forcing the re-hydrate.
+    // Catch up through a large committed suffix.
     const gap = Array.from({ length: 100 }, (_, i) => gapUser("kgap", i));
     seedSessionItems("conv_keep", [...preGap, ...gap]);
     sinks[0]!.error();
@@ -7199,13 +7236,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(sinks).toHaveLength(2);
 
     const state = useChatStore.getState();
-    // The fresh fetch returns ITEMS only — dropping these blocks would lose
-    // the pending ApprovalCard (and the failure reason) with no way back.
-    expect(state.blocks.map((b) => b.ctx.itemId ?? b.type)).toEqual([
-      ...gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
-      "elicitation",
-      "error",
-    ]);
+    expect(state.blocks.filter((b) => b.ctx.itemId).map((b) => b.ctx.itemId)).toEqual(
+      [...windowItems, ...gap].map((item) => item.id),
+    );
     const card = state.blocks.find((b): b is ElicitationBlock => b.type === "elicitation");
     expect(card?.elicitationId).toBe("elic_keep");
     expect(card?.status).toBe("pending");
@@ -7297,12 +7330,12 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(sinks).toHaveLength(2);
 
     // The stale preview is gone — kept, it would double-render beside
-    // the committed copy the reconnect backfill splices in.
+    // the committed copy the reconnect catch-up splices in.
     expect(livePreviews()).toEqual([]);
     const dones = useChatStore
       .getState()
       .blocks.filter((b): b is Extract<AnyBlock, { type: "text_done" }> => b.type === "text_done");
-    // Exactly one rendering of the text: the backfilled committed item.
+    // Exactly one rendering of the text: the caught-up committed item.
     // 2 = the pre-fix duplicate (stale preview + committed item).
     expect(dones.map((b) => b.ctx.itemId)).toEqual(["msg_resp_n_asst"]);
     expect(dones[0]!.fullText).toBe("Hello world!");
@@ -7924,7 +7957,7 @@ describe("chatStore — setCostControlMode", () => {
 });
 
 // Elicitations are keyed by elicitationId, never itemId (they are not
-// persisted conversation items), so neither the reconnect item backfill
+// persisted conversation items), so neither reconnect item catch-up
 // nor the itemId dedupe can see them. These tests cover the dedicated
 // elicitation recovery paths: cards surviving a transport drop, prompts
 // that fired or resolved while the socket was dead, and the server's

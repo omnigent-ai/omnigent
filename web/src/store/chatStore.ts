@@ -63,7 +63,7 @@ import {
   bindOnlyOnlineRunner,
   createSession,
   getSessionSlim,
-  fetchInitialHistoryWindow,
+  fetchSessionItemsAfter,
   fetchSessionItemsPage,
   interrupt as interruptSession,
   openSessionStream,
@@ -528,11 +528,10 @@ export interface ChatState {
   abortController: AbortController | null;
   /**
    * Monotonic guard for the loaded history window. Bumped whenever the
-   * window is reset (`switchTo`, `bindStream` hydration, the reconnect
-   * re-hydrate fallback) so an in-flight window read (`loadMoreHistory`,
-   * `reconcileOnReconnect` and its re-hydrate fallback) fetched against
-   * a previous window is dropped instead of writing a stale page or
-   * cursor into the new one.
+   * window is reset (`switchTo`, `bindStream` hydration) so an in-flight
+   * window read (`loadMoreHistory` or `reconcileOnReconnect`) fetched
+   * against a previous window is dropped instead of writing a stale page
+   * or cursor into the new one.
    */
   historyGeneration: number;
 
@@ -1650,7 +1649,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         conversationLoadError: null,
         hasMoreHistory: cached?.hasMoreHistory ?? false,
         // Prevent cursor-relative scroll-up requests from racing the
-        // cache gap bridge. Revalidation clears this without showing UI.
+        // cache catch-up. Revalidation clears this without showing UI.
         loadingMoreHistory: cached !== null,
         oldestItemId: cached?.oldestItemId ?? null,
         llmModel: null,
@@ -1872,7 +1871,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!conversationId || !oldestItemId || loadingMoreHistory || !hasMoreHistory) return;
     set({ loadingMoreHistory: true });
     // Drop the result if the window was reset while this page was in flight
-    // (navigate away-and-back, rebind hydration, reconnect re-hydrate): the
+    // (navigate away-and-back or rebind hydration): the
     // page is cursor-relative to the OLD window, and prepending it into the
     // new one would invert order or rewind the cursor past a silent gap.
     const stale = (): boolean =>
@@ -2235,8 +2234,9 @@ async function refreshSessionBinding(id: string): Promise<void> {
 
 /**
  * Start the session SSE stream, kick off the pump in the background
- * once the stream connects, then fetch metadata plus the most recent
- * page of item history and merge it into state.blocks.
+ * once the stream connects, then fetch metadata plus item history and
+ * merge it into state.blocks. Cold loads fetch the newest page; cache hits
+ * page forward from their newest committed item.
  *
  * Order matters per the migration plan §R1 ("stream-then-snapshot
  * race") — start the stream request FIRST so events emitted during
@@ -2259,14 +2259,8 @@ async function bindStream(
   set({ abortController: controller });
 
   const historyGeneration = get().historyGeneration;
-  const cachedItemIds = hydrateFromCache
-    ? new Set(
-        get()
-          .blocks.map((b) => b.ctx.itemId)
-          .filter((itemId): itemId is string => Boolean(itemId)),
-      )
-    : null;
-  const cacheHydrationStale = (): boolean =>
+  const cachedCursor = hydrateFromCache ? newestCommittedItemId(get().blocks) : null;
+  const cacheHydrationCancelled = (): boolean =>
     get().conversationId !== id || get().historyGeneration !== historyGeneration;
 
   void startStreamPump(id, controller, set, get);
@@ -2287,48 +2281,44 @@ async function bindStream(
     });
   }
 
-  // Snapshot the session metadata and hydrate the most recent page of
-  // item history. The pump may have already pushed blocks by the time
-  // this resolves — dedupe by item id.
+  // Snapshot session metadata and either hydrate the most recent history
+  // page or catch a cached transcript up from its newest item. The pump may
+  // have already pushed blocks by the time this resolves — dedupe by item id.
   // Always refetch the snapshot on bind. A cached session snapshot can
   // be stale after the agent commits new items while the user is viewing
   // another conversation; reusing it drops messages until a page refresh.
-  // Bind waits for only the newest page. HistoryAutoLoader grows the initial
-  // window after render, and `loadMoreHistory` handles later scroll-up paging.
+  // Cold binds wait for only the newest page. HistoryAutoLoader grows the
+  // initial window after render, and `loadMoreHistory` handles scroll-up.
   // `retry: false` because the most common failure here is "invalid conv
   // id in URL" (not transient).
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   try {
-    // Fetch one page here so the newest items can render after one round-trip.
-    // HistoryAutoLoader fetches any additional initial pages after this commit.
-    const [session, page] = await Promise.all([
+    // A cold bind renders after one history round-trip. A cached bind is already
+    // painted and fetches only the committed suffix added while it was away.
+    const historyPromise =
+      cachedCursor !== null
+        ? fetchItemsAfterCursor(id, cachedCursor, cacheHydrationCancelled)
+        : fetchSessionItemsPage(id);
+    const [session, historyResult] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
         queryFn: () => getSessionSlim(id, { refreshState: true }),
         staleTime: 0,
         retry: false,
       }),
-      fetchSessionItemsPage(id),
+      historyPromise.then(
+        (page) => ({ page, error: null }),
+        (error: unknown) => ({ page: null, error }),
+      ),
     ]);
-    if (get().conversationId !== id) return;
-
-    let historyPage = page;
-    let replaceCachedWindow = false;
-    if (cachedItemIds !== null) {
-      const bridged = await backfillItemsUntilCovered(id, page, cachedItemIds, cacheHydrationStale);
-      if (bridged === "stale") {
-        if (!cacheHydrationStale()) set({ loadingMoreHistory: false });
-        return;
-      }
-      if (bridged === "uncovered") {
-        replaceCachedWindow = true;
-      } else {
-        historyPage = bridged;
-      }
-      if (cacheHydrationStale()) return;
+    if (cacheHydrationCancelled()) return;
+    if (historyResult.error !== null && cachedCursor === null) throw historyResult.error;
+    if (historyResult.error !== null) {
+      console.warn(`Session ${id}: cached transcript catch-up failed`, historyResult.error);
     }
+    const historyPage = historyResult.page ?? { items: [], hasMore: false };
     const items = historyPage.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
@@ -2428,26 +2418,11 @@ async function bindStream(
       );
       const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
       let transcriptBlocks: AnyBlock[];
-      if (cachedItemIds === null) {
+      if (cachedCursor === null) {
         transcriptBlocks = [...unique, ...state.blocks];
-      } else if (!replaceCachedWindow) {
+      } else {
         transcriptBlocks =
           unique.length > 0 ? spliceUnseenAheadOfInFlight(state, unique) : state.blocks;
-      } else {
-        const rid =
-          state.activeResponse?.state === "streaming" ? state.activeResponse.responseId : null;
-        const liveTail = state.blocks.filter((b) => {
-          if (b.ctx.itemId) return !cachedItemIds.has(b.ctx.itemId);
-          if (b.type === "elicitation" || b.type === "error") return true;
-          return rid !== null && b.ctx.responseId === rid;
-        });
-        const liveTailIds = new Set(
-          liveTail.map((b) => b.ctx.itemId).filter((itemId): itemId is string => Boolean(itemId)),
-        );
-        transcriptBlocks = [
-          ...snapshotBlocks.filter((b) => !b.ctx.itemId || !liveTailIds.has(b.ctx.itemId)),
-          ...liveTail,
-        ];
       }
       // Dedupe against any elicitation blocks already produced by
       // the live pump (the snapshot may race ahead of or behind
@@ -2579,10 +2554,10 @@ async function bindStream(
               code: session.lastTaskError.code,
             }
           : null;
-      const preserveCachedCursor = cachedItemIds !== null && !replaceCachedWindow;
+      const preserveCachedCursor = cachedCursor !== null;
       return {
         ...effectiveBindingPatch,
-        ...(cachedItemIds !== null ? reconnectStatusPatch(session, state) : {}),
+        ...(cachedCursor !== null ? reconnectStatusPatch(session, state) : {}),
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
         pendingByConversation: prunedStash,
@@ -2687,7 +2662,7 @@ function nextReconnectDelay(failedOpens: number): number {
  *   surviving copy would double the text. A message that committed
  *   during the gap is excluded from the replay entirely; its preview
  *   must vanish too, or it would double-render beside the committed
- *   item the reconnect backfill splices in. So previews are dropped
+ *   item the reconnect catch-up splices in. So previews are dropped
  *   unconditionally (NOT gated on `activeResponse` — native sessions
  *   stream mid-turn while `session.status`-driven, e.g. parked on a
  *   permission prompt).
@@ -2717,14 +2692,6 @@ function dropEphemeralInFlightBlocks(id: string, set: Setter): void {
     return { blocks: kept };
   });
 }
-
-/**
- * How many pages `reconcileOnReconnect` will walk backwards looking for
- * overlap with the already-rendered transcript before giving up and
- * re-hydrating the window wholesale. Bounds the per-reconnect fan-out for
- * a very long disconnect gap (the fallback is one initial-window fetch).
- */
-const RECONNECT_BACKFILL_MAX_PAGES = 4;
 
 /**
  * Session-snapshot state every reconnect path recovers: `sessionStatus`,
@@ -2797,7 +2764,7 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
  * pending-elicitation list.
  *
  * Elicitations are keyed by `elicitationId`, never `itemId` (they are
- * not persisted items), so the reconnect item backfill can't recover
+ * not persisted items), so the reconnect item catch-up can't recover
  * them — and the SSE stream has no elicitation replay, so a prompt
  * whose `response.elicitation_request` fired into the dead socket
  * would otherwise stay invisible until a page refresh. The snapshot's
@@ -2892,104 +2859,37 @@ function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
   return { pending, autoResolved };
 }
 
-/**
- * Reconnect fallback when the disconnect gap outran the incremental
- * backfill cap: replace the history window wholesale from a fresh
- * initial-window fetch, exactly as a cold bind would. Pre-gap blocks are
- * dropped (the fresh window re-covers the newest items; older turns stay
- * reachable via scroll-up, since `oldestItemId` / `hasMoreHistory` are
- * reset alongside) while the live tail the reconnected pump has already
- * delivered — newly committed items plus the active turn's replayed
- * in-flight ephemera — is kept after the window, along with
- * elicitation/error blocks (never items, so the fresh fetch can't
- * recreate them). Elicitation cards are then reconciled against the
- * snapshot's pending list (see `reconcileElicitationBlocks`).
- */
-async function rehydrateWindowOnReconnect(
-  id: string,
-  session: Session,
-  preGapIds: Set<string>,
-  preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
-  set: Setter,
-  get: Getter,
-): Promise<void> {
-  // Pinned at entry (still the caller's generation — its guards just passed).
-  const generation = get().historyGeneration;
-  let fresh: SessionItemsPage;
-  try {
-    fresh = await fetchInitialHistoryWindow(id);
-  } catch {
-    return;
+/** Newest persisted item represented by the painted transcript. */
+function newestCommittedItemId(blocks: AnyBlock[]): string | null {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i]!;
+    if (block.ctx.itemId && !isLiveProvisionalBlock(block)) return block.ctx.itemId;
   }
-  if (get().conversationId !== id || get().historyGeneration !== generation) return;
-  const freshBlocks = itemsToBlocks(fresh.items);
-  const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
-  set((s) => {
-    const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-    const tail = s.blocks.filter((b) => {
-      if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
-      // Elicitation/error blocks aren't items, so the fresh fetch can't recreate them.
-      if (b.type === "elicitation" || b.type === "error") return true;
-      return rid !== null && b.ctx.responseId === rid;
-    });
-    const tailIds = new Set(
-      tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
-    );
-    const merged = [
-      ...freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId)),
-      ...tail,
-    ];
-    return {
-      ...reconnectStatusPatch(session, s),
-      blocks:
-        reconcileElicitationBlocks(
-          merged,
-          snapshotPending,
-          preGapElicitations.pending,
-          preGapElicitations.autoResolved,
-        ) ?? merged,
-      hasMoreHistory: fresh.hasMore,
-      oldestItemId: fresh.items[0]?.id ?? null,
-      loadingMoreHistory: false,
-      // The window cursor was reset: void any in-flight loadMoreHistory.
-      historyGeneration: s.historyGeneration + 1,
-    };
-  });
+  return null;
 }
 
-/** Page backwards until a newest-first window overlaps the painted transcript. */
-async function backfillItemsUntilCovered(
+/** Page forward from a known item until the committed suffix is complete. */
+async function fetchItemsAfterCursor(
   id: string,
-  firstPage: SessionItemsPage,
-  preGapIds: Set<string>,
-  stale: () => boolean,
-): Promise<{ items: ConversationItem[]; hasMore: boolean } | "uncovered" | "stale"> {
-  let items = firstPage.items;
-  let hasMore = firstPage.hasMore;
-  let covered = preGapIds.size === 0 || items.some((it) => preGapIds.has(it.id));
+  initialCursor: string,
+  cancelled: () => boolean,
+): Promise<SessionItemsPage | null> {
+  let cursor = initialCursor;
+  const items: ConversationItem[] = [];
   /* oxlint-disable no-await-in-loop */
-  for (
-    let fetched = 1;
-    hasMore && !covered && fetched < RECONNECT_BACKFILL_MAX_PAGES;
-    fetched += 1
-  ) {
-    const cursor = items[0]?.id;
-    if (!cursor) break;
-    let older: SessionItemsPage;
-    try {
-      older = await fetchSessionItemsPage(id, { olderThan: cursor });
-    } catch {
-      return "stale";
+  while (!cancelled()) {
+    const page = await fetchSessionItemsAfter(id, cursor);
+    if (cancelled()) return null;
+    items.push(...page.items);
+    if (!page.hasMore) return { items, hasMore: false };
+    const nextCursor = page.items.at(-1)?.id;
+    if (!nextCursor || nextCursor === cursor) {
+      throw new Error(`Session ${id}: forward item pagination made no progress`);
     }
-    if (stale()) return "stale";
-    items = [...older.items, ...items];
-    hasMore = older.hasMore;
-    covered = older.items.some((it) => preGapIds.has(it.id));
-    if (older.items.length === 0) break; // no progress; avoid refetching the same cursor
+    cursor = nextCursor;
   }
   /* oxlint-enable no-await-in-loop */
-  if (!covered) return "uncovered";
-  return { items, hasMore };
+  return null;
 }
 
 /** Insert committed gap items before the active turn's itemId-less replay tail. */
@@ -3011,41 +2911,27 @@ function spliceUnseenAheadOfInFlight(state: ChatState, unseen: AnyBlock[]): AnyB
 /**
  * Reconcile committed state after a reconnect.
  *
- * Re-fetches the session snapshot + the most-recent items pages and splices
- * in any committed items the live tail can't resupply — items that
- * committed during the disconnect gap, whose stream events fired into a
- * dead socket. Pages backwards (newest-first) until a fetched page overlaps
- * an already-rendered item — or the conversation start — so a gap longer
- * than one page can't leave an unreachable hole between the window and the
- * live tail; if `RECONNECT_BACKFILL_MAX_PAGES` is hit without overlap, the
- * window is re-hydrated wholesale instead (see
- * `rehydrateWindowOnReconnect`). Dedupes by `itemId` and runs concurrently
- * with the live pump — the same race-safe "stream-then-snapshot" shape
- * `bindStream` uses, so a turn that completes between the fetch and the
- * reopen is still caught by one or the other.
+ * Re-fetches the session snapshot and pages forward from the newest committed
+ * item already rendered. This returns exactly the suffix whose stream events
+ * fired into the dead socket, regardless of how many pages the disconnect gap
+ * spans. Results are deduped by `itemId` and merged concurrently with the live
+ * pump — the same race-safe "stream-then-snapshot" shape `bindStream` uses.
  *
  * Also recovers the working-indicator state (`sessionStatus` /
  * `activeResponse`) from the snapshot so a gap-completed turn doesn't leave
  * the spinner stuck, and reconciles ApprovalCards against the snapshot's
  * `pending_elicitations` (see `reconcileElicitationBlocks`) — elicitations
- * are not items, so the item backfill can't recover prompts that fired or
- * resolved while the socket was dead. The backfill path leaves history-window state
- * (`hasMoreHistory` / `oldestItemId`) and sticky picker prefs untouched —
- * a reconnect is not a re-hydrate. Swallows fetch errors: a transient
- * failure just means the next reconnect retries. All writes are
+ * are not items, so item catch-up can't recover prompts that fired or resolved
+ * while the socket was dead. Catch-up leaves history-window state
+ * (`hasMoreHistory` / `oldestItemId`) and sticky picker prefs untouched.
+ * Fetch errors are swallowed so the next reconnect can retry. All writes are
  * `historyGeneration`-guarded so a window reset mid-fetch voids them.
  */
 async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promise<void> {
   if (queryClient === null) return;
-  // Captured before any await: the ids rendered BEFORE the gap. The overlap
-  // check below must not be satisfied by items the reconnected pump appends
-  // while we fetch — those are at the new end of the transcript, not proof
-  // the fetched window reaches back to the pre-gap one.
-  const preGapIds = new Set(
-    get()
-      .blocks.map((b) => b.ctx.itemId)
-      .filter((iid): iid is string => Boolean(iid)),
-  );
+  // Capture before any await so live-pump items that arrive during the fetch
+  // cannot advance the cursor past committed events missed during the gap.
+  const preGapCursor = newestCommittedItemId(get().blocks);
   // Same pre-gap capture for elicitation cards: only cards rendered
   // before the snapshot fetch are eligible for its flips — see
   // `reconcileElicitationBlocks`.
@@ -3055,29 +2941,32 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
   const stale = (): boolean =>
     get().conversationId !== id || get().historyGeneration !== generation;
   let session: Session;
-  let page: SessionItemsPage;
+  let historyResult: { page: SessionItemsPage | null; error: unknown };
+  const historyPromise =
+    preGapCursor !== null
+      ? fetchItemsAfterCursor(id, preGapCursor, stale)
+      : fetchSessionItemsPage(id);
   try {
-    [session, page] = await Promise.all([
+    [session, historyResult] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
         queryFn: () => getSessionSlim(id),
         staleTime: 0,
         retry: false,
       }),
-      fetchSessionItemsPage(id),
+      historyPromise.then(
+        (page) => ({ page, error: null }),
+        (error: unknown) => ({ page: null, error }),
+      ),
     ]);
   } catch {
     return;
   }
   if (stale()) return;
-
-  const bridged = await backfillItemsUntilCovered(id, page, preGapIds, stale);
-  if (bridged === "stale") return;
-  if (bridged === "uncovered") {
-    await rehydrateWindowOnReconnect(id, session, preGapIds, preGapElicitations, set, get);
-    return;
+  if (historyResult.error !== null) {
+    console.warn(`Session ${id}: reconnect item catch-up failed`, historyResult.error);
   }
-  const items = bridged.items;
+  const items = historyResult.page?.items ?? [];
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);

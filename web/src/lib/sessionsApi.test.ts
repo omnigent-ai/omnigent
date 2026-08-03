@@ -12,6 +12,7 @@ import {
   bindOnlyOnlineRunner,
   createSession,
   fetchInitialHistoryWindow,
+  fetchSessionItemsAfter,
   fetchSessionItemsPage,
   forkSession,
   getSession,
@@ -786,6 +787,46 @@ describe("fetchSessionItemsPage", () => {
     // (the pre-fix shape) would return the conversation's start instead.
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
       "/v1/sessions/conv_abc/items?limit=25&order=desc&after=msg_50",
+    );
+  });
+});
+
+describe("fetchSessionItemsAfter", () => {
+  it("pages forward from a known item and preserves chronological order", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [
+          {
+            id: "msg_51",
+            response_id: "resp_51",
+            type: "message",
+            role: "user",
+            status: "completed",
+            content: [{ type: "input_text", text: "first missing" }],
+          },
+          {
+            id: "msg_52",
+            response_id: "resp_52",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            model: "agent_xyz",
+            content: [{ type: "output_text", text: "second missing" }],
+          },
+        ],
+        first_id: "msg_51",
+        last_id: "msg_52",
+        has_more: true,
+      }),
+    );
+
+    const page = await fetchSessionItemsAfter("conv with space", "msg_50", 25);
+
+    expect(page.items.map((item) => item.id)).toEqual(["msg_51", "msg_52"]);
+    expect(page.hasMore).toBe(true);
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      "/v1/sessions/conv%20with%20space/items?limit=25&order=asc&after=msg_50",
     );
   });
 });
