@@ -669,7 +669,7 @@ def test_list_conversations_user_with_direct_grant_sees_session(
 ) -> None:
     """A user with a direct grant sees their session via ``list_conversations(accessible_by=...)``.
 
-    The UNION filter in list_conversations must include sessions where the
+    The ACL filter in list_conversations must include sessions where the
     user has a direct permission row.
     """
     _ensure_user(store, "alice@test.com")
@@ -696,7 +696,7 @@ def test_list_conversations_user_with_no_grants_sees_nothing(
 ) -> None:
     """A user with no grants sees no sessions via ``list_conversations(accessible_by=...)``.
 
-    The UNION filter must exclude sessions where the user has no permission row.
+    The ACL filter must exclude sessions where the user has no permission row.
     """
     _ensure_user(store, "alice@test.com")
     _ensure_user(store, "bob@test.com")

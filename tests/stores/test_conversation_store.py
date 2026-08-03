@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 from sqlalchemy import text
 
@@ -5286,3 +5288,614 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+def _acl_perms(db_uri: str):
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    return perms
+
+
+def _spread_created_at(store: SqlAlchemyConversationStore, ids: list[str]) -> None:
+    """Give *ids* strictly decreasing ``created_at`` values, newest first.
+
+    Conversations created in the same second tie on ``created_at``, and the
+    tiebreaker differs by dialect (SQLite ``rowid`` = insertion order,
+    PostgreSQL the random uuid ``id``), so any order-sensitive assertion
+    must not depend on creation order. Spreading the timestamps makes the
+    expected order identical on every dialect.
+    """
+    from sqlalchemy import update as sa_update
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+
+    base = 2_000_000_000
+    with store._conv_session() as session:
+        for offset, conv_id in enumerate(ids):
+            session.execute(
+                sa_update(_Conv)
+                .where(_Conv.id == conv_id)
+                .values(created_at=base - offset, updated_at=base - offset)
+            )
+
+
+@contextlib.contextmanager
+def _capture_conversation_selects(store: SqlAlchemyConversationStore):
+    """Capture the SELECT statements the store emits against conversations.
+
+    Yields a list that receives the actual SQLAlchemy clause elements, so a
+    plan test can re-compile the STORE'S OWN statement with literal binds
+    instead of hand-writing SQL that may omit predicates the planner sees.
+    """
+    from sqlalchemy import event as sa_event
+
+    captured: list[object] = []
+
+    def _on_before_execute(conn, clauseelement, multiparams, params, execution_options):
+        text = str(clauseelement)
+        if text.lstrip().upper().startswith("SELECT") and "FROM conversations" in text:
+            captured.append(clauseelement)
+
+    sa_event.listen(store._conv_engine, "before_execute", _on_before_execute)
+    try:
+        yield captured
+    finally:
+        sa_event.remove(store._conv_engine, "before_execute", _on_before_execute)
+
+
+@contextlib.contextmanager
+def _capture_driver_sql(store: SqlAlchemyConversationStore):
+    """Capture (statement, parameters) as the DBAPI sees them.
+
+    Plan tests need the driver-level form: the cursor binds a 16-byte
+    identifier, which cannot be rendered as a SQL literal, and re-binding raw
+    Python values to a ``text()`` EXPLAIN skips the type decorator — the exact
+    trap that made the first row-values attempt fail only on PostgreSQL.
+    Capturing the adapted parameters lets EXPLAIN run the real statement.
+    """
+    from sqlalchemy import event as sa_event
+
+    captured: list[tuple[str, object]] = []
+
+    def _on(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "FROM conversations" in statement:
+            captured.append((statement, parameters))
+
+    sa_event.listen(store._conv_engine, "before_cursor_execute", _on)
+    try:
+        yield captured
+    finally:
+        sa_event.remove(store._conv_engine, "before_cursor_execute", _on)
+
+
+def _explain_driver(store: SqlAlchemyConversationStore, statement: str, parameters: object) -> str:
+    """``EXPLAIN`` the exact statement+parameters the store executed.
+
+    Returns the plan as one string: PostgreSQL JSON, or SQLite's
+    ``EXPLAIN QUERY PLAN`` rows joined.
+    """
+    import json
+
+    dialect = store._conv_engine.dialect.name
+    with store._conv_session() as session:
+        conn = session.connection()
+        if dialect == "postgresql":
+            conn.exec_driver_sql("ANALYZE conversations")
+            conn.exec_driver_sql("ANALYZE session_permissions")
+            raw = conn.exec_driver_sql(
+                "EXPLAIN (ANALYZE, FORMAT JSON) " + statement, parameters
+            ).scalar_one()
+            return json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+        rows = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+    return " | ".join(str(row) for row in rows)
+
+
+def _explain_json(store: SqlAlchemyConversationStore, sql: str, analyze: bool = False) -> str:
+    """Return a PostgreSQL plan for *sql* as a JSON string (ANALYZE first)."""
+    import json
+
+    from sqlalchemy import text as sql_text
+
+    with store._conv_session() as session:
+        session.execute(sql_text("ANALYZE conversations"))
+        session.execute(sql_text("ANALYZE session_permissions"))
+        prefix = "EXPLAIN (ANALYZE, FORMAT JSON) " if analyze else "EXPLAIN (FORMAT JSON) "
+        raw = session.execute(sql_text(prefix + sql)).scalar_one()
+    return json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+
+
+def _bulk_seed_conversations_and_grants(
+    store: SqlAlchemyConversationStore,
+    user_id: str,
+    *,
+    count: int,
+    granted_ratio: float,
+    tie_size: int = 1,
+) -> None:
+    """Insert *count* conversations (and grants for a fraction of them).
+
+    Core bulk inserts, not per-row store calls, so a plan test can reach a
+    realistic row count without a slow fixture.
+
+    :param tie_size: How many rows share one ``created_at`` value. The
+        default of 1 gives every row a distinct timestamp; a larger value
+        creates ties, which is what makes the cursor's tiebreaker term
+        load-bearing (without ties, dropping it changes nothing).
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import insert as sa_insert
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+    from omnigent.db.db_models import SqlSessionPermission as _Perm
+
+    base = 1_900_000_000
+    conv_rows = []
+    perm_rows = []
+    for i in range(count):
+        cid = _uuid.uuid4().hex
+        stamp = base + i // tie_size
+        conv_rows.append(
+            {
+                "workspace_id": 0,
+                "id": cid,
+                "created_at": stamp,
+                "updated_at": stamp,
+                "title": f"seed-{i}",
+                "parent_conversation_id": None,
+                "root_conversation_id": cid,
+                "next_position": 0,
+                # The endpoint filters has_agent_id=True, so an all-NULL
+                # agent_id seed would exclude every row and the plan under
+                # test would never be the plan production runs.
+                "agent_id": _uuid.uuid4().hex,
+                "archived": i % 5 == 0,
+            }
+        )
+        if i < int(count * granted_ratio):
+            perm_rows.append(
+                {
+                    "workspace_id": 0,
+                    "user_id": user_id,
+                    "conversation_id": cid,
+                    "level": 4,
+                }
+            )
+    with store._conv_session() as session:
+        session.execute(sa_insert(_Conv), conv_rows)
+    with store._session() as session:
+        session.execute(sa_insert(_Perm), perm_rows)
+
+
+def test_list_conversations_accessible_and_owned_intersect(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    ``accessible_by`` + ``owned_by`` intersect, with different users.
+
+    Passing the same user for both operands makes ownership imply
+    accessibility, so the intersection equals ``owned_by`` alone and dropping
+    either operand goes unnoticed. Alice can read the row Bob owns; nothing
+    else satisfies both.
+    """
+    owned_by_alice = conversation_store.create_conversation(title="owned-by-alice")
+    owned_by_bob = conversation_store.create_conversation(title="owned-by-bob")
+    alice_reads_bob_owns = conversation_store.create_conversation(title="alice-reads-bob-owns")
+    # Both can read it and NEITHER owns it: it satisfies the intersection only
+    # if owned_by stops requiring owner level.
+    both_read_neither_owns = conversation_store.create_conversation(title="both-read")
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", owned_by_alice.id, 4)
+    perms.grant("bob@example.com", owned_by_bob.id, 4)
+    perms.grant("alice@example.com", alice_reads_bob_owns.id, 1)
+    perms.grant("bob@example.com", alice_reads_bob_owns.id, 4)
+    perms.grant("alice@example.com", both_read_neither_owns.id, 1)
+    perms.grant("bob@example.com", both_read_neither_owns.id, 1)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            accessible_by="alice@example.com", owned_by="bob@example.com"
+        ).data
+    }
+    assert ids == {alice_reads_bob_owns.id}
+
+
+def test_single_db_acl_uses_exists_pushdown_not_prefetch(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    Single-DB mode pushes the ACL into the conversations query as a
+    correlated EXISTS: no standalone session_permissions prefetch runs,
+    and the ids never round-trip through Python.
+    """
+    from sqlalchemy import event
+
+    assert conversation_store._conv_engine is conversation_store._engine
+
+    conv = conversation_store.create_conversation(title="mine")
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", conv.id, 4)
+
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", _capture)
+    try:
+        result = conversation_store.list_conversations(
+            accessible_by="alice@example.com", owned_by="alice@example.com"
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", _capture)
+
+    assert {c.id for c in result.data} == {conv.id}
+    perm_stmts = [s for s in statements if "session_permissions" in s]
+    # The permission table appears only inside the conversations query
+    # (as EXISTS subqueries) — never as its own prefetch SELECT.
+    assert perm_stmts, "expected the list query to reference session_permissions"
+    for stmt in perm_stmts:
+        assert "FROM conversations" in stmt
+        assert "EXISTS" in stmt
+
+
+def test_list_conversations_acl_with_cursor_pagination(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """Cursor pagination composes with the ACL filter: walking every page
+    yields exactly the granted rows (no leak, no overlap, none lost), and a
+    NON-granted conversation used as the cursor still returns the granted
+    rows that follow it — an empty page would not satisfy this.
+
+    Owns the ACL-vs-cursor COMPOSITION: removing the filter (``needs_meta_filter
+    = False``) fails here, because the ungranted rows appear. It deliberately
+    does NOT own the pushdown — disabling it falls back to the id prefetch,
+    which must return identical rows on split binds, so this test passing
+    under that mutation is the contract working. The pushdown is pinned by
+    the statement-shape and plan guards below.
+    """
+    convs = [conversation_store.create_conversation(title=f"c{i}") for i in range(6)]
+    # Newest first: c0, c1, ... c5. Deterministic on every dialect.
+    _spread_created_at(conversation_store, [c.id for c in convs])
+    granted = {c.id for c in (convs[0], convs[1], convs[4], convs[5])}
+    perms = _acl_perms(db_uri)
+    for conv_id in granted:
+        perms.grant("alice@example.com", conv_id, 4)
+
+    # Full walk in pages of 2 must reproduce exactly the granted set.
+    seen: list[str] = []
+    cursor: str | None = None
+    for _ in range(10):  # bounded; 4 rows / 2 per page = 2 pages
+        page = conversation_store.list_conversations(
+            accessible_by="alice@example.com", limit=2, after=cursor
+        )
+        seen.extend(c.id for c in page.data)
+        if not page.has_more:
+            break
+        cursor = page.last_id
+    assert len(seen) == len(set(seen)), f"pages overlap: {seen}"
+    assert set(seen) == granted
+    assert seen == [convs[0].id, convs[1].id, convs[4].id, convs[5].id]
+
+    # A non-granted conversation (c2, positioned between granted rows) as
+    # the cursor: position filter only, ACL still applied — so the result is
+    # exactly the granted rows after it, not an empty page.
+    page3 = conversation_store.list_conversations(
+        accessible_by="alice@example.com", limit=10, after=convs[2].id
+    )
+    assert [c.id for c in page3.data] == [convs[4].id, convs[5].id]
+
+
+def test_list_projects_single_db_uses_exists_pushdown(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """Single-DB list_projects pushes ACL as EXISTS — no standalone
+    session_permissions prefetch — and still scopes correctly."""
+    from sqlalchemy import event
+
+    assert conversation_store._conv_engine is conversation_store._engine
+    mine = conversation_store.create_conversation(title="mine")
+    other = conversation_store.create_conversation(title="other")
+    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
+    conversation_store.set_labels(other.id, {"omni_project": "Other"})
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", other.id, 4)
+
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", _capture)
+    try:
+        projects = conversation_store.list_projects(accessible_by="alice@example.com")
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", _capture)
+
+    assert projects == ["Mine"]
+    perm_stmts = [s for s in statements if "session_permissions" in s]
+    assert perm_stmts, "expected the labels query to reference session_permissions"
+    for stmt in perm_stmts:
+        assert "conversation_labels" in stmt
+        assert "EXISTS" in stmt
+
+
+_PLAN_SEED_ROWS = 5_000
+"""Rows seeded for the plan tests.
+
+At a few hundred rows PostgreSQL correctly prefers a sequential scan, so a
+plan assertion there measures the planner's choice for a toy table rather than
+the production one. The index/range behaviour under test only appears once the
+table is large enough for an index plan to be the rational choice.
+"""
+
+
+def test_seeded_listing_plans_and_deep_pagination(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    Both listing contracts, explained against a realistically sized table.
+
+    Two contracts share one seed because seeding is the expensive part:
+
+    1. The default listing pushes the ACL into a correlated EXISTS and reads
+       the page through the ordering index — no id round-trip through Python,
+       no sort of the whole workspace.
+    2. The cursor predicate is emitted as a row-values comparison, which
+       PostgreSQL can use as an index RANGE condition. The equivalent
+       ``ts < :ts OR (ts = :ts AND id < :id)`` form is left as a residual
+       filter, so a deep cursor reads and discards every row above it, at a
+       cost that grows with cursor depth.
+
+    Everything is asserted against the statement the STORE emitted, captured
+    from the engine: the SQL shape from the clause element, and the PLAN from
+    the driver-level statement with its adapted parameters. The plan is the
+    load-bearing half — an earlier version asserted only the SQL spelling, so
+    restoring the OR form failed on spelling and CI never checked whether the
+    comparison reached the index. EXPLAIN needs the driver form because the
+    cursor binds a 16-byte identifier that cannot be written as a SQL literal,
+    and re-binding raw values to a ``text()`` EXPLAIN skips the type decorator
+    — the exact trap that made the first row-values attempt fail only on
+    PostgreSQL.
+    """
+    _acl_perms(db_uri)
+    # Tied timestamps: with one row per timestamp the cursor's tiebreaker term
+    # is decorative and dropping it loses nothing, so the walk below could not
+    # tell a correct cursor from a broken one.
+    _bulk_seed_conversations_and_grants(
+        conversation_store,
+        "alice@example.com",
+        count=_PLAN_SEED_ROWS,
+        # Half the workspace granted: a selective ACL is what production
+        # looks like, and an all-granted table lets the planner ignore the
+        # permission side entirely.
+        granted_ratio=0.5,
+        tie_size=4,
+    )
+    dialect = conversation_store._conv_engine.dialect.name
+
+    def _plan_of(driver_captured: list[tuple[str, object]]) -> str:
+        statement, parameters = next(
+            (
+                (st, pr)
+                for st, pr in driver_captured
+                if "created_at" in st and "LIMIT" in st.upper()
+            ),
+            driver_captured[-1],
+        )
+        return _explain_driver(conversation_store, statement, parameters)
+
+    def _index_conds_and_filtered(plan: str) -> tuple[list[str], list[int]]:
+        import json as _json
+
+        flat: list[dict[str, object]] = []
+
+        def _walk(node: dict[str, object]) -> None:
+            flat.append(node)
+            for child in node.get("Plans", []) or []:
+                _walk(child)
+
+        for entry in _json.loads(plan):
+            _walk(entry["Plan"])
+        return (
+            [str(n.get("Index Cond", "")) for n in flat if "Index Cond" in n],
+            [int(n.get("Rows Removed by Filter", 0) or 0) for n in flat],
+        )
+
+    # ── 1. default listing: ACL pushdown + ordering index ───────────────
+    with _capture_conversation_selects(conversation_store) as clauses:
+        with _capture_driver_sql(conversation_store) as driver_captured:
+            page = conversation_store.list_conversations(
+                limit=20,
+                accessible_by="alice@example.com",
+                has_agent_id=True,
+                kind="default",
+                sort_by="created_at",
+                order="desc",
+            )
+    assert page.data, "seed must produce visible rows or the plan is not the real one"
+    # On the uncompiled statement: without the pushdown the ACL becomes a
+    # materialized list of binary ids, and anything that renders it dies before
+    # reaching this assertion.
+    assert "EXISTS" in str(clauses[0]).upper(), str(clauses[0])
+    listing_plan = _plan_of(driver_captured)
+    if dialect == "postgresql":
+        assert "ix_conversations_archived_created" in listing_plan, listing_plan
+        # A Sort here would mean the whole accessible set was ordered to return
+        # twenty rows.
+        assert '"Node Type": "Sort"' not in listing_plan, listing_plan
+    else:
+        assert "ix_conversations_archived_created" in listing_plan, listing_plan
+        assert "SCAN conversations" not in listing_plan, listing_plan
+
+    # ── 2. deep cursor: row values as an index range condition ──────────
+    # A DEEP cursor with a NORMAL page size — the shape that distinguishes an
+    # index range condition from a residual filter. Asking for half the table
+    # in one page makes a sequential scan the planner's rational choice, and
+    # the plan would then say nothing about the predicate.
+    #
+    # ALL FOUR branches are explained, not just descending ``after``. The
+    # rewrite changed both directions and both orders, and the four produce
+    # different predicates; pinning one of them let the residual OR form be
+    # restored for the other three with every test still green. Behavioural
+    # equality cannot see this — the OR form returns the same rows, just by
+    # reading and discarding everything above the cursor.
+    baseline = conversation_store.list_conversations(
+        accessible_by="alice@example.com",
+        limit=_PLAN_SEED_ROWS * 2,
+        has_agent_id=True,
+        kind="default",
+        sort_by="created_at",
+        order="desc",
+    )
+    assert not baseline.has_more, "baseline must be a single complete page"
+    expected_ids = [c.id for c in baseline.data]
+    deep = int(len(expected_ids) * 0.7)
+
+    tiebreaker_col = conversation_store._tiebreaker_col
+    # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
+    # otherwise the uuid id) — assert against the store's own choice rather
+    # than hard-coding one dialect's spelling.
+    tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
+
+    first = None
+    second = None
+    for sort_by in ("created_at", "updated_at"):
+        for order in ("desc", "asc"):
+            for direction in ("after", "before"):
+                page = conversation_store.list_conversations(
+                    accessible_by="alice@example.com",
+                    limit=deep,
+                    has_agent_id=True,
+                    kind="default",
+                    sort_by=sort_by,
+                    order=order,
+                )
+                assert page.has_more, "seed must be deeper than one page"
+                cursor_id = page.data[-1].id
+                with _capture_conversation_selects(conversation_store) as clauses:
+                    with _capture_driver_sql(conversation_store) as driver_captured:
+                        cursor_page = conversation_store.list_conversations(
+                            accessible_by="alice@example.com",
+                            limit=20,
+                            has_agent_id=True,
+                            kind="default",
+                            sort_by=sort_by,
+                            order=order,
+                            **{direction: cursor_id},
+                        )
+                where = f"{sort_by}/{order}/{direction}"
+                # The PLAN first: a residual filter is the failure this form
+                # exists to avoid — it means the scan read every row past the
+                # cursor and threw it away.
+                cursor_plan = _plan_of(driver_captured)
+                if dialect == "postgresql":
+                    index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
+                    assert any(sort_by in c and "id" in c for c in index_conds), (
+                        where,
+                        cursor_plan,
+                    )
+                    assert all(r == 0 for r in rows_filtered), (where, cursor_plan)
+                else:
+                    assert "USING INDEX" in cursor_plan, (where, cursor_plan)
+                    assert "SCAN conversations" not in cursor_plan, (where, cursor_plan)
+
+                # Then the emitted spelling, as a description of what produced
+                # that plan. ``after`` in a descending scan compares "<";
+                # every other combination flips one of the two.
+                listing = next((c for c in clauses if sort_by in str(c)), clauses[0])
+                descending_scan = (order == "desc") if direction == "after" else (order == "asc")
+                comparison = "<" if descending_scan else ">"
+                assert f"(conversations.{sort_by}, {tiebreaker}) {comparison}" in " ".join(
+                    str(listing).split()
+                ), (where, tiebreaker, str(listing))
+
+                # Keep the descending created_at/after pages for the walk below.
+                if sort_by == "created_at" and order == "desc" and direction == "after":
+                    first, second = page, cursor_page
+
+    assert first is not None and second is not None
+
+    # ── 3. behaviour: deep pagination loses and duplicates nothing ──────
+    first_ids = [c.id for c in first.data]
+    second_ids = [c.id for c in second.data]
+    assert not set(first_ids) & set(second_ids), "cursor pages overlap"
+    # Non-overlap alone only proves no DUPLICATES. A cursor that skips rows —
+    # the failure mode of a wrong tiebreaker or a strict-vs-inclusive boundary
+    # slip — also produces non-overlapping pages, so compare the paged walk to
+    # the single-shot result.
+    walked: list[str] = []
+    after: str | None = None
+    while True:
+        walk_page = conversation_store.list_conversations(
+            accessible_by="alice@example.com",
+            limit=500,
+            after=after,
+            has_agent_id=True,
+            kind="default",
+            sort_by="created_at",
+            order="desc",
+        )
+        walked.extend(c.id for c in walk_page.data)
+        if not walk_page.has_more or walk_page.last_id is None:
+            break
+        after = walk_page.last_id
+    assert len(walked) == len(set(walked)), "paged walk returned a row twice"
+    assert walked == expected_ids, (
+        f"paged walk lost or reordered rows: {len(walked)} of {len(expected_ids)}"
+    )
+
+
+@pytest.mark.parametrize("order", ["desc", "asc"])
+@pytest.mark.parametrize("sort_by", ["created_at", "updated_at"])
+def test_cursor_pages_forward_and_backward_in_both_orders(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, sort_by: str, order: str
+) -> None:
+    """
+    ``before`` is the same rewritten predicate as ``after``, in reverse.
+
+    The row-values rewrite changed both directions and both sort columns, but
+    coverage only ever exercised descending ``after``. Tied timestamps are
+    seeded so the tiebreaker term decides page boundaries, which is where a
+    direction mix-up shows up: paging forward and then back must return the
+    same rows, in the same order.
+    """
+    _acl_perms(db_uri)
+    _bulk_seed_conversations_and_grants(
+        conversation_store, "alice@example.com", count=40, granted_ratio=1.0, tie_size=4
+    )
+
+    def _page(**kwargs: object) -> list[str]:
+        return [
+            c.id
+            for c in conversation_store.list_conversations(
+                accessible_by="alice@example.com",
+                has_agent_id=True,
+                kind="default",
+                sort_by=sort_by,
+                order=order,
+                **kwargs,  # type: ignore[arg-type]
+            ).data
+        ]
+
+    full = _page(limit=100)
+    assert len(full) > 12, "seed must cover several pages"
+
+    # Forward from a mid-list cursor.
+    forward = _page(limit=6, after=full[5])
+    assert forward == full[6:12], (forward, full[:14])
+
+    # ``before`` narrows to the rows preceding the cursor while keeping the
+    # same ORDER BY, so the whole prefix comes back in listing order and LIMIT
+    # takes it from the start — not the rows nearest the cursor. Both halves
+    # are asserted: the full prefix pins the boundary (exclusive, correct
+    # direction), the limited page pins which end LIMIT cuts.
+    assert _page(limit=100, before=full[12]) == full[:12], full[:14]
+    assert _page(limit=6, before=full[12]) == full[:6], full[:14]

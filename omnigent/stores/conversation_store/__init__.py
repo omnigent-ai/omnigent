@@ -688,10 +688,11 @@ class ConversationStore(ABC):
             does. Powers the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
         :param accessible_by: When set, filter to sessions the
-            user has access to via ``session_permissions``. Uses
-            a UNION subquery: sessions the user has a direct
-            grant on, plus sessions with a ``"__public__"`` grant.
-            ``None`` disables the filter (returns all sessions).
+            user has a direct grant on in ``session_permissions``.
+            Public (``"__public__"``) grants are deliberately NOT
+            included — a public-only session does not appear in the
+            user's own list. ``None`` disables the filter (returns
+            all sessions).
         :param owned_by: When set, filter to sessions the user
             *owns* (an ``owner``-level grant), a stricter form of
             ``accessible_by`` that excludes sessions merely shared
