@@ -5,6 +5,10 @@ generated at release time from each PR's `## Changelog` section, tagged by the
 PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on the
 website under `/releases`.
 
+## [v0.8.1] — 2026-08-03
+
+_No user-facing changes._
+
 ## [v0.8.0] — 2026-08-03
 
 - [Bug fix] Cursor YOLO sessions no longer stall piloted parents on mirrored tool-approval cards when Cursor leaves a lingering pending gate. (#2338)
