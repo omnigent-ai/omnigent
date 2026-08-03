@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,7 +20,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+import omnigent._native_post_delivery as native_post_delivery
+import omnigent.claude_native_bridge as bridge_module
 import omnigent.claude_native_forwarder as forwarder
+import omnigent.claude_native_message_display_hook as claude_native_message_display_hook
+import omnigent.claude_native_status as claude_native_status
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
@@ -7812,3 +7818,924 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
     assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
+
+
+def _user_record(uuid: str, text: str) -> str:
+    """
+    Build one transcript user record.
+
+    :param uuid: Record uuid, e.g. ``"user-1"``.
+    :param text: Message text, e.g. ``"hello"``.
+    :returns: A JSON line (no trailing newline).
+    """
+    return json.dumps({"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}})
+
+
+def _seed_idle_session(tmp_path: Path) -> tuple[Path, Path]:
+    """
+    Lay down a bridge dir plus a one-turn transcript that has already stopped.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: ``(bridge_dir, transcript_path)``.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(_user_record("user-1", "first") + "\n", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    return bridge_dir, transcript_path
+
+
+def _count_full_polls(monkeypatch: pytest.MonkeyPatch) -> Callable[[], int]:
+    """
+    Instrument the loop so tests can see how often the full body ran.
+
+    ``read_transcript_path`` runs exactly once per full body and never on a
+    gated tick, so counting it distinguishes "polled and did the work" from
+    "polled and skipped".
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: Callable returning the number of full bodies so far.
+    """
+    calls = {"n": 0}
+    original = forwarder.read_transcript_path
+
+    def _counting(bridge_dir: Path) -> Path | None:
+        calls["n"] += 1
+        return original(bridge_dir)
+
+    monkeypatch.setattr(forwarder, "read_transcript_path", _counting)
+    return lambda: calls["n"]
+
+
+@pytest.mark.asyncio
+async def test_forwarder_gate_settles_when_idle_then_wakes_on_new_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An idle session stops doing per-tick work, and new output is still prompt.
+
+    Both halves matter: gating that never engages buys nothing, and gating
+    that misses an append would strand the transcript. The append is made
+    after the loop has demonstrably settled, so this exercises the wake path,
+    not just the skip path.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(forwarder, "_IDLE_SETTLE_SECONDS", 0.05)
+    # High enough that the periodic resync cannot be mistaken for the gate
+    # failing to engage.
+    monkeypatch.setattr(forwarder, "_IDLE_RESYNC_SECONDS", 60.0)
+    bridge_dir, transcript_path = _seed_idle_session(tmp_path)
+    full_polls = _count_full_polls(monkeypatch)
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_gate",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        first = await _get_recorded_item_request(server)
+        assert first["body"]["data"]["item_data"]["content"][0]["text"] == "first"
+
+        # Let the gate engage, then measure a quiet window. Ungated this would
+        # be ~40 full bodies; gated it should be a small handful.
+        await asyncio.sleep(0.4)
+        before = full_polls()
+        await asyncio.sleep(0.4)
+        while_idle = full_polls() - before
+        assert while_idle <= 5, f"gate did not engage: {while_idle} full polls while idle"
+
+        # New output must still be picked up on the very next tick.
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(_user_record("user-2", "second") + "\n")
+        second = await _get_recorded_item_request(server, timeout_s=5.0)
+        assert second["body"]["data"]["item_data"]["content"][0]["text"] == "second"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarder_gate_forwards_every_record_of_a_slow_trickle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A slow drip of transcript records is forwarded in full, none skipped.
+
+    The gate settles between records, so each append has to re-open it. A gate
+    that latched shut, or that only re-checked on the periodic resync, would
+    drop or badly delay records here.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(forwarder, "_IDLE_SETTLE_SECONDS", 0.02)
+    monkeypatch.setattr(forwarder, "_IDLE_RESYNC_SECONDS", 60.0)
+    bridge_dir, transcript_path = _seed_idle_session(tmp_path)
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_trickle",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        assert (await _get_recorded_item_request(server))["body"]["data"]["item_data"]["content"][
+            0
+        ]["text"] == "first"
+        for index in range(6):
+            # Longer than the settle window, so the gate closes between writes.
+            await asyncio.sleep(0.12)
+            with transcript_path.open("a", encoding="utf-8") as handle:
+                handle.write(_user_record(f"drip-{index}", f"drip {index}") + "\n")
+            request = await _get_recorded_item_request(server, timeout_s=5.0)
+            assert request["body"]["data"]["item_data"]["content"][0]["text"] == f"drip {index}"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarder_gate_can_be_disabled_by_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The kill-switch restores a full body on every tick.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv(forwarder._IDLE_GATE_ENV_VAR, "0")
+    monkeypatch.setattr(forwarder, "_IDLE_SETTLE_SECONDS", 0.05)
+    monkeypatch.setattr(forwarder, "_IDLE_RESYNC_SECONDS", 60.0)
+    bridge_dir, _transcript_path = _seed_idle_session(tmp_path)
+    full_polls = _count_full_polls(monkeypatch)
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_nogate",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await _get_recorded_item_request(server)
+        await asyncio.sleep(0.4)
+        before = full_polls()
+        await asyncio.sleep(0.4)
+        assert full_polls() - before >= 10
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+def _subagents_dir(transcript: Path) -> Path:
+    """
+    Resolve a transcript's ``subagents/`` directory.
+
+    :param transcript: Parent transcript JSONL.
+    :returns: The sibling ``<stem>/subagents`` directory.
+    """
+    return transcript.parent / transcript.stem / "subagents"
+
+
+def _seed_transcript_with_subagents_dir(tmp_path: Path, *, stem: str = "session") -> Path:
+    """
+    Create a transcript plus the empty ``subagents/`` directory beside it.
+
+    :param tmp_path: Per-test temp directory.
+    :param stem: Transcript filename stem, so a test can model a rotation.
+    :returns: The transcript path.
+    """
+    transcript = tmp_path / f"{stem}.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    _subagents_dir(transcript).mkdir(parents=True, exist_ok=True)
+    return transcript
+
+
+def _fingerprint_for(bridge_dir: Path, transcript: Path | None = None):
+    """
+    Build a fingerprint helper pointed at *bridge_dir*.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param transcript: Transcript to watch, or ``None``.
+    :returns: A primed :class:`_BridgeInputPaths`.
+    """
+    paths = forwarder._BridgeInputPaths(bridge_dir)
+    paths.set_transcript(transcript)
+    return paths
+
+
+# Modules that place files in a claude-native bridge directory. Swept by the
+# by-name contract below. Deliberately excludes claude_native_state, whose
+# launch.json lives under ~/.omnigent/claude-native rather than the bridge dir.
+_BRIDGE_DIR_PRODUCER_MODULES = (
+    bridge_module,
+    forwarder,
+    claude_native_status,
+    claude_native_message_display_hook,
+    native_post_delivery,
+)
+
+
+def test_fingerprint_classifies_every_declared_bridge_file() -> None:
+    """
+    Every declared bridge-dir filename is watched for changes or explicitly ours.
+
+    The fingerprint stats a fixed list of names rather than scanning the
+    directory, which is ~2x cheaper but stops being self-maintaining: a file
+    added later would go unwatched, and its changes would only surface on the
+    periodic resync. This pins the classification so adding one without
+    deciding which side it falls on fails here instead of in production.
+
+    Sees only what a listed module declares, so it is paired with the
+    live-session test below, which checks what producers actually write.
+
+    :returns: None.
+    """
+    declared: dict[str, str] = {}
+    for module in _BRIDGE_DIR_PRODUCER_MODULES:
+        for name, value in vars(module).items():
+            if name.endswith("_FILE") and isinstance(value, str):
+                declared[value] = f"{module.__name__}.{name}"
+    assert declared, "no bridge file constants found — has the naming changed?"
+
+    _assert_all_classified(declared)
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_classifies_every_file_a_live_session_writes(tmp_path: Path) -> None:
+    """
+    Files a session actually writes are classified, not only declared ones.
+
+    The by-name sweep can only see filenames declared as a ``*_FILE`` constant
+    in a module it was told to look at, so it is blind to a producer nobody
+    listed and to a path built inline. Driving the producers and checking what
+    they leave on disk fails for a different set of mistakes.
+
+    Complementary rather than exhaustive: this sees only the producers and
+    branches the scenario below reaches, so a conditional output on an
+    unexercised path still escapes both checks. Together they narrow the gap;
+    neither closes it.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir, _transcript = _seed_idle_session(tmp_path)
+
+    # Drive each producer through its real entry point, so the filenames come
+    # from the producers rather than from this test restating them.
+    claude_native_status._write_context_atomic(bridge_dir, {"context_window_size": 200000})
+    delta_payload = json.dumps(
+        {"hook_event_name": "MessageDisplay", "message_id": "m1", "final": True, "delta": "hi"}
+    )
+    with patch("sys.stdin", io.StringIO(delta_payload)):
+        claude_native_message_display_hook.main(["--bridge-dir", str(bridge_dir)])
+    native_post_delivery.append_dead_letter(
+        bridge_dir,
+        session_id="conv_dead",
+        event_type="external_conversation_item",
+        payload={"item": "x"},
+        reason="permanent_rejection",
+    )
+
+    # ...plus the forwarder's own cursors, written by an actual run.
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_files",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await _get_recorded_item_request(server)
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    on_disk = {
+        entry.name: "written by a live session"
+        for entry in bridge_dir.iterdir()
+        if entry.is_file() and not entry.name.startswith(".")
+    }
+    assert len(on_disk) > 5, f"session wrote too little to be a real check: {sorted(on_disk)}"
+
+    _assert_all_classified(on_disk)
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_never_watches_a_file_the_forwarder_itself_writes(
+    tmp_path: Path,
+) -> None:
+    """
+    Nothing the forwarder writes is in the watched set.
+
+    The classification tests catch a bridge file that is *unclassified*, but not
+    one misfiled as watched — and watching our own output is the specific defect
+    that made each full body trigger the next, holding gate engagement at ~54 %.
+    A new cursor added to the wrong tuple would reintroduce it silently.
+
+    So this asserts the invariant directly and without relying on naming: run a
+    real forwarder, diff the bridge directory around it to see what *it* wrote,
+    and require none of that to be watched.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir, _transcript = _seed_idle_session(tmp_path)
+
+    def _snapshot() -> dict[str, tuple[int, int, int]]:
+        return {
+            entry.name: (
+                entry.stat().st_mtime_ns,
+                entry.stat().st_size,
+                entry.stat().st_ino,
+            )
+            for entry in bridge_dir.iterdir()
+            if entry.is_file() and not entry.name.startswith(".")
+        }
+
+    before = _snapshot()
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_own_writes",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Let it forward the seeded turn, which is what makes it write cursors.
+        await _get_recorded_item_request(server)
+        await asyncio.sleep(0.3)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    after = _snapshot()
+    written = {name for name, stamp in after.items() if before.get(name) != stamp}
+    assert written, "forwarder wrote nothing — the check would be vacuous"
+
+    watched = set(forwarder._WATCHED_BRIDGE_FILES)
+    self_watched = sorted(written & watched)
+    assert not self_watched, (
+        f"the forwarder writes {self_watched}, which the fingerprint also watches — "
+        "each write re-opens the gate on our own output, so a full body triggers "
+        "the next. Move them to _FORWARDER_OWNED_BRIDGE_FILES."
+    )
+
+
+def _assert_all_classified(candidates: dict[str, str]) -> None:
+    """
+    Require every bridge-dir filename to be watched or declared forwarder-owned.
+
+    :param candidates: Filename mapped to where it came from, for the message.
+    :returns: None.
+    """
+    watched = set(forwarder._WATCHED_BRIDGE_FILES)
+    owned = set(forwarder._FORWARDER_OWNED_BRIDGE_FILES)
+
+    unclassified = {
+        name: origin for name, origin in candidates.items() if name not in watched | owned
+    }
+    assert not unclassified, (
+        f"bridge file(s) {sorted(unclassified)} ({sorted(unclassified.values())}) are "
+        "neither watched by the poll loop's fingerprint nor declared "
+        "forwarder-owned; add them to _WATCHED_BRIDGE_FILES (an input the loop "
+        "reads) or _FORWARDER_OWNED_BRIDGE_FILES (written by us, not read by "
+        "the steady-state poll loop)"
+    )
+    # A file cannot be both: watching our own output re-opens the gate on work
+    # we just did.
+    assert not (watched & owned)
+
+
+def test_fingerprint_does_not_watch_the_forwarders_own_outputs(tmp_path: Path) -> None:
+    """
+    Writing anything the forwarder owns does not move the fingerprint.
+
+    Its cursors and the dead-letter sink all live in the bridge dir and change
+    whenever the loop does work. Counting them would re-open the gate on the
+    forwarder's own output and buy an extra full tick after every batch.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    paths = _fingerprint_for(bridge_dir)
+    before = paths.fingerprint()
+
+    for name in forwarder._FORWARDER_OWNED_BRIDGE_FILES:
+        (bridge_dir / name).write_text('{"byte_offset": 1}', encoding="utf-8")
+
+    assert paths.fingerprint() == before
+
+
+def test_bridge_input_fingerprint_sees_an_in_place_same_size_rewrite(tmp_path: Path) -> None:
+    """
+    A rewrite that keeps the byte count still changes the fingerprint.
+
+    Size alone would miss a same-length edit; the mtime and inode in the
+    triple are what make the detector safe for the bridge's small JSON state
+    files, which are replaced wholesale on every hook event.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    state = bridge_dir / "state.json"
+    state.write_text('{"a":1}', encoding="utf-8")
+    paths = _fingerprint_for(bridge_dir)
+    before = paths.fingerprint()
+
+    # Same length, different content, written the way the bridge writes it.
+    replacement = bridge_dir / "state.json.new"
+    replacement.write_text('{"a":2}', encoding="utf-8")
+    os.replace(replacement, state)
+
+    assert paths.fingerprint() != before
+
+
+def test_bridge_input_fingerprint_ignores_atomic_write_scratch_files(tmp_path: Path) -> None:
+    """
+    Dot-prefixed temp files must not churn the fingerprint.
+
+    The bridge's atomic writer creates ``.<name>.<rand>.tmp`` next to its
+    target. Counting those would re-open the gate on every write for no
+    reason.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "state.json").write_text("{}", encoding="utf-8")
+    paths = _fingerprint_for(bridge_dir)
+    before = paths.fingerprint()
+
+    (bridge_dir / ".state.json.abc123.tmp").write_text("{}", encoding="utf-8")
+
+    assert paths.fingerprint() == before
+
+
+def test_bridge_input_fingerprint_sees_a_new_subagent_before_its_transcript(
+    tmp_path: Path,
+) -> None:
+    """
+    A sub-agent's meta file moves the fingerprint even though it is not stat'ed.
+
+    Only ``agent-*.jsonl`` is stat'ed — every sub-agent ever spawned stays on
+    disk, so stat'ing the write-once meta files too would inflate the per-tick
+    syscalls at high fan-out. Their *arrival* must still open the gate: Claude
+    can write the meta before the transcript, and that meta is what registers
+    the sub-agent. The directory's own stat is what carries it.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    paths = _fingerprint_for(bridge_dir, transcript)
+    before = paths.fingerprint()
+
+    (_subagents_dir(transcript) / "agent-1.meta.json").write_text(
+        '{"agent_id": "1"}', encoding="utf-8"
+    )
+
+    assert paths.fingerprint() != before
+
+
+def test_bridge_input_fingerprint_sees_subagent_transcript_growth(tmp_path: Path) -> None:
+    """
+    Appends to a sub-agent transcript still move the fingerprint.
+
+    Membership is cached between directory-mtime changes, and an append moves
+    neither the directory mtime nor the member list — so this is the case a
+    membership-only check would miss.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    child = _subagents_dir(transcript) / "agent-1.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    paths = _fingerprint_for(bridge_dir, transcript)
+    before = paths.fingerprint()
+
+    with child.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+    assert paths.fingerprint() != before
+
+
+def test_bridge_input_fingerprint_picks_up_a_subagent_added_after_priming(
+    tmp_path: Path,
+) -> None:
+    """
+    A sub-agent appearing mid-session is watched from then on.
+
+    Membership is only re-listed when the directory's mtime moves, so a
+    sub-agent spawned after the cache was primed has to both move the
+    fingerprint on arrival *and* get added to the stat set — otherwise its
+    output would be invisible until the periodic resync.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    paths = _fingerprint_for(bridge_dir, transcript)
+    paths.fingerprint()
+
+    child = _subagents_dir(transcript) / "agent-late.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    after_arrival = paths.fingerprint()
+    assert "subagent/agent-late.jsonl" in after_arrival
+
+    with child.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+    assert paths.fingerprint() != after_arrival
+
+
+def test_bridge_input_fingerprint_sees_a_subagent_added_within_one_mtime_tick(
+    tmp_path: Path,
+) -> None:
+    """
+    A sub-agent whose arrival does not move the directory mtime is still watched.
+
+    ``st_mtime_ns`` reports nanoseconds but filesystems do not store them —
+    Linux stamps directory mtimes from the jiffy clock (4ms at CONFIG_HZ=250).
+    An entry created inside the same tick as the previous stat leaves the
+    recorded mtime unchanged, and nothing moves it afterwards either, so a
+    membership cache keyed on mtime inequality alone would leave that sub-agent
+    unwatched until the resync — its output surfacing in 10s chunks.
+
+    The directory mtime is pinned back deliberately rather than raced for: on a
+    fine-grained filesystem (APFS stamps at ~50us) the collision would almost
+    never occur, which is exactly how this escaped review.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    subagents = _subagents_dir(transcript)
+    paths = _fingerprint_for(bridge_dir, transcript)
+    paths.fingerprint()
+
+    frozen = os.stat(subagents).st_mtime_ns
+    child = subagents / "agent-same-tick.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    # Coarse-granularity filesystem: the create lands in the tick already
+    # recorded, so the directory's mtime does not advance.
+    os.utime(subagents, ns=(frozen, frozen))
+    assert os.stat(subagents).st_mtime_ns == frozen
+
+    after_arrival = paths.fingerprint()
+    assert "subagent/agent-same-tick.jsonl" in after_arrival
+
+    # ...and it stays watched, so its output is seen on the next tick.
+    with child.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+    assert paths.fingerprint() != after_arrival
+
+
+def test_bridge_input_fingerprint_relists_once_the_racy_window_expires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An entry that arrived during the racy window is picked up after it expires.
+
+    A coarse mtime records the START of its bucket, so a change landing late in
+    the bucket can already look older than the window by the time the next tick
+    runs. With the directory key unchanged and the mtime no longer recent,
+    nothing would re-list — and nothing ever moves that key again, so the
+    sub-agent would stay unwatched permanently. Sampling while racy therefore
+    has to latch the uncertainty and force one more listing once the mtime
+    settles — exactly one, or the membership cache stops paying for itself.
+
+    The clock is driven rather than slept through: a sleep-based version fails
+    whenever the scheduler pauses it during setup, which is indistinguishable
+    from the bug under test.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    clock = {"now": 1_700_000_000 * 1_000_000_000}
+    monkeypatch.setattr(forwarder, "_fingerprint_now_ns", lambda: clock["now"])
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    subagents = _subagents_dir(transcript)
+    paths = _fingerprint_for(bridge_dir, transcript)
+
+    listings = 0
+    original = paths._refresh_subagents
+
+    def _counting(dir_key: tuple[int, int], *, provisional: bool) -> None:
+        nonlocal listings
+        listings += 1
+        original(dir_key, provisional=provisional)
+
+    paths._refresh_subagents = _counting  # type: ignore[method-assign]
+
+    # First look: the directory carries the current bucket, so this listing is
+    # racy and cannot be trusted to be complete.
+    bucket = clock["now"]
+    os.utime(subagents, ns=(bucket, bucket))
+    paths.fingerprint()
+    listings_after_first = listings
+
+    # A sub-agent lands in the bucket already recorded, moving nothing.
+    child = subagents / "agent-late-in-bucket.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    os.utime(subagents, ns=(bucket, bucket))
+
+    # The next tick lands after the window has expired, so the directory now
+    # reads as settled even though its listing was taken while it was not.
+    clock["now"] = bucket + forwarder._DIR_MTIME_RACY_WINDOW_NS * 2
+    assert not forwarder._mtime_is_racy(bucket)
+
+    assert "subagent/agent-late-in-bucket.jsonl" in paths.fingerprint()
+    assert listings == listings_after_first + 1, "expected exactly one settling re-list"
+
+    # ...and having settled, it stops re-listing.
+    settled = listings
+    for _ in range(5):
+        paths.fingerprint()
+    assert listings == settled
+
+
+def test_bridge_input_fingerprint_handles_a_future_dated_directory(
+    tmp_path: Path,
+) -> None:
+    """
+    A directory stamped in the future is never treated as settled.
+
+    A networked filesystem whose server clock leads ours stamps mtimes ahead of
+    local time. A two-sided comparison would call a stamp far enough ahead
+    "settled" precisely because it is distant from now, so a sub-agent arriving
+    under it would go unwatched — the same failure the window exists to prevent.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    subagents = _subagents_dir(transcript)
+    paths = _fingerprint_for(bridge_dir, transcript)
+
+    ahead = time.time_ns() + 5 * 1_000_000_000
+    os.utime(subagents, ns=(ahead, ahead))
+    assert forwarder._mtime_is_racy(ahead)
+    paths.fingerprint()
+
+    child = subagents / "agent-skewed.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    os.utime(subagents, ns=(ahead, ahead))
+
+    assert "subagent/agent-skewed.jsonl" in paths.fingerprint()
+
+
+def test_mtime_is_racy_only_inside_the_granularity_window() -> None:
+    """
+    Recent and future timestamps are untrustworthy; settled ones are not.
+
+    The window is what keeps a directory being re-listed just after a change.
+    If it never expired the membership cache would be pointless, and if it
+    ignored future stamps an NFS server whose clock leads ours would silently
+    pass the mtime comparison.
+
+    :returns: None.
+    """
+    now = time.time_ns()
+
+    assert forwarder._mtime_is_racy(now)
+    # Future stamps are untrustworthy at ANY distance — the check is an age,
+    # not a distance, so a badly skewed server cannot look settled.
+    assert forwarder._mtime_is_racy(now + forwarder._DIR_MTIME_RACY_WINDOW_NS // 2)
+    assert forwarder._mtime_is_racy(now + forwarder._DIR_MTIME_RACY_WINDOW_NS * 100)
+    # A settled stamp is what lets the membership cache do its job.
+    assert not forwarder._mtime_is_racy(now - forwarder._DIR_MTIME_RACY_WINDOW_NS * 2)
+
+
+def test_bridge_input_fingerprint_stops_relisting_once_a_subagent_dir_settles(
+    tmp_path: Path,
+) -> None:
+    """
+    A quiet sub-agent directory is not re-listed on every tick.
+
+    The racy window buys correctness just after a change; the membership cache
+    is what keeps steady-state idle cheap under fan-out. If the window applied
+    forever, every tick would pay a directory scan again.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    subagents = _subagents_dir(transcript)
+    (subagents / "agent-1.jsonl").write_text("{}\n", encoding="utf-8")
+    paths = _fingerprint_for(bridge_dir, transcript)
+
+    # Age the directory well past the window, as an idle session's would be.
+    settled = time.time_ns() - forwarder._DIR_MTIME_RACY_WINDOW_NS * 2
+    os.utime(subagents, ns=(settled, settled))
+    paths.fingerprint()
+
+    listings = 0
+    original = paths._refresh_subagents
+
+    def _counting(dir_key: tuple[int, int]) -> None:
+        nonlocal listings
+        listings += 1
+        original(dir_key)
+
+    paths._refresh_subagents = _counting  # type: ignore[method-assign]
+    for _ in range(5):
+        paths.fingerprint()
+
+    assert listings == 0
+
+
+def test_bridge_input_fingerprint_drops_subagents_after_a_rotation(tmp_path: Path) -> None:
+    """
+    A /clear or /fork rotation retargets the fingerprint at the new session.
+
+    The rotated session resolves a different ``subagents/`` directory, so the
+    cached membership belongs to the old one and must not keep being stat'ed.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    first = _seed_transcript_with_subagents_dir(tmp_path, stem="first")
+    (_subagents_dir(first) / "agent-1.jsonl").write_text("{}\n", encoding="utf-8")
+    paths = _fingerprint_for(bridge_dir, first)
+    assert "subagent/agent-1.jsonl" in paths.fingerprint()
+
+    second = _seed_transcript_with_subagents_dir(tmp_path, stem="second")
+    paths.set_transcript(second)
+
+    # Dropped eagerly, not merely on the next listing refresh: the refresh is
+    # keyed on the directory's stat, so leaving the old entries in place would
+    # rely on the new directory never presenting the same key.
+    assert paths._subagent_targets == ()
+    assert "subagent/agent-1.jsonl" not in paths.fingerprint()
+
+
+def test_forwarder_tick_is_needed_while_a_retry_is_outstanding() -> None:
+    """
+    A pending retry keeps the loop working even with no file change.
+
+    Retries fire on a timer, so a gate that only watched the transcript would
+    leave a failed post permanently unsent.
+
+    :returns: None.
+    """
+    tracker = forwarder._PostRetryTracker()
+    dedupe = forwarder._ForwardDedupeState()
+    # Retry deadlines are stamped from the real monotonic clock, so anchor the
+    # synthetic "now" to it rather than an arbitrary constant.
+    settled = {
+        "now": time.monotonic(),
+        "last_change_at": 0.0,
+        "last_full_poll_at": time.monotonic(),
+    }
+    assert not forwarder._forwarder_tick_is_needed(
+        now=settled["now"],
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["last_full_poll_at"],
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+
+    # A retry that is scheduled but not yet due must NOT hold the gate open —
+    # a sustained outage would otherwise pin the loop at full rate forever.
+    tracker.record_failure("item:1", httpx.ConnectError("boom"))
+    assert not forwarder._forwarder_tick_is_needed(
+        now=settled["now"],
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["last_full_poll_at"],
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+    # ...but once it comes due, the body has to run.
+    assert forwarder._forwarder_tick_is_needed(
+        now=settled["now"] + forwarder._HTTP_POST_RETRY_MAX_DELAY_S + 1.0,
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["now"] + forwarder._HTTP_POST_RETRY_MAX_DELAY_S + 1.0,
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+
+    tracker.clear("item:1")
+    dedupe.cost_retry_not_before = settled["now"] - 1.0
+    assert forwarder._forwarder_tick_is_needed(
+        now=settled["now"],
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["last_full_poll_at"],
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+    dedupe.cost_retry_not_before = settled["now"] + 5.0
+    assert not forwarder._forwarder_tick_is_needed(
+        now=settled["now"],
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["last_full_poll_at"],
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+
+
+def test_forwarder_tick_is_needed_on_the_periodic_resync() -> None:
+    """
+    The resync floor runs the body even when nothing looks like it changed.
+
+    :returns: None.
+    """
+    assert forwarder._forwarder_tick_is_needed(
+        now=1000.0,
+        last_change_at=0.0,
+        last_full_poll_at=1000.0 - forwarder._IDLE_RESYNC_SECONDS,
+        retry_trackers=(),
+        dedupe=forwarder._ForwardDedupeState(),
+    )

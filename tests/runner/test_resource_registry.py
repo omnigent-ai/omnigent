@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import omnigent.inner.terminal as terminal_mod
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -1209,3 +1212,113 @@ def test_resolve_environment_runner_workspace_overrides_absolute_spec_cwd(
     # Compare via realpath because tmp_path on macOS goes through
     # /var → /private/var symlinks.
     assert os.path.realpath(env.cwd) == os.path.realpath(workspace)
+
+
+@pytest.mark.asyncio
+async def test_turn_start_wake_reaches_a_backed_off_native_status_watcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The runner's turn-start wake pulls a quiesced native watcher back to base rate.
+
+    Native harnesses inject a turn through the bridge from the harness process,
+    never through ``TerminalInstance.send``, so this watcher gets no in-process
+    signal that a turn began. It is also the only source of ``running``/``idle``
+    for those harnesses. Without the wake, a session the user just messaged
+    keeps reporting ``idle`` for a whole backed-off interval.
+
+    Exercises the real chain: registry → registered instance → status watcher →
+    session-status publisher.
+
+    :param tmp_path: Temporary directory for placeholder tmux paths.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    # Back off to a deep interval in one step, so the assertion window below
+    # can only be met by the wake — at the shipped 2s ceiling the watcher's
+    # own next tick would satisfy it and the test would pass without the fix.
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_FACTOR", 100.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 60.0)
+    terminal_registry = TerminalRegistry()
+    _seed_terminal(terminal_registry, "conv_wake", "claude", "main", tmp_path)
+    instance = terminal_registry.get("conv_wake", "claude", "main")
+    assert instance is not None
+
+    polled = threading.Semaphore(0)
+    pane = {"text": "idle prompt"}
+
+    def _capture() -> tuple[bool, str]:
+        polled.release()
+        return False, pane["text"]
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+
+    statuses: list[tuple[str, str]] = []
+    running_seen = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _publish(session_id: str, status: str) -> None:
+        statuses.append((session_id, status))
+        if status == "running":
+            running_seen.set()
+
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_session_status_publisher(_publish)
+    # The wake is scoped to status-owning roles, so the role has to be
+    # registered exactly as the launch path registers it.
+    registry._terminal_roles[("conv_wake", terminal_resource_id("claude", "main"))] = (
+        CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    registry._start_terminal_activity_watcher(
+        "conv_wake",
+        "claude",
+        "main",
+        instance,
+        CLAUDE_NATIVE_TERMINAL_ROLE,
+        TerminalLifecycle.REQUIRED,
+    )
+    try:
+        # Let it quiesce and back off. The claude-native watcher polls at 0.2s
+        # with a 1s idle threshold, so a few seconds is comfortably past the
+        # idle edge and several doublings up the ramp.
+        # The idle edge lands ~1.2s in (0.2s poll, 1s threshold) and the same
+        # tick takes the single backoff step to a ~20s interval.
+        await asyncio.sleep(2.5)
+        while polled.acquire(blocking=False):
+            pass
+        assert ("conv_wake", "idle") in statuses
+        # Deeply backed off: nothing is going to poll on its own for ~20s.
+        assert not await loop.run_in_executor(None, lambda: polled.acquire(timeout=1.0))
+
+        # A turn starts. The runner cannot use ``send`` here — the harness
+        # process injects — so this is the only signal the watcher gets.
+        pane["text"] = "working on it"
+        registry.wake_session_terminal_watchers("conv_wake")
+
+        await asyncio.wait_for(running_seen.wait(), timeout=3.0)
+    finally:
+        instance._stop_idle_watcher_thread()
+
+    assert statuses[-1] == ("conv_wake", "running")
+
+
+def test_wake_session_terminal_watchers_is_safe_without_terminals(tmp_path: Path) -> None:
+    """
+    Waking a session with no terminals (or no registry) is a no-op, not an error.
+
+    The runner calls this on every turn, including for harnesses that own no
+    tmux pane at all.
+
+    :param tmp_path: Temporary directory for placeholder tmux paths.
+    :returns: None.
+    """
+    SessionResourceRegistry().wake_session_terminal_watchers("conv_missing")
+
+    terminal_registry = TerminalRegistry()
+    _seed_terminal(terminal_registry, "conv_other", "bash", "s1", tmp_path)
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    # No watcher was ever started on this instance.
+    registry.wake_session_terminal_watchers("conv_other")
+    registry.wake_session_terminal_watchers("conv_absent")
