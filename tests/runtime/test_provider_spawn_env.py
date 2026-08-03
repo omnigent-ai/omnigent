@@ -1190,6 +1190,76 @@ def test_pi_cli_config_databricks_default_routes_gateway(
     assert env["HARNESS_PI_MODEL"] == _CATALOG_DEFAULTS[("databricks", "claude")]
 
 
+def test_pi_gateway_default_pi_scope_unresolved_credential_names_var(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``kind: gateway`` provider with ``default: pi`` names the missing env var on failure.
+
+    When a ``kind: gateway`` provider is the pi default via an explicit
+    ``default: pi`` scope and its ``api_key_ref: env:VAR`` cannot resolve
+    (the env var is unset in the runner), the error must name the missing
+    variable. The original credential-resolution error from ``resolve_secret``
+    is surfaced rather than a generic message that omits the variable name.
+    """
+    from omnigent.errors import OmnigentError
+
+    monkeypatch.delenv("MY_GATEWAY_TOKEN", raising=False)
+    monkeypatch.delenv("OMNIGENT_MY_GATEWAY_TOKEN", raising=False)
+    config: dict[str, object] = {
+        "providers": {
+            "my-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "api_key_ref": "env:MY_GATEWAY_TOKEN",
+                    "base_url": "https://example.com/v1",
+                    "models": {"default": "some-model-id"},
+                },
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="pi")
+
+    with pytest.raises(OmnigentError, match="MY_GATEWAY_TOKEN"):
+        _build_pi_spawn_env(spec, workdir=None)
+
+
+def test_pi_gateway_default_pi_scope_resolved_credential_succeeds(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``kind: gateway`` provider with ``default: pi`` routes pi when the credential resolves.
+
+    When ``MY_GATEWAY_TOKEN`` is exported, ``_build_pi_spawn_env`` must
+    populate the openai family's gateway transport vars correctly for a
+    provider that only claims the ``pi`` default scope (not ``openai``).
+    """
+    monkeypatch.setenv("MY_GATEWAY_TOKEN", "sk-gw-secret")
+    config: dict[str, object] = {
+        "providers": {
+            "my-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "api_key_ref": "env:MY_GATEWAY_TOKEN",
+                    "base_url": "https://example.com/v1",
+                    "models": {"default": "some-model-id"},
+                },
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="pi")
+
+    env = _build_pi_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY"] == "true"
+    assert env["HARNESS_PI_GATEWAY_BASE_URLS"] == '{"openai": "https://example.com/v1"}'
+    assert env["HARNESS_PI_GATEWAY_HOST"] == "https://example.com"
+    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-gw-secret"
+    assert env["HARNESS_PI_MODEL"] == "some-model-id"
+
+
 _DISMISSIBLE_CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 

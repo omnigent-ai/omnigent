@@ -15,13 +15,12 @@ import httpx
 from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
 
 _logger = logging.getLogger(__name__)
-
-_JsonObject = dict[str, object]
 
 
 def _build_accept_content(
@@ -115,14 +114,11 @@ def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -
 
 
 def _retry_payload(retry: RetryPolicy | None) -> object:
-    """Return a stable JSON payload for a retry policy-like object."""
+    """Return a stable JSON payload for a retry policy."""
     if retry is None:
         return None
-    to_json = getattr(retry, "to_json", None)
-    if callable(to_json):
-        payload: object = json.loads(to_json())
-        return payload
-    return repr(retry)
+    payload: object = json.loads(retry.to_json())
+    return payload
 
 
 def compute_server_hash(config: MCPServerConfig, cwd: Path | None = None) -> str:

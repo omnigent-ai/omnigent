@@ -182,7 +182,7 @@ describe("project folder header icon/chevron", () => {
     const header = headerButton("Projects");
 
     // The parent section label remains the compact muted caption tier.
-    expect(header).toHaveClass("gap-1", "pb-1", "pl-2", "text-xs", "leading-4");
+    expect(header).toHaveClass("gap-1", "pb-2", "pl-2", "text-xs", "leading-4");
 
     expect(header.querySelector(".lucide-folder")).toBeNull();
 

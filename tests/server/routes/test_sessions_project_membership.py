@@ -23,6 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -123,6 +124,35 @@ def test_omitting_project_id_leaves_membership_unchanged(db_uri: str) -> None:
     resp = client.patch(f"/v1/sessions/{conv.id}", json={"title": "renamed"})
     assert resp.status_code == 200
     assert resp.json()["project_id"] == project["id"]
+
+
+def test_patch_response_omits_items(db_uri: str) -> None:
+    """PATCH returns a slim snapshot: items stay empty even when the session has some."""
+    _ensure_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="s", agent_id=AGENT_ID)
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+        ],
+    )
+    client = TestClient(_single_user_app(db_uri))
+    project = client.post("/v1/projects", json={"name": "Work"}).json()
+
+    resp = client.patch(f"/v1/sessions/{conv.id}", json={"project_id": project["id"]})
+    assert resp.status_code == 200
+    assert resp.json()["project_id"] == project["id"]
+    # PATCH callers use only scalar fields; transcripts come from the items
+    # endpoint, so the mutation response skips the expensive items read.
+    assert resp.json()["items"] == []
+
+    # The slimming is PATCH-specific — the GET snapshot still carries items.
+    assert len(client.get(f"/v1/sessions/{conv.id}").json()["items"]) == 1
 
 
 def test_file_into_nonexistent_project_404(db_uri: str) -> None:

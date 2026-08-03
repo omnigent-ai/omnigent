@@ -170,6 +170,7 @@ export function TasksPage() {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search automations…"
+            componentId="tasks.search"
             data-testid="tasks-search"
             className="pl-9"
           />

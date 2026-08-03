@@ -256,9 +256,9 @@ class WorkspaceReader:
             capped = capped[:_MAX_READ_BYTES]
             truncated = True
 
+        text: str | None = None
         try:
             text = capped.decode("utf-8")
-            is_text = True
         except UnicodeDecodeError as exc:
             # A byte-cap truncation can split a multi-byte codepoint at the very
             # end, which would otherwise flip an oversize *text* file to base64.
@@ -271,16 +271,13 @@ class WorkspaceReader:
             if truncated and exc.start >= len(capped) - 3:
                 capped = capped[: exc.start]
                 text = capped.decode("utf-8")
-                is_text = True
-            else:
-                is_text = False
 
         payload: _WorkspacePayload = {
             "object": "session.environment.filesystem.file_content",
             "path": rel,
             "content_type": content_type_guess,
         }
-        if is_text:
+        if text is not None:
             if limit is not None:
                 lines = text.splitlines(keepends=True)
                 if len(lines) > limit:

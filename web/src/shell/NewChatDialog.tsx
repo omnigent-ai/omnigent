@@ -145,7 +145,12 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
-import { useProjectConfig, useProjects, moveConversationToProject } from "@/hooks/useConversations";
+import {
+  useProjectConfig,
+  useProjects,
+  moveConversationToProject,
+  PROJECT_LABEL_KEY,
+} from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -1889,8 +1894,9 @@ export function NewChatLandingScreen() {
   const [prefilledBranch, setPrefilledBranch] = useState<string>(
     () => landingDraft?.prefilledBranch ?? "",
   );
-  // Project to file the new session under (an implicit collection stored as a
-  // conversation_labels row). Empty = unfiled. Applied right after create.
+  // Project to file the new session under. Empty = unfiled. Stamped as the
+  // `omni_project` label at create (so the row is filed from its first sidebar
+  // appearance), then promoted to first-class `project_id` right after.
   // Pre-filled from the `?project=` param so the sidebar's per-project
   // "new session" pencil lands here with the project already selected.
   const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
@@ -2902,6 +2908,28 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
 
+      // Native terminal agents open terminal-first: `omnigent.ui: terminal`
+      // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
+      // selects which CLI bridge the runner launches — the values are the
+      // registered wrapper ids the runner keys off, not the display name. The
+      // DANGEROUS codex full-bypass opt-in rides along as an extra label (only
+      // when the toggle is armed for a codex-native agent) so the runner
+      // launches with --dangerously-bypass-approvals-and-sandbox and the choice
+      // survives reload.
+      const baseLabels =
+        agentSupportsApprovalMode && bypassSandbox
+          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : nativeLabels;
+      // When filing into a project, stamp its legacy `omni_project` label at
+      // create so the session is BORN FILED. The sidebar dual-reads project
+      // membership from this label OR the first-class `project_id` the follow-up
+      // move sets, so the row groups under its project from its very first
+      // sidebar appearance instead of flashing through the ungrouped "Sessions"
+      // section while the search-indexed session list catches up to the move.
+      const createLabels = selectedProject
+        ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
+        : baseLabels;
+
       let data: { id: string };
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
@@ -2913,6 +2941,10 @@ export function NewChatLandingScreen() {
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = {};
         if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
+        // Born-filed: stamp the project's `omni_project` label so a bundled
+        // session groups under its project from its first sidebar appearance,
+        // same as the JSON path (see `createLabels`).
+        if (selectedProject) metadata.labels = { [PROJECT_LABEL_KEY]: selectedProject };
         data = await createBundledSession(
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
@@ -2956,19 +2988,9 @@ export function NewChatLandingScreen() {
                       ? { branch_name: trimmedBranch, existing_worktree: true }
                       : undefined,
                 }),
-            // Native terminal agents open terminal-first: `omnigent.ui:
-            // terminal` tells the UI to render the terminal wrapper, and
-            // `omnigent.wrapper` selects which CLI bridge the runner launches.
-            // The values are the registered wrapper ids the runner keys off —
-            // they must match the wrapper registry, not the agent display name.
-            // The DANGEROUS codex full-bypass opt-in rides along as an extra
-            // label (only when the toggle is armed for a codex-native agent)
-            // so the runner launches with --dangerously-bypass-approvals-and-
-            // sandbox and the choice survives reload.
-            labels:
-              agentSupportsApprovalMode && bypassSandbox
-                ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-                : nativeLabels,
+            // Native-wrapper labels + codex bypass + the born-filed project
+            // label (see `createLabels` above).
+            labels: createLabels,
             // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args:
@@ -3011,9 +3033,12 @@ export function NewChatLandingScreen() {
         }
         data = (await res.json()) as { id: string };
       }
-      // File the new session under the chosen project (first-class membership).
-      // Awaited so the conversations refetch below already reflects it;
-      // non-fatal if it fails — the session is created either way, just unfiled.
+      // Promote the born-filed session to first-class project membership. The
+      // create above already stamped the `omni_project` label (so the row
+      // groups under its project immediately); this move sets the first-class
+      // `project_id` and clears that label — the single source of truth after
+      // the dual-read transition. Non-fatal if it fails: the session stays
+      // filed by its label, so it still shows under the project either way.
       if (selectedProject) {
         try {
           // File via first-class project_id; the helper resolves the picked
@@ -3026,7 +3051,10 @@ export function NewChatLandingScreen() {
           // useProjectSessions, separate from the global conversations list).
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
         } catch {
-          // Leave the session unfiled; the user can file it from the sidebar.
+          // Non-fatal: the create already stamped the `omni_project` label, so
+          // the session stays filed under its project by label even if this
+          // `project_id` promotion fails — the sidebar's dual-read grouping
+          // still shows it under the project.
         }
       }
       // Sandbox creates have no user-picked workspace to remember.

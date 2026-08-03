@@ -229,6 +229,7 @@ class _GenerateBuildInfo(build_py):
         any later non-build code path that does ``from omnigent
         import _build_info`` works without re-running the build.
         """
+        # Keep generated names and types aligned with omnigent/_build_info.pyi.
         target = Path(__file__).resolve().parent / "omnigent" / "_build_info.py"
         commit = _git_sha()
         # Use repr() for the SHA so quoting is always correct, even

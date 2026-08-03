@@ -365,10 +365,10 @@ describe("Sidebar session list", () => {
     const primaryNav = screen.getByTestId("sidebar-primary-nav");
     const inbox = within(primaryNav).getByTestId("inbox-button");
 
-    expect(primaryNav).toHaveClass("px-2", "pt-0", "pb-3");
+    expect(primaryNav).toHaveClass("px-2", "pt-2", "pb-0");
     expect(primaryNav).not.toHaveClass("-mt-0.5");
     expect(inbox).toHaveAttribute("href", "/inbox");
-    expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
+    expect(inbox).toHaveClass("h-8", "w-full", "justify-start");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
     expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
@@ -609,8 +609,8 @@ describe("Sidebar session list", () => {
     const plainRow = screen.getByText("Plain session").closest("a")!;
     const worktreeRow = screen.getByText("Worktree session").closest("a")!;
 
-    expect(plainRow).toHaveClass("h-7", "justify-center");
-    expect(worktreeRow).toHaveClass("h-7", "justify-center");
+    expect(plainRow).toHaveClass("h-8", "justify-center");
+    expect(worktreeRow).toHaveClass("h-8", "justify-center");
     expect(within(worktreeRow).queryByText("fix/sidebar-row-height")).toBeNull();
   });
 
@@ -1024,6 +1024,28 @@ describe("Sidebar project sections", () => {
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_far_1")).toBeInTheDocument();
     expect(within(projectSection).getByText("conv_far_2")).toBeInTheDocument();
+  });
+
+  it("shows a window member inside the folder even when the folder's own fetch lacks it", () => {
+    // The optimistic-move frame: the row already carries the folder's
+    // first-class id in the loaded window (useMoveToProject's overlay), but
+    // the folder's own fetch answered before the PATCH committed and lacks
+    // it. The folder body unions both sources, so the just-moved row is
+    // visible immediately instead of waiting out the PATCH + refetch chain.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_unfiled", "Claude Code"),
+      conv("conv_moved", "Claude Code", { project_id: "p_Customer X" }),
+    ]);
+    projectSessionsMock.current["Customer X"] = [];
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const projectSection = screen.getByText("Customer X").closest("section")!;
+    expect(within(projectSection).getByText("conv_moved")).toBeInTheDocument();
+    // Grouped out of the flat Sessions list, not duplicated there.
+    const recentSection = screen.getByText("Sessions").closest("section")!;
+    expect(within(recentSection).queryByText("conv_moved")).toBeNull();
   });
 
   it("offers a pencil that starts a new session pre-filed under the project", () => {

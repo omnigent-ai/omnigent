@@ -12,9 +12,8 @@ import time
 import uuid
 from importlib.resources import files
 from pathlib import Path
-from typing import TypeAlias
 
-_JsonObject: TypeAlias = dict[str, object]
+from omnigent.json_types import JsonObject as _JsonObject
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone
@@ -32,6 +31,11 @@ _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
 _INBOX_DIR = "inbox"
 _SESSIONS_DIR = "sessions"
+
+
+def bridge_root() -> Path:
+    """Return the root directory used for native Pi bridge files."""
+    return _BRIDGE_ROOT
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -129,7 +133,7 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
     :returns: Opaque message id.
     """
     message_id = f"msg_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": message_id,
         "type": "user_message",
         "content": content,
@@ -152,7 +156,7 @@ def enqueue_interrupt(bridge_dir: Path) -> str:
     :returns: Opaque interrupt id.
     """
     interrupt_id = f"interrupt_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": interrupt_id,
         "type": "interrupt",
         "created_at": time.time(),
@@ -209,7 +213,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     :returns: Opaque model-change id.
     """
     model_change_id = f"model_change_{uuid.uuid4().hex}"
-    payload = {
+    payload: _JsonObject = {
         "id": model_change_id,
         "type": "model_change",
         "model": model,

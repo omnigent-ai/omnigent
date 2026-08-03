@@ -428,7 +428,7 @@ class ExecutorAdapter(HarnessApp):
                                 _active_tool_parent = None
                         elif isinstance(event, TurnComplete):
                             response_text = event.response
-                            if event.usage is not None:
+                            if event.usage is not None and agent_span is not None:
                                 from omnigent.runtime.telemetry import record_llm_usage
 
                                 # Record usage on the agent span for
