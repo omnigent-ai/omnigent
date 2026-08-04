@@ -539,6 +539,22 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
     });
 
+    it("leaves a continued fragment that ran nothing expanded", () => {
+      // Streaming splits a turn into fragments (a reasoning burst, a
+      // narration preview) that are `continued` by the rest of the turn.
+      // Folding those produced a lone "Worked" row with nothing behind
+      // it — and they flipped folded/unfolded as fragments merged away.
+      const items: RenderItem[] = [
+        { kind: "reasoning", itemId: "r0", text: "Thinking it over.", duration: 1 },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" continued />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+    });
+
     it("still leaves an unanswered, uncontinued turn expanded", () => {
       // Nothing continues it, so folding would hide the turn's only
       // content behind a click with no answer to demarcate.

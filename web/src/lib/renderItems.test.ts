@@ -1716,6 +1716,42 @@ describe("buildBubbles — continued turns (sub-agent await)", () => {
     expect(assistantAt(assistants, 0).continued).toBeFalsy();
   });
 
+  it("does not mark anything while a turn is still streaming", () => {
+    // Mid-turn the transcript is full of transient fragment bubbles (live
+    // text previews, separate reasoning bursts) that merge away as the
+    // authoritative items land — a codex turn the server records as ONE
+    // response can show as several. Marking them folded and unfolded
+    // fragments on every delta.
+    const streaming = { responseId: "resp_2", state: "streaming" as const, error: null };
+    const bubbles = buildBubbles([...narrationThenTools("resp_1"), answer("resp_2")], streaming);
+    const assistants = bubbles.filter((b) => b.kind === "assistant");
+    expect(assistantAt(assistants, 0).continued).toBeFalsy();
+  });
+
+  it("keeps an existing mark when a later turn starts streaming", () => {
+    // Sticky: a bubble that already folded must not reopen just because
+    // the next turn began.
+    const blocks = [...narrationThenTools("resp_1"), answer("resp_2")];
+    const settled = buildBubbles(blocks, null);
+    expect(
+      assistantAt(
+        settled.filter((b) => b.kind === "assistant"),
+        0,
+      ).continued,
+    ).toBe(true);
+
+    const cache = createBubbleCache();
+    buildBubbles(blocks, null, cache);
+    const streaming = { responseId: "resp_3", state: "streaming" as const, error: null };
+    const later = buildBubbles([...blocks, answer("resp_3")], streaming, cache);
+    expect(
+      assistantAt(
+        later.filter((b) => b.kind === "assistant"),
+        0,
+      ).continued,
+    ).toBe(true);
+  });
+
   it("bubblesEqual distinguishes a bubble whose continuation just landed", () => {
     // The memo comparator must see the flip, or the fold never appears
     // when the continuation bubble arrives.

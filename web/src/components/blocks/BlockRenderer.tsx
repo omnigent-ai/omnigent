@@ -354,7 +354,15 @@ export function BlockRenderer({
   // dead-ends with no answer anywhere, renders expanded — there is
   // nothing to demarcate.
   const { process, exempt, final, finalStart } = partitionTurn(items);
-  const showFold = !isTurnLive && process.length > 0 && (final.length > 0 || continued);
+  // A `continued` bubble additionally has to have RUN something. That is
+  // the shape the flag exists for (narration + tool calls, then a yield
+  // to await sub-agents), and it keeps a stray narration- or
+  // reasoning-only fragment of a split turn from folding into a lone
+  // "Worked" row with nothing behind it.
+  const showFold =
+    !isTurnLive &&
+    process.length > 0 &&
+    (final.length > 0 || (continued && process.some(isToolItem)));
 
   // Animate only when the fold APPEARS on an already-mounted bubble —
   // the turn settled, or its continuation landed, while the user was

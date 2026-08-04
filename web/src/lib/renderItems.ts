@@ -247,6 +247,7 @@ export function buildBubbles(
   if (cache === undefined) {
     return markContinuedTurns(
       walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map()).bubbles,
+      activeResponse,
     );
   }
 
@@ -280,7 +281,7 @@ export function buildBubbles(
     cache.blocks = blocks;
     cache.activeResponse = activeResponse;
     cache.interruptedResponseIds = interruptedResponseIds;
-    cache.bubbles = markContinuedTurns(rest.bubbles);
+    cache.bubbles = markContinuedTurns(rest.bubbles, activeResponse);
     cache.lastBubbleStart = rest.lastBubbleStart;
     return cache.bubbles;
   }
@@ -290,7 +291,7 @@ export function buildBubbles(
   cache.blocks = blocks;
   cache.activeResponse = activeResponse;
   cache.interruptedResponseIds = interruptedResponseIds;
-  cache.bubbles = markContinuedTurns(full.bubbles);
+  cache.bubbles = markContinuedTurns(full.bubbles, activeResponse);
   cache.lastBubbleStart = full.lastBubbleStart;
   return cache.bubbles;
 }
@@ -311,19 +312,28 @@ export function buildBubbles(
  * are the await itself, not a new human turn, so scanning looks past
  * them; a real user message ends the turn and stops the scan.
  *
+ * Only runs between turns. While one is arriving the transcript is
+ * full of transient fragment bubbles — a streamed narration renders as
+ * its own `live:` preview until its authoritative item replaces it,
+ * and reasoning bursts group separately — so a codex turn that the
+ * server records as ONE response can show as half a dozen bubbles that
+ * appear and merge away on every delta. Marking those would fold and
+ * unfold fragments continuously. Flags are also sticky: a bubble that
+ * has folded never reopens because a later turn started streaming.
+ *
  * Returns the same array when nothing changed; bubbles that flip are
  * REPLACED (never mutated) so `bubblesEqual` sees a difference and the
  * memoized bubble actually re-renders.
  */
-function markContinuedTurns(bubbles: Bubble[]): Bubble[] {
+function markContinuedTurns(bubbles: Bubble[], activeResponse: ActiveResponse | null): Bubble[] {
+  if (activeResponse?.state === "streaming") return bubbles;
   let out: Bubble[] | null = null;
   for (let i = 0; i < bubbles.length; i += 1) {
     const bubble = bubbles[i]!;
-    if (bubble.kind !== "assistant") continue;
-    const continued = hasAssistantContinuation(bubbles, i);
-    if (continued === Boolean(bubble.continued)) continue;
+    if (bubble.kind !== "assistant" || bubble.continued) continue;
+    if (!hasAssistantContinuation(bubbles, i)) continue;
     if (out === null) out = bubbles.slice();
-    out[i] = { ...bubble, continued };
+    out[i] = { ...bubble, continued: true };
   }
   return out ?? bubbles;
 }
