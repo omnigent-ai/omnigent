@@ -326,6 +326,73 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Worked for 1m 46s")).toBeDefined();
     });
 
+    describe("expand scroll-into-view", () => {
+      // jsdom has no scrollIntoView — install a spy so the scroll path is
+      // observable (and its absence provable).
+      const scrollSpy = vi.fn();
+      beforeEach(() => {
+        (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView = scrollSpy;
+      });
+      afterEach(() => {
+        scrollSpy.mockReset();
+        delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+      });
+
+      const settledItems = (): RenderItem[] => [
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Done.", final: true },
+      ];
+
+      it("snaps the row into view when the expanded trace won't fit", () => {
+        // Scroll anchoring keeps the answer below the fold stationary on
+        // expand, so the trace opens above the viewport — the row reads
+        // as off-screen and the click must correct the scroll.
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={settledItems()} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        const row = screen.getByTestId("turn-worked-fold").firstElementChild as HTMLElement;
+        row.getBoundingClientRect = () =>
+          ({ top: -50, bottom: -28, left: 0, right: 0, height: 22, width: 0 }) as DOMRect;
+        fireEvent.click(screen.getByText("Worked"));
+        expect(scrollSpy).toHaveBeenCalledTimes(1);
+        expect(scrollSpy).toHaveBeenCalledWith({ block: "start" });
+      });
+
+      it("leaves the scroll alone when the row and trace already fit", () => {
+        // jsdom's zero-height layout always "fits" — the guard must
+        // decline to scroll rather than snapping on every expand.
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={settledItems()} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        fireEvent.click(screen.getByText("Worked"));
+        expect(screen.getByText("Called 1 tool")).toBeDefined();
+        expect(scrollSpy).not.toHaveBeenCalled();
+      });
+
+      it("never scrolls on the animateCollapse mount-close cycle", async () => {
+        // The fold appearing over a watched settle mounts OPEN and closes
+        // a frame later — programmatic, not a user expand; scrolling
+        // there would yank the reader away from the answer.
+        const { rerender } = render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={settledItems()} sessionStatus="idle" turnLifecycle="streaming" />
+          </FileViewerContext.Provider>,
+        );
+        rerender(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={settledItems()} sessionStatus="idle" turnLifecycle="completed" />
+          </FileViewerContext.Provider>,
+        );
+        await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+        await waitFor(() => expect(screen.queryByText("Called 1 tool")).toBeNull());
+        expect(scrollSpy).not.toHaveBeenCalled();
+      });
+    });
+
     it("trusts turnLifecycle over sessionStatus for liveness", async () => {
       const items: RenderItem[] = [
         { kind: "text", itemId: "m0", text: "Looking around.", final: true },

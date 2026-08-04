@@ -25,7 +25,7 @@
 //    bubbles) keeps its trace expanded.
 
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { defaultRemarkPlugins } from "streamdown";
@@ -676,6 +676,36 @@ function TurnWorkedFold({
     const frame = requestAnimationFrame(() => setOpen(false));
     return () => cancelAnimationFrame(frame);
   }, [animateCollapse]);
+
+  // On a USER-initiated expand (never the animateCollapse mount-close),
+  // bring the start of the trace into view. Without this, the browser's
+  // scroll anchoring holds the answer BELOW the fold stationary while
+  // the trace expands above it, so the work opens off the top of the
+  // viewport and the click appears to do nothing. Runs before paint so
+  // the correction and the anchor adjustment land as one jump.
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const scrollOnOpenRef = useRef(false);
+  const handleOpenChange = (next: boolean) => {
+    scrollOnOpenRef.current = next;
+    setOpen(next);
+  };
+  useLayoutEffect(() => {
+    if (!open || !scrollOnOpenRef.current) return;
+    scrollOnOpenRef.current = false;
+    const row = rowRef.current;
+    if (!row) return;
+    const scrollerRect = nearestScrollContainer(row)?.getBoundingClientRect();
+    const topLimit = scrollerRect?.top ?? 0;
+    const bottomLimit = scrollerRect?.bottom ?? window.innerHeight;
+    const rowRect = row.getBoundingClientRect();
+    const traceHeight = contentRef.current?.offsetHeight ?? 0;
+    // Fully visible row + trace needs no correction; otherwise snap the
+    // row to the top so the expanded work reads from its beginning.
+    if (rowRect.top >= topLimit && rowRect.bottom + traceHeight <= bottomLimit) return;
+    row.scrollIntoView({ block: "start" });
+  }, [open]);
+
   return (
     // Named `group/turn-fold` so only this collapsible's own chevron
     // rotates (inner tool cards carry unnamed `.group` rotations that a
@@ -683,11 +713,11 @@ function TurnWorkedFold({
     <Collapsible
       key="turn-worked-fold"
       open={open}
-      onOpenChange={setOpen}
+      onOpenChange={handleOpenChange}
       className="group/turn-fold not-prose w-full"
       data-testid="turn-worked-fold"
     >
-      <div className={animateCollapse ? "turn-fold-row-enter" : undefined}>
+      <div ref={rowRef} className={cn("scroll-mt-2", animateCollapse && "turn-fold-row-enter")}>
         <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
           <span className="shrink-0">{label}</span>
           <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
@@ -702,10 +732,21 @@ function TurnWorkedFold({
           this animation exists to remove. Expanded spacing comes from
           the row's hairline above and the message column's gap below. */}
       <CollapsibleContent className="turn-fold-content">
-        <div className="flex flex-col gap-2">{children}</div>
+        <div ref={contentRef} className="flex flex-col gap-2">
+          {children}
+        </div>
       </CollapsibleContent>
     </Collapsible>
   );
+}
+
+/** Nearest ancestor that actually scrolls vertically (overflow-y auto/scroll). */
+function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    const overflowY = getComputedStyle(p).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll") return p;
+  }
+  return null;
 }
 
 /** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */
