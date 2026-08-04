@@ -157,15 +157,117 @@ export const NATIVE_CODING_AGENTS = [
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
-const BY_AGENT_NAME = new Map<string, NativeCodingAgentSpec>(
-  NATIVE_CODING_AGENTS.map((agent) => [agent.agentName, agent]),
+/**
+ * A native-agent row as published by the server on `GET /v1/harnesses`
+ * (`native_agents[]`, PR 2.2). Carries identity + the fork-history axis; the
+ * capabilities object is passed through opaquely (consumers that need a
+ * specific axis read it by name). Presentation fields (iconKind / sortRank /
+ * marketing displayName / picker capabilities) are NOT server-sourced — they
+ * stay in the built-in literal above and default gracefully for unknown keys.
+ */
+export interface NativeAgentServerRow {
+  key: string;
+  agent_name: string;
+  harness: string;
+  wrapper_label: string;
+  terminal_name: string;
+  display_name: string;
+  subagent_wrapper_label: string | null;
+  fork_history: string | null;
+  capabilities: Record<string, unknown> | null;
+}
+
+// Synchronous module cache of the server's native-agent rows, primed by the
+// /v1/harnesses query (see primeNativeAgentCatalog). The many non-React
+// consumers of this module read the merged view built-in-literal ∪ server-rows,
+// so a community native harness resolves once the catalog has loaded, and the
+// built-ins still work before the first fetch (they're in the literal).
+let SERVER_ROWS: readonly NativeAgentServerRow[] = [];
+
+/**
+ * Turn a server row into the `NativeCodingAgentSpec` shape the module's lookups
+ * return, borrowing presentation fields (iconKind / sortRank / displayName /
+ * capabilities) from the same-`key` built-in literal when present, else safe
+ * defaults: generic-bot icon (`iconKind` matching no branch), sort-last, the
+ * server's `display_name`, and no picker capabilities. Plugin-provided icon
+ * resources are a planned follow-up; today an unknown harness renders with the
+ * generic glyph (same fallback qwen/hermes already use).
+ */
+function specFromServerRow(row: NativeAgentServerRow): NativeCodingAgentSpec {
+  const builtin = BUILTIN_BY_KEY.get(row.key);
+  return {
+    key: (builtin?.key ?? row.key) as NativeCodingAgentIconKind,
+    agentName: row.agent_name,
+    harness: row.harness,
+    wrapperLabel: row.wrapper_label,
+    displayName: builtin?.displayName ?? row.display_name,
+    iconKind: (builtin?.iconKind ?? row.key) as NativeCodingAgentIconKind,
+    sortRank: builtin?.sortRank ?? Number.POSITIVE_INFINITY,
+    capabilities: builtin?.capabilities,
+  };
+}
+
+const BUILTIN_BY_KEY = new Map<string, NativeCodingAgentSpec>(
+  NATIVE_CODING_AGENTS.map((agent) => [agent.key, agent]),
 );
-const BY_HARNESS = new Map<string, NativeCodingAgentSpec>(
-  NATIVE_CODING_AGENTS.map((agent) => [agent.harness, agent]),
-);
-const BY_WRAPPER = new Map<string, NativeCodingAgentSpec>(
-  NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
-);
+
+/**
+ * Prime the module cache with the server's native-agent rows. Called by the
+ * `/v1/harnesses` query (`agentLabels.ts`) whenever the catalog loads/refreshes.
+ * A native harness the server reports but the built-in literal lacks (a
+ * community plugin) becomes resolvable; built-ins are refreshed from the server
+ * for identity/fork data while keeping their client-side presentation.
+ */
+export function primeNativeAgentCatalog(rows: readonly NativeAgentServerRow[]): void {
+  SERVER_ROWS = rows;
+  rebuildIndexes();
+}
+
+// Test-only: reset the cache to the built-in literal (no server rows).
+export function resetNativeAgentCatalogForTests(): void {
+  SERVER_ROWS = [];
+  rebuildIndexes();
+}
+
+let BY_AGENT_NAME = new Map<string, NativeCodingAgentSpec>();
+let BY_HARNESS = new Map<string, NativeCodingAgentSpec>();
+let BY_WRAPPER = new Map<string, NativeCodingAgentSpec>();
+// harness id (canonical) → fork_history axis value, server-sourced. Empty until
+// the catalog primes; forkHarness.ts falls back to its built-in sets meanwhile.
+let FORK_HISTORY_BY_HARNESS = new Map<string, string>();
+
+function rebuildIndexes(): void {
+  // Built-in literal first, then server rows override by the same key — so the
+  // server is authoritative for identity/fork on built-ins, and community rows
+  // are additive. Presentation still comes from the literal via specFromServerRow.
+  const merged = new Map<string, NativeCodingAgentSpec>();
+  for (const agent of NATIVE_CODING_AGENTS) merged.set(agent.key, agent);
+  const forkByHarness = new Map<string, string>();
+  for (const row of SERVER_ROWS) {
+    merged.set(row.key, specFromServerRow(row));
+    if (typeof row.fork_history === "string" && row.fork_history !== "none") {
+      forkByHarness.set(row.harness, row.fork_history);
+    }
+  }
+  const specs = [...merged.values()];
+  BY_AGENT_NAME = new Map(specs.map((a) => [a.agentName, a]));
+  BY_HARNESS = new Map(specs.map((a) => [a.harness, a]));
+  BY_WRAPPER = new Map(specs.map((a) => [a.wrapperLabel, a]));
+  FORK_HISTORY_BY_HARNESS = forkByHarness;
+}
+
+rebuildIndexes();
+
+/**
+ * Server-sourced fork-history axis for a canonical harness id, or `undefined`
+ * before the catalog loads / for a harness the server doesn't classify.
+ * `forkHarness.ts` consults this first and falls back to its built-in sets.
+ */
+export function serverForkHistoryForHarness(
+  harness: string | null | undefined,
+): string | undefined {
+  return harness == null ? undefined : FORK_HISTORY_BY_HARNESS.get(harness);
+}
 
 // Reversed harness spellings that fold to a canonical native `harness`.
 // Mirrors omnigent.harness_aliases.NATIVE_HARNESSES on the server, which

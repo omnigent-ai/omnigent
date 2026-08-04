@@ -1,3 +1,5 @@
+import { serverForkHistoryForHarness } from "@/lib/nativeCodingAgents";
+
 // Pure helpers for the "fork / switch agent" flows: decide which target
 // harnesses preserve the source's conversation history (and so should appear
 // in each picker). Three carry mechanisms, all keyed off the TARGET harness —
@@ -134,6 +136,10 @@ const PREAMBLE_FORK_HARNESSES: ReadonlySet<string> = new Set([
  */
 export function forkTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
   if (!targetHarness) return false;
+  // Prefer the server's fork_history axis (PR 2.2) so community native harnesses
+  // classify correctly; fall back to the built-in sets before the catalog loads.
+  const fork = serverForkHistoryForHarness(targetHarness);
+  if (fork === "rebuild" || fork === "preamble") return true;
   return (
     NATIVE_REBUILD_HARNESSES.has(targetHarness) ||
     PREAMBLE_FORK_HARNESSES.has(targetHarness) ||
@@ -155,6 +161,13 @@ export function forkTargetCarriesHistory(targetHarness: string | null | undefine
  */
 export function switchTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
   if (!targetHarness) return false;
+  // Switch-agent carries history for rebuild only — NOT preamble, which is
+  // fork-only (a switch has no first-message injection point). Prefer the
+  // server axis; a `preamble` verdict means switch does NOT carry (preamble
+  // natives have no SDK family). Fall back to the built-in set pre-fetch.
+  const fork = serverForkHistoryForHarness(targetHarness);
+  if (fork === "rebuild") return true;
+  if (fork === "preamble") return false;
   return NATIVE_REBUILD_HARNESSES.has(targetHarness) || harnessFamily(targetHarness) !== null;
 }
 

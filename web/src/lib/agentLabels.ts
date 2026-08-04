@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { primeNativeAgentCatalog, type NativeAgentServerRow } from "@/lib/nativeCodingAgents";
 
 /**
  * Shared display-name helpers for agents and brain harnesses, used by
@@ -47,6 +48,10 @@ interface HarnessCatalogWire {
   // Setup steps keyed by EVERY harness spelling a session may declare (native
   // wrappers + installable non-picker ids), not just the picker rows in `data`.
   setup_steps?: Record<string, SetupStepWire[]>;
+  // Native coding-agent identity + capability rows (built-in and community),
+  // published by the server (PR 2.2). Drives native-agent recognition and
+  // fork-history gating; see `primeNativeAgentCatalog` in nativeCodingAgents.ts.
+  native_agents?: NativeAgentServerRow[];
 }
 
 interface HarnessCatalog {
@@ -54,6 +59,24 @@ interface HarnessCatalog {
   labels: Record<string, string>;
   /** harness spelling → ordered setup steps (install/auth) the server describes. */
   setupSteps: Record<string, SetupStepWire[]>;
+  /** Native coding-agent rows straight from the server (identity + fork_history). */
+  nativeAgents: NativeAgentServerRow[];
+}
+
+function parseNativeAgentRows(raw: unknown): NativeAgentServerRow[] {
+  if (!Array.isArray(raw)) return [];
+  const rows: NativeAgentServerRow[] = [];
+  for (const item of raw) {
+    if (
+      item != null &&
+      typeof item === "object" &&
+      typeof (item as { key?: unknown }).key === "string" &&
+      typeof (item as { harness?: unknown }).harness === "string"
+    ) {
+      rows.push(item as NativeAgentServerRow);
+    }
+  }
+  return rows;
 }
 
 async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
@@ -70,7 +93,13 @@ async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   // so the dialog resolves whatever harness the session declares.
   const setupSteps =
     body.setup_steps && typeof body.setup_steps === "object" ? body.setup_steps : {};
-  return { labels, setupSteps };
+  const nativeAgents = parseNativeAgentRows(body.native_agents);
+  // Prime the synchronous module cache so the many non-React consumers of
+  // nativeCodingAgents.ts (composerMentions, agentGrouping, chatStore) see the
+  // server rows — including community native harnesses absent from the built-in
+  // literal — without threading this async data through every call site.
+  primeNativeAgentCatalog(nativeAgents);
+  return { labels, setupSteps, nativeAgents };
 }
 
 // Both hooks share one request + cache entry, each selecting its own slice.

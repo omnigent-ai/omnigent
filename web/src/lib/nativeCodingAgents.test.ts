@@ -1,12 +1,32 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import {
   UI_MODE_LABEL_KEY,
   UI_MODE_TERMINAL_VALUE,
   WRAPPER_LABEL_KEY,
+  type NativeAgentServerRow,
   isNativeTerminalSession,
+  nativeCodingAgentForAgentName,
   nativeCodingAgentForHarness,
   nativeWrapperLabelsForAgent,
+  primeNativeAgentCatalog,
+  resetNativeAgentCatalogForTests,
+  serverForkHistoryForHarness,
 } from "./nativeCodingAgents";
+
+function serverRow(overrides: Partial<NativeAgentServerRow> = {}): NativeAgentServerRow {
+  return {
+    key: "foo",
+    agent_name: "foo-native-ui",
+    harness: "foo-native",
+    wrapper_label: "foo-native-ui",
+    terminal_name: "foo",
+    display_name: "Foo",
+    subagent_wrapper_label: null,
+    fork_history: "none",
+    capabilities: null,
+    ...overrides,
+  };
+}
 
 describe("nativeCodingAgentForHarness", () => {
   it("resolves the canonical pi-native harness", () => {
@@ -123,5 +143,85 @@ describe("isNativeTerminalSession", () => {
     expect(isNativeTerminalSession(null)).toBe(false);
     expect(isNativeTerminalSession(undefined)).toBe(false);
     expect(isNativeTerminalSession({})).toBe(false);
+  });
+});
+
+describe("primeNativeAgentCatalog (server-driven native rows, PR 2.3a)", () => {
+  afterEach(() => {
+    // Reset the module cache so these tests don't leak into the built-in-only
+    // suites above/below.
+    resetNativeAgentCatalogForTests();
+  });
+
+  it("makes a community native harness resolvable by harness + agent name", () => {
+    // Before priming, an unknown community harness is not recognized.
+    expect(nativeCodingAgentForHarness("foo-native")).toBeUndefined();
+
+    primeNativeAgentCatalog([serverRow()]);
+
+    expect(nativeCodingAgentForHarness("foo-native")?.key).toBe("foo");
+    expect(nativeCodingAgentForAgentName("foo-native-ui")?.harness).toBe("foo-native");
+  });
+
+  it("defaults presentation for an unknown community harness (generic icon, sort last)", () => {
+    primeNativeAgentCatalog([serverRow()]);
+    const spec = nativeCodingAgentForHarness("foo-native");
+    // Unknown key → generic-bot fallback (iconKind matches no icon branch) and
+    // sorts last; displayName falls back to the server's display_name.
+    expect(spec?.iconKind).toBe("foo");
+    expect(spec?.sortRank).toBe(Number.POSITIVE_INFINITY);
+    expect(spec?.displayName).toBe("Foo");
+    expect(spec?.capabilities).toBeUndefined();
+  });
+
+  it("keeps built-in presentation (icon/sortRank/marketing name) when the server row overrides identity", () => {
+    // The server reports claude with its identity display_name "Claude", but the
+    // web presentation keeps the marketing "Claude Code" + brand icon + sortRank.
+    primeNativeAgentCatalog([
+      serverRow({
+        key: "claude",
+        agent_name: "claude-native-ui",
+        harness: "claude-native",
+        wrapper_label: "claude-code-native-ui",
+        display_name: "Claude",
+        fork_history: "rebuild",
+      }),
+    ]);
+    const spec = nativeCodingAgentForHarness("claude-native");
+    expect(spec?.iconKind).toBe("claude");
+    expect(spec?.sortRank).toBe(10);
+    expect(spec?.displayName).toBe("Claude Code");
+  });
+
+  it("exposes the server fork_history axis (and omits 'none')", () => {
+    primeNativeAgentCatalog([
+      serverRow({ key: "foo", harness: "foo-native", fork_history: "rebuild" }),
+      serverRow({
+        key: "bar",
+        agent_name: "bar-native-ui",
+        harness: "bar-native",
+        wrapper_label: "bar-native-ui",
+        fork_history: "preamble",
+      }),
+      serverRow({
+        key: "baz",
+        agent_name: "baz-native-ui",
+        harness: "baz-native",
+        wrapper_label: "baz-native-ui",
+        fork_history: "none",
+      }),
+    ]);
+    expect(serverForkHistoryForHarness("foo-native")).toBe("rebuild");
+    expect(serverForkHistoryForHarness("bar-native")).toBe("preamble");
+    // "none" is not indexed — a harness with no carry path is undefined.
+    expect(serverForkHistoryForHarness("baz-native")).toBeUndefined();
+    expect(serverForkHistoryForHarness("unknown-native")).toBeUndefined();
+  });
+
+  it("built-in harnesses still resolve before any server priming (fallback)", () => {
+    // No prime call: the built-in literal is the source, so built-ins work
+    // pre-fetch with no regression.
+    expect(nativeCodingAgentForHarness("claude-native")?.key).toBe("claude");
+    expect(nativeCodingAgentForHarness("codex-native")?.key).toBe("codex");
   });
 });
