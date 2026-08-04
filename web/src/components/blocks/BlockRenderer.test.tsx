@@ -572,6 +572,94 @@ describe("BlockRenderer dispatch", () => {
       await waitFor(() => expect(screen.queryByText("Checking the CLI.")).toBeNull());
     });
 
+    it("holds the mount fold over a just-active trace so a live edge can cancel it", () => {
+      // A reload can land inside a step-wise turn's between-step gap,
+      // where the snapshot reads settled although the turn continues.
+      // Folding instantly then unfolding on the next step's running edge
+      // was the reported flash — a recent trace waits out the longer
+      // mount debounce instead.
+      vi.useFakeTimers();
+      try {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Approved; continuing.", final: true },
+        ];
+        const view = (status: "idle" | "running") => (
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer
+              items={items}
+              sessionStatus={status}
+              turnLifecycle="completed"
+              isLastAssistant
+              lastActivityAtS={Date.now() / 1000 - 2}
+            />
+          </FileViewerContext.Provider>
+        );
+        const { rerender } = render(view("idle"));
+        // No instant fold, and none 1s in — the mount debounce is holding.
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        act(() => vi.advanceTimersByTime(1_000));
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+
+        // The next step's running edge lands → the fold is cancelled.
+        rerender(view("running"));
+        act(() => vi.advanceTimersByTime(5_000));
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getByText("Checking the CLI.")).toBeDefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("folds a just-active trace after the mount debounce when nothing follows", () => {
+      vi.useFakeTimers();
+      try {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Narration.", final: true },
+          tool(1),
+          { kind: "text", itemId: "m1", text: "The answer.", final: true },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer
+              items={items}
+              sessionStatus="idle"
+              turnLifecycle="completed"
+              isLastAssistant
+              lastActivityAtS={Date.now() / 1000 - 2}
+            />
+          </FileViewerContext.Provider>,
+        );
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        act(() => vi.advanceTimersByTime(3_500));
+        expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("mounts an OLD settled trace already folded, with no delay", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Narration.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "The answer.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus="idle"
+            turnLifecycle="completed"
+            isLastAssistant
+            lastActivityAtS={Date.now() / 1000 - 3600}
+          />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.queryByText("Narration.")).toBeNull();
+    });
+
     it("never folds the last bubble while an elicitation is parked, even if all else reads settled", async () => {
       // Reload while parked on an approval: a step-wise turn's snapshot
       // names the STEP id (not the items' thread id), so the trace's

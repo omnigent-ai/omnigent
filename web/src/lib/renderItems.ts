@@ -151,6 +151,13 @@ export type Bubble =
        */
       workedForS?: number;
       /**
+       * Server epoch seconds of the turn's newest item, when known.
+       * A just-active trace mounted from history may still be mid-turn
+       * (a reload inside a step-wise turn's between-step gap), so the
+       * fold holds briefly instead of appearing instantly.
+       */
+      lastActivityAtS?: number;
+      /**
        * The turn's work continues in a LATER assistant bubble: this one
        * yielded mid-task (e.g. dispatching sub-agents and awaiting their
        * results), so the answer lands under a different response id. Lets
@@ -654,6 +661,7 @@ function walkBubbles(
 
     lastBubbleStart = groupStart;
     const workedForS = turnWorkedForS(groupBlocks);
+    const lastActivityAtS = turnLastActivityAtS(groupBlocks);
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,
@@ -662,10 +670,26 @@ function walkBubbles(
       error,
       items: buildAssistantItems(groupBlocks, lifecycle, crossBubbleResults),
       ...(workedForS !== undefined ? { workedForS } : {}),
+      ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
     });
   }
 
   return { bubbles, lastBubbleStart };
+}
+
+/**
+ * Server epoch seconds of the turn's newest block, when known. Lets the
+ * renderer tell a JUST-active trace (a reload can land in a step-wise
+ * turn's between-step gap, where everything else reads settled) from
+ * genuinely old history.
+ */
+function turnLastActivityAtS(groupBlocks: AnyBlock[]): number | undefined {
+  let latest: number | undefined;
+  for (const b of groupBlocks) {
+    const at = b.ctx.createdAtS;
+    if (at !== undefined && (latest === undefined || at > latest)) latest = at;
+  }
+  return latest;
 }
 
 /**

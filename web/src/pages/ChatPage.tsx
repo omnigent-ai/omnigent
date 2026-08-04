@@ -3494,6 +3494,7 @@ function AssistantBubble({
             continued={bubble.continued}
             isLastAssistant={isLastAssistant}
             hasPendingElicitation={hasPendingElicitation}
+            lastActivityAtS={bubble.lastActivityAtS}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (

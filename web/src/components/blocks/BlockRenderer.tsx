@@ -310,6 +310,16 @@ const STREAMING_TAIL = 3;
 // revive), short enough to feel immediate at a real turn end.
 const FOLD_SETTLE_DEBOUNCE_MS = 500;
 
+// A trace whose newest item is at most this old counts as "just
+// active": a page load over it may have landed inside a step-wise
+// turn's between-step gap, where the snapshot reads settled although
+// the turn continues. The last bubble's fold then waits
+// `FOLD_RECENT_MOUNT_DEBOUNCE_MS` instead of appearing instantly, so
+// the next step's running edge can cancel it — no fold flash. Genuinely
+// old history still mounts folded with no delay.
+const RECENT_ACTIVITY_WINDOW_S = 15;
+const FOLD_RECENT_MOUNT_DEBOUNCE_MS = 3_000;
+
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
@@ -350,6 +360,8 @@ interface BlockRendererProps {
    * until the card is answered.
    */
   hasPendingElicitation?: boolean;
+  /** Server epoch seconds of the turn's newest item (`Bubble.lastActivityAtS`). */
+  lastActivityAtS?: number;
 }
 
 type ToolRunFragment =
@@ -372,6 +384,7 @@ export function BlockRenderer({
   continued = false,
   isLastAssistant = false,
   hasPendingElicitation = false,
+  lastActivityAtS,
 }: BlockRendererProps) {
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
   const isTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
@@ -404,16 +417,33 @@ export function BlockRenderer({
   // a step-wise turn's idle edge between steps, a stray bare idle before
   // its revive — would otherwise fold and unfold the trace. Eligibility
   // must hold for a beat before the fold shows; losing eligibility hides
-  // it immediately, and a bubble MOUNTED eligible (settled history)
-  // folds with no delay.
-  const [showFold, setShowFold] = useState(foldEligible);
+  // it immediately. A bubble MOUNTED eligible (settled history) folds
+  // with no delay — UNLESS it is the last bubble over a just-active
+  // trace, where the page may have loaded inside a step-wise turn's
+  // between-step gap: that mount waits the longer recent-mount debounce
+  // so the next step's running edge can cancel the fold instead of
+  // flashing it.
+  const mountedOverRecentActivity =
+    isLastAssistant &&
+    lastActivityAtS !== undefined &&
+    Date.now() / 1000 - lastActivityAtS < RECENT_ACTIVITY_WINDOW_S;
+  const [showFold, setShowFold] = useState(foldEligible && !mountedOverRecentActivity);
+  const debounceMsRef = useRef(
+    mountedOverRecentActivity ? FOLD_RECENT_MOUNT_DEBOUNCE_MS : FOLD_SETTLE_DEBOUNCE_MS,
+  );
   useEffect(() => {
-    if (foldEligible === showFold) return undefined;
+    if (foldEligible === showFold) {
+      // Once the fold has shown (or the mount window resolved), later
+      // transitions use the ordinary settle debounce.
+      if (showFold) debounceMsRef.current = FOLD_SETTLE_DEBOUNCE_MS;
+      return undefined;
+    }
     if (!foldEligible) {
+      debounceMsRef.current = FOLD_SETTLE_DEBOUNCE_MS;
       setShowFold(false);
       return undefined;
     }
-    const timer = setTimeout(() => setShowFold(true), FOLD_SETTLE_DEBOUNCE_MS);
+    const timer = setTimeout(() => setShowFold(true), debounceMsRef.current);
     return () => clearTimeout(timer);
   }, [foldEligible, showFold]);
 

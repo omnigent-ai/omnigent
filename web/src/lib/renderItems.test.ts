@@ -1938,3 +1938,33 @@ describe("lastRenderableAssistantIndex", () => {
     expect(lastRenderableAssistantIndex([])).toBe(-1);
   });
 });
+
+describe("buildBubbles — lastActivityAtS", () => {
+  it("carries the newest item's server stamp onto the bubble", () => {
+    const textAt = (itemId: string, createdAtS: number): AnyBlock => ({
+      type: "text_done",
+      ctx: ctx({ itemId, responseId: "resp_1", createdAtS }),
+      fullText: "x",
+      hasCodeBlocks: false,
+    });
+    const bubbles = buildBubbles([textAt("m1", 1_753_900_000), textAt("m2", 1_753_900_030)], null);
+    const asst = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(asst.lastActivityAtS).toBe(1_753_900_030);
+  });
+
+  it("is absent when no block carries a server stamp (pure live turn)", () => {
+    const bubbles = buildBubbles(
+      [
+        {
+          type: "text_done",
+          ctx: ctx({ itemId: "m1", responseId: "resp_1" }),
+          fullText: "x",
+          hasCodeBlocks: false,
+        },
+      ],
+      null,
+    );
+    const asst = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(asst.lastActivityAtS).toBeUndefined();
+  });
+});
