@@ -1371,6 +1371,29 @@ def build_hook_settings(
         # publish live token deltas to the web UI.
         "MessageDisplay": [{"hooks": [message_display_hook]}],
     }
+    # SPIKE ONLY (in-harness routing S3). Not product code. Marker-gated
+    # UserPromptSubmit probe: logs payloads and, when
+    # ``<bridge_dir>/spike_block`` exists, blocks the prompt once.
+    hooks["UserPromptSubmit"].append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": shlex.join(
+                        [
+                            python,
+                            "-I",
+                            "-m",
+                            "omnigent.claude_native_hook",
+                            "spike-userprompt",
+                            "--bridge-dir",
+                            str(bridge_dir),
+                        ]
+                    ),
+                }
+            ]
+        }
+    )
     if ap_server_url:
         _write_json_file(
             bridge_dir / _PERMISSION_HOOK_FILE,

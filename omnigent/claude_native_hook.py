@@ -186,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_ask_user_question(raw_argv[1:])
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "spike-userprompt":
+        return _main_spike_userprompt(raw_argv[1:])
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -1137,6 +1139,63 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
     if not isinstance(parsed, dict):
         return {}
     return {str(key): str(value) for key, value in parsed.items()}
+
+
+def _main_spike_userprompt(argv: list[str]) -> int:
+    """
+    SPIKE ONLY (in-harness routing S3). Not product code.
+
+    Logs every ``UserPromptSubmit`` invocation with its full stdin payload
+    to ``<bridge_dir>/spike_hook_log.jsonl``, and when
+    ``<bridge_dir>/spike_block`` exists emits ``decision: "block"`` once
+    (consuming the marker) so the next — replayed — prompt falls through
+    untouched. Mirrors the codex spike hook's shape.
+
+    :param argv: CLI argv after the subcommand.
+    :returns: Always ``0``.
+    """
+    parser = argparse.ArgumentParser(prog="python -m omnigent.claude_native_hook spike-userprompt")
+    parser.add_argument("--bridge-dir", required=True)
+    args = parser.parse_args(argv)
+    bridge_dir = Path(args.bridge_dir)
+
+    started = time.time()
+    raw = sys.stdin.read()
+    record: dict[str, Any] = {
+        "ts": started,
+        "iso": time.strftime("%H:%M:%S", time.localtime(started)),
+        "argv": argv,
+        "cwd": str(Path.cwd()),
+        "raw_stdin": raw[:8000],
+    }
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        payload = {}
+        record["parse_error"] = str(exc)
+    if isinstance(payload, dict):
+        record["payload_keys"] = sorted(payload.keys())
+        record["hook_event_name"] = payload.get("hook_event_name")
+        record["prompt"] = payload.get("prompt")
+
+    block_marker = bridge_dir / "spike_block"
+    if block_marker.exists():
+        record["spike_blocked"] = True
+        sys.stdout.write(
+            json.dumps({"decision": "block", "reason": "SPIKE: routing"}),
+        )
+        sys.stdout.flush()
+        try:
+            block_marker.unlink()
+        except OSError:
+            pass
+    else:
+        record["spike_blocked"] = False
+
+    record["hook_seconds"] = round(time.time() - started, 3)
+    with (bridge_dir / "spike_hook_log.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, default=str) + "\n")
+    return 0
 
 
 if __name__ == "__main__":
