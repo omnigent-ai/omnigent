@@ -148,12 +148,12 @@ function renderWorkspace(
 }
 
 describe("WorkspacePanel surface presentation", () => {
-  it("uses an evenly inset desktop surface instead of clearing the header", () => {
+  it("sits flush to the window edge with a left divider, no floating card frame", () => {
     renderWorkspace();
 
     const panel = screen.getByRole("complementary", { name: "Workspace" });
-    expect(panel).toHaveClass("md:m-2", "md:rounded-lg");
-    expect(panel).not.toHaveClass("md:mt-14", "md:mr-2", "md:mb-2");
+    expect(panel).toHaveClass("md:border-l", "md:border-border");
+    expect(panel).not.toHaveClass("md:m-2", "md:rounded-lg", "md:shadow-lg");
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {
@@ -551,11 +551,11 @@ describe("WorkspacePanel maximize", () => {
     const toggle = screen.getByRole("button", { name: "Exit full screen" });
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     // The rail breaks out of the docked flex sizing to cover the region, but
-    // keeps the same card styling (m-2 inset + rounded) so only the width
-    // changes — the height is unaffected.
+    // keeps the same flush/bordered styling so only the width changes — the
+    // height is unaffected.
     const panel = screen.getByRole("complementary", { name: "Workspace" });
-    expect(panel).toHaveClass("md:absolute", "md:inset-0", "md:m-2", "md:rounded-lg");
-    expect(panel).not.toHaveClass("md:shrink-0");
+    expect(panel).toHaveClass("md:absolute", "md:inset-0", "md:border-l");
+    expect(panel).not.toHaveClass("md:shrink-0", "md:m-2", "md:rounded-lg");
   });
 });
 

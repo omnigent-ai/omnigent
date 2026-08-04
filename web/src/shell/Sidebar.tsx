@@ -648,15 +648,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // and gated to mobile so the desktop floating card is unaffected.
         "max-md:transition-transform max-md:duration-200 max-md:ease-out",
         effectiveOpen ? "translate-x-0" : "-translate-x-full",
-        // Desktop: a floating card. Detached from the window edges by a
-        // margin, rounded, and lifted off the bg-sidebar canvas with a
-        // full border + shadow. Width (the user-resizable variable) animates
-        // →0 to push main; when closed the margin/border collapse too so
-        // nothing lingers.
+        // Desktop: a full-height panel flush to the window edge, carrying
+        // the brand gradient canvas (see html:not(.dark) .conversations-sidebar
+        // in index.css) and separated from the white content by a right
+        // divider — no outer margin or rounding. Width (the user-resizable
+        // variable) animates →0 to push main; when closed the border
+        // collapses too so nothing lingers.
         "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
-        open
-          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-[var(--radius-otto-md)] md:border md:border-border"
-          : "md:m-0 md:w-0 md:border-0",
+        open ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
       )}
       style={
         {

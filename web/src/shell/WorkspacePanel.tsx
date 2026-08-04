@@ -671,21 +671,22 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
-      // Floating desktop surface: 8px from every edge. AppShell reserves the
-      // panel width from ChatHeader, so the pane can extend to the top without
-      // sitting underneath the existing session action cluster.
+      // Full-height desktop surface flush to the window edge, separated from
+      // the main content by a left divider — no outer margin, rounding, or
+      // shadow (mirrors the left sidebar). AppShell reserves the panel width
+      // from ChatHeader, so the pane extends to the top without sitting under
+      // the existing session action cluster.
       // ``@container/rail`` makes the rail a named container-query context so
       // the tab strip can switch scroll behavior on the rail's own width
       // (see the strip below) without a JS width listener.
       //
       // Maximized: break out of the flex row and stretch across the content
-      // region (absolute inset-0) so the rail owns the full width. It keeps the
-      // same m-2 / rounded-lg / bordered card styling as when docked — only the
-      // width changes, the 8px inset (and thus the height) stays identical. The
-      // resize handle is suppressed in that state — there's no neighbor to
-      // resize against.
+      // region (absolute inset-0) so the rail owns the full width, keeping the
+      // same flush/bordered styling — only the width changes. The resize
+      // handle is suppressed in that state — there's no neighbor to resize
+      // against.
       className={cn(
-        "@container/rail relative z-40 hidden md:m-2 md:flex md:min-h-0 md:flex-col md:overflow-hidden md:rounded-lg md:border md:border-border md:bg-card md:shadow-lg",
+        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and

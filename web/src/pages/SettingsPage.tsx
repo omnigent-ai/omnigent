@@ -328,7 +328,7 @@ const LIGHT_MODE_PREVIEW: PaletteSwatch = {
   text: "#11171c",
 };
 const DARK_MODE_PREVIEW: PaletteSwatch = {
-  bg: "#0d1218",
+  bg: "#0e1013",
   card: "#232a33",
   accent: "#5b6672",
   border: "#2b333d",

@@ -2567,7 +2567,7 @@ export function JumpToTopButton({
           // variant's hover (bg-muted) is a translucent black wash (--muted is
           // #0000000f), so over the faded chat text behind the pill it bleeds
           // through and reads as transparent. bg-background is opaque (#fff /
-          // #0d1218); hover feedback comes from a brightness filter, which keeps
+          // #0e1013); hover feedback comes from a brightness filter, which keeps
           // the fill fully opaque.
           "bg-background hover:bg-background hover:brightness-95",
           "dark:bg-background dark:hover:bg-background dark:hover:brightness-125",
