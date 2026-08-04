@@ -89,6 +89,17 @@ def _fetch_credential(server: str, host_id: str, host_token: str) -> tuple[str, 
     return str(data.get("username") or "x-access-token"), str(data["token"])
 
 
+def fetch_broker_token(server: str, host_id: str, host_token: str) -> str | None:
+    """The session owner's GitHub token from the broker, or ``None``.
+
+    The shared broker primitive: the same host<->server credential fetch the git
+    helper uses, exposed for other in-sandbox consumers (e.g. the GitHub MCP
+    proxy) so the token is fetched on demand and never persisted.
+    """
+    cred = _fetch_credential(server, host_id, host_token)
+    return cred[1] if cred is not None else None
+
+
 def configure_host_git(server_url: str, host_id: str) -> None:
     """Configure git in a managed sandbox to use the GitHub credential broker.
 
