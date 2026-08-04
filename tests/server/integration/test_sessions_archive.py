@@ -21,7 +21,9 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes import sessions as _sessions_facade
+from omnigent.server.routes._sessions import common as _sessions_common
+from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -115,7 +117,7 @@ async def _drain_detached_stops() -> None:
     immediately, so assertions about the stop must let it finish first.
     """
     await asyncio.gather(
-        *list(sessions_module._detached_stop_tasks),
+        *list(_sessions_orchestration._detached_stop_tasks),
         return_exceptions=True,
     )
 
@@ -128,9 +130,9 @@ async def test_archive_running_session_attempts_stop(
     session_id = session["id"]
 
     mock_stop = AsyncMock(return_value=True)
-    sessions_module._session_status_cache[session_id] = "running"
+    _sessions_common._session_status_cache[session_id] = "running"
     try:
-        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
                 json={"archived": True},
@@ -140,7 +142,7 @@ async def test_archive_running_session_attempts_stop(
         assert resp.json()["archived"] is True
         mock_stop.assert_awaited_once()
     finally:
-        sessions_module._session_status_cache.pop(session_id, None)
+        _sessions_common._session_status_cache.pop(session_id, None)
 
 
 async def test_archive_does_not_block_on_slow_stop(
@@ -165,9 +167,9 @@ async def test_archive_does_not_block_on_slow_stop(
         stopped.append(sid)
         await release.wait()
 
-    sessions_module._session_status_cache[session_id] = "running"
+    _sessions_common._session_status_cache[session_id] = "running"
     try:
-        with patch.object(sessions_module, "_best_effort_stop", _parked_stop):
+        with patch.object(_sessions_facade, "_best_effort_stop", _parked_stop):
             # Would exhaust the timeout here if the handler awaited the
             # stop inline (the fake stop parks until released below).
             resp = await asyncio.wait_for(
@@ -186,7 +188,7 @@ async def test_archive_does_not_block_on_slow_stop(
             release.set()
             await _drain_detached_stops()
     finally:
-        sessions_module._session_status_cache.pop(session_id, None)
+        _sessions_common._session_status_cache.pop(session_id, None)
 
 
 async def test_archive_idle_parent_stops_running_child(
@@ -214,9 +216,9 @@ async def test_archive_idle_parent_stops_running_child(
     )
 
     mock_stop = AsyncMock(return_value=True)
-    sessions_module._session_status_cache[child.id] = "running"
+    _sessions_common._session_status_cache[child.id] = "running"
     try:
-        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
                 json={"archived": True},
@@ -229,7 +231,7 @@ async def test_archive_idle_parent_stops_running_child(
         assert mock_stop.await_args is not None
         assert mock_stop.await_args.args[0] == child.id
     finally:
-        sessions_module._session_status_cache.pop(child.id, None)
+        _sessions_common._session_status_cache.pop(child.id, None)
 
 
 async def test_archive_tears_down_host_spawned_runner(
@@ -256,13 +258,13 @@ async def test_archive_tears_down_host_spawned_runner(
     conv_store.set_runner_id(session_id, "b1b2c3d4e5f61234567890abcdef0123")
 
     mock_teardown = AsyncMock(return_value=True)
-    sessions_module._session_status_cache[session_id] = "running"
+    _sessions_common._session_status_cache[session_id] = "running"
     try:
         with (
             patch.object(
-                sessions_module, "_stop_session_via_runner", AsyncMock(return_value=True)
+                _sessions_orchestration, "_stop_session_via_runner", AsyncMock(return_value=True)
             ),
-            patch.object(sessions_module, "_stop_session_host_runner", mock_teardown),
+            patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown),
         ):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
@@ -279,8 +281,8 @@ async def test_archive_tears_down_host_spawned_runner(
             "b1b2c3d4e5f61234567890abcdef0123",
         )
     finally:
-        sessions_module._session_status_cache.pop(session_id, None)
-        sessions_module._intentional_stop_sessions.discard(session_id)
+        _sessions_common._session_status_cache.pop(session_id, None)
+        _sessions_common._intentional_stop_sessions.discard(session_id)
 
 
 async def test_failed_archive_leaves_session_running(
@@ -297,9 +299,9 @@ async def test_failed_archive_leaves_session_running(
     session_id = session["id"]
 
     mock_stop = AsyncMock(return_value=True)
-    sessions_module._session_status_cache[session_id] = "running"
+    _sessions_common._session_status_cache[session_id] = "running"
     try:
-        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
                 json={"archived": True, "labels": {"omnigent.pinned.someone": "1"}},
@@ -310,7 +312,7 @@ async def test_failed_archive_leaves_session_running(
         listed = await client.get(f"/v1/sessions/{session_id}")
         assert listed.json()["archived"] is False
     finally:
-        sessions_module._session_status_cache.pop(session_id, None)
+        _sessions_common._session_status_cache.pop(session_id, None)
 
 
 async def test_archive_proceeds_when_stop_fails(
@@ -321,9 +323,9 @@ async def test_archive_proceeds_when_stop_fails(
     session_id = session["id"]
 
     mock_stop = AsyncMock(side_effect=ConnectionError("runner gone"))
-    sessions_module._session_status_cache[session_id] = "running"
+    _sessions_common._session_status_cache[session_id] = "running"
     try:
-        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
                 json={"archived": True},
@@ -332,7 +334,7 @@ async def test_archive_proceeds_when_stop_fails(
         assert resp.status_code == 200
         assert resp.json()["archived"] is True
     finally:
-        sessions_module._session_status_cache.pop(session_id, None)
+        _sessions_common._session_status_cache.pop(session_id, None)
 
 
 async def test_archive_proceeds_when_child_lookup_fails(
@@ -342,14 +344,14 @@ async def test_archive_proceeds_when_child_lookup_fails(
     session = await create_test_session(client, name="archive-db-fail")
     session_id = session["id"]
 
-    sessions_module._session_status_cache[session_id] = "running"
+    _sessions_common._session_status_cache[session_id] = "running"
     try:
         with patch.object(
-            sessions_module,
+            _sessions_orchestration,
             "_best_effort_stop",
-            wraps=sessions_module._best_effort_stop,
+            wraps=_sessions_orchestration._best_effort_stop,
         ):
-            orig = sessions_module._best_effort_stop
+            orig = _sessions_orchestration._best_effort_stop
 
             async def _patched_stop(sid, cs, rr):
                 with patch.object(
@@ -359,7 +361,7 @@ async def test_archive_proceeds_when_child_lookup_fails(
                 ):
                     await orig(sid, cs, rr)
 
-            with patch.object(sessions_module, "_best_effort_stop", _patched_stop):
+            with patch.object(_sessions_facade, "_best_effort_stop", _patched_stop):
                 resp = await client.patch(
                     f"/v1/sessions/{session_id}",
                     json={"archived": True},
@@ -368,7 +370,7 @@ async def test_archive_proceeds_when_child_lookup_fails(
         assert resp.status_code == 200
         assert resp.json()["archived"] is True
     finally:
-        sessions_module._session_status_cache.pop(session_id, None)
+        _sessions_common._session_status_cache.pop(session_id, None)
 
 
 async def test_archive_idle_session(
@@ -379,7 +381,7 @@ async def test_archive_idle_session(
     session_id = session["id"]
 
     mock_stop = AsyncMock()
-    with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+    with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
         resp = await client.patch(
             f"/v1/sessions/{session_id}",
             json={"archived": True},
@@ -400,9 +402,9 @@ async def test_unarchive_skips_stop(
     await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
 
     mock_stop = AsyncMock()
-    sessions_module._session_status_cache[session_id] = "running"
+    _sessions_common._session_status_cache[session_id] = "running"
     try:
-        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
                 json={"archived": False},
@@ -411,7 +413,7 @@ async def test_unarchive_skips_stop(
         assert resp.json()["archived"] is False
         mock_stop.assert_not_awaited()
     finally:
-        sessions_module._session_status_cache.pop(session_id, None)
+        _sessions_common._session_status_cache.pop(session_id, None)
 
 
 # ── Agent contents download ──────────────────────────────

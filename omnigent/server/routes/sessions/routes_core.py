@@ -154,6 +154,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
+    _spawn_archive_stop,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
