@@ -29,6 +29,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -1141,6 +1142,7 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="failed",
                 error=f"workspace path does not exist: {workspace}",
+                error_code=WORKSPACE_MISSING_ERROR_CODE,
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)

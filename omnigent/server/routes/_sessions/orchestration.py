@@ -43,6 +43,9 @@ from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
+)
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -2684,10 +2687,25 @@ async def ensure_runner_connected(
                 host_registry,
                 host_conn,
             )
-            # A harness-not-configured refusal is a real host-side error, but
-            # out of band there's no turn to persist it against — leave the
-            # binding and let the caller surface the transport failure.
-            if launch_attempt.error_code != _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            # A harness-not-configured or workspace-missing refusal means the
+            # runner will never appear — don't set relaunched_runner_id or the
+            # caller will wait out the full connect timeout for nothing.
+            # Record the refusal message in runner_exit_reports so the
+            # runner_failed_to_start error surfaces the actionable cause
+            # rather than the generic "may have failed to start" fallback.
+            _fatal_refusal = launch_attempt.error_code in (
+                _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                _WORKSPACE_MISSING_ERROR_CODE,
+            )
+            if _fatal_refusal and launch_attempt.error is not None:
+                _rer = getattr(app_state, "runner_exit_reports", None)
+                if _rer is not None:
+                    _rer.record(
+                        launch_attempt.runner_id,
+                        launch_attempt.error,
+                        owner=None,
+                    )
+            if not _fatal_refusal:
                 relaunched_runner_id = launch_attempt.runner_id
         elif await _maybe_relaunch_managed_sandbox(
             session_id=session_id,

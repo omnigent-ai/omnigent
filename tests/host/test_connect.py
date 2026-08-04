@@ -636,6 +636,9 @@ async def test_handle_launch_fails_for_bad_workspace() -> None:
     assert "does not exist" in (result.error or ""), (
         f"Error should mention path doesn't exist, got: {result.error!r}"
     )
+    assert result.error_code == "workspace_missing", (
+        f"Should carry workspace_missing error_code, got: {result.error_code!r}"
+    )
     assert result.runner_id is None
 
 
