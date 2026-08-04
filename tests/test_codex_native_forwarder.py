@@ -2275,6 +2275,115 @@ async def test_thread_active_status_does_not_settle_round(tmp_path: Path) -> Non
     assert client.posts == []
 
 
+@pytest.mark.asyncio
+async def test_model_output_item_settles_synthesized_round(tmp_path: Path) -> None:
+    """
+    The first model-produced item resolves the synthesized round mid-turn.
+
+    Codex defers turn execution until MCP startup settles, so an
+    assistant-side item proves the round is over while the turn is still
+    running. Without this signal, a server stuck ``starting`` (e.g. a
+    misconfigured command that never handshakes) pins the "Starting MCP
+    servers" band under a visibly working agent until the turn ends or
+    the config-derived window elapses.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_1",
+                "item": {"id": "item_1", "type": "agentMessage", "text": ""},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {}
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {"type": "external_mcp_startup", "data": {"servers": {}}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_message_item_does_not_settle_round(tmp_path: Path) -> None:
+    """
+    The turn's ``userMessage`` item must not settle the round.
+
+    Like the thread-active edge, the user message materializes when a
+    turn is merely ACCEPTED — which happens mid-startup — so settling on
+    it would clear the band during the genuine pre-turn wait.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_1",
+                "item": {"id": "item_0", "type": "userMessage", "text": "hi"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_other_thread_item_does_not_settle_round(tmp_path: Path) -> None:
+    """
+    An item on an unrecognized thread must not settle the parent round.
+
+    MCP startup is bridge-level state surfaced on the parent session;
+    another thread's activity proves nothing about this round.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_other",
+                "item": {"id": "item_1", "type": "agentMessage", "text": ""},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert client.posts == []
+
+
 def test_settle_timeout_tracks_slowest_configured_server(tmp_path: Path) -> None:
     """
     The settle window follows the slowest ``startup_timeout_sec`` in config.
