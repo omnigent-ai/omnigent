@@ -1,3 +1,9 @@
+// A lone `$` reads as a shell-style variable reference — `$VAR_NAME` or
+// `${VAR_NAME}` — when followed by a SCREAMING_CASE identifier of 2+ chars (an
+// env-var convention), so it's treated as literal text rather than a math
+// opener. Anchored at the `$`, which the caller has already matched.
+const SHELL_VAR_RE = /^\$(?:\{[A-Z_][A-Z0-9_]*\}|[A-Z_][A-Z0-9_]+)/;
+
 // Optional 1–3 space indent + a fence run, per CommonMark. Matching the full
 // run (not just the first three chars) also keeps a ````-fenced block from
 // leaking its fourth backtick into inline-code tracking.
@@ -15,11 +21,14 @@ const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
  * - A literal `\\` or `\$` is copied verbatim so its trailing `\[`/`\(` isn't
  *   read as an explicit delimiter and an escaped dollar isn't re-toggled.
  *
- * A single `$` immediately before a digit reads as currency ($5), not an inline
- * math opener, so it's escaped and doesn't flip the math span — otherwise, with
- * single-dollar math enabled, prose like "it costs $5 or $10" renders as a
- * garbled formula. (Genuine inline math that starts with a digit, e.g. `$3x$`,
- * is the rare casualty; digit-led currency in prose is far more common.)
+ * A single `$` reads as literal prose rather than an inline-math opener when it
+ * looks like currency ($5) or a shell-style variable reference ($LLM_API_KEY,
+ * ${OMNIGENT_LLM_API_KEY}), so it's escaped and doesn't flip the math span.
+ * Otherwise, with single-dollar math enabled, prose like "it costs $5 or $10"
+ * or an error such as "Unresolved variable '$LLM_API_KEY' … Set $LLM_API_KEY"
+ * renders as a garbled formula. (Genuine inline math that starts with a digit
+ * (`$3x$`) or a SCREAMING_CASE identifier (`$N_A$`) is the rare casualty;
+ * currency and env-var references in prose are far more common.)
  */
 export function normalizeExplicitMathDelimiters(text: string): string {
   let result = "";
@@ -83,8 +92,9 @@ export function normalizeExplicitMathDelimiters(text: string): string {
     if (char === "$") {
       let run = 1;
       while (text[i + run] === "$") run += 1;
-      const isCurrency = run === 1 && !inMath && /\d/.test(text[i + 1] ?? "");
-      if (isCurrency) {
+      const isLiteralDollar =
+        run === 1 && !inMath && (/\d/.test(text[i + 1] ?? "") || SHELL_VAR_RE.test(text.slice(i)));
+      if (isLiteralDollar) {
         result += "\\$";
         continue;
       }
