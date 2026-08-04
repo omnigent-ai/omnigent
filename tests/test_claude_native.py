@@ -44,6 +44,18 @@ def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _test_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    bridge_root = tmp_path / "claude-native"
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", bridge_root)
+    return bridge_root / "session"
+
+
+def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
+    settings_path = Path(args[args.index("--settings") + 1])
+    return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
 def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     """
     The terminal launch body pins ``cwd`` to the user's launch dir.
@@ -63,10 +75,11 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     Channels flag is not snuck in.
     """
     monkeypatch.chdir(tmp_path)
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     body = claude_native._claude_terminal_request(
         ("--resume", "claude-session", "-p", "hi"),
         command="claude",
-        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+        bridge_dir=bridge_dir,
     )
 
     assert body["terminal"] == "claude"
@@ -100,13 +113,13 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "omnigent.claude_native_bridge",
         "serve-mcp",
         "--bridge-dir",
-        "/tmp/omnigent-test-bridge",
+        str(bridge_dir),
     ]
     # The experimental Claude Channels flag is blocked at the org
     # policy layer — the wrapper must not pass it. Web-UI input now
     # goes through tmux send-keys.
     assert "--dangerously-load-development-channels" not in args
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     assert sorted(settings["hooks"]) == [
         "MessageDisplay",
         "PostToolUse",
@@ -127,7 +140,7 @@ def test_claude_terminal_request_default_launch_is_unwrapped(tmp_path, monkeypat
     body = claude_native._claude_terminal_request(
         ("--resume", "s"),
         command="claude",
-        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
     )
     spec = body["spec"]
     assert spec["command"] == "claude"
@@ -158,7 +171,7 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     body = claude_native._claude_terminal_request(
         ("--resume", "s"),
         command="claude",
-        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
     )
     spec = body["spec"]
     assert spec["command"] == "isaac"
@@ -170,7 +183,7 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     assert "--settings" in spec["args"]
 
 
-def test_claude_terminal_request_injects_claude_config() -> None:
+def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) -> None:
     """
     Ucode config reaches the terminal env, settings, and model argv.
 
@@ -185,14 +198,14 @@ def test_claude_terminal_request_injects_claude_config() -> None:
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         },
-        api_key_helper="printf token",
+        api_key_helper="printf %s sk-sentinel-do-not-use",
         model="databricks-claude-opus-test",
     )
 
     body = claude_native._claude_terminal_request(
         ("--print", "hi"),
         command="claude",
-        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
         claude_config=config,
     )
 
@@ -217,12 +230,13 @@ def test_claude_terminal_request_injects_claude_config() -> None:
         "--model",
         "databricks-claude-opus-test",
     ]
-    settings = json.loads(args[args.index("--settings") + 1])
-    assert settings["apiKeyHelper"] == "printf token"
+    settings = _load_invocation_settings(args)
+    assert all("sk-sentinel-do-not-use" not in arg for arg in args)
+    assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert "hooks" in settings
 
 
-def test_claude_terminal_request_preserves_user_model_arg() -> None:
+def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch) -> None:
     """
     User-selected Claude model wins over the ucode default.
 
@@ -239,7 +253,7 @@ def test_claude_terminal_request_preserves_user_model_arg() -> None:
     body = claude_native._claude_terminal_request(
         ("--model", "user-model", "--print", "hi"),
         command="claude",
-        bridge_dir=Path("/tmp/omnigent-test-bridge"),
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
         claude_config=config,
     )
 

@@ -174,6 +174,7 @@ _DRAFT_NEEDLE_MAX_CHARS = 24
 # surfaces in the web UI error banner instead of only in the terminal.
 _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
+_INVOCATION_SETTINGS_FILE = "claude-settings.json"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -1425,6 +1426,9 @@ def augment_claude_args(
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
 
+    Invocation settings are written into the owner-only bridge directory so
+    credential-bearing ``apiKeyHelper`` commands never appear in child argv.
+
     :param claude_args: User-provided Claude Code args, e.g.
         ``("--resume", "abc")``.
     :param bridge_dir: Bridge directory path.
@@ -1472,12 +1476,14 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
+    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+    _write_json_file(settings_path, hook_settings)
     args.extend(
         [
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":")),
             "--settings",
-            json.dumps(hook_settings, separators=(",", ":")),
+            str(settings_path),
         ]
     )
     if append_system_prompt:
