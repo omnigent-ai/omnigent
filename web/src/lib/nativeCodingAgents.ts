@@ -4,6 +4,37 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
+/** Wrapper stamped on a child row that tracks a Claude Code Task sub-agent. */
+export const CLAUDE_NATIVE_SUBAGENT_WRAPPER = "claude-code-native-ui-subagent";
+/** Task-tool `description` forwarded onto that child row, e.g. `"wave-worker-696"`. */
+export const CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY = "omnigent.claude_native.description";
+
+/**
+ * Human-readable label for a Claude Code sub-agent session.
+ *
+ * Its title is `"{agentType}:{subagentId}"` — a per-parent uniqueness key
+ * ending in an opaque hex id, so neither half is worth rendering. The Task
+ * description is what a human recognises; without one, the agent type's
+ * trailing segment reads best, since plugin-namespaced types arrive as
+ * `"rpw-published:debug-lead"`.
+ *
+ * @param labels - Session-scoped labels from the child row.
+ * @param subAgentName - The Claude `agentType` recorded on the row.
+ * @returns The label, or `null` when the row is not a Claude sub-agent (or
+ *   carries neither signal), leaving the caller's own fallbacks in charge.
+ */
+export function claudeNativeSubagentLabel(
+  labels: Record<string, string> | undefined,
+  subAgentName: string | null | undefined,
+): string | null {
+  if (labels?.[WRAPPER_LABEL_KEY] !== CLAUDE_NATIVE_SUBAGENT_WRAPPER) return null;
+  const description = labels[CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY]?.trim();
+  if (description) return description;
+  const agentType = subAgentName?.trim();
+  if (!agentType) return null;
+  return agentType.slice(agentType.lastIndexOf(":") + 1) || agentType;
+}
+
 export type NativeCodingAgentIconKind =
   | "claude"
   | "codex"

@@ -1141,6 +1141,37 @@ describe("subAgentComposerLabel", () => {
     // Degenerate snapshot — the tray still needs something to render.
     expect(subAgentComposerLabel(mkSession())).toBe("sub-agent");
   });
+
+  it("prefers the Task description for a Claude Code sub-agent", () => {
+    // Its title's suffix is an opaque hex id, so the title-split rule
+    // would put "a09d1dd1d8dbc0151" in the tray.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "general-purpose:a09d1dd1d8dbc0151",
+          subAgentName: "general-purpose",
+          labels: {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.description": "wave-worker-696",
+          },
+        }),
+      ),
+    ).toBe("wave-worker-696");
+  });
+
+  it("uses the bare agent name for a description-less namespaced Claude sub-agent", () => {
+    // "rpw-published:debug-lead" carries its own colon, so splitting the
+    // title on the first one left the id half showing.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "rpw-published:debug-lead:a361e6a6aa05689cb",
+          subAgentName: "rpw-published:debug-lead",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ),
+    ).toBe("debug-lead");
+  });
 });
 
 // ── containsMarkdownTable ──────────────────────────────────────────────────

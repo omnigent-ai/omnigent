@@ -123,6 +123,7 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import {
+  claudeNativeSubagentLabel,
   isNativeTerminalSession,
   nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
@@ -4487,9 +4488,14 @@ function ComposerStatusLine({
  *   loaded — both hide the tray.
  */
 export function subAgentComposerLabel(
-  session: Pick<Session, "parentSessionId" | "title" | "subAgentName" | "agentName"> | null,
+  session: Pick<
+    Session,
+    "parentSessionId" | "title" | "subAgentName" | "agentName" | "labels"
+  > | null,
 ): string | null {
   if (!session || session.parentSessionId == null) return null;
+  const claudeLabel = claudeNativeSubagentLabel(session.labels, session.subAgentName);
+  if (claudeLabel) return claudeLabel;
   // Strip the user-added "ui:" sentinel so its "agent:name" suffix reads
   // like an LLM-spawned title.
   let title = session.title ?? null;
