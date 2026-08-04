@@ -1437,6 +1437,13 @@ describe("routing eligibility gates", () => {
     expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
   });
 
+  it("a non-native SDK session is subagent-routing eligible whatever its harness", () => {
+    // Its spawns go through the session-create path, not the native hook, so the
+    // harness allowlist doesn't apply.
+    const piSession = { ...sdkSession, harness: "pi" } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), piSession)).toBe(true);
+  });
+
   it("both gates are off for a sub-agent (child) session even with the flag on", () => {
     const child = { ...sdkSession, parentSessionId: "conv_parent" } as unknown as Session;
     expect(isCostRoutingEligible(info(true), child)).toBe(false);

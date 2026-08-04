@@ -68,6 +68,7 @@ from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
     auto_harness_session,
     harness_family,
+    subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
@@ -4338,15 +4339,17 @@ async def _forward_event_to_runner(
     # the entire session.  The verdict is persisted as model_override
     # on the conversation so subsequent turns reuse it without another
     # judge call.
-    # Route if: toggle is on for this session (top-level), OR this is a
-    # sub-agent and its parent session has the toggle on.
+    # Route if: this session's own toggle is on (top-level), OR this is a
+    # sub-agent and its parent's subagent-routing switch is on — the same switch
+    # the native-subagent hook and the child-create path gate on, so one visible
+    # knob governs every spawn.
     _parent_routing_on = False
     if conv.parent_conversation_id is not None:
         _parent_conv = await asyncio.to_thread(
             conversation_store.get_conversation, conv.parent_conversation_id
         )
-        _parent_routing_on = (
-            _parent_conv is not None and _parent_conv.cost_control_mode_override == "on"
+        _parent_routing_on = _parent_conv is not None and subagent_routing_enabled(
+            _parent_conv.subagent_routing_override
         )
     _routing_enabled = (
         conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
@@ -4737,7 +4740,8 @@ async def _dispatch_session_event_to_runner_impl(
         # Same logic as the SDK path in _forward_event_to_runner: if
         # the toggle is on and no model_override is set, call the
         # judge and persist the chosen model on the conversation row.
-        # The native CLI reads model_override from the session.
+        # The native CLI reads model_override from the session. A child
+        # routes off its parent's subagent-routing switch.
         _native_parent_routing_on = False
         if conv.parent_conversation_id is not None:
             _native_parent_conv = await asyncio.to_thread(
@@ -4745,7 +4749,7 @@ async def _dispatch_session_event_to_runner_impl(
             )
             _native_parent_routing_on = (
                 _native_parent_conv is not None
-                and _native_parent_conv.cost_control_mode_override == "on"
+                and subagent_routing_enabled(_native_parent_conv.subagent_routing_override)
             )
         _native_routing_enabled = (
             conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
@@ -6713,11 +6717,18 @@ async def _create_session_from_existing_agent(
         body.subagent_routing_override
     )
 
-    # A child of a Smart Routing (auto) parent with routing on is routed
-    # regardless of the harness/model the orchestrator chose: force the "auto"
-    # sentinel so the first-message routing path picks both harness and model,
-    # ignoring the tool's ``agent``/``model`` args. Only applied to
+    # A child of an auto-harness parent whose subagent-routing switch is on is
+    # routed regardless of the harness/model the orchestrator chose: force the
+    # "auto" sentinel so the first-message routing path picks both harness and
+    # model, ignoring the tool's ``agent``/``model`` args. Only applied to
     # omnigent-executor agents (auto requires a swappable brain harness).
+    #
+    # The gate is the parent's subagent-routing switch — the one routing knob the
+    # in-session UI exposes — matching the gate the native-subagent hook applies
+    # to in-harness spawns. Behaviour-preserving for existing rows: a session
+    # that started on Smart Routing is stamped "on" at create, and the
+    # e6f7a8b9c0d1 migration backfilled the rows that predate the stamp. An
+    # explicit "off" now actually stops the forcing.
     #
     # A child of a session pinned to one harness family (a plain codex or
     # claude session) must NOT be forced to auto: the sentinel would hand the
@@ -6733,7 +6744,7 @@ async def _create_session_from_existing_agent(
         )
         if (
             _parent_for_routing is not None
-            and _parent_for_routing.cost_control_mode_override == "on"
+            and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
             and auto_harness_session(_parent_for_routing)
         ):
             try:
@@ -6755,7 +6766,7 @@ async def _create_session_from_existing_agent(
         or _native_smart_routing
         or (
             _parent_for_routing is not None
-            and _parent_for_routing.cost_control_mode_override == "on"
+            and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
         )
     ):
         subagent_routing_override = "on"

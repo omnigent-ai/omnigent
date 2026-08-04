@@ -898,6 +898,154 @@ async def test_child_of_a_spec_opted_in_parent_keeps_cross_harness_candidates(
     assert set(routing_client.offered[0]) == {"claude-sdk", "codex", "pi"}
 
 
+# ── 7b. The subagent-routing switch is the child-spawn gate ────────
+
+
+async def _auto_parent_and_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    *,
+    agent_name: str,
+    cost_control: str | None,
+    subagent_routing: str | None,
+) -> tuple[str, Any, SqlAlchemyConversationStore]:
+    """Create an auto-harness parent with explicit switches, plus one child.
+
+    The child goes through the real ``POST /v1/sessions`` create path, so the
+    forced-auto decision and the create stamp are exercised rather than faked.
+
+    :param client: Test HTTP client.
+    :param db_uri: Database URI for a direct store handle.
+    :param agent_name: Agent name to register.
+    :param cost_control: ``cost_control_mode_override`` for the parent.
+    :param subagent_routing: ``subagent_routing_override`` for the parent.
+    :returns: ``(parent_id, child_conversation, conversation_store)``.
+    """
+    agent = await create_test_agent(
+        client,
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    body: dict[str, Any] = {"agent_id": agent["id"], "harness_override": "auto"}
+    if cost_control is not None:
+        body["cost_control_mode_override"] = cost_control
+    if subagent_routing is not None:
+        body["subagent_routing_override"] = subagent_routing
+    parent = await client.post("/v1/sessions", json=body)
+    assert parent.status_code == 201, parent.text
+    parent_id = str(parent.json()["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent_conv = conv_store.get_conversation(parent_id)
+    assert parent_conv is not None
+    # The parent really is an auto-harness session either way, so the switch is
+    # the only thing that differs between the cases below.
+    assert parent_conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+    assert parent_conv.subagent_routing_override == subagent_routing
+
+    child = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "parent_session_id": parent_id, "title": "audit routing"},
+    )
+    assert child.status_code == 201, child.text
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    return parent_id, child_conv, conv_store
+
+
+@pytest.mark.parametrize(
+    ("case", "cost_control", "subagent_routing", "routed"),
+    [
+        # The switch says off, so the parent's own routing must not leak into its
+        # spawns — the child stays on the harness it was created with.
+        ("cc-on-switch-off", "on", "off", False),
+        # Preservation: the ordinary Smart Routing session, switch left stamped.
+        ("cc-on-switch-on", "on", "on", True),
+        # The switch alone drives spawns: the parent's own turns aren't routed,
+        # but its children are.
+        ("cc-off-switch-on", None, "on", True),
+    ],
+)
+async def test_child_spawn_gate_follows_the_parents_subagent_switch(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    case: str,
+    cost_control: str | None,
+    subagent_routing: str | None,
+    routed: bool,
+) -> None:
+    _parent_id, child, conv_store = await _auto_parent_and_child(
+        client,
+        db_uri,
+        agent_name=f"routing-child-switch-{case}",
+        cost_control=cost_control,
+        subagent_routing=subagent_routing,
+    )
+    # The forced-auto decision at create.
+    if routed:
+        assert child.harness_override == "auto"
+        assert child.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+    else:
+        assert child.harness_override != "auto"
+        assert AUTO_HARNESS_LABEL_KEY not in child.labels
+
+    routing_client = FakeRoutingClient(RoutingResult(model=ROUTED_MODEL, rationale="big task"))
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "rewrite the router"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child.id,
+                child,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    if routed:
+        assert len(routing_client.calls) == 1
+        assert refreshed.model_override == ROUTED_MODEL
+        assert len(_routing_decisions(conv_store, child.id)) == 1
+    else:
+        assert routing_client.calls == []
+        assert refreshed.model_override is None
+        assert _routing_decisions(conv_store, child.id) == []
+
+
+@pytest.mark.parametrize(
+    ("case", "cost_control", "subagent_routing", "stamped"),
+    [
+        ("cc-on-switch-off", "on", "off", None),
+        ("cc-off-switch-on", None, "on", "on"),
+    ],
+)
+async def test_child_create_stamp_inherits_the_parents_switch_not_its_cost_control(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    case: str,
+    cost_control: str | None,
+    subagent_routing: str | None,
+    stamped: str | None,
+) -> None:
+    """The child carries its own copy of the parent's *switch*.
+
+    The gate never re-reads the parent, so what the stamp copies decides whether
+    a grandchild spawn routes. Copying the parent's cost-control mode instead
+    would revive the switch the UI no longer exposes.
+    """
+    _parent_id, child, _conv_store = await _auto_parent_and_child(
+        client,
+        db_uri,
+        agent_name=f"routing-child-stamp-{case}",
+        cost_control=cost_control,
+        subagent_routing=subagent_routing,
+    )
+    assert child.subagent_routing_override == stamped
+
+
 # ── 8. Truthful record on a claude-native turn ─────────────────────
 
 

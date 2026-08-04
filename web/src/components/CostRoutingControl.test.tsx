@@ -39,10 +39,27 @@ describe("isSubagentRoutingSession", () => {
     }
   });
 
-  it("rejects harnesses with no native-subagent router", () => {
-    expect(isSubagentRoutingSession({ ...top, harness: "pi" })).toBe(false);
+  it("matches non-native sessions whatever their harness (spawns go through create)", () => {
+    // An SDK/bundle agent spawns children through the session-create path, which
+    // routes off this switch regardless of the harness the parent runs.
+    expect(isSubagentRoutingSession({ ...top, harness: "pi" })).toBe(true);
+    expect(isSubagentRoutingSession({ ...top, harness: "openai-agents" })).toBe(true);
+    expect(isSubagentRoutingSession({ ...top, harness: "not-a-real-harness" })).toBe(true);
+    expect(isSubagentRoutingSession({ ...top, harness: null })).toBe(true);
+  });
+
+  it("rejects native wrappers with no native-subagent router", () => {
+    // Native terminal CLIs spawn in-harness through the hook, which only
+    // Claude/Codex implement — the knob would be inert elsewhere.
     expect(isSubagentRoutingSession({ ...top, harness: "cursor-native" })).toBe(false);
-    expect(isSubagentRoutingSession({ ...top, harness: null })).toBe(false);
+    expect(isSubagentRoutingSession({ ...top, harness: "pi-native" })).toBe(false);
+    expect(
+      isSubagentRoutingSession({
+        ...top,
+        harness: "pi",
+        labels: { "omnigent.wrapper": "cursor-native-ui" },
+      }),
+    ).toBe(false);
   });
 
   it("rejects a child session even on a routable harness", () => {

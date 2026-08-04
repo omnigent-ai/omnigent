@@ -170,7 +170,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import {
   ConfigRow,
   EFFORT_SELECT_NONE,
@@ -232,7 +231,8 @@ export function isCostRoutingEligible(
 
 /**
  * Whether the session may control the routing of the sub-agents it spawns —
- * same deployment flag, wider session gate (native Claude/Codex included).
+ * same deployment flag, wider session gate (native Claude/Codex included, and
+ * every non-native top-level agent session regardless of harness).
  */
 export function isSubagentRoutingEligible(
   serverInfo: ServerInfoValue,
@@ -1466,7 +1466,7 @@ interface MainAgentSurfaceProps {
   showPollyCodexGoalControl?: boolean;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
   costRoutingEligible: boolean;
-  /** Session passes `isSubagentRoutingSession` (Claude/Codex/auto, top-level). */
+  /** Session passes `isSubagentRoutingSession` (top-level, native Claude/Codex or non-native). */
   subagentRoutingEligible: boolean;
   /**
    * Sub-agent instance label when the active session is a child, e.g.
@@ -3685,9 +3685,9 @@ interface ComposerProps {
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
   costRoutingEligible?: boolean;
   /**
-   * Session passes `isSubagentRoutingSession` — a top-level Claude/Codex/auto
-   * session, which gets the gear modal's "Subagent routing" row. Wider than
-   * `costRoutingEligible`: native-terminal sessions qualify here.
+   * Session passes `isSubagentRoutingSession` — a top-level session that gets
+   * the gear modal's "Subagent routing" row. Wider than `costRoutingEligible`:
+   * native-terminal Claude/Codex sessions qualify here too.
    */
   subagentRoutingEligible?: boolean;
   /**
@@ -5724,9 +5724,11 @@ const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session s
 /**
  * In-session run-config modal opened from the composer's gear icon. The
  * live-committing analogue of the new-session ``HarnessConfigModal``: only the
- * knobs switchable mid-session appear — Model, Effort, Smart Routing, and
- * Subagent routing. Permission/approval/cursor modes are launch-time only (no
- * in-session state to read or write), so they are intentionally absent.
+ * knobs switchable mid-session appear — Model (which folds Smart Routing in as
+ * an option where a dropdown exists), Effort, and Subagent routing. A session's
+ * own Smart Routing is otherwise a create-time choice, and
+ * permission/approval/cursor modes are launch-time only (no in-session state to
+ * read or write), so they are intentionally absent.
  *
  * Like the new-session modal, changes are drafted locally and only applied on
  * Save (through the store setters ``setModel`` / ``setEffort`` /
@@ -5763,8 +5765,8 @@ function SessionConfigModal({
   const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
 
-  // Agents with a Model dropdown fold Smart Routing into it as an option; those
-  // without one get a standalone Switch (matches HarnessConfigModal).
+  // Agents with a Model dropdown fold Smart Routing into it as an option. There
+  // is no in-session switch for agents without one — they choose at create.
   const liveRoutingOn = costRoutingEligible && costControlModeOverride === "on";
 
   // Resolve the row the current model maps to: the explicit override wins,
@@ -5907,30 +5909,6 @@ function SessionConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {/* Smart Routing as a standalone toggle only for routable agents with
-          no Model dropdown to fold it into (e.g. Polly). Agents that render a
-          Model dropdown (Claude, Codex, …) offer it as a Model option below. */}
-          {costRoutingEligible && !showModels && (
-            <ConfigRow
-              label={SMART_ROUTING_LABEL}
-              description="Auto-pick the model per turn by task"
-            >
-              <div className="flex h-8 items-center justify-end">
-                <Switch
-                  size="sm"
-                  checked={draftRoutingOn}
-                  data-testid="composer-config-smart-routing"
-                  aria-label={SMART_ROUTING_LABEL}
-                  onCheckedChange={(next) => {
-                    setDraftRoutingOn(next);
-                    // Routing picks the model + effort per turn, so an explicit
-                    // effort can't apply — reset it while routing is on.
-                    if (next) setDraftEffort(null);
-                  }}
-                />
-              </div>
-            </ConfigRow>
-          )}
           {showModels && (
             <ConfigRow label="Model" description="Underlying LLM">
               <RoutingModelSelect
@@ -5978,11 +5956,12 @@ function SessionConfigModal({
               </Select>
             </ConfigRow>
           )}
-          {/* Sub-agent routing. The only routing control native Claude/Codex
-          sessions get: their own model is baked at launch, but each sub-agent
-          they spawn is routed per spawn. Two options — a session that started
-          on Smart Routing was stamped "on" at create, so an unset value is
-          Default and the trigger always shows what's stored. */}
+          {/* Sub-agent routing — the only in-session routing control, for
+          native Claude/Codex (spawns route through the harness hook) and for
+          SDK/bundle agents alike (spawns route through the create path). A
+          session's own routing is a create-time choice. Two options — a session
+          that started on Smart Routing was stamped "on" at create, so an unset
+          value is Default and the trigger always shows what's stored. */}
           {subagentRoutingEligible && (
             <ConfigRow label={SUBAGENT_ROUTING_LABEL} description={SUBAGENT_ROUTING_DESCRIPTION}>
               <Select
@@ -6184,11 +6163,6 @@ function useSessionConfigSummary({
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
-  }
-  // Routable agents with no Model row surface routing as a standalone row;
-  // those with a Model dropdown fold it into Model above (shown as the value).
-  if (costRoutingEligible && !showModels && routingOn) {
-    rows.push({ label: SMART_ROUTING_LABEL, value: "On" });
   }
   return rows;
 }
