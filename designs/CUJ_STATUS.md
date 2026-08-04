@@ -442,10 +442,20 @@ subagent inheriting the session default 400s (the root-turn clamps in
 
 | Check                                                       | How to run                                                                       | Ground-truth signal                                                                                              | Status                    | Last verified |
 | ------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------- | ------------- |
-| glm offered in codex spawn candidates                        | unit: `candidate_models("codex-native", …)` with no live catalog                  | `system.ai.glm-5-2` in the candidate set (servable-alias spelling)                                                  | ⬜ fix in flight            | —             |
-| A glm-routed spawn resolves in-family, exact                 | unit: `resolve_subagent_route` with a delegate-class task + glm in candidates     | `action="rewrite"`, `model="system.ai.glm-5-2"`, no false raw_model arrow                                           | ⬜                          | —             |
-| A live glm subagent RUNS (the effort wall)                   | R0 codex Smart Routing session, named spawn whose task routes delegate→glm        | The spawned turn completes — no `reasoning.effort` 400; rollout/audit shows the glm spelling                        | ⬜ the crux                 | —             |
+| glm offered in codex spawn candidates                        | unit: `candidate_models("codex-native", …)` with no live catalog                  | `system.ai.glm-5-2` in the candidate set (servable-alias spelling)                                                  | ✅ unit + live (route-subagent menus carried `glm-5-2`, server log 00:02) | 2026-08-04 |
+| A glm-routed spawn resolves in-family, exact                 | unit: `resolve_subagent_route` with a delegate-class task + glm in candidates     | `action="rewrite"`, `model="system.ai.glm-5-2"`, no false raw_model arrow                                           | ✅ unit (`test_subagent_routing.py`) | 2026-08-04 |
+| A live glm subagent RUNS (the effort wall)                   | R0 codex Smart Routing session, spawn with `model "system.ai.glm-5-2"` (or a task the router delegates to glm) | The spawned turn completes — no `reasoning.effort` 400; rollout/audit shows the glm spelling                        | ✅ live: session `7f8c4f78`, subagent rollout `turn_context model=system.ai.glm-5-2 effort=medium` off an xhigh parent, replied "lychee" | 2026-08-04 |
 | `sys_session_create` child on glm still works (regression)   | §2.5 recipe: codex parent, child prompt whose route is glm                        | `child_session` decision row with a glm arm; child's `config.toml` clamped to a glm-safe effort (launch-pin clamp)  | ✅ evidence (§2.5, pre-fix) | 2026-07-31    |
+
+Live verification exposed and fixed two more layers this section's first cut
+missed (2026-08-04): this codex's `spawn_agent` has **no task-name field**, so
+every spawn scored the 19-char placeholder and landed the sol default — the
+hook now forwards the spawn `message` (plaintext in hook payloads; the
+encryption premise was disproven) as the routing signal. And an explicit
+`model` in the spawn arguments was silently overridden — it now travels as
+`requested_model` and is honored when it is an arm the spawn's own harness
+could route to (any spelling; cross-family or unoffered asks are routed over
+and recorded as `attempted_override`). Both proven live end to end.
 
 ---
 
