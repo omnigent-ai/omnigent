@@ -11,6 +11,9 @@ from omnigent.inner.hook_scripts import codex_router_hook as hook
 from omnigent.inner.hook_scripts import subagent_router
 from tests.inner.conftest import advertise_router
 
+# Delivered plaintext in hook payloads (measured live); the name survives
+# from when it was assumed encrypted and now documents that either way the
+# bytes are forwarded verbatim.
 _ENCRYPTED_MESSAGE = "enc:AAAABBBBCCCC=="
 
 
@@ -53,6 +56,7 @@ def _build(
         parent_model=parent_model,
         task_keys=hook.ROUTE_SEAMS["task_keys"],
         include_prompt=hook.ROUTE_SEAMS["include_prompt"],
+        prompt_keys=hook.ROUTE_SEAMS["prompt_keys"],
     )
 
 
@@ -86,16 +90,26 @@ def test_is_spawn_agent_tool_matches_flattened_name() -> None:
     assert not hook.is_spawn_agent_tool(None)
 
 
-def test_build_route_request_never_sends_the_encrypted_prompt() -> None:
+def test_build_route_request_sends_the_message_as_the_routing_prompt() -> None:
+    # The spawn message arrives plaintext, so it is the routing signal —
+    # without it every unnamed spawn scores the placeholder and lands the
+    # router's default arm, never a delegate arm like glm.
     body = _build(_payload()["tool_input"], parent_model="gpt-5-6-sol")
 
     assert body == {
         "harness": "codex-native",
         "task_name": "refactor-tests",
-        "prompt": None,
+        "prompt": _ENCRYPTED_MESSAGE,
         "parent_model": "gpt-5-6-sol",
+        "requested_model": None,
     }
-    assert _ENCRYPTED_MESSAGE not in json.dumps(body)
+
+
+def test_build_route_request_forwards_an_explicit_model_ask() -> None:
+    body = _build({"message": "fix the typo", "model": "system.ai.glm-5-2"})
+
+    assert body["requested_model"] == "system.ai.glm-5-2"
+    assert body["prompt"] == "fix the typo"
 
 
 @pytest.mark.parametrize(
@@ -116,8 +130,8 @@ def test_build_route_request_derives_task_name(
     body = _build(tool_input)
 
     assert body["task_name"] == expected_task_name
-    # The encrypted message is never forwarded on any of these paths.
-    assert body["prompt"] is None
+    # The message, when present, rides along as the routing prompt.
+    assert body["prompt"] == tool_input.get("message")
 
 
 def test_rewrite_injects_the_spawn_slug_and_passes_message_verbatim(
@@ -151,7 +165,7 @@ def test_rewrite_injects_the_spawn_slug_and_passes_message_verbatim(
         "systemMessage": "Using Smart Routing. Routing to gpt-5.6-luna.",
     }
     assert router.calls[0]["session_id"] == "conv_abc"
-    assert router.calls[0]["body"]["prompt"] is None
+    assert router.calls[0]["body"]["prompt"] == _ENCRYPTED_MESSAGE
 
 
 def test_glm_rewrite_spawns_under_the_gateways_own_spelling(

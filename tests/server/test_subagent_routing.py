@@ -215,6 +215,72 @@ async def test_same_family_pick_rewrites() -> None:
     assert len(decision.decision_id) == 36
 
 
+async def test_an_explicit_in_family_ask_is_honored_without_routing() -> None:
+    """A spawn that names a routable arm keeps it — glm included.
+
+    Placeholder-scored routing would otherwise override every deliberate
+    pick with the default arm, making glm unreachable from a spawn.
+    """
+    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="default arm"))
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native", prompt=None, requested_model=GLM_SERVABLE),
+        caps=FakeCaps(routing_client=client),
+        catalog={"self": [GPT_MODEL, GLM_MODEL]},
+    )
+    assert decision.action == "rewrite"
+    assert decision.model == GLM_SERVABLE
+    assert client.calls == []  # honored, never routed
+    record = decision_record(
+        _request(harness="codex-native", requested_model=GLM_SERVABLE), decision
+    )
+    assert record.attempted_override is None  # honored asks are not overrides
+
+
+async def test_an_ask_matches_candidates_on_the_bare_arm() -> None:
+    """Any spelling of the ask lands the candidate set's servable spelling."""
+    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="default arm"))
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native", prompt=None, requested_model=GLM_MODEL),
+        caps=FakeCaps(routing_client=client),
+        catalog={"self": [GPT_MODEL, GLM_MODEL]},
+    )
+    assert decision.action == "rewrite"
+    assert decision.model == GLM_SERVABLE
+
+
+async def test_a_cross_family_ask_on_an_auto_session_is_not_honored_in_place() -> None:
+    """Auto-harness candidates span both families, but a rewrite runs
+    in-place — a codex spawn must never be handed a claude arm to run."""
+    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="default arm"))
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native", prompt=None, requested_model=CLAUDE_MODEL),
+        caps=FakeCaps(routing_client=client),
+        cross_harness=True,
+    )
+    assert decision.action == "rewrite"
+    assert decision.model == GPT_MODEL
+    assert len(client.calls) == 1
+
+
+async def test_an_out_of_family_ask_is_routed_over_and_recorded() -> None:
+    """A codex spawn asking for a claude arm gets routed; the ask is recorded."""
+    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="default arm"))
+    req = _request(harness="codex-native", prompt=None, requested_model=CLAUDE_MODEL)
+    decision = await resolve_subagent_route(
+        "conv_1",
+        req,
+        caps=FakeCaps(routing_client=client),
+        catalog={"self": [GPT_MODEL, GLM_MODEL]},
+    )
+    assert decision.action == "rewrite"
+    assert decision.model == GPT_MODEL
+    assert len(client.calls) == 1  # not honored — routed normally
+    assert decision_record(req, decision).attempted_override == CLAUDE_MODEL
+
+
 async def test_raw_model_is_omitted_when_it_matches_the_resolved_model() -> None:
     client = FakeRoutingClient(
         RoutingResult(model=CLAUDE_MODEL, rationale="r", raw_model=CLAUDE_MODEL)

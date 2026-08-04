@@ -208,6 +208,10 @@ class SubagentRouteRequest:
     :param fork: ``True`` when the spawn is a fork of the parent session.
     :param parent_model: Model the parent session runs on, e.g.
         ``"databricks-claude-sonnet-4-6"``.
+    :param requested_model: Model the spawning agent explicitly asked for
+        in the spawn arguments, if any. Honored when it is among the
+        spawn's candidates; otherwise routed over and recorded as
+        ``attempted_override``.
     """
 
     harness: str
@@ -215,6 +219,7 @@ class SubagentRouteRequest:
     prompt: str | None = None
     fork: bool = False
     parent_model: str | None = None
+    requested_model: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> SubagentRouteRequest:
@@ -230,12 +235,16 @@ class SubagentRouteRequest:
         task_name = payload.get("task_name")
         prompt = payload.get("prompt")
         parent_model = payload.get("parent_model")
+        requested_model = payload.get("requested_model")
         return cls(
             harness=harness.strip(),
             task_name=task_name[:_TASK_NAME_CAP] if isinstance(task_name, str) else "",
             prompt=prompt if isinstance(prompt, str) and prompt else None,
             fork=bool(payload.get("fork")),
             parent_model=parent_model if isinstance(parent_model, str) and parent_model else None,
+            requested_model=(
+                requested_model if isinstance(requested_model, str) and requested_model else None
+            ),
         )
 
 
@@ -315,8 +324,14 @@ def decision_record(
     :returns: Item data ready for :func:`persist_subagent_decision`.
     """
     from omnigent.entities.conversation import RoutingDecisionData
+    from omnigent.server.smart_routing import _bare_id
 
     model = decision.model or req.parent_model or "unrouted"
+    # An explicit ask that routing did NOT land is an override attempt worth
+    # recording; an honored ask is just the model and stays out of the field.
+    attempted = req.requested_model
+    if attempted and _bare_id(attempted) == _bare_id(model):
+        attempted = None
     return RoutingDecisionData(
         model=model,
         applied=decision.action in ("rewrite", "redirect"),
@@ -326,6 +341,7 @@ def decision_record(
         raw_model=decision.raw_model,
         agent=req.task_name or None,
         scope=_SCOPE,
+        attempted_override=attempted,
     )
 
 
@@ -499,8 +515,6 @@ def _routing_task(req: SubagentRouteRequest) -> str:
     """
     if req.prompt:
         return req.prompt[:_PROMPT_CAP]
-    # Codex encrypts the spawn message, so ``task_name`` is the only real
-    # signal; ``agent_name`` already folds into it in the hook.
     if req.task_name:
         return req.task_name[:_PROMPT_CAP]
     return _PLACEHOLDER_TASK
@@ -604,6 +618,15 @@ async def _decide(
     if not candidates:
         return _unavailable_decision(f"no candidate models for harness {req.harness}")
 
+    # A spawn that names its own model made a deliberate choice; routing
+    # exists to pick for spawns that didn't. Honor the ask when it is an
+    # arm this spawn could have been routed to anyway — the candidate set
+    # already encodes the family policy — instead of overriding it with a
+    # scored default.
+    honored = _honored_request(req, candidates)
+    if honored is not None:
+        return honored
+
     try:
         result = await client.route(task, candidates)
     except Exception:  # noqa: BLE001 — router outages are a normal path here
@@ -616,6 +639,41 @@ async def _decide(
         return _unavailable_decision(detail)
 
     return _decision_from_result(req, result, candidates)
+
+
+def _honored_request(
+    req: SubagentRouteRequest,
+    candidates: Mapping[str, list[str]],
+) -> SubagentRouteDecision | None:
+    """Honor an explicitly requested model the spawn's own harness serves.
+
+    Matches on the bare arm so any spelling of the ask (catalog id, codex
+    slug, servable alias) lands the candidate set's servable spelling.
+    Only the requesting harness's own row counts: a rewrite runs in-place,
+    so honoring a counterpart-family arm would hand the spawn tool a model
+    it cannot speak. Everything else returns ``None`` — the router
+    decides, and the record carries the ask as ``attempted_override``.
+
+    :param req: The spawn awaiting a verdict.
+    :param candidates: Harness → servable model ids this spawn may use.
+    :returns: A rewrite honoring the ask, or ``None`` to route normally.
+    """
+    if not req.requested_model:
+        return None
+    from omnigent.server.smart_routing import _bare_id
+
+    wanted = _bare_id(req.requested_model)
+    for model in candidates.get(req.harness, []):
+        if _bare_id(model) == wanted:
+            return SubagentRouteDecision(
+                action="rewrite",
+                model=model,
+                rationale=(
+                    f"Spawn requested {req.requested_model}; honored — "
+                    "it is a routable arm for this session."
+                ),
+            )
+    return None
 
 
 def _decision_from_result(

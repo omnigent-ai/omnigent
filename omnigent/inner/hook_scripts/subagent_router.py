@@ -313,6 +313,7 @@ def build_route_request(
     parent_model: str | None = None,
     task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
     include_prompt: bool = True,
+    prompt_keys: Sequence[str] = ("prompt",),
 ) -> dict[str, Any]:  # type: ignore[explicit-any]
     """
     Build the ``route-subagent`` request body.
@@ -323,15 +324,27 @@ def build_route_request(
     :param task_keys: ``tool_input`` keys naming the subagent, in
         preference order.
     :param include_prompt: ``False`` sends ``prompt: null``, for harnesses
-        whose spawn message is encrypted in hook payloads (codex).
+        whose spawn payload carries no usable task text.
+    :param prompt_keys: ``tool_input`` keys carrying the task text, in
+        preference order (codex spells it ``message``).
     :returns: JSON-serializable request body.
     """
-    prompt = tool_input.get("prompt") if include_prompt else None
+    prompt = None
+    if include_prompt:
+        for key in prompt_keys:
+            value = tool_input.get(key)
+            if isinstance(value, str) and value:
+                prompt = value
+                break
+    requested = tool_input.get("model")
     return {
         "harness": harness,
         "task_name": spawn_task_name(tool_input, task_keys),
-        "prompt": prompt if isinstance(prompt, str) and prompt else None,
+        "prompt": prompt,
         "parent_model": parent_model,
+        # The model the spawning agent asked for, if any — the server honors
+        # an in-family ask instead of overriding a deliberate choice.
+        "requested_model": requested if isinstance(requested, str) and requested else None,
     }
 
 
@@ -529,6 +542,7 @@ def route_pre_tool_use(
     tool_matcher: Callable[[Any], bool] = is_agent_tool,  # type: ignore[explicit-any]
     task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
     include_prompt: bool = True,
+    prompt_keys: Sequence[str] = ("prompt",),
     parent_model_resolver: Callable[[dict[str, Any]], str | None] | None = None,  # type: ignore[explicit-any]
     model_translator_factory: Callable[[str | Path | None], Callable[[str], str | None]]
     | None = claude_model_translator,
@@ -549,6 +563,7 @@ def route_pre_tool_use(
     :param tool_matcher: Recognizes the harness's spawn tool by name.
     :param task_keys: ``tool_input`` keys naming the subagent.
     :param include_prompt: ``False`` withholds the spawn prompt.
+    :param prompt_keys: ``tool_input`` keys carrying the task text.
     :param parent_model_resolver: Derives the parent model from the
         payload; ``None`` reads the bridge config instead.
     :param model_translator_factory: Builds the decision-model translator
@@ -586,6 +601,7 @@ def route_pre_tool_use(
         parent_model=parent_model,
         task_keys=task_keys,
         include_prompt=include_prompt,
+        prompt_keys=prompt_keys,
     )
     decision = request_decision(endpoint, resolved_session, body, timeout=timeout)
     if decision is None:
