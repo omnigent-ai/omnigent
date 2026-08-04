@@ -269,6 +269,28 @@ function seedPins(ids: string[]) {
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
+  it("uses the interface text token for the empty session-list state", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    expect(screen.getByText("No active sessions")).toHaveClass("text-ui");
+    expect(screen.getByText("No active sessions")).not.toHaveClass("text-xs");
+  });
+
+  it("uses the interface text token for session-list errors", () => {
+    conversationsRef.current = [];
+    useConvMock.mockReturnValue({
+      isLoading: false,
+      isError: true,
+      error: new Error("boom"),
+    } as unknown as ReturnType<typeof useConversations>);
+    renderSidebar();
+
+    const error = screen.getByText("Failed to load: boom");
+    expect(error).toHaveClass("text-ui");
+    expect(error).not.toHaveClass("text-xs");
+  });
+
   it("keeps the session list scrollable without visible scrollbar chrome", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -326,7 +348,7 @@ describe("Sidebar session list", () => {
     // The same card now shows the settings nav (Back to app + sections),
     // not the conversation search/list.
     expect(screen.queryByTestId("sidebar-search-button")).toBeNull();
-    expect(screen.getByRole("link", { name: /Back to Omnigent/ })).toHaveAttribute("href", "/");
+    expect(screen.getByRole("link", { name: "Back" })).toHaveAttribute("href", "/");
     expect(screen.getByTestId("settings-nav-appearance")).toHaveAttribute(
       "href",
       "/settings/appearance",
@@ -404,6 +426,7 @@ describe("Sidebar session list", () => {
     });
     expect(selectSessions).toHaveAttribute("data-testid", "toggle-selection-mode");
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
+    expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
     expect(selectSessions.parentElement).toHaveClass(
       "md:opacity-0",

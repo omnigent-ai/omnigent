@@ -294,10 +294,14 @@ describe("quick pin/unpin hover button", () => {
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
-    expect(screen.getByTestId("project-actions")).toHaveClass("size-6");
-    expect(screen.getByTestId("project-actions")).not.toHaveClass("size-7");
-    expect(screen.getByTestId("project-new-session")).toHaveClass("size-6");
-    expect(screen.getByTestId("project-new-session")).not.toHaveClass("size-7");
+    const projectActions = screen.getByTestId("project-actions");
+    const projectNewSession = screen.getByTestId("project-new-session");
+    for (const button of [projectActions, projectNewSession]) {
+      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+      expect(button).not.toHaveClass("size-7");
+      expect(button.querySelector("svg")).toHaveClass("size-3.5");
+      expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
+    }
     // Same compact size as the session-row kebab it aligns with.
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });
@@ -310,10 +314,13 @@ describe("quick pin/unpin hover button", () => {
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
-    expect(screen.getByTestId("new-project")).toHaveClass("size-6");
-    expect(screen.getByTestId("new-project")).not.toHaveClass("size-7");
-    expect(screen.getByTestId("project-list-actions")).toHaveClass("size-6");
-    expect(screen.getByTestId("project-list-actions")).not.toHaveClass("size-7");
+    for (const button of [
+      screen.getByTestId("new-project"),
+      screen.getByTestId("project-list-actions"),
+    ]) {
+      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+      expect(button).not.toHaveClass("size-7");
+    }
   });
 
   it("hides the Projects list-actions kebab when there are no projects", () => {
@@ -334,6 +341,13 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.queryByText("Pinned")).toBeNull();
     const pinButton = screen.getByTestId("quick-pin-conversation");
     expect(pinButton).toHaveAttribute("aria-label", "Pin conversation");
+    expect(pinButton).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(pinButton.querySelector("svg")).toHaveClass("size-3.5");
+    expect(pinButton.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
+    const actionsButton = screen.getByTestId("conversation-actions");
+    expect(actionsButton).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(actionsButton.querySelector("svg")).toHaveClass("size-3.5");
+    expect(actionsButton.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
 
     fireEvent.click(pinButton);
 

@@ -543,7 +543,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // for the settings section nav (see settingsNav.tsx) — entering settings
   // shouldn't replace the whole sidebar.
   const { inSettings } = useSettingsRoute();
-  // Remember the pre-settings location so "Back to Omnigent" returns to the
+  // Remember the pre-settings location so the Back row returns to the
   // conversation the user was viewing, not the home page. Tracked here since
   // the sidebar stays mounted across the transition into settings.
   useTrackSettingsReturn();
@@ -681,7 +681,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
       />
       {inSettings ? (
-        <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
+        <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
         <>
           <div className="flex h-12 shrink-0 translate-y-0.5 items-center justify-between pr-3 pl-5">
@@ -1714,7 +1714,7 @@ function ConversationList({
   if (conversationsQuery.isError) {
     const err = conversationsQuery.error;
     return (
-      <p className="px-2 py-1 text-destructive text-xs">
+      <p className="px-2 py-1 text-destructive text-ui">
         Failed to load: {err instanceof Error ? err.message : String(err)}
       </p>
     );
@@ -1773,7 +1773,7 @@ function ConversationList({
             )}
             {totalVisible === 0 ? (
               <>
-                <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+                <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
                 {/* The list is one paginated stream ordered by updated_at across
               owned + shared sessions, so the current tab can be empty on the
               loaded window while its sessions live on a later page. Keep the
@@ -1922,6 +1922,7 @@ function ConversationList({
                                 size="icon-xs"
                                 aria-label="Select sessions"
                                 data-testid="toggle-selection-mode"
+                                className="text-muted-foreground"
                                 onClick={(event) => {
                                   event.stopPropagation();
                                   onEnterSelectionMode("sessions");
@@ -2202,12 +2203,13 @@ function ProjectHeaderActions({
               size="icon-xs"
               aria-label="Project list actions"
               data-testid="project-list-actions"
+              className="text-muted-foreground"
               onClick={(event) => event.stopPropagation()}
             >
               <MoreHorizontalIcon className="size-3.5" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+          <DropdownMenuContent align="end" className="min-w-40">
             {showExpandControls &&
               (allExpanded ? (
                 <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
@@ -2672,7 +2674,7 @@ function ConversationMenuItems({
               <FolderInputIcon className="size-3.5" />
               {currentProject ? "Move session" : "Add to project"}
             </C.SubTrigger>
-            <C.SubContent className="w-56 p-1 [&_[role=menuitem]]:text-xs">
+            <C.SubContent className="min-w-56">
               {/* A native submenu flyout — no separate popover layer, so no
                   open/dismiss race with the parent menu. */}
               <ProjectPickerMenu
@@ -3379,7 +3381,7 @@ function ConversationRow({
                 // that display and collapse the centering, leaving the glyph
                 // pinned to the top-left of the button — so keep the flex
                 // display when revealing it.
-                "transition-opacity",
+                "text-muted-foreground transition-opacity",
                 "hidden md:inline-flex",
                 "md:opacity-0 md:group-hover:opacity-100",
                 "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
@@ -3391,7 +3393,11 @@ function ConversationRow({
                 onTogglePinned(conversation.id);
               }}
             >
-              {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+              {isPinned ? (
+                <PinOffIcon className="size-3.5" data-icon-size="14" />
+              ) : (
+                <PinIcon className="size-3.5" data-icon-size="14" />
+              )}
             </Button>
           )}
           <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
@@ -3407,7 +3413,7 @@ function ConversationRow({
                 // keeping it surfaced while the menu is open so the trigger
                 // doesn't vanish under the cursor.
                 className={cn(
-                  "transition-opacity",
+                  "text-muted-foreground transition-opacity",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}
@@ -3417,13 +3423,10 @@ function ConversationRow({
                   e.stopPropagation();
                 }}
               >
-                <MoreHorizontalIcon className="size-3.5" />
+                <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
               </Button>
             </DropdownMenuTrigger>
-            {/* text-xs on every menu item (incl. the submenu trigger): a smaller,
-                denser kebab that reads closer to the row text. Scoped here so the
-                shared dropdown-menu component is untouched. */}
-            <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitem]]:text-xs">
+            <DropdownMenuContent align="end" className="min-w-44">
               <ConversationMenuItems
                 components={dropdownBundle}
                 setMenuOpen={setMenuOpen}
@@ -3726,7 +3729,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="max-md:hidden"
+            className="text-muted-foreground max-md:hidden"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -3737,7 +3740,7 @@ function ProjectFolderActions({
                 onNavigate(e);
               }}
             >
-              <SquarePenIcon className="size-3.5" />
+              <SquarePenIcon className="size-3.5" data-icon-size="14" />
             </Link>
           </Button>
         </TooltipTrigger>
@@ -3785,13 +3788,14 @@ function ProjectFolderMenu({
             size="icon-xs"
             aria-label={`Project actions for ${projectName}`}
             data-testid="project-actions"
+            className="text-muted-foreground"
             // Sits on the folder header; keep its click off the collapse toggle.
             onClick={(e) => e.stopPropagation()}
           >
-            <MoreHorizontalIcon className="size-3.5" />
+            <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+        <DropdownMenuContent align="end" className="min-w-40">
           {/* New session — mobile-only (md:hidden); desktop uses the
               hover-revealed pencil on the folder header. */}
           <DropdownMenuItem asChild className="md:hidden" data-testid="project-new-session-menu">
@@ -4231,7 +4235,7 @@ function BulkActionBar({
   return (
     <>
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-background p-1.5">
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
