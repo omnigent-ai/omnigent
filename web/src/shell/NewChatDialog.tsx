@@ -1292,9 +1292,10 @@ export function AgentHarnessPicker({
  * Harness-configuration modal opened from the composer's gear icon. Shows the
  * selected agent's run-config knobs — Claude: model / effort / permissions;
  * Codex/OpenCode: approval mode (+ Codex's dangerous full-bypass opt-in);
- * Cursor: exec mode; bundle agents: brain-harness override. A bundle agent on
- * the fully-auto harness shows only Permissions: the router owns harness and
- * model, so every other knob is undecidable before the pick.
+ * Cursor: exec mode; bundle agents: brain-harness override. On the fully-auto
+ * harness the router owns harness and model, so every harness-specific knob
+ * drops out — a bundle agent keeps its brain-harness row (the pick lives there
+ * and is how the user switches away) plus a locked Permissions row.
  *
  * The modal edits a LOCAL draft seeded from the live state each time it opens,
  * and only commits to the parent state + per-harness persistence on Save;
@@ -1519,22 +1520,6 @@ function HarnessConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {/* Fully-auto: the router owns harness + model, so the only row left is
-          Permissions — and it is locked to Default until a cross-harness
-          permission mapping exists. Default means "send no override", so the
-          picked harness inherits the machine's own Claude Code / Codex config. */}
-          {autoRouting && (
-            <ConfigRow label="Permissions" description="What the agent can do without asking">
-              <DescribedSelect
-                value={CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE}
-                onValueChange={() => {}}
-                options={AUTO_PERMISSION_MODE_OPTIONS}
-                testId="new-chat-landing-config-permission"
-                ariaLabel="Permissions"
-                disabled
-              />
-            </ConfigRow>
-          )}
           {!autoRouting && hasPermission && (
             <>
               <ConfigRow label="Model" description="Underlying LLM">
@@ -1679,7 +1664,10 @@ function HarnessConfigModal({
             </ConfigRow>
           )}
 
-          {!hasPermission && !hasApproval && !hasCursor && brainDefault && !autoRouting && (
+          {/* Stays rendered while Smart Routing is the pick: it is the control
+          that selected it, so hiding it would strand the choice with no way to
+          read it back or switch away without cancelling. */}
+          {!hasPermission && !hasApproval && !hasCursor && brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
               <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
                 <SelectTrigger
@@ -1723,6 +1711,23 @@ function HarnessConfigModal({
                   ))}
                 </SelectContent>
               </Select>
+            </ConfigRow>
+          )}
+
+          {/* Fully-auto: the router owns the model, so Permissions is the last
+          decidable row — and it is locked to Default until a cross-harness
+          permission mapping exists. Default means "send no override", so the
+          picked harness inherits the machine's own Claude Code / Codex config. */}
+          {autoRouting && (
+            <ConfigRow label="Permissions" description="What the agent can do without asking">
+              <DescribedSelect
+                value={CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE}
+                onValueChange={() => {}}
+                options={AUTO_PERMISSION_MODE_OPTIONS}
+                testId="new-chat-landing-config-permission"
+                ariaLabel="Permissions"
+                disabled
+              />
             </ConfigRow>
           )}
         </div>
@@ -2415,9 +2420,15 @@ export function NewChatLandingScreen() {
       selectedAgent.harness in brainHarnessLabels);
   const configSummary = useMemo((): { label: string; value: string }[] => {
     if (autoRoutingSelected) {
-      // Locked to Default in the modal, so report the constant — never a mode
-      // left over in state from a previously selected native harness.
-      return [{ label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
+      // A bundle agent keeps its Agent Harness row on the fully-auto pick (it is
+      // the way back out), so mirror it. Permissions is locked to Default in the
+      // modal, so report the constant — never a mode left over in state from a
+      // previously selected native harness.
+      const brainRow =
+        pickedHarness === AUTO_HARNESS_ID
+          ? [{ label: "Agent Harness", value: SMART_ROUTING_LABEL }]
+          : [];
+      return [...brainRow, { label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
     }
     if (supportsPermissionMode) {
       const modelValue = routingOn
@@ -2697,6 +2708,18 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     if (smartRoutingHarnessAvailable) setSmartRoutingDropped(null);
   }, [smartRoutingHarnessAvailable]);
+  // Same degrade for the bundle-agent flavor: a remembered fully-auto brain pick
+  // on Polly / Debby has no row behind it once the server switches routing off,
+  // so the harness select would show a blank value with no way back while the
+  // create still sent harness_override "auto". Quiet, like the top-level flavor —
+  // the user did nothing this visit to lose it, and the stored pick stays put in
+  // case routing returns.
+  useEffect(() => {
+    if (info === "loading" || smartRoutingEnabled) return;
+    if (pickedHarness !== AUTO_HARNESS_ID) return;
+    setPickedHarness(null);
+    _setCostControlMode(null);
+  }, [info, smartRoutingEnabled, pickedHarness]);
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -3130,8 +3153,8 @@ export function NewChatLandingScreen() {
       else setPickedHarness(remembered);
     }
     // Re-picking the agent that is currently on an Auto Harness drops back to
-    // its own harness — the Auto Harness modal shows only Permissions, so the
-    // picker is the way out of fully-auto.
+    // its own harness. This is the only way out for top-level Smart Routing,
+    // whose modal has no harness row; a bundle agent can also switch there.
     else if (isAutoHarness(pickedHarness)) handleSetPickedHarness(null, agent.id);
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
