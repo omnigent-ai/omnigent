@@ -41,6 +41,28 @@ from omnigent.claude_model_vocabulary import claude_model_alias
 ADVERTISEMENT_FILE = "subagent_router.json"
 # Claude-native bridge config, read for the session id / launch model.
 _BRIDGE_CONFIG_FILE = "bridge.json"
+# Per-turn relay advertisement listing the Omnigent tools this session holds.
+# Same filename as ``claude_native_bridge._TOOL_RELAY_FILE``; duplicated
+# because this module is stdlib-only and must not import the bridge.
+_TOOL_RELAY_FILE = "tool_relay.json"
+# MCP server the bridge registers the Omnigent tools under. Must match
+# ``claude_native_bridge._MCP_SERVER_NAME`` (and the codex-native
+# ``[mcp_servers.omnigent]`` table), which the same no-import rule forbids
+# reading directly.
+_MCP_SERVER_NAME = "omnigent"
+
+# Harnesses whose tool list spells an MCP tool ``mcp__<server>__<tool>``.
+_MCP_PREFIXING_HARNESSES = frozenset({"claude-sdk", "claude_sdk", "claude-native"})
+# Harnesses that address an MCP tool by its bare name plus a separate
+# server/namespace field, so no prefixed spelling can be quoted at them.
+# Codex flattens the pair for its own logs and hook payloads
+# (``omnigentsys_session_create``), but that spelling is not callable.
+_MCP_NAMESPACED_HARNESSES = frozenset({"codex", "codex-native"})
+
+# Omnigent tools a routed spawn needs. Named in the deny reason only when the
+# session's relay actually advertises the create tool.
+_SPAWN_TOOL = "sys_session_create"
+_AGENT_LIST_TOOL = "sys_agent_list"
 
 # Explicit advertisement directory. Set for harnesses that have no
 # claude-native bridge dir (e.g. the claude-agent-sdk executor).
@@ -437,41 +459,178 @@ _SMART_ROUTING_PREAMBLE = (
 )
 
 
-def routed_spawn_instruction(model: str, harness: str | None = None) -> str:
+def mcp_tool_name(bare: str, harness: str | None) -> str:
+    """
+    Spell an Omnigent tool the way *harness* advertises it.
+
+    :param bare: Omnigent tool name, e.g. ``"sys_session_create"``.
+    :param harness: Requesting harness, e.g. ``"claude-native"``. ``None``
+        or an unrecognized value keeps the bare name — an invented prefix
+        is worse than the name the agent spec already documents.
+    :returns: The name to quote at the model.
+    """
+    if harness in _MCP_PREFIXING_HARNESSES:
+        return f"mcp__{_MCP_SERVER_NAME}__{bare}"
+    return bare
+
+
+def advertised_relay_tools(bridge_dir: str | Path | None) -> frozenset[str]:
+    """
+    Read the Omnigent tool names this session's relay advertises.
+
+    Defensive like :func:`read_router_endpoint`: any failure reads as
+    "availability unknown" (an empty set), which callers treat as "assume
+    the tool is there" rather than degrading a working instruction.
+
+    :param bridge_dir: Directory containing :data:`_TOOL_RELAY_FILE`.
+    :returns: Advertised tool names, or an empty set when unknown.
+    """
+    if bridge_dir is None:
+        return frozenset()
+    try:
+        payload = json.loads((Path(bridge_dir) / _TOOL_RELAY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return frozenset()
+    if not isinstance(payload, dict):
+        return frozenset()
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return frozenset()
+    return frozenset(
+        name
+        for spec in tools
+        if isinstance(spec, dict) and isinstance((name := spec.get("name")), str) and name
+    )
+
+
+def _mcp_discovery_note(harness: str | None) -> str:
+    """Explain where the named tools live and how to find them.
+
+    Both native harnesses defer MCP schemas (Claude Code's tool search,
+    codex's ``tool_search``), so the tool is absent from the up-front list
+    and the model concludes it does not exist. Naming the server it comes
+    from is what turns "no such tool" into a lookup.
+    """
+    if harness in _MCP_NAMESPACED_HARNESSES:
+        return (
+            f"Both come from the `{_MCP_SERVER_NAME}` MCP server already attached to "
+            "this session, where they appear as "
+            f"`{_MCP_SERVER_NAME}.{_SPAWN_TOOL}` / `{_MCP_SERVER_NAME}.{_AGENT_LIST_TOOL}` "
+            "— call them by the bare names above with the server as the namespace, and "
+            "do not run the two words together into one identifier. If they are not in "
+            "your up-front tool list your MCP schemas are deferred: search your tools "
+            "for the name instead of concluding it does not exist."
+        )
+    return (
+        f"Both are MCP tools from the `{_MCP_SERVER_NAME}` server already attached to "
+        "this session, not new tools you need to install. If they are not in your "
+        "up-front tool list your MCP schemas are deferred: search your tools for the "
+        "name instead of concluding it does not exist."
+    )
+
+
+def _no_spawn_tool_instruction(model: str, picked: str) -> str:
+    """Deny reason for a session whose relay advertises no spawn tool.
+
+    Names no tool at all: pointing at a tool the session does not hold is
+    what made the model refuse in the first place.
+    """
+    del model
+    return (
+        f"{_SMART_ROUTING_PREAMBLE} It selected {picked} for this sub-task, which "
+        "your built-in spawn tool cannot launch, and this session holds no Omnigent "
+        "tool that can start one either. This is not an error and the sub-task is "
+        "approved — do the work yourself on your current model instead of spawning, "
+        "then continue."
+    )
+
+
+def routed_spawn_instruction(
+    model: str,
+    harness: str | None = None,
+    *,
+    requesting_harness: str | None = None,
+    available_tools: frozenset[str] = frozenset(),
+) -> str:
     """
     Build the instruction telling the model how to start a routed sub-task.
 
     Names ``sys_session_create`` — the tool a routed harness actually holds
-    (``spawn: True`` grants it) — with parameters that exist on its schema.
-    The previous wording pointed at ``sys_session_send``'s named-spawn mode,
-    which a session with no declared sub-agents never advertises, so the
-    instruction could not be followed and the spawn was simply dropped.
+    (``spawn: True`` grants it) — with parameters that exist on its schema,
+    spelled the way *requesting_harness* advertises it. The previous wording
+    named the bare tool at every harness, so a Claude session (which sees
+    ``mcp__omnigent__sys_session_create``) reported the tool as nonexistent
+    and dropped the sub-task.
 
     :param model: Model Smart Routing selected, e.g. ``"databricks-glm-5-2"``.
     :param harness: Harness it runs on, when the pick crosses harnesses.
+    :param requesting_harness: Harness whose model reads this, which decides
+        the tool spelling. ``None`` falls back to bare names.
+    :param available_tools: Omnigent tools the session's relay advertises.
+        Empty means "unknown", which assumes the spawn tool is there.
     :returns: Deny reason that reads as an approved, actionable re-route.
     """
     picked = f"{model} (harness {harness})" if harness else model
+    if available_tools and _SPAWN_TOOL not in available_tools:
+        return _no_spawn_tool_instruction(model, picked)
+    create = mcp_tool_name(_SPAWN_TOOL, requesting_harness)
+    agent_list = mcp_tool_name(_AGENT_LIST_TOOL, requesting_harness)
     return (
         f"{_SMART_ROUTING_PREAMBLE} It selected {picked} for this sub-task, "
         "which your built-in spawn tool cannot launch. This is not an error "
-        "and the sub-task is approved — start it with sys_session_create "
+        f"and the sub-task is approved — start it with {create} "
         "instead, which does accept the routed model: "
-        f'sys_session_create(agent_id="<id from sys_agent_list>", '
+        f'{create}(agent_id="<id from {agent_list}>", '
         f'model="{model}", message="<the task you were about to spawn>"). '
-        "Make that call now, then continue."
+        f"{_mcp_discovery_note(requesting_harness)} Make that call now, then continue."
     )
 
 
-def redirect_reason(harness: str, model: str) -> str:
+def smart_routing_spawn_note(harness: str) -> str:
+    """
+    Build the launch-time system-prompt note about routed spawns.
+
+    Lives next to :func:`routed_spawn_instruction` so the note and the deny
+    reason name the same tool in the same spelling — a session told about
+    one tool and denied with another is back to refusing the sub-task.
+
+    :param harness: Harness being launched, e.g. ``"claude-native"``.
+    :returns: Instructions to append to the session's system prompt.
+    """
+    create = mcp_tool_name(_SPAWN_TOOL, harness)
+    agent_list = mcp_tool_name(_AGENT_LIST_TOOL, harness)
+    return (
+        "Databricks Smart Routing is enabled for this session: each sub-task may be "
+        "placed on a different model than yours. When your built-in spawn tool "
+        f"(Agent/Task/spawn_agent) is denied with an instruction naming {create}, "
+        "that is an approved re-route, not an error or a permission problem — make "
+        f"the {create} call as instructed, using {agent_list} for the agent id. "
+        f"{_mcp_discovery_note(harness)}"
+    )
+
+
+def redirect_reason(
+    harness: str,
+    model: str,
+    *,
+    requesting_harness: str | None = None,
+    available_tools: frozenset[str] = frozenset(),
+) -> str:
     """
     Build the cross-harness redirect instruction shown to the model.
 
     :param harness: Harness the router picked, e.g. ``"codex"``.
     :param model: Model the router picked.
+    :param requesting_harness: Harness whose model reads this.
+    :param available_tools: Omnigent tools the session's relay advertises.
     :returns: Deny reason telling the model how to respawn correctly.
     """
-    return routed_spawn_instruction(model, harness)
+    return routed_spawn_instruction(
+        model,
+        harness,
+        requesting_harness=requesting_harness,
+        available_tools=available_tools,
+    )
 
 
 def decision_to_hook_output(
@@ -479,6 +638,8 @@ def decision_to_hook_output(
     tool_input: dict[str, Any],  # type: ignore[explicit-any]
     *,
     model_translator: Callable[[str], str | None] | None = None,
+    requesting_harness: str | None = None,
+    available_tools: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:  # type: ignore[explicit-any]
     """
     Map a ``route-subagent`` decision to Claude ``PreToolUse`` output.
@@ -491,6 +652,10 @@ def decision_to_hook_output(
         allowed unchanged — a degraded model beats a dead spawn, and an
         unacceptable value beats neither). ``None`` injects the id as-is,
         which is what codex's ``spawn_agent`` expects.
+    :param requesting_harness: Harness whose model reads a deny reason,
+        which decides how the Omnigent tools are spelled.
+    :param available_tools: Omnigent tools the session's relay advertises,
+        so a deny never names one the session does not hold.
     :returns: Hook output, or ``None`` for "no opinion" (allow the spawn
         unchanged with no emitted decision).
     """
@@ -510,7 +675,14 @@ def decision_to_hook_output(
     if action == "redirect":
         harness = decision.get("harness")
         if isinstance(harness, str) and harness and isinstance(model, str) and model:
-            return _deny(redirect_reason(harness, model))
+            return _deny(
+                redirect_reason(
+                    harness,
+                    model,
+                    requesting_harness=requesting_harness,
+                    available_tools=available_tools,
+                )
+            )
         # A redirect without a target can't be followed — fail open.
         return None
     if action == "deny":
@@ -518,13 +690,20 @@ def decision_to_hook_output(
         # sub-task. When the verdict names a model, hand back the same
         # actionable re-route the redirect path uses.
         if isinstance(model, str) and model:
-            return _deny(routed_spawn_instruction(model))
+            return _deny(
+                routed_spawn_instruction(
+                    model,
+                    requesting_harness=requesting_harness,
+                    available_tools=available_tools,
+                )
+            )
         return _deny(
             rationale
             or (
                 f"{_SMART_ROUTING_PREAMBLE} It could not place this sub-task on "
                 "a model your built-in spawn tool can run. Start it with "
-                "sys_session_create instead, or continue the work yourself."
+                f"{mcp_tool_name(_SPAWN_TOOL, requesting_harness)} instead, or "
+                "continue the work yourself."
             )
         )
     return None
@@ -579,7 +758,8 @@ def route_pre_tool_use(
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
-    endpoint = read_router_endpoint(discover_router_dir(router_dir))
+    discovered_dir = discover_router_dir(router_dir)
+    endpoint = read_router_endpoint(discovered_dir)
     if endpoint is None:
         return None
     resolved_session = (
@@ -611,7 +791,13 @@ def route_pre_tool_use(
         if model_translator_factory is not None
         else None
     )
-    output = decision_to_hook_output(decision, tool_input, model_translator=translator)
+    output = decision_to_hook_output(
+        decision,
+        tool_input,
+        model_translator=translator,
+        requesting_harness=harness,
+        available_tools=advertised_relay_tools(bridge_dir or discovered_dir),
+    )
     return post_process(output) if post_process is not None else output
 
 

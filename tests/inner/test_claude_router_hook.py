@@ -10,7 +10,7 @@ import pytest
 
 from omnigent.claude_model_vocabulary import claude_model_alias
 from omnigent.inner.hook_scripts import claude_router_hook, subagent_router
-from tests.inner.conftest import advertise_router
+from tests.inner.conftest import advertise_relay_tools, advertise_router
 
 
 def _payload(
@@ -187,13 +187,14 @@ def test_codex_style_output_keeps_the_catalog_id() -> None:
     }
 
 
-def test_redirect_denies_with_sys_session_send_instruction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    router_dir = advertise_router(tmp_path)
+def _redirect_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    """Run a cross-harness redirect through the hook and return its deny reason."""
     out, _requests = _run_hook(
         monkeypatch,
-        router_dir,
+        tmp_path,
         _payload(),
         {
             "action": "redirect",
@@ -208,14 +209,70 @@ def test_redirect_denies_with_sys_session_send_instruction(
     assert hook_output["hookEventName"] == "PreToolUse"
     assert hook_output["permissionDecision"] == "deny"
     reason = hook_output["permissionDecisionReason"]
-    # The instruction must name a tool this session actually holds. A
-    # spawn:True harness gets sys_session_create; sys_session_send's
-    # named-spawn mode is never advertised without declared sub-agents, so
-    # naming it produced an unfollowable instruction and the spawn was dropped.
-    assert "sys_session_create" in reason
+    assert isinstance(reason, str)
+    return reason
+
+
+def test_redirect_denies_with_mcp_prefixed_session_create_instruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    advertise_router(tmp_path)
+    advertise_relay_tools(tmp_path, "sys_session_create", "sys_agent_list", "sys_read_inbox")
+
+    reason = _redirect_reason(tmp_path, monkeypatch)
+
+    # The instruction must name the tool the way Claude advertises it. Claude
+    # exposes Omnigent's MCP tools as ``mcp__omnigent__<tool>``, so the bare
+    # name it used to quote made the model report the tool as nonexistent and
+    # abandon the sub-task (live: session e26d94b2).
+    assert "mcp__omnigent__sys_session_create" in reason
+    assert "mcp__omnigent__sys_agent_list" in reason
+    # No bare occurrence outside the prefixed spelling.
+    assert "sys_session_create" not in reason.replace("mcp__omnigent__sys_session_create", "")
+    assert "sys_agent_list" not in reason.replace("mcp__omnigent__sys_agent_list", "")
     assert "sys_session_send" not in reason
     assert "other-model" in reason
     assert "codex" in reason
+    # Claude Code defers MCP schemas behind tool search, so the tool is absent
+    # from the up-front list; the reason must say to search rather than assume.
+    assert "omnigent" in reason
+    assert "search" in reason.lower()
+
+
+def test_redirect_without_the_spawn_tool_names_no_sys_session_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session whose relay has no spawn tool must not be told to call one.
+
+    Naming an unheld tool is the failure this whole change fixes; the fallback
+    has to name nothing and hand the work back to the current model.
+    """
+    advertise_router(tmp_path)
+    advertise_relay_tools(tmp_path, "sys_read_inbox")
+
+    reason = _redirect_reason(tmp_path, monkeypatch)
+
+    assert "sys_session_" not in reason
+    assert "sys_agent_list" not in reason
+    assert "yourself" in reason
+    assert "other-model" in reason
+
+
+def test_redirect_without_a_relay_file_keeps_the_actionable_instruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``tool_relay.json`` means availability is unknown, not unavailable.
+
+    Every harness without a relay (the claude-agent-sdk arm) must keep today's
+    instruction rather than degrade to the do-it-yourself fallback.
+    """
+    advertise_router(tmp_path)
+    assert not (tmp_path / subagent_router._TOOL_RELAY_FILE).exists()
+
+    reason = _redirect_reason(tmp_path, monkeypatch)
+
+    assert "mcp__omnigent__sys_session_create" in reason
+    assert "yourself" not in reason
 
 
 def test_deny_carries_router_rationale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -262,6 +319,7 @@ def test_fork_typed_spawn_routes_like_any_other(
         "task_name": "fork",
         "prompt": "review the diff",
         "parent_model": None,
+        "requested_model": None,
     }
 
 

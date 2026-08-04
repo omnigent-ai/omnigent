@@ -407,6 +407,11 @@ class _CodexNativeLaunchConfig:
         ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
         app-server threads (no approval prompts, no command sandbox). Default
         ``False``. See issue #657.
+    :param auto_harness: ``True`` when the session started in Smart Routing's
+        auto-harness mode (``omnigent.routing.auto_harness`` label or a
+        ``harness_override`` of ``"auto"``), so the router may re-route its
+        spawns onto the Claude family. Only then are the routed-spawn developer
+        instructions installed.
     """
 
     workspace: Path
@@ -418,6 +423,7 @@ class _CodexNativeLaunchConfig:
     fork_source_external_id: str | None
     fork_carry_history: bool
     bypass_sandbox: bool
+    auto_harness: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -847,6 +853,7 @@ async def _codex_native_launch_config(
     # Fork directives stamped on a clone at fork time. Only consulted when
     # the clone has no external_session_id of its own yet (see the
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
+    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
@@ -857,6 +864,7 @@ async def _codex_native_launch_config(
     fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history = False
+    auto_harness = snapshot.get("harness_override") == "auto"
     # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
@@ -871,6 +879,7 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        auto_harness = auto_harness or labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -881,6 +890,7 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
+        auto_harness=auto_harness,
     )
 
 
@@ -3805,6 +3815,16 @@ async def _auto_create_codex_terminal(
         launch_config.policy_server_url, bearer_token=_policy_auth_token
     )
 
+    # Symmetric with the claude-native arm: an auto-harness session landing on
+    # codex can have its spawns re-routed onto the Claude family, so it needs
+    # the same "a denied spawn is an approved re-route" framing. Routed through
+    # ``developer_instructions`` (whose sidecar base keeps a resume reversible),
+    # never by editing config.toml here.
+    routed_spawn_note: str | None = None
+    if launch_config.auto_harness:
+        from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+
+        routed_spawn_note = smart_routing_spawn_note("codex-native")
     app_server = build_codex_native_server(
         socket_path=socket_path,
         codex_home=codex_home,
@@ -3820,6 +3840,7 @@ async def _auto_create_codex_terminal(
         # This TUI runs detached for the web UI, so trust the runner-selected
         # workspace in the session-private config instead of blocking forever.
         trust_project=True,
+        developer_instructions=routed_spawn_note,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
@@ -5513,6 +5534,38 @@ def _ensure_orchestrator_skills_in_bundle(
         )
 
 
+#: Omnigent MCP tools an auto-harness Claude session must be able to call
+#: without an interactive prompt: the two the cross-harness redirect names, the
+#: one that delivers the sub-task, and the one that collects its result. The
+#: native path passes no allowlist otherwise, so Claude Code's "don't ask mode"
+#: denies them outright ("Permission to use mcp__omnigent__sys_read_inbox has
+#: been denied"). Narrower than the SDK arm, which pre-approves every Omnigent
+#: tool in ``auto`` / ``bypassPermissions``.
+_ROUTED_SPAWN_ALLOWED_TOOLS: tuple[str, ...] = (
+    "mcp__omnigent__sys_session_create",
+    "mcp__omnigent__sys_agent_list",
+    "mcp__omnigent__sys_session_send",
+    "mcp__omnigent__sys_read_inbox",
+)
+
+
+def _routed_spawn_launch_args(auto_harness: bool) -> tuple[str | None, tuple[str, ...]]:
+    """
+    Resolve the routed-spawn additions to a Claude terminal's argv.
+
+    :param auto_harness: ``True`` for a session whose spawns the router may
+        move across harness families.
+    :returns: ``(append_system_prompt, allowed_tools)`` for
+        :func:`augment_claude_args`. ``(None, ())`` leaves the argv exactly as
+        a pinned session's, which is the point of the gate.
+    """
+    if not auto_harness:
+        return None, ()
+    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+
+    return smart_routing_spawn_note("claude-native"), _ROUTED_SPAWN_ALLOWED_TOOLS
+
+
 @dataclasses.dataclass(frozen=True)
 class _ClaudeSessionLaunchMetadata:
     """Persisted values consumed by Claude terminal launch."""
@@ -5524,13 +5577,18 @@ class _ClaudeSessionLaunchMetadata:
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
     routing_enabled: bool = False
+    #: Session started in Smart Routing's auto-harness mode, so the router may
+    #: place its subagents on the counterpart harness family. Only these
+    #: sessions get the routed-spawn system-prompt note and tool pre-approval;
+    #: a pinned session's argv stays byte-identical.
+    auto_harness: bool = False
 
 
 def _claude_launch_metadata_from_envelope(
     session_init: RunnerSessionInitEnvelope,
 ) -> _ClaudeSessionLaunchMetadata:
     """Project Claude launch metadata without server callbacks."""
-    from omnigent.runner.subagent_routing import routing_enabled
+    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, routing_enabled
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -5540,6 +5598,10 @@ def _claude_launch_metadata_from_envelope(
     fork_source = snapshot.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
     return _ClaudeSessionLaunchMetadata(
         routing_enabled=routing_enabled(snapshot.cost_control_mode_override),
+        auto_harness=(
+            snapshot.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+            or snapshot.harness_override == "auto"
+        ),
         reasoning_effort=snapshot.reasoning_effort,
         model_override=snapshot.model_override,
         terminal_launch_args=snapshot.terminal_launch_args,
@@ -5556,7 +5618,7 @@ async def _load_legacy_claude_launch_metadata(
     session_id: str,
 ) -> _ClaudeSessionLaunchMetadata:
     """Fetch Claude launch metadata for servers predating the init envelope."""
-    from omnigent.runner.subagent_routing import routing_enabled
+    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, routing_enabled
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -5588,6 +5650,9 @@ async def _load_legacy_claude_launch_metadata(
     metadata = _ClaudeSessionLaunchMetadata(
         routing_enabled=routing_enabled(
             cost_control_mode if isinstance(cost_control_mode, str) else None
+        ),
+        auto_harness=(
+            labels.get(AUTO_HARNESS_LABEL_KEY) == "1" or snapshot.get("harness_override") == "auto"
         ),
         reasoning_effort=effort if isinstance(effort, str) and effort else None,
         model_override=(
@@ -6099,6 +6164,11 @@ async def _auto_create_claude_terminal(
         harness="claude-native",
         server_client=server_client,
     )
+    # Only an auto-harness session's spawns can be re-routed across harness
+    # families, so only it needs the routed-spawn note and the pre-approval for
+    # the three Omnigent tools that carry out the re-route. A pinned session's
+    # argv must stay byte-identical.
+    routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(launch_metadata.auto_harness)
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -6109,6 +6179,8 @@ async def _auto_create_claude_terminal(
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
+        append_system_prompt=routed_spawn_note,
+        allowed_tools=routed_spawn_tools,
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the

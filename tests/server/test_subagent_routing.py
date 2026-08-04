@@ -16,8 +16,10 @@ from omnigent.entities.conversation import RoutingDecisionData
 from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
+    AUTO_HARNESS_LABEL_KEY,
     SubagentRouteDecision,
     SubagentRouteRequest,
+    auto_harness_session,
     candidate_models,
     decision_record,
     ensure_session_router,
@@ -195,6 +197,67 @@ def test_candidate_models_offers_both_families_for_auto_sessions() -> None:
     assert set(candidates) == {"claude-native", "codex-native"}
     assert CLAUDE_MODEL in candidates["claude-native"]
     assert GPT_MODEL in candidates["codex-native"]
+
+
+class _Conv:
+    """Minimal conversation row for the auto-harness gate."""
+
+    def __init__(self, labels: dict[str, str] | None = None, harness_override: str | None = None):
+        self.labels = labels or {}
+        self.harness_override = harness_override
+
+
+@pytest.mark.parametrize(
+    ("conv", "parent", "expected"),
+    [
+        # The durable label, which survives the sentinel being replaced once
+        # first-message routing resolves a harness.
+        (_Conv(labels={AUTO_HARNESS_LABEL_KEY: "1"}), None, True),
+        (_Conv(harness_override="auto"), None, True),
+        # A child of an auto-harness session inherits the permission.
+        (
+            _Conv(harness_override="codex-native"),
+            _Conv(labels={AUTO_HARNESS_LABEL_KEY: "1"}),
+            True,
+        ),
+        (_Conv(harness_override="codex-native"), _Conv(harness_override="auto"), True),
+        # Everything else is pinned: no label, a pinned override, an off label,
+        # a pinned parent, and a missing row.
+        (_Conv(harness_override="claude-native"), None, False),
+        (_Conv(labels={AUTO_HARNESS_LABEL_KEY: "0"}), None, False),
+        (_Conv(), _Conv(harness_override="claude-native"), False),
+        (None, None, False),
+    ],
+    ids=[
+        "label",
+        "sentinel",
+        "parent-label",
+        "parent-sentinel",
+        "pinned",
+        "label-off",
+        "pinned-parent",
+        "no-rows",
+    ],
+)
+def test_auto_harness_session_is_the_only_cross_harness_enabler(
+    conv: _Conv | None,
+    parent: _Conv | None,
+    expected: bool,
+) -> None:
+    """Pin the gate a cross-harness redirect depends on.
+
+    ``routes_hooks`` derives ``cross_harness`` from exactly this call, and
+    ``candidate_models(cross_harness=False)`` never offers the counterpart
+    family — so a pinned session can never receive a redirect verdict.
+    """
+    assert auto_harness_session(conv, parent) is expected
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+def test_pinned_sessions_are_never_offered_the_counterpart_family(harness: str) -> None:
+    counterpart = "codex-native" if harness == "claude-native" else "claude-native"
+    assert counterpart not in candidate_models(harness, cross_harness=False)
+    assert counterpart in candidate_models(harness, cross_harness=True)
 
 
 # ── Policy ──────────────────────────────────────────────────────────

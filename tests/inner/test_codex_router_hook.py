@@ -9,7 +9,7 @@ import pytest
 
 from omnigent.inner.hook_scripts import codex_router_hook as hook
 from omnigent.inner.hook_scripts import subagent_router
-from tests.inner.conftest import advertise_router
+from tests.inner.conftest import advertise_relay_tools, advertise_router
 
 # Delivered plaintext in hook payloads (measured live); the name survives
 # from when it was assumed encrypted and now documents that either way the
@@ -283,10 +283,8 @@ def test_finalize_spawn_input_passes_no_opinion_through() -> None:
     assert hook.finalize_spawn_input(None) is None
 
 
-def test_redirect_denies_with_sys_session_send_instruction(
-    tmp_path: Path,
-    router: _Router,
-) -> None:
+def _redirect_reason(tmp_path: Path, router: _Router) -> str:
+    """Run a cross-harness redirect through the hook and return its deny reason."""
     advertise_router(tmp_path)
     router.response = {
         "action": "redirect",
@@ -301,13 +299,62 @@ def test_redirect_denies_with_sys_session_send_instruction(
     assert hook_output["hookEventName"] == "PreToolUse"
     assert hook_output["permissionDecision"] == "deny"
     reason = hook_output["permissionDecisionReason"]
-    # Names sys_session_create (which a spawn:True harness holds), never
-    # sys_session_send's named-spawn mode — that is absent without declared
-    # sub-agents, so the old wording could not be acted on.
+    assert isinstance(reason, str)
+    return reason
+
+
+def test_redirect_denies_with_bare_session_create_instruction(
+    tmp_path: Path,
+    router: _Router,
+) -> None:
+    advertise_relay_tools(tmp_path, "sys_session_create", "sys_agent_list")
+
+    reason = _redirect_reason(tmp_path, router)
+
+    # Codex addresses an MCP tool by its BARE name plus a separate namespace
+    # field; the flattened ``omnigentsys_session_create`` spelling only shows up
+    # in codex's own logs and hook payloads and is not callable. The codex
+    # phrasing therefore quotes bare names and names the server as the
+    # namespace, never a prefixed spelling.
     assert "sys_session_create" in reason
+    assert "sys_agent_list" in reason
+    assert "mcp__omnigent__" not in reason
+    assert "omnigentsys_session_create" not in reason
+    assert "omnigent" in reason
     assert "sys_session_send" not in reason
     assert "claude-opus-4-8" in reason
     assert "claude-native" in reason
+    # Codex defers MCP schemas behind its own ``tool_search``, so the reason
+    # must send the model looking rather than let it conclude "no such tool".
+    assert "search" in reason.lower()
+
+
+def test_redirect_without_the_spawn_tool_names_no_sys_session_tool(
+    tmp_path: Path,
+    router: _Router,
+) -> None:
+    """No advertised spawn tool → name none and hand the work back."""
+    advertise_relay_tools(tmp_path, "sys_read_inbox")
+
+    reason = _redirect_reason(tmp_path, router)
+
+    assert "sys_session_" not in reason
+    assert "sys_agent_list" not in reason
+    assert "yourself" in reason
+    assert "claude-opus-4-8" in reason
+
+
+def test_redirect_without_a_relay_file_keeps_the_actionable_instruction(
+    tmp_path: Path,
+    router: _Router,
+) -> None:
+    """A missing relay file reads as "unknown", preserving today's instruction."""
+    assert not (tmp_path / subagent_router._TOOL_RELAY_FILE).exists()
+
+    reason = _redirect_reason(tmp_path, router)
+
+    assert "sys_session_create" in reason
+    assert "yourself" not in reason
 
 
 def test_deny_uses_router_rationale(

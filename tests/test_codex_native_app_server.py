@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
 from omnigent.codex_native_app_server import (
+    _FRAMEWORK_APPROVED_TOOLS,
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexNativeAppServer,
     _build_native_codex_app_server_argv,
@@ -138,6 +139,12 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
     assert captured_env == {"PATH": "/bin", "CODEX_HOME": captured_env["CODEX_HOME"]}
     assert process.terminated is True
     _model_discovery_cache.clear()
+
+# Every framework-approved Omnigent tool gets its own approval table, so a
+# routed spawn's sys_session_create never raises an interactive prompt.
+_EXPECTED_FRAMEWORK_TOOL_APPROVALS = {
+    tool: {"approval_mode": "approve"} for tool in _FRAMEWORK_APPROVED_TOOLS
+}
 
 
 def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
@@ -594,9 +601,7 @@ args = []
             "--bridge-dir",
             str(bridge_dir),
         ],
-        "tools": {
-            "sys_session_rename": {"approval_mode": "approve"},
-        },
+        "tools": _EXPECTED_FRAMEWORK_TOOL_APPROVALS,
     }
 
 
@@ -638,9 +643,7 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "--bridge-dir",
             str(bridge_dir),
         ],
-        "tools": {
-            "sys_session_rename": {"approval_mode": "approve"},
-        },
+        "tools": _EXPECTED_FRAMEWORK_TOOL_APPROVALS,
     }
 
 
@@ -1417,3 +1420,77 @@ async def test_policy_hook_command_runs_python_isolated() -> None:
 
     argv = shlex.split(_codex_policy_hook_command(Path("/b"), "/venv/bin/python"))
     assert argv[1:3] == ["-I", "-m"]
+
+
+def test_routed_spawn_note_appends_then_restores_the_user_base(tmp_path: Path) -> None:
+    """The codex routed-spawn note rides ``developer_instructions``, reversibly.
+
+    It must be additive to the user's own guidance on a fresh auto-harness
+    launch and gone again on a resumed / pinned launch, which is what keeps a
+    session that leaves auto-harness mode from carrying stale routing framing.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+
+    note = smart_routing_spawn_note("codex-native")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text('developer_instructions = "Keep user guidance."\n', encoding="utf-8")
+
+    _sync_codex_developer_instructions(codex_home, note)
+
+    active = tomllib.loads(config_path.read_text(encoding="utf-8"))["developer_instructions"]
+    assert active == f"Keep user guidance.\n\n{note}"
+    assert "sys_session_create" in active
+    # Codex takes bare MCP names plus a namespace, never a prefixed spelling.
+    assert "mcp__omnigent__" not in active
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep user guidance."
+
+
+@pytest.mark.parametrize(
+    ("labels", "harness_override", "expected"),
+    [
+        ({"omnigent.routing.auto_harness": "1"}, None, True),
+        # The sentinel survives until first-message routing resolves a harness.
+        ({}, "auto", True),
+        ({}, "codex-native", False),
+        ({}, None, False),
+    ],
+    ids=["label", "sentinel", "pinned", "neither"],
+)
+async def test_codex_native_launch_config_reads_the_auto_harness_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    labels: dict[str, str],
+    harness_override: str | None,
+    expected: bool,
+) -> None:
+    """Only an auto-harness codex session gets the routed-spawn instructions."""
+    import httpx
+
+    from omnigent.runner.native.orchestration import _codex_native_launch_config
+    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+    assert AUTO_HARNESS_LABEL_KEY == "omnigent.routing.auto_harness"
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:9999")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "workspace": str(tmp_path),
+                "labels": labels,
+                "harness_override": harness_override,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
+
+    assert config.auto_harness is expected

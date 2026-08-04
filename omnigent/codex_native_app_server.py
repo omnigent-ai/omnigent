@@ -187,6 +187,22 @@ def _remove_toml_table(text: str, table_name: str) -> str:
     return "".join(kept).rstrip()
 
 
+#: Omnigent tools the framework calls on the session's behalf, pre-approved so
+#: codex never raises an interactive prompt for them. The rename keeps a
+#: session's title current; the rest carry out a Smart Routing cross-harness
+#: redirect end to end — discover the agent, start the routed child, deliver the
+#: task, collect its result. Without the last one the redirect stalls on an
+#: approval prompt nobody is watching. Written unconditionally: a table for a
+#: tool this session's relay does not advertise is inert.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_rename",
+    "sys_session_create",
+    "sys_agent_list",
+    "sys_session_send",
+    "sys_read_inbox",
+)
+
+
 def _codex_mcp_server_config_section(
     bridge_dir: Path,
     python_executable: str | None = None,
@@ -200,7 +216,7 @@ def _codex_mcp_server_config_section(
         ``"/path/to/.venv/bin/python"``. ``None`` uses
         :data:`sys.executable`.
     :returns: TOML text for ``[mcp_servers.omnigent]`` and its
-        framework-managed rename-tool approval.
+        framework-managed tool approvals.
     """
     python = python_executable or sys.executable
     args = [
@@ -212,12 +228,15 @@ def _codex_mcp_server_config_section(
         str(bridge_dir),
     ]
     args_toml = ", ".join(json.dumps(a) for a in args)
+    approvals = "\n".join(
+        f'[mcp_servers.omnigent.tools.{tool}]\napproval_mode = "approve"\n'
+        for tool in _FRAMEWORK_APPROVED_TOOLS
+    )
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
         f"args = [{args_toml}]\n\n"
-        "[mcp_servers.omnigent.tools.sys_session_rename]\n"
-        'approval_mode = "approve"\n'
+        f"{approvals}"
     )
 
 
