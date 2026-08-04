@@ -1379,7 +1379,14 @@ def register_core_routes(
                 # A client disconnect is the normal terminal condition; any
                 # other exception is a real bug worth surfacing in logs.
                 if exc is not None and not isinstance(exc, WebSocketDisconnect):
-                    _logger.warning("session-updates stream task crashed: %r", exc)
+                    # exc_info: a bare repr names the exception but not the
+                    # frame that raised it, which is the only thing that makes
+                    # a crash here actionable.
+                    _logger.warning(
+                        "session-updates stream task crashed: %r",
+                        exc,
+                        exc_info=exc,
+                    )
         finally:
             with contextlib.suppress(RuntimeError):
                 await websocket.close()

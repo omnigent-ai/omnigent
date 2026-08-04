@@ -38,6 +38,7 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUserDailyCost,
     current_workspace_id,
+    normalize_uuid,
     uuid_to_bytes,
 )
 from omnigent.db.enum_codecs import (
@@ -1175,8 +1176,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .all()
                 )
         meta_by_id = {m.id: m for m in meta_rows}
+        # Key by the caller's spelling, not the bare hex the column reads back.
+        # A Uuid16 column resolves a dashed or legacy ``conv_``-prefixed id on
+        # the way in, so the row is found either way — but a caller indexing the
+        # result with the id it passed would miss, and silently treat an
+        # existing conversation as absent.
+        caller_spelling = {normalize_uuid(cid): cid for cid in unique_ids}
         return {
-            row.id: _to_conversation(
+            caller_spelling[row.id]: _to_conversation(
                 row,
                 meta_by_id.get(row.id),
                 labels_by_conv.get(row.id, {}),
@@ -1222,9 +1229,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     desc(self._tiebreaker_col),
                 )
             ).all()
+        # Re-key to the caller's spelling: a Uuid16 column takes dashed and
+        # legacy-prefixed ids but always reads back bare hex, so a caller that
+        # passed ``conv_<hex>`` would otherwise miss its own key.
+        caller_spelling = {normalize_uuid(pid): pid for pid in unique_ids}
         for parent_id, child_id in rows:
             if parent_id is not None:
-                result[parent_id].append(child_id)
+                result[caller_spelling[parent_id]].append(child_id)
         return result
 
     def set_labels(
@@ -1886,8 +1897,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .order_by(ranked.c.conversation_id, ranked.c.position.desc())
             ).all()
             decoded = self._decode_item_data_batch([row.data for row in rows])
+            # Re-key to the caller's spelling; see the Uuid16 note in
+            # ``list_child_conversation_ids_by_parent``.
+            caller_spelling = {normalize_uuid(cid): cid for cid in unique_ids}
             for row, data_json in zip(rows, decoded, strict=True):
-                result[row.conversation_id].append(_to_item(row, data_json))  # type: ignore[arg-type]
+                result[caller_spelling[row.conversation_id]].append(_to_item(row, data_json))  # type: ignore[arg-type]
         return result
 
     def _encode_item_data(self, data_json: str) -> str:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy import text
 
@@ -156,6 +158,29 @@ def test_get_conversations_empty_input_skips_query(
 ) -> None:
     """Empty id list returns an empty map without a database round-trip."""
     assert conversation_store.get_conversations([]) == {}
+
+
+@pytest.mark.parametrize("spelling", ["dashed", "legacy_prefix"])
+def test_get_conversations_keys_by_caller_spelling(
+    conversation_store: SqlAlchemyConversationStore, spelling: str
+) -> None:
+    """
+    Rows come back under the id spelling the caller passed.
+
+    A ``Uuid16`` column resolves a dashed or ``conv_``-prefixed id on the way
+    in, so the row is found either way — but keying the result by the bare hex
+    read back leaves a caller indexing on its own id seeing an existing
+    conversation as absent. ``WS /v1/sessions/updates`` hits this: the
+    watch-set carries whatever spelling the client sent, and a dropped row
+    silently vanishes from the sidebar.
+    """
+    conv = conversation_store.create_conversation(title="alpha")
+    asked = str(uuid.UUID(conv.id)) if spelling == "dashed" else f"conv_{conv.id}"
+
+    result = conversation_store.get_conversations([asked])
+
+    assert set(result) == {asked}
+    assert result[asked].title == "alpha"
 
 
 def test_list_latest_message_items_for_conversations(

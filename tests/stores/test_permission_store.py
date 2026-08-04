@@ -10,6 +10,8 @@ SQLite file and tears it down automatically.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from omnigent.entities import SessionPermission
@@ -1137,3 +1139,24 @@ def test_list_for_sessions_no_grants(store: SqlAlchemyPermissionStore, db_uri: s
     conv = _create_conversation(db_uri)
     result = store.list_for_sessions([conv])
     assert result == {conv: []}
+
+
+@pytest.mark.parametrize("spelling", ["dashed", "legacy_prefix"])
+def test_list_for_sessions_keys_by_caller_spelling(
+    store: SqlAlchemyPermissionStore, db_uri: str, spelling: str
+) -> None:
+    """Grants come back under the id spelling the caller passed.
+
+    A ``Uuid16`` column accepts dashed and ``conv_``-prefixed ids but always
+    reads back bare hex, so grouping by the value read back used to raise
+    ``KeyError`` for any caller that did not already use bare hex.
+    """
+    _ensure_user(store, "alice")
+    conv = _create_conversation(db_uri)
+    store.grant("alice", conv, level=2)
+
+    asked = str(uuid.UUID(conv)) if spelling == "dashed" else f"conv_{conv}"
+
+    result = store.list_for_sessions([asked])
+    assert list(result) == [asked]
+    assert [g.user_id for g in result[asked]] == ["alice"]
