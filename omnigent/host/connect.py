@@ -671,6 +671,16 @@ def _build_runner_env(
         or key in forwarded
     }
     env["RUNNER_SERVER_URL"] = server_url
+    # GitHub credential broker coordinates: forward the managed host's id and
+    # launch token so the runner's GitHub MCP proxy can fetch the owner's token
+    # from the server per connection (never persisted). Absent on a plain local
+    # host, where there is no server-vended GitHub credential.
+    from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_TOKEN_ENV_VAR
+
+    for _broker_var in (HOST_ID_ENV_VAR, HOST_TOKEN_ENV_VAR):
+        _broker_val = base_env.get(_broker_var)
+        if _broker_val:
+            env[_broker_var] = _broker_val
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_DELEGATED_AUTH_ENV_VAR] = "1"

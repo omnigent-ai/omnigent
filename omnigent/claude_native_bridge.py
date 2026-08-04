@@ -1263,24 +1263,36 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
     :returns: JSON-serializable Claude MCP config.
     """
     python = python_executable or sys.executable
-    return {
-        "mcpServers": {
-            _MCP_SERVER_NAME: {
-                "command": python,
-                "args": [
-                    "-I",
-                    "-m",
-                    "omnigent.claude_native_bridge",
-                    "serve-mcp",
-                    "--bridge-dir",
-                    str(bridge_dir),
-                ],
-                "env": {
-                    "PYTHONUNBUFFERED": "1",
-                },
-            }
+    servers: dict[str, Any] = {
+        _MCP_SERVER_NAME: {
+            "command": python,
+            "args": [
+                "-I",
+                "-m",
+                "omnigent.claude_native_bridge",
+                "serve-mcp",
+                "--bridge-dir",
+                str(bridge_dir),
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+            },
         }
     }
+    # Per-launch GitHub MCP server: a local stdio proxy (omnigent.github_mcp_proxy)
+    # that forwards to GitHub's hosted MCP and stamps the Open-in-Omnigent link
+    # onto PRs. Added when the session owner has connected GitHub, so the model
+    # can act on GitHub without a `gh`/`git` CLI in the image.
+    from omnigent.github_mcp import github_mcp_server_config
+
+    gh_server = github_mcp_server_config(python_executable=python)
+    if gh_server is not None and gh_server.name not in servers:
+        servers[gh_server.name] = {
+            "command": gh_server.command,
+            "args": list(gh_server.args),
+            "env": dict(gh_server.env),
+        }
+    return {"mcpServers": servers}
 
 
 def build_hook_settings(
