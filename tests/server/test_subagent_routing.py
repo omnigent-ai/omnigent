@@ -135,6 +135,56 @@ def test_candidate_models_offers_glm_under_its_servable_alias() -> None:
     }
 
 
+def test_every_codex_spawn_is_offered_glm() -> None:
+    """Policy: a codex session spawns codex OR glm subagents, always both.
+
+    GLM is in no discovery listing, so a live catalog row never carries it;
+    without the top-up a row that answers for the harness would hide GLM and
+    the session could not reach it.
+    """
+    for catalog in (
+        None,
+        {},
+        {"self": ["databricks-gpt-5-6-luna", "databricks-gpt-5-6-sol"]},
+        # A nested spawn (a codex subagent spawning again) has the same
+        # leaf-shaped catalog, so it must be offered GLM too.
+        {"self": [GPT_MODEL]},
+    ):
+        candidates = candidate_models("codex-native", catalog=catalog)
+        assert GLM_SERVABLE in candidates["codex-native"], catalog
+        # Never the raw catalog spelling — the gateway serves only the alias.
+        assert GLM_MODEL not in candidates["codex-native"], catalog
+
+
+def test_the_glm_top_up_does_not_widen_a_multi_model_harness() -> None:
+    """pi admits every family, but nothing proves its CLI can serve GLM."""
+    assert GLM_SERVABLE not in candidate_models("pi")["pi"]
+
+
+@pytest.mark.parametrize(
+    ("harness", "cross_harness", "expected_harnesses"),
+    [
+        # Pinned sessions stay in their own family, in both directions.
+        ("codex-native", False, {"codex-native"}),
+        ("claude-native", False, {"claude-native"}),
+        # A Smart Routing (auto-harness) session, and any child of one, may
+        # cross — that is the only case a redirect verdict can fire.
+        ("codex-native", True, {"codex-native", "claude-native"}),
+        ("claude-native", True, {"claude-native", "codex-native"}),
+    ],
+)
+def test_spawn_candidates_respect_the_family_restriction(
+    harness: str,
+    cross_harness: bool,
+    expected_harnesses: set[str],
+) -> None:
+    candidates = candidate_models(harness, cross_harness=cross_harness)
+    assert set(candidates) == expected_harnesses
+    for name, models in candidates.items():
+        family = harness_family(name)
+        assert all(model_in_family(family, model) for model in models)
+
+
 def test_candidate_models_drops_a_harness_with_nothing_servable() -> None:
     catalog = {"self": [CLAUDE_MODEL]}
     assert candidate_models("codex-native", catalog=catalog) == {}
@@ -254,6 +304,64 @@ async def test_parent_model_pick_allows_unchanged() -> None:
     )
     assert decision.action == "allow"
     assert decision.model == PARENT_MODEL
+
+
+async def test_codex_spawn_routed_to_glm_rewrites_in_family() -> None:
+    """A codex spawn the router sends to GLM stays on codex and rewrites.
+
+    GLM is codex-compatible, so the verdict must be ``rewrite`` on the
+    requesting harness — never a ``redirect`` that would send the model to
+    ``sys_session_create`` for a spawn its own tool can launch.
+    """
+    client = FakeRoutingClient(RoutingResult(model=GLM_SERVABLE, rationale="delegate down"))
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native", prompt=None, task_name="lint-fixer"),
+        caps=FakeCaps(routing_client=client),
+    )
+    # The static table is the only source of a glm candidate, and it offers the
+    # servable spelling.
+    assert GLM_SERVABLE in client.calls[0][1]["codex-native"]
+    assert decision.action == "rewrite"
+    assert decision.model == GLM_SERVABLE
+    assert decision.harness is None
+
+
+async def test_glm_arm_pick_stamps_no_substitution_arrow() -> None:
+    """The arm id and the servable spelling are the same arm, not a swap."""
+    client = FakeRoutingClient(
+        RoutingResult(model=GLM_SERVABLE, rationale="delegate down", raw_model="glm-5-2")
+    )
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native", prompt=None, task_name="lint-fixer"),
+        caps=FakeCaps(routing_client=client),
+    )
+    assert decision.action == "rewrite"
+    assert decision.model == GLM_SERVABLE
+    assert decision.raw_model is None
+    assert decision_record(_request(harness="codex-native"), decision).raw_model is None
+
+
+async def test_glm_spawn_from_a_live_catalog_is_applied_exactly() -> None:
+    """A workspace catalog listing GLM routes to the alias, not a substitute."""
+    client = FakeRoutingClient(RoutingResult(model=GLM_SERVABLE, rationale="delegate down"))
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native", prompt=None, task_name="lint-fixer"),
+        caps=FakeCaps(routing_client=client),
+        catalog={"self": [GLM_MODEL, "databricks-gpt-5-6-luna"]},
+    )
+    assert client.calls[0][1] == {"codex-native": [GLM_SERVABLE, "databricks-gpt-5-6-luna"]}
+    assert decision.action == "rewrite"
+    assert decision.model == GLM_SERVABLE
+
+
+async def test_claude_session_never_gets_a_glm_spawn() -> None:
+    """GLM is out of family for claude, so a GLM pick cannot be offered."""
+    candidates = candidate_models("claude-native", cross_harness=True)
+    assert GLM_SERVABLE in candidates["codex-native"]
+    assert GLM_SERVABLE not in candidates["claude-native"]
 
 
 async def test_fork_is_exempt_and_never_calls_router() -> None:

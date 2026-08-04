@@ -448,9 +448,41 @@ def candidate_models(
         # spawn's model matches what routing resolves to; dedupe when the
         # catalog carries both spellings.
         models = list(dict.fromkeys(apply_servable_alias(m) for m in models))
+        models = _with_unadvertised_arms(models, family)
         if models:
             result[candidate] = models
     return result
+
+
+#: Family each unadvertised arm is known servable on. ``model_in_family`` is
+#: too permissive here: it admits everything for ``pi`` (multi-model) and for
+#: an unknown harness, and nothing proves those CLIs can serve these arms.
+_UNADVERTISED_ARM_FAMILY = "gpt"
+
+
+def _with_unadvertised_arms(models: list[str], family: str | None) -> list[str]:
+    """Add arms of *family* that no catalog can advertise.
+
+    GLM appears in no discovery listing, so a live catalog row never carries
+    it and the row would otherwise hide it — leaving a codex session unable
+    to spawn a GLM subagent, which policy requires it can. Only arms already
+    known unadvertised, on the one family they are known servable on, so this
+    cannot widen a family.
+
+    :param models: Servable ids offered so far, cheapest first.
+    :param family: Family from :func:`harness_family`.
+    :returns: *models* plus any missing unadvertised arm of that family.
+    """
+    if not models or family != _UNADVERTISED_ARM_FAMILY:
+        return models
+    from omnigent.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
+
+    extra = [
+        model
+        for model in EXTENDED_CATALOG_MODELS.values()
+        if model_in_family(family, model) and model not in models
+    ]
+    return [*models, *extra] if extra else models
 
 
 def _routing_task(req: SubagentRouteRequest) -> str:

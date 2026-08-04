@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -34,6 +36,11 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
+from omnigent.codex_model_vocabulary import (
+    EXTENDED_CATALOG_MODELS,
+    EXTENDED_MODEL_DEFAULT_EFFORT,
+    EXTENDED_MODEL_EFFORTS,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -812,6 +819,14 @@ def _populate_codex_home_config(
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path)
+            if subagent_routing:
+                # Routed spawns can land on an arm codex's bundled catalog
+                # has no entry for, which its spawn tool rejects client-side.
+                catalog_path = write_codex_model_catalog(
+                    target_dir, codex_path=_find_codex_cli(), source_home=source_dir
+                )
+                if catalog_path is not None:
+                    set_codex_model_catalog_path(dest_path, catalog_path)
 
 
 def materialize_codex_provider_config(
@@ -1138,6 +1153,217 @@ def codex_router_session_id(env: Mapping[str, str] | None = None) -> str | None:
     """
     source = os.environ if env is None else env
     return (source.get(CODEX_ROUTER_SESSION_ID_ENV_VAR) or "").strip() or None
+
+
+# Catalog file written into the private codex-home, naming the models the
+# session's ``spawn_agent`` may target. See :func:`extended_model_catalog`.
+_CODEX_MODEL_CATALOG_FILENAME = "model_catalog.json"
+# Entry a gateway-only model is cloned from: the cheapest current arm, so an
+# unset field inherits a sane current-generation value rather than a frozen one.
+_CATALOG_CLONE_SOURCE_SLUG = "gpt-5.6-luna"
+
+
+def extended_model_catalog(
+    catalog: dict[str, Any],
+    *,
+    clone_source: str = _CATALOG_CLONE_SOURCE_SLUG,
+) -> dict[str, Any] | None:
+    """
+    Add the routed arms codex's own catalog has no entry for.
+
+    Codex validates ``spawn_agent``'s ``model`` against this catalog before
+    the request leaves the CLI, so an arm absent from it cannot be spawned
+    however servable the gateway makes it — that is what blocked GLM
+    subagents. Each missing arm is cloned from *clone_source* and re-slugged
+    to the id the gateway serves it as, with its own effort ladder so codex
+    clamps the spawn instead of refusing it.
+
+    :param catalog: ``codex debug models`` output, i.e.
+        ``{"models": [{"slug": ..., ...}, ...]}``.
+    :param clone_source: Slug whose entry supplies every field the added
+        arms do not override.
+    :returns: A new catalog including the added arms, or ``None`` when
+        *catalog* is unusable or has nothing to add (so the caller can leave
+        codex on its own bundled catalog).
+    """
+    models = catalog.get("models")
+    if not isinstance(models, list) or not models:
+        return None
+    by_slug = {m.get("slug"): m for m in models if isinstance(m, dict)}
+    template = by_slug.get(clone_source)
+    if template is None:
+        return None
+    added: list[dict[str, Any]] = []
+    for bare, slug in EXTENDED_CATALOG_MODELS.items():
+        if slug in by_slug:
+            continue
+        efforts = EXTENDED_MODEL_EFFORTS.get(bare, ())
+        entry = copy.deepcopy(template)
+        entry.update(
+            {
+                "slug": slug,
+                "display_name": slug.rsplit(".", 1)[-1],
+                "visibility": "list",
+                "default_reasoning_level": EXTENDED_MODEL_DEFAULT_EFFORT.get(bare, "medium"),
+                "supported_reasoning_levels": [
+                    level
+                    for level in template.get("supported_reasoning_levels", [])
+                    if isinstance(level, dict) and level.get("effort") in efforts
+                ],
+                # Upsell/nux metadata describes the cloned arm, not this one.
+                "availability_nux": None,
+                "upgrade": None,
+            }
+        )
+        added.append(entry)
+    if not added:
+        return None
+    return {**catalog, "models": [*models, *added]}
+
+
+# Cached ``codex debug models`` result, keyed by (binary, CODEX_HOME). The
+# catalog is a property of the installed CLI, not of a session, and the probe
+# runs on the event loop during session boot — so it is paid once per host
+# process rather than once per session. ``None`` is cached too: a CLI that
+# cannot answer will not start answering mid-process.
+_MODEL_CATALOG_CACHE: dict[tuple[str, str], dict[str, Any] | None] = {}
+
+
+def read_codex_model_catalog(
+    codex_path: str,
+    source_home: Path,
+    *,
+    timeout: float = 10.0,
+) -> dict[str, Any] | None:
+    """
+    Ask the codex CLI for its own model catalog, once per host process.
+
+    Read from the CLI rather than pinned in this repo so the catalog tracks
+    whatever codex version is installed: it is ~300 kB of vendor metadata
+    (per-model prompts included) that a pinned copy would silently freeze.
+
+    :param codex_path: The codex binary.
+    :param source_home: ``CODEX_HOME`` to resolve config from.
+    :param timeout: Seconds to wait; a slow probe must not delay session boot.
+    :returns: ``{"models": [...]}``, or ``None`` on any failure.
+    """
+    cache_key = (codex_path, str(source_home))
+    if cache_key in _MODEL_CATALOG_CACHE:
+        return _MODEL_CATALOG_CACHE[cache_key]
+    catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
+    _MODEL_CATALOG_CACHE[cache_key] = catalog
+    return catalog
+
+
+def _probe_codex_model_catalog(
+    codex_path: str,
+    source_home: Path,
+    *,
+    timeout: float,
+) -> dict[str, Any] | None:
+    """Run ``codex debug models``, returning ``None`` on any failure."""
+    try:
+        completed = subprocess.run(
+            [codex_path, "debug", "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "CODEX_HOME": str(source_home)},
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("could not read the codex model catalog (%s)", exc)
+        return None
+    if completed.returncode != 0:
+        logger.warning(
+            "codex debug models exited %s: %s", completed.returncode, completed.stderr[:200]
+        )
+        return None
+    try:
+        catalog = json.loads(completed.stdout)
+    except ValueError as exc:
+        logger.warning("could not parse the codex model catalog (%s)", exc)
+        return None
+    return catalog if isinstance(catalog, dict) else None
+
+
+def write_codex_model_catalog(
+    target_dir: Path,
+    *,
+    codex_path: str | None,
+    source_home: Path,
+) -> Path | None:
+    """
+    Give the session a model catalog its ``spawn_agent`` can route across.
+
+    ``model_catalog_json`` REPLACES codex's bundled catalog rather than
+    merging into it (probed: a one-entry file leaves ``spawn_agent`` with
+    exactly that one model), so the file is codex's own catalog plus the
+    gateway-only arms — never a hand-written list.
+
+    Every failure returns ``None`` and leaves the session on codex's bundled
+    catalog: a spawn that cannot reach GLM beats a session that will not
+    start.
+
+    :param target_dir: The per-session private ``CODEX_HOME``.
+    :param codex_path: The codex binary, or ``None`` when unresolved.
+    :param source_home: ``CODEX_HOME`` the probe should resolve config from.
+    :returns: The written catalog path, or ``None`` when nothing was written.
+    """
+    if codex_path is None:
+        return None
+    catalog = read_codex_model_catalog(codex_path, source_home)
+    if catalog is None:
+        return None
+    extended = extended_model_catalog(catalog)
+    if extended is None:
+        return None
+    path = target_dir / _CODEX_MODEL_CATALOG_FILENAME
+    try:
+        path.write_text(json.dumps(extended), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("could not write %s (%s)", path, exc)
+        return None
+    return path
+
+
+# ``model_catalog_json`` assignment appended to the private config copy. A
+# top-level key, so it goes before the first table header.
+_CATALOG_KEY_RE = re.compile(r"^\s*model_catalog_json\s*=")
+
+
+def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
+    """
+    Point the session's private ``config.toml`` at *catalog_path*.
+
+    :param config_path: The copied ``config.toml`` inside the private home.
+    :param catalog_path: Catalog written by
+        :func:`write_codex_model_catalog`.
+    :returns: ``True`` when the key was written, ``False`` when the config
+        already sets one (the user's choice wins) or the write failed.
+    """
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError as exc:
+        logger.warning("could not read %s (%s)", config_path, exc)
+        return False
+    for line in lines:
+        if line.lstrip().startswith("["):
+            break
+        if _CATALOG_KEY_RE.match(line):
+            return False
+    assignment = f"model_catalog_json = {json.dumps(str(catalog_path))}\n"
+    # Before the first table header, so the key stays top-level.
+    insert_at = next(
+        (i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines)
+    )
+    lines.insert(insert_at, assignment)
+    try:
+        config_path.write_text("".join(lines), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("could not write %s (%s)", config_path, exc)
+        return False
+    return True
 
 
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating

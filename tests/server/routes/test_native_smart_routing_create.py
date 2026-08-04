@@ -644,23 +644,32 @@ async def test_pre_session_catalog_is_offered_instead_of_the_static_table(
     assert "raw_model" not in verdict
 
 
-def test_static_candidates_serve_the_routers_current_codex_arms() -> None:
+@pytest.mark.parametrize(
+    ("arm", "applied"),
+    [
+        ("gpt-5-6-sol", "databricks-gpt-5-6-sol"),
+        ("gpt-5-6-luna", "databricks-gpt-5-6-luna"),
+        # No discovery listing carries glm, so the static table is its only
+        # source; it applies under the gateway's model-route spelling.
+        ("glm-5-2", "system.ai.glm-5-2"),
+    ],
+)
+def test_static_candidates_serve_the_routers_current_codex_arms(arm: str, applied: str) -> None:
     # The last-resort table must still cover the arms task_v1 picks from, or the
     # seam substitutes them down a generation.
     codex_models = infer_models("codex-native")
     assert codex_models is not None
-    source = TaskV1RouteOptionSource(model_prefixes=["databricks-"])
-    for arm in ("gpt-5-6-sol", "gpt-5-6-luna"):
-        resolved = source.resolve_selection(
-            RoutePick(model=arm),
-            ["codex-native"],
-            {"codex-native": list(codex_models)},
-        )
-        assert resolved is not None
-        # Applied exactly: the same model the router named, prefixed for this
-        # workspace's catalog vocabulary.
-        assert resolved.model == f"databricks-{arm}"
-        assert resolved.raw_model == arm
+    source = TaskV1RouteOptionSource(model_prefixes=["databricks-", "system.ai."])
+    resolved = source.resolve_selection(
+        RoutePick(model=arm),
+        ["codex-native"],
+        {"codex-native": list(codex_models)},
+    )
+    assert resolved is not None
+    # Applied exactly: the same arm the router named, spelled for this
+    # workspace's catalog vocabulary — never substituted down a generation.
+    assert resolved.model == applied
+    assert resolved.raw_model == arm
 
 
 @pytest.mark.parametrize(

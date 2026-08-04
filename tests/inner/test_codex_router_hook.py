@@ -120,14 +120,17 @@ def test_build_route_request_derives_task_name(
     assert body["prompt"] is None
 
 
-def test_rewrite_injects_model_and_passes_message_verbatim(
+def test_rewrite_injects_the_spawn_slug_and_passes_message_verbatim(
     tmp_path: Path,
     router: _Router,
 ) -> None:
+    # ``spawn_agent`` validates ``model`` against codex's own catalog before
+    # the request leaves the CLI, so the routed catalog id has to be spelled
+    # in codex's slugs — injecting it verbatim fails the spawn.
     advertise_router(tmp_path)
     router.response = {
         "action": "rewrite",
-        "model": "claude-sonnet-5",
+        "model": "databricks-gpt-5-6-luna",
         "rationale": "cheapest arm",
         "decision_id": "d1",
     }
@@ -141,14 +144,91 @@ def test_rewrite_injects_model_and_passes_message_verbatim(
             "updatedInput": {
                 "task_name": "refactor-tests",
                 "message": _ENCRYPTED_MESSAGE,
-                "model": "claude-sonnet-5",
+                "model": "gpt-5.6-luna",
             },
-            "permissionDecisionReason": "cheapest arm",
+            "permissionDecisionReason": "cheapest arm (applied as 'gpt-5.6-luna')",
         },
-        "systemMessage": "Using Smart Routing. Routing to claude-sonnet-5.",
+        "systemMessage": "Using Smart Routing. Routing to gpt-5.6-luna.",
     }
     assert router.calls[0]["session_id"] == "conv_abc"
     assert router.calls[0]["body"]["prompt"] is None
+
+
+def test_glm_rewrite_spawns_under_the_gateways_own_spelling(
+    tmp_path: Path,
+    router: _Router,
+) -> None:
+    # GLM has no codex slug of its own; omnigent adds it to the session's
+    # catalog under the exact id the gateway serves, so that id IS the slug.
+    advertise_router(tmp_path)
+    router.response = {"action": "rewrite", "model": "system.ai.glm-5-2", "rationale": "delegate"}
+
+    out = _route(_payload(), router_dir=tmp_path)
+
+    assert out is not None
+    assert out["hookSpecificOutput"]["updatedInput"]["model"] == "system.ai.glm-5-2"
+
+
+def test_glm_rewrite_clamps_an_effort_glm_refuses(
+    tmp_path: Path,
+    router: _Router,
+) -> None:
+    # Codex refuses the pairing client-side ("Reasoning effort `xhigh` is not
+    # supported for model `system.ai.glm-5-2`"), so an inherited session
+    # default would fail the spawn the router just approved.
+    advertise_router(tmp_path)
+    router.response = {"action": "rewrite", "model": "system.ai.glm-5-2", "rationale": "delegate"}
+
+    out = _route(_payload(reasoning_effort="xhigh"), router_dir=tmp_path)
+
+    assert out is not None
+    assert out["hookSpecificOutput"]["updatedInput"]["reasoning_effort"] == "medium"
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_an_effort_glm_accepts_is_left_alone(
+    tmp_path: Path,
+    router: _Router,
+    effort: str,
+) -> None:
+    advertise_router(tmp_path)
+    router.response = {"action": "rewrite", "model": "system.ai.glm-5-2", "rationale": "delegate"}
+
+    out = _route(_payload(reasoning_effort=effort), router_dir=tmp_path)
+
+    assert out is not None
+    assert out["hookSpecificOutput"]["updatedInput"]["reasoning_effort"] == effort
+
+
+def test_an_unset_effort_stays_unset(
+    tmp_path: Path,
+    router: _Router,
+) -> None:
+    # Codex then applies the model's own catalog default, which is inside its
+    # ladder; inventing a value would override a user default needlessly.
+    advertise_router(tmp_path)
+    router.response = {"action": "rewrite", "model": "system.ai.glm-5-2", "rationale": "delegate"}
+
+    out = _route(_payload(), router_dir=tmp_path)
+
+    assert out is not None
+    assert "reasoning_effort" not in out["hookSpecificOutput"]["updatedInput"]
+
+
+def test_a_pick_codex_cannot_spawn_allows_the_spawn_unchanged(
+    tmp_path: Path,
+    router: _Router,
+) -> None:
+    # A Claude id has no spawn slug at all. Falling open leaves the spawn on
+    # the parent's model — a degraded spawn beats one the CLI kills.
+    advertise_router(tmp_path)
+    router.response = {
+        "action": "rewrite",
+        "model": "databricks-claude-sonnet-5",
+        "rationale": "r",
+    }
+
+    assert _route(_payload(), router_dir=tmp_path) is None
 
 
 @pytest.mark.parametrize(
@@ -157,8 +237,9 @@ def test_rewrite_injects_model_and_passes_message_verbatim(
         # A rewrite is otherwise invisible — codex reports no model change — so
         # the routed model is announced in the TUI.
         (
-            {"action": "rewrite", "model": "gpt-5-6-luna", "rationale": "cheap"},
-            "Using Smart Routing. Routing to gpt-5-6-luna.",
+            {"action": "rewrite", "model": "databricks-gpt-5-6-luna", "rationale": "cheap"},
+            # The slug the spawn actually runs on, not the catalog id.
+            "Using Smart Routing. Routing to gpt-5.6-luna.",
         ),
         # A deny routed to nothing, so there is no model to announce.
         ({"action": "deny", "rationale": "over budget"}, None),
@@ -184,8 +265,8 @@ def test_routing_notice_announces_only_a_routed_model(
         assert "systemMessage" not in out["hookSpecificOutput"]
 
 
-def test_with_system_message_passes_no_opinion_through() -> None:
-    assert hook.with_system_message(None) is None
+def test_finalize_spawn_input_passes_no_opinion_through() -> None:
+    assert hook.finalize_spawn_input(None) is None
 
 
 def test_redirect_denies_with_sys_session_send_instruction(

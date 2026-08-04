@@ -67,8 +67,14 @@ MODEL_LISTS: dict[str, list[str]] = {
 # to its own endpoint instead of substituting down a generation (a routed
 # gpt-5-6-sol landing on gpt-5-5). Kept out of the curated ordering above,
 # which is a cost/capability spread the arms do not belong to.
+#
+# ``glm-5-2`` is an arm too, and no discovery listing carries it (see
+# :data:`_SERVABLE_ALIASES`), so this table is the only place a glm pick can be
+# offered from — without it a routed glm substitutes down to the luna fallback.
+# It resolves through :func:`apply_servable_alias` to ``system.ai.glm-5-2``.
 _CURRENT_GENERATION_MODELS: dict[str, tuple[str, ...]] = {
     "gpt": (
+        "databricks-glm-5-2",
         "databricks-gpt-5-6-luna",
         "databricks-gpt-5-6-sol",
     ),
