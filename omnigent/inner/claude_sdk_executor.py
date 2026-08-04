@@ -89,6 +89,13 @@ logger = logging.getLogger(__name__)
 # producer (Databricks AI gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 
+# Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
+# request headers. The Databricks AI gateway only serves Claude requests
+# in coding-agent mode when this header is present, so the Databricks
+# gateway env (not the generic-provider gateway env) must carry it.
+_ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
+_DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
+
 # ---------------------------------------------------------------------------
 # TypeAliases for Omnigent JSON-shaped boundary values. The SDK exchanges
 # heterogeneous dicts at the transport and tool boundaries — named aliases
@@ -1014,6 +1021,7 @@ def _resolve_gateway_env(
             auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
         ),
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        _ANTHROPIC_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
         _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command,
     }
 
