@@ -2311,13 +2311,19 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
-    // The turn was actually still live — its next delta revives it.
+    // The turn was actually still live — its next delta revives it, and
+    // the session's busy signal comes back with it: leaving
+    // sessionStatus "idle" let a mid-turn send bypass shouldQueueSend's
+    // queue gate. Local `status` stays "idle" — this client sent
+    // nothing, so no local send is in flight.
     reviveStrayCompletedResponse(useChatStore.setState);
     expect(useChatStore.getState().activeResponse).toEqual({
       responseId: "resp_in_flight",
       state: "streaming",
       error: null,
     });
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+    expect(useChatStore.getState().status).toBe("idle");
   });
 
   it("finalizes a streaming turn on a bare idle edge (no response id)", () => {
@@ -2381,14 +2387,17 @@ describe("chatStore — send while streaming (queueing)", () => {
   it("revive is a no-op for failed and absent responses", () => {
     useChatStore.setState({
       conversationId: "conv_abc",
+      sessionStatus: "idle",
       activeResponse: { responseId: "resp_a", state: "failed", error: "boom" },
     });
     reviveStrayCompletedResponse(useChatStore.setState);
     expect(useChatStore.getState().activeResponse?.state).toBe("failed");
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
 
     useChatStore.setState({ activeResponse: null });
     reviveStrayCompletedResponse(useChatStore.setState);
     expect(useChatStore.getState().activeResponse).toBeNull();
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
   });
 });
 

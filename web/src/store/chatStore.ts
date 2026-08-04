@@ -3493,7 +3493,16 @@ export function adoptTrailingUnattributedBlocks(
 export function reviveStrayCompletedResponse(set: Setter): void {
   set((s) => {
     if (s.activeResponse?.state !== "completed") return {};
-    return { activeResponse: { ...s.activeResponse, state: "streaming" } };
+    // The delta also proves the SESSION is mid-turn: restore the busy
+    // signal the stray idle edge cleared, so send gating
+    // (shouldQueueSend) queues instead of firing into the live turn and
+    // the Working indicator comes back before the next running edge.
+    // Local `status` stays untouched — it means "this client's send is
+    // in flight", which is false for cross-client and TUI-typed turns.
+    return {
+      activeResponse: { ...s.activeResponse, state: "streaming" },
+      sessionStatus: "running",
+    };
   });
 }
 
