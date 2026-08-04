@@ -174,6 +174,49 @@ tools:
 
 ---
 
+## Memory — `memory:`
+
+Automatic long-term memory. `memory:` is a generic feature; the backend is chosen by
+`provider` (default and, today, only value `hindsight`, backed by
+[Hindsight](https://github.com/vectorize-io/hindsight)), so the feature name stays
+independent of any one integration. This is the deterministic counterpart to the
+`hindsight_*` built-in tools: instead of relying on the model to *call* a tool, the
+runtime recalls relevant memories and injects them before each turn, and persists the
+user's turn afterward. It works across every harness because it runs at the shared
+turn-dispatch point, not in a harness-specific hook: executor harnesses (`claude-sdk`,
+`llm`) receive recalled memory as an injected system prompt, while native harnesses —
+whose system prompt is fixed at spawn — receive it prepended to the turn's user message.
+
+```yaml
+memory:
+  enabled: true                 # master switch (default false → no auto memory)
+  api_key: ${HINDSIGHT_API_KEY} # required when enabled
+  # --- all optional below ---
+  provider: hindsight           # memory backend (default & only value: hindsight)
+  api_url: https://api.hindsight.vectorize.io   # default: the provider's default endpoint
+  bank_id: my-agent             # default: agent id, then conversation id
+  auto_recall: true             # inject recalled memories into the prompt (default true)
+  auto_retain: true             # persist the user's turn (default true)
+  budget: mid                   # recall depth: low | mid | high (default mid)
+  max_tokens: 4096              # max recalled memory injected per turn
+  recall_timeout: 10.0          # seconds before a slow recall is skipped for the turn
+```
+
+Both phases are **best effort**: recall is time-bounded (`recall_timeout`) and retain
+runs in the background, so a slow or unreachable backend never blocks or fails a turn.
+The bank resolves the same way as the `hindsight_*` tools (`bank_id` → agent id →
+conversation id), so declaring both shares one bank. Setting `enabled: true` turns on
+both `auto_recall` and `auto_retain` unless either is individually set to `false`.
+
+`auto_retain` persists **the user's turn only** — not the assistant's response. Recall
+is therefore built from what users tell the agent (plus Hindsight's server-side fact
+extraction), not from the model's own answers. If you want the agent to store its
+conclusions too, keep the `hindsight_retain` tool available alongside this block.
+
+The `hindsight-client` SDK ships in the `omnigent[hindsight]` extra.
+
+---
+
 ## Instructions
 
 Free-form text injected into the system prompt. Defines personality,
@@ -404,9 +447,6 @@ The validator (`validator.py`) enforces:
 
 - **Builtin tools: `search.web`, `code.execute`, `memory.*`** — standardized
   runtime-provided tools. Interfaces and availability will be defined soon.
-
-- **Memory policy declarations** — a `memory:` block for consent hints and
-  scope declarations. Memory is purely a tool concern in v1.
 
 - **`when:` routing hints on sub-agents** — declarative hints in `tools.agents`
   entries describing when to call each sub-agent. Skill content handles routing
