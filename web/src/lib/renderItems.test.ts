@@ -771,9 +771,23 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
     return tool!;
   }
 
+  /** The inbox wake marker that separates a dispatch turn from its continuation. */
+  function wakeMarker(itemId: string): AnyBlock {
+    return {
+      type: "user_message",
+      ctx: ctx({ itemId, responseId: "" }),
+      content: [
+        {
+          type: "input_text",
+          text: "[System: sub-agent general-purpose/general-purpose finished (completed) — 1 result waiting in inbox.]",
+        },
+      ],
+    };
+  }
+
   it("folds a backdated result into the prior turn's card without splitting the live bubble", () => {
-    // Live out-of-band shape: turn A's spawn call, turn B streaming, the
-    // child's result arrives mid-B backdated to A.
+    // Live out-of-band shape: turn A's spawn call, the inbox wake, turn B
+    // streaming, the child's result arrives mid-B backdated to A.
     const blocks: AnyBlock[] = [
       {
         type: "tool_group",
@@ -781,6 +795,7 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
         executions: [mkExec("spawn_agent", "c1")],
         iteration: 0,
       },
+      wakeMarker("u_wake"),
       { type: "text_chunk", ctx: ctx({ responseId: "resp_B" }), text: "Synthesizing " },
       resultBlock("c1", "child output", { itemId: "fco_1", responseId: "resp_A" }),
       { type: "text_chunk", ctx: ctx({ responseId: "resp_B" }), text: "results." },
@@ -788,9 +803,9 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
     const active: ActiveResponse = { responseId: "resp_B", state: "streaming", error: null };
     const bubbles = buildBubbles(blocks, active);
 
-    // Exactly two bubbles: the absorbed result must not split B's
-    // narration (three bubbles = the detached-bubble bug).
-    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "assistant"]);
+    // The absorbed result must not split B's narration (an extra
+    // assistant bubble = the detached-bubble bug).
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "user", "assistant"]);
     const a = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
     expect(a.responseId).toBe("resp_A");
     const tool = toolOf(a);
@@ -799,7 +814,7 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
     expect(tool.output).toBe("child output");
     expect(tool.state).toBe("output-available");
 
-    const b = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    const b = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
     expect(b.responseId).toBe("resp_B");
     // ONE continuous text item — the absorbed result must not split the
     // text run into two paragraphs either.
@@ -819,16 +834,17 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
         executions: [mkExec("spawn_agent", "c1")],
         iteration: 0,
       },
+      wakeMarker("u_wake"),
       { type: "text_chunk", ctx: ctx({ responseId: "resp_B" }), text: "Synthesizing " },
     ];
-    const liveId = (buildBubbles(before, active)[1] as Extract<Bubble, { kind: "assistant" }>)
+    const liveId = (buildBubbles(before, active)[2] as Extract<Bubble, { kind: "assistant" }>)
       .stableId;
     const after: AnyBlock[] = [
       ...before,
       resultBlock("c1", "child output", { itemId: "fco_1", responseId: "resp_A" }),
       { type: "text_chunk", ctx: ctx({ responseId: "resp_B" }), text: "results." },
     ];
-    const bubble = buildBubbles(after, active)[1] as Extract<Bubble, { kind: "assistant" }>;
+    const bubble = buildBubbles(after, active)[2] as Extract<Bubble, { kind: "assistant" }>;
     expect(bubble.stableId).not.toBe("fco_1");
     expect(bubble.stableId).toBe(liveId);
   });
@@ -853,6 +869,19 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
         name: "spawn_agent",
         arguments: JSON.stringify({ title: "reviewer" }),
         call_id: "c1",
+      },
+      {
+        id: "u_wake",
+        response_id: "resp_T2",
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [
+          {
+            type: "input_text",
+            text: "[System: sub-agent general-purpose/general-purpose finished (completed) — 1 result waiting in inbox.]",
+          },
+        ],
       },
       {
         id: "msg_t2a",
@@ -884,8 +913,8 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
     const bubbles = buildBubbles(itemsToBlocks(items), null);
 
     // No empty orphan bubble for the consumed result, and T2 stays one
-    // bubble (before: [user, assistant, assistant, EMPTY, assistant]).
-    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "assistant"]);
+    // bubble (before: an EMPTY assistant bubble appeared for the result).
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "user", "assistant"]);
     const t1 = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
     expect(t1.responseId).toBe("resp_T1");
     const tool = toolOf(t1);
@@ -895,7 +924,7 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
     expect(tool.output).toBe("reviewer findings");
     expect(tool.state).toBe("output-available");
 
-    const t2 = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    const t2 = bubbles[3] as Extract<Bubble, { kind: "assistant" }>;
     expect(t2.responseId).toBe("resp_T2");
     expect(t2.items.map((item) => (item as Extract<RenderItem, { kind: "text" }>).text)).toEqual([
       "Synthesizing the review.",
@@ -980,6 +1009,7 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
         iteration: 0,
       },
       resultBlock("shared", "first output", { itemId: "fco_a", responseId: "resp_1" }),
+      wakeMarker("u_wake"),
       {
         type: "tool_group",
         ctx: ctx({ itemId: "fc_b", responseId: "resp_2" }),
@@ -989,11 +1019,11 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
       resultBlock("shared", "second output", { itemId: "fco_b", responseId: "resp_2" }),
     ];
     const bubbles = buildBubbles(blocks, null);
-    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "assistant"]);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "user", "assistant"]);
     // If results were ever indexed by bare callId (last-wins), the
     // first card would wrongly show "second output".
     expect(toolOf(bubbles[0]!).output).toBe("first output");
-    expect(toolOf(bubbles[1]!).output).toBe("second output");
+    expect(toolOf(bubbles[2]!).output).toBe("second output");
   });
 
   it("a dangling call does not adopt a later turn's output when its callId is reused", () => {
@@ -1007,6 +1037,7 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
         executions: [mkExec("Read", "shared")],
         iteration: 0,
       },
+      wakeMarker("u_wake"),
       {
         type: "tool_group",
         ctx: ctx({ itemId: "fc_b", responseId: "resp_2" }),
@@ -1016,12 +1047,12 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
       resultBlock("shared", "second output", { itemId: "fco_b", responseId: "resp_2" }),
     ];
     const bubbles = buildBubbles(blocks, null);
-    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "assistant"]);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "user", "assistant"]);
     const dangling = toolOf(bubbles[0]!);
     // The unresolved card keeps its honest no-output state.
     expect(dangling.output).toBeNull();
     expect(dangling.state).toBe("no-output");
-    expect(toolOf(bubbles[1]!).output).toBe("second output");
+    expect(toolOf(bubbles[2]!).output).toBe("second output");
   });
 
   it("cache: a late result targeting a finalized bubble invalidates reuse, then reuse resumes", () => {
@@ -1034,6 +1065,7 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
         executions: [mkExec("spawn_agent", "c1")],
         iteration: 0,
       },
+      wakeMarker("u_wake"),
       { type: "text_chunk", ctx: ctx({ responseId: "resp_B" }), text: "Synthesizing " },
     ];
     const first = buildBubbles(base, streaming, cache);
@@ -1109,15 +1141,22 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
       },
     ];
     const streaming: ActiveResponse = { responseId: "resp_B", state: "streaming", error: null };
+    // No user message separates resp_A from resp_B (a retry-shaped
+    // continuation), so the two responses render as ONE turn bubble;
+    // pairing is still keyed by (responseId, callId) within it.
     const mid = buildBubbles(new BlockStream().reduceSync(throughOutOfBand), streaming);
-    expect(mid.map((b) => b.kind)).toEqual(["assistant", "assistant"]);
+    expect(mid.map((b) => b.kind)).toEqual(["assistant"]);
+    const midTools = (mid[0] as Extract<Bubble, { kind: "assistant" }>).items.filter(
+      (item): item is Extract<RenderItem, { kind: "tool" }> => item.kind === "tool",
+    );
+    expect(midTools).toHaveLength(2);
     // The delayed output paints resp_A's card mid-stream...
-    expect(toolOf(mid[0]!).output).toBe("A-output");
-    expect(toolOf(mid[0]!).state).toBe("output-available");
+    expect(midTools[0]!.output).toBe("A-output");
+    expect(midTools[0]!.state).toBe("output-available");
     // ...while resp_B's same-callId tool keeps spinning instead of
     // adopting resp_A's output.
-    expect(toolOf(mid[1]!).output).toBeNull();
-    expect(toolOf(mid[1]!).state).toBe("input-available");
+    expect(midTools[1]!.output).toBeNull();
+    expect(midTools[1]!.state).toBe("input-available");
 
     const blocks = new BlockStream().reduceSync([
       ...throughOutOfBand,
@@ -1135,11 +1174,15 @@ describe("buildBubbles — cross-bubble tool_result pairing", () => {
       },
     ]);
     const bubbles = buildBubbles(blocks, null);
-    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "assistant"]);
-    // Each turn's card carries its own output — cross-pollinating in
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant"]);
+    const tools = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items.filter(
+      (item): item is Extract<RenderItem, { kind: "tool" }> => item.kind === "tool",
+    );
+    expect(tools).toHaveLength(2);
+    // Each call's card carries its own output — cross-pollinating in
     // either direction is the reused-callId bug.
-    expect(toolOf(bubbles[0]!).output).toBe("A-output");
-    expect(toolOf(bubbles[1]!).output).toBe("B-output");
+    expect(tools[0]!.output).toBe("A-output");
+    expect(tools[1]!.output).toBe("B-output");
   });
 });
 
@@ -1523,14 +1566,15 @@ describe("buildBubbles — incremental reuse cache", () => {
 
   it("reuses finalized bubbles by reference while the active bubble grows", () => {
     const cache = createBubbleCache();
-    // A finished turn (resp_1) followed by a streaming turn (resp_2).
+    // A finished turn (resp_1), then the next turn's user message and its
+    // streaming reply (resp_2).
     const finished = [userBlock("u1", "resp_1"), doneBlock("a1", "resp_1", "done one")];
     const streaming = { responseId: "resp_2", state: "streaming" as const, error: null };
 
-    const blocks2 = [...finished, chunk("resp_2", "Hel")];
+    const blocks2 = [...finished, userBlock("u2", "resp_2"), chunk("resp_2", "Hel")];
     const first = buildBubbles(blocks2, streaming, cache);
-    // [user, assistant(resp_1, finalized), assistant(resp_2, streaming)].
-    expect(first.map((b) => b.kind)).toEqual(["user", "assistant", "assistant"]);
+    // [user, assistant(resp_1, finalized), user, assistant(resp_2, streaming)].
+    expect(first.map((b) => b.kind)).toEqual(["user", "assistant", "user", "assistant"]);
 
     // A streaming delta grows the active bubble — append-only extension.
     const blocks3 = [...blocks2, chunk("resp_2", "lo")];
@@ -1542,8 +1586,8 @@ describe("buildBubbles — incremental reuse cache", () => {
     expect(second[0]).toBe(first[0]); // user bubble
     expect(second[1]).toBe(first[1]); // finalized assistant(resp_1)
     // The active bubble IS rebuilt (its content changed Hel → Hello).
-    expect(second[2]).not.toBe(first[2]);
-    const active = second[2] as Extract<Bubble, { kind: "assistant" }>;
+    expect(second[3]).not.toBe(first[3]);
+    const active = second[3] as Extract<Bubble, { kind: "assistant" }>;
     expect(active.items).toEqual([{ kind: "text", itemId: null, text: "Hello", final: false }]);
 
     // Incremental output must equal a from-scratch rebuild (no cache).
@@ -1731,8 +1775,16 @@ describe("buildBubbles — continued turns (sub-agent await)", () => {
 
   it("keeps an existing mark when a later turn starts streaming", () => {
     // Sticky: a bubble that already folded must not reopen just because
-    // the next turn began.
-    const blocks = [...narrationThenTools("resp_1"), answer("resp_2")];
+    // the next turn began. The wake marker separates the dispatch turn
+    // from its continuation, as in the real inbox-wake flow.
+    const blocks = [
+      ...narrationThenTools("resp_1"),
+      userMessage(
+        "resp_wake",
+        "[System: sub-agent general-purpose/general-purpose finished (completed) — 1 result waiting in inbox.]",
+      ),
+      answer("resp_2"),
+    ];
     const settled = buildBubbles(blocks, null);
     expect(
       assistantAt(
@@ -1812,9 +1864,31 @@ describe("buildBubbles — anonymous blocks join the surrounding turn", () => {
     expect(assistants(bubbles)[0]!.responseId).toBe("codex_t1");
   });
 
-  it("still splits on a genuinely different real response id", () => {
+  it("merges a same-turn continuation across a real response-id change", () => {
+    // Codex's step-wise (goal/plan) turns publish a distinct response id
+    // per step while the items carry the thread id — one user turn, so
+    // one bubble (and eventually ONE "Worked for" fold, not one per
+    // step).
     const bubbles = buildBubbles(
-      [textDone("m1", "resp_a", "turn A"), textDone("m2", "resp_b", "turn B")],
+      [textDone("m1", "codex_step1", "step one"), textDone("m2", "codex_step2", "step two")],
+      null,
+    );
+    expect(assistants(bubbles)).toHaveLength(1);
+    // Lifecycle tracks the LATEST step id.
+    expect(assistants(bubbles)[0]!.responseId).toBe("codex_step2");
+  });
+
+  it("splits turns at a real user message", () => {
+    const bubbles = buildBubbles(
+      [
+        textDone("m1", "resp_a", "turn A"),
+        {
+          type: "user_message",
+          ctx: ctx({ itemId: "u2", responseId: "resp_b" }),
+          content: [{ type: "input_text", text: "next question" }],
+        },
+        textDone("m2", "resp_b", "turn B"),
+      ],
       null,
     );
     expect(assistants(bubbles)).toHaveLength(2);

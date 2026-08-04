@@ -343,13 +343,14 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Looking around.")).toBeDefined();
 
       // Completed turn folds even while the SESSION is still running
-      // (a later turn is the live one, not this bubble).
+      // (a later turn is the live one, not this bubble) — after the
+      // settle debounce.
       rerender(
         <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
           <BlockRenderer items={items} sessionStatus="running" turnLifecycle="completed" />
         </FileViewerContext.Provider>,
       );
-      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
       // The trace collapses a frame later (it mounts open to animate away).
       await waitFor(() => expect(screen.queryByText("Looking around.")).toBeNull());
       expect(screen.getByText("Answer text.")).toBeDefined();
@@ -564,9 +565,10 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
       expect(screen.getByText("Checking the CLI.")).toBeDefined();
 
-      // The session's terminal edge lands → the fold forms.
+      // The session's terminal edge lands → the fold forms (after the
+      // settle debounce).
       rerender(view("idle"));
-      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
       await waitFor(() => expect(screen.queryByText("Checking the CLI.")).toBeNull());
     });
 
@@ -683,11 +685,12 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
 
       rerender(view("completed"));
-      // Fold is present AND its trace is still on screen (mounted open).
-      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      // The fold waits out the settle debounce (absorbing transient
+      // settled reads), then appears — trace still on screen until it
+      // mounts open and closes itself.
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
       expect(screen.getByText("Looking around.")).toBeDefined();
-
-      // It closes itself on the next frame.
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
       await waitFor(() => expect(screen.queryByText("Looking around.")).toBeNull());
       expect(screen.getByText("All done.")).toBeDefined();
     });

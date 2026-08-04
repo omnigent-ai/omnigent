@@ -304,6 +304,12 @@ export function FilePathAwareMessageResponse({
 
 const STREAMING_TAIL = 3;
 
+// How long fold eligibility must hold before the "Worked for" fold
+// appears on a live bubble. Long enough to absorb transient settled
+// reads (a step-wise turn's between-step idle, a stray idle before its
+// revive), short enough to feel immediate at a real turn end.
+const FOLD_SETTLE_DEBOUNCE_MS = 500;
+
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
@@ -372,7 +378,7 @@ export function BlockRenderer({
   // to await sub-agents), and it keeps a stray narration- or
   // reasoning-only fragment of a split turn from folding into a lone
   // "Worked" row with nothing behind it.
-  const showFold =
+  const foldEligible =
     !isTurnLive &&
     // The last assistant bubble in a RUNNING session is (or may be) the
     // live turn even when its lifecycle reads settled — a mid-turn
@@ -382,6 +388,23 @@ export function BlockRenderer({
     !isProvisionalTrace(items) &&
     process.length > 0 &&
     (final.length > 0 || (continued && process.some(isToolItem)));
+
+  // Debounce fold APPEARANCE on a live bubble: transient settled reads —
+  // a step-wise turn's idle edge between steps, a stray bare idle before
+  // its revive — would otherwise fold and unfold the trace. Eligibility
+  // must hold for a beat before the fold shows; losing eligibility hides
+  // it immediately, and a bubble MOUNTED eligible (settled history)
+  // folds with no delay.
+  const [showFold, setShowFold] = useState(foldEligible);
+  useEffect(() => {
+    if (foldEligible === showFold) return undefined;
+    if (!foldEligible) {
+      setShowFold(false);
+      return undefined;
+    }
+    const timer = setTimeout(() => setShowFold(true), FOLD_SETTLE_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [foldEligible, showFold]);
 
   // Animate only when the fold APPEARS on an already-mounted bubble —
   // the turn settled, or its continuation landed, while the user was

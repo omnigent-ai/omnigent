@@ -348,6 +348,18 @@ function isAnonymousRid(rid: string): boolean {
   return rid === "" || rid.startsWith(LIVE_ITEM_PREFIX);
 }
 
+/**
+ * Blocks stamped a distinct response id ON PURPOSE so they render as
+ * their own bubble: deny/failure sentinels aren't part of any turn's
+ * work, and REQUEST-phase elicitations get a unique id precisely so
+ * `isRequestElicitationBubble` can lift them out. A response-id change
+ * into or out of one of these is a real bubble boundary, not a
+ * same-turn continuation.
+ */
+function isStandaloneSentinelBlock(b: AnyBlock): boolean {
+  return b.type === "policy_denied" || b.type === "error" || b.type === "elicitation";
+}
+
 /** Whether a later assistant bubble continues the turn started at `from`. */
 function hasAssistantContinuation(bubbles: Bubble[], from: number): boolean {
   for (let i = from + 1; i < bubbles.length; i += 1) {
@@ -538,20 +550,28 @@ function walkBubbles(
       continue;
     }
 
-    // Open an assistant bubble. Collect all subsequent blocks that
-    // share this `responseId` and are not themselves user/compaction
-    // boundaries. Out-of-band blocks with a different REAL responseId
-    // close the bubble; ANONYMOUS blocks never do. A live-streamed
-    // block often doesn't know its turn yet — native harnesses emit
-    // reasoning before the edge that names the turn (rid ""), and text
-    // previews carry a synthetic `live:` id until their authoritative
-    // item replaces them — and splitting on those rendered one turn as
-    // several fragment bubbles live that merged into one on reload
-    // (the codex fold flicker). Anonymous blocks belong to whatever
-    // turn surrounds them, and a group that OPENED on one adopts the
-    // first real rid that arrives.
+    // Open an assistant bubble: ONE bubble per user turn. Collect every
+    // subsequent assistant-side block up to the next user/compaction/
+    // routing boundary, REGARDLESS of response id. A response-id change
+    // between two assistant blocks with no user message between them is
+    // a continuation of the same turn, not a new one — native harnesses
+    // emit reasoning before the edge that names the turn (rid "") and
+    // stream text as `live:` previews, and codex's step-wise (goal/plan)
+    // turns publish a distinct response id PER STEP while the items all
+    // carry the thread id. Splitting on any of those rendered one turn
+    // as several fragment bubbles live (each folding into its own
+    // "Worked for" row) that merged back into one on reload. The group
+    // tracks the LAST real response id it saw, so lifecycle matching
+    // against `activeResponse` follows the live edge. Blocks that carry
+    // a DISTINCT id on purpose still open their own bubble: deny/failure
+    // sentinels (`policy_denied` / `error`) are not part of the turn's
+    // work, and REQUEST-phase elicitations are stamped a unique id
+    // precisely so they stand alone (`isRequestElicitationBubble`).
     let groupResponseId = b.ctx.responseId;
     const groupStart = i;
+    // Sentinel-headed groups never absorb a different turn's blocks, in
+    // either direction (see the id-change handling below).
+    const groupOpenedOnSentinel = isStandaloneSentinelBlock(b);
     while (i < blocks.length) {
       const cur = blocks[i]!;
       // Break on boundaries that start a new top-level bubble. Include
@@ -572,10 +592,15 @@ function walkBubbles(
       }
       // A bare tool_result never renders standalone (it folds into its
       // call's card by callId) — don't let a backdated one split the
-      // open bubble.
+      // open bubble. Anonymous blocks never carry turn identity.
       const curRid = cur.ctx.responseId;
       if (cur.type !== "tool_result" && !isAnonymousRid(curRid) && curRid !== groupResponseId) {
-        if (!isAnonymousRid(groupResponseId)) break;
+        if (
+          !isAnonymousRid(groupResponseId) &&
+          (isStandaloneSentinelBlock(cur) || groupOpenedOnSentinel)
+        ) {
+          break;
+        }
         groupResponseId = curRid;
       }
       i += 1;
