@@ -309,13 +309,17 @@ def write_mcp_config(
 
     existing: dict[str, Any] = {}
     if path.exists():
-        try:
+        with contextlib.suppress(json.JSONDecodeError, OSError):
             existing = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
+
+    # A hand-edited mcp.json can hold any JSON shape; discard non-dicts so a
+    # malformed file can't crash the session launch.
+    if not isinstance(existing, dict):
+        existing = {}
+    if not isinstance(existing.get("mcpServers"), dict):
+        existing["mcpServers"] = {}
 
     omnigent_entry = build_mcp_config(bridge_dir, python_executable=python_executable)
-    existing.setdefault("mcpServers", {})
     existing["mcpServers"][_MCP_SERVER_NAME] = omnigent_entry["mcpServers"][_MCP_SERVER_NAME]
 
     tmp = path.with_suffix(path.suffix + ".tmp")
