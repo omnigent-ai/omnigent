@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -22,11 +24,13 @@ from omnigent.db.utils import (
     _resolve_lakebase_token_provider,
     build_search_snippet,
     builtin_agent_id,
+    checkpoint_wal_periodically,
     clear_engine_cache,
     extract_search_text,
     generate_agent_id,
     generate_item_id,
     get_or_create_engine,
+    run_wal_checkpoint,
     set_lakebase_token_provider,
     strip_nul_bytes,
 )
@@ -686,3 +690,67 @@ def test_build_search_snippet_no_match_returns_none() -> None:
     """No occurrence (or empty query) yields None so the caller shows no preview."""
     assert build_search_snippet("no match here", "xyz") is None
     assert build_search_snippet("anything", "") is None
+
+
+# ── WAL checkpointing ──────────────────────────────────
+
+
+def _grow_wal(db_path: Path) -> sqlite3.Connection:
+    """
+    Grow a SQLite WAL sidecar and keep the writer connection open.
+    """
+    connection = sqlite3.connect(str(db_path))
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA wal_autocheckpoint=0")
+    connection.execute("CREATE TABLE IF NOT EXISTS wal_growth (id INTEGER PRIMARY KEY, data BLOB)")
+    payload = b"x" * 4096
+    connection.executemany(
+        "INSERT INTO wal_growth (data) VALUES (?)",
+        [(payload,) for _ in range(256)],
+    )
+    connection.commit()
+    return connection
+
+
+def test_run_wal_checkpoint_truncates_grown_sqlite_wal(tmp_path: Path) -> None:
+    """
+    ``run_wal_checkpoint`` truncates a grown SQLite WAL sidecar.
+    """
+    db_path = tmp_path / "wal.db"
+    engine = get_or_create_engine(f"sqlite:///{db_path}")
+    writer = _grow_wal(db_path)
+    try:
+        wal_path = Path(f"{db_path}-wal")
+        grown_size = wal_path.stat().st_size if wal_path.exists() else 0
+        assert grown_size > 0
+
+        result = run_wal_checkpoint(engine)
+
+        assert result is not None
+        assert result.busy == 0
+        truncated_size = wal_path.stat().st_size if wal_path.exists() else 0
+        assert truncated_size == 0
+    finally:
+        writer.close()
+
+
+def test_run_wal_checkpoint_non_sqlite_noop() -> None:
+    """
+    Non-SQLite engines are ignored.
+    """
+    engine = MagicMock()
+    engine.dialect.name = "postgresql"
+
+    assert run_wal_checkpoint(engine) is None
+    engine.connect.assert_not_called()
+
+
+async def test_checkpoint_wal_periodically_non_sqlite_noop() -> None:
+    """
+    The async checkpoint loop returns immediately for non-SQLite engines.
+    """
+    engine = MagicMock()
+    engine.dialect.name = "postgresql"
+
+    await asyncio.wait_for(checkpoint_wal_periodically(engine, interval=0.001), timeout=0.1)
+    engine.connect.assert_not_called()
