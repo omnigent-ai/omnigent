@@ -962,6 +962,11 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+def _spec_cache_temp_prefix(runner_id: str) -> str:
+    """Return a compact Windows prefix to preserve room below ``MAX_PATH``."""
+    return "og-rs-" if IS_WINDOWS else f"runner-specs-{runner_id}-"
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
     spec_cache_root: Path,
@@ -1137,7 +1142,7 @@ def create_app(
     # references.
     import tempfile
 
-    _spec_cache_root = Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-"))
+    _spec_cache_root = Path(tempfile.mkdtemp(prefix=_spec_cache_temp_prefix(_runner_id)))
 
     async def spec_resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec | None:
         """

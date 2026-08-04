@@ -70,7 +70,11 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
-from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import (
+    HostIdentity,
+    host_identity_config_path,
+    load_or_create_host_identity,
+)
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -304,6 +308,15 @@ def _url_is_loopback(url: str) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 10.0
 _RECONNECT_JITTER = 0.5
+
+
+def _console_safe_text(text: str) -> str:
+    """Return text encodable by the active stdout stream."""
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return text
+    return text.encode(encoding, errors="replace").decode(encoding)
+
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -1064,9 +1077,12 @@ class HostProcess:
                 # terminal — print once per redirect streak so a foreground
                 # `omnigent host` shows the auth problem and its fix instead
                 # of sitting silent while it retries.
-                print(
+                warning = (
                     f"⚠ {cause} Retrying — this also happens briefly while "
-                    f"the server restarts. {self._credentials_fix_hint()}",
+                    f"the server restarts. {self._credentials_fix_hint()}"
+                )
+                print(
+                    _console_safe_text(warning),
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1240,12 +1256,12 @@ class HostProcess:
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
         session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
-        print(
+        lifecycle_message = (
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
             f"    log: {_display_log_path(log_path)}"
-            f"{session_line}",
-            flush=True,
+            f"{session_line}"
         )
+        print(_console_safe_text(lifecycle_message), flush=True)
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
             status="launched",
@@ -1278,10 +1294,8 @@ class HostProcess:
                 handle.proc.kill()
                 handle.proc.wait()
         _logger.info("Stopped runner %s", frame.runner_id)
-        print(
-            f"  ↓ Runner stopped: {frame.runner_id}",
-            flush=True,
-        )
+        lifecycle_message = f"  ↓ Runner stopped: {frame.runner_id}"
+        print(_console_safe_text(lifecycle_message), flush=True)
         return HostStopRunnerResultFrame(
             request_id=frame.request_id,
             status="stopped",
@@ -2470,12 +2484,12 @@ class HostProcess:
         # success line after the noisy ``databricks.sdk`` warnings —
         # otherwise the terminal goes silent after auth and there's no
         # signal the WS handshake actually completed.
-        print(
+        connected_message = (
             f"✓ Connected as {self._identity.name!r} "
             f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
-            "Listening for sessions — Ctrl-C to disconnect.",
-            flush=True,
+            "Listening for sessions — Ctrl-C to disconnect."
         )
+        print(_console_safe_text(connected_message), flush=True)
 
         loop = asyncio.get_running_loop()
         next_quick_refresh = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
@@ -2640,9 +2654,7 @@ def run_host_process(
 
     telemetry.init("omni-host")
 
-    from omnigent.host.identity import CONFIG_PATH
-
-    path = config_path or CONFIG_PATH
+    path = config_path or host_identity_config_path()
     identity = load_or_create_host_identity(path)
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
@@ -2667,5 +2679,6 @@ def run_host_process(
         # Fail loud: a permanent connection failure must not look like the
         # process is still working. Print the cause + fix, then exit non-zero
         # instead of the old behavior of reconnecting silently forever.
-        print(f"\n✗ Could not connect to {server_url}.\n{exc}", file=sys.stderr, flush=True)
+        failure = f"\n✗ Could not connect to {server_url}.\n{exc}"
+        print(_console_safe_text(failure), file=sys.stderr, flush=True)
         raise SystemExit(1) from exc

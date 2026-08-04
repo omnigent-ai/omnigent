@@ -42,6 +42,14 @@ from omnigent.cli import (
 from omnigent.host.local_server import LocalServerStartup
 
 
+def test_host_pid_path_honors_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Daemon registry state follows ``OMNIGENT_DATA_DIR`` by default."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", None)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+
+    assert cli._host_pid_path() == tmp_path / "host.pid"
+
+
 @pytest.fixture(autouse=True)
 def _stable_current_host_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep daemon-reuse tests independent of the developer's real config."""

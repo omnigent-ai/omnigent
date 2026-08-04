@@ -253,11 +253,14 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
         sleep_calls.append(seconds)
 
     def _fake_get(url: str, timeout: float) -> _Resp:
-        """Fail twice, then report ready on the third probe."""
-        del url, timeout
+        """Time out once, refuse once, then report ready."""
+        del timeout
         http_calls["count"] += 1
-        if http_calls["count"] < 3:
-            raise __import__("httpx").ConnectError("not ready")
+        request = httpx.Request("GET", url)
+        if http_calls["count"] == 1:
+            raise httpx.ConnectTimeout("not ready", request=request)
+        if http_calls["count"] == 2:
+            raise httpx.ConnectError("not ready", request=request)
         return _Resp(200)
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)

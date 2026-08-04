@@ -70,8 +70,15 @@ def _normalize_host_id(host_id: str) -> str:
     return host_id
 
 
+def host_identity_config_path() -> Path:
+    """Return the effective config path for the persistent host identity."""
+    from omnigent.config import global_config_path
+
+    return global_config_path(CONFIG_PATH)
+
+
 def load_or_create_host_identity(
-    path: Path = CONFIG_PATH,
+    path: Path | None = None,
 ) -> HostIdentity:
     """Load host identity from config.yaml, or create it if absent.
 
@@ -88,11 +95,12 @@ def load_or_create_host_identity(
     launcher bug and fails loud.
 
     :param path: Path to the config YAML file, e.g.
-        ``Path("~/.omnigent/config.yaml")``. Defaults to
-        :data:`CONFIG_PATH`.
+        ``Path("~/.omnigent/config.yaml")``. ``None`` uses
+        ``OMNIGENT_CONFIG_HOME`` when set, else :data:`CONFIG_PATH`.
     :returns: The loaded or newly created :class:`HostIdentity`.
     :raises ValueError: If exactly one of the identity env vars is set.
     """
+    resolved_path = path or host_identity_config_path()
     env_host_id = os.environ.get(HOST_ID_ENV_VAR)
     env_name = os.environ.get(HOST_NAME_ENV_VAR)
     if (env_host_id is None) != (env_name is None):
@@ -104,8 +112,8 @@ def load_or_create_host_identity(
         return HostIdentity(host_id=_normalize_host_id(env_host_id), name=env_name)
 
     cfg: dict[str, object] = {}
-    if path.exists():
-        with open(path) as f:
+    if resolved_path.exists():
+        with open(resolved_path) as f:
             cfg = yaml.safe_load(f) or {}
 
     host_section = cfg.get("host")
@@ -120,8 +128,8 @@ def load_or_create_host_identity(
     identity = HostIdentity(host_id=host_id, name=name)
 
     cfg["host"] = {"host_id": identity.host_id, "name": identity.name}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(resolved_path, "w") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
     return identity

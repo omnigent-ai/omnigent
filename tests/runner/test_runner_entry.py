@@ -37,6 +37,7 @@ from omnigent.runner._entry import (
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
+    _spec_cache_temp_prefix,
     main,
 )
 from omnigent.runner.identity import (
@@ -51,6 +52,13 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 # here (via import_module, so there is no bound-but-unused import) resolves and
 # caches it with the real type.
 importlib.import_module("mcp.client.streamable_http")
+
+
+def test_spec_cache_temp_prefix_is_compact_on_windows(monkeypatch) -> None:
+    """Verify Windows runner extraction leaves room below ``MAX_PATH``."""
+    monkeypatch.setattr("omnigent.runner._entry.IS_WINDOWS", True)
+
+    assert _spec_cache_temp_prefix("runner_token_" + "a" * 32) == "og-rs-"
 
 
 class _TrackingTerminalRegistry:

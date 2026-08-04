@@ -3429,7 +3429,7 @@ def _wait_for_server(port: int, server: LocalServer, timeout: float = 45.0) -> N
                 )
                 if runner_resp.status_code == 200 and runner_resp.json()["online"] is True:
                     return
-        except httpx.ConnectError:
+        except (httpx.ConnectError, httpx.TimeoutException):
             pass
         elapsed = time.monotonic() - start
         poll_interval = (
