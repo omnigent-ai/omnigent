@@ -66,6 +66,39 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
+# The header Chat/Terminal switcher is a Radix dropdown whose trigger *toggles*
+# on pointer-down. On a busy page (a live terminal stream plus the trigger's own
+# hover-driven tooltip re-rendering onto the same node) a lone click can net back
+# to closed, leaving the menu shut. Reopen until the target item is on screen
+# instead of asserting a single click landed.
+_VIEW_MENU_OPEN_ATTEMPTS = 5
+_VIEW_MENU_OPEN_TIMEOUT_MS = 5_000
+
+
+def _select_view_mode(page: Page, option: str) -> None:
+    """Open the header Chat/Terminal switcher and select *option*.
+
+    Clicks the ``view-mode-toggle`` trigger and waits for the ``option`` radio
+    item; a Radix toggle-trigger click can be swallowed on a busy page, so retry
+    the open before selecting rather than trusting one click.
+
+    :param page: The Playwright page, on the session's chat surface.
+    :param option: The menu item label, e.g. ``"Chat"`` or ``"Terminal"``.
+    """
+    toggle = page.get_by_test_id("view-mode-toggle")
+    expect(toggle).to_be_visible(timeout=30_000)
+    item = page.get_by_role("menuitemradio", name=option)
+    for attempt in range(_VIEW_MENU_OPEN_ATTEMPTS):
+        toggle.click()
+        try:
+            expect(item).to_be_visible(timeout=_VIEW_MENU_OPEN_TIMEOUT_MS)
+            break
+        except AssertionError:
+            if attempt == _VIEW_MENU_OPEN_ATTEMPTS - 1:
+                raise
+    item.click()
+
+
 def _ensure_chat_view(page: Page) -> None:
     """Switch a terminal-first (native) session to its chat bubble view.
 
@@ -76,13 +109,9 @@ def _ensure_chat_view(page: Page) -> None:
 
     :param page: The Playwright page, on the session's chat surface.
     """
-    view_mode = page.get_by_test_id("view-mode-toggle")
-    if view_mode.count() == 0:
+    if page.get_by_test_id("view-mode-toggle").count() == 0:
         return
-    view_mode.click()
-    chat_item = page.get_by_role("menuitemradio", name="Chat")
-    expect(chat_item).to_be_visible(timeout=30_000)
-    chat_item.click()
+    _select_view_mode(page, "Chat")
 
 
 def _turn_prompt(index: int, user_marker: str, assistant_token: str) -> str:
