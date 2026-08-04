@@ -33,6 +33,23 @@ _HOST_ID = "host_abc123"
 _SESSION_ID = "conv_routed"
 
 
+@pytest.fixture(autouse=True)
+def _no_local_gateway_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the machine-local gateway check to "unknown" for every test.
+
+    The preflight resolves this machine's own harness configs, so leaving it
+    live would make every case depend on the developer's ``~/.omnigent``. Cases
+    about the local gate override it explicitly.
+    """
+    monkeypatch.setattr("omnigent.smart_routing_cli.local_gateway_inference", dict)
+
+
+def _mock_local_gateway(monkeypatch: pytest.MonkeyPatch, gateway: dict[str, bool]) -> None:
+    monkeypatch.setattr(
+        "omnigent.smart_routing_cli.local_gateway_inference", lambda: dict(gateway)
+    )
+
+
 def _mock_info(*, enabled: bool = True) -> None:
     respx.get(f"{_BASE}/v1/info").mock(
         return_value=httpx.Response(200, json={"smart_routing_enabled": enabled})
@@ -138,6 +155,128 @@ def test_auto_route_requires_both_native_families() -> None:
     assert smart_routing_families(None) == ("claude-native", "codex-native")
     assert smart_routing_families("auto") == ("claude-native", "codex-native")
     assert smart_routing_families("codex-native") == ("codex-native",)
+
+
+# ── preflight: the machine-local gate ────────────────────────────────────
+#
+# A ``--smart-routing`` launch runs its TUI on THIS machine, so the local config
+# resolution is the authoritative answer about whether a routed model would be
+# reachable — and unlike the host row it is available before the daemon has
+# registered, which is exactly when the server-side gate reads "unknown".
+
+#: The four credential states the gating table pins, as this machine reports
+#: them: (state, local map, the harness that must still route).
+_LOCAL_GATEWAY_STATES: list[tuple[str, dict[str, bool], str | None]] = [
+    ("A: neither harness on the gateway", {"claude-native": False, "codex-native": False}, None),
+    (
+        "B: claude on the gateway, codex on a ChatGPT subscription",
+        {"claude-native": True, "codex-native": False},
+        "claude-native",
+    ),
+    (
+        "C: codex on the gateway, claude on a subscription",
+        {"claude-native": False, "codex-native": True},
+        "codex-native",
+    ),
+    ("D: both on the gateway", {"claude-native": True, "codex-native": True}, "both"),
+]
+
+
+@respx.mock
+@pytest.mark.parametrize(("state", "local", "routable"), _LOCAL_GATEWAY_STATES)
+def test_preflight_gates_each_harness_on_the_local_gateway_answer(
+    monkeypatch: pytest.MonkeyPatch, state: str, local: dict[str, bool], routable: str | None
+) -> None:
+    """Each arm gates on its OWN inference; the auto route needs both."""
+    _mock_info()
+    # No host row at all — the local answer must gate on its own.
+    _mock_hosts(None)
+    _mock_local_gateway(monkeypatch, local)
+
+    for harness in ("claude-native", "codex-native"):
+        allowed = routable in (harness, "both")
+        if allowed:
+            check_smart_routing_available(base_url=_BASE, harnesses=(harness,), host_id=None)
+        else:
+            with pytest.raises(ClickException, match=f"unavailable for {harness}"):
+                check_smart_routing_available(base_url=_BASE, harnesses=(harness,), host_id=None)
+    # The auto route picks across both arms, so one arm off the gateway takes it.
+    auto = smart_routing_families(None)
+    if routable == "both":
+        check_smart_routing_available(base_url=_BASE, harnesses=auto, host_id=None)
+    else:
+        with pytest.raises(ClickException, match="not AI-Gateway-backed"):
+            check_smart_routing_available(base_url=_BASE, harnesses=auto, host_id=None)
+
+
+@respx.mock
+def test_preflight_gates_without_a_registered_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The local answer gates even when the server has never seen this host.
+
+    Before the daemon registers there is no ``gateway_inference`` row to read,
+    and the old server-only gate let a routed launch through on a pane that
+    could not reach the pick.
+    """
+    _mock_info()
+    _mock_local_gateway(monkeypatch, {"codex-native": False})
+
+    with pytest.raises(ClickException, match=r"codex-native.*not AI-Gateway-backed"):
+        check_smart_routing_available(base_url=_BASE, harnesses=("codex-native",), host_id=None)
+
+
+@respx.mock
+def test_preflight_local_answer_wins_over_a_stale_host_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TUI launches here, so this machine's own config decides."""
+    _mock_info()
+    _mock_hosts({"codex-native": True})
+    _mock_local_gateway(monkeypatch, {"codex-native": False})
+
+    with pytest.raises(ClickException, match="not AI-Gateway-backed"):
+        check_smart_routing_available(
+            base_url=_BASE, harnesses=("codex-native",), host_id=_HOST_ID
+        )
+
+
+@respx.mock
+def test_preflight_falls_back_to_the_host_row_for_an_unanswered_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A family the local check could not evaluate is omitted, not False."""
+    _mock_info()
+    _mock_hosts({"codex-native": False})
+    # gateway_inference_map omits an unevaluable family, so codex is absent here.
+    _mock_local_gateway(monkeypatch, {"claude-native": True})
+
+    with pytest.raises(ClickException, match="not AI-Gateway-backed"):
+        check_smart_routing_available(
+            base_url=_BASE, harnesses=("codex-native",), host_id=_HOST_ID
+        )
+
+
+@respx.mock
+def test_preflight_routing_disabled_is_reported_before_the_gateway_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """State A's two causes read differently: no router beats no gateway."""
+    _mock_info(enabled=False)
+    _mock_local_gateway(monkeypatch, {"claude-native": False, "codex-native": False})
+
+    with pytest.raises(ClickException, match="no routing model configured"):
+        check_smart_routing_available(base_url=_BASE, harnesses=("claude-native",), host_id=None)
+
+
+def test_local_gateway_inference_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unevaluable local map is unknown, and unknown does not gate."""
+    from omnigent import smart_routing_cli
+
+    def _boom() -> dict[str, bool]:
+        raise RuntimeError("no config")
+
+    monkeypatch.setattr("omnigent.gateway_inference.gateway_inference_map", _boom)
+
+    assert smart_routing_cli.local_gateway_inference() == {}
 
 
 # ── the routed create ────────────────────────────────────────────────────
@@ -681,3 +820,84 @@ def test_claude_subcommand_falls_back_to_a_fresh_session(
     assert captured["session_id"] is None
     assert captured["prompt"] == "hello"
     assert "Smart Routing was unavailable" in result.output
+
+
+# ── credential-provider gating, end to end ───────────────────────────────
+#
+# The shape a Databricks user actually has: Claude Code pointed at the workspace
+# AI Gateway, Codex signed in to a personal ChatGPT subscription. Routing is
+# applied by rewriting the launch model to a gateway catalog id, so only the
+# Claude pane can honour it — every routed entry point into Codex must fail
+# fast, and the auto route (which may land on either arm) with it.
+
+_CODEX_ON_SUBSCRIPTION = {"claude-native": True, "codex-native": False}
+_NO_GATEWAY_AT_ALL = {"claude-native": False, "codex-native": False}
+
+
+@respx.mock
+def test_auto_route_is_refused_when_only_one_arm_is_gateway_backed() -> None:
+    _mock_info()
+    _mock_hosts(_CODEX_ON_SUBSCRIPTION)
+
+    with pytest.raises(ClickException, match=r"codex-native.*not AI-Gateway-backed"):
+        check_smart_routing_available(
+            base_url=_BASE,
+            harnesses=smart_routing_families(None),
+            host_id=_HOST_ID,
+        )
+
+
+@respx.mock
+def test_claude_route_survives_codex_being_on_a_subscription() -> None:
+    """Per-family gating: the arm that IS on the gateway keeps its routing."""
+    _mock_info()
+    _mock_hosts(_CODEX_ON_SUBSCRIPTION)
+
+    check_smart_routing_available(
+        base_url=_BASE,
+        harnesses=smart_routing_families("claude-native"),
+        host_id=_HOST_ID,
+    )
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("args", "gateway"),
+    [
+        # The auto route may land on Codex, so one ungatewayed arm blocks it.
+        (["run", "--smart-routing", "-p", "hello"], _CODEX_ON_SUBSCRIPTION),
+        (
+            ["run", "--harness", "codex-native", "--smart-routing", "-p", "hello"],
+            _CODEX_ON_SUBSCRIPTION,
+        ),
+        (["codex", "--smart-routing", "-p", "hello"], _CODEX_ON_SUBSCRIPTION),
+        # No AI Gateway anywhere: every entry point errors, Claude included.
+        (["run", "--smart-routing", "-p", "hello"], _NO_GATEWAY_AT_ALL),
+        (["claude", "--smart-routing", "-p", "hello"], _NO_GATEWAY_AT_ALL),
+    ],
+)
+def test_smart_routing_entry_points_error_on_an_ungatewayed_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    _routing_env: None,
+    args: list[str],
+    gateway: dict[str, Any],
+) -> None:
+    _mock_info()
+    _mock_hosts(gateway)
+
+    def _must_not_launch(**_kwargs: Any) -> None:
+        raise AssertionError("wrapper launched despite ungatewayed inference")
+
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _must_not_launch)
+    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _must_not_launch)
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 1, result.output
+    assert "not AI-Gateway-backed" in result.output
+    # The error names the harness and the way out, not just "unavailable".
+    assert "omnigent configure harnesses" in result.output
+    # Nothing was created: a pick that cannot be applied is not attempted, so
+    # preflight's reads are the only traffic.
+    assert all(call.request.method == "GET" for call in respx.calls)

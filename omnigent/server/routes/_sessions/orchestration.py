@@ -6057,6 +6057,119 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
     ]
 
 
+def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -> list[str]:
+    """Which of *harnesses* this host does not back with the workspace AI gateway.
+
+    Routing rewrites the launch model to a gateway catalog id, so a CLI pointed
+    at Bedrock, a personal subscription, or any other provider cannot run the
+    pick even with the binary installed. Reads the host's ``gateway_inference``
+    map; unknown (an older host, or none bound) keeps every option.
+
+    :param host: The session's target host, or ``None`` (e.g. a sandbox).
+    :param harnesses: Harness ids to check, e.g. ``("claude-native",)``.
+    :returns: The not-backed ids, in the order given.
+    """
+    from omnigent.gateway_inference import not_gateway_backed
+
+    gateway = getattr(host, "gateway_inference", None) if host is not None else None
+    return not_gateway_backed(gateway, harnesses)
+
+
+def _harness_labels(harnesses: Sequence[str]) -> str:
+    """Join *harnesses* into user-facing prose, e.g. ``"Claude Code and Codex"``.
+
+    :param harnesses: Harness ids, e.g. ``("claude-native", "codex-native")``.
+    :returns: The display names, comma-joined with a trailing "and".
+    """
+    labels = []
+    for harness in harnesses:
+        native = native_coding_agent_for_harness(harness)
+        labels.append(native.display_name if native is not None else harness)
+    if len(labels) <= 1:
+        return labels[0] if labels else ""
+    return f"{', '.join(labels[:-1])} and {labels[-1]}"
+
+
+def _ungatewayed_auto_routing_error(ungatewayed: Sequence[str]) -> str:
+    """Message for a top-level Smart Routing create the gateway cannot back.
+
+    Both arms are on the menu, so one arm off the gateway takes the whole
+    top-level pick away — the router would be free to land the session on a
+    pane that cannot run its own routed model.
+
+    :param ungatewayed: The arms the host does not back, e.g.
+        ``["codex-native"]``.
+    :returns: One sentence naming the arms and the way out.
+    """
+    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+
+    verb = "is" if len(ungatewayed) == 1 else "are"
+    return (
+        f"Smart Routing needs {_harness_labels(AUTO_NATIVE_ROUTING_HARNESSES)} on the "
+        f"workspace AI Gateway: {_harness_labels(ungatewayed)} {verb} not AI-Gateway-backed "
+        "on this host, so a routed model would not be reachable. Pick a harness directly, "
+        "or point it at the workspace AI Gateway (`omnigent configure harnesses`)."
+    )
+
+
+def _ungatewayed_model_routing_error(harness: str) -> str:
+    """Message for a routing-on create whose own harness is off the gateway.
+
+    :param harness: The session's native harness, e.g. ``"codex-native"``.
+    :returns: One sentence naming the harness and the way out.
+    """
+    return (
+        f"Smart Routing is unavailable for {harness} on this host: "
+        f"{_harness_labels([harness])} is not backed by the AI Gateway, so a routed model "
+        "would not be reachable from the pane. Create the session without "
+        'cost_control_mode_override="on", or point the harness at the workspace AI Gateway '
+        "(`omnigent configure harnesses`)."
+    )
+
+
+async def _reject_ungatewayed_model_routing(
+    body: SessionCreateRequest,
+    request: Request,
+    user_id: str | None,
+    agent: Agent,
+    agent_cache: AgentCache | None,
+) -> None:
+    """Reject a routing-on create pinned to a harness the gateway cannot back.
+
+    Smart Routing as a Model choice only exists on the two native panes, and it
+    is applied by rewriting their launch/turn model to a gateway catalog id. A
+    caller who asks for it on a pane running off a personal subscription gets a
+    clear error rather than a session whose routing silently never applies.
+
+    Children and sub-agent sessions are routed by the spawn/turn paths in their
+    parent's family, so they are left to those gates.
+
+    :param body: The validated create request.
+    :param request: Used to reach the app's host store.
+    :param user_id: Authenticated caller, or ``None`` when auth is disabled.
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: None when the create may proceed.
+    :raises OmnigentError: 400 when the harness is not AI-Gateway-backed.
+    :raises HTTPException: 404/403 from resolving ``body.host_id``.
+    """
+    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+
+    if body.cost_control_mode_override != "on":
+        return
+    if body.parent_session_id is not None or body.sub_agent_name is not None:
+        return
+    harness = await asyncio.to_thread(
+        _create_resolved_harness, agent, body.harness_override, agent_cache
+    )
+    if harness not in AUTO_NATIVE_ROUTING_HARNESSES:
+        return
+    host = await _routing_host_for_create(body, request, user_id)
+    if not _ungatewayed_native_harnesses(host, (harness,)):
+        return
+    raise OmnigentError(_ungatewayed_model_routing_error(harness), code=ErrorCode.INVALID_INPUT)
+
+
 # Per-harness budget for the pre-session host model-options round-trip. This
 # sits on the session-create path, so it stays well under the picker's own
 # 15s ceiling: a slow or silent host degrades to the static table rather than
@@ -6330,9 +6443,15 @@ async def _resolve_native_smart_routing(
     :raises HTTPException: 404 if ``host_id`` is unknown, 403 if it belongs
         to another user.
     """
-    from omnigent.server.smart_routing import route_session_harness
+    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES, route_session_harness
 
     host = await _routing_host_for_create(body, request, user_id)
+    # Both arms must be gateway-backed before the router may choose between
+    # them: an arm off the gateway cannot run a routed model, and the pick is
+    # made after the create commits, so there is no safe half-menu.
+    ungatewayed = _ungatewayed_native_harnesses(host, AUTO_NATIVE_ROUTING_HARNESSES)
+    if ungatewayed:
+        return None, None, None, _ungatewayed_auto_routing_error(ungatewayed)
     installed = _installed_native_harnesses(host)
     if not installed:
         return None, None, None, "No native CLI is installed on this host."
@@ -6454,6 +6573,12 @@ async def _create_session_from_existing_agent(
             permission_store=permission_store,
             conversation_store=conversation_store,
         )
+
+    # Routing on a native pane whose CLI is not AI-Gateway-backed can never
+    # apply, so an explicit request for it is an error rather than a session
+    # that silently ignores it. (The auto path checks both arms itself, above.)
+    if not _native_smart_routing:
+        await _reject_ungatewayed_model_routing(body, request, user_id, agent, agent_cache)
 
     # Fixed native harness + Smart Routing on: the harness is the caller's own
     # choice, so only the MODEL is routed — and it has to happen here, since the

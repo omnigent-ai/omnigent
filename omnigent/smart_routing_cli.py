@@ -92,6 +92,27 @@ def smart_routing_families(harness: str | None) -> tuple[str, ...]:
     return (harness,)
 
 
+def local_gateway_inference() -> dict[str, bool]:
+    """
+    This machine's own per-harness AI-Gateway-backed map, or ``{}``.
+
+    A ``--smart-routing`` launch always runs its TUI on *this* machine, so the
+    local config resolution is the authoritative answer — and it needs neither a
+    registered host row nor a server round-trip. Never raises: an unevaluable
+    map is "unknown", which does not gate.
+
+    :returns: Harness spelling → gateway-backed flag, e.g.
+        ``{"claude-native": True, "codex-native": False}``; ``{}`` when the
+        check could not run at all.
+    """
+    from omnigent.gateway_inference import gateway_inference_map
+
+    try:
+        return gateway_inference_map()
+    except Exception:  # noqa: BLE001 — an unevaluable map is unknown, not unavailable
+        return {}
+
+
 def check_smart_routing_available(
     *,
     base_url: str,
@@ -101,18 +122,26 @@ def check_smart_routing_available(
     """
     Fail loud when Smart Routing cannot be applied for *harnesses*.
 
-    Two gates, both config-level (no liveness probing): the server must have a
-    routing client (``GET /v1/info`` ``smart_routing_enabled``), and this
-    machine's inference for each harness family must be AI-Gateway-backed
-    (``GET /v1/hosts`` ``gateway_inference``). An absent ``gateway_inference``
-    map — or an absent entry in it — is *unknown*, not unavailable: hosts on
-    older builds keep every option.
+    Three gates, all config-level (no liveness probing):
+
+    1. the server must have a routing client (``GET /v1/info``
+       ``smart_routing_enabled``);
+    2. this machine's own inference for each harness family must be
+       AI-Gateway-backed (:func:`local_gateway_inference`) — the launch happens
+       here, so the local answer is authoritative and needs no host row;
+    3. failing a local answer, the host row the server holds for this machine
+       (``GET /v1/hosts`` ``gateway_inference``), which is what an older CLI
+       had to rely on.
+
+    An absent ``gateway_inference`` map — or an absent entry in it — is
+    *unknown*, not unavailable: a family whose check could not run keeps every
+    option.
 
     :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
     :param harnesses: Harness ids the route may pick, e.g.
         ``("claude-native",)``.
     :param host_id: This machine's host id, e.g. ``"host_abc123"``. ``None``
-        skips the per-host gate (nothing to look up).
+        skips the server-side per-host gate (nothing to look up).
     :returns: None when routing may proceed.
     :raises click.ClickException: When routing is unavailable, naming why.
     """
@@ -123,13 +152,16 @@ def check_smart_routing_available(
             "model configured. Re-run without --smart-routing, or pass --model to "
             "pick a model yourself."
         )
-    if host_id is None:
-        return
-    gateway = _gateway_inference_for_host(base_url=base_url, host_id=host_id)
-    if gateway is None:
-        return
+    local = local_gateway_inference()
+    remote: dict[str, Any] | None = None
     for harness in harnesses:
-        state = _gateway_state(gateway, harness)
+        state = _gateway_state(local, harness)
+        if state is None:
+            # The local check said nothing about this family; fall back to the
+            # host row, which an older host build may still answer for.
+            if remote is None and host_id is not None:
+                remote = _gateway_inference_for_host(base_url=base_url, host_id=host_id) or {}
+            state = _gateway_state(remote or {}, harness)
         if state is None or state is True:
             continue
         reason = state if isinstance(state, str) else "not gateway-backed"

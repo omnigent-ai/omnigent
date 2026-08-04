@@ -10,6 +10,8 @@ pipeline without subprocesses.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
@@ -133,6 +135,53 @@ async def test_info_advertises_installable_harnesses_when_enabled(
     assert data["harness_install_enabled"] is True
     assert set(data["installable_harnesses"]) == set(ui_installable_harnesses())
     assert "codex-native" in data["installable_harnesses"]
+
+
+# ── GET /v1/info: smart_routing_enabled ──────────────────
+#
+# The flag is the SPA's and the CLI's first gate: with it false, no Smart
+# Routing surface exists anywhere (no top-level harness row, no per-harness
+# Model option, no bundle-agent brain option), and ``--smart-routing`` is a hard
+# error. It reports whether the SERVER can route at all — a host whose CLIs run
+# off a personal subscription is gated separately, per harness, off the host's
+# ``gateway_inference`` map.
+
+
+async def test_info_reports_smart_routing_off_without_a_router(
+    client: httpx.AsyncClient,
+) -> None:
+    """No ``routing:`` block and no Databricks provider means no routing."""
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    assert resp.json()["smart_routing_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("caps", "expected"),
+    [
+        # Nothing initialized at all (an embedding host that never built caps).
+        (None, False),
+        # Caps with neither routing capability.
+        (SimpleNamespace(routing_client=None, policy_llm_connection_factory=None), False),
+        # A configured RoutingClient (a server ``llm:`` block, or
+        # ``routing.provider=external``, or the Databricks-provider default).
+        (SimpleNamespace(routing_client=object(), policy_llm_connection_factory=None), True),
+        # A managed deployment supplies its own client from this factory.
+        (SimpleNamespace(routing_client=None, policy_llm_connection_factory=lambda: None), True),
+    ],
+)
+async def test_info_smart_routing_enabled_tracks_the_servers_routing_capability(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caps: object,
+    expected: bool,
+) -> None:
+    """Either routing capability turns the flag on; neither leaves it off."""
+    monkeypatch.setattr("omnigent.runtime._globals._caps", caps, raising=False)
+
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    assert resp.json()["smart_routing_enabled"] is expected
 
 
 # ── GET /v1/me ───────────────────────────────────────────

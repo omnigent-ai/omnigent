@@ -526,7 +526,10 @@ async def test_no_installed_native_candidates_reports_the_standard_error() -> No
     assert routing_client.offered == []
 
 
-def _host(readiness: dict[str, Any] | None) -> Host:  # type: ignore[explicit-any]
+def _host(
+    readiness: dict[str, Any] | None,  # type: ignore[explicit-any]
+    gateway: dict[str, bool] | None = None,
+) -> Host:
     return Host(
         host_id="host_1",
         name="dev",
@@ -535,6 +538,7 @@ def _host(readiness: dict[str, Any] | None) -> Host:  # type: ignore[explicit-an
         created_at=0,
         updated_at=0,
         configured_harnesses=readiness,
+        gateway_inference=gateway,
     )
 
 
@@ -557,6 +561,219 @@ def test_installed_native_harnesses_follows_host_readiness(
     host: Host | None, expected: list[str]
 ) -> None:
     assert _installed_native_harnesses(host) == expected
+
+
+# ── Credential-provider gating ──────────────────────────────────────────────
+#
+# Routing rewrites the launch model to a gateway catalog id, so a pane whose CLI
+# resolves credentials somewhere else (a personal Claude/ChatGPT subscription,
+# Bedrock) cannot run the pick. The host reports that per family as
+# ``gateway_inference``; only an explicit ``False`` gates, so an older host that
+# reports nothing keeps every option.
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        (_host(None, {"claude-native": True, "codex-native": True}), []),
+        # Claude Code on the gateway, Codex on a ChatGPT subscription.
+        (_host(None, {"claude-native": True, "codex-native": False}), ["codex-native"]),
+        (
+            _host(None, {"claude-native": False, "codex-native": False}),
+            AUTO_NATIVE_ROUTING_HARNESSES,
+        ),
+        # Reversed spellings resolve to the same family.
+        (_host(None, {"native-codex": False}), ["codex-native"]),
+        # Unknown is not "unavailable": an older host, an unevaluable family,
+        # and no host at all all keep both arms.
+        (_host(None, {"claude-native": True}), []),
+        (_host(None, None), []),
+        (None, []),
+    ],
+)
+def test_ungatewayed_native_harnesses_reads_the_hosts_gateway_map(
+    host: Host | None, expected: list[str]
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
+
+    assert _ungatewayed_native_harnesses(host, AUTO_NATIVE_ROUTING_HARNESSES) == list(expected)
+
+
+def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
+    """A request whose host store serves *host* and whose registry is empty."""
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                host_store=SimpleNamespace(get_host=lambda host_id: host),
+                host_registry=None,
+            )
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("gateway", "named"),
+    [
+        ({"claude-native": True, "codex-native": False}, "Codex"),
+        ({"claude-native": False, "codex-native": True}, "Claude"),
+        # No AI Gateway anywhere: both arms are named.
+        ({"claude-native": False, "codex-native": False}, "Claude and Codex"),
+    ],
+)
+async def test_auto_routing_is_refused_when_an_arm_is_off_the_gateway(
+    gateway: dict[str, bool],
+    named: str,
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        agent_name, model, verdict, error = await _resolve_native_smart_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(_host(None, gateway))),
+            "alice@example.com",
+        )
+
+    # No wrapper name is the signal the create turns into a 400.
+    assert (agent_name, model, verdict) == (None, None, None)
+    assert error is not None
+    assert named in error
+    assert "not AI-Gateway-backed" in error
+    # The router is never asked to pick between arms it cannot apply to.
+    assert routing_client.offered == []
+
+
+async def test_auto_routing_still_runs_when_the_host_reports_no_gateway_map() -> None:
+    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        agent_name, model, _verdict, error = await _resolve_native_smart_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(_host(None, None))),
+            "alice@example.com",
+        )
+
+    assert error is None
+    assert (agent_name, model) == ("codex-native-ui", GPT_MODEL)
+
+
+async def test_top_level_smart_routing_create_is_rejected_off_the_gateway(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    ungatewayed = _host(None, {"claude-native": True, "codex-native": False})
+    with patch.object(
+        orchestration, "_routing_host_for_create", return_value=ungatewayed
+    ) as _resolved:
+        created = await _create_smart_routing_session(client, wrappers, routing_client)
+
+    assert created.status_code == 400, created.text
+    assert "not AI-Gateway-backed" in created.text
+    assert routing_client.offered == []
+
+
+@pytest.mark.parametrize("harness", list(AUTO_NATIVE_ROUTING_HARNESSES))
+async def test_fixed_harness_routing_create_is_rejected_off_the_gateway(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    ungatewayed = _host(None, {harness: False})
+    with patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed):
+        created = await _create_fixed_harness_session(client, wrappers[harness], routing_client)
+
+    assert created.status_code == 400, created.text
+    assert harness in created.json()["error"]["message"]
+    assert "not backed by the AI Gateway" in created.json()["error"]["message"]
+    assert routing_client.offered == []
+
+
+@pytest.mark.parametrize(
+    ("gateway", "extra"),
+    [
+        # The other family being off the gateway is not this pane's problem.
+        ({"claude-native": True, "codex-native": False}, {}),
+        # Unknown keeps the option.
+        ({}, {}),
+        # Routing not asked for: the guard has nothing to reject.
+        ({"claude-native": False}, {"cost_control_mode_override": "off"}),
+    ],
+)
+async def test_fixed_harness_create_is_allowed_when_its_own_family_is_backed(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    gateway: dict[str, bool],
+    extra: dict[str, Any],  # type: ignore[explicit-any]
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    with patch.object(
+        orchestration, "_routing_host_for_create", return_value=_host(None, gateway)
+    ):
+        created = await _create_fixed_harness_session(
+            client, wrappers["claude-native"], routing_client, **extra
+        )
+
+    assert created.status_code == 201, created.text
+
+
+async def test_child_create_is_not_gated_by_the_parents_gateway_state(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    wrappers = await _native_wrappers(client, db_uri)
+    parent = await client.post("/v1/sessions", json={"agent_id": wrappers["codex-native"]})
+    assert parent.status_code == 201, parent.text
+
+    # A child is routed by the spawn / turn paths in its parent's family, so the
+    # create-time gate leaves it alone rather than 400ing a legitimate spawn.
+    with patch.object(
+        orchestration,
+        "_routing_host_for_create",
+        return_value=_host(None, {"codex-native": False}),
+    ):
+        created = await _create_fixed_harness_session(
+            client,
+            wrappers["codex-native"],
+            None,
+            parent_session_id=parent.json()["id"],
+        )
+
+    assert created.status_code == 201, created.text
+
+
+async def test_sdk_harness_create_is_not_gated_by_native_gateway_state(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    # An SDK harness runs its inference through the server, not a host CLI, so a
+    # host whose native CLIs are off the gateway says nothing about it.
+    agent = await create_test_agent(client, name="ungatewayed-sdk-agent")
+    with patch.object(
+        orchestration,
+        "_routing_host_for_create",
+        return_value=_host(None, {"claude-native": False, "codex-native": False}),
+    ):
+        created = await _create_fixed_harness_session(client, agent["id"], None)
+
+    assert created.status_code == 201, created.text
 
 
 # ── Pre-session candidate catalog ───────────────────────────────────────────
