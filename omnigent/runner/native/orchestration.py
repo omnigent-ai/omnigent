@@ -6299,7 +6299,6 @@ async def _auto_create_claude_terminal(
         subagent_router_dir=subagent_router_dir,
         append_system_prompt=routed_spawn_note,
         allowed_tools=routed_spawn_tools,
-        turn_router_dir=bridge_dir if _claude_turn_router is not None else None,
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
