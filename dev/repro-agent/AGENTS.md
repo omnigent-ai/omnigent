@@ -28,18 +28,22 @@ session and logs are things you *produce*, not inputs:
   or `https://linear.app/omnigent/issue/OMNI-1234`). Read the report to get the
   bug description, steps, and version:
   - **GitHub** → `gh issue view <url> --comments` (the CLI is on the machine).
-  - **Linear** → query the GraphQL API with `sys_os_shell`, using the
-    `LINEAR_API_KEY` from your environment (endpoint
-    `https://api.linear.app/graphql`, header `Authorization: $LINEAR_API_KEY` —
-    **no** `Bearer` prefix). Fetch the ticket by its identifier, e.g.:
+  - **Linear** → query the GraphQL API with `sys_os_shell`, using the Linear key
+    from your environment. It arrives as `LINEAR_API_KEY` locally or as
+    `DATABRICKS_LINEAR_API_KEY` under `--server` (the CLI→runner env strip only
+    forwards the `DATABRICKS_`-prefixed name), so read whichever is set. Endpoint
+    `https://api.linear.app/graphql`, header `Authorization: <key>` — **no**
+    `Bearer` prefix. Fetch the ticket by its identifier, e.g.:
     ```bash
+    KEY="${LINEAR_API_KEY:-$DATABRICKS_LINEAR_API_KEY}"
     curl -s https://api.linear.app/graphql \
-      -H "Authorization: $LINEAR_API_KEY" -H 'Content-Type: application/json' \
+      -H "Authorization: $KEY" -H 'Content-Type: application/json' \
       -d '{"query":"{ issue(id: \"OMNI-1234\") { identifier title description url state { name } comments(first: 50) { nodes { body } } attachments(first: 20) { nodes { url } } } }"}'
     ```
-    If `LINEAR_API_KEY` is not set (or the fetch fails auth), you cannot read the
-    ticket body — stop with verdict `needs_more_info` naming the missing key
-    rather than guessing the bug from the URL slug.
+    If neither `LINEAR_API_KEY` nor `DATABRICKS_LINEAR_API_KEY` is set (or the
+    fetch fails auth), you cannot read the ticket body — stop with verdict
+    `needs_more_info` naming the missing key rather than guessing the bug from the
+    URL slug.
   - **Linear → linked GitHub issue.** A Linear ticket often links a GitHub issue
     (in its `attachments`, description, or comments). If you find one, **always
     fetch that GitHub issue too** (`gh issue view <url> --comments`) and treat it
@@ -87,8 +91,9 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    tooling with one `sys_os_shell` / tool check: the browser tools
    (`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`)
    for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
-   can read the report: `gh` is available for a GitHub issue, or `LINEAR_API_KEY`
-   is set for a Linear ticket (if it isn't, stop with `needs_more_info`).
+   can read the report: `gh` is available for a GitHub issue, or a Linear key
+   (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
+   (if it isn't, stop with `needs_more_info`).
 
 If you cannot reach the app at all, stop and say so. Don't narrate a clean
 preflight.

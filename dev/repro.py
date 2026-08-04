@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -45,6 +46,35 @@ _AGENT_REL = "dev/repro-agent"
 def _die(msg: str) -> NoReturn:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def _launch_env(bug_url: str) -> dict[str, str]:
+    """Build the child env for ``omnigent run``, forwarding the Linear key.
+
+    Reading a Linear ticket needs ``DATABRICKS_LINEAR_API_KEY`` to reach the
+    agent's shell. Under ``--server`` the daemon→runner hop strips everything
+    not in its allowlist, and the ``DATABRICKS_`` prefix survives only the
+    CLI→daemon hop — so we also name the key in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
+    (itself allowlisted), which tells the runner env-build to forward it the rest
+    of the way. Only kicks in for Linear URLs; if the key is unset we warn rather
+    than fail (the agent stops with ``needs_more_info`` and names the missing key).
+    """
+    env = os.environ.copy()
+    if "linear.app" not in bug_url:
+        return env
+    if not env.get("DATABRICKS_LINEAR_API_KEY"):
+        print(
+            "warning: Linear URL but DATABRICKS_LINEAR_API_KEY is not set — the "
+            "agent won't be able to read the ticket (it will stop with "
+            "needs_more_info).",
+            file=sys.stderr,
+        )
+        return env
+    names = [n for n in env.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "").split(",") if n.strip()]
+    if "DATABRICKS_LINEAR_API_KEY" not in names:
+        names.append("DATABRICKS_LINEAR_API_KEY")
+    env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] = ",".join(names)
+    return env
 
 
 def _slug_from_bug_url(bug_url: str) -> str:
@@ -174,10 +204,12 @@ def main() -> None:
     cmd = ["omnigent", "run", _AGENT_REL, "-p", prompt]
     if args.server is not None:
         cmd += ["--server", args.server]
+
+    env = _launch_env(bug_url)
     print(f"→ running: {' '.join(cmd)}")
     print(f"→ cwd:     {worktree}\n")
 
-    result = subprocess.run(cmd, cwd=str(worktree), check=False)
+    result = subprocess.run(cmd, cwd=str(worktree), env=env, check=False)
 
     # Always keep the worktree; the authored test (if any) lives on its branch.
     print(
