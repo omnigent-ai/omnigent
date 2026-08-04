@@ -162,14 +162,38 @@ Confirmed constraints (per the official hooks/model-config docs, checked
   transcribing that constant, plan 0d).
 
 So the deterministic claude sequence is exactly Variant A:
-**block → `/model <alias>` (locked, settle-confirmed) → send-keys the
-original prompt → turn 1 runs routed.** Every step is an existing, verified
-primitive; the only new composition is "replay the blocked prompt", and
-web-message delivery already does precisely that injection every day. The
-fallback if the block UX proves unacceptable (S3): non-blocking turn-2
-routing — allow turn 1 on the default, apply `/model` immediately after, all
-subsequent turns routed. Worse (turn 1 unrouted) but zero UX disruption;
-product call after the spike.
+**block → `/model <id>` (settle-confirmed) → send-keys the original prompt →
+turn 1 runs routed.** Every step is an existing, verified primitive; the only
+new composition is "replay the blocked prompt", and web-message delivery
+already does precisely that injection every day. **S3 verified all of it
+live** (see §4) and the turn-2 fallback is NOT needed.
+
+Four claude-specific facts S3 corrected or discovered:
+
+1. **The claude hook payload has no `model` field** (codex's does) and no
+   omnigent session id — fields are `session_id` (claude's own),
+   `transcript_path`, `cwd`, `prompt_id`, `permission_mode`,
+   `hook_event_name`, `prompt`. So `route-turn` bakes
+   `--bridge-dir`/`--session-id` into argv (same as `route-subagent`) and
+   reads the live model from `<bridge_dir>/context.json`, never the payload.
+2. **`/model <arg>` + Enter rewrites the user's GLOBAL default** — the settle
+   line is literally "Set model to X **and saved as your default for new
+   sessions**", and it mutates `~/.claude/settings.json` `"model"`. It did
+   exactly that during S3. The picker's `s` ("session only") has no
+   direct-arg equivalent. **This is a product blocker for shipping the claude
+   actuator as-is** and needs a decision: find a session-scoped switch, drive
+   the picker instead of the arg form, or save/restore the user's key around
+   the switch.
+3. **Weak-model contamination from the `/model` echo.** The slash command
+   lands in context as a `local-command-caveat` ("DO NOT respond to these
+   messages") plus its stdout. On Haiku 4.5 the model then *refused the
+   replayed prompt*. Sonnet 5 / Opus 5 were fine. Pre-existing behavior, but
+   block-and-replay puts that echo ahead of the **first** turn every time —
+   consider suppressing or relocating the echo.
+4. **The `/model` vocabulary in this deployment is full catalog ids**
+   (`databricks-claude-opus-5`, `-sonnet-5`, `-haiku-4-5`), not the bare
+   `opus`/`sonnet` aliases — re-check the alias-pin assumption in 0d before
+   implementing.
 
 ## 4. Spikes — S1/S2/S4 RAN 2026-08-03 on `routing-mvp-v4` (:64688 stack)
 
@@ -187,10 +211,29 @@ product call after the spike.
   hook command exactly as `route-subagent` does. Marker re-entrancy on the
   replay: verified (the replayed prompt's hook no-op'd on the consumed
   marker).
-- **S3 (claude UX): still open** — block a typed prompt on claude; does the
-  input box clear, is the reason shown, does the send-keys replay submit
-  cleanly? (Codex's equivalent is now proven: clean 1.08 s abort, nothing
-  persisted.)
+- **S3 — PASS, ship block-and-replay on claude (no turn-2 fallback needed).**
+  Block is *cleaner* than the docs promise: input box erased, reason rendered
+  in-pane, and **nothing persists** — the claude transcript logs only a
+  `system`/informational row (`preventContinuation: true`), no `user` row and
+  no model call, and the omnigent conversation records nothing for the
+  blocked prompt (items go `resource_event` → `slash_command(model)` →
+  `message(user, replayed)` → `message(assistant)`; no duplicate bubble).
+  Replay is byte-exact including a genuine multi-line prompt (the existing
+  `inject_user_message` `load-buffer` + `paste-buffer -p` bracketed paste
+  submits it as ONE turn). The replay fires a fresh `UserPromptSubmit` and
+  no-ops on the consumed marker; `/model` is a slash command and does **not**
+  fire `UserPromptSubmit`, so the switch cannot self-trigger. Three
+  consecutive routed turns on one session landed three different arms.
+  Visible gap: **~3–4 s** (hook ≈0.5 s; the `/model` settle dominates at
+  ≈2.4–2.7 s).
+
+  Actuator spec that worked (use this, not fixed sleeps): hook blocks and
+  consumes the marker → confirm from the hook log/transcript, **not** pane
+  text → `send-keys C-u`, `send-keys -l "/model <id>"`, `Enter` → **poll
+  `capture-pane` for the `Switch model?` dialog and send `Enter` when seen**
+  → poll `read_claude_status_model` (`<bridge_dir>/context.json`) until it
+  equals the target — that is the settle signal → `inject_user_message(...)`
+  unchanged.
 - **S4 — PASS.** Whole `UserPromptSubmit` chain (policy hook + spike hook +
   two personal user hooks, incl. the app-server round trip): 0.37–0.78 s.
   The `thread/settings/update` itself: 26–77 ms. A 1–3 s router call fits
@@ -260,4 +303,16 @@ rides the existing trust pass; a new module needs its own
   RESOLVED (S2, 2026-08-03): yes, byte-identical payloads. So the deferred
   phase-4 collapse is *technically* open for codex too; still gated on
   Bryan's explicit go per 3c.
-- The only remaining open spike is **S3** (claude block-and-replay UX).
+- ~~S3 (claude block-and-replay UX)~~ — RESOLVED, PASS (see §4). **All spikes
+  are now closed; the design is de-risked and phase 1 can start.**
+- Two items S3 surfaced that need decisions before the claude actuator ships:
+  the global-default write (3d.2) and the `/model`-echo contamination (3d.3).
+- One **pre-existing defect to fix independently of this feature** (S3 found
+  it, it bites the current branch today): `inject_slash_command(auto_confirm=True)`
+  (`claude_native_bridge.py:2911-2916`) confirms the "Switch model?" dialog
+  after a fixed `time.sleep(0.3)`, but that dialog took **1.861 s** to render
+  when the session has cached history. The Enter is dropped, the dialog stays
+  open, and the next `inject_user_message` fails with "terminal did not become
+  ready within 30.0s". First-message routing dodges it (no history → no
+  dialog), but **every turn-2+ routed `/model` switch can hit it**. Fix: poll
+  for the dialog instead of sleeping.
