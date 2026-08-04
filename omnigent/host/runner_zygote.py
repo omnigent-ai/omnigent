@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import BinaryIO
 
 from omnigent.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
@@ -94,7 +95,7 @@ class ZygoteRunnerProc:
             code = self.poll()
             if code is not None:
                 return code
-            if deadline is not None and time.monotonic() >= deadline:
+            if timeout is not None and deadline is not None and time.monotonic() >= deadline:
                 raise subprocess.TimeoutExpired(cmd="omnigent.runner._zygote", timeout=timeout)
             time.sleep(0.05)
 
@@ -197,11 +198,11 @@ class ZygoteManager:
         """
         env = {**os.environ, ZYGOTE_CONTROL_FD_ENV_VAR: str(child_fd)}
         with contextlib.ExitStack() as stack:
-            stdio: dict[str, object] = {"stdin": subprocess.DEVNULL}
+            # The zygote's own stdout/stderr go to its log file when configured,
+            # else inherit the daemon's; stdin is always /dev/null.
+            log_fh: BinaryIO | None = None
             if self._log_path is not None:
                 log_fh = stack.enter_context(open(self._log_path, "ab", buffering=0))
-                stdio["stdout"] = log_fh
-                stdio["stderr"] = log_fh
             # Forward the --log-to-stderr terminal fd so runners forked by the
             # zygote can mirror to the daemon's TTY exactly like the direct-Popen
             # path. The helper dups the fd, rewrites env[LOG_TTY_FD] to the duped
@@ -213,7 +214,9 @@ class ZygoteManager:
                 [self._python, "-m", "omnigent.runner._zygote"],
                 env=env,
                 pass_fds=pass_fds,
-                **stdio,  # type: ignore[arg-type]
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=log_fh,
             )
 
     def fork_runner(self, env: dict[str, str], log_path: str) -> ZygoteRunnerProc:

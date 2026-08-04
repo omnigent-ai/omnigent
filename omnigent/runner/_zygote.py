@@ -49,7 +49,7 @@ import selectors
 import socket
 import sys
 import threading
-from typing import Any
+from typing import Any, cast
 
 from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
 
@@ -255,7 +255,9 @@ class _ZygoteServer:
                 self._reap()
                 # Timeout so idle periods still reap exited children promptly.
                 for key, _mask in self._sel.select(timeout=1.0):
-                    if not self._on_readable(key.fileobj, key.data):
+                    # Only sockets are ever registered, so key.fileobj (typed
+                    # HasFileno | int by selectors) is always a socket here.
+                    if not self._on_readable(cast("socket.socket", key.fileobj), key.data):
                         return
         finally:
             self._sel.close()
@@ -296,7 +298,7 @@ class _ZygoteServer:
             line, _, rest = buf.partition(b"\n")
             del buf[:]
             buf.extend(rest)
-            self._dispatch(conn, line)
+            self._dispatch(conn, bytes(line))
         return True
 
     def _dispatch(self, conn: socket.socket, line: bytes) -> None:
