@@ -7,10 +7,18 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
+import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { BlockRenderer } from "./BlockRenderer";
 
 afterEach(cleanup);
+
+// Stick-to-bottom lock fixture for the fold's expand snap. Module scope so
+// the provider value is a constant (jsx-no-constructed-context-values);
+// reset inside the test that uses it.
+const lockState = { isAtBottom: true, escapedFromLock: false };
+const lockStopScroll = vi.fn();
+const lockValue = { stopScroll: lockStopScroll, state: lockState };
 
 const FILE_VIEWER_NOOP = {
   openFile: () => {},
@@ -357,6 +365,28 @@ describe("BlockRenderer dispatch", () => {
         fireEvent.click(screen.getByText("Worked"));
         expect(screen.getByText("Called 1 tool")).toBeDefined();
         expect(scrollSpy).toHaveBeenCalledTimes(1);
+        expect(scrollSpy).toHaveBeenCalledWith({ block: "start" });
+      });
+
+      it("releases the stick-to-bottom lock before snapping", () => {
+        // Viewing the last turn the view is pinned; without the release
+        // the library's resize-driven scrollToBottom overrides the snap
+        // (isAtBottom is still true from the pre-click view) and the
+        // click appears to do nothing.
+        lockState.isAtBottom = true;
+        lockState.escapedFromLock = false;
+        lockStopScroll.mockReset();
+        render(
+          <ConversationScrollLockContext.Provider value={lockValue}>
+            <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+              <BlockRenderer items={settledItems()} sessionStatus="idle" />
+            </FileViewerContext.Provider>
+          </ConversationScrollLockContext.Provider>,
+        );
+        fireEvent.click(screen.getByText("Worked"));
+        expect(lockStopScroll).toHaveBeenCalledTimes(1);
+        expect(lockState.isAtBottom).toBe(false);
+        expect(lockState.escapedFromLock).toBe(true);
         expect(scrollSpy).toHaveBeenCalledWith({ block: "start" });
       });
 

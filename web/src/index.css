@@ -2064,6 +2064,13 @@
 .turn-fold-content[data-state="open"] {
   animation: turn-fold-expand 200ms cubic-bezier(0.4, 0, 0.2, 1);
 }
+/* User-click expands open at full height in one frame: the animation
+   starts at height 0, so the snap-to-top that accompanies a user expand
+   would clamp against a scroller that has no room yet, then lose the
+   200ms growth to the stick-to-bottom pin / scroll anchoring. */
+.turn-fold-content-instant[data-state="open"] {
+  animation: none;
+}
 .turn-fold-content[data-state="closed"] {
   animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1);
 }

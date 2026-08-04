@@ -25,7 +25,7 @@
 //    bubbles) keeps its trace expanded.
 
 import type { ReactNode } from "react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { defaultRemarkPlugins } from "streamdown";
@@ -34,6 +34,7 @@ import { MessageResponse } from "@/components/ai-elements/message";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
@@ -683,20 +684,24 @@ function TurnWorkedFold({
     return () => cancelAnimationFrame(frame);
   }, [animateCollapse]);
 
-  // On a USER-initiated expand (never the animateCollapse mount-close),
-  // snap the fold row to the top of the scroller so the trace reads
-  // from its beginning. Without this the growing trace doesn't stay
-  // put: viewing the LAST turn, the stick-to-bottom scroller treats the
-  // 200ms height animation as appended content and re-pins the bottom;
-  // elsewhere, native scroll anchoring pins the answer below — either
-  // way the row glides off the top and the click appears to do nothing.
-  // The upward snap doubles as a user-scroll signal that unpins
-  // stick-to-bottom; parking overflow-anchor covers the native case for
-  // the rest of the animation.
+  // A USER-initiated expand (never the animateCollapse mount-close)
+  // opens INSTANTLY — no height animation — and snaps the fold row to
+  // the top of the scroller so the trace reads from its beginning. The
+  // animation is what defeated the snap: it opens at height 0, so at
+  // snap time the scroller has no room yet (the snap clamps at the old
+  // max-scroll), and the 200ms of growth then plays out against the
+  // stick-to-bottom pin (which rides the bottom on the last turn) or
+  // native scroll anchoring (which pins the answer below) — either way
+  // the row glides off the top and the click appears to do nothing.
+  // Instant height means the first layout already has the full trace:
+  // the snap lands, and there is no growth window left to fight over.
   const rowRef = useRef<HTMLDivElement | null>(null);
+  const [userOpened, setUserOpened] = useState(false);
   const scrollOnOpenRef = useRef(false);
+  const scrollLock = useContext(ConversationScrollLockContext);
   const handleOpenChange = (next: boolean) => {
     scrollOnOpenRef.current = next;
+    setUserOpened(next);
     setOpen(next);
   };
   useLayoutEffect(() => {
@@ -704,9 +709,20 @@ function TurnWorkedFold({
     scrollOnOpenRef.current = false;
     const row = rowRef.current;
     if (!row) return;
+    // Release StickToBottom's bottom-lock first (same recipe as
+    // JumpToTopButton): viewing the last turn the view is pinned, and
+    // the expand's resize otherwise fires the library's scrollToBottom
+    // (isAtBottom is still true from the pre-click view), overriding
+    // the snap and riding the bottom — the click appears to do nothing.
+    if (scrollLock) {
+      scrollLock.stopScroll();
+      scrollLock.state.isAtBottom = false;
+      scrollLock.state.escapedFromLock = true;
+    }
     const scroller = nearestScrollContainer(row);
-    // The restore deliberately outlives the effect (no cleanup): the
-    // timer must fire even if the fold re-renders or unmounts mid-hold.
+    // Park native scroll anchoring across the expand commit. The
+    // restore deliberately outlives the effect (no cleanup): the timer
+    // must fire even if the fold re-renders or unmounts mid-hold.
     if (scroller) {
       scroller.style.overflowAnchor = "none";
       window.setTimeout(() => {
@@ -714,7 +730,7 @@ function TurnWorkedFold({
       }, FOLD_EXPAND_ANCHOR_HOLD_MS);
     }
     row.scrollIntoView?.({ block: "start" });
-  }, [open]);
+  }, [open, scrollLock]);
 
   return (
     // Named `group/turn-fold` so only this collapsible's own chevron
@@ -741,7 +757,9 @@ function TurnWorkedFold({
           height that appears before the collapse starts, i.e. the jolt
           this animation exists to remove. Expanded spacing comes from
           the row's hairline above and the message column's gap below. */}
-      <CollapsibleContent className="turn-fold-content">
+      <CollapsibleContent
+        className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
+      >
         <div className="flex flex-col gap-2">{children}</div>
       </CollapsibleContent>
     </Collapsible>
