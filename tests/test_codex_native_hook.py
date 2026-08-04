@@ -546,3 +546,273 @@ def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_i
         "http://127.0.0.1:8787/v1/sessions/conv_active/policies/evaluate"
     )
     assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}
+
+
+# ── route-turn (first-message model routing) ────────────────────────
+
+
+def _advertise_turn_router(bridge_dir: Path) -> None:
+    """
+    Write a live ``turn_router.json`` advertisement into *bridge_dir*.
+
+    :param bridge_dir: The session's bridge directory.
+    :returns: None.
+    """
+    import os
+
+    from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
+
+    (bridge_dir / ADVERTISEMENT_FILE).write_text(
+        json.dumps(
+            {
+                "url": "http://127.0.0.1:54321",
+                "token": "turn-token",
+                "pid": os.getpid(),
+                "session_id": "conv_active",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _run_route_turn(
+    bridge_dir: Path, payload: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> int:
+    """
+    Feed *payload* on stdin and run the ``route-turn`` subcommand.
+
+    :param bridge_dir: The session's bridge directory.
+    :param payload: The codex ``UserPromptSubmit`` hook payload.
+    :param monkeypatch: pytest monkeypatch fixture.
+    :returns: The hook process exit code.
+    """
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    return codex_native_hook.main(
+        ["route-turn", "--bridge-dir", str(bridge_dir), "--harness", "codex-native"]
+    )
+
+
+def test_route_turn_fast_skips_on_the_marker(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A consumed marker means no output and no network at all.
+
+    This is the re-entrancy guard the replayed prompt hits: the replay
+    re-fires ``UserPromptSubmit``, and a second block there would drop the
+    routed turn.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    (bridge_dir / MARKER_FILE).write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *args, **kwargs: pytest.fail("the marker must skip the network"),
+    )
+
+    exit_code = _run_route_turn(
+        bridge_dir, {"prompt": "hello", "model": "gpt-5.6-sol"}, monkeypatch
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""
+
+
+def test_route_turn_blocks_and_switches_on_a_routed_verdict(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A routed verdict switches the thread, writes the marker, then blocks.
+
+    Order is load-bearing: the marker is the runner's "I blocked it, you
+    owe it a replay" handshake, so it must be on disk before the block.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    sent: dict[str, object] = {}
+    switched: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        sent.update({"url": url, "token": token, "body": body, "timeout": timeout})
+        return {
+            "action": "route",
+            "model": "gpt-5.6-luna",
+            "rationale": "short lookup",
+            "terminal": True,
+        }
+
+    def _switch(bdir: Path, model: str) -> bool:
+        # The marker is only written after the switch is accepted.
+        assert not (bdir / MARKER_FILE).exists()
+        switched.append(model)
+        return True
+
+    monkeypatch.setattr(codex_native_hook, "_post_json", _post)
+    monkeypatch.setattr(codex_native_hook, "_apply_thread_model", _switch)
+
+    exit_code = _run_route_turn(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "what testing framework does this project use?",
+            "turn_id": "turn_1",
+            "model": "gpt-5.6-sol",
+        },
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert sent["url"] == "http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"
+    assert sent["token"] == "turn-token"
+    assert sent["body"] == {
+        "harness": "codex-native",
+        "prompt": "what testing framework does this project use?",
+        "turn_id": "turn_1",
+        # The live model comes from the payload; config.toml is stale.
+        "model": "gpt-5.6-sol",
+    }
+    assert switched == ["gpt-5.6-luna"]
+    assert (bridge_dir / MARKER_FILE).exists()
+    result = json.loads(captured.out)
+    assert result["decision"] == "block"
+    assert "gpt-5.6-luna" in result["reason"]
+
+
+def test_route_turn_allows_and_marks_an_already_pinned_session(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A terminal no-op writes the marker so later prompts skip the hop."""
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *args, **kwargs: {
+            "action": "allow",
+            "rationale": "already pinned",
+            "terminal": True,
+        },
+    )
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_apply_thread_model",
+        lambda *args: pytest.fail("an allow verdict must not switch the model"),
+    )
+
+    exit_code = _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""
+    assert (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_keeps_asking_after_a_non_terminal_no_op(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Routing can be toggled on mid-session, so no marker is written."""
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *args, **kwargs: {"action": "allow", "rationale": "routing off"},
+    )
+
+    exit_code = _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch)
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_allows_the_prompt_when_the_switch_fails(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    No block without an applied switch — otherwise the prompt is lost.
+
+    The runner's replay only fires when the marker appears, so a hook that
+    blocked without switching would drop the user's message entirely.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *args, **kwargs: {
+            "action": "route",
+            "model": "gpt-5.6-luna",
+            "rationale": "x",
+            "terminal": True,
+        },
+    )
+    monkeypatch.setattr(codex_native_hook, "_apply_thread_model", lambda *args: False)
+
+    exit_code = _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == ""
+    assert "could not switch" in captured.err
+    # No marker: it is the replay handshake, and this prompt is running.
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_no_ops_without_an_advertisement(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch)
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_no_ops_on_an_empty_prompt(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *args, **kwargs: pytest.fail("an empty prompt must not reach the router"),
+    )
+    assert _run_route_turn(bridge_dir, {"prompt": "   "}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_no_ops_when_the_endpoint_is_unreachable(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A routing outage must never block a user's turn."""
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(codex_native_hook, "_post_json", lambda *args, **kwargs: None)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()

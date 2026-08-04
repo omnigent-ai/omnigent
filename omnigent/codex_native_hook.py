@@ -55,8 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "spike-userprompt":
-        return _main_spike_userprompt(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "route-turn":
+        return _main_route_turn(raw_argv[1:])
     print(
         f"omnigent codex hook: unknown subcommand {raw_argv[:1]!r}",
         file=sys.stderr,
@@ -206,113 +206,234 @@ def _parse_evaluate_policy_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _main_spike_userprompt(argv: list[str]) -> int:
+def _main_route_turn(argv: list[str]) -> int:
     """
-    SPIKE ONLY (in-harness routing S1/S2). Not product code.
+    Route the model this session runs on, from its first real prompt.
 
-    Logs every invocation to ``<bridge_dir>/spike_hook_log.jsonl`` (S2:
-    does codex fire ``UserPromptSubmit`` for app-server ``turn/start``
-    turns?) and, when ``<bridge_dir>/spike_switch_model`` exists, fires
-    ``thread/settings/update`` on the live thread from inside the hook's
-    synchronous window before allowing the prompt (S1: does the
-    just-submitted turn pick up the new model?).
+    The in-harness half of first-message routing (see
+    :mod:`omnigent.runner.turn_routing`), registered as a second
+    ``UserPromptSubmit`` command alongside the policy gate. On every
+    prompt submit, in order:
 
-    :param argv: CLI argv after the subcommand.
-    :returns: Always ``0`` (allow).
+    1. Fast skip on ``<bridge_dir>/turn_routing_done`` — no output, no
+       network. The authoritative gate is the endpoint's
+       ``model_override`` check; this file only saves the round trip.
+    2. POST ``{session_id, prompt, harness, turn_id, model}`` to the
+       advertised loopback ``route-turn`` endpoint. ``model`` comes from
+       the hook payload, which tracks the LIVE thread model —
+       ``config.toml`` reports the stale launch model.
+    3. On a routed verdict: switch the thread with
+       ``thread/settings/update`` (codex binds the turn's model before
+       this hook runs, so the switch lands from the next turn), write the
+       marker, and BLOCK the prompt. The runner then replays it as a
+       normal user turn, which runs on the routed model.
+
+    Fails open everywhere: an absent advertisement, an unreachable
+    endpoint, an unroutable verdict or a failed switch all exit ``0`` with
+    no output, and the prompt runs untouched on the current model.
+
+    :param argv: CLI argv after the ``route-turn`` subcommand, e.g.
+        ``["--bridge-dir", "/tmp/x", "--harness", "codex-native"]``.
+    :returns: Process exit code. Always ``0`` — the block is expressed via
+        the JSON on stdout, never via the exit code.
     """
-    import time
+    from omnigent.runner.turn_routing import (
+        ADVERTISEMENT_FILE,
+        HOOK_REQUEST_TIMEOUT_S,
+        MARKER_FILE,
+        ROUTE_PATH_TEMPLATE,
+    )
 
-    parser = argparse.ArgumentParser(prog="python -m omnigent.codex_native_hook spike-userprompt")
+    parser = argparse.ArgumentParser(prog="python -m omnigent.codex_native_hook route-turn")
     parser.add_argument("--bridge-dir", required=True)
+    parser.add_argument("--harness", default="codex-native")
     args = parser.parse_args(argv)
     bridge_dir = Path(args.bridge_dir)
-    log_path = bridge_dir / "spike_hook_log.jsonl"
+
+    if (bridge_dir / MARKER_FILE).exists():
+        return 0
 
     raw = sys.stdin.read()
-    record: dict[str, object] = {
-        "ts": time.time(),
-        "iso": time.strftime("%H:%M:%S", time.localtime()),
-        "argv": argv,
-        "cwd": str(Path.cwd()),
-        "raw_stdin": raw[:4000],
-    }
     try:
         payload = json.loads(raw or "{}")
-    except json.JSONDecodeError as exc:
-        payload = {}
-        record["parse_error"] = str(exc)
-    if isinstance(payload, dict):
-        record["payload_keys"] = sorted(payload.keys())
-        record["hook_event_name"] = payload.get("hook_event_name")
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return 0
 
-    marker = bridge_dir / "spike_switch_model"
-    if marker.exists():
-        target = marker.read_text(encoding="utf-8").strip()
-        record["spike_mode"] = "settings_update"
-        record["spike_target_model"] = target
-        record["model_before"] = read_codex_config_model(bridge_dir)
-        started = time.monotonic()
-        try:
-            record["settings_update_result"] = _spike_settings_update(bridge_dir, target)
-        except Exception as exc:  # noqa: BLE001 - spike diagnostics
-            record["settings_update_error"] = f"{type(exc).__name__}: {exc}"
-        record["settings_update_seconds"] = round(time.monotonic() - started, 3)
-        # One-shot: remove the marker so the next prompt is a clean control.
-        try:
-            marker.unlink()
-        except OSError:
-            pass
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 
-    block_marker = bridge_dir / "spike_block"
-    if block_marker.exists():
-        record["spike_blocked"] = True
-        sys.stdout.write(
-            json.dumps({"decision": "block", "reason": "SPIKE: Smart Routing is picking a model…"})
+    endpoint = read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE)
+    if endpoint is None:
+        return 0
+    state = read_bridge_state(bridge_dir)
+    session_id = endpoint.session_id or (state.session_id if state is not None else None)
+    if not session_id:
+        return 0
+
+    body = {
+        "harness": args.harness,
+        "prompt": prompt,
+        "turn_id": _payload_str(payload, "turn_id"),
+        # The payload's model tracks thread/settings/update; config.toml does not.
+        "model": _payload_str(payload, "model"),
+    }
+    url = endpoint.url + ROUTE_PATH_TEMPLATE.format(
+        session_id=urllib.parse.quote(session_id, safe="")
+    )
+    decision = _post_json(url, endpoint.token, body, HOOK_REQUEST_TIMEOUT_S)
+    if decision is None:
+        return 0
+    model = decision.get("model")
+    if decision.get("action") != "route" or not isinstance(model, str) or not model:
+        if decision.get("terminal"):
+            # Nothing will route this session again, so stop asking.
+            _write_marker(bridge_dir / MARKER_FILE)
+        return 0
+
+    if not _apply_thread_model(bridge_dir, model):
+        # No marker: the prompt is about to run, and the marker is what
+        # tells the runner to replay it. Writing one here would replay a
+        # prompt that already ran. The server-side pin still keeps the
+        # next prompt from re-routing.
+        print(
+            f"omnigent codex route-turn hook: could not switch to {model}; "
+            "letting the prompt run on the current model",
+            file=sys.stderr,
         )
-        try:
-            block_marker.unlink()
-        except OSError:
-            pass
-
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, default=str) + "\n")
+        return 0
+    # Marker after the switch and before the block, so its presence means
+    # both "the routed model is applied" and "this prompt was dropped, you
+    # owe it a replay".
+    if not _write_marker(bridge_dir / MARKER_FILE):
+        return 0
+    sys.stdout.write(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": f"Smart Routing selected {model}; rerunning your message on it.",
+            }
+        )
+    )
     return 0
 
 
-def _spike_settings_update(bridge_dir: Path, target_model: str) -> object:
+def _payload_str(payload: dict[str, object], key: str) -> str | None:
     """
-    SPIKE ONLY. Fire ``thread/settings/update`` on the live thread.
+    Read an optional string field from a hook payload.
+
+    :param payload: Decoded hook payload.
+    :param key: Field name, e.g. ``"turn_id"``.
+    :returns: The value, or ``None`` when absent or not a non-empty string.
+    """
+    value = payload.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _write_marker(path: Path) -> bool:
+    """
+    Write the turn-routing marker file.
+
+    :param path: Marker path, ``<bridge_dir>/turn_routing_done``.
+    :returns: ``True`` when the marker is on disk.
+    """
+    try:
+        path.write_text("", encoding="utf-8")
+    except OSError:
+        print(
+            f"omnigent codex route-turn hook: could not write {path}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _post_json(
+    url: str,
+    token: str,
+    body: dict[str, object],
+    timeout: float,
+) -> dict[str, object] | None:
+    """
+    POST one JSON body to the loopback endpoint.
+
+    :param url: Fully-qualified loopback URL.
+    :param token: Bearer token from the advertisement.
+    :param body: Request body.
+    :param timeout: Socket timeout in seconds.
+    :returns: The decoded response object, or ``None`` on any transport or
+        decode failure (callers treat that as "allow unrouted").
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            decoded = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _apply_thread_model(bridge_dir: Path, model: str) -> bool:
+    """
+    Switch the live Codex thread onto *model*.
+
+    ``thread/settings/update`` is the thread-level switch (the same one the
+    web picker drives through the executor); the app-server accepts a
+    second concurrent client while a turn is in flight, so the hook can
+    fire it from inside its own synchronous window. The accepted switch is
+    mirrored into ``config.toml`` the way the executor does, so the
+    cost-budget gate reads the routed model rather than the launch one.
 
     :param bridge_dir: Native Codex bridge directory.
-    :param target_model: Model id to switch the thread to.
-    :returns: A JSON-safe summary of the app-server exchange.
+    :param model: Servable model id, e.g. ``"gpt-5.6-luna"``.
+    :returns: ``True`` when Codex accepted the switch.
     """
     import asyncio
 
     from omnigent.codex_native_app_server import client_for_transport
+    from omnigent.codex_native_bridge import write_codex_config_model
+    from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
 
     state = read_bridge_state(bridge_dir)
     if state is None:
-        return {"error": "no bridge state"}
+        return False
 
-    async def _run() -> object:
-        client = client_for_transport(state.socket_path, client_name="omnigent-spike-hook")
+    async def _switch() -> None:
+        client = client_for_transport(state.socket_path, client_name="omnigent-route-turn-hook")
         await client.connect()
         try:
-            resp = await client.request(
+            await client.request(
                 "thread/settings/update",
-                {"threadId": state.thread_id, "model": target_model},
+                {"threadId": state.thread_id, "model": model},
             )
-            return {
-                "thread_id": state.thread_id,
-                "transport": state.socket_path,
-                "active_turn_id": state.active_turn_id,
-                "response": resp,
-            }
         finally:
             await client.close()
 
-    return asyncio.run(asyncio.wait_for(_run(), timeout=20))
+    try:
+        asyncio.run(asyncio.wait_for(_switch(), timeout=SETTINGS_UPDATE_TIMEOUT_S))
+    except Exception as exc:  # noqa: BLE001 - any failure means "leave the model alone"
+        print(
+            f"omnigent codex route-turn hook: thread/settings/update failed: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    if not write_codex_config_model(bridge_dir, model):
+        print(
+            f"omnigent codex route-turn hook: could not mirror {model} into config.toml",
+            file=sys.stderr,
+        )
+    return True
 
 
 if __name__ == "__main__":

@@ -1437,3 +1437,152 @@ def register_hooks_routes(
             content=json.dumps(decision.to_payload()),
             media_type="application/json",
         )
+
+    @router.post(
+        "/sessions/{session_id}/hooks/route-turn",
+        # Internal runner relay — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def route_turn_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Decide the model a session's first real prompt should run on.
+
+        The in-harness sibling of ``route-subagent``: a harness
+        ``UserPromptSubmit`` hook relays here (through the runner's
+        loopback endpoint, advertised as ``turn_router.json``) because
+        ``RuntimeCaps.routing_client`` only lives in the server process.
+        It closes the bare-launch gap — a session started with no prompt,
+        whose first message is typed straight into the TUI and so is
+        invisible to the composer turn gate. Everything else about routing
+        is unchanged: same decision seam, same chip, same
+        ``model_override`` pin, and that pin is what stops a session from
+        ever routing twice.
+
+        :param request: FastAPI request — body is the route-turn request
+            JSON.
+        :param session_id: Session/conversation id from the path.
+        :returns: The route-turn decision as JSON.
+        :raises OmnigentError: 400 when the body is not a JSON object or
+            omits ``harness`` / ``prompt``.
+        """
+        from omnigent.runner.turn_routing import (
+            TurnRouteRequest,
+            decision_scope,
+            resolve_turn_route,
+        )
+        from omnigent.server.routes._sessions.orchestration import (
+            _native_turn_catalog,
+            _publish_routed_model,
+            _stamp_routing_decision_label,
+        )
+        from omnigent.server.smart_routing import route_turn as _route_turn_seam
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in route-turn body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "route-turn body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            route_request = TurnRouteRequest.from_payload(payload)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        parent = None
+        if conv is not None and conv.parent_conversation_id is not None:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+        runner_client = None
+        catalog = None
+        if conv is not None:
+            try:
+                runner_client = await _get_runner_client(
+                    session_id, runner_router or get_server_runner_router()
+                )
+                catalog = await _native_turn_catalog(session_id, conv, runner_client)
+            except Exception:
+                _logger.debug(
+                    "route-turn: live catalog unavailable for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+
+        async def _route(
+            harness: str | None, prompt: str
+        ) -> tuple[str | None, dict[str, Any] | None]:
+            return await _route_turn_seam(
+                harness,
+                prompt,
+                session_id=session_id,
+                runner_client=runner_client,
+                catalog=catalog,
+            )
+
+        async def _pin(model: str) -> bool:
+            try:
+                await asyncio.to_thread(
+                    conversation_store.update_conversation,
+                    session_id,
+                    model_override=model,
+                )
+            except (OSError, ValueError):
+                _logger.warning(
+                    "route-turn: could not pin model_override for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+                return False
+            _publish_routed_model(session_id, model)
+            return True
+
+        async def _persist(model: str, verdict: dict[str, Any]) -> None:
+            decision_id = await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                model,
+                verdict,
+                scope=decision_scope(),
+                harness=route_request.harness,
+            )
+            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
+
+        decision = await resolve_turn_route(
+            session_id,
+            route_request,
+            conv=conv,
+            parent=parent,
+            route_turn=_route,
+            pin=_pin,
+            persist=_persist,
+        )
+        _logger.info(
+            "route-turn: session=%s harness=%s live_model=%s pinned=%s action=%s model=%s (%s)",
+            session_id,
+            route_request.harness,
+            route_request.model,
+            conv.model_override if conv is not None else None,
+            decision.action,
+            decision.model,
+            decision.rationale,
+        )
+        return Response(
+            content=json.dumps(decision.to_payload()),
+            media_type="application/json",
+        )

@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from omnigent.opencode_native_client import OpenCodeClient, OpenCodeSession
     from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
     from omnigent.runner.subagent_routing import SubagentRouter
+    from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
 
 import click
@@ -523,6 +524,52 @@ def _start_subagent_router_for_native_session(
         harness=harness,
     )
     return _NativeRouterLaunch(bridge_dir if router is not None else None, router)
+
+
+def _start_turn_router_for_native_session(
+    session_id: str,
+    *,
+    bridge_dir: Path,
+    harness: str,
+    server_client: httpx.AsyncClient | None,
+) -> TurnRouter | None:
+    """Start the first-message turn-routing endpoint for a native session.
+
+    Installed for every session of a supported harness, routed or not: the
+    server re-reads the session's routing state on each prompt, so a
+    session that starts unrouted can still be toggled on before its first
+    message.
+
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Session bridge directory the hook discovers.
+    :param harness: Harness the endpoint is being installed for.
+    :param server_client: Runner→server client the relay forwards on, and
+        the replay delivers through.
+    :returns: The router handle, or ``None`` when it could not start.
+    """
+    from omnigent.runner.turn_routing import ensure_session_turn_router
+
+    return ensure_session_turn_router(
+        session_id,
+        bridge_dir=bridge_dir,
+        server_client=server_client,
+        harness=harness,
+    )
+
+
+async def _shutdown_session_turn_router_async(
+    session_id: str, router: TurnRouter | None = None
+) -> None:
+    """Tear down a session's turn-routing endpoint off the event loop.
+
+    :param session_id: Session/conversation identifier.
+    :param router: Handle this launch started, so a late teardown cannot
+        close the endpoint a re-created terminal has since installed.
+    :returns: None.
+    """
+    from omnigent.runner.turn_routing import shutdown_session_turn_router
+
+    await asyncio.to_thread(shutdown_session_turn_router, session_id, router)
 
 
 async def _shutdown_session_router_async(
@@ -3855,6 +3902,16 @@ async def _auto_create_codex_terminal(
         from omnigent.runner.subagent_routing import router_env
 
         app_server.env.update(router_env(session_id, _codex_router_dir, harness="codex-native"))
+    # First-message model routing. Advertised in the same bridge dir the
+    # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of
+    # its own), and live before the app-server starts because the hook can
+    # fire on the very first prompt.
+    _codex_turn_router = _start_turn_router_for_native_session(
+        session_id,
+        bridge_dir=bridge_dir,
+        harness="codex-native",
+        server_client=server_client,
+    )
     app_server.listen_url = codex_ws_url
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
@@ -3999,6 +4056,7 @@ async def _auto_create_codex_terminal(
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
                 subagent_router=_codex_router,
+                turn_router=_codex_turn_router,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -4007,6 +4065,7 @@ async def _auto_create_codex_terminal(
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
                 subagent_router=_codex_router,
+                turn_router=_codex_turn_router,
             )
         ),
         name=f"codex-forwarder-{session_id}",
@@ -4037,6 +4096,7 @@ async def _codex_discover_thread_and_forward(
     event_client: CodexAppServerClient,
     routing_summary: str,
     subagent_router: SubagentRouter | None = None,
+    turn_router: TurnRouter | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -4064,6 +4124,8 @@ async def _codex_discover_thread_and_forward(
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
+    :param turn_router: First-message routing endpoint this launch
+        started, torn down alongside the subagent one.
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
@@ -4183,6 +4245,7 @@ async def _codex_discover_thread_and_forward(
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()
         await _shutdown_session_router_async(session_id, subagent_router)
+        await _shutdown_session_turn_router_async(session_id, turn_router)
 
 
 async def _codex_forward_known_thread(
@@ -4192,6 +4255,7 @@ async def _codex_forward_known_thread(
     codex_ws_url: str,
     thread_id: str,
     subagent_router: SubagentRouter | None = None,
+    turn_router: TurnRouter | None = None,
 ) -> None:
     """
     Forward a runner-owned Codex terminal that resumes an existing thread.
@@ -4205,6 +4269,8 @@ async def _codex_forward_known_thread(
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
+    :param turn_router: First-message routing endpoint this launch
+        started, torn down alongside the subagent one.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -4234,6 +4300,7 @@ async def _codex_forward_known_thread(
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()
         await _shutdown_session_router_async(session_id, subagent_router)
+        await _shutdown_session_turn_router_async(session_id, turn_router)
 
 
 async def _run_antigravity_reader(

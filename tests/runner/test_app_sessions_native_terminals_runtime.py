@@ -613,10 +613,12 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     ]
     assert published_events[0]["type"] == "session.resource.created"
     assert len(forward_calls) == 1
-    # The router handle is threaded through so the forwarder's ``finally``
-    # tears down *its* endpoint, not a re-created session's live one.
+    # The router handles are threaded through so the forwarder's ``finally``
+    # tears down *its* endpoints, not a re-created session's live ones.
     assert "subagent_router" in forward_calls[0]
     del forward_calls[0]["subagent_router"]
+    assert "turn_router" in forward_calls[0]
+    del forward_calls[0]["turn_router"]
     assert forward_calls == [
         {
             "session_id": session_id,

@@ -142,7 +142,11 @@ def discover_router_dir(bridge_dir: str | Path | None = None) -> Path | None:
     return None
 
 
-def read_router_endpoint(router_dir: str | Path | None) -> RouterEndpoint | None:
+def read_router_endpoint(
+    router_dir: str | Path | None,
+    *,
+    filename: str = ADVERTISEMENT_FILE,
+) -> RouterEndpoint | None:
     """
     Read the advertised endpoint.
 
@@ -152,15 +156,17 @@ def read_router_endpoint(router_dir: str | Path | None) -> RouterEndpoint | None
     (a stale entry's port can be re-bound by another local process). Either
     check failing means "router unreachable".
 
-    :param router_dir: Directory containing
-        :data:`ADVERTISEMENT_FILE`.
+    :param router_dir: Directory containing *filename*.
+    :param filename: Advertisement file name. Defaults to
+        :data:`ADVERTISEMENT_FILE`; the codex ``route-turn`` hook passes
+        its own so both endpoints share this validation.
     :returns: Endpoint, or ``None`` when the advertisement is absent,
         malformed, or fails validation.
     """
     if router_dir is None:
         return None
     try:
-        raw = (Path(router_dir) / ADVERTISEMENT_FILE).read_text(encoding="utf-8")
+        raw = (Path(router_dir) / filename).read_text(encoding="utf-8")
         payload = json.loads(raw)
     except (OSError, ValueError):
         return None

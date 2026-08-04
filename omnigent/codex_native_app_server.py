@@ -1244,10 +1244,38 @@ def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
-    # SPIKE ONLY (in-harness routing S1/S2): a second UserPromptSubmit hook
-    # in the same module (so the policy trust pass covers it) that logs every
-    # invocation and can fire thread/settings/update mid-block.
-    spike_hook = {
+    return {
+        "hooks": {
+            "PreToolUse": [{"hooks": [hook]}],
+            "PostToolUse": [{"hooks": [hook]}],
+            "UserPromptSubmit": [
+                {"hooks": [hook, _codex_route_turn_hook(bridge_dir, python_executable)]}
+            ],
+        }
+    }
+
+
+def _codex_route_turn_hook(bridge_dir: Path, python_executable: str | None) -> dict[str, Any]:
+    """
+    Build the ``UserPromptSubmit`` entry for first-message model routing.
+
+    A second command alongside the policy gate rather than a module of its
+    own: codex trusts hooks by command, and the trust pass filters on
+    :data:`_POLICY_HOOK_MODULE`, so keeping the subcommand there rides the
+    existing handshake. It no-ops (exit 0, no output) unless the runner has
+    advertised a ``route-turn`` endpoint and nothing has pinned the
+    session's model yet; when it does route, it blocks the prompt and the
+    runner replays it on the routed model. See
+    :mod:`omnigent.runner.turn_routing`.
+
+    :param bridge_dir: Native Codex bridge directory, holding both the
+        endpoint advertisement and the marker file.
+    :param python_executable: Python executable for the hook command.
+    :returns: One ``hooks.json`` command-hook entry.
+    """
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    return {
         "type": "command",
         "command": shlex.join(
             [
@@ -1255,19 +1283,14 @@ def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None
                 "-I",
                 "-m",
                 _POLICY_HOOK_MODULE,
-                "spike-userprompt",
+                "route-turn",
                 "--bridge-dir",
                 str(bridge_dir),
+                "--harness",
+                "codex-native",
             ]
         ),
-        "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
-    }
-    return {
-        "hooks": {
-            "PreToolUse": [{"hooks": [hook]}],
-            "PostToolUse": [{"hooks": [hook]}],
-            "UserPromptSubmit": [{"hooks": [hook, spike_hook]}],
-        }
+        "timeout": HARNESS_HOOK_TIMEOUT_S,
     }
 
 

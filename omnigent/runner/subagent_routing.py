@@ -782,6 +782,7 @@ def write_advertisement(
     url: str,
     token: str,
     session_id: str | None = None,
+    filename: str = ADVERTISEMENT_FILE,
 ) -> Path:
     """Advertise the endpoint to hook scripts.
 
@@ -791,10 +792,14 @@ def write_advertisement(
     :param session_id: Session the endpoint serves. Included so a hook
         with no session env var of its own still knows which session to
         route for.
-    :returns: Path of the written ``subagent_router.json``.
+    :param filename: Advertisement file name. Defaults to this module's
+        ``subagent_router.json``; ``omnigent.runner.turn_routing`` passes
+        its own so the two endpoints share one writer (and its token
+        hardening) without sharing a file.
+    :returns: Path of the written advertisement.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = bridge_dir / ADVERTISEMENT_FILE
+    path = bridge_dir / filename
     payload: dict[str, Any] = {
         "url": url,
         "token": token,
@@ -807,7 +812,7 @@ def write_advertisement(
     # for the instant between the write and a follow-up chmod. A unique temp
     # name also keeps two concurrent re-advertisements from clobbering each
     # other's partial file.
-    fd, tmp_name = tempfile.mkstemp(dir=bridge_dir, prefix=f"{ADVERTISEMENT_FILE}.", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=bridge_dir, prefix=f"{filename}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             os.fchmod(handle.fileno(), 0o600)

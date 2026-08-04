@@ -257,6 +257,23 @@ rides the existing trust pass; a new module needs its own
    marker, model_override pin), codex hook command, apply variant per S1,
    unit + live verification (R1/R3 on a bare `omni codex` launch). The web
    path is untouched.
+   **✅ LANDED 2026-08-03** (`omnigent/runner/turn_routing.py` + hook
+   subcommand + `hooks/route-turn` endpoint + runner-side replay; spike
+   scaffolding removed). Live-verified twice on :64688 — trivial→luna,
+   sprawling→sol, one decision row and one user turn each, second turn
+   fast-skips with zero network. **Design change ratified during
+   implementation:** the authoritative route-once gate is the routing
+   decision label (`omnigent.routing.decision_id`), NOT `model_override` —
+   the codex forwarder mirrors config.toml's (stale) model into
+   `model_override` at the first `turn/started`, beating the hook, so
+   presence/match checks can't tell a real pin from the mirror.
+   `model_override` is still pinned by the route (keeps the composer gate
+   off the replayed turn). **Residual gap for phase 2+:** a manual-pin
+   session with Smart Routing left on gets hook-routed once (the composer
+   gate would decline); closing it needs pin-provenance labels or fixing
+   the forwarder's launch-model post — shipping-path changes deliberately
+   not made here. Low-residual: two concurrent first prompts could both
+   pass the label gate (no per-session lock).
 2. **Claude**: block-and-replay per S3; live verification (R1/R2 pane
    capture: `/model` echo then the replayed prompt, banner on the routed
    model). The web path is untouched.
