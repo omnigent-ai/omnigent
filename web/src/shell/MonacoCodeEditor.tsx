@@ -420,10 +420,12 @@ function MonacoCodeEditorInner({
     else status = "idle";
     onSaveStatusChangeRef.current?.(status);
     // "Saved" is transient: clear it back to idle so the chip doesn't linger.
-    if (status === "saved") {
-      const t = window.setTimeout(() => onSaveStatusChangeRef.current?.("idle"), SAVED_BADGE_MS);
-      return () => window.clearTimeout(t);
-    }
+    if (status !== "saved") return undefined;
+    const timeout = window.setTimeout(
+      () => onSaveStatusChangeRef.current?.("idle"),
+      SAVED_BADGE_MS,
+    );
+    return () => window.clearTimeout(timeout);
   }, [writePending, writeError, writeSuccess, saveDisabled, isDirty]);
 
   // Clear the toolbar chip when this editor goes away (file switch / mode change

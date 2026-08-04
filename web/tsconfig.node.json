@@ -16,6 +16,7 @@
     "noEmit": true,
 
     /* Linting */
+    "noImplicitReturns": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noImplicitOverride": true,

@@ -91,10 +91,9 @@ export function PreviewSearchBar({
 
   // Focus the input when the bar opens.
   useEffect(() => {
-    if (open) {
-      const id = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => clearTimeout(id);
-    }
+    if (!open) return undefined;
+    const id = setTimeout(() => inputRef.current?.focus(), 0);
+    return () => clearTimeout(id);
   }, [open, inputRef]);
 
   const goNext = useCallback(() => {
