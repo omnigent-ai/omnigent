@@ -163,6 +163,6 @@ def test_shared_url_module_routes_workspace_api_mount_to_ui(page: Page) -> None:
     )
 
     assert result == {
-        "target": "https://dbc-x.cloud.databricks.com/ml/omnigents?o=123#session",
+        "target": "https://dbc-x.cloud.databricks.com/omnigent?o=123#session",
         "probes": 0,
     }

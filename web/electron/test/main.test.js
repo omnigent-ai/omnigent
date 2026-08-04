@@ -158,7 +158,7 @@ describe("OAuth popup COOP-strip wiring (src/main.js)", () => {
 });
 
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
-// (/c/<id>) lives UNDER the server's workspace mount (/ml/omnigents), so it
+// (/c/<id>) lives UNDER the server's workspace mount (/omnigent), so it
 // must be string-concatenated (resolveServerPath) — NOT resolved with
 // `new URL(path, serverUrl)`, which would anchor against the ORIGIN and drop
 // the mount, opening the wrong URL for every workspace deep link. This catches
@@ -170,7 +170,7 @@ describe("deep-link path join wiring (src/main.js)", () => {
       /resolveServerPath\(serverUrl, opts\.path\)/,
       [
         "createWindow no longer joins opts.path onto opts.serverUrl via",
-        "resolveServerPath. A deep link to a workspace server (origin + /ml/omnigents",
+        "resolveServerPath. A deep link to a workspace server (origin + /omnigent",
         "mount) would lose the mount and 404. Restore the mount-aware join (see",
         "resolveServerPath); do not replace it with `new URL(path, serverUrl)`.",
       ].join(" "),
@@ -345,10 +345,7 @@ describe("workspace API URL canonicalization wiring (src/main.js)", () => {
       liveCode,
       /const serverUrl\s*=\s*requestedServerUrl\s*\?\s*canonicalizeDesktopServerUrl\(requestedServerUrl\)\s*:\s*null/,
     );
-    assert.match(
-      liveCode,
-      /explicit\s*\?\s*canonicalizeDesktopServerUrl\(explicit\)\s*:\s*null/,
-    );
+    assert.match(liveCode, /explicit\s*\?\s*canonicalizeDesktopServerUrl\(explicit\)\s*:\s*null/);
   });
 });
 

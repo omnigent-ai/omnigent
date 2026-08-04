@@ -26,7 +26,7 @@ describe("normalizeServerUrl", () => {
   it("strips trailing slashes and trims", () => {
     assert.equal(normalizeServerUrl("https://x.com/"), "https://x.com");
     assert.equal(normalizeServerUrl("  http://localhost:6767//  "), "http://localhost:6767");
-    assert.equal(normalizeServerUrl("https://x.com/ml/omnigents"), "https://x.com/ml/omnigents");
+    assert.equal(normalizeServerUrl("https://x.com/omnigent"), "https://x.com/omnigent");
   });
 
   it("returns empty string for non-strings", () => {

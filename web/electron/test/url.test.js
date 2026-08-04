@@ -12,7 +12,6 @@ const {
   isPlainHttpRemote,
   WORKSPACE_API_PATH,
   expandDatabricksWorkspaceUrl,
-  WORKSPACE_UI_PATH,
   canonicalizeDesktopServerUrl,
 } = require("../src/url");
 
@@ -112,7 +111,7 @@ describe("canonicalizeDesktopServerUrl", () => {
   it("maps the workspace API mount to the desktop UI mount", () => {
     assert.equal(
       canonicalizeDesktopServerUrl(`https://ws.cloud.databricks.com${WORKSPACE_API_PATH}`),
-      `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}`,
+      "https://ws.cloud.databricks.com/omnigent",
     );
   });
 
@@ -121,7 +120,7 @@ describe("canonicalizeDesktopServerUrl", () => {
       canonicalizeDesktopServerUrl(
         `https://ws.cloud.databricks.com${WORKSPACE_API_PATH}/?o=123#section`,
       ),
-      `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}?o=123#section`,
+      "https://ws.cloud.databricks.com/omnigent?o=123#section",
     );
   });
 
@@ -172,7 +171,7 @@ describe("expandDatabricksWorkspaceUrl", () => {
           await expandDatabricksWorkspaceUrl(
             `https://ws.cloud.databricks.com${WORKSPACE_API_PATH}`,
           ),
-          `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}`,
+          "https://ws.cloud.databricks.com/omnigent",
         );
       },
     );
@@ -188,7 +187,7 @@ describe("expandDatabricksWorkspaceUrl", () => {
       },
       async () => {
         const out = await expandDatabricksWorkspaceUrl("https://ws.cloud.databricks.com/");
-        assert.equal(out, `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}`);
+        assert.equal(out, "https://ws.cloud.databricks.com/omnigent");
       },
     );
     // Probed the root with a HEAD request.

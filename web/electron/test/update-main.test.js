@@ -110,6 +110,7 @@ function loadMainHarness({
     "./localhost_cors": { registerLocalhostCors: () => {} },
     "./url": {
       normalizeUrl: (url) => url,
+      canonicalizeDesktopServerUrl: (url) => url,
       expandDatabricksWorkspaceUrl: async (url) => url,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
