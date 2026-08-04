@@ -50,6 +50,8 @@
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
+  /* Weaker panel border for low-contrast dividers. */
+  --color-border-weak: var(--border-weak);
   /* Stronger border for higher-contrast dividers/outlines. */
   --color-border-strong: var(--border-strong);
   /* Neutral border specifically for buttons (lighter than --border-strong). */
@@ -75,6 +77,8 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
+  /* Tertiary text for lighter/disabled labels. */
+  --color-foreground-tertiary: var(--foreground-tertiary);
   --color-muted: var(--muted);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-secondary: var(--secondary);
@@ -184,11 +188,13 @@
      * The auth pages (outside the gradient shell) use this as their
      * full-page canvas. */
   --background: #fff;
-  --foreground: #11171c;
+  --foreground: #27272a;
+  /* Tertiary gray for lighter/disabled/placeholder text. */
+  --foreground-tertiary: #a1a1aa;
   --card: #fff;
   /* Light --card is already opaque; the solid form only diverges in dark. */
   --card-solid: #fff;
-  --card-foreground: #11171c;
+  --card-foreground: #27272a;
   /* Tray surface (composer footer tray): white, applied translucently
      * via opacity modifiers so the page gradient shows through. */
   --tray: #fff;
@@ -201,9 +207,9 @@
   /* Light grey fill so secondary badges/headers read as surfaces (a
      * fully-transparent value left them as bare floating text). */
   --secondary: #eceef1;
-  --secondary-foreground: #11171c;
+  --secondary-foreground: #27272a;
   --muted: #0000000f;
-  --muted-foreground: #6f6f6f;
+  --muted-foreground: #71717a;
   /* Dedicated chip background for inline code — a hair darker than the
      * white card so the chip reads as a tile. Kept separate from --muted
      * (now a translucent black wash reused for hover/quote surfaces). */
@@ -221,12 +227,14 @@
      * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
      * with strong contrast on the white card surface. */
   --session-active: #2f7fd4;
-  --border: #e8ecf0;
+  --border: #e4e4e7;
+  /* Weaker panel border for low-contrast dividers. */
+  --border-weak: #ececee;
   /* Stronger divider/outline + a dedicated neutral button border. */
-  --border-strong: #a3b1bf;
+  --border-strong: #a1a1aa;
   --button-border: #d6d6d6;
-  --button-icon-hover-color: #11171c;
-  --input: #e8ecf0;
+  --button-icon-hover-color: #27272a;
+  --input: #e4e4e7;
   /* Focus ring matches --primary. */
   --ring: #11171c;
   /* Brand pink — reserved for brand moments, not status. */
@@ -255,12 +263,12 @@
      * message copy button) blend into the canvas rather than painting
      * a lavender band. */
   --sidebar: #fdfafa;
-  --sidebar-foreground: #11171c;
+  --sidebar-foreground: #27272a;
   --sidebar-primary: #2272b4;
   --sidebar-primary-foreground: #fff;
   --sidebar-accent: #d7edfe;
   --sidebar-accent-foreground: #04355d;
-  --sidebar-border: #e8ecf0;
+  --sidebar-border: #e4e4e7;
   --sidebar-ring: #2272b4;
   --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 3%, transparent);
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
