@@ -397,6 +397,14 @@
   -webkit-mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
 }
 
+/* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
+ * Must land BELOW the fade above: the mask is fully opaque only from 80px,
+ * so a smaller margin parks the row in the transparent band — scrolled
+ * "to the top" yet invisible. Kept next to the fade so they can't desync. */
+.turn-fold-row {
+  scroll-margin-top: 88px;
+}
+
 /* Turn rail's edges dissolve so it's clear the ticks scroll past both ends.
  * Short symmetric ramps since the ticks are small and evenly spaced. The ramp
  * width comes from --turn-rail-fade, set inline from TurnRail's FADE constant
@@ -604,6 +612,10 @@
       transparent calc(48px + var(--omnigent-inset-top)),
       black calc(80px + var(--omnigent-inset-top))
     );
+  }
+
+  [data-ios-native] .turn-fold-row {
+    scroll-margin-top: calc(88px + var(--omnigent-inset-top));
   }
 
   /* Android: the floating server-switcher pill sits at the top. Start the
