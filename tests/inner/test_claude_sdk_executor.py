@@ -1136,6 +1136,10 @@ class TestResolveGatewayEnv(unittest.TestCase):
                 'databricks auth token --host "https://example.databricks.com"',
                 env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
             )
+            self.assertEqual(
+                env["ANTHROPIC_CUSTOM_HEADERS"],
+                "x-databricks-use-coding-agent-mode: true",
+            )
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
 
     def test_strips_trailing_slash(self):
@@ -1180,6 +1184,20 @@ class TestResolveGatewayEnv(unittest.TestCase):
             "https://example.databricks.com/ai-gateway/anthropic",
         )
         self.assertEqual(env["OMNIGENT_CLAUDE_API_KEY_HELPER"], "printf token")
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"],
+            "x-databricks-use-coding-agent-mode: true",
+        )
+
+    def test_generic_provider_gateway_omits_databricks_header(self):
+        """Non-Databricks gateways must not receive the Databricks mode header."""
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        env = _resolve_gateway_env(
+            base_url_override="https://mock-llm.example/v1",
+            auth_command_override="printf sk-test",
+        )
+        self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS", env)
 
     def test_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
