@@ -63,7 +63,7 @@ repos:
       - id: web-oxlint
         name: web oxlint
         language: system
-        entry: bash -c 'test -x web/node_modules/.bin/oxlint && cd web && node_modules/.bin/oxlint --deny-warnings .'
+        entry: bash -c 'test -x web/node_modules/.bin/oxlint && cd web && node_modules/.bin/oxlint --deny-warnings --report-unused-disable-directives .'
         files: ^(web/.*\.[cm]?[jt]sx?|web/\.oxlintrc\.json|web/package\.json|pnpm-lock\.yaml)$
         pass_filenames: false
 

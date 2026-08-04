@@ -541,7 +541,7 @@ function FileViewerBody({
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const { open: openComments, addressed: addressedComments } = useMemo(
     () => classifyAndRemapComments(allComments, fileContent),
-    [allComments, fileContent], // eslint-disable-line react-hooks/exhaustive-deps
+    [allComments, fileContent],
   );
 
   // Apply the linked comment (from ?comment= URL param) once per lifecycle.

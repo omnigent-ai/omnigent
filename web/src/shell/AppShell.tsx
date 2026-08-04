@@ -896,7 +896,7 @@ export function AppShell() {
       );
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
-  ); // eslint-disable-line react-hooks/exhaustive-deps
+  );
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*

@@ -46,7 +46,6 @@ export function PreviewSearchBar({
     }
     setRanges(findTextRanges(container, query.trim()));
     // contentVersion forces a rebuild after the preview re-renders.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [containerRef, open, query, contentVersion]);
 
   const matchCount = ranges.length;

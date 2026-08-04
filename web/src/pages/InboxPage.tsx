@@ -125,7 +125,6 @@ export function InboxPage() {
   // any snapshot query delivers fresh data (dataUpdatedAt advances),
   // sweep verdicts whose id is still pending on the server — those
   // approvals were consumed and the server re-parked the prompt.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const snapshotVersionKey = snapshotQueries.map((q) => q.dataUpdatedAt ?? 0).join(",");
   const isFirstRender = useRef(true);
   useEffect(() => {
