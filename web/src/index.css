@@ -3,6 +3,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist-mono";
+@import "@fontsource-variable/hanken-grotesk";
 
 /* Streamdown ships utility classes pre-compiled in its dist; this @source
  * pragma tells Tailwind v4 to scan those files so the classes survive the
@@ -25,6 +26,11 @@
     ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol",
     "Noto Color Emoji";
   --font-mono: "Geist Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+  /* Hanken Grotesk — self-hosted via @fontsource-variable (no CDN). Generates
+     * the `font-display-alt` utility; falls back to the UI stack if the woff2
+     * hasn't loaded. Variable file covers 100-900, so set font-weight at the
+     * usage site (the design calls for 400). */
+  --font-display-alt: "Hanken Grotesk Variable", var(--font-sans);
   /* 13px/18px text step between text-xs (12px) and text-sm (14px) —
      * generates the `text-13` utility. Body and chat-thread text (both
      * 13/18), plus compact UI chrome like the composer footer selectors
@@ -71,6 +77,8 @@
   --color-session-active: var(--session-active);
   /* Brand pink — reserved for brand moments, not status. */
   --color-brand-accent: var(--brand-accent);
+  /* Pink tag surface (translucent) — generates `bg-tag-pink`. */
+  --color-tag-pink: var(--tag-pink);
   /* Named status hues — success/warning/info are repointed to the
      * green/yellow/blue of this set below, so the two stay in lockstep. */
   --color-status-blue: var(--status-blue);
@@ -243,6 +251,8 @@
   --ring: #11171c;
   /* Brand pink — reserved for brand moments, not status. */
   --brand-accent: #df3c85;
+  /* Pink tag surface — a translucent wash, so it tints whatever it sits on. */
+  --tag-pink: rgba(240, 1, 150, 0.06);
   /* Named status hues. success/warning/info above mirror green/yellow/blue. */
   --status-blue: #3b8ff5;
   --status-green: #2ea65c;
@@ -326,6 +336,9 @@
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */
   --brand-accent: #df3c85;
+  /* Pink tag surface — a heavier wash than light, since 6% all but vanishes
+     * against the dark canvas. */
+  --tag-pink: rgba(240, 1, 150, 0.15);
   --status-blue: #3b8ff5;
   --status-green: #2ea65c;
   --status-yellow: #d4972a;
@@ -408,6 +421,19 @@ html:not(.dark) .conversations-sidebar {
     radial-gradient(var(--sidebar-dot-color) 0.6px, transparent 0.8px) 0 0 / 20px 20px,
     linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)),
     linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%);
+}
+
+/* Below md the sidebar is a full-screen overlay ON TOP of the chat, so it has
+ * to be opaque — the rules above set `background` as a shorthand, which resets
+ * background-color and would otherwise let the conversation show through the
+ * translucent layers. Restores what Sidebar.tsx's max-md:bg-card-solid does on
+ * desktop. Above md the sidebar pushes content aside instead of covering it,
+ * so it keeps its translucent canvas there. */
+@media (width < 48rem) {
+  html:not(.dark) .conversations-sidebar,
+  .dark .conversations-sidebar {
+    background-color: var(--card-solid);
+  }
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat

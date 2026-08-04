@@ -3101,6 +3101,10 @@ export function NewChatLandingScreen() {
     }
   }
 
+  const placeholderText = selectedProject
+    ? `Start a new session in ${selectedProject}`
+    : "Describe a task to start a new session…";
+
   // The working-directory chip — a single Popover trigger button that opens
   // the file browser. The directory-conflict warning lives inside the browser
   // (a banner on the occupied folder), not on the chip.
@@ -3136,20 +3140,22 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5 sm:flex-row">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-display-alt">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
             // to Otto's h-18 box so the centered composer doesn't shift when
             // toggling between the two landings.
             <span className="flex h-18 shrink-0 items-center">
-              <FolderIcon className="size-12 text-muted-foreground" />
+              <div className="w-14 h-14 flex rounded-xl bg-tag-pink items-center justify-center">
+                <FolderIcon className="size-6 text-brand-accent" />
+              </div>
             </span>
           ) : (
             <OttoEyes className="h-18 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-3xl font-medium tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
-            {selectedProject || "What should we do?"}
+          <h1 className="min-w-0 break-words text-center text-[1.75em] font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+            {selectedProject || "What should we build?"}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
@@ -3293,8 +3299,8 @@ export function NewChatLandingScreen() {
               }}
               // Suppress the native placeholder when the overlay supplies its
               // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : "Describe a task to start a new session…"}
-              aria-label="Describe a task to start a new session"
+              placeholder={pillSkills.length > 0 ? "" : placeholderText}
+              aria-label={placeholderText}
               rows={1}
               autoFocus
               data-testid="new-chat-landing-input"

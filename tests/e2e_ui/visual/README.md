@@ -14,7 +14,7 @@ stubs.
 Pages covered:
 
 - **Empty landing (`/`)** — the open left sidebar plus the `NewChatLandingScreen`
-  ("What should we do?") hero and composer.
+  ("What should we build?") hero and composer.
   [`test_landing_snapshot.py`](test_landing_snapshot.py)
 - **Chat conversation (`/c/{id}`)** — a fully-mocked one-turn transcript (user
   question + assistant markdown reply) rendered as message bubbles, with the
