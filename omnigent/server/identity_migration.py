@@ -50,6 +50,7 @@ from omnigent.db.db_models import (
     SqlUser,
     current_workspace_id,
 )
+from omnigent.db.query_context import query_name_scope
 from omnigent.server.auth import _RESERVED_USERS
 
 
@@ -102,7 +103,10 @@ def build_domain_mapping(engine: Engine, domain: str) -> dict[str, str]:
     """
     domain = domain.lstrip("@").strip().lower()
     mapping: dict[str, str] = {}
-    with Session(engine) as session:
+    with (
+        query_name_scope("omnigent.identity_migration.build_domain_mapping"),
+        Session(engine) as session,
+    ):
         ids = (
             session.execute(
                 select(SqlUser.id).where(SqlUser.workspace_id == current_workspace_id())
@@ -151,7 +155,10 @@ def remap_identities(
     """
     report = RemapReport(mapping=dict(mapping))
 
-    with Session(engine) as session:
+    with (
+        query_name_scope("omnigent.identity_migration.remap_identities"),
+        Session(engine) as session,
+    ):
         for old_id, new_id in mapping.items():
             if old_id == new_id:
                 continue

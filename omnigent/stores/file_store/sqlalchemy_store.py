@@ -11,7 +11,7 @@ from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
     generate_file_id,
     get_or_create_engine,
-    make_managed_session_maker,
+    make_named_managed_session_maker,
     now_epoch,
 )
 from omnigent.entities import PagedList, StoredFile
@@ -52,7 +52,10 @@ class SqlAlchemyFileStore(FileStore):
         """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.file_store",
+        )
 
     def create(
         self,
@@ -79,10 +82,8 @@ class SqlAlchemyFileStore(FileStore):
             content_type=content_type,
             session_id=session_id,
         )
-        with self._session() as session:
+        with self._session("insert_file") as session:
             session.add(row)
-            with query_name_scope("omnigent.file_store.insert_file"):
-                session.flush()
             return _to_entity(row)
 
     def get(
@@ -101,9 +102,8 @@ class SqlAlchemyFileStore(FileStore):
         :returns: The :class:`StoredFile` if found, otherwise
             ``None``.
         """
-        with self._session() as session:
-            with query_name_scope("omnigent.file_store.select_file_by_id"):
-                row = session.get(SqlFile, (current_workspace_id(), file_id))
+        with self._session("select_file_by_id") as session:
+            row = session.get(SqlFile, (current_workspace_id(), file_id))
             if row is None:
                 return None
             if session_id is not None and row.session_id != normalize_uuid(session_id):
@@ -134,7 +134,7 @@ class SqlAlchemyFileStore(FileStore):
             files (``session_id IS NULL``).
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
-        with self._session() as session:
+        with self._session("list_files") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
             stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id())
@@ -172,8 +172,7 @@ class SqlAlchemyFileStore(FileStore):
                 sort_fn(SqlFile.created_at),
                 sort_fn(SqlFile.id),
             ).limit(limit + 1)
-            with query_name_scope("omnigent.file_store.list_files"):
-                rows = list(session.execute(stmt).scalars().all())
+            rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
@@ -200,7 +199,7 @@ class SqlAlchemyFileStore(FileStore):
         :param session_id: If set, verify ownership.
         :returns: ``True`` if deleted, ``False`` otherwise.
         """
-        with self._session() as session:
+        with self._session("delete_file") as session:
             with query_name_scope("omnigent.file_store.select_file_by_id"):
                 row = session.get(SqlFile, (current_workspace_id(), file_id))
             if not row:
@@ -208,8 +207,6 @@ class SqlAlchemyFileStore(FileStore):
             if session_id is not None and row.session_id != normalize_uuid(session_id):
                 return False
             session.delete(row)
-            with query_name_scope("omnigent.file_store.delete_file"):
-                session.flush()
             return True
 
     def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
@@ -219,7 +216,7 @@ class SqlAlchemyFileStore(FileStore):
         :param session_id: Owning session/conversation id.
         :returns: List of deleted file ids for artifact cleanup.
         """
-        with self._session() as session:
+        with self._session("delete_session_files") as session:
             stmt = select(SqlFile).where(
                 SqlFile.workspace_id == current_workspace_id(),
                 SqlFile.session_id == session_id,
@@ -229,6 +226,4 @@ class SqlAlchemyFileStore(FileStore):
             ids = [row.id for row in rows]
             for row in rows:
                 session.delete(row)
-            with query_name_scope("omnigent.file_store.delete_session_files"):
-                session.flush()
             return ids

@@ -17,7 +17,7 @@ from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import (
     get_or_create_conversation_engine,
     get_or_create_engine,
-    make_managed_session_maker,
+    make_named_managed_session_maker,
     now_epoch,
 )
 from omnigent.entities import Agent, PagedList
@@ -52,14 +52,20 @@ class SqlAlchemyAgentStore(AgentStore):
         super().__init__(storage_location)
         self.conversation_storage_location = conversation_storage_location
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.agent_store",
+        )
         conv_uri = conversation_storage_location or storage_location
         self._conv_engine = (
             self._engine
             if conv_uri == storage_location
             else get_or_create_conversation_engine(conv_uri)
         )
-        self._conv_session = make_managed_session_maker(self._conv_engine)
+        self._conv_session = make_named_managed_session_maker(
+            self._conv_engine,
+            query_name_prefix="omnigent.agent_store",
+        )
 
     def _session_id_for_agent(self, agent_id: str) -> str | None:
         """
@@ -74,7 +80,7 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: Owning conversation id, or ``None`` when no
             conversation points at this agent.
         """
-        with self._conv_session() as conv_sess:
+        with self._conv_session("select_session_id_for_agent") as conv_sess:
             return conv_sess.execute(
                 select(SqlConversation.id)
                 .where(
@@ -112,7 +118,7 @@ class SqlAlchemyAgentStore(AgentStore):
             kind=encode_agent_kind("template"),
             description=description,
         )
-        with self._session() as session:
+        with self._session("create_agent") as session:
             # Template names are unique within a workspace. This can't be a
             # partial unique index (MySQL has none), so enforce it here.
             conflict = session.execute(
@@ -139,7 +145,7 @@ class SqlAlchemyAgentStore(AgentStore):
             e.g. ``"agent_abc123"``.
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
-        with self._session() as session:
+        with self._session("select_agent_by_id") as session:
             row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if row is None:
                 return None
@@ -162,7 +168,7 @@ class SqlAlchemyAgentStore(AgentStore):
             e.g. ``"code-assistant"``.
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
-        with self._session() as session:
+        with self._session("select_agent_by_name") as session:
             row = session.execute(
                 select(SqlAgent).where(
                     SqlAgent.workspace_id == current_workspace_id(),
@@ -194,7 +200,7 @@ class SqlAlchemyAgentStore(AgentStore):
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :returns: A :class:`PagedList` of :class:`Agent` objects.
         """
-        with self._session() as session:
+        with self._session("list_agents") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
             is_template = SqlAgent.kind == encode_agent_kind("template")
@@ -247,7 +253,7 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         if not agent_ids:
             return {}
-        with self._session() as session:
+        with self._session("select_agent_names") as session:
             rows = session.execute(
                 select(SqlAgent.id, SqlAgent.name).where(
                     SqlAgent.workspace_id == current_workspace_id(),
@@ -272,7 +278,7 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
-        with self._session() as session:
+        with self._session("update_agent") as session:
             row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return None
@@ -294,7 +300,7 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: ``True`` if the agent was deleted, ``False`` if
             it did not exist.
         """
-        with self._session() as session:
+        with self._session("delete_agent") as session:
             row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return False
