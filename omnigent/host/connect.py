@@ -1344,7 +1344,13 @@ class HostProcess:
                 handle.proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 handle.proc.kill()
-                handle.proc.wait()
+                # Bounded: a bare wait() would hang if the handle can't observe
+                # the exit (e.g. a zygote-forked runner whose zygote died and
+                # whose pid probe is the only signal). The kill has been sent;
+                # give it a short window, then move on rather than block the
+                # daemon's control handler forever.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    handle.proc.wait(timeout=5.0)
         _logger.info("Stopped runner %s", frame.runner_id)
         print(
             f"  ↓ Runner stopped: {frame.runner_id}",

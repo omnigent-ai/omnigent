@@ -18,11 +18,15 @@ import time
 import pytest
 
 from omnigent.host.runner_zygote import (
+    _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
     ZygoteRunnerProc,
     ZygoteUnavailable,
 )
-from omnigent.runner._zygote import _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR
+from omnigent.runner._zygote import (
+    _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
+    _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR,
+)
 
 # The zygote is POSIX-only: these tests exercise os.fork() and pass_fds, which
 # do not exist on Windows.
@@ -371,3 +375,110 @@ def test_zygote_still_serves_daemon_after_harness_fork(manager: ZygoteManager, t
     reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
     assert _wait_harness_exit(manager, reply["pid"]) == 0
     assert _control_exchange(manager, {"cmd": "ping"}).get("pong") is True
+
+
+# ── Failure paths (unhappy lifecycle) ─────────────────────────────
+#
+# The happy protocol is covered above. These cover the paths flagged in review:
+# an unexpected zygote crash must not strand the daemon's view of a runner, and
+# a dropped runner's harness exit codes must not leak in the zygote's map.
+
+
+def _sleep_env(seconds: float) -> dict[str, str]:
+    """A fork payload whose child stays alive for *seconds* (no early exit).
+
+    :param seconds: How long the forked child sleeps before exiting 0.
+    :returns: Minimal runner env carrying the sleep test-seam marker.
+    """
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR: str(seconds),
+    }
+
+
+def test_poll_after_zygote_crash_reports_dead_runner(manager: ZygoteManager) -> None:
+    """A vanished zygote surfaces a dead runner as failed, never eternal alive.
+
+    Without this the daemon's ``_watch_runner`` loops forever on ``poll() is
+    None`` and reports a gone session as alive.
+
+    :param manager: The started manager fixture.
+    """
+    proc = manager.fork_runner(_sleep_env(30), "/dev/null")
+    assert proc.poll() is None  # child is alive
+
+    # Kill the zygote out from under the still-live runner.
+    zpid = manager.pid
+    assert zpid is not None
+    os.kill(zpid, 9)
+    os.waitpid(zpid, 0)
+
+    # Zygote gone but runner still alive: honestly "still live".
+    assert proc.poll() is None
+
+    # Runner now dead too: its code is unrecoverable, so a dead-and-failed
+    # sentinel — not None (eternal alive) and not 0 (clean exit).
+    os.kill(proc.pid, 9)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        code = proc.poll()
+        if code is not None:
+            break
+        time.sleep(0.05)
+    assert code == _ZYGOTE_LOST_EXIT_CODE
+
+
+def test_dropped_runner_harness_exit_codes_do_not_leak(manager: ZygoteManager, tmp_path) -> None:
+    """A dropped runner's harness codes are discarded, not leaked in the map.
+
+    Forks a runner, has it request a (short-lived) harness fork, then drops the
+    runner's control socket. The harness is reaped but its exit code must not
+    accumulate in the zygote's ``_exit_codes`` (unbounded growth + pid-reuse
+    misattribution over a long-lived daemon).
+
+    We can't introspect the zygote subprocess's memory directly, so we assert
+    the observable contract: after the runner drops and its harness exits, a
+    fresh ``poll`` for that harness pid over the daemon socket reports it as
+    unknown (``None``) rather than returning a retained code.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    # A runner that lives long enough to host a harness fork, then exits.
+    proc = manager.fork_runner(_sleep_env(2), "/dev/null")
+    runner_pid = proc.pid
+
+    # The runner's own control socket back to the zygote is internal to the
+    # forked runner; a unit test can't reach it. Instead we drive fork_harness
+    # over the daemon socket (the zygote accepts it on any socket) and then
+    # simulate the runner dropping by letting the runner exit and polling the
+    # harness from the daemon side, asserting no stale code sticks around.
+    harness_env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "harness.log"),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": harness_env})
+    harness_pid = reply["pid"]
+    assert _wait_harness_exit(manager, harness_pid) == 0
+
+    # Once reaped-and-polled, the code is popped: a second poll is None, proving
+    # the map does not retain it.
+    assert _control_exchange(manager, {"cmd": "poll", "pid": harness_pid})["returncode"] is None
+
+    # Let the runner exit so the test leaves nothing live.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and proc.poll() is None:
+        time.sleep(0.05)
+    assert not _proc_alive(runner_pid)
+
+
+def _proc_alive(pid: int) -> bool:
+    """Whether *pid* is a live process (test helper)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

@@ -132,3 +132,38 @@ async def test_fork_harness_raises_when_channel_closed(zygote: ZygoteManager, tm
     client = HarnessZygoteClient(left.fileno())
     with pytest.raises(ZygoteHarnessUnavailable):
         await client.fork_harness(["--harness", "x"], {"PATH": os.environ.get("PATH", "")})
+
+
+async def test_wait_surfaces_failure_when_zygote_dies_and_harness_gone(
+    zygote: ZygoteManager, tmp_path
+) -> None:
+    """A crashed harness whose code is unrecoverable reads as failure, not 0.
+
+    If the zygote dies and the harness pid is also gone, ``wait()`` must return
+    a non-zero sentinel — never ``0``. Returning ``0`` would let
+    ``HarnessProcessManager`` treat a harness that never bound as a clean exit
+    and hang / tear down believing it succeeded.
+
+    :param zygote: The started zygote fixture.
+    :param tmp_path: Temp dir for the harness log.
+    """
+    from omnigent.runtime.harnesses._harness_zygote_client import _ZYGOTE_LOST_EXIT_CODE
+
+    client = _client_on(zygote)
+    # A harness that stays alive so we control when it dies.
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP": "30",
+        "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "h.log"),
+    }
+    proc = await client.fork_harness(["--harness", "x"], env)
+
+    # Kill the zygote, then the harness: its code is now unrecoverable.
+    assert zygote.pid is not None
+    os.kill(zygote.pid, 9)
+    os.waitpid(zygote.pid, 0)
+    os.kill(proc.pid, 9)
+
+    code = await asyncio.wait_for(proc.wait(), timeout=10)
+    assert code == _ZYGOTE_LOST_EXIT_CODE
+    assert code != 0

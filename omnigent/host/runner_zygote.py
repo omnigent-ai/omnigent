@@ -17,9 +17,10 @@ This module owns:
   ``wait`` round-trip to the zygote (the real parent) for exit status, while
   ``terminate``/``kill`` signal the pid directly.
 
-Everything here is Linux-only and opt-in; the daemon gates it behind
-``OMNIGENT_RUNNER_ZYGOTE=1`` and falls back to direct ``Popen`` on any failure,
-so the zygote is never a hard dependency.
+This code runs on any POSIX host (the gate is ``IS_POSIX``); the copy-on-write
+*savings* are Linux-specific, but the fork/protocol path executes on macOS too.
+Opt-in: the daemon gates it behind ``OMNIGENT_RUNNER_ZYGOTE=1`` and falls back
+to direct ``Popen`` on any failure, so the zygote is never a hard dependency.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
+from omnigent.inner import _proc
 from omnigent.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
 
@@ -45,6 +47,13 @@ logger = logging.getLogger(__name__)
 # Bound each control round-trip so a wedged zygote can never hang the daemon;
 # fork + reply is sub-millisecond locally, so this is purely a safety net.
 _CONTROL_TIMEOUT_S = 30.0
+
+# Reported for a forked runner whose real exit code can no longer be recovered
+# because the zygote (its OS parent, the only process that could waitpid it)
+# died. The runner process itself is confirmed gone by a direct pid probe; we
+# just can't know its code, so surface a non-zero sentinel — a lost runner must
+# read as dead-and-failed, never as a clean exit or an eternal "still alive".
+_ZYGOTE_LOST_EXIT_CODE = 254
 
 
 class ZygoteUnavailable(RuntimeError):
@@ -246,10 +255,13 @@ class ZygoteManager:
         try:
             reply = self._exchange({"cmd": "poll", "pid": pid})
         except ZygoteUnavailable:
-            # If the zygote died, its children were reparented and are being
-            # torn down by their own orphan watchdog; report "still live" so
-            # the caller keeps polling rather than misreporting a crash.
-            return None
+            # The zygote (the runner's OS parent) died, so exit status can no
+            # longer be recovered over the control socket. Probe the runner pid
+            # directly: if it is gone, surface a dead-and-failed sentinel so the
+            # daemon's watcher stops looping and reports the exit; if it is
+            # somehow still alive, report "still live" and keep polling. Never
+            # report an eternal None for a process that has actually exited.
+            return None if _proc.process_alive(pid) else _ZYGOTE_LOST_EXIT_CODE
         code = reply.get("returncode")
         return code if isinstance(code, int) else None
 

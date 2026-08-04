@@ -34,6 +34,7 @@ import signal
 import socket
 from typing import Any
 
+from omnigent.inner import _proc
 from omnigent.runner._zygote import ZYGOTE_HARNESS_FD_ENV_VAR
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,12 @@ logger = logging.getLogger(__name__)
 # runs for the life of the conversation, so this only matters around teardown;
 # 0.1s keeps wait() responsive without loading the control channel.
 _POLL_INTERVAL_S = 0.1
+
+# Reported when a harness's real exit code can't be recovered because the
+# zygote (its OS parent) died AND the harness pid is itself gone. Non-zero so a
+# harness that crashed on boot reads as a failure — never as a clean exit that
+# would let the process manager treat a never-bound harness as success.
+_ZYGOTE_LOST_EXIT_CODE = 254
 
 
 class ZygoteHarnessUnavailable(RuntimeError):
@@ -74,10 +81,16 @@ class ZygoteHarnessProc:
             try:
                 code = await self._client.poll(self.pid)
             except ZygoteHarnessUnavailable:
-                # Zygote gone: the harness reparented and is self-terminating
-                # via its own watchdog; stop polling and let wait() proceed via
-                # the signal path the manager takes on teardown.
-                return
+                # The zygote (the harness's OS parent) died, so its exit code
+                # can no longer be recovered. Probe the harness pid directly: if
+                # it is gone, record a non-zero sentinel so a crashed / never-
+                # bound harness reads as a failure rather than a clean exit; if
+                # it is somehow still alive, keep polling.
+                if not await asyncio.to_thread(_proc.process_alive, self.pid):
+                    self.returncode = _ZYGOTE_LOST_EXIT_CODE
+                    return
+                await asyncio.sleep(_POLL_INTERVAL_S)
+                continue
             if code is not None:
                 self.returncode = code
                 return
@@ -86,15 +99,16 @@ class ZygoteHarnessProc:
     async def wait(self) -> int:
         """Block until the harness exits, returning its code.
 
-        :returns: The harness exit code (0 if it could not be determined
-            because the zygote went away — the harness is gone either way).
+        :returns: The harness exit code, or a non-zero sentinel if it could not
+            be determined because the zygote went away (the harness is gone
+            either way — a lost code reads as failure, never as clean exit).
         """
         # A teardown that cancels the manager's task should not turn wait() into
         # a hard error; fall through to the cached returncode.
         if self._poll_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._poll_task
-        return self.returncode if self.returncode is not None else 0
+        return self.returncode if self.returncode is not None else _ZYGOTE_LOST_EXIT_CODE
 
     def send_signal(self, sig: int) -> None:
         """Signal the harness pid, ignoring an already-exited process.

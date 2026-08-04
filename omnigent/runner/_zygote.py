@@ -34,9 +34,10 @@ its own. When the daemon dies, the control socket hits EOF, the zygote exits,
 its runner children reparent, ``getppid()`` changes, and each runner tears
 itself down — preserving today's parent-death semantics through one extra hop.
 
-Linux-only and opt-in: the daemon gates all of this behind
-``OMNIGENT_RUNNER_ZYGOTE=1`` and falls back to direct ``Popen`` if the zygote is
-unavailable, so this is never a hard dependency.
+POSIX (the gate is ``IS_POSIX``) and opt-in: the fork path runs on macOS too,
+though the copy-on-write savings are Linux-specific. The daemon gates all of
+this behind ``OMNIGENT_RUNNER_ZYGOTE=1`` and falls back to direct ``Popen`` if
+the zygote is unavailable, so this is never a hard dependency.
 """
 
 from __future__ import annotations
@@ -72,6 +73,10 @@ _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_EXIT"
 # Test-only seam: raise SystemExit(code) rather than os._exit, to exercise the
 # child guard's SystemExit-code preservation. Never set in production launches.
 _ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
+# Test-only seam: when set, the child sleeps for this many seconds (staying
+# genuinely alive) instead of exiting, so a test can kill the zygote out from
+# under a live child and assert the crash-recovery path. Never set in prod.
+_ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
 
 
 def _import_runner_graph() -> None:
@@ -171,6 +176,26 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     # prove one fork's env never leaks into another's. When the raise variant is
     # set it raises SystemExit instead of os._exit-ing, so the child guard's
     # SystemExit-code preservation can be tested end-to-end.
+    _maybe_run_test_seam()
+
+    from omnigent.runner._entry import main
+
+    main()
+
+
+def _maybe_run_test_seam() -> None:
+    """Honor the fork-payload test seams (exit / raise / sleep). Never in prod.
+
+    Returns normally when no seam is set; otherwise exits or sleeps and does
+    not return. Shared by runner and harness child bodies so both can be driven
+    deterministically (including staying alive for crash-recovery tests).
+    """
+    sleep_s = os.environ.get(_ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR)
+    if sleep_s is not None:
+        import time
+
+        time.sleep(float(sleep_s))
+        os._exit(0)
     test_exit = os.environ.get(_ZYGOTE_TEST_CHILD_EXIT_ENV_VAR)
     if test_exit is not None:
         sys.stdout.write(f"marker={os.environ.get('OMNIGENT_ZYGOTE_MARKER', '')}\n")
@@ -179,10 +204,6 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
         if env_truthy(os.environ.get(_ZYGOTE_TEST_CHILD_RAISE_ENV_VAR)):
             raise SystemExit(int(test_exit))
         os._exit(int(test_exit))
-
-    from omnigent.runner._entry import main
-
-    main()
 
 
 def _run_harness_child(request: dict[str, Any]) -> None:
@@ -207,8 +228,15 @@ def _run_harness_child(request: dict[str, Any]) -> None:
 
     _wire_child_stdio(os.environ.get(PROCESS_LOG_FILE_ENV_VAR))
 
-    # Test seam: harness children exit immediately with a code, echoing argv so
-    # a test can assert the payload round-tripped. Never set in production.
+    # Test seam: a sleep seam keeps the harness genuinely alive (crash-recovery
+    # tests); the exit seam echoes argv so a test can assert the payload
+    # round-tripped. Never set in production.
+    sleep_s = os.environ.get(_ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR)
+    if sleep_s is not None:
+        import time
+
+        time.sleep(float(sleep_s))
+        os._exit(0)
     test_exit = os.environ.get(_ZYGOTE_TEST_CHILD_EXIT_ENV_VAR)
     if test_exit is not None:
         sys.stdout.write(f"harness_argv={' '.join(request.get('argv') or [])}\n")
@@ -241,6 +269,16 @@ class _ZygoteServer:
         # daemon/runner are not these children's parents and cannot waitpid().
         self._exit_codes: dict[int, int] = {}
         self._live: set[int] = set()
+        # Harness pids forked on behalf of each runner, keyed by that runner's
+        # control-socket fileno. When a runner drops, its harnesses have no
+        # remaining client to poll their exit code, so they are orphaned (see
+        # _drop_runner) — reaped to avoid zombies but not retained in
+        # _exit_codes, which would otherwise grow unbounded and risk pid-reuse
+        # misattribution over a long-lived daemon.
+        self._runner_harness_pids: dict[int, set[int]] = {}
+        # Pids whose exit code must be discarded (not stored) when reaped: a
+        # dropped runner's harness children that nothing will ever poll.
+        self._orphaned: set[int] = set()
         # Every zygote-side control socket a forked child inherits and must
         # close (the daemon socket + all runner sockets).
         self._control_socks: set[socket.socket] = {control_sock}
@@ -263,17 +301,30 @@ class _ZygoteServer:
             self._sel.close()
 
     def _reap(self) -> None:
-        """Non-blocking reap of any exited children into ``exit_codes``."""
+        """Non-blocking reap of any exited children into ``exit_codes``.
+
+        Orphaned pids (a dropped runner's harness children) are reaped to avoid
+        zombies but their exit code is discarded rather than stored, since no
+        client remains to poll it.
+        """
         for pid in list(self._live):
             try:
                 waited, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
-                self._live.discard(pid)
+                self._forget_pid(pid)
                 continue
             if waited == 0:
                 continue
-            self._exit_codes[pid] = os.waitstatus_to_exitcode(status)
             self._live.discard(pid)
+            if pid in self._orphaned:
+                self._orphaned.discard(pid)
+                continue
+            self._exit_codes[pid] = os.waitstatus_to_exitcode(status)
+
+    def _forget_pid(self, pid: int) -> None:
+        """Drop all tracking state for a pid that is no longer reapable."""
+        self._live.discard(pid)
+        self._orphaned.discard(pid)
 
     def _on_readable(self, conn: socket.socket, role: str) -> bool:
         """Drain a readable socket, dispatching each newline-delimited request.
@@ -400,6 +451,9 @@ class _ZygoteServer:
             self._close_inherited_in_child()
             self._exit_child(lambda: _run_harness_child(request))
         self._live.add(pid)
+        # Track under the requesting runner so _drop_runner can orphan this
+        # harness's exit-code state if that runner disappears before polling.
+        self._runner_harness_pids.setdefault(conn.fileno(), set()).add(pid)
         _send(conn, {"pid": pid})
 
     @staticmethod
@@ -426,14 +480,23 @@ class _ZygoteServer:
         """Forget a runner whose control socket closed (the runner exited).
 
         Its harness children self-terminate via their own watchdog (which
-        probes the runner pid) and are reaped by the shared loop.
+        probes the runner pid). With the runner gone, nothing will ever poll
+        their exit codes, so mark them orphaned: _reap still waitpid's them (no
+        zombies) but discards the code instead of leaking it in _exit_codes —
+        which would otherwise grow unbounded and risk pid-reuse misattribution.
+        Any already-reaped codes for this runner's harnesses are dropped too.
 
         :param conn: The closed runner socket.
         """
+        fileno = conn.fileno()
         with contextlib.suppress(KeyError):
             self._sel.unregister(conn)
         self._control_socks.discard(conn)
-        self._buffers.pop(conn.fileno(), None)
+        self._buffers.pop(fileno, None)
+        for harness_pid in self._runner_harness_pids.pop(fileno, set()):
+            self._exit_codes.pop(harness_pid, None)
+            if harness_pid in self._live:
+                self._orphaned.add(harness_pid)
         with contextlib.suppress(OSError):
             conn.close()
 
