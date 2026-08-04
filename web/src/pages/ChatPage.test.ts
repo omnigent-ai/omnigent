@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
+import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
@@ -30,6 +31,7 @@ import {
   shouldShowWorkingIndicator,
   shouldShowTerminalSurface,
   splitSlashCommand,
+  stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
   WORKING_MESSAGES,
@@ -579,6 +581,56 @@ describe("stripPendingElicitations", () => {
     expect(stripped[0]).toBe(a1);
     expect(stripped[1]).not.toBe(a2);
     expect((stripped[1] as Extract<Bubble, { kind: "assistant" }>).items).toEqual([]);
+  });
+});
+
+// ── sub-agent routing chip gate ─────────────────────────────────────────────
+
+// Routing-decision chip bubble at some scope, e.g. an in-harness Task spawn.
+const routingChip = (id: string, scope?: RoutingScope): Bubble => ({
+  kind: "routing_decision",
+  itemId: id,
+  model: "databricks-claude-haiku-4-5",
+  applied: true,
+  rationale: "cheap lookup",
+  ...(scope !== undefined && { routing: { scope } }),
+});
+const chipIds = (bubbles: Bubble[]): string[] =>
+  bubbles.filter((b) => b.kind === "routing_decision").map((b) => b.itemId);
+
+describe("stripGatedSubagentRoutingChips", () => {
+  it("shows the spawn chips when the session turned sub-agent routing on", () => {
+    const bubbles = [userBubble("u1"), routingChip("rd_sub", "native_subagent")];
+    expect(stripGatedSubagentRoutingChips(bubbles, "on")).toBe(bubbles);
+  });
+
+  it("hides spawn chips on Inherit but keeps the session's own decisions", () => {
+    // The reported bug: an inheriting session advertised per-spawn Smart
+    // Routing it was never explicitly asked for. Its own session/turn verdicts
+    // (and legacy rows with no scope) still belong on screen.
+    const bubbles = [
+      routingChip("rd_session", "session"),
+      routingChip("rd_turn", "turn"),
+      routingChip("rd_legacy"),
+      routingChip("rd_child", "child_session"),
+      userBubble("u1"),
+      routingChip("rd_sub", "native_subagent"),
+      assistantText("a1"),
+    ];
+    const shown = stripGatedSubagentRoutingChips(bubbles, null);
+    expect(chipIds(shown)).toEqual(["rd_session", "rd_turn", "rd_legacy", "rd_child"]);
+    // Everything else keeps its place and its reference (BubbleView's memo).
+    expect(bubbleIds(shown)).toEqual(["", "", "", "", "u1", "a1"]);
+  });
+
+  it("hides spawn chips on an explicit off", () => {
+    const bubbles = [routingChip("rd_sub", "native_subagent")];
+    expect(stripGatedSubagentRoutingChips(bubbles, "off")).toEqual([]);
+  });
+
+  it("returns the same array reference when there is nothing to hide", () => {
+    const bubbles = [userBubble("u1"), routingChip("rd_session", "session")];
+    expect(stripGatedSubagentRoutingChips(bubbles, null)).toBe(bubbles);
   });
 });
 
