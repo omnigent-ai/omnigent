@@ -1716,7 +1716,9 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     # here for both effort_change and model_change.
     [
         ({"type": "effort_change", "effort": "high"}, "inject_slash_command"),
-        ({"type": "model_change", "model": "claude-opus-4-7"}, "inject_slash_command"),
+        # model_change drives the ``/model`` picker rather than the argument
+        # form, so its injector is ``inject_model_selection``.
+        ({"type": "model_change", "model": "claude-opus-4-7"}, "inject_model_selection"),
     ],
     ids=["effort_change", "model_change"],
 )
@@ -1755,7 +1757,7 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
         del kwargs
         captured_bridge_dir.append(bridge_dir)
 
-    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, inject_attr, _fake_inject)
 
     sentinel_bridge_id = "bridge_from_fork_label_xyz"
 
@@ -1825,33 +1827,42 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
 
 
 @pytest.mark.asyncio
-async def test_events_model_change_on_native_session_types_slash_command(
+async def test_events_model_change_on_native_session_drives_the_model_picker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     POST ``/events`` with ``{"type":"model_change","model":"claude-opus-4-7"}``
-    on a claude-native session injects ``/model claude-opus-4-7`` into tmux.
+    on a claude-native session drives the ``/model`` picker for that model.
 
-    Mirrors the effort_change happy-path test. Pins that the new
-    runner dispatch routes model_change to the native handler and
-    assembles the right slash command.
+    Mirrors the effort_change happy-path test. Pins that the runner dispatch
+    routes model_change to the native handler, and that it goes through the
+    picker's session-scoped pick — ``/model <id>`` would save the pick as the
+    user's global default and rewrite their ``~/.claude/settings.json``.
     """
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
 
+    def _fake_inject_slash(bridge_dir: Any, **kwargs: Any) -> None:
+        """Fail the test if the model change regresses to the argument form."""
+        del bridge_dir
+        raise AssertionError(
+            f"model_change must not use inject_slash_command; got {kwargs!r}. "
+            f"The argument form of /model rewrites the user's global default."
+        )
+
     def _fake_inject(
         bridge_dir: Any,
         *,
-        command: str,
+        targets: Any,
         timeout_s: float,
-        auto_confirm: bool = False,
     ) -> None:
         """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, command, timeout_s))
+        captured.append((bridge_dir, tuple(targets), timeout_s))
 
-    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject_slash)
+    monkeypatch.setattr(claude_native_bridge, "inject_model_selection", _fake_inject)
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -1907,16 +1918,62 @@ async def test_events_model_change_on_native_session_types_slash_command(
         f"Native model_change must return 204 from /events; got {resp.status_code}: {resp.text}"
     )
     assert len(captured) == 1, (
-        f"Expected one inject_slash_command call from native model_change, got {len(captured)}."
+        f"Expected one inject_model_selection call from native model_change, got {len(captured)}."
     )
-    _bridge_dir, command, timeout_s = captured[0]
-    assert command == "/model claude-opus-4-7", (
-        f"Expected '/model claude-opus-4-7' literal, got {command!r}."
+    _bridge_dir, targets, timeout_s = captured[0]
+    # The resolved selection first, then the family alias Claude Code labels
+    # an unpinned row with — this session recorded no alias pinning.
+    assert targets == ("claude-opus-4-7", "opus"), (
+        f"Expected the resolved selection then its family alias, got {targets!r}."
     )
     assert timeout_s == 1.0
     assert queued_events == [], (
         f"model_change must not publish session events; got {queued_events!r}."
     )
+
+
+# A workspace serving two Opus generations: ``opus`` pinned to 4.8, and the
+# extra picker slot holding Opus 5 under a display name. Both rows answer to
+# "opus", which is why a tier selection has to carry its exact spellings.
+_TWO_GENERATION_MODEL_ENV = {
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-opus-5",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Opus 5",
+}
+
+
+@pytest.mark.parametrize(
+    ("model", "model_env", "expected"),
+    [
+        # A pinned alias labels its picker row with the exact catalog id, so
+        # the pin must come FIRST — the bare alias would otherwise reach the
+        # custom slot's "Opus 5" row, a generation the user did not pick.
+        ("opus", _TWO_GENERATION_MODEL_ENV, ("databricks-claude-opus-4-8", "opus")),
+        ("haiku", _TWO_GENERATION_MODEL_ENV, ("databricks-claude-haiku-4-5", "haiku")),
+        # The custom slot's row is labelled with its display name, not the id
+        # the slot holds, so the name has to be offered or the row is
+        # unreachable and the switch fails open.
+        (
+            "databricks-claude-opus-5",
+            _TWO_GENERATION_MODEL_ENV,
+            ("databricks-claude-opus-5", "Opus 5"),
+        ),
+        # Nothing pinned (a direct Anthropic login): the row carries Claude
+        # Code's own display name, which the alias reaches on its own.
+        ("haiku", {}, ("haiku",)),
+    ],
+    ids=["pinned-alias", "pinned-haiku", "custom-slot", "unpinned"],
+)
+def test_claude_native_model_picker_targets_offers_the_pin_before_the_alias(
+    model: str,
+    model_env: dict[str, str],
+    expected: tuple[str, ...],
+) -> None:
+    from omnigent.runner.app import _claude_native_model_picker_targets
+
+    assert _claude_native_model_picker_targets(model, model_env) == expected
 
 
 @pytest.mark.asyncio
@@ -2011,21 +2068,15 @@ async def test_events_model_change_on_native_session_skips_inject_for_empty_or_n
     """
     from omnigent.spec.types import ExecutorSpec
 
-    def _fake_inject(
-        bridge_dir: Any,
-        *,
-        command: str,
-        timeout_s: float,
-        auto_confirm: bool = False,
-    ) -> None:
+    def _fake_inject(bridge_dir: Any, **kwargs: Any) -> None:
         """Fail the test if the runner reaches inject for an empty value."""
-        del bridge_dir, command, timeout_s
+        del bridge_dir, kwargs
         raise AssertionError(
-            f"inject_slash_command must not be called for model={model_value!r}; "
+            f"inject_model_selection must not be called for model={model_value!r}; "
             f"the native handler should skip empty / null values."
         )
 
-    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "inject_model_selection", _fake_inject)
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -2082,18 +2133,12 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
     """
     from omnigent.spec.types import ExecutorSpec
 
-    def _fake_inject(
-        bridge_dir: Any,
-        *,
-        command: str,
-        timeout_s: float,
-        auto_confirm: bool = False,
-    ) -> None:
+    def _fake_inject(bridge_dir: Any, **kwargs: Any) -> None:
         """Simulate the bridge-not-ready path."""
-        del bridge_dir, command, timeout_s
+        del bridge_dir, kwargs
         raise RuntimeError("tmux target is not advertised")
 
-    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "inject_model_selection", _fake_inject)
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -2148,26 +2193,20 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
     In-process harnesses re-read the persisted ``model_override`` on
     each turn (or via the per-event override). Omnigent server is harness-
     agnostic and POSTs model_change for every PATCH, so the runner
-    must accept the event with a 204 — never reach the slash-command
+    must accept the event with a 204 — never reach the model
     injector.
     """
     from omnigent.spec.types import ExecutorSpec
 
-    def _fake_inject(
-        bridge_dir: Any,
-        *,
-        command: str,
-        timeout_s: float,
-        auto_confirm: bool = False,
-    ) -> None:
+    def _fake_inject(bridge_dir: Any, **kwargs: Any) -> None:
         """Fail the test if a non-native session reaches the injector."""
-        del bridge_dir, command, timeout_s
+        del bridge_dir, kwargs
         raise AssertionError(
-            "inject_slash_command must never be called for non-native "
+            "inject_model_selection must never be called for non-native "
             "sessions — model_change is a no-op for in-process harnesses."
         )
 
-    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "inject_model_selection", _fake_inject)
 
     # Default harness (in-process LLM loop), NOT claude-native.
     default_spec = AgentSpec(

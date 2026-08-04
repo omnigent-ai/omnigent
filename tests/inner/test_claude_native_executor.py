@@ -823,33 +823,33 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
     tmp_path: Path,
 ) -> None:
     """
-    A routed model is switched via ``/model`` BEFORE the message, in order.
+    A routed model is applied BEFORE the message, in order.
 
     Intelligent routing delivers the picked model on the turn (adapter maps
-    ``request.model_override`` -> ``config.model``). The executor must type
-    ``/model <routed>`` and then inject the message as one sequence under
+    ``request.model_override`` -> ``config.model``). The executor must apply
+    the switch and then inject the message as one sequence under
     ``_inject_lock`` — never as a separate racing writer. This test records
-    the call order across both injectors and asserts ``/model`` lands first,
+    the call order across both injectors and asserts the switch lands first,
     then the message, exactly once each. A regression that dropped the switch
     (or ran it concurrently) would fail the ordering assertion.
 
-    The typed argument is the session's alias for the routed catalog id:
-    ``/model`` rejects a bare gateway id and silently keeps the old model.
+    The switch goes through the picker's session-only pick, and the routed id
+    is offered alongside the session's alias for it: ``/model`` rejects a bare
+    gateway id, and the argument form would rewrite the user's global default.
     """
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
     bridge_dir = tmp_path / "bridge"
     calls: list[tuple[str, str]] = []
 
-    def fake_inject_slash_command(
+    def fake_inject_model_selection(
         bridge_dir_arg: Path,
         *,
-        command: str,
+        targets: tuple[str, ...],
         timeout_s: float = 30.0,
-        auto_confirm: bool = False,
     ) -> None:
-        """Record the ``/model`` switch keystroke and its auto_confirm flag."""
+        """Record the picker-driven model switch and the row spellings tried."""
         del bridge_dir_arg, timeout_s
-        calls.append(("slash", command, auto_confirm))
+        calls.append(("model", tuple(targets)))
 
     def fake_inject_user_message(
         bridge_dir_arg: Path,
@@ -869,7 +869,9 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
         "read_model_env",
         lambda _bridge: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_selection", fake_inject_model_selection
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -884,11 +886,11 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
     ]
 
     assert calls == [
-        # auto_confirm=True mirrors the manual picker path so the switch is
-        # accepted if the CLI ever pops a confirmation dialog.
-        ("slash", "/model sonnet", True),
+        # The routed id first (the picker labels a pinned row with it), then
+        # the alias as the fallback spelling.
+        ("model", ("databricks-claude-sonnet-5", "sonnet")),
         ("message", "review this function"),
-    ], f"Expected /model (auto_confirm) then message, in order; got {calls}."
+    ], f"Expected the model switch then the message, in order; got {calls}."
     assert events == [TurnComplete(response=None)]
 
 
@@ -899,13 +901,13 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
 ) -> None:
     """A model pinned to the custom picker slot is applied exactly."""
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
-    slash_calls: list[str] = []
+    switch_calls: list[tuple[str, ...]] = []
 
-    def fake_inject_slash_command(
-        bridge_dir_arg: Path, *, command: str, timeout_s: float = 30.0, auto_confirm: bool = False
+    def fake_inject_model_selection(
+        bridge_dir_arg: Path, *, targets: tuple[str, ...], timeout_s: float = 30.0
     ) -> None:
-        del bridge_dir_arg, timeout_s, auto_confirm
-        slash_calls.append(command)
+        del bridge_dir_arg, timeout_s
+        switch_calls.append(tuple(targets))
 
     monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
     monkeypatch.setattr(
@@ -916,7 +918,9 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
             "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5",
         },
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_selection", fake_inject_model_selection
+    )
     monkeypatch.setattr(
         claude_native_executor,
         "inject_user_message",
@@ -934,7 +938,8 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
         )
     ]
 
-    assert slash_calls == ["/model databricks-claude-sonnet-5"]
+    # The custom slot's exact id needs no alias fallback — it deduplicates.
+    assert switch_calls == [("databricks-claude-sonnet-5",)]
     assert events == [TurnComplete(response=None)]
 
 
@@ -950,14 +955,14 @@ async def test_run_turn_skips_switch_for_untranslatable_model(
     model while reporting success, so the switch is skipped instead.
     """
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
-    slash_calls: list[str] = []
+    switch_calls: list[tuple[str, ...]] = []
     msg_calls: list[str] = []
 
-    def fake_inject_slash_command(
-        bridge_dir_arg: Path, *, command: str, timeout_s: float = 30.0, auto_confirm: bool = False
+    def fake_inject_model_selection(
+        bridge_dir_arg: Path, *, targets: tuple[str, ...], timeout_s: float = 30.0
     ) -> None:
-        del bridge_dir_arg, timeout_s, auto_confirm
-        slash_calls.append(command)
+        del bridge_dir_arg, timeout_s
+        switch_calls.append(tuple(targets))
 
     def fake_inject_user_message(
         bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
@@ -973,7 +978,9 @@ async def test_run_turn_skips_switch_for_untranslatable_model(
         "read_model_env",
         lambda _bridge: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"},
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_selection", fake_inject_model_selection
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
@@ -987,7 +994,7 @@ async def test_run_turn_skips_switch_for_untranslatable_model(
         )
     ]
 
-    assert slash_calls == []
+    assert switch_calls == []
     assert msg_calls == ["hello"]
     assert events == [TurnComplete(response=None)]
 
@@ -1004,7 +1011,7 @@ async def test_run_turn_skips_switch_when_the_family_pin_drifted(
     while the transcript claimed it ran.
     """
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
-    slash_calls: list[str] = []
+    switch_calls: list[tuple[str, ...]] = []
     msg_calls: list[str] = []
 
     monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
@@ -1015,10 +1022,8 @@ async def test_run_turn_skips_switch_when_the_family_pin_drifted(
     )
     monkeypatch.setattr(
         claude_native_executor,
-        "inject_slash_command",
-        lambda bridge_dir_arg, *, command, timeout_s=30.0, auto_confirm=False: slash_calls.append(
-            command
-        ),
+        "inject_model_selection",
+        lambda bridge_dir_arg, *, targets, timeout_s=30.0: switch_calls.append(tuple(targets)),
     )
     monkeypatch.setattr(
         claude_native_executor,
@@ -1037,7 +1042,7 @@ async def test_run_turn_skips_switch_when_the_family_pin_drifted(
         )
     ]
 
-    assert slash_calls == []
+    assert switch_calls == []
     assert msg_calls == ["hello"]
     assert events == [TurnComplete(response=None)]
 
@@ -1048,21 +1053,21 @@ async def test_run_turn_without_model_override_injects_message_only(
     tmp_path: Path,
 ) -> None:
     """
-    No routed model -> no ``/model`` typed, message injected as before.
+    No routed model -> no switch applied, message injected as before.
 
     A non-routing turn (config.model None) must not touch the model at all —
     typing ``/model`` on every turn would be wrong and noisy.
     """
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
     bridge_dir = tmp_path / "bridge"
-    slash_calls: list[str] = []
+    switch_calls: list[tuple[str, ...]] = []
     msg_calls: list[str] = []
 
-    def fake_inject_slash_command(
-        bridge_dir_arg: Path, *, command: str, timeout_s: float = 30.0, auto_confirm: bool = False
+    def fake_inject_model_selection(
+        bridge_dir_arg: Path, *, targets: tuple[str, ...], timeout_s: float = 30.0
     ) -> None:
-        del bridge_dir_arg, timeout_s, auto_confirm
-        slash_calls.append(command)
+        del bridge_dir_arg, timeout_s
+        switch_calls.append(tuple(targets))
 
     def fake_inject_user_message(
         bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
@@ -1070,7 +1075,9 @@ async def test_run_turn_without_model_override_injects_message_only(
         del bridge_dir_arg, timeout_s
         msg_calls.append(content)
 
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_selection", fake_inject_model_selection
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1084,7 +1091,7 @@ async def test_run_turn_without_model_override_injects_message_only(
         )
     ]
 
-    assert slash_calls == [], f"No /model expected without a routed model; got {slash_calls}."
+    assert switch_calls == [], f"No switch expected without a routed model; got {switch_calls}."
     assert msg_calls == ["hi"]
     assert events == [TurnComplete(response=None)]
 
@@ -1095,7 +1102,7 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
     tmp_path: Path,
 ) -> None:
     """
-    A routed model equal to the pane's launch model types no ``/model``.
+    A routed model equal to the pane's launch model applies no switch.
 
     ``read_launch_model`` reports what Claude booted with; if routing picks
     that same model there is nothing to switch, so the executor must inject
@@ -1104,14 +1111,14 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
     """
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
     bridge_dir = tmp_path / "bridge"
-    slash_calls: list[str] = []
+    switch_calls: list[tuple[str, ...]] = []
     msg_calls: list[str] = []
 
-    def fake_inject_slash_command(
-        bridge_dir_arg: Path, *, command: str, timeout_s: float = 30.0, auto_confirm: bool = False
+    def fake_inject_model_selection(
+        bridge_dir_arg: Path, *, targets: tuple[str, ...], timeout_s: float = 30.0
     ) -> None:
-        del bridge_dir_arg, timeout_s, auto_confirm
-        slash_calls.append(command)
+        del bridge_dir_arg, timeout_s
+        switch_calls.append(tuple(targets))
 
     def fake_inject_user_message(
         bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
@@ -1124,7 +1131,9 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
         "read_launch_model",
         lambda _bridge: "databricks-claude-opus-4-8",
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_selection", fake_inject_model_selection
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1138,6 +1147,8 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
         )
     ]
 
-    assert slash_calls == [], f"No /model expected when already on that model; got {slash_calls}."
+    assert switch_calls == [], (
+        f"No switch expected when already on that model; got {switch_calls}."
+    )
     assert msg_calls == ["hello"]
     assert events == [TurnComplete(response=None)]

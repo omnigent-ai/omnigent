@@ -50,6 +50,11 @@ ALIAS_MODEL_ENV_VARS: dict[str, str] = {
 #: Agent tool's enum has no such slot, so only ``/model`` uses it.
 CUSTOM_MODEL_OPTION_ENV_VAR = "ANTHROPIC_CUSTOM_MODEL_OPTION"
 
+#: Display name Claude Code labels the custom slot's ``/model`` picker row
+#: with. That row shows this name instead of the slot's id, so driving the
+#: picker onto it needs the name as an accepted row spelling.
+CUSTOM_MODEL_OPTION_NAME_ENV_VAR = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
+
 #: Launch-env keys that define this session's model vocabulary.
 MODEL_VOCABULARY_ENV_VARS: tuple[str, ...] = (
     *ALIAS_MODEL_ENV_VARS.values(),
