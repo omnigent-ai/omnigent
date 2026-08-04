@@ -260,6 +260,60 @@ def test_unstarted_manager_reports_not_running() -> None:
     assert mgr.pid is None
 
 
+def test_malloc_tuning_is_applied_at_the_zygote_exec(monkeypatch, tmp_path) -> None:
+    """The glibc arena cap rides on the zygote's exec, not on a fork payload.
+
+    glibc reads MALLOC_ARENA_MAX once, when its allocator initializes at exec.
+    The zygote's Popen is the only exec on this path — forked runners merely
+    replace ``os.environ``, far too late to configure an allocator — so the cap
+    must be set here or it silently stops applying to every runner.
+
+    :param monkeypatch: Fixture used to force the Linux tuning branch.
+    :param tmp_path: Temp dir for the zygote log path.
+    """
+    monkeypatch.setattr("omnigent.inner._proc.IS_LINUX", True)
+    captured: dict[str, str] = {}
+
+    class _FakePopen:
+        pid = 4321
+
+        def __init__(self, argv, env, **kwargs) -> None:
+            captured.update(env)
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr._spawn_zygote_process(child_fd=7)
+
+    assert captured["MALLOC_ARENA_MAX"] == "2"
+    assert captured["MALLOC_TRIM_THRESHOLD_"] == "134217728"
+
+
+def test_operator_malloc_override_wins_at_the_zygote_exec(monkeypatch, tmp_path) -> None:
+    """An explicit MALLOC_ARENA_MAX in the daemon env is not overwritten.
+
+    The tuning is merged with setdefault so an operator who exported a value
+    keeps it.
+
+    :param monkeypatch: Fixture used to force Linux and seed the parent env.
+    :param tmp_path: Temp dir for the zygote log path.
+    """
+    monkeypatch.setattr("omnigent.inner._proc.IS_LINUX", True)
+    monkeypatch.setenv("MALLOC_ARENA_MAX", "16")
+    captured: dict[str, str] = {}
+
+    class _FakePopen:
+        pid = 4321
+
+        def __init__(self, argv, env, **kwargs) -> None:
+            captured.update(env)
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr._spawn_zygote_process(child_fd=7)
+
+    assert captured["MALLOC_ARENA_MAX"] == "16"
+
+
 # ── Harness-fork path (fork_harness) ──────────────────────────────
 #
 # The zygote also forks HARNESS children on request, sharing the harness import

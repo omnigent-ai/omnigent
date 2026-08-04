@@ -46,6 +46,11 @@ _DEFAULT_MALLOC_TRIM_THRESHOLD = "134217728"  # 128 MiB
 def malloc_tuning_env() -> dict[str, str]:
     """Env vars that bound glibc allocator RSS for a spawned child.
 
+    Arena multiplication is specific to glibc's allocator. macOS libmalloc uses
+    per-CPU magazines with madvise-based reclaim and exposes no equivalent knob
+    (``MALLOC_ARENA_MAX`` is simply ignored there), so macOS hosts get their
+    reduction from the threadpool cap instead — see ``_entry`` — not from here.
+
     Returns an empty dict off Linux (macOS has no ``mallopt``; Windows and musl
     ignore these), so callers can merge unconditionally without a platform
     branch. Honors operator overrides ``OMNIGENT_RUNNER_MALLOC_ARENA_MAX``
