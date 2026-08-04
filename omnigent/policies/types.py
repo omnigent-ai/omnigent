@@ -15,6 +15,8 @@ Three types live in this module:
   resolved tool_name).
 - :class:`PolicyResult` — what a single policy returns and what
   the engine composes across policies.
+- :class:`ApprovalPresentation` — optional human-facing target
+  metadata supplied by an ASKing policy.
 - :class:`ElicitationRequest` — the internal contract for an
   ASK that's about to be surfaced upstream as an MCP-style
   elicitation. Carries the human-readable message plus the
@@ -54,6 +56,64 @@ class _CreateResponse(Protocol):
 
 
 _log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ApprovalPresentation:
+    """Policy-controlled presentation metadata for a policy ASK.
+
+    The ASKing policy derives the metadata from values the policy has
+    evaluated. ``secondary_arguments`` names raw tool-call arguments the
+    renderer may demote visually; it never authorizes hiding them, and the
+    complete raw call remains available.
+
+    :param title: Human-readable approval target.
+    :param href: Optional external target link. The elicitation boundary
+        validates it before transport.
+    :param secondary_arguments: Top-level argument names to render as
+        secondary detail.
+    """
+
+    title: str
+    href: str | None = None
+    secondary_arguments: tuple[str, ...] = ()
+
+
+def coerce_approval_presentation(value: object) -> ApprovalPresentation | None:
+    """Normalize a policy-supplied presentation without raising.
+
+    Python policies may return :class:`ApprovalPresentation` directly;
+    dict-returning policies and CEL use its mapping shape. A malformed
+    mapping drops only the presentation so policy evaluation can still
+    produce its ALLOW, ASK, or DENY decision.
+
+    :param value: Candidate dataclass or mapping.
+    :returns: A normalized presentation, or ``None`` when malformed.
+    """
+    title: object
+    if isinstance(value, ApprovalPresentation):
+        title = value.title
+        href = value.href
+        secondary = value.secondary_arguments
+    elif isinstance(value, dict):
+        title = value.get("title")
+        href = value.get("href")
+        secondary = value.get("secondary_arguments", ())
+    else:
+        return None
+    if not isinstance(title, str):
+        return None
+    if href is not None and not isinstance(href, str):
+        return None
+    if not isinstance(secondary, (list, tuple)) or not all(
+        isinstance(name, str) for name in secondary
+    ):
+        return None
+    return ApprovalPresentation(
+        title=title,
+        href=href,
+        secondary_arguments=tuple(secondary),
+    )
 
 
 # Proto-style phase wire strings (the ``type`` field on events that
@@ -272,6 +332,11 @@ class PolicyResult:
         denied ASK must leave no trace). ``None`` means "no
         state changes." e.g.
         ``[StateUpdate(key="call_count", action=StateUpdateAction.INCREMENT, value=1)]``.
+    :param approval: Optional policy-controlled presentation metadata
+        derived from values the ASKing policy has evaluated. The engine
+        keeps the first ASKing policy's value when composing several ASK
+        results. The elicitation boundary validates it before transport;
+        renderers only change hierarchy and keep raw arguments.
     """
 
     action: PolicyAction
@@ -280,6 +345,7 @@ class PolicyResult:
     deciding_policies: list[str] | None = None
     data: object | None = None
     state_updates: list[StateUpdate] | None = None
+    approval: ApprovalPresentation | None = None
 
     @property
     def deciding_policy(self) -> str | None:
@@ -328,6 +394,10 @@ class ElicitationRequest:
         gated. Lets a human reviewer see what they're approving
         without overwhelming the UI on a 50 KB payload. Surfaces in
         the elicitation event's extras.
+    :param approval: Validated policy-controlled presentation metadata
+        derived from values the policy has evaluated. Renderers may
+        headline it and demote named arguments, but the raw call remains
+        available.
     """
 
     message: str
@@ -335,6 +405,7 @@ class ElicitationRequest:
     policy_names: list[str]
     content_preview: str
     requested_schema: dict[str, object] = field(default_factory=dict)
+    approval: ApprovalPresentation | None = None
 
     @property
     def policy_name(self) -> str:
@@ -495,8 +566,10 @@ class PolicyLLMClient:
 
 
 __all__ = [
+    "ApprovalPresentation",
     "ElicitationRequest",
     "EvaluationContext",
     "PolicyLLMClient",
     "PolicyResult",
+    "coerce_approval_presentation",
 ]

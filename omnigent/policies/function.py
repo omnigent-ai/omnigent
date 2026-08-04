@@ -41,12 +41,17 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Protocol, cast
 
 from omnigent.policies.base import Policy
 from omnigent.policies.schema import PolicyEvent
-from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.policies.types import (
+    EvaluationContext,
+    PolicyResult,
+    coerce_approval_presentation,
+)
 from omnigent.spec.types import (
     FunctionPolicySpec,
     Phase,
@@ -58,6 +63,9 @@ from omnigent.spec.types import (
 
 class _DynamicCallable(Protocol):
     def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
+_log = logging.getLogger(__name__)
 
 
 def _phase_to_event_type(phase: Phase) -> str:
@@ -523,11 +531,19 @@ def _coerce_to_policy_result(raw: object, *, spec_name: str) -> PolicyResult:
             ) from exc
         raw_set_labels = getattr(raw, "set_labels", None)
         raw_state_updates = getattr(raw, "state_updates", None)
+        raw_approval = getattr(raw, "approval", None)
+        approval = coerce_approval_presentation(raw_approval)
+        if raw_approval is not None and approval is None:
+            _log.debug(
+                "FunctionPolicy %r returned malformed approval presentation; dropping it",
+                spec_name,
+            )
         return PolicyResult(
             action=action,
             reason=getattr(raw, "reason", None),
             set_labels=(dict(raw_set_labels) if isinstance(raw_set_labels, dict) else None),
             state_updates=_coerce_state_updates(raw_state_updates, spec_name=spec_name),
+            approval=approval,
         )
     raise TypeError(
         f"FunctionPolicy {spec_name!r} returned unsupported type "
@@ -577,12 +593,20 @@ def _policy_result_from_dict(
     raw_state_updates = raw.get("state_updates")
     raw_set_labels = raw.get("set_labels")
     reason = raw.get("reason")
+    raw_approval = raw.get("approval")
+    approval = coerce_approval_presentation(raw_approval)
+    if raw_approval is not None and approval is None:
+        _log.debug(
+            "FunctionPolicy %r returned malformed approval presentation; dropping it",
+            spec_name,
+        )
     return PolicyResult(
         action=action,
         reason=cast("str | None", reason),
         data=raw.get("data"),
         state_updates=_coerce_state_updates(raw_state_updates, spec_name=spec_name),
         set_labels=dict(raw_set_labels) if isinstance(raw_set_labels, dict) else None,
+        approval=approval,
     )
 
 
