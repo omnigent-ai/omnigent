@@ -785,9 +785,19 @@ class HostProcess:
         exit 0 for a crash — so the reaper skips these and lets
         ``_watch_runner`` / ``_handle_stop`` own them.
 
-        :returns: Set of live tracked runner OS pids.
+        The runner zygote is included for the same reason: it is a direct
+        ``Popen`` child of the daemon whose status ``ZygoteManager._proc``
+        owns. Reaping it as an "orphan" on an unexpected crash would consume
+        its status out from under the manager, confusing ``is_running()`` /
+        ``stop()``.
+
+        :returns: Set of live tracked pids (runners + the zygote).
         """
-        return {h.proc.pid for h in self._runners.values()}
+        pids = {h.proc.pid for h in self._runners.values()}
+        zygote_pid = self._zygote.pid if self._zygote is not None else None
+        if zygote_pid is not None:
+            pids.add(zygote_pid)
+        return pids
 
     async def _orphan_reaper_loop(self) -> None:
         """Reap orphaned descendant processes reparented to this host.
@@ -1320,7 +1330,7 @@ class HostProcess:
         finally:
             log_fh.close()
 
-    def _handle_stop(
+    async def _handle_stop(
         self,
         frame: HostStopRunnerFrame,
     ) -> HostStopRunnerResultFrame:
@@ -1338,19 +1348,11 @@ class HostProcess:
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
-        if handle.proc.poll() is None:
-            handle.proc.terminate()
-            try:
-                handle.proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                handle.proc.kill()
-                # Bounded: a bare wait() would hang if the handle can't observe
-                # the exit (e.g. a zygote-forked runner whose zygote died and
-                # whose pid probe is the only signal). The kill has been sent;
-                # give it a short window, then move on rather than block the
-                # daemon's control handler forever.
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    handle.proc.wait(timeout=5.0)
+        # The poll/terminate/wait round-trips are lock-free waitpid calls for a
+        # direct-Popen runner, but blocking control-socket exchanges for a
+        # zygote-forked one — run them off the loop so a wedged zygote can't
+        # freeze the daemon's control handler.
+        await asyncio.to_thread(self._stop_runner_proc, handle.proc)
         _logger.info("Stopped runner %s", frame.runner_id)
         print(
             f"  ↓ Runner stopped: {frame.runner_id}",
@@ -1360,6 +1362,30 @@ class HostProcess:
             request_id=frame.request_id,
             status="stopped",
         )
+
+    @staticmethod
+    def _stop_runner_proc(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> None:
+        """Terminate a runner: SIGTERM, brief wait, then SIGKILL. Blocking.
+
+        Runs on a worker thread (see :meth:`_handle_stop`) because for a
+        zygote-forked runner these are blocking control-socket round-trips, not
+        lock-free waitpid calls.
+
+        :param proc: The runner process handle (Popen or zygote shim).
+        """
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            # Bounded: a bare wait() would hang if the handle can't observe the
+            # exit (e.g. a zygote-forked runner whose zygote died and whose pid
+            # probe is the only signal). The kill has been sent; give it a short
+            # window, then move on.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5.0)
 
     def _handle_runner_status(
         self,
@@ -1413,7 +1439,11 @@ class HostProcess:
         handle = self._runners.get(runner_id)
         if handle is None:  # pragma: no cover — spawned just before us
             return
-        while handle.proc.poll() is None:
+        # poll() is a lock-free waitpid for a direct-Popen runner, but a
+        # blocking control-socket round-trip (with lock contention against a
+        # booting zygote) for a zygote-forked one — so run it off the event
+        # loop to avoid freezing the daemon on the enabled path.
+        while await asyncio.to_thread(handle.proc.poll) is None:
             await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
         if self._runners.get(runner_id) is not handle:
             # _handle_stop (or _cleanup_runners) removed it first —
@@ -2655,7 +2685,7 @@ class HostProcess:
         if isinstance(frame, HostLaunchRunnerFrame):
             await ws.send(encode_host_frame(await self._handle_launch(frame)))
         elif isinstance(frame, HostStopRunnerFrame):
-            await ws.send(encode_host_frame(self._handle_stop(frame)))
+            await ws.send(encode_host_frame(await self._handle_stop(frame)))
         elif isinstance(frame, HostRunnerStatusFrame):
             await ws.send(encode_host_frame(self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):

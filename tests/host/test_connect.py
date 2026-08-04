@@ -1185,7 +1185,7 @@ async def test_watch_runner_silent_on_intentional_stop(
     assert result.status == "launched", result.error
 
     runner_id = token_bound_runner_id("tok_stop")
-    stop_result = host._handle_stop(
+    stop_result = await host._handle_stop(
         HostStopRunnerFrame(request_id="req_stop_2", runner_id=runner_id)
     )
     assert stop_result.status == "stopped"
@@ -1312,7 +1312,7 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
-def test_handle_stop_terminates_process(tmp_path: Path) -> None:
+async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
     returns status='stopped'.
@@ -1332,7 +1332,7 @@ def test_handle_stop_terminates_process(tmp_path: Path) -> None:
         request_id="req_003",
         runner_id="runner_aaa",
     )
-    result = host._handle_stop(frame)
+    result = await host._handle_stop(frame)
 
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "stopped"
@@ -1342,7 +1342,7 @@ def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     assert "runner_aaa" not in host._runners
 
 
-def test_handle_stop_unknown_runner() -> None:
+async def test_handle_stop_unknown_runner() -> None:
     """
     Verify that _handle_stop returns status='failed' for an
     unknown runner_id.
@@ -1355,7 +1355,7 @@ def test_handle_stop_unknown_runner() -> None:
         request_id="req_004",
         runner_id="runner_nonexistent",
     )
-    result = host._handle_stop(frame)
+    result = await host._handle_stop(frame)
 
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"

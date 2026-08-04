@@ -180,18 +180,22 @@ def test_signal_of_exited_runner_is_a_safe_noop(manager: ZygoteManager, tmp_path
     proc.kill()
 
 
-def test_poll_after_stop_returns_none(manager: ZygoteManager, tmp_path) -> None:
-    """Polling once the zygote is stopped reports 'still live', never crashes.
+def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp_path) -> None:
+    """A still-live runner polls as None once the zygote is stopped.
 
-    When the control socket is gone the manager cannot learn the exit code, so
-    it returns None (the runner's own orphan watchdog handles teardown).
+    With the control socket gone the manager can't learn the exit code, so it
+    probes the pid: a still-live runner reports None (the runner's own orphan
+    watchdog handles teardown) rather than a bogus exit or a crash.
 
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"))
     manager.stop()
-    assert proc.poll() is None
+    try:
+        assert proc.poll() is None  # pid still alive -> honestly "still live"
+    finally:
+        proc.kill()
 
 
 def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) -> None:
