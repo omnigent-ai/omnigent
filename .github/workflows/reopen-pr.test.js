@@ -59,10 +59,16 @@ async function run({
   assert.deepStrictEqual(r.reopens, []);
   assert.match(r.comments[0], /Only the PR author/);
 
-  // Closed by a human maintainer: refused, names them.
+  // Closed by a maintainer: refused, names them.
   r = await run({ closer: "maintainer1" });
   assert.deepStrictEqual(r.reopens, []);
   assert.match(r.comments[0], /closed by @maintainer1/);
+
+  // Author closed it themselves: reopened (Read-only authors can't undo even
+  // their own close).
+  r = await run({ closer: "ext" });
+  assert.deepStrictEqual(r.reopens, [{ pull_number: 7, state: "open" }]);
+  assert.match(r.comments[0], /Reopened/);
 
   // Head branch deleted: explains instead of failing.
   r = await run({ branchExists: false });

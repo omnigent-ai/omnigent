@@ -5,17 +5,18 @@
 // option today is opening a fresh PR. This lets them ask the bot, which does
 // have the permission, to do it.
 //
-// Only the PR author may use it, and only on a PR a bot closed (never one a
-// maintainer closed deliberately, and never a merged one). Reopening also
-// requires the head branch to still exist; if it is gone, say so instead of
-// failing silently.
+// Only the PR author may use it, and only when the close was automated or their
+// own (a Read-only author cannot reopen even their own close). A close by a
+// maintainer stands -- that was a decision, not a mechanism. Merged PRs are
+// ignored. Reopening also requires the head branch to still exist; if it is
+// gone, say so instead of failing silently.
 
 const BOT_CLOSERS = ["github-actions[bot]"];
 
 const notAuthor = () =>
   "Only the PR author can use `/reopen`. A maintainer can reopen this PR directly.";
 
-const closedByHuman = (login) =>
+const closedByMaintainer = (login) =>
   `This PR was closed by @${login}, not automatically, so \`/reopen\` does not apply. ` +
   `Please reply here and ask them to reopen it.`;
 
@@ -61,8 +62,8 @@ module.exports = async ({ github, context, core }) => {
   }
 
   const closer = await lastCloser({ github, owner, repo, number });
-  if (closer && !BOT_CLOSERS.includes(closer)) {
-    await comment(closedByHuman(closer));
+  if (closer && !BOT_CLOSERS.includes(closer) && closer !== pr.user.login) {
+    await comment(closedByMaintainer(closer));
     return;
   }
 
