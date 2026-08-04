@@ -1199,6 +1199,7 @@ async def _auto_create_opencode_terminal(
     # server boots. Best-effort: if the gateway can't be resolved (no profile,
     # databricks-sdk absent, auth failure), opencode falls back to whatever
     # provider config the ambient env/global config already gives it.
+    from omnigent.github_mcp import github_mcp_server_config
     from omnigent.opencode_native_bridge import xdg_config_home_for_bridge_dir
     from omnigent.opencode_native_provider import (
         build_opencode_mcp_block,
@@ -1239,7 +1240,22 @@ async def _auto_create_opencode_terminal(
     # through Omnigent's policy engine via the forwarder's permission gate —
     # opencode's enforcement is reactive (no pre-tool hook), so "ask" is what
     # makes the policy verdicts apply to MCP (and other) tools.
-    mcp_block = build_opencode_mcp_block(_opencode_native_mcp_servers_from_spec(agent_spec))
+    opencode_mcp_servers = _opencode_native_mcp_servers_from_spec(agent_spec)
+    # Add the per-launch GitHub MCP server (a local proxy to GitHub's hosted MCP)
+    # when the session owner has connected GitHub, unless the agent already
+    # declares one. Lets the model act on GitHub without a `gh`/`git` CLI, and
+    # the proxy stamps opened PRs with an Open-in-Omnigent link back to this
+    # session (built from the public base URL + session id).
+    from omnigent.conversation_browser import conversation_url
+
+    _public_base = (os.environ.get("OMNIGENT_ACCOUNTS_BASE_URL") or "").strip()
+    _session_url = conversation_url(_public_base, session_id) if _public_base else None
+    github_mcp = github_mcp_server_config(session_url=_session_url)
+    if github_mcp is not None and not any(
+        getattr(s, "name", None) == github_mcp.name for s in opencode_mcp_servers
+    ):
+        opencode_mcp_servers = [*opencode_mcp_servers, github_mcp]
+    mcp_block = build_opencode_mcp_block(opencode_mcp_servers)
     if server_client is not None and ensure_comment_relay is not None:
         mcp_block.update(build_opencode_omnigent_mcp_server(bridge_dir))
     if mcp_block:
