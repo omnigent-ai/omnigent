@@ -36,6 +36,12 @@ describe("normalizeExplicitMathDelimiters — dollar handling", () => {
     expect(normalizeExplicitMathDelimiters("the $A + B$ span")).toBe("the $A + B$ span");
   });
 
+  it("does not match a SCREAMING_CASE prefix of a mixed-case token", () => {
+    // `$FOO` is a prefix of `$FOOBar`; matching it would escape the opener and
+    // strand the closing `$`, breaking the surrounding inline math span.
+    expect(normalizeExplicitMathDelimiters("the $FOOBar$ span")).toBe("the $FOOBar$ span");
+  });
+
   it("leaves genuine inline math intact", () => {
     expect(normalizeExplicitMathDelimiters("the value $x + y$ holds")).toBe(
       "the value $x + y$ holds",

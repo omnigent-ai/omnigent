@@ -3,8 +3,13 @@
 // convention), so it's treated as literal text rather than a math opener. The
 // braces already disambiguate `${A}`, so a single char is enough there; the
 // bare form requires 2+ chars so a lone `$X …` still reads as inline math.
+// The bare form also demands a full-token boundary (`(?![A-Za-z0-9_])`) so a
+// mixed token like `$FOOBar$` isn't matched by its uppercase prefix — the
+// lookahead rejects any continuing identifier char so greedy backtracking
+// can't settle on `$FOO`; escaping only the opener would strand the closing
+// `$` and break genuine inline math.
 // Anchored at the `$`, which the caller has already matched.
-const SHELL_VAR_RE = /^\$(?:\{[A-Z_][A-Z0-9_]*\}|[A-Z_][A-Z0-9_]+)/;
+const SHELL_VAR_RE = /^\$(?:\{[A-Z_][A-Z0-9_]*\}|[A-Z_][A-Z0-9_]+(?![A-Za-z0-9_]))/;
 
 // Optional 1–3 space indent + a fence run, per CommonMark. Matching the full
 // run (not just the first three chars) also keeps a ````-fenced block from
