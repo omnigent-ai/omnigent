@@ -235,7 +235,10 @@ export function TerminalsPanel({
         {/* xterm — only rendered when a terminal is selected */}
         <div className={cn("min-h-0 min-w-0 flex-1", !activeTerminal && "hidden")}>
           {expanded && activeTerminal ? (
-            <div key={activeTerminal.id} className="flex h-full flex-col">
+            // Scope the key to the session: agent terminals share a fixed id
+            // across same-shape sessions (e.g. `terminal_claude_main`), so id
+            // alone reuses the xterm mount and shows stale scrollback.
+            <div key={`${conversationId}:${activeTerminal.id}`} className="flex h-full flex-col">
               <TerminalView
                 sessionId={conversationId}
                 terminalId={activeTerminal.id}
