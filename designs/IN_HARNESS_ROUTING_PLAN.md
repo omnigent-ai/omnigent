@@ -83,14 +83,25 @@ prompt never races the model switch. The replayed prompt re-fires
   the turn appears (as web-delivered turns already do). SPIKE S3 confirms the
   claude block leaves a clean input box.
 
-**Variant B — in-place apply, codex only (lower latency, needs proof).** The
-hook calls `route-turn`, the endpoint fires `thread/settings/update` on the
-live thread *during the hook's synchronous block window*, and the hook then
-**allows** the original prompt through — no replay. Whether the already-
-submitted turn picks up the settings change is SPIKE S1. If S1 passes, codex
-uses B and only claude uses A; if it fails, both use A. Claude has no
-in-place equivalent (a hook cannot type `/model`), so A is claude's only
-deterministic option.
+**Variant B — in-place apply — DISPROVEN (S1 ran 2026-08-03, 3× with a
+positive control).** Codex binds the turn's model at `turn/start` and writes
+`turn_context` BEFORE running `UserPromptSubmit` hooks. A
+`thread/settings/update` fired inside the hook window is accepted (26–77 ms)
+and applies to the thread — but only from the NEXT turn. Proof beyond the
+stale record: a mid-window switch to a bogus model id let the turn succeed
+(the wire used the old model), while the matched control — the same bogus id
+present at `turn_context` time — hard-failed with a gateway 404
+("does not exist"). Reproduced on RPC-delivered and TUI-typed turns.
+
+**Therefore both harnesses use Variant A — one code path, the A-vs-B fork is
+closed.** Variant A was live-verified on codex during the spike in exactly
+the shape above: block (clean 1.08 s abort — no `user_message` persisted, no
+model call, no error) → `thread/settings/update` → replay through the normal
+events path → `turn_context` on the routed model. The replayed prompt
+re-fired the hook and no-op'd on the consumed marker, confirming the
+re-entrancy guard. Free bonus: the forwarder's `thread_settings_applied`
+handler pushed the hook-driven switch back into `model_override` on its own —
+a hook switch self-pins, so the marker semantics come for free on codex.
 
 ### 3c. What this ADDS vs. keeps — RESOLVED conservative (Bryan, 2026-08-03)
 
@@ -160,20 +171,40 @@ routing — allow turn 1 on the default, apply `/model` immediately after, all
 subsequent turns routed. Worse (turn 1 unrouted) but zero UX disruption;
 product call after the spike.
 
-## 4. Spikes (ordered; each ≤ half a day on the live stack)
+## 4. Spikes — S1/S2/S4 RAN 2026-08-03 on `routing-mvp-v4` (:64688 stack)
 
-- **S1 (codex, decides A vs B):** during a `UserPromptSubmit` block, fire
-  `thread/settings/update` on the live thread, allow the prompt, read the
-  rollout `turn_context` — did the in-flight turn run on the new model?
-- **S2 (both):** confirm `UserPromptSubmit` fires for composer-delivered
-  turns on codex (claude is already evidenced), so the entry points truly
-  collapse; verify the marker prevents double-routing on the replay.
-- **S3 (claude UX):** block a typed prompt — does the input box clear, is
-  the reason shown, does an immediate send-keys replay submit cleanly?
-- **S4 (latency):** router round-trip (~1–3 s) inside the hook's timeout
-  budget (policy hooks run with generous timeouts; ucode uses 35 s), and the
-  fail-open path when the endpoint is unreachable (allow, unrouted — same
-  posture as `route-subagent`).
+- **S1 — FAIL (Variant B disproven, see 3b).** 3 runs (2 RPC + 1 TUI-typed),
+  each with a bogus-model positive control. `turn_context` is written before
+  `UserPromptSubmit` runs; the wire uses the pre-hook model. Variant A was
+  then verified end-to-end on codex in the same session.
+- **S2 — PASS.** Codex fires `UserPromptSubmit` for `turn/start` RPC turns,
+  with payloads byte-identical to TUI-typed input — the entry points truly
+  collapse. Payload fields available to the hook: `prompt` (full text),
+  `model` (**the live thread model — tracks settings updates**), `turn_id`,
+  `session_id` (**codex's thread id, NOT the omnigent session id**),
+  `transcript_path`, `cwd`, `permission_mode`. No omnigent session id and no
+  harness → `route-turn` must bake `--bridge-dir`/`--session-id` into the
+  hook command exactly as `route-subagent` does. Marker re-entrancy on the
+  replay: verified (the replayed prompt's hook no-op'd on the consumed
+  marker).
+- **S3 (claude UX): still open** — block a typed prompt on claude; does the
+  input box clear, is the reason shown, does the send-keys replay submit
+  cleanly? (Codex's equivalent is now proven: clean 1.08 s abort, nothing
+  persisted.)
+- **S4 — PASS.** Whole `UserPromptSubmit` chain (policy hook + spike hook +
+  two personal user hooks, incl. the app-server round trip): 0.37–0.78 s.
+  The `thread/settings/update` itself: 26–77 ms. A 1–3 s router call fits
+  the 30 s budget with wide margin.
+
+Spike mechanics worth transcribing into the implementation (from the run):
+`state.json`'s `socket_path` is now a `ws://127.0.0.1:PORT` URL — reuse
+`client_for_transport` from `codex_native_app_server` (connect does
+`initialize`/`initialized`; a second concurrent client is accepted while a
+turn is in flight). Registering the hook as a second command on the existing
+`UserPromptSubmit` entry works, and a block from the second hook is honored.
+Keeping the hook command in an already-trusted module (`codex_native_hook`)
+rides the existing trust pass; a new module needs its own
+`trust_codex_router_hooks`-style pass.
 
 ## 5. Phasing (conservative — per 3c)
 
@@ -206,6 +237,16 @@ product call after the spike.
   same trust boundary (loopback-only, advertised token, live-pid check).
 - In-TUI `/model` after routing still wins (last-writer semantics preserved
   by the config mirror design — `LIVE_MODEL_STATE.md`).
+- **Never read the live model from `config.toml` (spike-discovered trap).**
+  During the spike, `read_codex_config_model` returned the stale launch
+  model on every invocation while the thread actually ran a different one —
+  the `LIVE_MODEL_STATE.md` reversion trap, live. `route-turn` must take the
+  current model from the hook payload's `model` field (which tracks
+  `thread/settings/update`). Side-finding to triage separately: the
+  cost-gate hook stamps `context["model"]` from the same stale source, and
+  `usage_by_model` attributes tokens from settings events rather than the
+  wire (it billed a bogus model) — both are pre-existing, not caused by this
+  work.
 
 ## 7. Open items pending research
 
@@ -215,6 +256,8 @@ product call after the spike.
   output field NO on any event; hooks-run-slash-commands NO; SessionStart
   cannot change the model (context/`initialUserMessage` only); 30 s default
   timeout, synchronous. Folded into 3d.
-- Whether codex fires `UserPromptSubmit` for `turn/start` RPC turns (S2's
-  codex half) — decides whether phase 3 can retire the composer trigger for
-  codex too or claude-only.
+- ~~Whether codex fires `UserPromptSubmit` for `turn/start` RPC turns~~ —
+  RESOLVED (S2, 2026-08-03): yes, byte-identical payloads. So the deferred
+  phase-4 collapse is *technically* open for codex too; still gated on
+  Bryan's explicit go per 3c.
+- The only remaining open spike is **S3** (claude block-and-replay UX).
