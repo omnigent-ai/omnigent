@@ -115,6 +115,8 @@ _TOOL_CALL_TIMEOUT_S = 300.0
 # below the real round-trip latency under load, so slow-but-healthy calls
 # (session history reads, shell) tripped it and crashed the bridge.
 _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
+# Backstop per-request threads above any expected client tool-call fan-out.
+_MAX_CONCURRENT_MCP_REQUESTS = 64
 # Web-UI → Claude input now flows through tmux send-keys, not
 # Claude's experimental Channels MCP capability. The runner writes
 # ``tmux.json`` after the Claude terminal launches; the harness
@@ -3756,6 +3758,7 @@ def _stdio_jsonrpc_loop(
     :returns: None when stdin reaches EOF.
     """
     use_content_length = False
+    request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_MCP_REQUESTS)
     while True:
         raw_line = sys.stdin.buffer.readline()
         if raw_line == b"":
@@ -3790,20 +3793,37 @@ def _stdio_jsonrpc_loop(
         method = message.get("method")
         if request_id is None or not isinstance(method, str):
             continue
-        threading.Thread(
-            target=_handle_and_write_mcp_request,
-            args=(
-                request_id,
-                method,
-                message.get("params"),
-                tools,
-                bridge_dir,
-                stdout_lock,
-                use_content_length,
-            ),
-            name="claude-native-mcp-request",
-            daemon=True,
-        ).start()
+        if request_slots.acquire(blocking=False):
+            request_thread = threading.Thread(
+                target=_handle_and_write_mcp_request,
+                args=(
+                    request_id,
+                    method,
+                    message.get("params"),
+                    tools,
+                    bridge_dir,
+                    stdout_lock,
+                    use_content_length,
+                    request_slots,
+                ),
+                name="claude-native-mcp-request",
+                daemon=True,
+            )
+            try:
+                request_thread.start()
+            except RuntimeError:
+                request_slots.release()
+            else:
+                continue
+        _write_jsonrpc(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32000, "message": "server busy"},
+            },
+            stdout_lock,
+            framed=use_content_length,
+        )
 
 
 def _handle_and_write_mcp_request(
@@ -3814,6 +3834,7 @@ def _handle_and_write_mcp_request(
     bridge_dir: Path,
     stdout_lock: threading.Lock,
     framed: bool,
+    request_slots: threading.BoundedSemaphore,
 ) -> None:
     """
     Handle one request without blocking the stdio reader.
@@ -3825,6 +3846,7 @@ def _handle_and_write_mcp_request(
     :param bridge_dir: Bridge directory used to resolve the active relay.
     :param stdout_lock: Lock serializing responses and notifications.
     :param framed: Whether to emit a Content-Length framed response.
+    :param request_slots: Concurrency slot released after the response.
     :returns: None after the response is written.
     """
     # A request failure must not tear down the long-lived MCP server.
@@ -3841,7 +3863,10 @@ def _handle_and_write_mcp_request(
             "id": request_id,
             "error": {"code": -32603, "message": f"internal error: {exc}"},
         }
-    _write_jsonrpc(response, stdout_lock, framed=framed)
+    try:
+        _write_jsonrpc(response, stdout_lock, framed=framed)
+    finally:
+        request_slots.release()
 
 
 def _handle_mcp_request(
