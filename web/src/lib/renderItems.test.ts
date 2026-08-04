@@ -18,6 +18,7 @@ import {
   bubblesEqual,
   createBubbleCache,
   lastRenderableAssistantIndex,
+  liveCandidateAssistantIndex,
 } from "./renderItems";
 import type { ActiveResponse } from "@/store/types";
 
@@ -1936,6 +1937,51 @@ describe("lastRenderableAssistantIndex", () => {
     const bubbles = buildBubbles([textDone("m1", "resp_1", "answer")], null);
     expect(lastRenderableAssistantIndex(bubbles)).toBe(0);
     expect(lastRenderableAssistantIndex([])).toBe(-1);
+  });
+});
+
+describe("liveCandidateAssistantIndex", () => {
+  const textDone = (itemId: string, rid: string, text: string): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, responseId: rid }),
+    fullText: text,
+    hasCodeBlocks: false,
+  });
+  const userMsg = (itemId: string, text: string): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx({ itemId, responseId: "" }),
+    content: [{ type: "input_text", text }],
+  });
+
+  it("returns the trailing assistant bubble (normal live-turn shape)", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "question"), textDone("m1", "r1", "working…")],
+      null,
+    );
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(1);
+  });
+
+  it("returns -1 once a real user message follows the last assistant", () => {
+    // The reply-in-flight belongs to the newer input (which has no bubble
+    // yet), so the settled prior bubble must not lose its fold while the
+    // new turn spins up.
+    const bubbles = buildBubbles(
+      [userMsg("u1", "question"), textDone("m1", "r1", "done"), userMsg("u2", "follow-up")],
+      null,
+    );
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(-1);
+  });
+
+  it("ignores a trailing [System: …] wake marker — the turn may continue", () => {
+    const bubbles = buildBubbles(
+      [
+        userMsg("u1", "question"),
+        textDone("m1", "r1", "dispatching…"),
+        userMsg("u2", "[System: sub-agent general-purpose finished (completed) — 1 result]"),
+      ],
+      null,
+    );
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(1);
   });
 });
 

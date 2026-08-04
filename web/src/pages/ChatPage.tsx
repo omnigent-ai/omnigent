@@ -95,7 +95,7 @@ import {
   buildBubbles,
   bubblesEqual,
   createBubbleCache,
-  lastRenderableAssistantIndex,
+  liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1545,8 +1545,12 @@ function MainAgentSurface({
   // While the session runs, the last assistant bubble is (or may be) the
   // live turn even if its lifecycle reads settled — BlockRenderer keeps
   // its "Worked for" fold suppressed until a terminal status edge lands.
+  // Once a newer real user message follows it (optimistic pending bubbles
+  // included — they're merged into `bubbles` above), the running status
+  // belongs to that newer turn instead, so no bubble is possibly-live and
+  // no fold is suppressed (index -1).
   const lastAssistantIndex = useMemo(
-    () => lastRenderableAssistantIndex(streamBubbles),
+    () => liveCandidateAssistantIndex(streamBubbles),
     [streamBubbles],
   );
 

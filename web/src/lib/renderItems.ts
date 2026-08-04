@@ -365,6 +365,28 @@ export function lastRenderableAssistantIndex(bubbles: readonly Bubble[]): number
 }
 
 /**
+ * Index of the last renderable assistant bubble ONLY IF it may still be
+ * the session's live turn; -1 otherwise.
+ *
+ * A real user message after that bubble ends its turn for good — any
+ * "running" status then belongs to the reply-in-flight for that newer
+ * input, which has no bubble yet. Suppressing the settled bubble's
+ * "Worked for" fold in that window pops it open until the new turn's
+ * first item lands (seconds on native harnesses, whose items round-trip
+ * through the vendor TUI). System `[System: ...]` markers don't end a
+ * turn (see `hasAssistantContinuation`), so they don't clear the
+ * suppression.
+ */
+export function liveCandidateAssistantIndex(bubbles: readonly Bubble[]): number {
+  const idx = lastRenderableAssistantIndex(bubbles);
+  for (let i = idx + 1; i < bubbles.length; i += 1) {
+    const b = bubbles[i]!;
+    if (b.kind === "user" && !isSystemUserContent(b.content)) return -1;
+  }
+  return idx;
+}
+
+/**
  * Whether a block's response id doesn't identify a real turn: `""`
  * (emitted before the turn was named) or a `live:` preview id. Such
  * blocks belong to the turn around them, never to a turn of their own.
