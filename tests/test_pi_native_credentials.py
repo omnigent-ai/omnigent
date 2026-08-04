@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -1153,3 +1154,162 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
     assert gpt == []
     assert completions == []
     assert gemini == []
+
+
+def _mock_databricks_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the Databricks profile path at a fake workspace with fake creds."""
+    from omnigent.inner import databricks_executor
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+    monkeypatch.setattr(
+        creds,
+        "resolve_databricks_workspace",
+        lambda profile: db_creds_mod.WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
+    )
+
+
+def test_non_claude_model_not_registered_on_anthropic_surface(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-Claude model the catalog didn't place must not land on Anthropic.
+
+    The live model-services fetch is best-effort (expired token, network blip,
+    a workspace listing nothing). Registering the selected model on the primary
+    provider regardless put GLM/Gemini/DeepSeek on ``anthropic-messages``,
+    where the gateway answers "API type 'anthropic/v1/messages' is not
+    supported" — the #2575 hang. Leaving it unregistered makes Pi fail fast
+    instead, and the log says why.
+    """
+    _mock_databricks_profile(monkeypatch)
+
+    def _boom(*_args: object) -> None:
+        raise RuntimeError("network blip")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _boom)
+
+    with caplog.at_level(logging.ERROR, logger=creds._LOGGER.name):
+        provider = creds.resolve_pi_native_provider(
+            model="databricks-glm-5-2", config_loader=_databricks_config
+        )
+    assert provider is not None
+
+    cfg = provider.to_models_config()
+    assert list(cfg["providers"]) == ["omnigent"]
+    assert cfg["providers"]["omnigent"]["api"] == "anthropic-messages"
+    assert cfg["providers"]["omnigent"]["models"] == []
+    assert any(
+        "databricks-glm-5-2" in record.message and "workspace model catalog" in record.message
+        for record in caplog.records
+    ), "the refusal must be logged with the model id"
+
+
+def test_claude_model_registered_when_catalog_fetch_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Claude model still self-registers: the primary surface can serve it."""
+    _mock_databricks_profile(monkeypatch)
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: ([], [], [], []))
+
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-claude-sonnet-4-6", config_loader=_databricks_config
+    )
+    assert provider is not None
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"]["omnigent"]["models"]] == [
+        "databricks-claude-sonnet-4-6"
+    ]
+
+
+def test_non_claude_model_in_catalog_is_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard only fires when nothing claimed the model.
+
+    A catalog that placed the model under a secondary provider keeps working —
+    the model is served there, and the primary must not offer it as well.
+    """
+    _mock_databricks_profile(monkeypatch)
+    live_claude = [{"id": "databricks-claude-sonnet-4-6", "input": ["text", "image"]}]
+    live_completions = [{"id": "databricks-llama-4", "input": ["text", "image"]}]
+    monkeypatch.setattr(
+        creds, "_fetch_pi_model_lists", lambda *_: (live_claude, [], live_completions, [])
+    )
+
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-llama-4", config_loader=_databricks_config
+    )
+    assert provider is not None
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"]["omnigent-completions"]["models"]] == [
+        "databricks-llama-4"
+    ]
+    assert [m["id"] for m in cfg["providers"]["omnigent"]["models"]] == [
+        "databricks-claude-sonnet-4-6"
+    ]
+
+
+def test_inline_family_provider_still_self_registers() -> None:
+    """Non-Databricks primaries pick their api from the family, so any id fits.
+
+    ``_inline_family_pi_provider`` sets ``api`` to match the model's family, so
+    the Anthropic-surface guard must not strand an OpenAI key provider's model.
+    """
+    config = {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": True,
+                "openai": {"base_url": "https://api.openai.com/v1", "api_key": "sk-test"},
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(model="gpt-5-5", config_loader=lambda: config)
+    assert provider is not None
+    assert provider.api != "anthropic-messages"
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"][provider.provider_id]["models"]] == ["gpt-5-5"]
+
+
+def test_anthropic_protocol_proxy_serves_non_claude_model() -> None:
+    """An Anthropic-protocol proxy may serve non-Claude ids — don't refuse it.
+
+    ``anthropic-messages`` on its own does NOT imply "Claude only": a gateway
+    or LiteLLM-style proxy can speak the Anthropic protocol for arbitrary
+    models. Only the Databricks AI Gateway's ``/ai-gateway/anthropic`` surface
+    is Claude-only, and its builders say so via ``primary_claude_only``.
+    """
+    config = {
+        "providers": {
+            "proxy": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://litellm.internal.example.com/anthropic",
+                    "api_key": "sk-proxy",
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="zai-org/GLM-4.7", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.primary_claude_only is False
+
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"]["omnigent"]["models"]] == ["zai-org/GLM-4.7"]
+
+
+def test_databricks_builders_declare_claude_only_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Databricks profile path marks its primary Claude-only."""
+    _mock_databricks_profile(monkeypatch)
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: ([], [], [], []))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+    assert provider is not None
+    assert provider.primary_claude_only is True

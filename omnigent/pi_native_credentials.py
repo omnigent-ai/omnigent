@@ -248,32 +248,43 @@ class PiProviderConfig:
     # an OpenAI Completions provider for GPT models on the Databricks gateway).
     # Keys are provider ids; values are complete Pi provider config dicts.
     additional_providers: dict[str, _PiProviderPayload] = field(default_factory=dict, hash=False)
+    # Set by the two Databricks builders: their primary is the AI Gateway's
+    # Claude-only ``/ai-gateway/anthropic`` surface. Never inferred from
+    # ``api``: a proxy can speak anthropic-messages for arbitrary models.
+    primary_claude_only: bool = False
+
+    def _model_suits_primary(self) -> bool:
+        """Return whether the primary provider can serve the selected model."""
+        if not self.primary_claude_only:
+            return True
+        return "claude" in self.model.lower()
 
     def to_models_config(self) -> _PiModelsConfig:
         """Render this provider as a Pi ``models.json`` mapping."""
-        models: list[_PiModelEntry]
-        if self.extra_models:
-            # Include all known models, ensuring the selected model is present.
-            # The selected model may be a newer id not yet in the static list.
-            models = list(self.extra_models)
-            # Only append to this (Anthropic) provider when the model is absent
-            # from ALL providers. Non-Claude models (GLM, GPT…) live in
-            # additional_providers (openai-completions); appending them here
-            # too would register them under the wrong wire protocol.
-            in_additional = any(
-                any(model_entry["id"] == self.model for model_entry in provider["models"])
-                for provider in self.additional_providers.values()
-            )
-            # Skip models excluded from Pi entirely (e.g. Gemini — no Responses API
-            # models) — don't register them under the Anthropic provider either.
-            if (
-                not any(m.get("id") == self.model for m in models)
-                and not in_additional
-                and not unsupported_in_pi(self.model.lower())
-            ):
-                models.append({"id": self.model, "input": ["text", "image"]})
-        else:
-            models = [{"id": self.model}]
+        in_additional = any(
+            any(model_entry["id"] == self.model for model_entry in provider["models"])
+            for provider in self.additional_providers.values()
+        )
+        models: list[_PiModelEntry] = list(self.extra_models)
+        if not in_additional and not any(m.get("id") == self.model for m in models):
+            if self._model_suits_primary():
+                models.append(
+                    {"id": self.model, "input": ["text", "image"]}
+                    if self.extra_models
+                    else {"id": self.model}
+                )
+            else:
+                # Self-registering here would put a non-Claude model on the
+                # gateway's Claude-only Anthropic surface — the #2575 hang.
+                # Leave it unregistered so Pi fails fast with an unknown model.
+                _LOGGER.error(
+                    "pi-native: %r is not a Claude model and the Databricks workspace model "
+                    "catalog did not list it, so no provider can serve it and Pi will not be "
+                    "able to select it. The catalog fetch may have failed (expired credentials "
+                    "or an unreachable workspace), or the endpoint may not be listed by the "
+                    "model-services API.",
+                    self.model,
+                )
         provider: _PiProviderPayload = {
             "baseUrl": self.base_url,
             "api": self.api,
@@ -364,6 +375,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         extra_models=claude_models,
         additional_providers=additional,
         credential_warning=credential_warning,
+        primary_claude_only=True,
     )
 
 
@@ -758,6 +770,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         auth_header=True,
         extra_models=claude_models,
         additional_providers=additional,
+        primary_claude_only=True,
     )
 
 
