@@ -25,11 +25,15 @@
     ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol",
     "Noto Color Emoji";
   --font-mono: "Geist Mono Variable", "JetBrains Mono", ui-monospace, monospace;
-  /* 13px/20px text step between text-xs (12px) and text-sm (14px) —
-     * generates the `text-13` utility. Used for compact UI chrome like
-     * the composer footer selectors and slash-command menu rows. */
+  /* 13px/18px text step between text-xs (12px) and text-sm (14px) —
+     * generates the `text-13` utility. Body and chat-thread text (both
+     * 13/18), plus compact UI chrome like the composer footer selectors
+     * and slash-command menu rows. */
   --text-13: 13px;
-  --text-13--line-height: 20px;
+  --text-13--line-height: 18px;
+  /* Caption step — sidebar section subtitles (Projects/Sessions) et al. */
+  --text-caption: 12px;
+  --text-caption--line-height: 16px;
   /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
      * with a slightly larger 32px face on the same 36px line. */
   --text-3xl: 32px;
