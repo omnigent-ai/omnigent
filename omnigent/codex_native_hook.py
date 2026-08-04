@@ -16,6 +16,7 @@ import json
 import sys
 import urllib.parse
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent.codex_native_bridge import (
     read_bridge_state,
@@ -31,6 +32,9 @@ from omnigent.native_policy_hook import (
     read_relay_policy_config,
     relay_policy_evaluate_url,
 )
+
+if TYPE_CHECKING:
+    from omnigent.codex_native_app_server import CodexAppServerClient
 
 # Budget for the policy evaluation POST. Normally a quick
 # request/reply, but a TOOL_CALL ASK now parks server-side (URL-based
@@ -416,12 +420,19 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> bool:
     mirrored into ``config.toml`` the way the executor does, so the
     cost-budget gate reads the routed model rather than the launch one.
 
+    The routed catalog id is translated into codex's own spelling first (see
+    :mod:`omnigent.codex_model_vocabulary`) — codex serves either, but only
+    recognizes its own, so an untranslated switch runs the right model while
+    the TUI warns about missing metadata and ``/model`` keeps highlighting
+    the launch slug.
+
     :param bridge_dir: Native Codex bridge directory.
-    :param model: Servable model id, e.g. ``"gpt-5.6-luna"``.
+    :param model: Routed model id, e.g. ``"databricks-gpt-5-6-luna"``.
     :returns: ``True`` when Codex accepted the switch.
     """
     import asyncio
 
+    from omnigent.codex_model_vocabulary import codex_model_slug
     from omnigent.codex_native_app_server import client_for_transport
     from omnigent.codex_native_bridge import write_codex_config_model
     from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
@@ -430,13 +441,19 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> bool:
     if state is None:
         return False
 
+    # The spelling codex accepted, mirrored into config.toml below so the
+    # file and the live thread never disagree about the model.
+    applied = model
+
     async def _switch() -> None:
+        nonlocal applied
         client = client_for_transport(state.socket_path, client_name="omnigent-route-turn-hook")
         await client.connect()
         try:
+            applied = codex_model_slug(model, await _list_codex_models(client))
             await client.request(
                 "thread/settings/update",
-                {"threadId": state.thread_id, "model": model},
+                {"threadId": state.thread_id, "model": applied},
             )
         finally:
             await client.close()
@@ -449,12 +466,46 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> bool:
             file=sys.stderr,
         )
         return False
-    if not write_codex_config_model(bridge_dir, model):
+    if not write_codex_config_model(bridge_dir, applied):
         print(
-            f"omnigent codex route-turn hook: could not mirror {model} into config.toml",
+            f"omnigent codex route-turn hook: could not mirror {applied} into config.toml",
             file=sys.stderr,
         )
     return True
+
+
+async def _list_codex_models(client: CodexAppServerClient) -> list[dict[str, object]]:
+    """
+    Read this session's codex model catalog over an open app-server client.
+
+    Hidden rows are included: they are still switchable, and translating a
+    routed model beats sending a spelling codex has no metadata for.
+
+    :param client: Connected app-server client.
+    :returns: Raw ``model/list`` rows, empty when the call fails (the
+        caller then applies the routed id verbatim).
+    """
+    rows: list[dict[str, object]] = []
+    cursor: str | None = None
+    try:
+        while True:
+            params: dict[str, object] = {"includeHidden": True}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await client.request("model/list", params)
+            result = response.get("result")
+            if not isinstance(result, dict):
+                break
+            rows.extend(row for row in result.get("data") or () if isinstance(row, dict))
+            cursor = result.get("nextCursor")
+            if not isinstance(cursor, str) or not cursor:
+                break
+    except Exception as exc:  # noqa: BLE001 - an unreadable catalog means "no translation"
+        print(
+            f"omnigent codex route-turn hook: model/list failed: {exc}",
+            file=sys.stderr,
+        )
+    return rows
 
 
 if __name__ == "__main__":

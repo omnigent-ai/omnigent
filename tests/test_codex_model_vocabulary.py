@@ -9,9 +9,21 @@ from omnigent.codex_model_vocabulary import (
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
     clamp_spawn_effort,
+    codex_model_slug,
     codex_spawn_model,
+    comparable_model_id,
 )
 from omnigent.reasoning_effort import clamp_effort_for_model
+
+# A live ``model/list`` response from a databricks-gateway codex session:
+# codex spells versions with dots, and the extended-catalog row keeps its
+# catalog spelling because that IS codex's id for it.
+_CATALOG: list[dict[str, object]] = [
+    {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True},
+    {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna"},
+    {"id": "system.ai.glm-5-2", "model": "system.ai.glm-5-2"},
+    {"id": "gpt-5.5", "model": "gpt-5.5"},
+]
 
 
 @pytest.mark.parametrize(
@@ -85,7 +97,56 @@ def test_every_extended_model_declares_a_ladder_and_a_fallback() -> None:
         assert fallback in EXTENDED_MODEL_EFFORTS[bare]
 
 
+def test_comparable_model_id_folds_prefix_dots_and_case() -> None:
+    assert comparable_model_id("databricks-gpt-5-6-luna") == "gpt-5-6-luna"
+    assert comparable_model_id("gpt-5.6-luna") == "gpt-5-6-luna"
+    assert comparable_model_id("system.ai.glm-5-2") == "glm-5-2"
+    assert comparable_model_id("Databricks-GPT-5-6-Sol[1M]") == "gpt-5-6-sol"
+
+
+def test_catalog_id_translates_to_the_codex_slug() -> None:
+    assert codex_model_slug("databricks-gpt-5-6-luna", _CATALOG) == "gpt-5.6-luna"
+    assert codex_model_slug("databricks-gpt-5-6-sol", _CATALOG) == "gpt-5.6-sol"
+    assert codex_model_slug("databricks-gpt-5-5", _CATALOG) == "gpt-5.5"
+
+
+def test_a_codex_slug_translates_to_itself() -> None:
+    assert codex_model_slug("gpt-5.6-luna", _CATALOG) == "gpt-5.6-luna"
+
+
+def test_an_extended_catalog_id_is_already_the_slug() -> None:
+    """glm is listed under its catalog spelling, so it must survive intact."""
+    assert codex_model_slug("system.ai.glm-5-2", _CATALOG) == "system.ai.glm-5-2"
+    assert codex_model_slug("glm-5-2", _CATALOG) == "system.ai.glm-5-2"
+
+
+def test_an_unknown_id_stays_verbatim() -> None:
+    """Fail-safe: the gateway may still serve it, so send it unchanged."""
+    assert codex_model_slug("databricks-claude-opus-5", _CATALOG) == "databricks-claude-opus-5"
+    assert codex_model_slug("databricks-gpt-5-6-luna", []) == "databricks-gpt-5-6-luna"
+
+
+def test_a_row_naming_a_separate_servable_id_matches_on_either_side() -> None:
+    options = [{"id": "gpt-5.5", "model": "databricks-gpt-5-5"}]
+
+    assert codex_model_slug("databricks-gpt-5-5", options) == "gpt-5.5"
+    assert codex_model_slug("gpt-5.5", options) == "gpt-5.5"
+
+
+def test_malformed_rows_are_skipped() -> None:
+    options: list[object] = ["nonsense", {"model": "gpt-5.6-luna"}, {"id": "  "}]
+
+    assert codex_model_slug("databricks-gpt-5-6-luna", options) == "databricks-gpt-5-6-luna"  # type: ignore[arg-type]
+
+
 def test_catalog_prefixes_match_the_claude_vocabulary() -> None:
     # Both hook-side vocabularies strip the same prefixes; a drift would make
     # one harness resolve an id the other cannot.
     assert _CATALOG_PREFIXES == _CLAUDE_PREFIXES
+
+
+def test_catalog_prefixes_match_the_routing_defaults() -> None:
+    """This module duplicates the prefix list to stay stdlib-only; keep it equal."""
+    from omnigent.server.smart_routing import MODEL_ID_PREFIXES
+
+    assert _CATALOG_PREFIXES == MODEL_ID_PREFIXES

@@ -878,3 +878,170 @@ def test_route_turn_traces_the_route_it_applied(
     ]
     assert [entry["outcome"] for entry in traced] == ["route"]
     assert "gpt-5.6-luna" in traced[0]["detail"]
+
+
+# ── the actuator: what spelling reaches thread/settings/update ───────
+
+
+class _FakeAppServerClient:
+    """
+    App-server client stub scripting ``model/list`` and recording requests.
+
+    :param catalog: ``model/list`` rows to serve, or ``None`` to make the
+        call raise (an unreadable catalog).
+    """
+
+    def __init__(self, catalog: list[dict[str, object]] | None) -> None:
+        """
+        Build the stub.
+
+        :param catalog: Rows to serve, or ``None`` to fail the call.
+        :returns: None.
+        """
+        self._catalog = catalog
+        self.requests: list[tuple[str, dict[str, object]]] = []
+        self.closed = False
+
+    async def connect(self) -> None:
+        """
+        Pretend to dial the app-server.
+
+        :returns: None.
+        """
+
+    async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        """
+        Record one request and answer it.
+
+        :param method: App-server method name.
+        :param params: Method parameters.
+        :returns: A JSON-RPC response envelope.
+        """
+        self.requests.append((method, params))
+        if method == "model/list":
+            if self._catalog is None:
+                raise RuntimeError("app-server refused model/list")
+            return {"result": {"data": self._catalog, "nextCursor": None}}
+        return {"result": {}}
+
+    async def close(self) -> None:
+        """
+        Record the close.
+
+        :returns: None.
+        """
+        self.closed = True
+
+
+def _install_fake_client(
+    monkeypatch: pytest.MonkeyPatch,
+    client: _FakeAppServerClient,
+) -> _FakeAppServerClient:
+    """
+    Route the hook's app-server connect at a stub.
+
+    :param monkeypatch: pytest monkeypatch fixture.
+    :param client: Stub to hand back from ``client_for_transport``.
+    :returns: The stub the hook will use.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.client_for_transport",
+        lambda *args, **kwargs: client,
+    )
+    return client
+
+
+# A live databricks-gateway ``model/list`` response.
+_LIVE_CATALOG: list[dict[str, object]] = [
+    {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True},
+    {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna"},
+    {"id": "system.ai.glm-5-2", "model": "system.ai.glm-5-2"},
+]
+
+
+@pytest.mark.parametrize(
+    ("routed", "applied"),
+    [
+        # The routed arm arrives as a catalog id; codex only has metadata for
+        # its own dotted slug, and ``/model`` only highlights that one.
+        ("databricks-gpt-5-6-luna", "gpt-5.6-luna"),
+        # Extended-catalog rows are listed under the catalog spelling, which
+        # IS codex's id for them — translating must not mangle it.
+        ("system.ai.glm-5-2", "system.ai.glm-5-2"),
+        # Nothing in the catalog names it: send it anyway (the gateway may
+        # still serve it) rather than skipping the switch.
+        ("databricks-claude-opus-5", "databricks-claude-opus-5"),
+    ],
+)
+def test_apply_thread_model_switches_in_codex_spelling(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    routed: str,
+    applied: str,
+) -> None:
+    """The thread switch and the config.toml mirror both speak codex."""
+    from omnigent.codex_native_bridge import read_codex_config_model
+
+    codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
+    client = _install_fake_client(monkeypatch, _FakeAppServerClient(_LIVE_CATALOG))
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, routed) is True
+
+    assert client.requests == [
+        ("model/list", {"includeHidden": True}),
+        ("thread/settings/update", {"threadId": "thread_abc", "model": applied}),
+    ]
+    assert client.closed is True
+    assert read_codex_config_model(bridge_dir) == applied
+
+
+def test_apply_thread_model_falls_back_to_the_routed_id_without_a_catalog(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable catalog must not cost the switch — send the id verbatim."""
+    from omnigent.codex_native_bridge import read_codex_config_model
+
+    codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
+    client = _install_fake_client(monkeypatch, _FakeAppServerClient(None))
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-6-luna") is True
+
+    assert client.requests[-1] == (
+        "thread/settings/update",
+        {"threadId": "thread_abc", "model": "databricks-gpt-5-6-luna"},
+    )
+    assert read_codex_config_model(bridge_dir) == "databricks-gpt-5-6-luna"
+
+
+def test_apply_thread_model_pages_the_catalog(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slug on a later page still translates."""
+
+    class _PagedClient(_FakeAppServerClient):
+        async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            """
+            Serve ``model/list`` in two pages.
+
+            :param method: App-server method name.
+            :param params: Method parameters.
+            :returns: A JSON-RPC response envelope.
+            """
+            self.requests.append((method, params))
+            if method != "model/list":
+                return {"result": {}}
+            if params.get("cursor") is None:
+                return {"result": {"data": [{"id": "gpt-5.5"}], "nextCursor": "p2"}}
+            return {"result": {"data": [{"id": "gpt-5.6-luna"}], "nextCursor": None}}
+
+    codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
+    client = _install_fake_client(monkeypatch, _PagedClient(None))
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-6-luna") is True
+
+    assert client.requests[-1] == (
+        "thread/settings/update",
+        {"threadId": "thread_abc", "model": "gpt-5.6-luna"},
+    )

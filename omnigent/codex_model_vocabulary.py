@@ -1,16 +1,16 @@
-"""Codex's spawn-tool model vocabulary, and how to speak it.
+"""Codex's model vocabulary, and how to speak it.
 
 Omnigent routes to servable catalog ids (``databricks-gpt-5-6-luna``), but
-codex's ``spawn_agent`` validates ``model`` **client-side** against its own
-model catalog, before any request leaves the CLI. A catalog id is rejected
-outright (probed live on codex 0.145.0)::
+codex names the same model ``gpt-5.6-luna`` — the version segment is dotted
+where the catalog hyphenates it. Two paths need the translation, and they need
+it from opposite directions:
+
+**Spawns** (``spawn_agent``). Codex validates ``model`` **client-side**,
+against its own bundled catalog, before any request leaves the CLI. A catalog
+id is rejected outright (probed live on codex 0.145.0)::
 
     Unknown model `databricks-gpt-5-6-luna` for spawn_agent.
     Available models: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.2
-
-Codex's slugs differ from the catalog's only in punctuation — the version
-segment is dotted (``gpt-5.6-luna``) where the catalog hyphenates it
-(``gpt-5-6-luna``) — so translating is mechanical, no per-model table.
 
 The same validation caps the effort per model, again client-side::
 
@@ -18,32 +18,44 @@ The same validation caps the effort per model, again client-side::
     Supported reasoning efforts: low, medium, high
 
 so a session default of ``xhigh`` kills a GLM spawn unless the spawn's own
-``reasoning_effort`` is clamped alongside its model.
+``reasoning_effort`` is clamped alongside its model. Models outside codex's
+bundled catalog (GLM) have no slug until the session's codex-home extends the
+catalog — see :data:`EXTENDED_CATALOG_MODELS`. :func:`codex_spawn_model`
+returns ``None`` for anything else, and the caller falls open rather than
+sending a value the CLI drops.
 
-Models outside codex's own catalog (GLM) have no slug until the session's
-codex-home extends the catalog — see :data:`EXTENDED_CATALOG_MODELS`.
-Translation returns ``None`` for anything else, and the caller falls open
-rather than sending a value the CLI drops.
+**Turns** (``thread/setModel`` on a live thread). Here codex is its own
+vocabulary authority: the live ``model/list`` response IS the mapping, so
+:func:`codex_model_slug` hardcodes no model id. The gateway serves either
+spelling, so a thread switched onto a catalog id still RUNS; codex just warns
+"Model metadata for databricks-gpt-5-6-luna not found. Defaulting to fallback
+metadata" and leaves ``/model`` pointing at the launch slug, which reads as
+"routing did nothing". Extended-catalog rows (``system.ai.glm-5-2``) are
+listed under the catalog spelling, so they translate to themselves. An id no
+row matches is returned verbatim — the turn still runs, which beats skipping
+the switch.
 
-Stdlib-only so hook subprocesses can import it on the spawn path.
+Stdlib-only so hook subprocesses can import it on the spawn/routing paths.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 #: Catalog prefixes stripped before comparing ids. Same list as
-#: :data:`omnigent.claude_model_vocabulary._CATALOG_PREFIXES`.
+#: :data:`omnigent.claude_model_vocabulary._CATALOG_PREFIXES`, and equal to
+#: :data:`omnigent.server.smart_routing.MODEL_ID_PREFIXES` (both asserted by
+#: ``tests/test_codex_model_vocabulary.py``); duplicated because this module
+#: stays stdlib-only for hook subprocesses, which also means it cannot honour
+#: a deployment's ``routing.model_prefix`` override.
 _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
 
 #: A bare gpt id, split into family, version digits, and optional tier —
 #: ``gpt-5-6-luna`` → ``("gpt", "5", "6", "luna")``. Codex spells the
 #: version with a dot and keeps the tier hyphenated.
 _GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)-(\d+)(?:-([a-z0-9]+))?$")
-
-#: The same id already in codex's spelling, so translating is a no-op — a
-#: parent model read straight off the hook payload arrives this way.
-_GPT_SLUG_RE = re.compile(r"^(?:gpt|codex)-\d+\.\d+(?:-[a-z0-9]+)?$")
 
 #: Models the gateway serves that codex's bundled catalog does not carry, so
 #: omnigent adds them to the session's own catalog (``model_catalog_json``)
@@ -64,16 +76,32 @@ EXTENDED_MODEL_DEFAULT_EFFORT: dict[str, str] = {"glm-5-2": "medium"}
 
 
 def bare_model_id(model: str) -> str:
-    """Strip a catalog prefix and fold to the comparison spelling.
+    """Strip a catalog prefix and fold case, keeping codex's punctuation.
 
     :param model: Any model id, e.g. ``"databricks-gpt-5-6-luna"``.
-    :returns: The bare id, e.g. ``"gpt-5-6-luna"``.
+    :returns: The bare id, e.g. ``"gpt-5-6-luna"``. A codex slug keeps its
+        dotted version (``"gpt-5.6-luna"``); use :func:`comparable_model_id`
+        to fold the two spellings together.
     """
     bare = model.strip().lower().removesuffix("[1m]")
     for prefix in _CATALOG_PREFIXES:
         if bare.startswith(prefix):
             return bare[len(prefix) :]
     return bare
+
+
+def comparable_model_id(model: str) -> str:
+    """Fold a model id to the spelling codex ids compare in.
+
+    Comparison only, never a value to send anywhere: codex writes version
+    numbers with dots (``gpt-5.6-luna``) where the catalog writes dashes
+    (``databricks-gpt-5-6-luna``), and the prefix/case folding is the shared
+    catalog rule.
+
+    :param model: Any model id, catalog or codex spelling.
+    :returns: The comparable bare id, e.g. ``"gpt-5-6-luna"``.
+    """
+    return bare_model_id(model).replace(".", "-")
 
 
 def codex_spawn_model(model: str) -> str | None:
@@ -85,12 +113,10 @@ def codex_spawn_model(model: str) -> str | None:
         catalog (Kimi), so the caller can fall open instead of sending a
         value the CLI rejects.
     """
-    bare = bare_model_id(model)
+    bare = comparable_model_id(model)
     extended = EXTENDED_CATALOG_MODELS.get(bare)
     if extended is not None:
         return extended
-    if _GPT_SLUG_RE.match(bare):
-        return bare
     match = _GPT_ID_RE.match(bare)
     if match is None:
         return None
@@ -114,8 +140,39 @@ def clamp_spawn_effort(effort: str | None, model: str | None) -> str | None:
     """
     if effort is None or model is None:
         return effort
-    bare = bare_model_id(model)
+    bare = comparable_model_id(model)
     supported = EXTENDED_MODEL_EFFORTS.get(bare)
     if supported is None or effort in supported:
         return effort
     return EXTENDED_MODEL_DEFAULT_EFFORT.get(bare, effort)
+
+
+def codex_model_slug(
+    model: str,
+    options: Iterable[Mapping[str, Any]],  # type: ignore[explicit-any]  # raw model/list rows
+) -> str:
+    """Translate a routed model id into codex's own spelling.
+
+    :param model: Model id from a routing decision, e.g.
+        ``"databricks-gpt-5-6-luna"``.
+    :param options: Raw ``model/list`` rows, e.g.
+        ``[{"id": "gpt-5.6-luna", "model": "gpt-5.6-luna"}]``.
+    :returns: The matching row's ``id``, or *model* verbatim when no row
+        names the same model (an empty catalog included).
+    """
+    if not isinstance(model, str) or not model.strip():
+        return model
+    target = comparable_model_id(model)
+    for option in options:
+        if not isinstance(option, Mapping):
+            continue
+        slug = option.get("id")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        # ``model`` is the servable id behind the row when codex reports one
+        # separately from its own slug; matching either side keeps the
+        # translation working whichever spelling the deployment lists.
+        for spelling in (slug, option.get("model")):
+            if isinstance(spelling, str) and comparable_model_id(spelling) == target:
+                return slug.strip()
+    return model
