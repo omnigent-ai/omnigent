@@ -21,9 +21,11 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     terminalId: string;
     readOnly?: boolean;
   }) => {
-    // useRef initializer runs once per mount, so the id is stable across
-    // re-renders and only changes on a remount.
-    const instance = useRef(++terminalMountSeq);
+    // Assign once per mount (useRef(arg) evaluates arg every render but keeps
+    // the first value), so the id is stable across re-renders and only changes
+    // on a remount.
+    const instance = useRef<number | null>(null);
+    if (instance.current === null) instance.current = ++terminalMountSeq;
     return (
       <div
         data-testid="terminal-view"
