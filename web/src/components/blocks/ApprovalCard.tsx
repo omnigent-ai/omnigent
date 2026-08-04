@@ -87,7 +87,7 @@ interface ParsedApprovalPreview {
 /** Parse object arguments while retaining the producer's wrapper form. */
 function parseApprovalPreview(raw: string): ParsedApprovalPreview | null {
   const trimmed = raw.trim();
-  const hookMatch = /^([A-Za-z0-9_.:-]+)\((.*)$/s.exec(trimmed);
+  const hookMatch = trimmed.match(/^([A-Za-z0-9_.:-]+)\((.*)$/s);
   const wrapper = hookMatch?.[1] ?? null;
   let jsonText = hookMatch?.[2] ?? trimmed;
   const closed = wrapper !== null && jsonText.endsWith(")");
