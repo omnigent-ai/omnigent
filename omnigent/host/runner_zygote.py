@@ -19,8 +19,9 @@ This module owns:
 
 This code runs on any POSIX host (the gate is ``IS_POSIX``); the copy-on-write
 *savings* are Linux-specific, but the fork/protocol path executes on macOS too.
-Opt-in: the daemon gates it behind ``OMNIGENT_RUNNER_ZYGOTE=1`` and falls back
-to direct ``Popen`` on any failure, so the zygote is never a hard dependency.
+On by default; set ``OMNIGENT_RUNNER_ZYGOTE=0`` to opt out. The daemon falls
+back to direct ``Popen`` on any failure, so the zygote is never a hard
+dependency.
 """
 
 from __future__ import annotations

@@ -1362,7 +1362,7 @@ async def test_handle_stop_unknown_runner() -> None:
     assert "unknown runner" in (result.error or "")
 
 
-def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
     """
     Verify ``_handle_runner_status`` reports ``alive`` for a tracked
     runner whose process is still running.
@@ -1380,7 +1380,7 @@ def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
         host._runners["runner_live"] = _RunnerHandle(
             proc=proc, log_path=tmp_path / "runner-live.log"
         )
-        result = host._handle_runner_status(
+        result = await host._handle_runner_status(
             HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
         )
         assert isinstance(result, HostRunnerStatusResultFrame)
@@ -1391,7 +1391,7 @@ def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
         proc.wait()
 
 
-def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
+async def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
     """
     Verify ``_handle_runner_status`` reports ``dead`` for a tracked
     runner whose process has exited.
@@ -1408,14 +1408,14 @@ def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
     )
     proc.wait()  # ensure the process has exited before we query
     host._runners["runner_gone"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-gone.log")
-    result = host._handle_runner_status(
+    result = await host._handle_runner_status(
         HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_gone")
     )
     assert isinstance(result, HostRunnerStatusResultFrame)
     assert result.status == "dead"
 
 
-def test_handle_runner_status_unknown_for_untracked_runner() -> None:
+async def test_handle_runner_status_unknown_for_untracked_runner() -> None:
     """
     Verify ``_handle_runner_status`` reports ``unknown`` for a runner
     this host has no record of.
@@ -1426,7 +1426,7 @@ def test_handle_runner_status_unknown_for_untracked_runner() -> None:
     grace. Both must read ``unknown`` so the server relaunches at once.
     """
     host = _make_host_process()
-    result = host._handle_runner_status(
+    result = await host._handle_runner_status(
         HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_never_seen")
     )
     assert isinstance(result, HostRunnerStatusResultFrame)

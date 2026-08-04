@@ -34,10 +34,10 @@ its own. When the daemon dies, the control socket hits EOF, the zygote exits,
 its runner children reparent, ``getppid()`` changes, and each runner tears
 itself down — preserving today's parent-death semantics through one extra hop.
 
-POSIX (the gate is ``IS_POSIX``) and opt-in: the fork path runs on macOS too,
-though the copy-on-write savings are Linux-specific. The daemon gates all of
-this behind ``OMNIGENT_RUNNER_ZYGOTE=1`` and falls back to direct ``Popen`` if
-the zygote is unavailable, so this is never a hard dependency.
+POSIX (the gate is ``IS_POSIX``): the fork path runs on macOS too, though the
+copy-on-write savings are Linux-specific. On by default; set
+``OMNIGENT_RUNNER_ZYGOTE=0`` to opt out. The daemon falls back to direct
+``Popen`` if the zygote is unavailable, so this is never a hard dependency.
 """
 
 from __future__ import annotations
@@ -56,7 +56,8 @@ from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
 
 # Env var the daemon sets to the inherited control-socket fd number.
 ZYGOTE_CONTROL_FD_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD"
-# Env var gating zygote use in the daemon (read there, documented here).
+# Env var gating zygote use in the daemon (read there, documented here). The
+# zygote is on by default; set this to 0/false/no/off to opt out.
 ZYGOTE_ENABLED_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE"
 # Env var the zygote sets on each forked runner: the fd of that runner's own
 # connected control socket back to the zygote. The runner uses it to ask the

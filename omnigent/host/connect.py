@@ -760,17 +760,20 @@ class HostProcess:
         # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
         # because both the mutation and the reaper run on the event loop.
         self._owned_subprocess_ops = 0
-        # Copy-on-write runner forkserver, started on first launch when
-        # OMNIGENT_RUNNER_ZYGOTE is set. POSIX-only (needs os.fork + AF_UNIX
-        # fd-passing); the host daemon runs on the user's own machine, most
-        # often macOS, so gating on IS_POSIX rather than IS_LINUX lets those
-        # users share the ~120MB import floor too. Instantiated cheaply here
-        # (no process yet — start() spawns it, idempotent under its own lock).
-        # On any failure ``_zygote_disabled`` latches so future launches take
-        # the direct Popen path, while ``_zygote`` is retained so a
-        # still-running zygote is reaped on daemon shutdown. The zygote is an
-        # optimization, never required.
-        self._zygote_enabled = IS_POSIX and env_truthy(os.environ.get(ZYGOTE_ENABLED_ENV_VAR))
+        # Copy-on-write runner forkserver, on by default; set
+        # OMNIGENT_RUNNER_ZYGOTE=0 (or false/no/off) to opt out onto the direct
+        # Popen path. POSIX-only (needs os.fork + AF_UNIX fd-passing); the host
+        # daemon runs on the user's own machine, most often macOS, so gating on
+        # IS_POSIX rather than IS_LINUX lets those users share the ~120MB import
+        # floor too. Instantiated cheaply here (no process yet — start() spawns
+        # it, idempotent under its own lock). On any failure ``_zygote_disabled``
+        # latches so future launches take the direct Popen path, while
+        # ``_zygote`` is retained so a still-running zygote is reaped on daemon
+        # shutdown. The zygote is an optimization, never required.
+        _zygote_optout = os.environ.get(ZYGOTE_ENABLED_ENV_VAR)
+        self._zygote_enabled = IS_POSIX and not (
+            _zygote_optout is not None and not env_truthy(_zygote_optout)
+        )
         self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
         self._zygote_disabled = False
 
@@ -1387,7 +1390,7 @@ class HostProcess:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5.0)
 
-    def _handle_runner_status(
+    async def _handle_runner_status(
         self,
         frame: HostRunnerStatusFrame,
     ) -> HostRunnerStatusResultFrame:
@@ -1409,10 +1412,13 @@ class HostProcess:
         handle = self._runners.get(frame.runner_id)
         if handle is None:
             status = "unknown"
-        elif handle.proc.poll() is None:
-            status = "alive"
         else:
-            status = "dead"
+            # poll() is a lock-free waitpid for a direct-Popen runner, but a
+            # blocking control-socket round-trip (bounded only by the 30s
+            # control timeout, and contended against a booting zygote) for a
+            # zygote-forked one — so run it off the loop, matching
+            # _watch_runner / _handle_stop, lest a slow zygote stall the daemon.
+            status = "alive" if await asyncio.to_thread(handle.proc.poll) is None else "dead"
         return HostRunnerStatusResultFrame(
             request_id=frame.request_id,
             status=status,
@@ -2687,7 +2693,7 @@ class HostProcess:
         elif isinstance(frame, HostStopRunnerFrame):
             await ws.send(encode_host_frame(await self._handle_stop(frame)))
         elif isinstance(frame, HostRunnerStatusFrame):
-            await ws.send(encode_host_frame(self._handle_runner_status(frame)))
+            await ws.send(encode_host_frame(await self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
             await ws.send(encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
