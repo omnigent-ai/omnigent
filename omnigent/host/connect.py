@@ -457,6 +457,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # host→runner intrinsically, so the setter need not also list it in
         # OMNIGENT_RUNNER_ENV_PASSTHROUGH.
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
+        # The operator's env-forwarding control var itself. Without it here, the
+        # var is stripped before it reaches the daemon in --server mode (the
+        # remote daemon prefixes are DATABRICKS_ + LC_/MLFLOW_/OTEL_/OMNIGENT_OTEL_,
+        # not plain OMNIGENT_), so _build_runner_env never sees the names it lists
+        # and the whole passthrough is a no-op remotely. It carries only env var
+        # NAMES, not secrets, so allowlisting it leaks nothing on its own.
+        # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.

@@ -2135,6 +2135,44 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert "UNLISTED_SECRET" not in env
 
 
+def test_build_runner_env_passthrough_survives_remote_daemon_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_RUNNER_ENV_PASSTHROUGH forwards a named var through BOTH hops.
+
+    In ``--server`` mode the env crosses two strips: CLI→daemon
+    (``_build_host_daemon_env``) then daemon→runner (``_build_runner_env``). The
+    control var must survive the first hop or the second never sees the names it
+    lists. A named var travels via the ``DATABRICKS_`` prefix on the first hop and
+    the passthrough on the second, so it must reach the runner; an unnamed secret
+    must not.
+    """
+    from omnigent.cli import _build_host_daemon_env
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
+    monkeypatch.setenv("DATABRICKS_LINEAR_API_KEY", "lin-secret")
+    monkeypatch.setenv("DATABRICKS_UNNAMED", "should-not-forward")
+
+    server = "https://example.databricksapps.com"
+    daemon_env = _build_host_daemon_env(server_url=server)
+    # The first hop must keep the control var (regression guard for the remote no-op).
+    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
+
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server,
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    # The named var reaches the runner; an unnamed one does not.
+    assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
+    assert "DATABRICKS_UNNAMED" not in runner_env
+
+
 def test_build_runner_env_preserves_ambient_databricks_profile() -> None:
     """
     Ambient Databricks profile/config-file selectors reach host runners.
