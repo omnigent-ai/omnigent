@@ -37,7 +37,7 @@
      * and slash-command menu rows. */
   --text-13: 13px;
   --text-13--line-height: 18px;
-  /* Caption step — sidebar section subtitles (Projects/Sessions) et al. */
+  /* Fixed caption step for non-scaling microcopy. */
   --text-caption: 12px;
   --text-caption--line-height: 16px;
   /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
@@ -117,22 +117,28 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+@theme {
+  /* App-default interface/body text. Keep this non-inline so the desktop
+   * typography mapping can override the token at runtime. */
+  --text-ui: 1rem;
+  --text-ui--line-height: 1.5;
+  /* Slightly larger hierarchy/caption step than Tailwind's default. */
+  --text-sm: 0.9rem;
+}
+
 /* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
  * ~#007AFF light, ~#0A84FF dark). Reserved for focus rings, charts,
  * unread state, and the active sidebar highlight; surfaces and primary
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
-  /* User-controlled UI font size, as a unitless multiplier on the root
-   * font-size (see Appearance settings / lib/uiFontPreferences.ts). 1 = the
-   * browser default; the root `html` rules multiply it into their font-size so
-   * the whole rem-based UI scales. Overridden at runtime on documentElement. */
-  --ui-font-scale: 1;
-  /* Compact sidebar text size. In `rem` so it rides the root font-size (which
-   * folds in --ui-font-scale and the mobile bump) — 0.8125rem = 13px at the
-   * 16px default, matching the design while still scaling with the Appearance
-   * font-size setting. */
-  --sidebar-font-size: 0.8125rem;
+  /* User-controlled desktop UI font size (see Appearance settings /
+   * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
+   * runtime on documentElement. It feeds typography tokens only; layout and
+   * icon geometry remain on the fixed 16px desktop rem grid. */
+  --desktop-ui-font-size: 16px;
+  --icon-size-default: 14px;
+  --icon-container-default: 16px;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -368,11 +374,30 @@
   --sidebar-dot-color: rgba(255, 255, 255, 0.12);
 }
 
-/* Sidebar body rows — the design's body step: 13px on an 18px line. Both in
- * `rem` so they ride the root font-size (mobile bump + Appearance setting). */
+/* Main-sidebar item labels use the same text-ui semantic step as Appearance
+ * content. Both read the desktop typography tokens derived from the size
+ * selected in Settings. */
 .sidebar-compact-text {
-  font-size: var(--sidebar-font-size);
-  line-height: 1.125rem;
+  font-size: var(--text-ui);
+  line-height: var(--text-ui--line-height);
+}
+
+/* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
+.ui-icon {
+  box-sizing: border-box;
+  width: var(--icon-container-default);
+  height: var(--icon-container-default);
+  padding: 1px;
+  flex-shrink: 0;
+}
+
+/* Shared buttons standardize every unescaped SVG to the same fixed icon
+ * geometry. Set data-icon-size on a deliberately exceptional icon. */
+.button-standard-icons svg:not([data-icon-size]) {
+  box-sizing: border-box;
+  width: var(--icon-container-default);
+  height: var(--icon-container-default);
+  padding: 1px;
 }
 
 /* App-shell canvas — the transparent <main> shows it through. Light: flat
@@ -794,10 +819,9 @@ html:not(.dark) .conversations-sidebar {
      * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
      * with the system stack as the fallback when it's unset. */
     font-family: var(--ui-font-family, var(--font-sans));
-    /* Root size for the whole rem-based UI. `1em` resolves against the
-     * browser default so a customized default is preserved; --ui-font-scale
-     * layers the user's Appearance choice on top. */
-    font-size: calc(1em * var(--ui-font-scale));
+    /* Keep the desktop rem grid fixed so font preferences cannot resize icons,
+     * controls, spacing, or radii. Typography is mapped separately below. */
+    font-size: 16px;
   }
   /* Code surfaces stay on the mono stack, immune to the UI --ui-font-family
    * override above. The Appearance font-family setting is UI chrome only; the
@@ -821,21 +845,47 @@ html:not(.dark) .conversations-sidebar {
   }
 }
 
+/* Desktop-only typography mapping. Tailwind text utilities read these tokens,
+ * while the fixed 16px root keeps every spacing/size utility geometrically
+ * stable. Typed multiplication preserves each Tailwind text step relative to
+ * the discrete Appearance value without affecting mobile. */
+@media (width >= 48rem) {
+  :root {
+    --text-xs: calc(var(--desktop-ui-font-size) * 0.75);
+    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
+    --text-ui: var(--desktop-ui-font-size);
+    --text-base: var(--desktop-ui-font-size);
+    --text-lg: calc(var(--desktop-ui-font-size) * 1.125);
+    --text-xl: calc(var(--desktop-ui-font-size) * 1.25);
+    --text-2xl: calc(var(--desktop-ui-font-size) * 1.5);
+    --text-3xl: calc(var(--desktop-ui-font-size) * 2);
+    --text-3xl--line-height: calc(var(--desktop-ui-font-size) * 2.25);
+  }
+
+  body {
+    font-size: var(--desktop-ui-font-size);
+  }
+}
+
 /* Mobile typography bump.
  *
  * Push the root font-size from the browser default (16px) to 18px below
  * Tailwind's `md` breakpoint. Tailwind v4 sizes typography AND spacing in
  * `rem`, so the whole UI scales up ~12.5% uniformly — easier to read at
  * arm's length and slightly more forgiving touch targets. Desktop is
- * untouched. `--ui-font-scale` (the user's Appearance choice) multiplies in
- * here too, so the bump composes with the setting instead of being lost.
+ * controlled independently by the Appearance setting.
  *
  * Note that `rem` in `@media` queries always refers to the user-agent's
  * default (16px) per the CSS spec — so `48rem` here is the same 768px
  * Tailwind uses for `md:*` utilities, regardless of our root override. */
 @media (width < 48rem) {
   html {
-    font-size: calc(1.125em * var(--ui-font-scale));
+    font-size: 1.125em;
+  }
+  /* Mobile typography remains independent of the desktop Appearance setting. */
+  .sidebar-compact-text {
+    font-size: 0.8125rem;
+    line-height: 1.125rem;
   }
 }
 

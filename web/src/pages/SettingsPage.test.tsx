@@ -191,11 +191,10 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
-  // Reset the font-size preference + applied scale so the Appearance tests
-  // don't leak persisted state or the --ui-font-scale variable into each other.
+  // Reset the font-size preference + applied desktop size so the Appearance
+  // tests don't leak state into each other.
   localStorage.clear();
-  document.documentElement.style.removeProperty("--ui-font-scale");
-  document.documentElement.style.removeProperty("--sidebar-font-size");
+  document.documentElement.style.removeProperty("--desktop-ui-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
@@ -370,26 +369,27 @@ describe("SettingsPage", () => {
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
     // No stored preference → 16px default.
     expect(input.value).toBe("16");
+    expect(screen.getByTestId("ui-font-size-inc").querySelector("svg")).toHaveClass("ui-icon");
 
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     expect(input.value).toBe("17");
     // The choice is persisted so it survives a refresh.
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("17");
-    // The scale is applied live to the document root (17 / 16).
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.0625");
+    // The discrete desktop size is applied live to the document root.
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("17px");
   });
 
   it("disables the steppers at the min and max bounds", () => {
-    localStorage.setItem("omnigent:ui-font-size", "20");
+    localStorage.setItem("omnigent:ui-font-size", "18");
     renderPage("/settings/appearance");
-    // At the 20px max, only the increase button is disabled.
+    // At the 18px max, only the increase button is disabled.
     expect(screen.getByTestId("ui-font-size-inc")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-dec")).not.toBeDisabled();
 
     cleanup();
-    localStorage.setItem("omnigent:ui-font-size", "12");
+    localStorage.setItem("omnigent:ui-font-size", "11");
     renderPage("/settings/appearance");
-    // At the 12px min, only the decrease button is disabled.
+    // At the 11px min, only the decrease button is disabled.
     expect(screen.getByTestId("ui-font-size-dec")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
   });
@@ -474,7 +474,7 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("16px");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
@@ -501,19 +501,18 @@ describe("SettingsPage", () => {
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
     expect(input.value).toBe("13");
 
-    // Deleting a digit leaves "1" — below the 12px min. The box must SHOW "1"
-    // (free editing) without snapping to 12 or persisting the transient value.
+    // Deleting a digit leaves "1" — below the 11px min. The box must SHOW "1"
+    // (free editing) without snapping to 11 or persisting the transient value.
     fireEvent.change(input, { target: { value: "1" } });
     expect(input.value).toBe("1");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("13");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
 
     // Finishing the number to a valid size applies it live and persists it.
     fireEvent.change(input, { target: { value: "18" } });
     expect(input.value).toBe("18");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
-    // 18 / 16 base = 1.125.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.125");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
   });
 
   it("clamps a below-min entry to the minimum on blur", () => {
@@ -524,8 +523,8 @@ describe("SettingsPage", () => {
     fireEvent.change(input, { target: { value: "1" } });
     fireEvent.blur(input);
     // On blur the draft settles to the clamped minimum.
-    expect(input.value).toBe("12");
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("12");
+    expect(input.value).toBe("11");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("11");
   });
 
   it("reverts an empty entry to the committed size on blur", () => {
@@ -552,8 +551,8 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
     expect(input.value).toBe("14");
     // Persisted under the code-font key (distinct from the chrome font's) so it
-    // survives a refresh. There's no --ui-font-scale here — the pref reaches the
-    // editor/terminal imperatively, not via a CSS variable.
+    // survives a refresh. It doesn't use --desktop-ui-font-size — the pref
+    // reaches the editor/terminal imperatively, not via a CSS variable.
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("14");
   });
 

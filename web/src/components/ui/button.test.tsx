@@ -65,6 +65,15 @@ describe("buttonVariants translate/transform composition", () => {
   });
 });
 
+describe("buttonVariants icon geometry", () => {
+  it("keeps default button icons at a fixed 14px glyph inside a 16px box", () => {
+    const classes = buttonVariants({});
+    // index.css owns the fixed geometry through this semantic hook; callers can
+    // opt an exceptional icon out with data-icon-size.
+    expect(classes).toContain("button-standard-icons");
+  });
+});
+
 describe("Button loading state", () => {
   it("keeps the label in the DOM so the button width doesn't collapse or grow", () => {
     // The label must stay rendered (just hidden) — replacing it with the
