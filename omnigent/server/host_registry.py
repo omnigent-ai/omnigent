@@ -237,6 +237,12 @@ class HostConnection:
         Resolved when the host sends ``host.store_secret_result``. Values carry
         the result fields (``status``, ``configured_harnesses``, ``error``) —
         never the secret. Same ``Any`` typing rationale as ``pending_stats``.
+    :param db_write_lock: Serializes this connection's ``hosts``-row writes.
+        A heartbeat already running in a worker thread cannot be cancelled,
+        so without this it can land after the route's ``set_offline`` and
+        leave a host with no tunnel reading online for a full liveness TTL.
+        A ``threading`` lock, not an asyncio one: it is held in the worker
+        thread that performs the write.
     :param credential_write_lock: Serializes credential writes to this host so
         two overlapping requests (a double-click, or key + gateway in quick
         succession) can't interleave the daemon's non-atomic
@@ -299,6 +305,7 @@ class HostConnection:
     pending_credential_detects: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    db_write_lock: threading.Lock = field(default_factory=threading.Lock)
     credential_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
@@ -382,19 +389,40 @@ class HostRegistry:
             self._hosts[key] = conn
         return conn
 
-    def deregister(self, host_id: str, workspace_id: int | None = None) -> None:
+    def deregister(
+        self,
+        host_id: str,
+        workspace_id: int | None = None,
+        conn: HostConnection | None = None,
+    ) -> HostConnection | None:
         """Remove a host connection.
 
         No-op if ``(workspace_id, host_id)`` is not registered.
 
         :param host_id: Host identifier to remove, in any accepted
             spelling (see :func:`_canonical_host_id`).
-        :param workspace_id: Tenant partition; defaults to
-            :func:`current_workspace_id`.
+        :param workspace_id: Tenant partition; defaults to the
+            connection's own workspace when *conn* is given (as
+            ``send_text`` does), otherwise :func:`current_workspace_id`.
+        :param conn: Optional generation guard. When provided,
+            deregistration only removes the registry entry if the
+            current entry is this exact connection object. This prevents
+            stale route handlers from deleting a newer tunnel.
+        :returns: The removed connection, or ``None`` when the host is
+            already offline or the guard did not match.
         """
-        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        if workspace_id is not None:
+            ws_id = workspace_id
+        elif conn is not None:
+            ws_id = conn.workspace_id
+        else:
+            ws_id = current_workspace_id()
         with self._lock:
-            self._hosts.pop((ws_id, _canonical_host_id(host_id)), None)
+            key = (ws_id, _canonical_host_id(host_id))
+            current = self._hosts.get(key)
+            if current is None or (conn is not None and current is not conn):
+                return None
+            return self._hosts.pop(key)
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.

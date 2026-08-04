@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
@@ -19,9 +22,9 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.server.auth import AuthProvider
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import HostStore, host_is_live
 
 pytestmark = pytest.mark.asyncio
 
@@ -163,6 +166,27 @@ async def _wait_offline(
         await asyncio.sleep(0.01)
 
 
+async def _wait_count(
+    events: list[str],
+    count: int,
+    *,
+    timeout_s: float = 2.0,
+) -> None:
+    """Poll until *events* holds at least *count* entries.
+
+    :param events: Recorded callback announcements.
+    :param count: Number of entries to wait for.
+    :param timeout_s: Max seconds to poll before raising.
+    :raises asyncio.TimeoutError: If the count is not reached in time.
+    """
+
+    async def _poll() -> None:
+        while len(events) < count:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=timeout_s)
+
+
 async def _wait_updated_at_at_least(
     store: HostStore,
     host_id: str,
@@ -238,10 +262,274 @@ async def test_host_tunnel_ping_loop_persists_heartbeat(
 
     host = store.get_host(_HOST_ID)
     assert host is not None
-    assert host.status == "online", "heartbeat must not change status"
+    assert host.status == "online", "heartbeat must keep a live host online"
 
     # Clean up the live tunnel so the loop stops.
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@dataclass
+class _IdleWebSocket:
+    """WebSocket stand-in for driving ``_ping_loop`` without a route.
+
+    :param closed: Close codes the loop asked for, if it ever did.
+    """
+
+    closed: list[int] = field(default_factory=list)
+
+    async def send_text(self, data: str) -> None:
+        """Discard an outbound frame.
+
+        :param data: The text frame content.
+        """
+        del data
+
+    async def receive_text(self) -> str:
+        """Block forever — the ping loop never reads.
+
+        :returns: Never returns in practice.
+        """
+        await asyncio.sleep(3600)
+        return ""  # pragma: no cover
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        """Record a close request.
+
+        :param code: WebSocket close code.
+        :param reason: Close reason, ignored.
+        """
+        del reason
+        self.closed.append(code)
+
+
+async def test_ping_loop_stops_heartbeating_after_takeover(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A superseded connection's ping loop must stop refreshing last-seen.
+
+    ``updated_at`` is the liveness freshness gate. Once a newer tunnel
+    holds the host, the old loop no longer speaks for it, so a heartbeat
+    from there would keep a dead generation looking fresh — and would
+    fight the very cleanup a takeover is supposed to settle.
+    """
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.01)
+
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    store.upsert_on_connect(_HOST_ID, "test-laptop", "alice@example.com")
+    stale = now_epoch() - 10_000
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(
+            update(SqlHost).where(SqlHost.host_id == _HOST_ID).values(updated_at=stale)
+        )
+        session.commit()
+
+    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="test-laptop")
+    ws = _IdleWebSocket()
+    old_conn = registry.register(_HOST_ID, ws, hello, owner=None)
+    # A newer tunnel takes the host over.
+    registry.register(_HOST_ID, _IdleWebSocket(), hello, owner=None)
+
+    task = asyncio.create_task(
+        tunnel_mod._ping_loop(cast(Any, ws), old_conn, _HOST_ID, store, registry),
+    )
+    # Many intervals' worth of grace — long enough that a loop still
+    # writing would have written dozens of times.
+    done, _pending = await asyncio.wait({task}, timeout=0.5)
+
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.updated_at == stale, "a superseded ping loop must not refresh last-seen"
+    assert task in done, "a superseded ping loop must exit rather than keep spinning"
+    assert ws.closed == [], "a takeover is not a ping timeout; the loop must not close the socket"
+
+
+class _ProbeLock:
+    """Write-lock stand-in that exposes acquisition ordering to tests.
+
+    Two knobs, one per test: *hold_first* parks the first acquirer at
+    ``gate`` (modelling a thread that started but has not yet taken the
+    lock), and ``contended`` fires when an acquirer has to wait for a
+    current holder — a signal, so tests never infer blocking from elapsed
+    time.
+
+    :param hold_first: Whether to park the first acquirer at the gate.
+    """
+
+    def __init__(self, *, hold_first: bool = False) -> None:
+        self._lock = threading.Lock()
+        self._hold_first = hold_first
+        self.at_gate = threading.Event()
+        self.gate = threading.Event()
+        self.contended = threading.Event()
+
+    def acquire(self, *args: object, **kwargs: object) -> bool:
+        """Acquire, signalling gate arrival and contention.
+
+        :returns: Whether the underlying lock was acquired.
+        """
+        if self._hold_first:
+            self._hold_first = False
+            self.at_gate.set()
+            assert self.gate.wait(timeout=5.0), "gate was never opened"
+        if self._lock.acquire(blocking=False):
+            return True
+        self.contended.set()
+        return self._lock.acquire()
+
+    def release(self) -> None:
+        """Release the underlying lock."""
+        self._lock.release()
+
+    def __enter__(self) -> _ProbeLock:
+        """Acquire on context entry.
+
+        :returns: This lock.
+        """
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        """Release on context exit.
+
+        :returns: ``False`` so exceptions propagate.
+        """
+        self.release()
+        return False
+
+
+async def test_set_offline_waits_out_an_inflight_heartbeat(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """set_offline must take the same lock a running heartbeat holds.
+
+    Cancelling the ping task cannot stop a ``to_thread`` heartbeat that
+    already started, and the heartbeat rewrites ``status="online"``. This
+    pins the exclusion half: while that write is in progress, the route's
+    ``set_offline`` waits rather than interleaving with it.
+    """
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    store = HostStore(db_uri)
+    store.upsert_on_connect(_HOST_ID, "test-laptop", "alice@example.com")
+    registry = HostRegistry()
+    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="test-laptop")
+    conn = registry.register(_HOST_ID, _IdleWebSocket(), hello, owner=None)
+    lock = _ProbeLock()
+    conn.db_write_lock = cast(Any, lock)
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_heartbeat = store.heartbeat
+
+    def _slow_heartbeat(host_id: str) -> None:
+        """Hold the connection's write lock until the test releases it.
+
+        :param host_id: Host identifier forwarded to the real heartbeat.
+        """
+        entered.set()
+        assert release.wait(timeout=5.0), "heartbeat was never released"
+        real_heartbeat(host_id)
+
+    monkeypatch.setattr(store, "heartbeat", _slow_heartbeat)
+
+    beat = asyncio.create_task(
+        asyncio.to_thread(tunnel_mod._write_heartbeat, conn, store, _HOST_ID, registry),
+    )
+    assert await asyncio.to_thread(entered.wait, 5.0), "heartbeat never started"
+
+    offline = asyncio.create_task(
+        asyncio.to_thread(tunnel_mod._write_offline, conn, store, _HOST_ID),
+    )
+    # Signalled, not timed: the offline worker reached the lock and blocked.
+    assert await asyncio.to_thread(lock.contended.wait, 5.0), (
+        "set_offline never waited for the connection lock"
+    )
+    blocked = store.get_host(_HOST_ID)
+    assert blocked is not None
+    assert blocked.status == "online", "offline landed while the heartbeat held the lock"
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(beat, offline), timeout=5.0)
+
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "offline", "a late heartbeat must not resurrect a dead host"
+    assert not host_is_live(host)
+
+
+async def test_late_heartbeat_after_cleanup_does_not_resurrect_host(
+    db_uri: str,
+) -> None:
+    """A heartbeat reaching its write after cleanup must be a no-op.
+
+    The write lock only excludes, it does not order: a heartbeat thread
+    that started before teardown can take the lock *after* ``set_offline``
+    released it, rewriting ``status="online"`` for a host with no tunnel.
+    Cleanup pops the connection first, so the write-side registration
+    check is what makes that late heartbeat harmless.
+    """
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    store = HostStore(db_uri)
+    store.upsert_on_connect(_HOST_ID, "test-laptop", "alice@example.com")
+    registry = HostRegistry()
+    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="test-laptop")
+    conn = registry.register(_HOST_ID, _IdleWebSocket(), hello, owner=None)
+    late = _ProbeLock(hold_first=True)
+    conn.db_write_lock = cast(Any, late)
+
+    # The heartbeat is dispatched and running, but parked before the lock.
+    beat = asyncio.create_task(
+        asyncio.to_thread(tunnel_mod._write_heartbeat, conn, store, _HOST_ID, registry),
+    )
+    assert await asyncio.to_thread(late.at_gate.wait, 5.0), "heartbeat never reached the lock"
+
+    # Route teardown runs to completion while the heartbeat is parked.
+    registry.deregister(_HOST_ID, conn=conn)
+    await asyncio.to_thread(tunnel_mod._write_offline, conn, store, _HOST_ID)
+    assert store.get_host(_HOST_ID).status == "offline"  # type: ignore[union-attr]
+
+    # Only now does the heartbeat get the lock — strictly after offline.
+    late.gate.set()
+    await asyncio.wait_for(beat, timeout=5.0)
+
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "offline", "a late heartbeat must not resurrect a dead host"
+    assert not host_is_live(host)
+
+
+async def test_host_tunnel_marks_offline_after_an_out_of_band_deregister(
+    db_uri: str,
+) -> None:
+    """An empty registry slot still needs the row marked offline.
+
+    The managed-wake path deregisters the live connection out of band. The
+    route's own teardown then finds an empty slot — which is NOT a
+    takeover, so suppressing cleanup would leave the row online for a
+    liveness TTL with no hosts-changed nudge for clients.
+    """
+    app, registry, store, _connects, disconnects = _announcing_app(db_uri)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    # The wake path drops the current connection; no newer tunnel exists.
+    assert registry.deregister(_HOST_ID) is not None
+    assert registry.get(_HOST_ID) is None
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    await asyncio.wait_for(comm.future, timeout=2.0)
+
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "offline", "an empty slot is not a takeover; the row must go offline"
+    assert disconnects == [_HOST_ID], "clients still need exactly one hosts-changed nudge"
 
 
 async def test_host_tunnel_accepts_and_registers(
@@ -388,6 +676,118 @@ async def test_host_tunnel_sets_offline_on_disconnect(
     host = store.get_host(_HOST_ID)
     assert host is not None
     assert host.status == "offline"
+
+
+def _announcing_app(
+    db_uri: str,
+) -> tuple[FastAPI, HostRegistry, HostStore, list[str], list[str]]:
+    """Build a host-tunnel app that records its connect/disconnect announcements.
+
+    :param db_uri: SQLite URI from the shared fixture.
+    :returns: Tuple of (app, registry, store, connects, disconnects),
+        the two lists collecting announced host ids in call order.
+    """
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    connects: list[str] = []
+    disconnects: list[str] = []
+
+    async def _on_host_connect(host_id: str, _owner: str | None) -> None:
+        connects.append(host_id)
+
+    async def _on_host_disconnect(host_id: str, _owner: str | None) -> None:
+        disconnects.append(host_id)
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            store,
+            on_host_connect=_on_host_connect,
+            on_host_disconnect=_on_host_disconnect,
+        ),
+        prefix="/v1",
+    )
+    return app, registry, store, connects, disconnects
+
+
+async def _overlap_tunnels(
+    app: FastAPI,
+    registry: HostRegistry,
+    connects: list[str],
+) -> tuple[ApplicationCommunicator, HostConnection]:
+    """Open a second tunnel for an already-connected host and let the first unwind.
+
+    The second connect announcement — not a registry poll — is the
+    "replacement is live" signal: a buggy cleanup can empty the registry
+    between polls, which would look like the takeover never happened.
+
+    :param app: App hosting the tunnel route.
+    :param registry: Registry the tunnels register in.
+    :param connects: Connect announcements recorded by the app.
+    :returns: Tuple of (surviving communicator, the superseded connection).
+    """
+    comm_old = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm_old, registry)
+    old_conn = registry.get(_HOST_ID)
+    assert old_conn is not None
+
+    comm_new = await _connect_route(app, _TUNNEL_PATH)
+    await comm_new.send_input({"type": "websocket.receive", "text": _make_hello()})
+    await _wait_count(connects, 2)
+
+    # Barrier: the superseded handler's task has finished, so whatever
+    # cleanup it does has already happened — no sleep-based guessing.
+    await asyncio.wait_for(comm_old.future, timeout=2.0)
+    return comm_new, old_conn
+
+
+async def test_host_tunnel_takeover_keeps_replacement_online(
+    db_uri: str,
+) -> None:
+    """A second tunnel for one host_id must not leave the live host offline.
+
+    Registration is newest-wins: the second tunnel poisons the first's
+    outbound queue and takes the registry slot. The first handler then
+    unwinds cleanly — and must not run disconnect cleanup, or it
+    deregisters the replacement and flips the DB row offline while a
+    perfectly good tunnel is up. Nothing rewrites ``status`` until the
+    next reconnect, so the host would read offline for the whole life of
+    a working tunnel.
+    """
+    app, registry, store, connects, _disconnects = _announcing_app(db_uri)
+    comm_new, old_conn = await _overlap_tunnels(app, registry, connects)
+
+    live = registry.get(_HOST_ID)
+    assert live is not None, "superseded handler deregistered the live tunnel"
+    assert live is not old_conn, "the replacement should hold the registry slot"
+
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "online", "superseded handler flipped the live host offline"
+    assert host_is_live(host), "the live tunnel's host must still read as live"
+
+    await comm_new.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_host_tunnel_takeover_suppresses_disconnect_callback(
+    db_uri: str,
+) -> None:
+    """Takeover announces nothing; the survivor's real close announces once.
+
+    ``on_host_disconnect`` drives the SSE "hosts changed" nudge, so firing
+    it for a superseded connection tells clients a live host went away.
+    """
+    app, registry, store, connects, disconnects = _announcing_app(db_uri)
+    comm_new, _old_conn = await _overlap_tunnels(app, registry, connects)
+
+    assert disconnects == [], "a superseded connection must not announce a disconnect"
+
+    await comm_new.send_input({"type": "websocket.disconnect", "code": 1000})
+    await asyncio.wait_for(comm_new.future, timeout=2.0)
+
+    assert disconnects == [_HOST_ID], "the survivor's real close must announce exactly once"
+    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=2.0)
 
 
 async def test_host_tunnel_rejects_bad_protocol_version(

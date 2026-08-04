@@ -228,6 +228,38 @@ def create_host_tunnel_router(
 
         await ws.accept()
         conn: HostConnection | None = None
+        released = False
+
+        async def _release_host(*, announce: bool) -> None:
+            """Run this connection's disconnect cleanup at most once.
+
+            Skipped when a NEWER tunnel holds the registry slot: that
+            connection owns the host now, and flipping the row offline
+            would report a connected host as gone. An already-empty slot
+            is different — nothing newer exists to protect and this
+            handler is the last owner, so the row still needs marking
+            offline (the managed-wake path deregisters out of band).
+
+            :param announce: Whether to fire ``on_host_disconnect``.
+            """
+            nonlocal released
+            if conn is None or released:
+                return
+            if host_registry.deregister(host_id, conn=conn) is None:
+                superseded = host_registry.get(conn.host_id, conn.workspace_id) is not None
+                if superseded:
+                    return
+            released = True
+            await asyncio.to_thread(_write_offline, conn, host_store, host_id)
+            if announce and on_host_disconnect is not None:
+                try:
+                    await on_host_disconnect(host_id, tunnel_owner)
+                except Exception:
+                    _logger.exception(
+                        "on_host_disconnect callback failed for %s",
+                        host_id,
+                    )
+
         try:
             raw = await ws.receive_text()
             frame = decode_host_frame(raw)
@@ -275,7 +307,7 @@ def create_host_tunnel_router(
                 name=f"host-sender:{host_id}",
             )
             ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, host_store),
+                _ping_loop(ws, conn, host_id, host_store, host_registry),
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
@@ -326,41 +358,18 @@ def create_host_tunnel_router(
                     receive_task,
                     return_exceptions=True,
                 )
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
-                if on_host_disconnect is not None:
-                    try:
-                        await on_host_disconnect(host_id, tunnel_owner)
-                    except Exception:
-                        _logger.exception(
-                            "on_host_disconnect callback failed for %s",
-                            host_id,
-                        )
+                await _release_host(announce=True)
 
         except WebSocketDisconnect:
             _logger.warning("Host %s disconnected", host_id)
-            # Only run disconnect cleanup if we actually registered this
-            # host on THIS connection. A connect that failed before
-            # register — e.g. the upsert IntegrityError when a peer
-            # connects with another owner's host_id — must not deregister
-            # or flip that owner's host offline (cross-user DoS).
-            if conn is not None:
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
-                if on_host_disconnect is not None:
-                    try:
-                        await on_host_disconnect(host_id, tunnel_owner)
-                    except Exception:
-                        _logger.exception(
-                            "on_host_disconnect callback failed for %s",
-                            host_id,
-                        )
+            # A connect that failed before register — e.g. the upsert
+            # IntegrityError when a peer connects with another owner's
+            # host_id — must not flip that owner's host offline (cross-user
+            # DoS). ``_release_host`` covers that: no conn, no cleanup.
+            await _release_host(announce=True)
         except Exception:
             _logger.exception("Host tunnel error for %s", host_id)
-            # Same guard as above: don't touch a host we never registered.
-            if conn is not None:
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
+            await _release_host(announce=False)
 
     return router
 
@@ -384,6 +393,53 @@ async def _refuse_upgrade(ws: WebSocket, *, status: int, reason: str) -> None:
         await ws.send_denial_response(PlainTextResponse(reason, status_code=status))
     else:
         await ws.close(code=4009, reason=reason)
+
+
+def _write_heartbeat(
+    conn: HostConnection,
+    host_store: HostStore,
+    host_id: str,
+    host_registry: HostRegistry,
+) -> None:
+    """Persist a heartbeat, unless this connection is no longer registered.
+
+    Runs in a worker thread. A thread that has already started cannot be
+    cancelled, so this can reach the write after the route tore the
+    connection down — and the heartbeat rewrites ``status="online"``.
+    Re-checking registration *inside* the lock makes that case a no-op:
+    cleanup always pops the connection before writing offline.
+
+    :param conn: The connection whose tunnel was alive at dispatch time.
+    :param host_store: Persistent host store to write to.
+    :param host_id: Host identifier to refresh.
+    :param host_registry: Registry that decides whether this connection
+        still speaks for the host.
+    """
+    with conn.db_write_lock:
+        if host_registry.get(conn.host_id, conn.workspace_id) is not conn:
+            return
+        host_store.heartbeat(host_id)
+
+
+def _write_offline(conn: HostConnection, host_store: HostStore, host_id: str) -> None:
+    """Mark the host offline as the last word for a dead tunnel.
+
+    Runs in a worker thread. Ordering against a late heartbeat comes from
+    cleanup popping the connection *before* this runs, plus
+    :func:`_write_heartbeat`'s in-lock registration check — not from the
+    lock alone, which only excludes, never orders.
+
+    Not atomic against a *different* connection: a new tunnel can upsert
+    itself online between this connection's registry pop and this write,
+    leaving a live host with an offline row. Its own heartbeat converges
+    that within one ping interval.
+
+    :param conn: The connection being torn down.
+    :param host_store: Persistent host store to write to.
+    :param host_id: Host identifier to mark offline.
+    """
+    with conn.db_write_lock:
+        host_store.set_offline(host_id)
 
 
 async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
@@ -680,6 +736,7 @@ async def _ping_loop(
     conn: HostConnection,
     host_id: str,
     host_store: HostStore,
+    host_registry: HostRegistry,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
@@ -695,9 +752,16 @@ async def _ping_loop(
     :param conn: Host connection for timing checks.
     :param host_id: Host id for logging.
     :param host_store: Persistent host store the heartbeat is written to.
+    :param host_registry: Registry consulted each tick so a connection a
+        newer tunnel replaced stops writing.
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
+        if host_registry.get(conn.host_id, conn.workspace_id) is not conn:
+            # A newer tunnel serves this host now, so stop the loop rather
+            # than hop to a thread only to no-op. The write-side check in
+            # ``_write_heartbeat`` is what actually guarantees this.
+            return
         elapsed = time.time() - conn.last_frame_at
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
             _logger.warning(
@@ -711,7 +775,7 @@ async def _ping_loop(
             return
         # The host is still within the liveness window — refresh its
         # last-seen so the freshness gate keeps it in the online set.
-        await asyncio.to_thread(host_store.heartbeat, host_id)
+        await asyncio.to_thread(_write_heartbeat, conn, host_store, host_id, host_registry)
         try:
             ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
             conn.outbound_queue.put_nowait(ping_text)
