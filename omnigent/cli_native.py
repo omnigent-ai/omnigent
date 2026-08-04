@@ -79,6 +79,10 @@ def register_native_commands(cli: click.Group) -> None:
     _smart_routing_decision = _late_bound(lambda: _cli._smart_routing_decision)
     _with_routed_model_arg = _late_bound(lambda: _cli._with_routed_model_arg)
 
+    from omnigent.runner.turn_routing import (
+        supports_in_harness_turn_routing as _supports_in_harness_turn_routing,
+    )
+
     @cli.command(
         context_settings={
             "ignore_unknown_options": True,
@@ -170,7 +174,10 @@ def register_native_commands(cli: click.Group) -> None:
         "smart_routing",
         is_flag=True,
         default=False,
-        help=("Let the server pick the model for this launch from the prompt. Requires -p."),
+        help=(
+            "Let the server pick the model for this launch. With -p the pick "
+            "happens up front; without it, your first typed message picks it."
+        ),
     )
     @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
     def claude(
@@ -208,8 +215,12 @@ def register_native_commands(cli: click.Group) -> None:
         _reject_native_on_windows("claude")
         if smart_routing:
             # Validate before any side effects (daemon spawn, server discovery)
-            # so a missing prompt fails instantly.
-            prompt = _require_smart_routing_prompt(prompt)
+            # so an unroutable invocation fails instantly. This harness hooks
+            # its own first prompt, so a bare launch routes on what gets typed.
+            prompt = _require_smart_routing_prompt(
+                prompt,
+                in_harness_routing=_supports_in_harness_turn_routing("claude-native"),
+            )
         startup_profiler = StartupProfiler.from_env(
             name="omnigent claude",
             env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -346,7 +357,10 @@ def register_native_commands(cli: click.Group) -> None:
         "smart_routing",
         is_flag=True,
         default=False,
-        help=("Let the server pick the model for this launch from the prompt. Requires -p."),
+        help=(
+            "Let the server pick the model for this launch. With -p the pick "
+            "happens up front; without it, your first typed message picks it."
+        ),
     )
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
     def codex(
@@ -381,8 +395,12 @@ def register_native_commands(cli: click.Group) -> None:
         model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
         if smart_routing:
             # Validate before any side effects (daemon spawn, server discovery)
-            # so a missing prompt fails instantly.
-            prompt = _require_smart_routing_prompt(prompt)
+            # so an unroutable invocation fails instantly. This harness hooks
+            # its own first prompt, so a bare launch routes on what gets typed.
+            prompt = _require_smart_routing_prompt(
+                prompt,
+                in_harness_routing=_supports_in_harness_turn_routing("codex-native"),
+            )
         choice = _split_resume_value(resume)
         if session_id is not None and (choice.picker or choice.conversation_id is not None):
             raise click.UsageError(

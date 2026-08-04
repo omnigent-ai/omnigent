@@ -1371,29 +1371,7 @@ def build_hook_settings(
         # publish live token deltas to the web UI.
         "MessageDisplay": [{"hooks": [message_display_hook]}],
     }
-    # SPIKE ONLY (in-harness routing S3). Not product code. Marker-gated
-    # UserPromptSubmit probe: logs payloads and, when
-    # ``<bridge_dir>/spike_block`` exists, blocks the prompt once.
-    hooks["UserPromptSubmit"].append(
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": shlex.join(
-                        [
-                            python,
-                            "-I",
-                            "-m",
-                            "omnigent.claude_native_hook",
-                            "spike-userprompt",
-                            "--bridge-dir",
-                            str(bridge_dir),
-                        ]
-                    ),
-                }
-            ]
-        }
-    )
+    hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
         _write_json_file(
             bridge_dir / _PERMISSION_HOOK_FILE,
@@ -1545,6 +1523,45 @@ def build_hook_settings(
         status_parts.extend(["--chain", chain_command])
     settings["statusLine"] = {"type": "command", "command": shlex.join(status_parts)}
     return settings
+
+
+def _claude_route_turn_hook(bridge_dir: Path, python: str) -> dict[str, Any]:
+    """
+    Build the ``UserPromptSubmit`` entry for first-message model routing.
+
+    A no-op (exit 0, no output) unless the runner has advertised a
+    ``route-turn`` endpoint in *bridge_dir* and nothing has routed this
+    session yet. When it does route it blocks the prompt and the runner
+    replays it, which applies the routed model on the way in. See
+    :mod:`omnigent.runner.turn_routing`.
+
+    :param bridge_dir: Bridge directory holding both the endpoint
+        advertisement and the hook's fast-skip marker.
+    :param python: Python executable to run the hook module with.
+    :returns: One Claude settings command-hook entry.
+    """
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    return {
+        "type": "command",
+        "command": shlex.join(
+            [
+                python,
+                "-I",
+                "-m",
+                "omnigent.claude_native_hook",
+                "route-turn",
+                "--bridge-dir",
+                str(bridge_dir),
+                "--harness",
+                "claude-native",
+            ]
+        ),
+        # Outermost hop of the timeout ladder in ``omnigent.runner.turn_routing``:
+        # it must exceed the hook script's own request budget so the script's
+        # fail-open branch runs before Claude kills it.
+        "timeout": HARNESS_HOOK_TIMEOUT_S,
+    }
 
 
 def url_component(value: str) -> str:
@@ -3500,6 +3517,11 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     "Usable" means the TUI is back at a mounted chat input with no ``/model``
     picker or confirmation dialog on top of it — the state an injection needs
     to land, and the settle signal after a picker-driven model switch.
+
+    It is also the claude-native answer to "has the blocked prompt cleared?"
+    for first-message routing: a blocked ``UserPromptSubmit`` starts no turn
+    and persists nothing, so there is no turn id to wait out, and a mounted
+    input box with nothing on top of it is what says the replay may land.
 
     Never raises: an unadvertised pane or a torn capture is "not ready yet".
 

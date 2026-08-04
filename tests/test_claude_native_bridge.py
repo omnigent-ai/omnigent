@@ -6304,10 +6304,13 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    The claude-native "an injection may land now" signal.
+    The claude-native "an injection may land now" signal, which doubles as the
+    settle signal for the routing replay.
 
     An open ``/model`` picker or ``Switch model?`` dialog swallows typed text,
     so a mounted input box with neither on top of it is what readiness means.
+    A blocked ``UserPromptSubmit`` starts no turn either, so there is no turn
+    id to wait out — this is what says the replay may land.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     frames = {"pane": _IDLE_PANE}

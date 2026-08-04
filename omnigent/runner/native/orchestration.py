@@ -6272,21 +6272,21 @@ async def _auto_create_claude_terminal(
         harness="claude-native",
         server_client=server_client,
     )
-    # Only an auto-harness session's spawns can be re-routed across harness
-    # families, so only it needs the routed-spawn note and the pre-approval for
-    # the three Omnigent tools that carry out the re-route. A pinned session's
-    # argv must stay byte-identical.
-    routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(launch_metadata.auto_harness)
-    # First-message model routing: the UserPromptSubmit hook reads the
-    # advertisement from the same bridge dir, so a prompt typed straight into
-    # the TUI on a bare launch still gets routed. Always installed — the
-    # endpoint decides per prompt whether anything routes.
-    _turn_router = _start_turn_router_for_native_session(
+    # First-message model routing. Advertised in the same bridge dir the
+    # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its
+    # own), and live before the terminal launches because the hook can fire on
+    # the very first prompt the user types.
+    _claude_turn_router = _start_turn_router_for_native_session(
         session_id,
         bridge_dir=bridge_dir,
         harness="claude-native",
         server_client=server_client,
     )
+    # Only an auto-harness session's spawns can be re-routed across harness
+    # families, so only it needs the routed-spawn note and the pre-approval for
+    # the three Omnigent tools that carry out the re-route. A pinned session's
+    # argv must stay byte-identical.
+    routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(launch_metadata.auto_harness)
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -6299,7 +6299,7 @@ async def _auto_create_claude_terminal(
         subagent_router_dir=subagent_router_dir,
         append_system_prompt=routed_spawn_note,
         allowed_tools=routed_spawn_tools,
-        turn_router_dir=bridge_dir if _turn_router is not None else None,
+        turn_router_dir=bridge_dir if _claude_turn_router is not None else None,
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
@@ -6455,7 +6455,7 @@ async def _auto_create_claude_terminal(
             )
         finally:
             await _shutdown_session_router_async(session_id, _subagent_router)
-            await _shutdown_session_turn_router_async(session_id, _turn_router)
+            await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),

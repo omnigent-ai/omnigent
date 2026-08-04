@@ -2473,3 +2473,343 @@ def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -
     assert resp is not None
     assert resp.status_code == 200
     assert _OkClient.calls == 1
+
+
+# ── route-turn (first-message model routing) ────────────────────────
+
+
+def _turn_routing_bridge_dir(tmp_path: Path) -> Path:
+    """
+    Create a bridge dir whose active session is ``conv_active``.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: The bridge directory.
+    """
+    bridge_dir = prepare_bridge_dir("conv_active", bridge_id="bridge_turn", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    return bridge_dir
+
+
+def _advertise_turn_router(bridge_dir: Path, *, session_id: str | None = "conv_active") -> None:
+    """
+    Write a live ``turn_router.json`` advertisement into *bridge_dir*.
+
+    :param bridge_dir: The session's bridge directory.
+    :param session_id: Session id to advertise, or ``None`` to omit it so
+        the hook has to fall back to the bridge's active session.
+    :returns: None.
+    """
+    import os
+
+    from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
+
+    payload: dict[str, object] = {
+        "url": "http://127.0.0.1:54321",
+        "token": "turn-token",
+        "pid": os.getpid(),
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
+    (bridge_dir / ADVERTISEMENT_FILE).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _run_route_turn(
+    bridge_dir: Path, payload: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> int:
+    """
+    Feed *payload* on stdin and run the ``route-turn`` subcommand.
+
+    :param bridge_dir: The session's bridge directory.
+    :param payload: The claude ``UserPromptSubmit`` hook payload.
+    :param monkeypatch: pytest monkeypatch fixture.
+    :returns: The hook process exit code.
+    """
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    return claude_native_hook.main(
+        ["route-turn", "--bridge-dir", str(bridge_dir), "--harness", "claude-native"]
+    )
+
+
+def test_route_turn_fast_skips_on_the_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A consumed marker short-circuits before any network call.
+
+    This is the re-entrancy guard the replayed prompt relies on: the replay
+    re-fires ``UserPromptSubmit``, and a second block would erase it.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    (bridge_dir / MARKER_FILE).write_text("", encoding="utf-8")
+
+    def _boom(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("the marker must skip the route-turn round trip")
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _boom)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_blocks_on_a_routed_verdict_without_touching_the_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A routed verdict writes the marker and blocks — and switches nothing.
+
+    Claude's pane is frozen waiting on this very subprocess, so keystrokes
+    sent from here would queue behind the block. The runner owns the switch;
+    the hook's only job is the marker (its "you owe me a replay" handshake)
+    and the block itself.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    # The live model is read from the statusLine snapshot, never a config file.
+    (bridge_dir / "context.json").write_text(
+        json.dumps({"model": "databricks-claude-opus-4-8", "context_window_size": 200000}),
+        encoding="utf-8",
+    )
+    sent: dict[str, object] = {}
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        sent.update({"url": url, "token": token, "body": body, "timeout": timeout})
+        return {
+            "action": "route",
+            "model": "databricks-claude-sonnet-5",
+            "rationale": "short lookup",
+            "terminal": True,
+        }
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "inject_model_selection",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("the hook must not drive tmux")),
+        raising=False,
+    )
+
+    exit_code = _run_route_turn(
+        bridge_dir,
+        {"hook_event_name": "UserPromptSubmit", "prompt": "what test runner is this?"},
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert sent["url"] == "http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"
+    assert sent["token"] == "turn-token"
+    assert sent["body"] == {
+        "harness": "claude-native",
+        "prompt": "what test runner is this?",
+        # Claude's payload carries no turn id, and a blocked prompt starts
+        # no turn for the replay to wait out.
+        "turn_id": None,
+        "model": "databricks-claude-opus-4-8",
+    }
+    assert (bridge_dir / MARKER_FILE).exists()
+    result = json.loads(captured.out)
+    assert result["decision"] == "block"
+    assert "databricks-claude-sonnet-5" in result["reason"]
+
+
+def test_route_turn_marks_a_terminal_allow_so_it_stops_asking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A terminal ``allow`` consumes the marker but never blocks the prompt.
+
+    That is the already-routed / already-pinned session: nothing will route
+    it again, so later prompts should not pay for the round trip.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "allow", "terminal": True, "rationale": "already routed"},
+    )
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    assert (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_keeps_asking_after_a_non_terminal_allow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-terminal ``allow`` leaves no marker.
+
+    Routing being off is not permanent — it can be toggled on before the
+    next prompt — so the hook must keep asking.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "allow", "terminal": False, "rationale": "routing is off"},
+    )
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_route_turn_does_not_block_when_the_marker_cannot_be_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    Without a marker on disk the prompt must run, not be blocked.
+
+    The marker is what tells the runner to replay. Blocking without one
+    would drop the user's prompt entirely.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: {"action": "route", "model": "databricks-claude-sonnet-5"},
+    )
+    monkeypatch.setattr(claude_native_hook, "_write_turn_routing_marker", lambda _path: False)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_falls_back_to_the_bridges_active_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An advertisement with no session id uses the bridge's active session.
+
+    Claude's hook payload carries claude's own session id, never omnigent's,
+    so the bridge is the only other place the id can come from.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir, session_id=None)
+    urls: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> None:
+        urls.append(url)
+        return
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert urls == ["http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"prompt": "   "},
+        {"prompt": 42},
+        {},
+    ],
+)
+def test_route_turn_no_ops_without_a_usable_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_route_turn_post",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no prompt, no round trip")),
+    )
+
+    assert _run_route_turn(bridge_dir, payload, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_no_ops_without_an_advertisement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    No advertised endpoint means routing is not installed — fail open.
+    """
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_route_turn_no_ops_when_the_endpoint_is_unreachable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A dead loopback endpoint lets the prompt run on the current model.
+
+    The real ``_route_turn_post`` is exercised here (nothing is listening on
+    the advertised port), so the fail-open path is the transport's own.
+    """
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_build_hook_settings_registers_the_route_turn_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``UserPromptSubmit`` carries the ``route-turn`` command.
+
+    Without it a bare ``omnigent claude --smart-routing`` launch never routes:
+    nothing else can see a prompt typed straight into the TUI. It must ride
+    the same bridge dir the runner advertises into, name the harness, and
+    carry the timeout ladder's outermost budget.
+    """
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_rt", workspace=tmp_path)
+
+    settings = build_hook_settings(bridge_dir)
+    entries = [
+        hook
+        for group in settings["hooks"]["UserPromptSubmit"]
+        for hook in group["hooks"]
+        if "route-turn" in hook["command"]
+    ]
+    assert len(entries) == 1, "route-turn must be registered exactly once"
+    command = entries[0]["command"]
+    assert "omnigent.claude_native_hook" in command
+    assert str(bridge_dir) in command
+    assert "claude-native" in command
+    assert entries[0]["timeout"] == HARNESS_HOOK_TIMEOUT_S
+    # The spike scaffolding this replaced must be gone.
+    assert "spike-userprompt" not in json.dumps(settings)

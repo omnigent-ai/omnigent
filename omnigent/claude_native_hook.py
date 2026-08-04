@@ -186,8 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_ask_user_question(raw_argv[1:])
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "spike-userprompt":
-        return _main_spike_userprompt(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "route-turn":
+        return _main_route_turn(raw_argv[1:])
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -1141,61 +1141,158 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
     return {str(key): str(value) for key, value in parsed.items()}
 
 
-def _main_spike_userprompt(argv: list[str]) -> int:
+def _main_route_turn(argv: list[str]) -> int:
     """
-    SPIKE ONLY (in-harness routing S3). Not product code.
+    Route the model this session runs on, from its first real prompt.
 
-    Logs every ``UserPromptSubmit`` invocation with its full stdin payload
-    to ``<bridge_dir>/spike_hook_log.jsonl``, and when
-    ``<bridge_dir>/spike_block`` exists emits ``decision: "block"`` once
-    (consuming the marker) so the next — replayed — prompt falls through
-    untouched. Mirrors the codex spike hook's shape.
+    The in-harness half of first-message routing (see
+    :mod:`omnigent.runner.turn_routing`), registered as an extra
+    ``UserPromptSubmit`` command alongside the forwarder's status hook and
+    the policy gate. On every prompt submit, in order:
 
-    :param argv: CLI argv after the subcommand.
-    :returns: Always ``0``.
+    1. Fast skip on ``<bridge_dir>/turn_routing_done`` — no output, no
+       network. The authoritative gate is the endpoint's routing-decision
+       check; this file only saves the round trip.
+    2. POST ``{session_id, prompt, harness, model}`` to the advertised
+       loopback ``route-turn`` endpoint. Claude's hook payload carries no
+       model, so ``model`` is the live one from ``context.json`` (the
+       statusLine snapshot) — never a config file, which reports the
+       launch model.
+    3. On a routed verdict: write the marker and BLOCK the prompt. The
+       hook does **not** touch the model itself — the pane is frozen
+       waiting on this very subprocess, so keystrokes sent from here would
+       queue behind the block. The runner replays the prompt through the
+       normal turn path, which applies the routed model under the pane's
+       inject lock and then delivers the text.
+
+    Fails open everywhere: an absent advertisement, an unreachable
+    endpoint or an unroutable verdict all exit ``0`` with no output, and
+    the prompt runs untouched on the current model.
+
+    :param argv: CLI argv after the ``route-turn`` subcommand, e.g.
+        ``["--bridge-dir", "/tmp/x", "--harness", "claude-native"]``.
+    :returns: Process exit code. Always ``0`` — the block is expressed via
+        the JSON on stdout, never via the exit code.
     """
-    parser = argparse.ArgumentParser(prog="python -m omnigent.claude_native_hook spike-userprompt")
+    from omnigent.runner.turn_routing import (
+        ADVERTISEMENT_FILE,
+        HOOK_REQUEST_TIMEOUT_S,
+        MARKER_FILE,
+        ROUTE_PATH_TEMPLATE,
+    )
+
+    parser = argparse.ArgumentParser(prog="python -m omnigent.claude_native_hook route-turn")
     parser.add_argument("--bridge-dir", required=True)
+    parser.add_argument("--harness", default="claude-native")
     args = parser.parse_args(argv)
     bridge_dir = Path(args.bridge_dir)
 
-    started = time.time()
-    raw = sys.stdin.read()
-    record: dict[str, Any] = {
-        "ts": started,
-        "iso": time.strftime("%H:%M:%S", time.localtime(started)),
-        "argv": argv,
-        "cwd": str(Path.cwd()),
-        "raw_stdin": raw[:8000],
-    }
+    if (bridge_dir / MARKER_FILE).exists():
+        return 0
+
     try:
-        payload = json.loads(raw or "{}")
-    except json.JSONDecodeError as exc:
-        payload = {}
-        record["parse_error"] = str(exc)
-    if isinstance(payload, dict):
-        record["payload_keys"] = sorted(payload.keys())
-        record["hook_event_name"] = payload.get("hook_event_name")
-        record["prompt"] = payload.get("prompt")
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return 0
 
-    block_marker = bridge_dir / "spike_block"
-    if block_marker.exists():
-        record["spike_blocked"] = True
-        sys.stdout.write(
-            json.dumps({"decision": "block", "reason": "SPIKE: routing"}),
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+
+    endpoint = read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE)
+    if endpoint is None:
+        return 0
+    session_id = endpoint.session_id or read_active_session_id(bridge_dir)
+    if not session_id:
+        return 0
+
+    body = {
+        "harness": args.harness,
+        "prompt": prompt,
+        # Claude's payload has no turn id the runner could match a replay
+        # against, and a blocked prompt starts no turn at all.
+        "turn_id": None,
+        "model": read_claude_status_model(bridge_dir),
+    }
+    url = endpoint.url + ROUTE_PATH_TEMPLATE.format(session_id=url_component(session_id))
+    decision = _route_turn_post(url, endpoint.token, body, HOOK_REQUEST_TIMEOUT_S)
+    if decision is None:
+        return 0
+    model = decision.get("model")
+    if decision.get("action") != "route" or not isinstance(model, str) or not model:
+        if decision.get("terminal"):
+            # Nothing will route this session again, so stop asking.
+            _write_turn_routing_marker(bridge_dir / MARKER_FILE)
+        return 0
+    # The marker is what tells the runner "this prompt was dropped, you owe
+    # it a replay", so a marker we could not write means we must not block.
+    if not _write_turn_routing_marker(bridge_dir / MARKER_FILE):
+        return 0
+    sys.stdout.write(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": f"Smart Routing selected {model}; rerunning your message on it.",
+            }
         )
-        sys.stdout.flush()
-        try:
-            block_marker.unlink()
-        except OSError:
-            pass
-    else:
-        record["spike_blocked"] = False
-
-    record["hook_seconds"] = round(time.time() - started, 3)
-    with (bridge_dir / "spike_hook_log.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, default=str) + "\n")
+    )
+    sys.stdout.flush()
     return 0
+
+
+def _write_turn_routing_marker(path: Path) -> bool:
+    """
+    Write the turn-routing marker file.
+
+    :param path: Marker path, ``<bridge_dir>/turn_routing_done``.
+    :returns: ``True`` when the marker is on disk.
+    """
+    try:
+        path.write_text("", encoding="utf-8")
+    except OSError:
+        print(f"omnigent claude route-turn hook: could not write {path}", file=sys.stderr)
+        return False
+    return True
+
+
+def _route_turn_post(
+    url: str,
+    token: str,
+    body: dict[str, Any],
+    timeout: float,
+) -> dict[str, Any] | None:
+    """
+    POST one JSON body to the loopback ``route-turn`` endpoint.
+
+    Uses :mod:`urllib` rather than the module's ``httpx`` import so the
+    call stays available to a ``python -I`` hook whose interpreter may not
+    resolve site packages the same way the CLI's does.
+
+    :param url: Fully-qualified loopback URL.
+    :param token: Bearer token from the advertisement.
+    :param body: Request body.
+    :param timeout: Socket timeout in seconds.
+    :returns: The decoded response object, or ``None`` on any transport or
+        decode failure (callers treat that as "allow unrouted").
+    """
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            decoded = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 if __name__ == "__main__":

@@ -6171,7 +6171,8 @@ _CONTINUE_HELP = "Continue the most recent conversation for this agent."
 _NO_SESSION_HELP = "Use a fresh temporary local session store for this run."
 _SMART_ROUTING_HELP = (
     "Let the server pick the model for this launch (and the harness too, "
-    "unless --harness pins one). Requires -p."
+    "unless --harness pins one). Requires -p, except with --harness "
+    "claude-native / codex-native, which route on your first typed message."
 )
 
 _FORK_HELP = "Fork an existing session by id and open the REPL on the fork."
@@ -6647,12 +6648,14 @@ def _dispatch_native_terminal_harness(
 
 
 # ── Smart Routing (route before launch) ──────────────────────────────────
-# Bryan's decision: --smart-routing requires -p. Routing needs text, and the
-# degraded "route on turn 2" mode is not shipping — so an empty invocation is
-# a usage error that points at the two surfaces that do work.
+# Only a launch with no harness able to route from inside itself needs the text
+# up front: the cross-harness route has to pick a harness before one exists to
+# hook, and a harness without the first-message hook can never route in-session.
 _SMART_ROUTING_NEEDS_PROMPT = (
-    '--smart-routing needs the text to route: pass -p "<prompt>", or start '
-    "the session from the web UI (which routes on your first message)."
+    "--smart-routing needs the text to route up front here: this launch has no "
+    'harness that can route from inside itself, so pass -p "<prompt>", start the '
+    "session from the web UI, or pin --harness claude-native / --harness "
+    "codex-native, which route on the first message you type."
 )
 #: Fail-open harness for a tier-3 route that returned nothing usable.
 _SMART_ROUTING_FALLBACK_HARNESS = "claude-native"
@@ -6681,17 +6684,31 @@ def _smart_routing_capable_harness(harness: str | None) -> str | None:
     return native.harness
 
 
-def _require_smart_routing_prompt(prompt: str | None) -> str:
+def _require_smart_routing_prompt(
+    prompt: str | None, *, in_harness_routing: bool = True
+) -> str | None:
     """
-    Reject ``--smart-routing`` without a prompt to route.
+    Resolve the text a routed launch starts from, rejecting an unroutable one.
+
+    A harness that hooks its own first typed message can be launched bare — the
+    hook routes whatever the user types — so a missing prompt is fine there.
+    Any other launch has to route before a harness exists to hook, and needs the
+    text up front.
 
     :param prompt: The ``-p`` text, or ``None``.
-    :returns: The prompt, unchanged.
-    :raises click.UsageError: When there is no text to route.
+    :param in_harness_routing: Whether this launch's harness routes its own
+        first message (see
+        :func:`omnigent.runner.turn_routing.supports_in_harness_turn_routing`).
+        Defaults to ``True`` for the per-harness ``--smart-routing``
+        subcommands, which exist only on harnesses carrying that hook.
+    :returns: The prompt, or ``None`` when the harness routes in-session.
+    :raises click.UsageError: When there is no text and no in-harness route.
     """
-    if prompt is None or not prompt.strip():
-        raise click.UsageError(_SMART_ROUTING_NEEDS_PROMPT)
-    return prompt
+    if prompt is not None and prompt.strip():
+        return prompt
+    if in_harness_routing:
+        return None
+    raise click.UsageError(_SMART_ROUTING_NEEDS_PROMPT)
 
 
 def _reject_smart_routing_resume(*, resuming: bool, flag: str = "--resume") -> None:
@@ -6736,7 +6753,7 @@ def _with_routed_model_arg(args: tuple[str, ...], model: str | None) -> tuple[st
 def _smart_routing_decision(
     *,
     server: str,
-    prompt: str,
+    prompt: str | None,
     harness: str | None,
 ) -> RoutingDecision:
     """
@@ -6747,8 +6764,13 @@ def _smart_routing_decision(
     whose notice is printed here, so the caller only has to launch a plain
     wrapper session.
 
+    A ``None`` *prompt* creates the session with Smart Routing on but nothing
+    routed: the harness's own first-message hook picks the model once the user
+    types, which is what the stderr line reports.
+
     :param server: Resolved Omnigent server base URL.
-    :param prompt: The text to route (also the TUI's initial input).
+    :param prompt: The text to route (also the TUI's initial input), or ``None``
+        to leave the pick to the harness's in-session hook.
     :param harness: Canonical harness to pin, or ``None`` to route the harness
         too.
     :returns: The routed session and pick to launch on.
@@ -6791,6 +6813,11 @@ def _smart_routing_decision(
     )
     if decision.notice is not None:
         click.echo(decision.notice, err=True)
+    elif prompt is None:
+        click.echo(
+            "omnigent: Smart Routing is on for this session; your first message picks the model.",
+            err=True,
+        )
     elif decision.model is not None:
         picked = (
             f"{decision.harness} on {decision.model}"
@@ -6818,6 +6845,13 @@ def _dispatch_smart_routing(
     :data:`_SMART_ROUTING_FALLBACK_HARNESS` (with a notice) when the create
     resolved nothing, or a harness the CLI cannot hand a prompt to.
 
+    Without a *prompt*, a *harness* that routes its own first typed message is
+    launched bare: the session is created with Smart Routing on, and the TUI
+    starts with no initial input and no routed ``--model`` (there is no
+    create-time pick — the harness's hook applies one in-session). The auto
+    route cannot do this, because a harness has to be chosen before one exists
+    to hook.
+
     The wrapper always attaches to the created session rather than bundling its
     own, so the routed model, the decision card, and the wrapper labels the
     server wrote at create are the ones the launch runs on. When the create
@@ -6827,13 +6861,19 @@ def _dispatch_smart_routing(
     :param harness: Canonical native harness to pin, or ``None`` for the auto
         route.
     :param server: ``--server`` value (or its config default), or ``None``.
-    :param prompt: The routed prompt; also the TUI's initial input.
+    :param prompt: The routed prompt (also the TUI's initial input), or ``None``
+        to let *harness* route its own first message.
     :param model: ``--model`` fallback used when routing returns no model.
     :param auto_open_conversation: Whether to open the web conversation.
     :returns: None once the TUI attach ends.
     :raises click.ClickException: When Smart Routing is unavailable.
+    :raises click.UsageError: When there is no prompt and no in-harness route.
     """
-    prompt = _require_smart_routing_prompt(prompt)
+    from omnigent.runner.turn_routing import supports_in_harness_turn_routing
+
+    prompt = _require_smart_routing_prompt(
+        prompt, in_harness_routing=supports_in_harness_turn_routing(harness)
+    )
     server = _ensure_backend(server)
     decision = _smart_routing_decision(server=server, prompt=prompt, harness=harness)
     launch_harness = harness or _smart_routing_capable_harness(decision.harness)
@@ -6890,13 +6930,15 @@ def _run_smart_routing(
     Handle ``omnigent run --smart-routing``: validate, then route and launch.
 
     ``--harness`` (a native terminal harness) pins the harness and routes the
-    model; ``--harness auto`` or no ``--harness`` at all routes both. An AGENT
+    model; ``--harness auto`` or no ``--harness`` at all routes both, and always
+    needs ``-p`` (the harness is picked before one exists to route in). An AGENT
     is rejected: a routed session is a native TUI, and an agent spec's
     prompt/tools are never consulted there.
 
     :param target: The AGENT argument as the user passed it, or ``None``.
     :param harness: The ``--harness`` value the user passed, or ``None``.
-    :param prompt: The ``-p`` text, or ``None`` (a usage error).
+    :param prompt: The ``-p`` text, or ``None`` — allowed only when
+        ``--harness`` pins a harness that routes its own first message.
     :param server: ``--server`` value or its config default.
     :param model: ``--model`` fallback for an unrouted launch.
     :param resume_conversation_id: ``--resume <id>`` target, rejected when set.

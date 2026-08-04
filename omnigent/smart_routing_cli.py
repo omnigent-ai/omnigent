@@ -13,6 +13,11 @@ row already carries the agent binding, the wrapper's presentation labels, the
 routed model, and the routing decision card, so the launched session shows the
 same chip and provenance the web UI gets.
 
+A harness that routes its own first typed message needs no prompt up front:
+the create then only turns Smart Routing on for the session (no
+``smart_routing_message``), and the in-harness hook picks the model when the
+user types.
+
 Two rules shape everything here:
 
 * **Preflight is a hard error.** Routing that the server cannot do, or a host
@@ -176,7 +181,7 @@ def check_smart_routing_available(
 def create_smart_routing_session(
     *,
     base_url: str,
-    prompt: str,
+    prompt: str | None,
     harness: str | None,
     host_id: str | None = None,
     workspace: str | None = None,
@@ -184,12 +189,21 @@ def create_smart_routing_session(
     """
     Create the routed session, and read the verdict back off the create.
 
-    Sends the routing contract — ``cost_control_mode_override="on"``,
-    ``smart_routing_message=<prompt>``, and (auto route only)
+    Sends the routing contract — ``cost_control_mode_override="on"``, the
+    ``smart_routing_message`` (prompt-ful create only), and (auto route only)
     ``harness_override="auto"``; a fixed harness comes from the bound wrapper
     agent, so it needs no override. The response carries the resolved
     ``harness`` and ``model_override``, with the session snapshot as a fallback.
     This is the session the wrapper attaches to — nothing is deleted.
+
+    Two modes, split by *prompt*:
+
+    * **With a prompt** the message triggers the create-time route, so the
+      response is expected to carry a model and a missing one earns a notice.
+    * **Without one** only the mode override is sent: Smart Routing is on for
+      the session, but nothing is routed yet — the harness's own first-message
+      hook picks the model in-session, so an empty ``model_override`` is the
+      normal answer and carries no notice.
 
     Never raises: a create the server rejects (including the auto route's
     "no native CLI on this host") yields a decision with no session and a
@@ -197,7 +211,8 @@ def create_smart_routing_session(
 
     :param base_url: Omnigent server base URL.
     :param prompt: The user's ``-p`` text. Routed, not dispatched — the TUI
-        delivers it as its own first input.
+        delivers it as its own first input. ``None`` creates a bare routed
+        session that routes nothing at create time.
     :param harness: Canonical harness to pin, or ``None`` for the auto route.
     :param host_id: Host this session will run on, e.g. ``"host_abc123"``.
         Needed for a real verdict: the server builds the candidate model
@@ -215,8 +230,11 @@ def create_smart_routing_session(
         "host_type": "external",
         "labels": dict(ROUTING_SESSION_LABELS),
         "cost_control_mode_override": "on",
-        "smart_routing_message": prompt,
     }
+    if prompt is not None:
+        # The message is what routes at create time; a bare create only turns
+        # Smart Routing on and leaves the pick to the in-harness hook.
+        body["smart_routing_message"] = prompt
     if harness is None:
         # Auto route: the sentinel tells the server to pick the harness and
         # rebind the session's agent to that wrapper.
@@ -251,9 +269,11 @@ def create_smart_routing_session(
         return _unavailable(f"could not reach {base_url}: {exc}")
     if session_id is None:
         return _unavailable("the create returned no session id")
+    # A bare create routes nothing yet, so an empty model is expected there and
+    # only a prompt-ful create that came back without one is worth reporting.
     notice = (
         None
-        if picked_model is not None
+        if picked_model is not None or prompt is None
         else (
             "omnigent: Smart Routing did not pick a model for this session; "
             "launching on the harness default."

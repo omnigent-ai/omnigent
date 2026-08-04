@@ -27,11 +27,15 @@ handler forwards to it with :func:`make_server_relay_resolver`.
 routing-decision label. The hook's local :data:`MARKER_FILE` is only a
 fast skip that saves a round trip; it is never the source of truth.
 
-**Block-and-replay.** Codex binds the turn's model before
-``UserPromptSubmit`` runs (design plan §3b, spike S1), so a switch fired
-from inside the hook window only applies from the next turn. The hook
-therefore blocks the prompt, applies the switch, and this module replays
-the captured prompt as a normal user turn — which then runs routed. The
+**Block-and-replay.** Neither harness can retarget the turn that is
+already in flight — codex binds the turn's model before
+``UserPromptSubmit`` runs (design plan §3b, spike S1), and claude's hook
+output carries no model at all. So the hook blocks the prompt, the switch
+is applied while nothing is running, and this module replays the captured
+prompt as a normal user turn — which then runs routed. The two harnesses
+differ only in *who* applies the switch: codex's hook does it over the
+app-server RPC, while claude's must be done from the runner
+(:func:`_apply_routed_model`) because the pane is frozen on the hook. The
 ordering handshake is documented on :func:`schedule_replay`.
 
 Once the hook blocks, the prompt exists **only** in the replay, and the
@@ -47,7 +51,7 @@ strictly larger than the hop it waits on — otherwise an inner hop's
 fail-open branch can never run. Canonical values, outermost first:
 
 1. harness hook timeout — :data:`HARNESS_HOOK_TIMEOUT_S` (45s, registered
-   on the codex ``UserPromptSubmit`` entry)
+   on each harness's ``UserPromptSubmit`` entry)
 2. hook script HTTP request + model switch —
    :data:`HOOK_REQUEST_TIMEOUT_S` (25s) then
    :data:`SETTINGS_UPDATE_TIMEOUT_S` (15s)
@@ -83,10 +87,10 @@ _logger = logging.getLogger(__name__)
 #: Bridge-dir file that advertises the loopback endpoint to the hook.
 ADVERTISEMENT_FILE = "turn_router.json"
 
-#: Bridge-dir file the hook writes once it has blocked a prompt and applied
-#: the routed model. Two jobs: the next prompt's hook fast-skips on it (no
-#: network), and the runner reads it as "this prompt was blocked, you owe it
-#: a replay". Absent means the hook let the prompt run.
+#: Bridge-dir file the hook writes immediately before it blocks a prompt.
+#: Two jobs: the next prompt's hook fast-skips on it (no network), and the
+#: runner reads it as "this prompt was blocked, you owe it a replay". Absent
+#: means the hook let the prompt run.
 MARKER_FILE = "turn_routing_done"
 
 #: Bridge-dir file holding the prompt a routed verdict still owes a replay.
@@ -117,7 +121,8 @@ HARNESS_HOOK_TIMEOUT_S = 45
 #: Hop 2a: the hook script's HTTP budget for the routing verdict.
 HOOK_REQUEST_TIMEOUT_S = 25.0
 
-#: Hop 2b: the hook's ``thread/settings/update`` budget, after the verdict.
+#: Hop 2b: the codex hook's ``thread/settings/update`` budget, after the
+#: verdict. Claude's hook applies nothing, so it has no hop 2b.
 SETTINGS_UPDATE_TIMEOUT_S = 15.0
 
 #: Hop 3: seconds the runner's loopback relay waits for a verdict.
@@ -605,6 +610,7 @@ def make_server_relay_resolver(
     *,
     bridge_dir: Path,
     timeout_s: float = SERVER_HOP_TIMEOUT_S,
+    harness: str | None = None,
 ) -> Resolver:
     """Build a resolver that forwards to the server's relay route.
 
@@ -614,6 +620,8 @@ def make_server_relay_resolver(
     :param server_client: Async HTTP client pointed at the AP server.
     :param bridge_dir: Session bridge directory, for the replay handshake.
     :param timeout_s: Per-request timeout. Hop 4 (innermost).
+    :param harness: Harness this router serves, which selects the replay's
+        settle probe. ``None`` falls back to the request's own ``harness``.
     :returns: Resolver for :func:`start_turn_router`.
     """
 
@@ -657,6 +665,7 @@ def make_server_relay_resolver(
                 bridge_dir=bridge_dir,
                 blocked_turn_id=req.turn_id,
                 server_client=server_client,
+                harness=harness or req.harness,
                 model=decision.model,
             )
         return decision
@@ -767,6 +776,7 @@ def schedule_replay(
     bridge_dir: Path,
     blocked_turn_id: str | None,
     server_client: Any,
+    harness: str | None = None,
     model: str | None = None,
     idle: Callable[[str | None], bool] | None = None,
 ) -> asyncio.Task[None]:
@@ -777,20 +787,23 @@ def schedule_replay(
     the hook do that, both bounded:
 
     1. **Did the hook actually block?** The hook writes
-       :data:`MARKER_FILE` only after the model switch is applied and
-       immediately before it emits its block, so the marker means "the
-       prompt was dropped, you owe it a replay". No marker inside
-       :data:`REPLAY_MARKER_WAIT_S` means the hook fell open, the prompt
-       already ran on the old model, and the replay is abandoned — a
-       double-run is the one outcome worse than an unrouted turn.
-    2. **Has the blocked turn cleared?** The harness records its live turn
-       id in the bridge state, so the replay waits until that is no longer
-       the turn the prompt was submitted on. Delivering while the aborting
-       turn is still current would be steered into it instead of starting
-       a fresh routed turn. Once the wait expires the prompt is delivered
-       anyway: losing it is worse than delivering it early.
+       :data:`MARKER_FILE` immediately before it emits its block, so the
+       marker means "the prompt was dropped, you owe it a replay". No
+       marker inside :data:`REPLAY_MARKER_WAIT_S` means the hook fell open,
+       the prompt already ran on the old model, and the replay is
+       abandoned — a double-run is the one outcome worse than an unrouted
+       turn.
+    2. **Has the blocked prompt cleared?** :func:`_settle_probe` answers
+       that per harness. Delivering into an aborting turn would steer it
+       instead of starting a fresh routed one. Once the wait expires the
+       prompt is delivered anyway: losing it is worse than delivering it
+       early.
 
-    Then the prompt goes through the **normal events path** — the same
+    Then, on harnesses whose hook could not apply the model itself, the
+    switch happens here (:func:`_apply_routed_model`) — after the block is
+    in effect and before the prompt exists, so nothing races it.
+
+    Finally the prompt goes through the **normal events path** — the same
     ``POST /v1/sessions/{id}/events`` the web composer uses — so it is
     persisted, mirrored and executed like any other user turn. That path
     re-checks the routing gate and finds ``model_override`` pinned, so it
@@ -807,11 +820,16 @@ def schedule_replay(
     :param prompt: The captured prompt text to re-deliver.
     :param bridge_dir: Session bridge directory (marker + bridge state).
     :param blocked_turn_id: Harness turn id the blocked prompt was
-        submitted on. ``None`` falls back to waiting for no active turn.
+        submitted on. ``None`` falls back to the harness's own settle
+        signal.
     :param server_client: Runner→server client used to deliver the prompt.
-    :param model: The routed model, carried in-band on the replayed turn.
-    :param idle: Override for the "is the blocked turn gone?" probe, taking
-        the blocked turn id. ``None`` reads the codex-native bridge state.
+    :param harness: Harness the blocked prompt came from, which selects the
+        settle probe and the actuator.
+    :param model: Routed model, carried in-band on the replayed turn and
+        applied before delivery on harnesses whose hook could not switch it.
+        ``None`` skips the switch.
+    :param idle: Override for the "has the blocked prompt cleared?" probe,
+        taking the blocked turn id. ``None`` picks one by *harness*.
     :returns: The scheduled task (tests await it; callers ignore it).
     """
     return asyncio.get_running_loop().create_task(
@@ -821,6 +839,7 @@ def schedule_replay(
             bridge_dir=bridge_dir,
             blocked_turn_id=blocked_turn_id,
             server_client=server_client,
+            harness=harness,
             model=model,
             idle=idle,
         ),
@@ -835,12 +854,13 @@ async def _replay(
     bridge_dir: Path,
     blocked_turn_id: str | None,
     server_client: Any,
+    harness: str | None,
     model: str | None,
     idle: Callable[[str | None], bool] | None,
 ) -> None:
     """Run the replay handshake and deliver the prompt. See
     :func:`schedule_replay` for the ordering contract."""
-    turn_cleared = idle if idle is not None else _bridge_turn_probe(bridge_dir)
+    turn_cleared = idle if idle is not None else _settle_probe(bridge_dir, harness)
     marker = bridge_dir / MARKER_FILE
     if not await _wait_for(marker.exists, REPLAY_MARKER_WAIT_S):
         _logger.warning(
@@ -860,6 +880,7 @@ async def _replay(
             blocked_turn_id,
             session_id,
         )
+    await _apply_routed_model(session_id, bridge_dir=bridge_dir, harness=harness, model=model)
     if not await _deliver_prompt(
         session_id, prompt=prompt, server_client=server_client, model=model
     ):
@@ -1055,8 +1076,104 @@ def _bridge_thread_probe(bridge_dir: Path) -> Callable[[], bool]:
     return _ready
 
 
-def _bridge_turn_probe(bridge_dir: Path) -> Callable[[str | None], bool]:
-    """Build the codex bridge-state "blocked turn is gone" probe."""
+async def _apply_routed_model(
+    session_id: str,
+    *,
+    bridge_dir: Path,
+    harness: str | None,
+    model: str | None,
+) -> bool:
+    """Put the pane on the routed model, for harnesses whose hook cannot.
+
+    Codex's hook switches the thread itself (an RPC to the app-server,
+    which accepts a second client mid-turn), so nothing is left to do here.
+    Claude's cannot: its only mid-session switch is a keystroke into the
+    tmux pane, and the pane is frozen waiting on the hook subprocess that
+    would be typing. So the switch moves here — after the block is in
+    effect, before the replayed prompt exists.
+
+    Fails open: a switch that does not take is logged and the prompt is
+    still delivered, on the pane's current model. Losing the prompt is
+    worse, and the recorded decision already names the routed model.
+
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Session bridge directory.
+    :param harness: Harness the blocked prompt came from.
+    :param model: Routed model id, or ``None`` to skip.
+    :returns: ``True`` when the pane was switched (or needed no switch).
+    """
+    if harness != "claude-native" or not model:
+        return True
+    from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+    from omnigent.claude_native_bridge import (
+        inject_model_selection,
+        read_claude_status_model,
+        read_model_env,
+    )
+
+    live = read_claude_status_model(bridge_dir)
+    if live and normalized_model_id(live) == normalized_model_id(model):
+        # Already there. Skipping keeps a needless ``/model`` echo out of the
+        # transcript, which otherwise sits ahead of the very first turn.
+        _logger.info(
+            "route-turn: session=%s pane is already on %s; no switch typed", session_id, model
+        )
+        return True
+    env = read_model_env(bridge_dir) or None
+    arg = claude_model_command_arg(model, env)
+    if arg is None:
+        _logger.warning(
+            "route-turn: routed model %r has no spelling session=%s accepts (pins=%s); "
+            "replaying on the launch model",
+            model,
+            session_id,
+            sorted(env or ()),
+        )
+        return False
+    try:
+        await asyncio.to_thread(
+            inject_model_selection,
+            bridge_dir,
+            targets=tuple(dict.fromkeys((model, arg))),
+        )
+    except (RuntimeError, ValueError):
+        _logger.warning(
+            "route-turn: could not switch session=%s onto %s; replaying on the launch model",
+            session_id,
+            model,
+            exc_info=True,
+        )
+        return False
+    _logger.info("route-turn: session=%s pane switched onto %s", session_id, model)
+    return True
+
+
+def _settle_probe(bridge_dir: Path, harness: str | None) -> Callable[[str | None], bool]:
+    """Build the "has the blocked prompt cleared?" probe for *harness*.
+
+    The two harnesses signal it differently, because they block at
+    different depths. Codex has already opened a turn by the time
+    ``UserPromptSubmit`` runs, so its bridge state names an active turn the
+    replay must wait out. Claude blocks before any turn exists — nothing is
+    persisted and no turn id reaches the hook — so the honest signal there
+    is the pane itself being back at a mounted input box.
+
+    :param bridge_dir: Session bridge directory.
+    :param harness: Harness the blocked prompt came from. An unknown
+        harness falls back to the codex bridge-state probe, which reads as
+        "cleared" when it finds no state.
+    :returns: Probe taking the blocked turn id, returning ``True`` when the
+        replay may be delivered.
+    """
+    if harness == "claude-native":
+
+        def _pane_ready(blocked_turn_id: str | None) -> bool:
+            del blocked_turn_id
+            from omnigent.claude_native_bridge import claude_pane_ready
+
+            return claude_pane_ready(bridge_dir)
+
+        return _pane_ready
 
     def _cleared(blocked_turn_id: str | None) -> bool:
         from omnigent.codex_native_bridge import read_bridge_state
@@ -1114,6 +1231,20 @@ _lifecycle_lock = threading.Lock()
 _TURN_HOOK_HARNESSES = frozenset({"codex-native", "claude-native"})
 
 
+def supports_in_harness_turn_routing(harness: str | None) -> bool:
+    """Report whether *harness* routes its first prompt from inside itself.
+
+    The CLI reads this to decide whether ``--smart-routing`` with no ``-p``
+    is servable: a harness that hooks its own ``UserPromptSubmit`` can be
+    launched bare and route on whatever the user types, while any other
+    harness still needs the prompt up front.
+
+    :param harness: Canonical harness id, e.g. ``"claude-native"``.
+    :returns: ``True`` when this harness carries the ``route-turn`` hook.
+    """
+    return harness in _TURN_HOOK_HARNESSES
+
+
 def ensure_session_turn_router(
     session_id: str,
     *,
@@ -1155,7 +1286,9 @@ def ensure_session_turn_router(
             router = start_turn_router(
                 bridge_dir=bridge_dir,
                 session_id=session_id,
-                resolver=make_server_relay_resolver(server_client, bridge_dir=bridge_dir),
+                resolver=make_server_relay_resolver(
+                    server_client, bridge_dir=bridge_dir, harness=harness
+                ),
                 loop=resolver_loop,
             )
             _session_routers[session_id] = router

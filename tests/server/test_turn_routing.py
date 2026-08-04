@@ -353,9 +353,11 @@ async def test_loopback_endpoint_allows_when_the_resolver_errors(tmp_path: Path)
 
 
 async def test_ensure_session_turn_router_skips_unsupported_harnesses(tmp_path: Path) -> None:
+    # Only harnesses carrying the ``route-turn`` hook get an endpoint; the
+    # rest would advertise one nothing reads.
     assert (
         ensure_session_turn_router(
-            "conv_x", bridge_dir=tmp_path, server_client=object(), harness="cursor-native"
+            "conv_x", bridge_dir=tmp_path, server_client=object(), harness="pi-native"
         )
         is None
     )
@@ -805,3 +807,249 @@ async def test_recovery_ignores_another_session_sharing_the_bridge_dir(
         is None
     )
     assert read_pending_replay(tmp_path) is not None
+
+# ── claude-native: settle probe + the runner-side actuator ──────────────
+
+
+def test_in_harness_turn_routing_covers_both_native_harnesses() -> None:
+    """The CLI's bare ``--smart-routing`` gate reads this predicate."""
+    from omnigent.runner.turn_routing import supports_in_harness_turn_routing
+
+    assert supports_in_harness_turn_routing("codex-native")
+    assert supports_in_harness_turn_routing("claude-native")
+    assert not supports_in_harness_turn_routing("claude")
+    assert not supports_in_harness_turn_routing(None)
+
+
+def test_settle_probe_reads_the_pane_for_claude_and_the_turn_id_for_codex(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The two harnesses block at different depths, so they settle differently.
+
+    Codex has a turn open by the time its hook runs; claude blocks before any
+    turn exists, so its only honest signal is the pane being idle again.
+    """
+    asked: list[Path] = []
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.claude_pane_ready",
+        lambda bridge_dir: bool(asked.append(bridge_dir)) or True,
+    )
+
+    claude_probe = turn_routing._settle_probe(tmp_path, "claude-native")
+    assert claude_probe("ignored") is True
+    assert asked == [tmp_path]
+
+    # No codex bridge state in this dir, which reads as "nothing active".
+    codex_probe = turn_routing._settle_probe(tmp_path, "codex-native")
+    assert codex_probe("turn_1") is True
+
+
+async def test_replay_switches_the_claude_pane_before_delivering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Claude's model switch happens in the replay, not in its hook.
+
+    The hook's own pane is frozen waiting on the hook subprocess, so
+    keystrokes sent from there would queue behind the block. Order is
+    load-bearing: the pane must already be on the routed model when the
+    prompt arrives, or the turn runs on the launch model.
+    """
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    switched: list[tuple[Path, tuple[str, ...]]] = []
+    client = _FakeServerClient()
+
+    def _inject(bridge_dir: Path, *, targets: tuple[str, ...]) -> None:
+        assert not client.posts, "the pane must be switched before the prompt lands"
+        switched.append((bridge_dir, tuple(targets)))
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.inject_model_selection", _inject, raising=False
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.read_model_env",
+        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
+    )
+
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id=None,
+        server_client=client,
+        harness="claude-native",
+        model="databricks-claude-sonnet-5",
+        idle=lambda _turn: True,
+    )
+
+    assert switched == [(tmp_path, ("databricks-claude-sonnet-5", "sonnet"))]
+    assert len(client.posts) == 1
+
+
+async def test_replay_still_delivers_when_the_claude_switch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch that does not take must not cost the user their prompt."""
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    client = _FakeServerClient()
+
+    def _boom(_bridge_dir: Path, *, targets: tuple[str, ...]) -> None:
+        del targets
+        raise RuntimeError("picker never opened")
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.inject_model_selection", _boom, raising=False
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.read_model_env",
+        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
+    )
+
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id=None,
+        server_client=client,
+        harness="claude-native",
+        model="databricks-claude-sonnet-5",
+        idle=lambda _turn: True,
+    )
+
+    assert len(client.posts) == 1
+
+
+async def test_replay_skips_the_switch_for_an_unspeakable_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A model this pane has no ``/model`` spelling for is left alone.
+
+    Typing a value the picker does not list would either wedge the picker or
+    silently keep the old model while claiming the routed one.
+    """
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    client = _FakeServerClient()
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.inject_model_selection",
+        lambda *a, **k: pytest.fail("must not touch the pane"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.read_model_env",
+        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
+    )
+
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id=None,
+        server_client=client,
+        harness="claude-native",
+        model="databricks-claude-opus-4-8",
+        idle=lambda _turn: True,
+    )
+
+    assert len(client.posts) == 1
+
+
+async def test_replay_leaves_the_model_alone_for_codex(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex's hook already switched the thread over its app-server RPC."""
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    client = _FakeServerClient()
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.inject_model_selection",
+        lambda *a, **k: pytest.fail("codex must not drive the claude pane"),
+        raising=False,
+    )
+
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id=None,
+        server_client=client,
+        harness="codex-native",
+        model="gpt-5.6-luna",
+        idle=lambda _turn: True,
+    )
+
+    assert len(client.posts) == 1
+
+
+async def test_server_relay_hands_the_routed_model_to_the_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The replay is the claude actuator, so it needs the pick."""
+    armed: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        turn_routing,
+        "schedule_replay",
+        lambda session_id, **kwargs: armed.append({"session_id": session_id, **kwargs}),
+    )
+    client = _FakeServerClient(
+        verdict={"action": "route", "model": ROUTED_MODEL, "rationale": "x", "terminal": True}
+    )
+    resolver = make_server_relay_resolver(client, bridge_dir=tmp_path, harness="claude-native")
+
+    await resolver("c1", _request())
+
+    assert armed[0]["model"] == ROUTED_MODEL
+    assert armed[0]["harness"] == "claude-native"
+
+
+async def test_replay_skips_the_switch_when_the_pane_is_already_there(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane already on the routed model gets no ``/model`` echo.
+
+    Block-and-replay puts that echo ahead of the session's very first turn,
+    where weak models have been observed refusing the replayed prompt, so a
+    redundant switch is worth not typing.
+    """
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    client = _FakeServerClient()
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.read_claude_status_model",
+        lambda _dir: "databricks-claude-sonnet-5",
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.inject_model_selection",
+        lambda *a, **k: pytest.fail("no switch when the pane is already on it"),
+        raising=False,
+    )
+
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id=None,
+        server_client=client,
+        harness="claude-native",
+        model="databricks-claude-sonnet-5",
+        idle=lambda _turn: True,
+    )
+
+    assert len(client.posts) == 1
