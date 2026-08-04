@@ -51,7 +51,10 @@ dependencies = [
     "psutil>=5.9,<8",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
-    # Pure-Python implementation; available on all platforms.
+    # NOT pure-Python: cel-python hard-depends on google-re2 (a C++ extension,
+    # imported at celpy module scope with no fallback), whose sdist needs bazel.
+    # Packagers must pin its prebuilt wheel — see WHEEL_PACKAGES in
+    # .github/scripts/homebrew/generate_formula.py.
     "cel-python>=0.5",
     # OS keychain for storing model-provider API keys (OSS model
     # selection). Used by omnigent/onboarding/secrets.py; falls back to
