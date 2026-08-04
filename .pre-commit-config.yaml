@@ -70,7 +70,7 @@ repos:
       - id: web-tsc
         name: web TypeScript type check
         language: system
-        entry: pnpm --filter web run type-check
+        entry: bash -c 'test -x web/node_modules/.bin/tsc && cd web && node_modules/.bin/tsc -b'
         files: ^(web/.*\.[cm]?[jt]sx?|web/tsconfig(?:\.[^.]+)?\.json|web/package\.json|pnpm-(?:lock|workspace)\.yaml)$
         pass_filenames: false
 
