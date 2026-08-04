@@ -3281,16 +3281,26 @@ function isLiveProvisionalBlock(b: AnyBlock): boolean {
  * Build a provisional in-flight assistant-text block for live streaming.
  *
  * Shaped like a finalized `text_done` so the existing renderer draws it
- * as assistant text, but keyed with a synthetic `live:<messageId>` id —
- * its own `responseId` too, so it forms its own bubble until the
- * authoritative item replaces it; that id is never matched against a
- * real server response.
+ * as assistant text, and keyed with a synthetic `live:<messageId>` id
+ * that drives in-place replacement when the authoritative item lands.
+ *
+ * `responseId` is the LIVE TURN's id whenever one is streaming, so the
+ * preview groups into that turn's bubble (`walkBubbles` groups by
+ * response id). Giving it a synthetic id instead split one native turn
+ * into several fragment bubbles while streaming that merged back into
+ * one on reload — so a turn rendered differently live vs. reloaded, no
+ * fragment had the process-plus-answer shape the "Worked for" fold
+ * needs, and shifting fragment boundaries made the fold flicker. Falls
+ * back to the synthetic id when no turn is streaming (a preview that
+ * arrives before the turn's id is known must not join the PREVIOUS
+ * turn's bubble).
  *
  * :param itemId: the provisional id, e.g. ``"live:2ca51d97-..."``.
  * :param text: the text accumulated so far, e.g. ``"Hello"``.
+ * :param responseId: the live turn's id, or `itemId` when none.
  * :returns: a `TextDone` block ready to push into `blocks`.
  */
-function makeLiveTextBlock(itemId: string, text: string): TextDone {
+function makeLiveTextBlock(itemId: string, text: string, responseId: string): TextDone {
   return {
     type: "text_done",
     // ``timestamp`` matches the reducer's monotonic source (not wall
@@ -3300,7 +3310,7 @@ function makeLiveTextBlock(itemId: string, text: string): TextDone {
       depth: 0,
       turn: 0,
       timestamp: performance.now() / 1000,
-      responseId: itemId,
+      responseId,
       itemId,
     },
     fullText: text,
@@ -3345,7 +3355,9 @@ function applyLiveDelta(
   set((s) => {
     const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
     if (at === -1) {
-      return { blocks: [...s.blocks, makeLiveTextBlock(itemId, delta)] };
+      const live = s.activeResponse;
+      const responseId = live?.state === "streaming" ? live.responseId : itemId;
+      return { blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)] };
     }
     const existing = s.blocks[at]!;
     if (existing.type !== "text_done") return {};
@@ -3451,6 +3463,33 @@ async function* tapLiveDeltas(
  * re-finalizes it. `failed` / `cancelled` are user-visible verdicts and
  * are never revived.
  */
+/**
+ * Attribute the trailing run of turn-id-less blocks to a just-started turn.
+ *
+ * A native harness sends no `response.created`, and codex opens its
+ * reasoning block a couple of seconds BEFORE the `running` status edge
+ * that carries the turn id — so those blocks are stamped with an empty
+ * id. `walkBubbles` groups by response id, so they render as a bubble of
+ * their own next to the turn's committed items instead of inside it.
+ * Only the trailing empty-id run is adopted, so nothing older moves.
+ *
+ * @returns the rewritten blocks, or `null` when nothing needed adopting.
+ */
+export function adoptTrailingUnattributedBlocks(
+  blocks: AnyBlock[],
+  responseId: string,
+): AnyBlock[] | null {
+  let start = blocks.length;
+  while (start > 0 && blocks[start - 1]!.ctx.responseId === "") start -= 1;
+  if (start === blocks.length) return null;
+  const next = blocks.slice();
+  for (let i = start; i < next.length; i += 1) {
+    const b = next[i]!;
+    next[i] = { ...b, ctx: { ...b.ctx, responseId } };
+  }
+  return next;
+}
+
 export function reviveStrayCompletedResponse(set: Setter): void {
   set((s) => {
     if (s.activeResponse?.state !== "completed") return {};
@@ -4261,6 +4300,12 @@ export function handleSessionEvent(event: StreamEvent): void {
             state: "streaming",
             error: null,
           };
+          // Blocks the reducer emitted before this edge named the turn
+          // (codex opens reasoning ~2s earlier) carry no response id, so
+          // they'd group into their own bubble beside the turn's own.
+          // Attribute them to the turn they belong to.
+          const adopted = adoptTrailingUnattributedBlocks(s.blocks, event.responseId);
+          if (adopted !== null) patch.blocks = adopted;
         }
         // `waiting` is a TURN-END edge (the turn already finished; only
         // background work — background shells / sub-agents — outlives it). It

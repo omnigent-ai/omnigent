@@ -484,7 +484,17 @@ interface TurnPartition {
 // fold into the process trace instead.
 const TRAILING_WRAPUP_TOOLS = new Set(["turn_diff"]);
 
-function isTrailingWrapupTool(item: RenderItem): boolean {
+/**
+ * Whether a trailing item is wrap-up rather than part of the answer.
+ *
+ * Reasoning counts: it is process by definition, never the answer, and
+ * codex opens a reasoning section as the turn ends — landing it after
+ * the final message, where it blocked the fold live (the item is
+ * transient, so a reload folded the same turn and the two views
+ * disagreed).
+ */
+function isTrailingWrapup(item: RenderItem): boolean {
+  if (item.kind === "reasoning") return true;
   return item.kind === "tool" && TRAILING_WRAPUP_TOOLS.has(item.execution.name);
 }
 
@@ -508,7 +518,7 @@ function isTrailingWrapupTool(item: RenderItem): boolean {
 function partitionTurn(items: RenderItem[]): TurnPartition {
   let end = items.length;
   const wrapup: RenderItem[] = [];
-  while (end > 0 && isTrailingWrapupTool(items[end - 1]!)) {
+  while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
     wrapup.unshift(items[end - 1]!);
     end -= 1;
   }

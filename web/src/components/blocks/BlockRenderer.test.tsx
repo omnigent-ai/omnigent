@@ -539,6 +539,28 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
     });
 
+    it("folds a turn whose reasoning burst lands after the answer", () => {
+      // Codex opens a reasoning section as the turn ends, so the item
+      // arrives AFTER the final message. Reasoning is process, never the
+      // answer — without peeling it the turn stayed expanded live while a
+      // reload (where the transient item is absent) folded the same turn.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Server started on 8838.", final: true },
+        { kind: "reasoning", itemId: null, text: "", duration: undefined },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" turnLifecycle="completed" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      // The answer stays out; the narration folds away with the trace.
+      expect(screen.getByText("Server started on 8838.")).toBeDefined();
+      expect(screen.queryByText("Checking the CLI.")).toBeNull();
+    });
+
     it("never folds a bubble made only of streaming artifacts", () => {
       // Codex splits an in-flight turn into fragments: a reasoning burst
       // (no item id yet) plus a `live:` narration preview. Their
