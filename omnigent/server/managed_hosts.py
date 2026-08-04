@@ -60,6 +60,7 @@ stores into ``create_app``):
          boxlite:                 # optional block (provider: boxlite)
            image: docker.io/me/omnigent-host:latest    # shared; default: official
            env: [OPENAI_API_KEY, GIT_TOKEN]            # shared; SERVER env var NAMES
+           disk_size_gb: 100                           # shared; default: SDK default
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
@@ -770,7 +771,9 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "boxlite":
         section = _boxlite_section(raw)
-        _reject_unknown_keys(section, {"image", "env", "local", "cloud"}, "sandbox.boxlite")
+        _reject_unknown_keys(
+            section, {"image", "env", "local", "cloud", "disk_size_gb"}, "sandbox.boxlite"
+        )
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
         launcher_factory = _boxlite_launcher_factory(
             endpoint,
@@ -778,6 +781,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_boxlite_env(section),
             home_dir,
             registry,
+            _parse_provider_positive_int(raw, "boxlite", "disk_size_gb"),
         )
         token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
@@ -1055,6 +1059,7 @@ def _boxlite_launcher_factory(
     env: list[str] | None,
     home_dir: str | None,
     registry: dict[str, object] | None,
+    disk_size_gb: int | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
@@ -1073,6 +1078,7 @@ def _boxlite_launcher_factory(
     :param registry: LOCAL-mode private-registry config for the host image
         (``host`` + optional ``transport`` / ``skip_verify`` / ``*_env``
         credential names), or ``None`` for anonymous pulls.
+    :param disk_size_gb: Box disk size in GB, or ``None`` for the SDK default.
     :returns: A factory producing parameterized boxlite launchers.
     """
 
@@ -1081,7 +1087,12 @@ def _boxlite_launcher_factory(
         from omnigent.onboarding.sandboxes.boxlite import BoxliteSandboxLauncher
 
         return BoxliteSandboxLauncher(
-            endpoint=endpoint, image=image, env=env, home_dir=home_dir, registry=registry
+            endpoint=endpoint,
+            image=image,
+            env=env,
+            home_dir=home_dir,
+            registry=registry,
+            disk_size_gb=disk_size_gb,
         )
 
     return _build

@@ -228,6 +228,7 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
                 "image": "docker.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cloud": {"endpoint": "https://boxlite.example.com:8100"},
+                "disk_size_gb": 100,
             },
         }
     )
@@ -242,6 +243,7 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
     assert fake.endpoint == "https://boxlite.example.com:8100"
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.disk_size_gb == 100
 
 
 def test_parse_boxlite_without_section_defaults_local(
@@ -260,6 +262,7 @@ def test_parse_boxlite_without_section_defaults_local(
     assert fake.endpoint is None
     assert fake.image is None
     assert fake.env is None
+    assert fake.disk_size_gb is None
 
 
 def test_parse_boxlite_local_customization_reaches_launcher(
