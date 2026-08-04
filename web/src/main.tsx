@@ -15,12 +15,7 @@ import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
-import {
-  applyUiFontFamily,
-  applyUiFontScale,
-  readUiFontFamily,
-  readUiFontSizePx,
-} from "./lib/uiFontPreferences";
+import { restoreFontPreferences } from "./lib/restoreFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -59,9 +54,10 @@ void resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
-// Apply the saved UI font size and family before first paint so there's no flash.
-applyUiFontScale(readUiFontSizePx());
-applyUiFontFamily(readUiFontFamily());
+// Apply the saved UI + code font preferences before first paint so there's no
+// flash, and kick off the catalog webfont loads so a chosen font is fetched on
+// boot rather than only on the next Settings change.
+restoreFontPreferences();
 
 // The sidebar font size control was removed. Clear any previously persisted
 // value so existing users fall back to the default 13px size on reload.
