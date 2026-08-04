@@ -20,8 +20,7 @@ What it does:
 Usage (from the repo root):
   python dev/repro.py                     # prompts for the bug URL
   python dev/repro.py https://github.com/omnigent-ai/omnigent/issues/1234
-  python dev/repro.py OMNI-1234 --ref v1.2.3
-  python dev/repro.py <bug_url> --server http://localhost:6767
+  python dev/repro.py OMNI-1234 --server http://localhost:6767
 
 Reproducing runs against whatever server ``omnigent run`` uses (the local server
 it spins up by default, or the one you pass with ``--server``).
@@ -105,11 +104,6 @@ def _parse_args() -> argparse.Namespace:
         "id like OMNI-1234 / 3987. Prompted for if omitted.",
     )
     p.add_argument(
-        "--ref",
-        default=None,
-        help="Version the bug was reported on (informational; passed to the agent).",
-    )
-    p.add_argument(
         "--server",
         default=None,
         help="Omnigent server URL to reproduce against. Omit to use the local "
@@ -133,11 +127,9 @@ def main() -> None:
     if not bug_url:
         _die("no bug URL given")
 
-    # Build the agent's input contract: bug_url (required) + optional ref.
-    payload: dict[str, str] = {"bug_url": bug_url}
-    if args.ref:
-        payload["ref"] = args.ref
-    prompt = json.dumps(payload)
+    # The agent's input contract is just the bug URL; it always reproduces
+    # against the running build (latest main), so there's no version to pass.
+    prompt = json.dumps({"bug_url": bug_url})
 
     # Create the isolated worktree off the CURRENT checkout's HEAD. We resolve
     # HEAD to a concrete commit and pass it as the base, because create_worktree

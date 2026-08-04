@@ -25,11 +25,12 @@ omnigent run dev/repro-agent \
 
 # Against a server you already run:
 omnigent run dev/repro-agent --server http://localhost:6767 \
-  -p '{"bug_url":"https://linear.app/omnigent/issue/OMNI-1234","ref":"v1.2.3"}'
+  -p '{"bug_url":"https://linear.app/omnigent/issue/OMNI-1234"}'
 ```
 
-The `-p` payload is the input contract — `bug_url` (required) plus an optional
-`ref` (the version the bug was reported on; informational).
+The `-p` payload is the input contract — just `bug_url`. The agent always
+reproduces against the running build (latest `main`), so there's no version to
+pass.
 
 ### Driver script (isolated worktree)
 
@@ -41,7 +42,7 @@ checkout, and runs the agent from there.
 ```bash
 python dev/repro.py                     # prompts for the bug URL
 python dev/repro.py https://github.com/omnigent-ai/omnigent/issues/1234
-python dev/repro.py OMNI-1234 --server http://localhost:6767 --ref v1.2.3
+python dev/repro.py OMNI-1234 --server http://localhost:6767
 ```
 
 It always keeps the worktree and prints its path + branch at the end; remove it

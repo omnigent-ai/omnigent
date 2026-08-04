@@ -7,9 +7,9 @@
 # happens, then authoring the reproduction as an e2e test in THIS checkout.
 #
 # Invoke it with just the bug — a `bug_url` (a GitHub issue or Linear ticket
-# link) and an optional `ref` (the version the bug was reported on —
-# informational). Reproducing the bug is the agent's job, so the session and
-# logs are OUTPUTS it produces, not inputs.
+# link). Reproducing the bug is the agent's job, so the session and logs are
+# OUTPUTS it produces, not inputs. It always reproduces against the running
+# build (latest main), so there's no version to pass.
 #
 # Usage (run from the root of your omnigent-ai/omnigent checkout, so the agent's
 # working directory is this repo and it can author tests into tests/e2e_ui/ or
@@ -21,7 +21,7 @@
 #
 #   # Against a specific local/remote server you already run:
 #   omnigent run dev/repro-agent --server http://localhost:6767 \
-#     -p '{"bug_url":"https://linear.app/omnigent/issue/OMNI-1234","ref":"v1.2.3"}'
+#     -p '{"bug_url":"https://linear.app/omnigent/issue/OMNI-1234"}'
 #
 # The brain runs on the Claude Agent SDK, so configure a Claude provider first
 # (`omnigent setup` — an Anthropic key, a Claude subscription, an
@@ -33,9 +33,9 @@ name: repro_agent
 description: >-
   Reproduces a bug live in a running Omnigent app and captures it as a durable
   end-to-end test. Given just the bug — a bug_url (a GitHub issue or Linear
-  ticket link) and an optional ref — it reconstructs the user journey from the
-  linked report, drives the app it is connected to (a local server, or one
-  passed with --server) through the journey until the failure happens live, and
+  ticket link) — it reconstructs the user journey from the linked report, drives
+  the app it is connected to (a local server, or one passed with --server)
+  through the journey until the failure happens live, and
   authors an e2e test (Playwright tests/e2e_ui/ for UI bugs, or tests/e2e/ for
   backend) as the regression artifact. Reproducing is its job, so its session
   and logs are outputs it produces. It does not fix the bug or run a fix proof —
