@@ -1895,7 +1895,11 @@ export function NewChatLandingScreen() {
   // collapsed badge). OFF → the composer/picker fall back to the original
   // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
   const harnessInstallEnabled = info !== "loading" && info.harness_install_enabled;
-  const brainHarnessLabels = useBrainHarnessLabels(smartRoutingEnabled);
+  // Unfiltered brain-harness labels: safe for membership checks and for
+  // labelling an existing pick, but the OPTIONS offered in the gear modal use
+  // the gated `brainHarnessLabels` below, which drops the fully-auto row when
+  // the gateway cannot back both arms.
+  const brainHarnessLabelsAll = useBrainHarnessLabels(smartRoutingEnabled);
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
@@ -2410,7 +2414,7 @@ export function NewChatLandingScreen() {
     supportsApprovalMode ||
     supportsCursorMode ||
     smartRoutingEligible ||
-    (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabels);
+    (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
   // Label/value pairs summarizing the selected agent's current run-config, for
   // the gear icon's hover tooltip. Mirrors the modal's per-capability rows so a
   // user can read the active settings without opening it. "Default" = an unset
@@ -2427,7 +2431,7 @@ export function NewChatLandingScreen() {
     smartRoutingHarnessSelected ||
     (pickedHarness === AUTO_HARNESS_ID &&
       selectedAgent?.harness != null &&
-      selectedAgent.harness in brainHarnessLabels);
+      selectedAgent.harness in brainHarnessLabelsAll);
   const configSummary = useMemo((): { label: string; value: string }[] => {
     if (smartRoutingHarnessSelected) {
       // Top-level Smart Routing's modal is the locked Permissions row alone, so
@@ -2489,10 +2493,10 @@ export function NewChatLandingScreen() {
         CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
       return [{ label: "Mode", value: modeValue }, ...routingRow];
     }
-    if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabels) {
+    if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
       return [
-        { label: "Agent Harness", value: brainHarnessLabels[active] ?? active },
+        { label: "Agent Harness", value: brainHarnessLabelsAll[active] ?? active },
         ...routingRow,
       ];
     }
@@ -2503,7 +2507,7 @@ export function NewChatLandingScreen() {
     supportsApprovalMode,
     supportsCursorMode,
     selectedAgent,
-    brainHarnessLabels,
+    brainHarnessLabelsAll,
     routingOn,
     pickedModel,
     claudeModelOptions,
@@ -2672,6 +2676,21 @@ export function NewChatLandingScreen() {
     [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost],
   );
   const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
+  // The fully-auto brain needs both model families on the workspace AI
+  // gateway — the router may land the session's work on either, and an arm
+  // running off a personal subscription cannot run a routed pick. Gateway
+  // backing ONLY: unlike the top-level row, the bundle brain routes across
+  // SDK harnesses, so the native wrappers/CLIs are deliberately not required
+  // here. Gates the OPTIONS map only — membership checks and the summary
+  // label for an existing pick keep reading `brainHarnessLabelsAll`.
+  const brainGatewayBacked = SMART_ROUTING_ARMS.every((harness) =>
+    hostBacksHarnessWithGateway(harnessWarningHost, harness),
+  );
+  const brainHarnessLabels = useMemo(() => {
+    if (brainGatewayBacked) return brainHarnessLabelsAll;
+    const { [AUTO_HARNESS_ID]: _dropped, ...rest } = brainHarnessLabelsAll;
+    return rest;
+  }, [brainHarnessLabelsAll, brainGatewayBacked]);
   // Whether we know enough to judge availability: before the agent list, the
   // server flags, and the target (host or sandbox) land, "unavailable" only
   // means "not loaded yet". The target matters as much as the rest — with no

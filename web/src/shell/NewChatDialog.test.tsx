@@ -4123,6 +4123,36 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     expect(screen.getByTestId("new-chat-landing-harness-codex")).toBeTruthy();
   });
 
+  // The fully-auto brain routes across the same two arms as the top-level
+  // row, so it needs both on the workspace AI gateway — a codex pane running
+  // off a personal subscription cannot run a routed pick.
+  it.each([
+    ["codex isn't gateway-backed", { "claude-native": true, "codex-native": false }],
+    ["claude isn't gateway-backed", { "claude-native": false, "codex-native": true }],
+  ])("offers no Smart Routing brain when %s", (_case, gateway) => {
+    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("ag_debby");
+    openSelect("new-chat-landing-config-harness");
+    expect(screen.queryByTestId("new-chat-landing-harness-auto")).toBeNull();
+    // The explicit brains stay — only the routed option needs the gateway.
+    expect(screen.getByTestId("new-chat-landing-harness-codex")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-claude-sdk")).toBeTruthy();
+  });
+
+  it("keeps the Smart Routing brain when both arms are gateway-backed", () => {
+    mockHosts([
+      {
+        ...host("online"),
+        gateway_inference: { "claude-native": true, "codex-native": true },
+      } as Host,
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("ag_debby");
+    openSelect("new-chat-landing-config-harness");
+    expect(screen.getByTestId("new-chat-landing-harness-auto")).toBeTruthy();
+  });
+
   it.each(BOTH_BUNDLES)(
     "keeps %s's harness row on the Smart Routing pick, and the modal still names the agent",
     (name, agentId) => {
