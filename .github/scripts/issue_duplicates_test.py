@@ -3,38 +3,68 @@ import unittest
 from issue_duplicates import (
     AUTO_CLOSE_CONFIDENCE,
     build_duplicate_comment,
-    build_search_terms,
-    merge_candidates,
+    build_search_queries,
+    extract_issue_references,
+    rank_candidates,
     validate_duplicate_decision,
 )
 
 
 class IssueDuplicatesTest(unittest.TestCase):
-    def test_build_search_terms_prefers_meaningful_title_words(self):
+    def test_build_search_queries_spread_short_phrases_across_title(self):
         issue = {
-            "title": "The runner crashes when reconnecting a session",
+            "title": (
+                "[Bug] Host runners inherit the daemon's cwd; a deleted launch dir "
+                "breaks every new native session"
+            ),
             "body": "Ignore this template boilerplate and unrelated detail.",
         }
 
-        self.assertEqual(build_search_terms(issue), "runner crashes reconnecting session")
+        self.assertEqual(
+            build_search_queries(issue),
+            ["host runners", "daemon cwd", "launch dir", "native session"],
+        )
 
-    def test_merge_candidates_keeps_older_non_duplicate_issues(self):
-        candidates = merge_candidates(
-            20,
+    def test_build_search_queries_keep_short_technical_terms(self):
+        issue = {"title": "[Feature] No Go client for the session API"}
+
+        self.assertIn("go client", build_search_queries(issue))
+
+    def test_extract_issue_references_supports_shorthand_and_urls(self):
+        issue = {
+            "number": 4000,
+            "title": "Related to #3101",
+            "body": (
+                "See omnigent-ai/omnigent#2386 and "
+                "https://github.com/omnigent-ai/omnigent/issues/3085. "
+                "Ignore newer #4001 and repeated #3101."
+            ),
+        }
+
+        self.assertEqual(extract_issue_references(issue), [3101, 2386, 3085])
+
+    def test_rank_candidates_prioritizes_explicit_and_repeated_matches(self):
+        issue = {
+            "number": 20,
+            "title": "Runner inherits host daemon cwd",
+            "body": "Related implementation path: #17.",
+        }
+        candidates = rank_candidates(
+            issue,
             [
                 {"number": 20, "title": "current"},
                 {"number": 19, "title": "newer duplicate", "labels": ["duplicate"]},
-                {"number": 18, "title": "open", "state": "open"},
-            ],
-            [
-                {"number": 18, "title": "repeated"},
-                {"number": 17, "title": "closed", "state": "closed"},
+                {"number": 18, "title": "Runner daemon cwd", "state": "open"},
+                {"number": 18, "title": "Runner daemon cwd", "state": "open"},
+                {"number": 16, "title": "Merged PR", "state": "merged"},
                 {"number": 21, "title": "newer"},
             ],
+            [{"number": 17, "title": "Host cwd", "state": "closed"}],
         )
 
-        self.assertEqual([candidate["number"] for candidate in candidates], [18, 17])
-        self.assertEqual(candidates[0]["state"], "OPEN")
+        self.assertEqual([candidate["number"] for candidate in candidates], [17, 18])
+        self.assertTrue(candidates[0]["explicitReference"])
+        self.assertEqual(candidates[1]["searchHits"], 2)
 
     def test_high_confidence_allowlisted_duplicate_is_closeable(self):
         result = validate_duplicate_decision(

@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 from typing import Any
 
 AUTO_CLOSE_CONFIDENCE = 0.92
 MAX_CANDIDATES = 10
+MAX_SEARCH_QUERIES = 4
+MAX_EXPLICIT_REFERENCES = 5
 MAX_SIMILAR_ISSUES = 3
 MAX_REASON_LENGTH = 360
 
@@ -43,66 +46,125 @@ _STOP_WORDS = {
     "with",
 }
 
+_SEARCH_NOISE = {
+    "ability",
+    "add",
+    "allow",
+    "bug",
+    "can",
+    "cannot",
+    "does",
+    "every",
+    "feature",
+    "get",
+    "issue",
+    "make",
+    "new",
+    "only",
+    "same",
+    "should",
+    "support",
+    "use",
+    "using",
+}
 
-def build_search_terms(issue: dict[str, Any], limit: int = 6) -> str:
-    """Build a compact GitHub search query from an issue."""
+_SHORT_TECH_TERMS = {"ci", "db", "go", "os", "ui"}
+
+
+def build_search_queries(issue: dict[str, Any], limit: int = MAX_SEARCH_QUERIES) -> list[str]:
+    """Build short phrase queries spread across an issue title."""
     title = str(issue.get("title") or "")
     body = str(issue.get("body") or "")[:1000]
-    title_tokens = _search_tokens(title)
-    tokens = title_tokens if len(title_tokens) >= 3 else title_tokens + _search_tokens(body)
+    title_tokens = _query_tokens(title)
+    tokens = title_tokens if len(title_tokens) >= 2 else title_tokens + _query_tokens(body)
 
-    unique_tokens: list[str] = []
-    seen: set[str] = set()
-    for token in tokens:
-        if token not in seen:
-            unique_tokens.append(token)
-            seen.add(token)
-        if len(unique_tokens) == limit:
+    if not tokens:
+        return []
+    if len(tokens) == 1:
+        return tokens
+
+    pairs = list(
+        dict.fromkeys(" ".join(tokens[index : index + 2]) for index in range(len(tokens) - 1))
+    )
+    if len(pairs) <= limit:
+        return pairs
+
+    indexes = [index * (len(pairs) - 1) // (limit - 1) for index in range(limit)]
+    return [pairs[index] for index in dict.fromkeys(indexes)]
+
+
+def extract_issue_references(
+    issue: dict[str, Any], limit: int = MAX_EXPLICIT_REFERENCES
+) -> list[int]:
+    """Extract older issue references from title and body text."""
+    issue_number = issue.get("number")
+    if isinstance(issue_number, bool) or not isinstance(issue_number, int):
+        return []
+
+    text = f"{issue.get('title') or ''}\n{issue.get('body') or ''}"
+    references = []
+    for value in re.findall(r"(?:#|/issues/)(\d{1,10})\b", text):
+        number = int(value)
+        if number < issue_number and number not in references:
+            references.append(number)
+        if len(references) == limit:
             break
-    return " ".join(unique_tokens)
+    return references
 
 
-def merge_candidates(
-    issue_number: int,
-    open_candidates: list[dict[str, Any]],
-    closed_candidates: list[dict[str, Any]],
+def rank_candidates(
+    issue: dict[str, Any],
+    search_candidates: list[dict[str, Any]],
+    referenced_candidates: list[dict[str, Any]],
     limit: int = MAX_CANDIDATES,
 ) -> list[dict[str, Any]]:
-    """Normalize candidate search results, keeping canonical issues only."""
-    merged: list[dict[str, Any]] = []
-    seen: set[int] = set()
+    """Normalize, deduplicate, and rank candidate issues for classification."""
+    issue_number = issue.get("number")
+    if isinstance(issue_number, bool) or not isinstance(issue_number, int):
+        return []
 
-    for candidate in [*open_candidates, *closed_candidates]:
-        number = candidate.get("number")
-        if (
-            isinstance(number, bool)
-            or not isinstance(number, int)
-            or number >= issue_number
-            or number in seen
-        ):
+    explicit_numbers = set(extract_issue_references(issue))
+    candidates_by_number: dict[int, dict[str, Any]] = {}
+    search_hits: Counter[int] = Counter()
+
+    for candidate in search_candidates:
+        normalized = _normalize_candidate(issue_number, candidate)
+        if normalized is None:
             continue
+        number = normalized["number"]
+        search_hits[number] += 1
+        candidates_by_number.setdefault(number, normalized)
 
-        labels = _label_names(candidate.get("labels"))
-        if any(label.casefold() == "duplicate" for label in labels):
-            continue
+    for candidate in referenced_candidates:
+        normalized = _normalize_candidate(issue_number, candidate)
+        if normalized is not None and normalized["number"] in explicit_numbers:
+            candidates_by_number[normalized["number"]] = normalized
 
-        merged.append(
-            {
-                "number": number,
-                "title": str(candidate.get("title") or "")[:500],
-                "body": str(candidate.get("body") or "")[:2000],
-                "state": str(candidate.get("state") or "UNKNOWN").upper(),
-                "url": str(candidate.get("url") or ""),
-                "createdAt": candidate.get("createdAt"),
-                "updatedAt": candidate.get("updatedAt"),
-                "labels": labels,
-            }
+    issue_tokens = set(_query_tokens(str(issue.get("title") or "")))
+
+    def score(candidate: dict[str, Any]) -> tuple[Any, ...]:
+        number = candidate["number"]
+        candidate_tokens = set(_query_tokens(candidate["title"]))
+        shared = issue_tokens & candidate_tokens
+        union = issue_tokens | candidate_tokens
+        overlap = len(shared) / len(union) if union else 0.0
+        technical_matches = sum(_is_technical_token(token) for token in shared)
+        return (
+            number in explicit_numbers,
+            search_hits[number],
+            technical_matches,
+            len(shared),
+            overlap,
+            candidate["state"] == "OPEN",
+            number,
         )
-        seen.add(number)
-        if len(merged) == limit:
-            break
 
-    return merged
+    ranked = sorted(candidates_by_number.values(), key=score, reverse=True)[:limit]
+    for candidate in ranked:
+        number = candidate["number"]
+        candidate["explicitReference"] = number in explicit_numbers
+        candidate["searchHits"] = search_hits[number]
+    return ranked
 
 
 def format_candidates_for_prompt(candidates: list[dict[str, Any]]) -> str:
@@ -203,8 +265,41 @@ def _search_tokens(text: str) -> list[str]:
     return [
         token
         for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_-]+", text.lower())
-        if len(token) >= 3 and token not in _STOP_WORDS
+        if (len(token) >= 3 or token in _SHORT_TECH_TERMS) and token not in _STOP_WORDS
     ]
+
+
+def _query_tokens(text: str) -> list[str]:
+    return [token for token in _search_tokens(text) if token not in _SEARCH_NOISE]
+
+
+def _is_technical_token(token: str) -> bool:
+    return "_" in token or "-" in token or any(character.isdigit() for character in token)
+
+
+def _normalize_candidate(issue_number: int, candidate: dict[str, Any]) -> dict[str, Any] | None:
+    number = candidate.get("number")
+    if isinstance(number, bool) or not isinstance(number, int) or number >= issue_number:
+        return None
+
+    labels = _label_names(candidate.get("labels"))
+    if any(label.casefold() == "duplicate" for label in labels):
+        return None
+
+    state = str(candidate.get("state") or "UNKNOWN").upper()
+    if state not in {"OPEN", "CLOSED"}:
+        return None
+
+    return {
+        "number": number,
+        "title": str(candidate.get("title") or "")[:500],
+        "body": str(candidate.get("body") or "")[:2000],
+        "state": state,
+        "url": str(candidate.get("url") or ""),
+        "createdAt": candidate.get("createdAt"),
+        "updatedAt": candidate.get("updatedAt"),
+        "labels": labels,
+    }
 
 
 def _label_names(labels: Any) -> list[str]:

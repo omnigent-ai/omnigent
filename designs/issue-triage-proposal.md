@@ -45,7 +45,7 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 3. **Assigns priority** - one of `P0-critical`, `P1-high`, `P2-medium`, `P3-low`
 4. **Routes to contributors** - adds `good-first-issue` for well-scoped, self-contained issues; `help-wanted` for issues needing community help with more context
 5. **Flags incomplete issues** - adds `needs-info` if repro steps are missing or description is too vague (replaces priority label)
-6. **Detects duplicates** - comments with exact, similar, or no-match results; adds `duplicate` and closes with GitHub's native duplicate link only when a validated candidate reaches at least 0.92 confidence
+6. **Detects duplicates** - unions several short title searches with explicitly referenced issues, ranks the candidates, and comments with exact, similar, or no-match results; adds `duplicate` and closes with GitHub's native duplicate link only when a validated candidate reaches at least 0.92 confidence
 
 **What the bot does NOT do:**
 - Post suggestions or verbose responses beyond the duplicate-check result

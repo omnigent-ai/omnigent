@@ -111,6 +111,10 @@ prompt: |
     this whenever a possible duplicate is below 0.92 confidence.
   - `none` means no candidate is meaningfully related.
 
+  Candidate objects may include `explicitReference` and `searchHits`. These
+  fields explain why retrieval included an issue; they are not evidence by
+  themselves that two reports describe the same problem.
+
   **duplicate_of** — for `duplicate`, set this to exactly one issue number from
   CANDIDATE DUPLICATES. Otherwise use `null`.
 

@@ -144,50 +144,74 @@ jobs:
             --json number,title,body,labels,author,state,createdAt,comments \
             > /tmp/issue.json
 
-          terms=$(PYTHONPATH=.github/scripts python3 - <<'PYEOF'
+          PYTHONPATH=.github/scripts python3 <<'PYEOF'
           import json
           import pathlib
 
-          from issue_duplicates import build_search_terms
+          from issue_duplicates import build_search_queries, extract_issue_references
 
           issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
-          print(build_search_terms(issue))
-          PYEOF
+          queries = build_search_queries(issue)
+          references = extract_issue_references(issue)
+          pathlib.Path("/tmp/search-queries.json").write_text(json.dumps(queries))
+          pathlib.Path("/tmp/issue-references.json").write_text(
+              json.dumps(references)
           )
+          print(f"Duplicate search queries: {queries}")
+          print(f"Explicit issue references: {references}")
+          PYEOF
 
-          # Search open and closed issues separately so resolved duplicates are
-          # still considered without crowding open candidates out of the results.
-          if [ -n "$terms" ]; then
-            gh search issues --repo "$REPO" --state open --limit 5 \
+          # Short queries improve recall; trusted ranking below caps the union.
+          search_index=0
+          while IFS= read -r query; do
+            gh search issues --repo "$REPO" --limit 10 \
               --json number,title,body,state,url,createdAt,updatedAt,labels \
-              "$terms" > /tmp/open-duplicates.json 2>/dev/null \
-              || echo "[]" > /tmp/open-duplicates.json
-            gh search issues --repo "$REPO" --state closed --limit 5 \
+              "$query" > "/tmp/search-candidates-$search_index.json" \
+              2>/dev/null \
+              || echo "[]" > "/tmp/search-candidates-$search_index.json"
+            search_index=$((search_index + 1))
+          done < <(jq -r '.[]' /tmp/search-queries.json)
+
+          # Explicit references are always candidates, including related issues
+          # that keyword search would not rediscover. Pull requests are removed
+          # by the trusted state validator below.
+          reference_index=0
+          while IFS= read -r reference; do
+            gh issue view "$reference" --repo "$REPO" \
               --json number,title,body,state,url,createdAt,updatedAt,labels \
-              "$terms" > /tmp/closed-duplicates.json 2>/dev/null \
-              || echo "[]" > /tmp/closed-duplicates.json
-          else
-            echo "[]" > /tmp/open-duplicates.json
-            echo "[]" > /tmp/closed-duplicates.json
-          fi
+              > "/tmp/reference-candidate-$reference_index.json" \
+              2>/dev/null \
+              || echo "{}" > "/tmp/reference-candidate-$reference_index.json"
+            reference_index=$((reference_index + 1))
+          done < <(jq -r '.[]' /tmp/issue-references.json)
 
           PYTHONPATH=.github/scripts python3 <<'PYEOF'
           import json
-          import os
           import pathlib
 
-          from issue_duplicates import merge_candidates
+          from issue_duplicates import rank_candidates
 
-          open_candidates = json.loads(
-              pathlib.Path("/tmp/open-duplicates.json").read_text()
-          )
-          closed_candidates = json.loads(
-              pathlib.Path("/tmp/closed-duplicates.json").read_text()
-          )
-          candidates = merge_candidates(
-              int(os.environ["ISSUE_NUMBER"]), open_candidates, closed_candidates
+          issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
+          search_candidates = []
+          for path in pathlib.Path("/tmp").glob("search-candidates-*.json"):
+              result = json.loads(path.read_text())
+              if isinstance(result, list):
+                  search_candidates.extend(result)
+
+          referenced_candidates = []
+          for path in pathlib.Path("/tmp").glob("reference-candidate-*.json"):
+              result = json.loads(path.read_text())
+              if isinstance(result, dict) and result:
+                  referenced_candidates.append(result)
+
+          candidates = rank_candidates(
+              issue, search_candidates, referenced_candidates
           )
           pathlib.Path("/tmp/duplicates.json").write_text(json.dumps(candidates))
+          print(
+              "Ranked duplicate candidates: "
+              f"{[candidate['number'] for candidate in candidates]}"
+          )
           PYEOF
 
       # ── LLM classification (no tools, no shell, no GH_TOKEN) ────────
