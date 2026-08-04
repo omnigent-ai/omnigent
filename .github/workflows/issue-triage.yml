@@ -161,12 +161,14 @@ jobs:
           print(f"Explicit issue references: {references}")
           PYEOF
 
-          # Short queries improve recall; trusted ranking below caps the union.
+          # Pass each sanitized pair as AND terms, not one exact phrase.
+          # Trusted ranking below caps the broader result union.
           search_index=0
           while IFS= read -r query; do
+            read -r -a query_terms <<< "$query"
             gh search issues --repo "$REPO" --limit 10 \
               --json number,title,body,state,url,createdAt,updatedAt,labels \
-              "$query" > "/tmp/search-candidates-$search_index.json" \
+              "${query_terms[@]}" > "/tmp/search-candidates-$search_index.json" \
               2>/dev/null \
               || echo "[]" > "/tmp/search-candidates-$search_index.json"
             search_index=$((search_index + 1))
