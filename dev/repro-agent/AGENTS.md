@@ -71,9 +71,20 @@ failure (crash, traceback, wrong output, missing UI affordance). If the report i
 too thin to reconstruct a concrete journey, stop with verdict `needs_more_info`
 naming exactly what the report is missing.
 
+**Enumerate every distinct symptom the report claims — do not collapse them.**
+Many reports describe a *compound* bug: a title like "picker is unavailable **and**
+defaults/router catalog lag" is really two claims, and they can have *different*
+truth on the running build (one already fixed, the other still live). List each
+claimed sub-symptom as its own line item with its own observable failure. You will
+reproduce and give a verdict for **each** (Step 2), so a partially-landed fix
+can't make you miss the part that's still broken. Do not anchor on whichever
+facet you investigate first.
+
 ## Step 2 — Reproduce it live in the app
 
-Drive the running app through that journey and **observe the failure yourself**:
+Drive the running app through the journey and **observe the failure yourself**.
+Do this for **each** sub-symptom you enumerated in Step 1 — reproduce them
+independently, because a compound bug can be partly fixed:
 
 - **UI bugs** — use the browser tools to navigate the app, click/type through the
   reconstructed steps, and `browser_snapshot` the state that shows the failure
@@ -85,15 +96,21 @@ Drive the running app through that journey and **observe the failure yourself**:
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.
 
-Judge the outcome honestly:
+Judge **each sub-symptom** honestly and independently:
 
 - Failure reproduces → **`reproduced`**. Capture the evidence (snapshot, response,
   log excerpt).
-- Behaves correctly on the running build → the bug does **not** reproduce here.
-  If the report was against an older version and a later commit clearly fixed it,
-  hunt for the fixing commit (`git log`) and report **`already_fixed`** with the
-  commit. Otherwise report **`not_reproduced`** and what you'd need to see it
+- Behaves correctly on the running build → that sub-symptom does **not** reproduce
+  here. If the report was against an older version and a later commit clearly
+  fixed it, hunt for the fixing commit (`git log`) and mark it **`already_fixed`**
+  with the commit. Otherwise **`not_reproduced`** and what you'd need to see it
   (often a `needs_more_info`-style gap).
+
+**Roll up to an overall verdict, but never let it hide a live sub-symptom.** If
+*any* sub-symptom still reproduces, the overall verdict is **`reproduced`** — even
+when other facets are already fixed. Report the per-facet breakdown in the output
+(see below) so a partial fix is visible, not averaged away. Only when *every*
+sub-symptom is fixed is the overall verdict `already_fixed`.
 
 ## Step 3 — Author the durable e2e test
 
@@ -119,9 +136,16 @@ and verifies the same test goes fail→pass).
 End with a single structured verdict block — this is the handoff to the fix step,
 so make it self-contained. These are the artifacts you **produce**:
 
-- `bug_url`, `ref`, and `verdict` (`reproduced` / `not_reproduced` /
-  `already_fixed` / `needs_more_info`).
-- `test_path` — the e2e test you authored (the durable regression test).
+- `bug_url`, `ref`, and the overall `verdict` (`reproduced` / `not_reproduced` /
+  `already_fixed` / `needs_more_info`), rolled up per the Step 2 rule (any live
+  sub-symptom ⇒ overall `reproduced`).
+- `facets` — the per-sub-symptom breakdown from Steps 1–2: each claimed symptom
+  with its own verdict and one line of evidence (e.g. `picker display: reproduced
+  (raw IDs shown)`, `catalog default: already_fixed (#3448)`). Always include
+  this, even for a single-symptom bug (then it's one row). This is what stops a
+  partially-landed fix from being averaged into a misleading single verdict.
+- `test_path` — the e2e test you authored (the durable regression test); when
+  multiple facets still reproduce, the test(s) should cover each live one.
 - `session_id` — **this session** (in the app), so the fix step can replay how
   you reproduced it and you can browse it in the app UI at `<server>/c/<session_id>`.
   Get it from `sys_session_get_info`.
