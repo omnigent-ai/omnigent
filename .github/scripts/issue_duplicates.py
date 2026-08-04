@@ -14,6 +14,11 @@ MAX_SEARCH_QUERIES = 4
 MAX_EXPLICIT_REFERENCES = 5
 MAX_SIMILAR_ISSUES = 3
 MAX_REASON_LENGTH = 360
+MIN_TRUSTED_TITLE_TOKENS = 4
+MIN_TRUSTED_DOCUMENT_TOKENS = 8
+MIN_TRUSTED_TITLE_JACCARD = 0.8
+MIN_TRUSTED_DOCUMENT_JACCARD = 0.25
+MIN_TRUSTED_DOCUMENT_CONTAINMENT = 0.5
 
 _STOP_WORDS = {
     "a",
@@ -174,18 +179,74 @@ def format_candidates_for_prompt(candidates: list[dict[str, Any]]) -> str:
     return json.dumps(candidates, ensure_ascii=False, indent=2)
 
 
+def parse_triage_output(raw: str) -> dict[str, Any]:
+    """Parse exactly one JSON object, optionally wrapped in one code fence."""
+    value = raw.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", value, re.DOTALL | re.IGNORECASE)
+    if fenced is not None:
+        value = fenced.group(1).strip()
+
+    try:
+        result = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError("triage output must be exactly one JSON object") from error
+    if not isinstance(result, dict):
+        raise ValueError("triage output must be a JSON object")
+    return result
+
+
+def trusted_duplicate_match(issue: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """Require strong deterministic lexical agreement before auto-closing."""
+    issue_title = set(_similarity_tokens(str(issue.get("title") or "")))
+    candidate_title = set(_similarity_tokens(str(candidate.get("title") or "")))
+    if (
+        len(issue_title) < MIN_TRUSTED_TITLE_TOKENS
+        or len(candidate_title) < MIN_TRUSTED_TITLE_TOKENS
+    ):
+        return False
+
+    title_union = issue_title | candidate_title
+    title_jaccard = len(issue_title & candidate_title) / len(title_union)
+    if title_jaccard < MIN_TRUSTED_TITLE_JACCARD:
+        return False
+
+    issue_document = set(
+        _similarity_tokens(f"{issue.get('title') or ''}\n{str(issue.get('body') or '')[:2000]}")
+    )
+    candidate_document = set(
+        _similarity_tokens(
+            f"{candidate.get('title') or ''}\n{str(candidate.get('body') or '')[:2000]}"
+        )
+    )
+    if (
+        len(issue_document) < MIN_TRUSTED_DOCUMENT_TOKENS
+        or len(candidate_document) < MIN_TRUSTED_DOCUMENT_TOKENS
+    ):
+        return False
+
+    shared_document = issue_document & candidate_document
+    document_jaccard = len(shared_document) / len(issue_document | candidate_document)
+    document_containment = len(shared_document) / min(len(issue_document), len(candidate_document))
+    return (
+        document_jaccard >= MIN_TRUSTED_DOCUMENT_JACCARD
+        and document_containment >= MIN_TRUSTED_DOCUMENT_CONTAINMENT
+    )
+
+
 def validate_duplicate_decision(
     result: dict[str, Any],
+    issue: dict[str, Any],
     candidates: list[dict[str, Any]],
     auto_close_confidence: float = AUTO_CLOSE_CONFIDENCE,
 ) -> dict[str, Any]:
     """Validate the model's duplicate decision against prefetched candidates."""
-    candidate_numbers = {
-        candidate["number"]
+    candidates_by_number = {
+        candidate["number"]: candidate
         for candidate in candidates
         if isinstance(candidate.get("number"), int)
         and not isinstance(candidate.get("number"), bool)
     }
+    candidate_numbers = set(candidates_by_number)
     requested_decision = result.get("duplicate_decision")
     confidence = _confidence(result.get("duplicate_confidence"))
     duplicate_of = result.get("duplicate_of")
@@ -201,13 +262,17 @@ def validate_duplicate_decision(
 
     decision = "none"
     if requested_decision == "duplicate" and duplicate_of is not None:
-        if confidence >= auto_close_confidence:
+        if confidence >= auto_close_confidence and trusted_duplicate_match(
+            issue, candidates_by_number[duplicate_of]
+        ):
             decision = "duplicate"
             similar_issues = []
         else:
             decision = "similar"
             similar_issues = _deduplicate([duplicate_of, *similar_issues])[:MAX_SIMILAR_ISSUES]
             duplicate_of = None
+            if confidence >= auto_close_confidence:
+                reason = None
     elif requested_decision == "similar" and similar_issues:
         decision = "similar"
         duplicate_of = None
@@ -271,6 +336,10 @@ def _search_tokens(text: str) -> list[str]:
 
 def _query_tokens(text: str) -> list[str]:
     return [token for token in _search_tokens(text) if token not in _SEARCH_NOISE]
+
+
+def _similarity_tokens(text: str) -> list[str]:
+    return _query_tokens(text.replace("_", " ").replace("-", " "))
 
 
 def _is_technical_token(token: str) -> bool:

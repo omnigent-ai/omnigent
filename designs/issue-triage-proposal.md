@@ -45,7 +45,7 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 3. **Assigns priority** - one of `P0-critical`, `P1-high`, `P2-medium`, `P3-low`
 4. **Routes to contributors** - adds `good-first-issue` for well-scoped, self-contained issues; `help-wanted` for issues needing community help with more context
 5. **Flags incomplete issues** - adds `needs-info` if repro steps are missing or description is too vague (replaces priority label)
-6. **Detects duplicates** - unions several short title searches with explicitly referenced issues, ranks the candidates, and comments with exact, similar, or no-match results; adds `duplicate` and closes with GitHub's native duplicate link only when a validated candidate reaches at least 0.92 confidence
+6. **Detects duplicates** - unions several short title searches with explicitly referenced issues, ranks the candidates, and comments with exact, similar, or no-match results; adds `duplicate` and closes with GitHub's native duplicate link only when a validated candidate reaches at least 0.92 confidence and passes an independent deterministic near-copy gate
 
 **What the bot does NOT do:**
 - Post suggestions or verbose responses beyond the duplicate-check result
@@ -58,7 +58,7 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 
 | Issue state | What happens | Human needed? |
 |---|---|---|
-| **Duplicate** | Comment with the canonical issue → close immediately at ≥0.92 confidence | No |
+| **Duplicate** | Comment with the canonical issue → close at ≥0.92 confidence plus trusted near-copy validation | No |
 | **Similar issue** | Comment with up to three related issues → leave open | No |
 | **`needs-info`**, reporter responds | Bot removes `needs-info`, re-adds `needs-triage`, bot re-triages | No |
 | **`needs-info`**, no response 14d | Marked `stale` → closed after 7 more days | No |
@@ -122,9 +122,9 @@ Use `omnigent run .github/triage/` as the triage engine — a tool-less Claude S
 
 ### Decision: High-confidence duplicate closure
 
-Duplicates close immediately only when the classifier selects a prefetched candidate and reports at least 0.92 confidence. Lower-confidence matches are linked as similar and remain open. Authors can comment on a closed issue when the reports are materially different, and a maintainer can reopen it.
+Duplicates close immediately only when the classifier selects a prefetched candidate, reports at least 0.92 confidence, and a trusted deterministic check finds strong title and document overlap. The deterministic gate is intentionally conservative: model confidence alone cannot authorize a destructive action, and any match that fails the gate is linked as similar and left open. Authors can comment on a closed issue when the reports are materially different, and a maintainer can reopen it.
 
-**Why:** Duplicate detection is high-ROI automation, but false positives erode trust. Candidate allowlisting, a conservative confidence threshold, downgrade-to-similar behavior, and a public explanation keep auto-closure narrow and reviewable.
+**Why:** Duplicate detection is high-ROI automation, but false positives erode trust. Candidate allowlisting, a conservative confidence threshold, an independent near-copy gate, downgrade-to-similar behavior, strict single-object JSON parsing, and a public explanation keep auto-closure narrow and reviewable even when issue content is adversarial.
 
 ### Decision: Stale lifecycle with exemptions
 

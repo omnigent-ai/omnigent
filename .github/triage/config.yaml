@@ -104,8 +104,9 @@ prompt: |
   CANDIDATE DUPLICATES:
   - `duplicate` means the same underlying bug or the same requested capability,
     with matching expected behavior and no material contradiction. Use this only
-    when confidence is at least 0.92 because a trusted step will close the new
-    issue at that threshold.
+    when confidence is at least 0.92. A trusted deterministic similarity gate
+    independently limits auto-close to near-copy reports; other matches are
+    downgraded to `similar` even when model confidence is higher.
   - `similar` means there is meaningful overlap, but the reports may have
     different causes, requirements, environments, or expected outcomes. Also use
     this whenever a possible duplicate is below 0.92 confidence.

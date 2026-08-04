@@ -395,13 +395,21 @@ jobs:
           set -euo pipefail
 
           prompt=$(cat /tmp/triage_prompt.txt)
+          stop_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 
+          echo "::stop-commands::$stop_token"
+          set +e
           uv run omnigent run .github/triage/ \
             -p "$prompt" \
             --no-session \
             2>triage-stderr.log \
-            | tee /tmp/triage_output.txt \
-            || { echo "::warning::Triage agent exited non-zero"; }
+            | tee /tmp/triage_output.txt
+          triage_status=${PIPESTATUS[0]}
+          set -e
+          echo "::$stop_token::"
+          if [ "$triage_status" -ne 0 ]; then
+            echo "::warning::Triage agent exited non-zero"
+          fi
 
       - name: Redact secrets from logs
         if: steps.creds.outputs.available == 'true' && always()
@@ -425,7 +433,7 @@ jobs:
           # Print redacted stderr so maintainers can still debug failures.
           if [ -f triage-stderr.log ] && [ -s triage-stderr.log ]; then
             echo "--- triage-stderr.log (redacted) ---"
-            cat triage-stderr.log
+            sed 's/^/triage stderr | /' triage-stderr.log
           fi
 
       # ── Trusted label application (LLM cannot influence these) ───────
@@ -450,29 +458,16 @@ jobs:
 
           from issue_duplicates import (
               build_duplicate_comment,
+              parse_triage_output,
               validate_duplicate_decision,
           )
 
           raw = pathlib.Path("/tmp/triage_output.txt").read_text()
-
-          # Strip markdown code fences if present.
-          import re
-          raw = re.sub(r"```(?:json)?\s*", "", raw)
-
-          # Use raw_decode to find the first valid JSON object, handling
-          # nested braces (e.g. reasoning containing { or }).
-          decoder = json.JSONDecoder()
-          result = None
-          for i, ch in enumerate(raw):
-              if ch == "{":
-                  try:
-                      result, _ = decoder.raw_decode(raw, i)
-                      break
-                  except json.JSONDecodeError:
-                      continue
-
-          if result is None:
+          try:
+              result = parse_triage_output(raw)
+          except ValueError as error:
               print("::error::Triage agent did not output valid JSON")
+              print(f"Parse failure: {error}")
               sys.exit(1)
 
           # Validate fields against allowed values to prevent label injection.
@@ -490,7 +485,7 @@ jobs:
               os.environ.get("ISSUE_PRIORITIZATION_V2_ENABLED", "").lower() == "true"
           )
           candidates = json.loads(pathlib.Path("/tmp/duplicates.json").read_text())
-          duplicate = validate_duplicate_decision(result, candidates)
+          duplicate = validate_duplicate_decision(result, issue_data, candidates)
 
           labels_add = []
           labels_remove = []
@@ -625,7 +620,7 @@ jobs:
               print(f"Duplicate of: #{duplicate['duplicate_of']}")
           if duplicate["similar_issues"]:
               print(f"Similar issues: {duplicate['similar_issues']}")
-          print(f"Reasoning: {output['reasoning']}")
+          print(f"Reasoning: {json.dumps(output['reasoning'], ensure_ascii=True)}")
           PYEOF
 
           # Keep exactly one duplicate-check comment across workflow reruns.
@@ -651,8 +646,10 @@ jobs:
               --body-file /tmp/duplicate_comment.md
           fi
 
-          # Do not assign or alter the close reason if another actor closed the
-          # issue while triage was running.
+          # Refresh state after labeling/commenting so closure and assignment do
+          # not rely on the earlier read.
+          issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
+            --json state --jq '.state')
           if [ "$issue_state" != "OPEN" ]; then
             exit 0
           fi
@@ -660,8 +657,12 @@ jobs:
           duplicate_decision=$(jq -r '.duplicate_decision' /tmp/triage_result.json)
           if [ "$duplicate_decision" = "duplicate" ]; then
             duplicate_of=$(jq -r '.duplicate_of' /tmp/triage_result.json)
-            gh issue close "$ISSUE_NUMBER" --repo "$REPO" \
-              --duplicate-of "$duplicate_of"
+            issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
+              --json state --jq '.state')
+            if [ "$issue_state" = "OPEN" ]; then
+              gh issue close "$ISSUE_NUMBER" --repo "$REPO" \
+                --duplicate-of "$duplicate_of"
+            fi
             exit 0
           fi
 
@@ -670,8 +671,12 @@ jobs:
           maintainer_assigned=false
           if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER; then
             echo "Issue filed by maintainer $author — assigning to author"
-            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
-            maintainer_assigned=true
+            issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
+              --json state --jq '.state')
+            if [ "$issue_state" = "OPEN" ]; then
+              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
+              maintainer_assigned=true
+            fi
           fi
 
           # Otherwise, assign an owner: the least-loaded area owner, with LLM
@@ -724,7 +729,11 @@ jobs:
 
             assignee=$(cat /tmp/assignee.txt)
             if [ -n "$assignee" ]; then
-              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$assignee"
+              issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
+                --json state --jq '.state')
+              if [ "$issue_state" = "OPEN" ]; then
+                gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$assignee"
+              fi
             fi
           fi
 
