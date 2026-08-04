@@ -2744,6 +2744,52 @@ def inject_interrupt(
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
 
 
+# Option-1 label in Claude Code's plan-review dialog: proof that dialog is
+# what's on screen before a verdict is keyed into it.
+_PLAN_DIALOG_MARKER = "Yes, and use auto mode"
+
+_PLAN_VERDICT_KEYS = {"auto": "1", "manual": "2", "reject": "Escape"}
+
+
+def inject_plan_verdict(
+    bridge_dir: Path,
+    *,
+    verdict: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> bool:
+    """
+    Answer Claude Code's plan-review dialog by keystroke.
+
+    Claude Code ignores a ``PermissionRequest`` hook's ``allow`` for
+    ``ExitPlanMode`` — that dialog is answerable only from the TUI — so a
+    web-UI plan verdict has to be keyed in the way a local user would.
+    Every other gated tool honors the hook decision instead.
+
+    The pane check is the only guard available (the verdict carries no tool
+    identity), and it doubles as the "already answered in the terminal" case.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :param verdict: ``"auto"`` (approve + auto mode), ``"manual"``
+        (approve, keep approving edits), or ``"reject"``.
+    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``1.0``.
+    :returns: ``True`` when the keystroke was sent, ``False`` when the
+        plan dialog was not showing.
+    :raises ValueError: If *verdict* is not a known option.
+    :raises RuntimeError: If the tmux target is not advertised in time,
+        or if the ``tmux send-keys`` invocation fails.
+    """
+    key = _PLAN_VERDICT_KEYS.get(verdict)
+    if key is None:
+        raise ValueError(f"unknown plan verdict {verdict!r}")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    if _PLAN_DIALOG_MARKER not in _capture_pane(info["socket_path"], info["tmux_target"]):
+        return False
+    # No ``-l``: tmux must read ``Escape`` as a key name, not literal text.
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], key)
+    return True
+
+
 def kill_session(
     bridge_dir: Path,
     *,
