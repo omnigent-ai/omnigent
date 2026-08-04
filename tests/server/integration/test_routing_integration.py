@@ -749,6 +749,66 @@ async def test_child_of_an_auto_parent_keeps_cross_harness_candidates(
     assert set(routing_client.offered[0]) == {"claude-sdk", "codex", "pi"}
 
 
+async def test_child_of_a_spec_opted_in_parent_keeps_cross_harness_candidates(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A spec-level opt-in lifts the family clamp the same way the sentinel does.
+
+    The two-headed case: a brain pinned to ``claude-sdk`` used to clamp every
+    child into the claude family, so a codex sub-agent was rerouted onto
+    claude-sdk. With ``smart_routing_harness: auto`` the parent starts auto and
+    the child is routed against all families.
+    """
+    agent = await create_test_agent(
+        client,
+        name="routing-child-family-spec-opt-in",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk", "smart_routing_harness": "auto"},
+        },
+    )
+    # No harness_override: turning Smart Routing on is the whole request.
+    parent = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert parent.status_code == 201, parent.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent_conv = conv_store.get_conversation(str(parent.json()["id"]))
+    assert parent_conv is not None
+    assert parent_conv.harness_override == "auto"
+    assert parent_conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+
+    child = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "parent_session_id": parent.json()["id"]},
+    )
+    assert child.status_code == 201, child.text
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    assert child_conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "compare the options"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child_conv.id,
+                child_conv,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    # allowed_family=None: every family is on offer, so a codex head can stay
+    # on codex instead of being clamped into the brain's claude family.
+    assert set(routing_client.offered[0]) == {"claude-sdk", "codex", "pi"}
+
+
 # ── 8. Truthful record on a claude-native turn ─────────────────────
 
 

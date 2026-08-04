@@ -481,6 +481,142 @@ async def test_bundle_agent_auto_path_is_unchanged(
     assert routing_client.offered == []
 
 
+# ── Spec-level opt-in: executor.config.smart_routing_harness ───────
+
+OPT_IN_EXECUTOR = {
+    "type": "omnigent",
+    "config": {"harness": "claude-sdk", "smart_routing_harness": "auto"},
+}
+
+
+async def _create_opt_in_session(
+    client: httpx.AsyncClient,
+    agent_id: str,
+    **extra: Any,
+) -> httpx.Response:
+    """Create a session the way the landing screen does for a bundle agent.
+
+    Sends no ``harness_override``: the spec's opt-in is what must turn the
+    brain harness over to the router.
+
+    :param client: Test HTTP client.
+    :param agent_id: The bound bundle agent.
+    :param extra: Extra create-body fields, e.g. ``model_override``.
+    :returns: The create response.
+    """
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        return await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "cost_control_mode_override": "on",
+                "smart_routing_message": ROUTING_MESSAGE,
+                **extra,
+            },
+        )
+
+
+async def test_spec_opt_in_hands_the_brain_harness_to_the_router(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client, name="spec-opt-in-agent", executor=OPT_IN_EXECUTOR)
+    created = await _create_opt_in_session(client, str(agent["id"]))
+    assert created.status_code == 201, created.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    # The spec's own pin (claude-sdk) is replaced by the sentinel, so the first
+    # message routes harness AND model instead of inheriting the pinned family.
+    assert conv.harness_override == "auto"
+    assert conv.model_override is None
+    # The durable marker is what lets a sub-agent leave the brain's family.
+    assert conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+
+
+async def test_spec_opt_in_is_inert_with_smart_routing_off(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(
+        client, name="spec-opt-in-routing-off", executor=OPT_IN_EXECUTOR
+    )
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    # No routing, no sentinel: the session runs on the spec's pinned harness.
+    assert conv.harness_override is None
+    assert AUTO_HARNESS_LABEL_KEY not in conv.labels
+
+
+async def test_explicit_harness_override_beats_the_spec_opt_in(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(
+        client, name="spec-opt-in-explicit-harness", executor=OPT_IN_EXECUTOR
+    )
+    created = await _create_opt_in_session(client, str(agent["id"]), harness_override="codex")
+    assert created.status_code == 201, created.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    # The user picked a harness in the gear modal; the spec does not overrule it.
+    assert conv.harness_override == "codex"
+    assert AUTO_HARNESS_LABEL_KEY not in conv.labels
+
+
+async def test_client_model_pin_suppresses_the_spec_opt_in(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(
+        client, name="spec-opt-in-pinned-model", executor=OPT_IN_EXECUTOR
+    )
+    created = await _create_opt_in_session(client, str(agent["id"]), model_override=CLAUDE_MODEL)
+    assert created.status_code == 201, created.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    # Going auto nulls the model, so a client's pin must keep the opt-in off
+    # rather than being silently dropped.
+    assert conv.harness_override is None
+    assert conv.model_override == CLAUDE_MODEL
+    assert AUTO_HARNESS_LABEL_KEY not in conv.labels
+
+
+async def test_a_spec_without_the_opt_in_keeps_its_pinned_harness(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client, name="spec-no-opt-in")
+    created = await _create_opt_in_session(client, str(agent["id"]))
+    assert created.status_code == 201, created.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    # Smart Routing alone changes nothing about the harness — the key does.
+    assert conv.harness_override is None
+    assert AUTO_HARNESS_LABEL_KEY not in conv.labels
+
+
+async def test_a_non_auto_opt_in_value_is_rejected(client: httpx.AsyncClient) -> None:
+    agent = await create_test_agent(
+        client,
+        name="spec-opt-in-bad-value",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk", "smart_routing_harness": "codex"},
+        },
+    )
+    created = await _create_opt_in_session(client, str(agent["id"]))
+    assert created.status_code == 400, created.text
+    assert "smart_routing_harness" in created.text
+
+
 async def test_native_candidates_impose_no_family_constraint() -> None:
     # The candidate override and the parent-family filter are orthogonal: an
     # auto session passes no allowed_family, so both native families reach the

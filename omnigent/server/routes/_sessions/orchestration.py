@@ -6361,6 +6361,53 @@ def _fixed_native_routing_harness(
     return harness if harness in AUTO_NATIVE_ROUTING_HARNESSES else None
 
 
+def _spec_routes_its_own_harness(
+    body: SessionCreateRequest,
+    agent: Agent,
+    agent_cache: AgentCache | None,
+) -> bool:
+    """Whether this create must hand the brain harness to the router.
+
+    A spec pinning ``executor.config.harness`` also pins the family its
+    sub-agents are routed within, so a two-headed agent loses the head that
+    lives in the other family. ``smart_routing_harness: auto`` opts the spec out
+    of its own pin for a Smart Routing session, taking the same ``"auto"``
+    sentinel path the brain-harness picker offers by hand.
+
+    Off unless Smart Routing is on for this create, so a spec carrying the key
+    behaves exactly as before with routing off. Deliberately narrow otherwise:
+    a client's explicit ``harness_override`` or ``model_override`` is the user's
+    own pick and outranks the spec, and a child / named sub-agent create is
+    routed by the spawn and turn paths (which read the parent's routing state),
+    not here.
+
+    :param body: The validated create request.
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: ``True`` when ``harness_override`` must become ``"auto"``.
+    :raises OmnigentError: ``invalid_input`` when the spec's opt-in value is
+        not the ``"auto"`` sentinel, or sits on a non-omnigent executor type.
+    """
+    if body.cost_control_mode_override != "on":
+        return False
+    if body.harness_override is not None or body.model_override is not None:
+        return False
+    if body.parent_session_id is not None or body.sub_agent_name is not None:
+        return False
+    if agent_cache is None:
+        return False
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+        # An unloadable spec just means "no opt-in"; the create's own
+        # validation reports it.
+        _logger.debug("create-time routing: agent %r failed to load", agent.name, exc_info=True)
+        return False
+    return _validated_spec_smart_routing_harness(loaded.spec) is not None
+
+
 async def _resolve_fixed_native_model_routing(
     body: SessionCreateRequest,
     request: Request,
@@ -6585,9 +6632,16 @@ async def _create_session_from_existing_agent(
     # terminal launches with the row and its turns originate in the TUI (the
     # server never sees the first message pre-inference). Fails open: no pin, a
     # decision card with the reason, and the CLI's default model.
+    # A spec that hands its brain harness to the router (``smart_routing_harness:
+    # auto``) takes the sentinel path below instead of any create-time pick: the
+    # harness is not decided until the first message, so there is no single
+    # harness whose model could be routed here.
+    _spec_auto_brain = not _native_smart_routing and await asyncio.to_thread(
+        _spec_routes_its_own_harness, body, agent, agent_cache
+    )
     _fixed_native_harness = (
         None
-        if _native_smart_routing
+        if _native_smart_routing or _spec_auto_brain
         else await asyncio.to_thread(_fixed_native_routing_harness, body, agent, agent_cache)
     )
     _fixed_routed_model: str | None = None
@@ -6695,10 +6749,11 @@ async def _create_session_from_existing_agent(
         # "auto" behind would make the first message re-route an already-running
         # terminal. The auto marker is stamped as a label below instead.
         harness_override = None
-    elif _force_auto_for_child or body.harness_override == "auto":
+    elif _force_auto_for_child or _spec_auto_brain or body.harness_override == "auto":
         await asyncio.to_thread(_validated_harness_override_executor_type, agent)
         harness_override = "auto"
-        # Ignore any orchestrator-supplied model; routing picks it.
+        # Ignore any orchestrator-supplied model; routing picks it. (The spec
+        # opt-in never reaches here with a client model, so none is dropped.)
         model_override = None
     else:
         harness_override = await asyncio.to_thread(
