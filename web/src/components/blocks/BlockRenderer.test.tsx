@@ -572,6 +572,38 @@ describe("BlockRenderer dispatch", () => {
       await waitFor(() => expect(screen.queryByText("Checking the CLI.")).toBeNull());
     });
 
+    it("never folds the last bubble while an elicitation is parked, even if all else reads settled", async () => {
+      // Reload while parked on an approval: a step-wise turn's snapshot
+      // names the STEP id (not the items' thread id), so the trace's
+      // lifecycle reads "completed" AND the session status can read
+      // settled — but the pending card proves the turn is still in
+      // flight. Folding here collapsed the partial work into a
+      // premature "Worked for" row.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Need approval next.", final: true },
+      ];
+      const view = (parked: boolean) => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus="idle"
+            turnLifecycle="completed"
+            isLastAssistant
+            hasPendingElicitation={parked}
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender } = render(view(true));
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Checking the CLI.")).toBeDefined();
+
+      // Card answered and the turn settles → the fold forms.
+      rerender(view(false));
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+    });
+
     it("folds an earlier (non-last) settled bubble even while the session runs", () => {
       // Only the LAST bubble can be the live turn; prior turns fold as
       // usual while a later turn streams.

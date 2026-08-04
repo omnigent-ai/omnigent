@@ -95,6 +95,7 @@ import {
   buildBubbles,
   bubblesEqual,
   createBubbleCache,
+  lastRenderableAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1545,7 +1546,7 @@ function MainAgentSurface({
   // live turn even if its lifecycle reads settled — BlockRenderer keeps
   // its "Worked for" fold suppressed until a terminal status edge lands.
   const lastAssistantIndex = useMemo(
-    () => streamBubbles.findLastIndex((b) => b.kind === "assistant"),
+    () => lastRenderableAssistantIndex(streamBubbles),
     [streamBubbles],
   );
 
@@ -3453,6 +3454,12 @@ function AssistantBubble({
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // A pending elicitation means the turn is parked awaiting the user —
+  // still in flight even when its lifecycle or the session status reads
+  // settled (e.g. a reload while parked). Feeds the fold suppression.
+  const hasPendingElicitation = useChatStore((s) =>
+    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
+  );
   // Getter computes the markdown lazily at click time — the hook must run
   // before the early return below (rules of hooks), but `markdownText` is
   // derived after it.
@@ -3486,6 +3493,7 @@ function AssistantBubble({
             workedForS={bubble.workedForS}
             continued={bubble.continued}
             isLastAssistant={isLastAssistant}
+            hasPendingElicitation={hasPendingElicitation}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (

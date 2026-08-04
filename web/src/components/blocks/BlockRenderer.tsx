@@ -341,6 +341,15 @@ interface BlockRendererProps {
    * which is the natural moment anyway.
    */
   isLastAssistant?: boolean;
+  /**
+   * The session has a pending elicitation (approval/question card
+   * awaiting the user). The turn is parked, not over — a reload while
+   * parked can read BOTH the lifecycle and the session status as
+   * settled (a step-wise turn's snapshot names the STEP id, not the
+   * items' thread id) — so the last bubble's fold stays suppressed
+   * until the card is answered.
+   */
+  hasPendingElicitation?: boolean;
 }
 
 type ToolRunFragment =
@@ -362,6 +371,7 @@ export function BlockRenderer({
   workedForS,
   continued = false,
   isLastAssistant = false,
+  hasPendingElicitation = false,
 }: BlockRendererProps) {
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
   const isTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
@@ -380,11 +390,12 @@ export function BlockRenderer({
   // "Worked" row with nothing behind it.
   const foldEligible =
     !isTurnLive &&
-    // The last assistant bubble in a RUNNING session is (or may be) the
-    // live turn even when its lifecycle reads settled — a mid-turn
-    // (re)connect can miss the edge that names the turn. Never fold it
-    // while the session runs; the terminal status edge folds it.
-    !(isLastAssistant && sessionStatus === "running") &&
+    // The last assistant bubble of a RUNNING session — or one parked on
+    // a pending elicitation — is (or may be) the live turn even when its
+    // lifecycle reads settled: a mid-turn (re)connect can miss the edge
+    // that names the turn. Never fold it until the session settles AND
+    // the card is answered; the terminal status edge folds it.
+    !(isLastAssistant && (sessionStatus === "running" || hasPendingElicitation)) &&
     !isProvisionalTrace(items) &&
     process.length > 0 &&
     (final.length > 0 || (continued && process.some(isToolItem)));

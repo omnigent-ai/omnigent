@@ -340,6 +340,24 @@ function markContinuedTurns(bubbles: Bubble[], activeResponse: ActiveResponse | 
 }
 
 /**
+ * Index of the last assistant bubble that actually renders content.
+ *
+ * "Last assistant" gates the fold suppression for the possibly-live
+ * turn, so it must point at the turn's TRACE bubble. A parked
+ * elicitation forms its own trailing assistant bubble whose card
+ * ChatPage floats to the page bottom, leaving the bubble item-less (it
+ * renders null) — counting that phantom as "last" handed the live
+ * turn's trace to the fold.
+ */
+export function lastRenderableAssistantIndex(bubbles: readonly Bubble[]): number {
+  for (let i = bubbles.length - 1; i >= 0; i -= 1) {
+    const b = bubbles[i]!;
+    if (b.kind === "assistant" && b.items.length > 0) return i;
+  }
+  return -1;
+}
+
+/**
  * Whether a block's response id doesn't identify a real turn: `""`
  * (emitted before the turn was named) or a `live:` preview id. Such
  * blocks belong to the turn around them, never to a turn of their own.

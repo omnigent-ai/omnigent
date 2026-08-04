@@ -17,6 +17,7 @@ import {
   buildBubbles,
   bubblesEqual,
   createBubbleCache,
+  lastRenderableAssistantIndex,
 } from "./renderItems";
 import type { ActiveResponse } from "@/store/types";
 
@@ -1902,5 +1903,38 @@ describe("buildBubbles — anonymous blocks join the surrounding turn", () => {
       null,
     );
     expect(assistants(bubbles)[0]!.stableId).toBe("m2");
+  });
+});
+
+describe("lastRenderableAssistantIndex", () => {
+  const textDone = (itemId: string, rid: string, text: string): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, responseId: rid }),
+    fullText: text,
+    hasCodeBlocks: false,
+  });
+
+  it("skips a trailing item-less assistant bubble (floated elicitation phantom)", () => {
+    // A parked elicitation forms its own trailing bubble whose card
+    // ChatPage floats out, leaving items:[] — it renders null. Counting
+    // it as "last assistant" handed the live turn's TRACE to the fold on
+    // a reload while parked.
+    const bubbles = buildBubbles([textDone("m1", "codex_t", "working…")], null);
+    const phantom: Bubble = {
+      kind: "assistant",
+      responseId: "elicit_e1",
+      stableId: "elicit_e1:0",
+      lifecycle: "completed",
+      error: null,
+      items: [],
+    };
+    const withPhantom = [...bubbles, phantom];
+    expect(lastRenderableAssistantIndex(withPhantom)).toBe(0);
+  });
+
+  it("returns the real last assistant when it has items, and -1 when none do", () => {
+    const bubbles = buildBubbles([textDone("m1", "resp_1", "answer")], null);
+    expect(lastRenderableAssistantIndex(bubbles)).toBe(0);
+    expect(lastRenderableAssistantIndex([])).toBe(-1);
   });
 });
