@@ -107,7 +107,7 @@ function WorkspacePathInlineCode({
         // link only adds the underline affordance on top of Streamdown's
         // styling and any caller-provided attributes survive.
         className={cn(
-          "font-mono text-sm underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
+          "font-mono text-ui underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
           className,
         )}
         onClick={() => openFile(linkPath)}
@@ -127,7 +127,7 @@ function WorkspacePathInlineCode({
   // looks unchanged.
   return (
     <code
-      className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-sm", className)}
+      className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
       data-streamdown="inline-code"
       {...codeProps}
     >

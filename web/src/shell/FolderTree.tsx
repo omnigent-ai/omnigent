@@ -477,7 +477,7 @@ function FileRowItem({
           />
           <span
             className={cn(
-              "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
+              "min-w-0 flex-1 truncate font-mono text-ui md:text-xs",
               labelIsPath ? "[direction:rtl]" : fileStatus === "created" && "font-semibold",
               isDeleted && "line-through opacity-50",
               fileColorClass,
@@ -682,7 +682,7 @@ function TreeNodeRow({
         />
         <span
           className={cn(
-            "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
+            "min-w-0 flex-1 truncate font-mono text-ui md:text-xs",
             dirStatus === "created" && "font-semibold",
             dirDotClass,
           )}

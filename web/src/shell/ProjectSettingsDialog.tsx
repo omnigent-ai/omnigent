@@ -62,7 +62,7 @@ function Field({
   return (
     <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
       <label htmlFor={htmlFor} className="flex flex-col pt-1.5">
-        <span className="font-medium text-sm">{label}</span>
+        <span className="font-medium text-ui">{label}</span>
         {hint && <span className="text-muted-foreground text-xs">{hint}</span>}
       </label>
       <div className="sm:w-64">{children}</div>
@@ -284,7 +284,7 @@ export function ProjectSettingsDialog({
               // be chosen once a host is selected (the file browser lists
               // against a concrete host, and a path is host-relative anyway).
               <p
-                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-sm"
+                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
                 data-testid="project-settings-workspace"
               >
                 Pick a host first
@@ -306,7 +306,7 @@ export function ProjectSettingsDialog({
                   onClick={() => setWorkspaceOpen((v) => !v)}
                   aria-expanded={workspaceOpen}
                   disabled={isLoading}
-                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
                     {workspace || "Browse…"}
@@ -344,7 +344,7 @@ export function ProjectSettingsDialog({
               <input
                 id="project-settings-workspace"
                 data-testid="project-settings-workspace"
-                className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 placeholder="/path/to/repo"
                 value={workspace}
                 onChange={(e) => setWorkspace(e.target.value)}
@@ -400,7 +400,7 @@ export function ProjectSettingsDialog({
                 // (full width, bordered, h-8) so the control right-aligns with
                 // the host / effort dropdowns instead of floating mid-row.
                 triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
-                triggerLabelClassName="max-w-none text-sm"
+                triggerLabelClassName="max-w-none text-ui"
               />
               {agentId && (
                 <Button
@@ -418,7 +418,7 @@ export function ProjectSettingsDialog({
 
           {loadFailed && (
             <p
-              className="text-destructive text-sm"
+              className="text-destructive text-ui"
               role="alert"
               data-testid="project-settings-load-error"
             >
@@ -427,7 +427,7 @@ export function ProjectSettingsDialog({
             </p>
           )}
           {updateConfig.isError && (
-            <p className="text-destructive text-sm" role="alert">
+            <p className="text-destructive text-ui" role="alert">
               {(updateConfig.error as Error).message}
             </p>
           )}

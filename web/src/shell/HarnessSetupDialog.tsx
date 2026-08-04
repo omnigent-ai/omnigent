@@ -155,7 +155,7 @@ export function HarnessSetupDialog({
           // dead-end. When everything IS done we fall through to the checklist
           // (all green ticks) rather than showing a "run omni setup"
           // signpost that would contradict the "is ready" description.
-          <p className="py-1 text-sm text-muted-foreground" data-testid="harness-setup-empty">
+          <p className="py-1 text-ui text-muted-foreground" data-testid="harness-setup-empty">
             Run <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">omni setup</code>{" "}
             on {host?.name} to finish setting up {name}.
           </p>
@@ -249,7 +249,7 @@ function SetupStepRow({
           <StepIcon status={step.status} />
         </span>
         <div className="flex min-w-0 flex-1 flex-col gap-1">
-          <span className="text-sm font-medium">{step.title}</span>
+          <span className="text-ui font-medium">{step.title}</span>
           {/* While this harness's install is in flight, the detail line becomes
               the progress caption — kept next to the install step it describes
               rather than stranded at the bottom of the dialog. */}

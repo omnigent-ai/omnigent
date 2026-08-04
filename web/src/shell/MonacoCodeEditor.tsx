@@ -516,12 +516,12 @@ function MonacoCodeEditorInner({
         ))}
       <div className="relative min-h-0 flex-1">
         {loadError && (
-          <div className="flex items-center justify-center p-8 text-destructive text-sm">
+          <div className="flex items-center justify-center p-8 text-destructive text-ui">
             Failed to load the editor.
           </div>
         )}
         {!loadError && !ready && (
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         )}

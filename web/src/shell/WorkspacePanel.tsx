@@ -471,7 +471,7 @@ function RailTerminalView({
   const terminal = terminals.find((t) => terminalTabKey(t) === terminalKey) ?? null;
   if (!terminal) {
     return (
-      <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm">
+      <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
         Shell not available.
       </div>
     );

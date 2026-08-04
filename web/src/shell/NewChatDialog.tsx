@@ -3184,7 +3184,7 @@ export function NewChatLandingScreen() {
           >
             {isDragActive && (
               <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-sm font-medium text-ring">Drop files here</span>
+                <span className="text-ui font-medium text-ring">Drop files here</span>
               </div>
             )}
             {/* Skill suggestions — floats above the composer box. */}
@@ -3311,14 +3311,14 @@ export function NewChatLandingScreen() {
               // inside them): min 60px = one 20px line + a spare line of
               // breathing room; max 200px = the spec's 180px of content.
               // useAutoGrowTextarea drives the height between the two.
-              className="max-h-[200px] min-h-[60px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              className="max-h-[200px] min-h-[60px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
                 textarea; the pills themselves opt back in. */}
             {pillSkills.length > 0 && message.length === 0 && (
               <div className="pointer-events-none absolute inset-x-4 top-4 flex flex-wrap items-center gap-2">
-                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-muted-foreground">
+                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
                   Describe a task, or try a skill
                 </span>
                 <SkillPills skills={pillSkills} onPick={applySkillPill} />

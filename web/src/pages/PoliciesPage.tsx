@@ -171,7 +171,7 @@ function AddDefaultPolicyDialog({
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
                     placeholder="Filter policies..."
-                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-ui placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
                     autoFocus
                   />
                   <div className="flex max-h-52 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
@@ -182,7 +182,7 @@ function AddDefaultPolicyDialog({
                         onClick={() => handleSelect(r.handler)}
                         className="flex flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-muted"
                       >
-                        <span className="text-sm">{r.name}</span>
+                        <span className="text-ui">{r.name}</span>
                         {r.description && (
                           <span className="line-clamp-2 text-[11px] text-muted-foreground">
                             {r.description}
@@ -202,7 +202,7 @@ function AddDefaultPolicyDialog({
           {entry && (
             <div className="flex flex-col gap-1 rounded border border-border bg-muted/50 px-2.5 py-2">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium">{entry.name}</span>
+                <span className="text-ui font-medium">{entry.name}</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -230,7 +230,7 @@ function AddDefaultPolicyDialog({
                 type="text"
                 value={policyName}
                 onChange={(e) => setPolicyName(e.target.value)}
-                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
               />
             </div>
           )}
@@ -271,7 +271,7 @@ function AddDefaultPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       >
                         <option value="true">true</option>
                         <option value="false">false</option>
@@ -290,7 +290,7 @@ function AddDefaultPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       >
                         {prop.enum.map((v) => (
                           <option key={v} value={v}>
@@ -369,7 +369,7 @@ function AddDefaultPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       />
                     )}
                   </div>
@@ -380,7 +380,7 @@ function AddDefaultPolicyDialog({
           {(paramError || addPolicy.isError) && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
             >
               {paramError ?? addPolicy.error?.message}
             </div>
@@ -458,7 +458,7 @@ export function PoliciesPage() {
 
   if (!isSingleUser && meIsAdmin === null) {
     return (
-      <div className="flex min-h-full items-center justify-center text-sm text-muted-foreground">
+      <div className="flex min-h-full items-center justify-center text-ui text-muted-foreground">
         Loading...
       </div>
     );
@@ -468,7 +468,7 @@ export function PoliciesPage() {
     return (
       <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Global Policies</h1>
-        <p className="text-sm text-muted-foreground">
+        <p className="text-ui text-muted-foreground">
           You don't have permission to manage global policies.
         </p>
       </PageScroll>
@@ -496,7 +496,7 @@ export function PoliciesPage() {
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Global Policies</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <p className="mt-1 text-ui text-muted-foreground">
             Global policies applied to all sessions.
           </p>
         </div>
@@ -521,7 +521,7 @@ export function PoliciesPage() {
                     <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium">{p.name}</span>
+                        <span className="text-ui font-medium">{p.name}</span>
                         {p.source === "config" && (
                           <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
                             Config
@@ -594,7 +594,7 @@ export function PoliciesPage() {
       )}
 
       {policies.length === 0 && (
-        <p className="text-sm text-muted-foreground">
+        <p className="text-ui text-muted-foreground">
           No global policies configured. Add one to apply it to all sessions.
         </p>
       )}
@@ -629,7 +629,7 @@ export function PoliciesPage() {
           {actionError !== null && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
             >
               {actionError}
             </div>

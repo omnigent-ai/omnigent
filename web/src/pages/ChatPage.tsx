@@ -1741,7 +1741,7 @@ function MainAgentSurface({
                     <h3 className="text-2xl font-medium tracking-[-0.02em]">
                       What should we work on?
                     </h3>
-                    <p className="text-muted-foreground text-base">
+                    <p className="text-muted-foreground text-ui">
                       {agentsError
                         ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
                         : "Send a message to get started."}
@@ -1902,7 +1902,7 @@ function MainAgentSurface({
 
 function HydratingPlaceholder() {
   return (
-    <div className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-sm">
+    <div className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-ui">
       <Loader2Icon className="size-4 animate-spin" />
       Loading conversation…
     </div>
@@ -1929,7 +1929,7 @@ function ConversationLoadError({
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-md flex-col items-center gap-3 text-center">
         <h1 className="font-medium text-foreground text-lg">Conversation not found</h1>
-        <p className="text-muted-foreground text-sm">
+        <p className="text-muted-foreground text-ui">
           Couldn't load{" "}
           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{conversationId}</code>
           : {error.message}
@@ -2116,7 +2116,7 @@ function HistoryLoadingIndicator() {
   return (
     <div
       role="status"
-      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm"
+      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-ui"
     >
       <Loader2Icon className="size-4 animate-spin" aria-hidden />
       Loading earlier messages…
@@ -2908,7 +2908,7 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
       aria-live="polite"
     >
       <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-sm">
+        <span className="flex items-center gap-2 text-muted-foreground text-ui">
           <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
           {line}
         </span>
@@ -2977,7 +2977,7 @@ export function McpStartupIndicator() {
         aria-live="polite"
       >
         <MessageContent>
-          <span className="flex items-center gap-2 text-muted-foreground text-sm">
+          <span className="flex items-center gap-2 text-muted-foreground text-ui">
             <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
             {mcpStartingLine(starting, names.length)}
           </span>
@@ -2994,7 +2994,7 @@ export function McpStartupIndicator() {
   return (
     <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
       <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-sm">
+        <span className="flex items-center gap-2 text-muted-foreground text-ui">
           <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
           {`MCP startup incomplete (${parts.join("; ")})`}
         </span>
@@ -3157,7 +3157,7 @@ function useCopyMessage(getText: () => string): {
         window.clearTimeout(timeoutRef.current);
         timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
         if (isMobile) {
-          showToast(<span className="text-sm">Copied to clipboard</span>, { duration: 1500 });
+          showToast(<span className="text-ui">Copied to clipboard</span>, { duration: 1500 });
         }
       },
       (error) => {
@@ -4786,7 +4786,7 @@ export function Composer({
       >
         {isDragActive && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-            <span className="text-sm font-medium text-ring">Drop files here</span>
+            <span className="text-ui font-medium text-ring">Drop files here</span>
           </div>
         )}
         {/* Slash-command suggestions — floats above the composer box */}
@@ -4844,7 +4844,7 @@ export function Composer({
               ref={backdropRef}
               aria-hidden
               data-testid="composer-highlight-overlay"
-              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-4 pt-3 pb-2 text-sm text-foreground"
+              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-4 pt-3 pb-2 text-ui text-foreground"
             >
               {(() => {
                 const split = splitSlashCommand(value);
@@ -4926,7 +4926,7 @@ export function Composer({
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
             data-slash-command={composerIsCommand ? "true" : undefined}
             className={cn(
-              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-60",
+              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-ui outline-none placeholder:text-muted-foreground disabled:opacity-60",
               // Hand glyph painting to the overlay while a command is drafted;
               // the caret stays visible via caret-foreground.
               composerIsCommand && "text-transparent caret-foreground",
