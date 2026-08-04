@@ -413,6 +413,43 @@ def claude_model_translator(
     return lambda model: claude_model_alias(model, vocabulary_env)
 
 
+# Opening clause of every routed-spawn instruction. Naming the user's own
+# choice, and framing the block as an approved re-route rather than a refusal,
+# is what gets the model to follow through: a terse denial reads as a dead end
+# and the model abandons the spawn instead of retrying (matrix row A-sub).
+_SMART_ROUTING_PREAMBLE = (
+    "Databricks Smart Routing is enabled for this session: the user chose to "
+    "have each task run on the model best suited to it, and Smart Routing "
+    "picked the model for this one."
+)
+
+
+def routed_spawn_instruction(model: str, harness: str | None = None) -> str:
+    """
+    Build the instruction telling the model how to start a routed sub-task.
+
+    Names ``sys_session_create`` — the tool a routed harness actually holds
+    (``spawn: True`` grants it) — with parameters that exist on its schema.
+    The previous wording pointed at ``sys_session_send``'s named-spawn mode,
+    which a session with no declared sub-agents never advertises, so the
+    instruction could not be followed and the spawn was simply dropped.
+
+    :param model: Model Smart Routing selected, e.g. ``"databricks-glm-5-2"``.
+    :param harness: Harness it runs on, when the pick crosses harnesses.
+    :returns: Deny reason that reads as an approved, actionable re-route.
+    """
+    picked = f"{model} (harness {harness})" if harness else model
+    return (
+        f"{_SMART_ROUTING_PREAMBLE} It selected {picked} for this sub-task, "
+        "which your built-in spawn tool cannot launch. This is not an error "
+        "and the sub-task is approved — start it with sys_session_create "
+        "instead, which does accept the routed model: "
+        f'sys_session_create(agent_id="<id from sys_agent_list>", '
+        f'model="{model}", message="<the task you were about to spawn>"). '
+        "Make that call now, then continue."
+    )
+
+
 def redirect_reason(harness: str, model: str) -> str:
     """
     Build the cross-harness redirect instruction shown to the model.
@@ -421,10 +458,7 @@ def redirect_reason(harness: str, model: str) -> str:
     :param model: Model the router picked.
     :returns: Deny reason telling the model how to respawn correctly.
     """
-    return (
-        f"Router selected {harness}/{model}. Use sys_session_send with "
-        f"args.harness={harness}, args.model={model} instead."
-    )
+    return routed_spawn_instruction(model, harness)
 
 
 def decision_to_hook_output(
@@ -467,7 +501,19 @@ def decision_to_hook_output(
         # A redirect without a target can't be followed — fail open.
         return None
     if action == "deny":
-        return _deny(rationale or "Spawn denied by Omnigent smart routing.")
+        # A bare "denied" leaves the model nowhere to go, so it drops the
+        # sub-task. When the verdict names a model, hand back the same
+        # actionable re-route the redirect path uses.
+        if isinstance(model, str) and model:
+            return _deny(routed_spawn_instruction(model))
+        return _deny(
+            rationale
+            or (
+                f"{_SMART_ROUTING_PREAMBLE} It could not place this sub-task on "
+                "a model your built-in spawn tool can run. Start it with "
+                "sys_session_create instead, or continue the work yourself."
+            )
+        )
     return None
 
 

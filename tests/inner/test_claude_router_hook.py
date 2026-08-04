@@ -203,16 +203,19 @@ def test_redirect_denies_with_sys_session_send_instruction(
             "decision_id": "dec-2",
         },
     )
-    assert out == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                "Router selected codex/other-model. Use sys_session_send with "
-                "args.harness=codex, args.model=other-model instead."
-            ),
-        }
-    }
+    assert out is not None
+    hook_output = out["hookSpecificOutput"]
+    assert hook_output["hookEventName"] == "PreToolUse"
+    assert hook_output["permissionDecision"] == "deny"
+    reason = hook_output["permissionDecisionReason"]
+    # The instruction must name a tool this session actually holds. A
+    # spawn:True harness gets sys_session_create; sys_session_send's
+    # named-spawn mode is never advertised without declared sub-agents, so
+    # naming it produced an unfollowable instruction and the spawn was dropped.
+    assert "sys_session_create" in reason
+    assert "sys_session_send" not in reason
+    assert "other-model" in reason
+    assert "codex" in reason
 
 
 def test_deny_carries_router_rationale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

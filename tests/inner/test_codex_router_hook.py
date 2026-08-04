@@ -201,16 +201,18 @@ def test_redirect_denies_with_sys_session_send_instruction(
 
     out = _route(_payload(), router_dir=tmp_path)
 
-    assert out == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": (
-                "Router selected claude-native/claude-opus-4-8. Use sys_session_send "
-                "with args.harness=claude-native, args.model=claude-opus-4-8 instead."
-            ),
-        }
-    }
+    assert out is not None
+    hook_output = out["hookSpecificOutput"]
+    assert hook_output["hookEventName"] == "PreToolUse"
+    assert hook_output["permissionDecision"] == "deny"
+    reason = hook_output["permissionDecisionReason"]
+    # Names sys_session_create (which a spawn:True harness holds), never
+    # sys_session_send's named-spawn mode — that is absent without declared
+    # sub-agents, so the old wording could not be acted on.
+    assert "sys_session_create" in reason
+    assert "sys_session_send" not in reason
+    assert "claude-opus-4-8" in reason
+    assert "claude-native" in reason
 
 
 def test_deny_uses_router_rationale(
