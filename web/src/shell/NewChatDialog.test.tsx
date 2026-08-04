@@ -3471,22 +3471,28 @@ describe("NewChatLandingScreen Auto harness", () => {
     expect(auto.textContent).toContain("Harness and model picked per task by smart routing");
   });
 
-  it("reads 'Smart Routing' on the composer chip, with the behavior as hover text", () => {
+  it("keeps naming the agent on the composer chip — the routed brain is its knob", () => {
     renderLanding({ smart_routing_enabled: true });
     selectAutoHarness();
     const chip = screen.getByTestId("new-chat-landing-agent-select");
-    expect(chip.textContent).toContain("Smart Routing");
-    // The agent it falls back to must not be named — the router owns the pick.
-    expect(chip.textContent).not.toContain("Polly");
-    expect(chip).toHaveAttribute("title", "Harness and model picked per task by smart routing");
+    // The session still runs as Polly; routing her brain must not rewrite the
+    // whole selection as if top-level Smart Routing had been picked.
+    expect(chip.textContent).toContain("Polly");
+    expect(chip.textContent).not.toContain("Smart Routing");
+    // No router blurb either — that hover text belongs to the top-level pick.
+    expect(chip).not.toHaveAttribute("title");
   });
 
-  it("shows the harness row plus Permissions in the Auto config modal, titled 'Configure Smart Routing'", () => {
+  it("shows the harness row alone in the Auto config modal, still titled 'Configure Polly'", () => {
     renderLanding({ smart_routing_enabled: true });
     selectAutoHarness();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByText("Configure Smart Routing")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-config-permission")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
+      "Configure Polly",
+    );
+    // Select it and that's it: a claude-sdk create carries no permission field,
+    // so a locked Permissions row would be decoration.
+    expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
     // The row that selected Auto stays, reading the pick back — it is how the
     // user switches away without cancelling.
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
@@ -3498,43 +3504,18 @@ describe("NewChatLandingScreen Auto harness", () => {
     expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
   });
 
-  it("locks Permissions to Default — no other mode is selectable", () => {
+  it("keeps the routed brain when the agent's own row is re-picked", () => {
     renderLanding({ smart_routing_enabled: true });
     selectAutoHarness();
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    const permission = screen.getByTestId("new-chat-landing-config-permission");
-    expect(permission.textContent).toContain("Default");
-    expect(permission).toBeDisabled();
-    // A disabled trigger can't open, so no other mode is reachable.
-    openSelect("new-chat-landing-config-permission");
-    expect(screen.queryByRole("option", { name: "Plan" })).toBeNull();
-    expect(screen.queryByRole("option", { name: "Bypass permissions" })).toBeNull();
-  });
-
-  it("ignores a stale non-default mode stored for the auto sentinel", () => {
-    // Nothing writes this key for "auto" anymore, but an older build could have.
-    // It must never be restored — the row is Default, and the create sends no
-    // override, so a stale "plan" can't leak into the router's pick.
-    localStorage.setItem(HARNESS_OPTIONS_KEY, JSON.stringify({ auto: { mode: "plan" } }));
-    renderLanding({ smart_routing_enabled: true });
-    selectAutoHarness();
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    const permission = screen.getByTestId("new-chat-landing-config-permission");
-    expect(permission.textContent).toContain("Default");
-    expect(permission.textContent).not.toContain("Plan");
-  });
-
-  it("leaves Auto via the picker: re-selecting the agent restores its own harness", () => {
-    renderLanding({ smart_routing_enabled: true });
-    selectAutoHarness();
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Smart Routing",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
+    // Re-clicking Polly is a pick of Polly, not a reset of her saved brain — she
+    // was already selected, and the gear row is the way to switch away.
     selectAgent("ag_polly");
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
-    // The Agent Harness row is back, so the full modal is reachable again.
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-harness")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
+      "Smart Routing",
+    );
   });
 
   it("sends harness_override 'auto' with cost_control_mode_override 'on'", async () => {
@@ -3737,6 +3718,47 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-config-harness")).toBeNull();
+  });
+
+  it("locks Permissions to Default — no other mode is selectable", () => {
+    renderLanding({ smart_routing_enabled: true });
+    selectSmartRoutingHarness();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    const permission = screen.getByTestId("new-chat-landing-config-permission");
+    expect(permission.textContent).toContain("Default");
+    expect(permission).toBeDisabled();
+    // A disabled trigger can't open, so no other mode is reachable.
+    openSelect("new-chat-landing-config-permission");
+    expect(screen.queryByRole("option", { name: "Plan" })).toBeNull();
+    expect(screen.queryByRole("option", { name: "Bypass permissions" })).toBeNull();
+  });
+
+  it("ignores a non-default mode remembered for the wrapper it binds", () => {
+    // The placeholder rides claude-native, whose remembered "plan" is live in
+    // state when the row is picked. It must not surface on the locked row, and
+    // must not survive the pick — the create sends no override either way.
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { mode: "plan" } }),
+    );
+    renderLanding({ smart_routing_enabled: true });
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain("Plan");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
+
+    selectSmartRoutingHarness();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    const permission = screen.getByTestId("new-chat-landing-config-permission");
+    expect(permission.textContent).toContain("Default");
+    expect(permission.textContent).not.toContain("Plan");
+    // Reads the state behind the locked row, not the row's own constant: the
+    // wrapper's full modal is back and shows the reset value.
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
+    selectAgent("a1");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
+      "Default",
+    );
   });
 
   it("leaves Smart Routing by re-picking a harness row", () => {
@@ -4102,8 +4124,8 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
   });
 
   it.each(BOTH_BUNDLES)(
-    "keeps %s's harness row on the Smart Routing pick, retitled and with Permissions locked",
-    (_name, agentId) => {
+    "keeps %s's harness row on the Smart Routing pick, and the modal still names the agent",
+    (name, agentId) => {
       renderLanding({ smart_routing_enabled: true });
       draftSmartRouting(agentId);
       // The control that made the pick must not vanish under the cursor: it
@@ -4111,12 +4133,14 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
         "Smart Routing",
       );
-      expect(screen.getByText("Configure Smart Routing")).toBeTruthy();
-      // The router owns the model, so Permissions is all that's left — locked to
-      // Default until a cross-harness permission mapping exists.
-      const permission = screen.getByTestId("new-chat-landing-config-permission");
-      expect(permission.textContent).toContain("Default");
-      expect(permission).toBeDisabled();
+      // The pick is a knob on this agent, so the modal is still hers — only the
+      // top-level Smart Routing harness retitles.
+      expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
+        `Configure ${name}`,
+      );
+      // Select it and that's it: nothing else is decidable, and a claude-sdk
+      // create carries no permission field, so no locked row is offered.
+      expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
       expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
       expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
     },
@@ -4127,7 +4151,7 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     draftSmartRouting("ag_debby");
     pickSelectOption("new-chat-landing-config-harness", "Codex");
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain("Codex");
-    // Back to a decidable harness → the locked Permissions row goes away again.
+    // A brain pick never adds rows, so the row set is the same either way.
     expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
       "Configure Debby",
@@ -4149,16 +4173,19 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     renderLanding({ smart_routing_enabled: true });
     draftSmartRouting("ag_debby");
     saveConfig();
-    // The chip names the router, not the agent it falls back to.
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Smart Routing",
-    );
+    // The chip still names Debby — the routed brain is her knob, not a different
+    // selection. (This is the leak the whole scope fix is about.)
+    const chip = screen.getByTestId("new-chat-landing-agent-select");
+    expect(chip.textContent).toContain("Debby");
+    expect(chip.textContent).not.toContain("Smart Routing");
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByText("Configure Smart Routing")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
+      "Configure Debby",
+    );
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
       "Smart Routing",
     );
-    expect(screen.getByTestId("new-chat-landing-config-permission")).toBeDisabled();
+    expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
   });
 
   it("mirrors the modal's rows in the gear tooltip", async () => {
@@ -4173,7 +4200,9 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     );
     const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
     expect(tooltip.textContent).toContain("Agent Harness: Smart Routing");
-    expect(tooltip.textContent).toContain("Permissions: Default");
+    // The modal has no Permissions row for a routed brain, so the tooltip that
+    // mirrors it must not invent one.
+    expect(tooltip.textContent).not.toContain("Permissions");
   });
 
   it.each(BOTH_BUNDLES)(
@@ -4241,9 +4270,9 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     localStorage.setItem(LAST_AGENT_KEY, "ag_debby");
     localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_debby: "auto" }));
     renderLanding({ smart_routing_enabled: true });
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Smart Routing",
-    );
+    // Restored as Debby-with-a-routed-brain, so the chip is hers; the gear row is
+    // where the restored pick shows.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Debby");
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
       "Smart Routing",
@@ -4265,9 +4294,10 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
-    const chip = screen.getByTestId("new-chat-landing-agent-select");
-    expect(chip.textContent).toContain("Debby");
-    expect(chip.textContent).not.toContain("Smart Routing");
+    // The chip names Debby whether or not the pick degraded (a routed brain never
+    // renames the selection), so it can't carry this test — the gear row and the
+    // create payload below are what pin the degrade.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Debby");
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
       "Claude SDK",
@@ -4282,5 +4312,137 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
       ag_debby: "auto",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The two Smart Routing flavors share a label and must not share a scope. A
+// bundle agent's routed brain (the "auto" sentinel, stored per agent) is a knob
+// on that agent; the top-level Smart Routing harness ("auto-native", riding a
+// placeholder wrapper) replaces the selection outright. These need one fixture
+// carrying both — the two native wrappers AND a bundle agent — so a pick of one
+// flavor can be shown not to move the other.
+// ---------------------------------------------------------------------------
+
+describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () => {
+  const SMART_ROUTING_ROW = "new-chat-landing-harness-smart-routing";
+
+  beforeEach(() => {
+    setupLandingMocks();
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a2",
+        name: "codex-native-ui",
+        display_name: "Codex",
+        description: null,
+        harness: "codex-native",
+        skills: [],
+      },
+      {
+        id: "ag_debby",
+        name: "debby",
+        display_name: "Debby",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  function openPicker(): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  }
+
+  /** Give Debby a routed brain from her gear modal and commit it. */
+  function routeDebbysBrain(): void {
+    openAgentConfig("ag_debby");
+    pickSelectOption("new-chat-landing-config-harness", "Smart Routing");
+    saveConfig();
+  }
+
+  it("routing a bundle agent's brain leaves the top-level harness choice alone", () => {
+    renderLanding({ smart_routing_enabled: true });
+    routeDebbysBrain();
+    // The session is still Debby's — this is the leak the fix closes: keying the
+    // chip on the union of both flavors renamed everything "Smart Routing".
+    const chip = screen.getByTestId("new-chat-landing-agent-select");
+    expect(chip.textContent).toContain("Debby");
+    expect(chip.textContent).not.toContain("Smart Routing");
+    // The top-level row is offered here (both wrappers ready) and was NOT picked.
+    openPicker();
+    expect(screen.getByTestId(SMART_ROUTING_ROW)).not.toHaveAttribute("data-active");
+    closeMenu();
+    // Her brain pick is where it belongs: on her own Agent Harness row.
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
+      "Smart Routing",
+    );
+  });
+
+  it("a plain new chat after that still starts on the native harness", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_native_after_brain" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    routeDebbysBrain();
+    selectAgent("a1");
+    const { body } = await submitAndReadBody();
+    // Nothing of Debby's routed brain rides along with an unrelated harness pick.
+    expect(body.agent_id).toBe("a1");
+    expect(body.harness_override).toBeUndefined();
+    expect(body.cost_control_mode_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+  });
+
+  it("selecting a bundle agent after top-level Smart Routing hands the session to it", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openPicker();
+    fireEvent.click(screen.getByTestId(SMART_ROUTING_ROW));
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+      "Smart Routing",
+    );
+    // The reverse leak: the top-level sentinel must not read as Debby's brain.
+    selectAgent("ag_debby");
+    const chip = screen.getByTestId("new-chat-landing-agent-select");
+    expect(chip.textContent).toContain("Debby");
+    expect(chip.textContent).not.toContain("Smart Routing");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
+      "Claude SDK",
+    );
+    // The sentinel stays filed under the wrapper it bound, never under Debby.
+    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
+      a1: "auto-native",
+    });
+  });
+
+  it("a routed brain survives re-picking the agent's own row", () => {
+    renderLanding({ smart_routing_enabled: true });
+    routeDebbysBrain();
+    // Re-clicking the already-selected agent clears the top-level sentinel (that
+    // modal has no harness row to escape through) but must leave a saved brain
+    // pick alone — the gear row is how you switch that one away.
+    selectAgent("ag_debby");
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Debby");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
+      "Smart Routing",
+    );
   });
 });

@@ -1409,7 +1409,11 @@ function HarnessConfigModal({
   // it has no brainDefault of its own).
   const autoNative = draftHarness === AUTO_NATIVE_HARNESS_ID;
   const autoRouting = autoNative || (brainDefault != null && draftHarness === AUTO_HARNESS_ID);
-  const configTitleName = autoRouting ? SMART_ROUTING_LABEL : agent.display_name;
+  // Only top-level Smart Routing replaces the agent's identity (it rides a
+  // placeholder wrapper, so naming that wrapper would misreport what runs). A
+  // bundle agent's routed brain is a knob on that agent, so the modal keeps its
+  // name: "Configure Debby", not "Configure Smart Routing".
+  const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const claudeModelSelectOptions = useMemo(
     () => claudeModelOptions.map((m) => ({ id: m.id, label: displayModelName(m) })),
@@ -1714,11 +1718,14 @@ function HarnessConfigModal({
             </ConfigRow>
           )}
 
-          {/* Fully-auto: the router owns the model, so Permissions is the last
-          decidable row — and it is locked to Default until a cross-harness
-          permission mapping exists. Default means "send no override", so the
-          picked harness inherits the machine's own Claude Code / Codex config. */}
-          {autoRouting && (
+          {/* Top-level Smart Routing: the router owns the model, so Permissions
+          is the last decidable row — and it is locked to Default until a
+          cross-harness permission mapping exists. Default means "send no
+          override", so the picked harness inherits the machine's own Claude Code
+          / Codex config. A bundle agent's routed brain gets no such row: its
+          create call (claude-sdk) never carries a permission field, so the row
+          would only be decoration on top of the Agent Harness pick. */}
+          {autoNative && (
             <ConfigRow label="Permissions" description="What the agent can do without asking">
               <DescribedSelect
                 value={CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE}
@@ -2411,24 +2418,22 @@ export function NewChatLandingScreen() {
   // Gate on eligibility so a stale "on" (server flag off, or a non-routable
   // agent) never shows misleading routing rows in the tooltip.
   const routingOn = smartRoutingEligible && costControlMode === "on";
-  // Fully-auto: the router owns harness + model, so the tooltip mirrors the
-  // modal and reports only the permission value.
+  // Either fully-auto flavor is active: the router owns harness + model, so the
+  // per-turn routing rows don't apply. Row gating only — this says nothing about
+  // WHOSE session it is. Identity readers (the composer chip, its tooltip, the
+  // modal title) key on `smartRoutingHarnessSelected` instead, because a bundle
+  // agent's routed brain is a knob on that agent, not a different selection.
   const autoRoutingSelected =
     smartRoutingHarnessSelected ||
     (pickedHarness === AUTO_HARNESS_ID &&
       selectedAgent?.harness != null &&
       selectedAgent.harness in brainHarnessLabels);
   const configSummary = useMemo((): { label: string; value: string }[] => {
-    if (autoRoutingSelected) {
-      // A bundle agent keeps its Agent Harness row on the fully-auto pick (it is
-      // the way back out), so mirror it. Permissions is locked to Default in the
-      // modal, so report the constant — never a mode left over in state from a
+    if (smartRoutingHarnessSelected) {
+      // Top-level Smart Routing's modal is the locked Permissions row alone, so
+      // mirror it. Report the constant — never a mode left over in state from a
       // previously selected native harness.
-      const brainRow =
-        pickedHarness === AUTO_HARNESS_ID
-          ? [{ label: "Agent Harness", value: SMART_ROUTING_LABEL }]
-          : [];
-      return [...brainRow, { label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
+      return [{ label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
     }
     if (supportsPermissionMode) {
       const modelValue = routingOn
@@ -2493,7 +2498,7 @@ export function NewChatLandingScreen() {
     }
     return routingRow;
   }, [
-    autoRoutingSelected,
+    smartRoutingHarnessSelected,
     supportsPermissionMode,
     supportsApprovalMode,
     supportsCursorMode,
@@ -2616,12 +2621,14 @@ export function NewChatLandingScreen() {
     autoRoutingSelected,
     setCostControlMode,
   ]);
-  // The Auto Harness pins permissions to Default (no override sent), so entering
-  // fully-auto resets the mode rather than restoring one: nothing is remembered
+  // Top-level Smart Routing pins permissions to Default (no override sent), so
+  // entering it resets the mode rather than restoring one: nothing is remembered
   // for the sentinel, and a value left over from a previously selected native
-  // harness must not ride along into the router's pick.
+  // harness must not ride along into the router's pick. The bundle-agent flavor
+  // is untouched — its create call (claude-sdk) carries no permission field, and
+  // resetting would clobber the mode of whatever native harness comes next.
   useEffect(() => {
-    if (!isAutoHarness(pickedHarness)) return;
+    if (pickedHarness !== AUTO_NATIVE_HARNESS_ID) return;
     setPermissionMode(CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE);
   }, [pickedHarness]);
   // Native-terminal agents interpret slash commands inside their own CLI
@@ -3095,9 +3102,12 @@ export function NewChatLandingScreen() {
     : "Repository";
   // The trigger label is just the agent name; the run-config knobs live in
   // the picker's per-entry submenu, so duplicating their values here would be
-  // redundant. Fully-auto is the exception: the router owns the harness AND the
-  // model, so naming the fallback agent would misreport what runs.
-  const agentLabel = autoRoutingSelected
+  // redundant. Top-level Smart Routing is the exception: it has no agent of its
+  // own (the wrapper it binds is a placeholder), so naming that wrapper would
+  // misreport what runs. A bundle agent whose brain is routed still runs as that
+  // agent, so the chip keeps naming it — the routed brain is a knob, not a
+  // different selection.
+  const agentLabel = smartRoutingHarnessSelected
     ? SMART_ROUTING_LABEL
     : selectedAgent
       ? selectedAgent.display_name
@@ -3152,10 +3162,12 @@ export function NewChatLandingScreen() {
       if (remembered === AUTO_NATIVE_HARNESS_ID) handleSetPickedHarness(null, agent.id);
       else setPickedHarness(remembered);
     }
-    // Re-picking the agent that is currently on an Auto Harness drops back to
-    // its own harness. This is the only way out for top-level Smart Routing,
-    // whose modal has no harness row; a bundle agent can also switch there.
-    else if (isAutoHarness(pickedHarness)) handleSetPickedHarness(null, agent.id);
+    // Re-picking the agent that top-level Smart Routing binds as its placeholder
+    // drops back to that wrapper's own harness — the only way out, since that
+    // modal has no harness row. A bundle agent's routed brain is deliberately
+    // NOT cleared here: it is a saved knob on the agent, and its modal's
+    // always-rendered Agent Harness row is how the user switches away.
+    else if (pickedHarness === AUTO_NATIVE_HARNESS_ID) handleSetPickedHarness(null, agent.id);
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };
@@ -3810,7 +3822,9 @@ export function NewChatLandingScreen() {
                     onSelectPending={handleSelectPending}
                     onCreateCustomAgent={() => setCreateAgentOpen(true)}
                     sandboxSelected={sandboxSelected}
-                    triggerTooltip={autoRoutingSelected ? AUTO_HARNESS_DESCRIPTION : undefined}
+                    triggerTooltip={
+                      smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
+                    }
                     autoHarnessAvailable={smartRoutingHarnessAvailable}
                     autoHarnessActive={smartRoutingHarnessSelected}
                     onSelectAutoHarness={handleSelectSmartRoutingHarness}
