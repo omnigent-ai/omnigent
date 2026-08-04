@@ -751,9 +751,9 @@ def test_position_not_enforced_by_db(
 
     # Neither a same-second nor a later-second duplicate is rejected now: the
     # index is not UNIQUE, and distinct ids keep the PK unique so both persist.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.add(_duplicate_position_row(existing_created_at))
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.add(_duplicate_position_row(existing_created_at + 1))
 
 
@@ -4533,7 +4533,7 @@ def _stored_next_position(
     """Read the raw ``conversations.next_position`` counter for assertions."""
     from omnigent.db.db_models import SqlConversation
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         row = session.get(SqlConversation, (0, conversation_id))
         assert row is not None
         return row.next_position
@@ -4548,7 +4548,7 @@ def _stored_positions(
 
     from omnigent.db.db_models import SqlConversationItem
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         return sorted(
             session.execute(
                 select(SqlConversationItem.position).where(
@@ -4603,7 +4603,7 @@ def test_append_reads_counter_not_max_scan(
     conv = conversation_store.create_conversation()
     conversation_store.append(conv.id, [_user_message("a"), _user_message("b")])
     # Real max position is 1; jump the counter ahead to 100.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.get(SqlConversation, (0, conv.id)).next_position = 100
 
     conversation_store.append(conv.id, [_user_message("c")])
@@ -4629,7 +4629,7 @@ def test_append_falls_back_to_scan_when_counter_null(
     if preexisting:
         conversation_store.append(conv.id, [_user_message(f"pre{i}") for i in range(preexisting)])
     # Simulate a pre-counter row: clear the maintained counter.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.get(SqlConversation, (0, conv.id)).next_position = None
     assert _stored_next_position(conversation_store, conv.id) is None
 
@@ -5179,7 +5179,7 @@ def _stored_item_data(store: SqlAlchemyConversationStore, conversation_id: str) 
 
     from omnigent.db.db_models import SqlConversationItem
 
-    with store._conv_session() as session:
+    with store._conv_session("test_setup") as session:
         return list(
             session.execute(
                 select(SqlConversationItem.data)
@@ -5294,7 +5294,7 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
         ],
     )
 
-    with store._conv_session() as session:
+    with store._conv_session("test_setup") as session:
         stored = list(
             session.execute(
                 select(SqlConversationItem.search_text).where(

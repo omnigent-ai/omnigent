@@ -2561,6 +2561,7 @@ async def test_get_session_includes_runner_online(
 
 async def test_get_session_slim_skips_items_and_liveness(
     client: httpx.AsyncClient,
+    db_uri: str,
 ) -> None:
     """
     ``GET /v1/sessions/{id}?include_items=false&include_liveness=false``
@@ -2579,6 +2580,8 @@ async def test_get_session_slim_skips_items_and_liveness(
     session = await _create_session(client, agent["id"], initial_message="hello")
     session_id = session["id"]
     await _wait_for_idle(client, session_id)
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert stored is not None
 
     slim = await client.get(
         f"/v1/sessions/{session_id}",
@@ -2587,6 +2590,7 @@ async def test_get_session_slim_skips_items_and_liveness(
     assert slim.status_code == 200
     slim_body = slim.json()
     assert slim_body["id"] == session_id
+    assert slim_body["updated_at"] == stored.updated_at
     # Items read skipped — empty list, not an absent field, so clients
     # that parse `items ?? []` see the same shape either way.
     assert slim_body["items"] == []
