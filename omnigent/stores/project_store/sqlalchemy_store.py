@@ -73,8 +73,8 @@ def _is_name_conflict(exc: IntegrityError) -> bool:
     integrity failure (unexpected PK collision, NOT NULL, etc.) must surface
     as itself rather than a misleading "already exists". Drivers name the hit
     constraint differently: Postgres reports the index name (``ix_projects_name``)
-    while SQLite lists the columns (``...owner_user_id, projects.name``). Match
-    either signature, keyed on the ``name`` column that is unique to this index.
+    while SQLite lists the columns (``...user_id, projects.name``). Match either
+    signature, keyed on the ``name`` column that is unique to this index.
     """
     message = str(exc.orig)
     return "ix_projects_name" in message or "projects.name" in message
@@ -90,7 +90,7 @@ def _to_entity(row: SqlProject) -> Project:
     return Project(
         id=row.id,
         name=row.name,
-        owner_user_id=row.owner_user_id,
+        user_id=row.user_id,
         created_at=row.created_at,
         updated_at=row.updated_at,
         config=_decode_config(row.config),
@@ -102,7 +102,7 @@ class SqlAlchemyProjectStore(ProjectStore):
     SQLAlchemy-backed implementation of :class:`ProjectStore`.
 
     Persists projects in a relational database via the SQLAlchemy ORM. Every
-    query is scoped by ``workspace_id`` (tenant partition) and ``owner_user_id``
+    query is scoped by ``workspace_id`` (tenant partition) and ``user_id``
     (projects are owner-private).
     """
 
@@ -127,25 +127,25 @@ class SqlAlchemyProjectStore(ProjectStore):
         self,
         session: Session,
         *,
-        owner_user_id: str | None,
+        user_id: str | None,
         name: str,
         exclude_id: str | None,
     ) -> bool:
-        """Return whether ``owner_user_id`` already has a project named ``name``.
+        """Return whether ``user_id`` already has a project named ``name``.
 
         Enforces per-owner name uniqueness in the store because a DB unique
-        index cannot: ``owner_user_id`` is NULL in single-user mode and SQL
-        treats NULLs as distinct, so null-owner rows would never collide.
+        index cannot: ``user_id`` is NULL in single-user mode and SQL treats
+        NULLs as distinct, so null-owner rows would never collide.
 
         :param session: The active SQLAlchemy session.
-        :param owner_user_id: The owner scope.
+        :param user_id: The owner scope.
         :param name: The candidate name.
         :param exclude_id: A project id to exclude (the row being renamed).
         :returns: ``True`` if another of the owner's projects has this name.
         """
         stmt = select(SqlProject.id).where(
             SqlProject.workspace_id == current_workspace_id(),
-            SqlProject.owner_user_id == owner_user_id,
+            SqlProject.user_id == user_id,
             SqlProject.name == name,
         )
         if exclude_id is not None:
@@ -156,7 +156,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         self,
         project_id: str,
         name: str,
-        owner_user_id: str | None,
+        user_id: str | None,
         config: dict[str, Any] | None = None,
     ) -> Project:
         """Insert a new, empty project.
@@ -170,7 +170,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         re-raised untranslated.
         """
         with self._session("insert_project") as session:
-            if self._name_taken(session, owner_user_id=owner_user_id, name=name, exclude_id=None):
+            if self._name_taken(session, user_id=user_id, name=name, exclude_id=None):
                 raise OmnigentError(
                     f"A project named {name!r} already exists",
                     code=ErrorCode.ALREADY_EXISTS,
@@ -178,7 +178,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             row = SqlProject(
                 id=project_id,
                 name=name,
-                owner_user_id=owner_user_id,
+                user_id=user_id,
                 created_at=now_epoch(),
                 updated_at=None,
                 config=_encode_config(config),
@@ -195,21 +195,21 @@ class SqlAlchemyProjectStore(ProjectStore):
                 ) from exc
             return _to_entity(row)
 
-    def get(self, project_id: str, *, owner_user_id: str | None) -> Project | None:
+    def get(self, project_id: str, *, user_id: str | None) -> Project | None:
         """Return an owned project by id, or ``None`` if not found."""
         with self._session("select_project_by_id") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
-            if row is None or row.owner_user_id != owner_user_id:
+            if row is None or row.user_id != user_id:
                 return None
             return _to_entity(row)
 
-    def list(self, *, owner_user_id: str | None) -> list[Project]:
+    def list(self, *, user_id: str | None) -> list[Project]:
         """List the owner's projects ordered by ``created_at ASC, id ASC``."""
         with self._session("list_projects") as session:
             stmt = (
                 select(SqlProject)
                 .where(SqlProject.workspace_id == current_workspace_id())
-                .where(SqlProject.owner_user_id == owner_user_id)
+                .where(SqlProject.user_id == user_id)
                 .order_by(asc(SqlProject.created_at), asc(SqlProject.id))
             )
             rows = session.execute(stmt).scalars().all()
@@ -219,25 +219,23 @@ class SqlAlchemyProjectStore(ProjectStore):
         self,
         project_id: str,
         *,
-        owner_user_id: str | None,
+        user_id: str | None,
         name: str | None = None,
         config: dict[str, Any] | None = None,
     ) -> Project | None:
         """Update mutable fields of an owned project.
 
         ``None`` leaves a field unchanged. Returns ``None`` if the project does
-        not exist or is not owned by ``owner_user_id``. A ``config`` of ``{}``
-        clears the stored defaults (distinct from ``None`` = leave unchanged).
+        not exist or is not owned by ``user_id``. A ``config`` of ``{}`` clears
+        the stored defaults (distinct from ``None`` = leave unchanged).
         """
         with self._session("update_project") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
-            if row is None or row.owner_user_id != owner_user_id:
+            if row is None or row.user_id != user_id:
                 return None
             changed = False
             if name is not None and row.name != name:
-                if self._name_taken(
-                    session, owner_user_id=owner_user_id, name=name, exclude_id=project_id
-                ):
+                if self._name_taken(session, user_id=user_id, name=name, exclude_id=project_id):
                     raise OmnigentError(
                         f"A project named {name!r} already exists",
                         code=ErrorCode.ALREADY_EXISTS,
@@ -264,11 +262,11 @@ class SqlAlchemyProjectStore(ProjectStore):
                 ) from exc
             return _to_entity(row)
 
-    def delete(self, project_id: str, *, owner_user_id: str | None) -> bool:
+    def delete(self, project_id: str, *, user_id: str | None) -> bool:
         """Delete an owned project. Idempotent; returns ``False`` if not found."""
         with self._session("delete_project") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
-            if row is None or row.owner_user_id != owner_user_id:
+            if row is None or row.user_id != user_id:
                 return False
             session.delete(row)
             return True
