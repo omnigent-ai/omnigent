@@ -346,6 +346,10 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       content: p.content,
+      // The send's wire position, so `mergePendingBubbles` can place the
+      // bubble instead of trailing it. Undefined on snapshot-replayed and
+      // stash-restored entries, which carry no position.
+      ...(p.anchorIndex !== undefined ? { blockStart: p.anchorIndex } : {}),
       ...(author !== null ? { createdBy: author } : {}),
     };
   });
@@ -407,18 +411,37 @@ export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble
 
 // Place optimistic pending user bubbles into the committed timeline.
 //
-// Pending sends normally trail everything (the input should be visible
-// immediately, and they migrate into `blocks` once their
-// `session.input.consumed` event lands). The exception is a REQUEST-phase
-// policy ASK: that message never gets a consumed event until approval, so
-// it stays pending while its elicitation card renders as a committed
-// bubble — appending the pending bubble after the card would show the
-// approval prompt ABOVE the message that triggered it. When the timeline
-// ends in a run of such request-elicitation bubbles, splice the pending
-// bubbles in just before that run so the prompt stays on top.
+// A pending send belongs at the position it had on the wire, not at the
+// bottom. The two are the same whenever nothing commits between the POST
+// and `session.input.consumed` — but a smart-routed turn holds that ack
+// across the router call and the runner forward, so the routing card and
+// the first reply tokens commit first and a trailing bubble would render
+// the message UNDER the answer to it (issue #3983). `blockStart` carries
+// the block count at send time (`PendingUserMessage.anchorIndex`), so
+// splice in ahead of the first committed bubble built from a later block.
+// The store applies the same position when the ack finally promotes the
+// message, so the bubble doesn't move on promotion.
+//
+// Entries with no `blockStart` (snapshot-replayed, stash-restored) keep
+// the historical trailing behaviour.
+//
+// Layered on top: a REQUEST-phase policy ASK never gets a consumed event
+// until approval, so it stays pending while its elicitation card renders
+// as a committed bubble — leaving the pending bubble after the card would
+// show the approval prompt ABOVE the message that triggered it. When the
+// insertion point is preceded by a run of such request-elicitation
+// bubbles, walk back past them so the prompt stays on top.
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
+  // Position the group by its FIFO head: promotion is FIFO, so the head is
+  // the entry about to commit, and near-simultaneous sends stay contiguous
+  // rather than being scattered by one block each.
+  const anchor = pending[0]!.blockStart;
+  if (anchor !== undefined) {
+    const at = committed.findIndex((b) => b.blockStart !== undefined && b.blockStart >= anchor);
+    if (at !== -1) insertAt = at;
+  }
   while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }

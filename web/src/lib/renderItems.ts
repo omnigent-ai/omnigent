@@ -118,9 +118,24 @@ export type RenderItem =
       rememberScope?: RememberScope | null;
     };
 
+/**
+ * Index of the first block this bubble was built from.
+ *
+ * Lets a caller place something at a known BLOCK position into the
+ * BUBBLE list — specifically, `ChatPage` splices an optimistic user
+ * bubble in at the wire position recorded on its pending entry
+ * (`PendingUserMessage.anchorIndex`), so the message renders above the
+ * turn it started even before its `session.input.consumed` lands
+ * (issue #3983). Absent on bubbles that don't come from a block, i.e.
+ * the optimistic ones the page builds itself.
+ */
+interface BubblePosition {
+  blockStart?: number;
+}
+
 /** A bubble cluster. The page maps over these. */
 export type Bubble =
-  | {
+  | ({
       kind: "user";
       itemId: string;
       content: MessageContentBlock[];
@@ -133,8 +148,8 @@ export type Bubble =
        * optimistic→committed swap (no remount/flink).
        */
       stableKey?: string;
-    }
-  | {
+    } & BubblePosition)
+  | ({
       kind: "assistant";
       responseId: string;
       // Stable, sibling-unique identifier for React keying
@@ -165,17 +180,17 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
-    }
-  | { kind: "compaction_loading"; itemId: string }
-  | { kind: "compaction"; itemId: string }
-  | {
+    } & BubblePosition)
+  | ({ kind: "compaction_loading"; itemId: string } & BubblePosition)
+  | ({ kind: "compaction"; itemId: string } & BubblePosition)
+  | ({
       kind: "routing_decision";
       itemId: string;
       model: string;
       applied: boolean;
       rationale: string;
       agent?: string;
-    };
+    } & BubblePosition);
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
 const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "reasoning_block"]);
@@ -540,6 +555,7 @@ function walkBubbles(
       lastBubbleStart = i;
       bubbles.push({
         kind: "user",
+        blockStart: i,
         itemId: b.ctx.itemId ?? `user_${i}`,
         content: b.content,
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
@@ -555,6 +571,7 @@ function walkBubbles(
       lastBubbleStart = i;
       bubbles.push({
         kind: "compaction_loading",
+        blockStart: i,
         itemId: b.ctx.itemId ?? `compaction_loading_${i}`,
       });
       i += 1;
@@ -575,6 +592,7 @@ function walkBubbles(
       lastBubbleStart = i;
       bubbles.push({
         kind: "compaction",
+        blockStart: i,
         itemId: b.ctx.itemId ?? `compaction_${i}`,
       });
       i += 1;
@@ -587,6 +605,7 @@ function walkBubbles(
       lastBubbleStart = i;
       bubbles.push({
         kind: "routing_decision",
+        blockStart: i,
         itemId: b.ctx.itemId ?? `routing_${i}`,
         model: b.model,
         applied: b.applied,
@@ -686,6 +705,7 @@ function walkBubbles(
     const lastActivityAtS = turnLastActivityAtS(groupBlocks);
     bubbles.push({
       kind: "assistant",
+      blockStart: groupStart,
       responseId: groupResponseId,
       stableId,
       lifecycle,

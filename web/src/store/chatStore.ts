@@ -148,6 +148,19 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /**
+   * The message's wire position: how many blocks were committed when it
+   * was sent. The optimistic bubble renders at the bottom of the
+   * transcript, but the promoted block belongs HERE — before everything
+   * the send itself caused — so the consumed handler splices it in at
+   * this index instead of appending (see the consumed handler and
+   * {@link commitUserBlockInPlace}).
+   *
+   * Unset on snapshot-replayed entries and on bubbles restored from the
+   * navigate-back stash: those carry no position relative to the blocks
+   * array they land in, so they fall back to append-on-consumed.
+   */
+  anchorIndex?: number;
 }
 
 /**
@@ -1231,7 +1244,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({
       pendingUserMessages: [
         ...s.pendingUserMessages,
-        { tempId, content, ...(selfAuthor !== null ? { author: selfAuthor } : {}) },
+        {
+          tempId,
+          content,
+          anchorIndex: s.blocks.length,
+          ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+        },
       ],
       // A new turn supersedes the prior turn's background-shell tally: the
       // "N background tasks still running" label must give way to "Working…" the
@@ -1425,6 +1443,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         {
           tempId,
           content: [{ type: "input_text" as const, text: commandText }],
+          anchorIndex: s.blocks.length,
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
         },
       ],
@@ -1609,9 +1628,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // Stashing a settled bubble is what stranded image-only messages
         // forever (committed while away + consumed event missed → no
         // pending_inputs entry left, no text for the dedupe to match).
-        const own = s.pendingUserMessages.filter(
-          (p) => p.tempId.startsWith("pend_") && p.posted !== true,
-        );
+        // `anchorIndex` is an index into THIS session's blocks array, which
+        // the switch below clears — drop it so a restored bubble can't
+        // splice itself into an unrelated position on navigate-back. A
+        // stash-restored bubble appends on consumption, as before.
+        const own = s.pendingUserMessages
+          .filter((p) => p.tempId.startsWith("pend_") && p.posted !== true)
+          .map(({ anchorIndex: _droppedAnchor, ...rest }) => rest);
         if (own.length > 0) {
           // Capture the committed user texts present NOW as the dedup
           // baseline: on navigate-back only committed messages new since this
@@ -3735,7 +3758,16 @@ export async function pumpStreamEvents(
         );
       }
       if (fresh.length === 0) return extra ?? {};
-      return { ...(extra ?? {}), blocks: [...s.blocks, ...fresh] };
+      // Read the active response from THIS commit's patch when it carries
+      // one (the `response_start` flush sets it alongside its blocks), else
+      // from current state — so a card batched with its own turn opening
+      // still sees a streaming turn to anchor to.
+      const active = extra?.activeResponse !== undefined ? extra.activeResponse : s.activeResponse;
+      const streamingResponseId = active?.state === "streaming" ? active.responseId : null;
+      return {
+        ...(extra ?? {}),
+        blocks: appendInWireOrder(s.blocks, fresh, streamingResponseId),
+      };
     });
   };
 
@@ -3958,6 +3990,102 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
 
 function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
+}
+
+/**
+ * Append streamed blocks, keeping each routing-decision card at the head
+ * of the turn it describes.
+ *
+ * The server publishes the card only after the blocking router call and
+ * the runner forward, so on a routed turn it can lose the race against
+ * the first deltas of the very response it routed. Appended where it
+ * lands, it splits the reply: `renderItems` starts a new bubble group on
+ * `routing_decision`, so the same response paints as text, then the
+ * card, then a second bubble that reads as the stream restarting
+ * (issue #3983). Slot the card in ahead of the contiguous run of blocks
+ * already committed for its own response instead — the position the
+ * persisted order gives it.
+ *
+ * Only a card belonging to the response that is CURRENTLY STREAMING is
+ * moved, and that guard is load-bearing rather than defensive. The
+ * server publishes the chip with no `response_id` on the wire, so
+ * `blockStream` stamps it with whatever `state.responseId` holds — which
+ * between turns is still the PREVIOUS turn's id. A card that arrives
+ * ahead of its own `response.created` (the intended, non-racing order)
+ * therefore carries the prior turn's id, and walking back on that would
+ * hoist it above the prior turn's reply. Requiring a streaming match
+ * confines the walk to the turn the card actually routed.
+ *
+ * The walk additionally stops at the first block of another response (or
+ * a user message, whose responseId is ""), so a card can never jump a
+ * turn boundary; a card that already leads its turn is left untouched.
+ *
+ * @param blocks - Current committed blocks.
+ * @param fresh - Newly streamed blocks to commit.
+ * @param streamingResponseId - Id of the response currently streaming, or null when none is.
+ * @returns The new blocks array.
+ */
+export function appendInWireOrder(
+  blocks: AnyBlock[],
+  fresh: AnyBlock[],
+  streamingResponseId: string | null,
+): AnyBlock[] {
+  const out = [...blocks, ...fresh];
+  if (streamingResponseId === null) return out;
+  for (const block of fresh) {
+    if (block.type !== "routing_decision") continue;
+    const responseId = block.ctx.responseId;
+    if (!responseId || responseId !== streamingResponseId) continue;
+    // Re-find the card: an earlier hoist in this batch may have moved it.
+    const card = out.lastIndexOf(block);
+    let at = card;
+    while (at > 0 && out[at - 1]!.ctx.responseId === responseId) at -= 1;
+    if (at === card) continue;
+    out.splice(card, 1);
+    out.splice(at, 0, block);
+  }
+  return out;
+}
+
+/**
+ * Commit a promoted user block at the position its message occupied on
+ * the wire, and keep the still-optimistic bubbles anchored.
+ *
+ * Appending on consumption puts the message below everything that
+ * committed while it was optimistic — and on a smart-routed turn that
+ * window spans the router LLM call and the runner forward, so the reply
+ * starts streaming (and the routing card lands) before the message is
+ * promoted. Appending then freezes that inversion into the live view:
+ * the user's own message renders under the answer to it until reload.
+ * Splicing at `anchorIndex` (the block count at send time) puts it back
+ * where the persisted order has it. See issue #3983.
+ *
+ * Promotions are FIFO, so a burst of sends shares an anchor; each splice
+ * shifts the anchors at or after it by one, keeping the burst in order.
+ *
+ * @param blocks - Current committed blocks.
+ * @param pending - Optimistic bubbles remaining AFTER removing the promoted one.
+ * @param block - The committed user block to place.
+ * @param anchorIndex - The promoted message's wire position, or undefined to append.
+ */
+function commitUserBlockInPlace(
+  blocks: AnyBlock[],
+  pending: PendingUserMessage[],
+  block: UserMessageBlock,
+  anchorIndex: number | undefined,
+): { blocks: AnyBlock[]; pendingUserMessages: PendingUserMessage[] } {
+  if (anchorIndex === undefined) {
+    return { blocks: [...blocks, block], pendingUserMessages: pending };
+  }
+  const at = Math.min(Math.max(anchorIndex, 0), blocks.length);
+  return {
+    blocks: [...blocks.slice(0, at), block, ...blocks.slice(at)],
+    pendingUserMessages: pending.map((p) =>
+      p.anchorIndex !== undefined && p.anchorIndex >= at
+        ? { ...p, anchorIndex: p.anchorIndex + 1 }
+        : p,
+    ),
+  };
 }
 
 /**
@@ -4606,7 +4734,31 @@ export function handleSessionEvent(event: StreamEvent): void {
       //   3. No pending entry — render the event payload as a fresh
       //      committed bubble (TUI-typed message, or another client).
       useChatStore.setState((s) => {
-        if (hasCommittedItem(s.blocks, event.itemId)) return {};
+        // Already committed (a snapshot merge or the native transcript
+        // relay won the race). The block is in place, but the optimistic
+        // bubble is NOT — and no second consumed event is coming, so
+        // returning here without popping it strands the user's message at
+        // the bottom of the transcript for the rest of the session
+        // (issue #3983). Pop the entry this event names, by the same
+        // id-then-FIFO precedence used below.
+        if (hasCommittedItem(s.blocks, event.itemId)) {
+          const clearedId = event.clearedPendingId;
+          const namedIdx = clearedId
+            ? s.pendingUserMessages.findIndex((p) => p.tempId === clearedId)
+            : -1;
+          // Fall back to the FIFO head exactly as branch 2 does: a named id
+          // we don't hold is the normal shape of the race this branch exists
+          // for (the POST hasn't returned the server id to adopt yet), NOT
+          // evidence that the bubble belongs to someone else.
+          const strandedIdx = namedIdx >= 0 ? namedIdx : s.pendingUserMessages.length > 0 ? 0 : -1;
+          if (strandedIdx < 0) return {};
+          return {
+            pendingUserMessages: [
+              ...s.pendingUserMessages.slice(0, strandedIdx),
+              ...s.pendingUserMessages.slice(strandedIdx + 1),
+            ],
+          };
+        }
 
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;
@@ -4616,23 +4768,19 @@ export function handleSessionEvent(event: StreamEvent): void {
             const matched = s.pendingUserMessages[idx]!;
             const content = committedContentFor(event, matched.content);
             if (content === null) return {};
-            return {
-              pendingUserMessages: [
-                ...s.pendingUserMessages.slice(0, idx),
-                ...s.pendingUserMessages.slice(idx + 1),
-              ],
+            return commitUserBlockInPlace(
+              s.blocks,
+              [...s.pendingUserMessages.slice(0, idx), ...s.pendingUserMessages.slice(idx + 1)],
               // stableKey = the optimistic bubble's temp id → the
               // promoted bubble keeps the same React key (no remount).
-              blocks: [
-                ...s.blocks,
-                committedUserBlock(
-                  event.itemId,
-                  content,
-                  matched.tempId,
-                  event.createdBy ?? matched.author,
-                ),
-              ],
-            };
+              committedUserBlock(
+                event.itemId,
+                content,
+                matched.tempId,
+                event.createdBy ?? matched.author,
+              ),
+              matched.anchorIndex,
+            );
           }
         }
 
@@ -4641,20 +4789,14 @@ export function handleSessionEvent(event: StreamEvent): void {
         if (head) {
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
-          return {
-            pendingUserMessages: s.pendingUserMessages.slice(1),
+          return commitUserBlockInPlace(
+            s.blocks,
+            s.pendingUserMessages.slice(1),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
-            blocks: [
-              ...s.blocks,
-              committedUserBlock(
-                event.itemId,
-                content,
-                head.tempId,
-                event.createdBy ?? head.author,
-              ),
-            ],
-          };
+            committedUserBlock(event.itemId, content, head.tempId, event.createdBy ?? head.author),
+            head.anchorIndex,
+          );
         }
 
         // 3. Nothing pending — render the event payload fresh.
