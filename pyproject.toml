@@ -486,9 +486,10 @@ extend-exclude = [
 # ``RET``      — flake8-return (consistent return statements)
 # ``C4``       — flake8-comprehensions (cleaner list/dict/set comprehensions)
 # ``PIE``      — flake8-pie (misc correctness + style)
+# ``LOG``      — flake8-logging (correct exception and logger usage)
 # ``RUF``      — ruff-specific (sorted ``__all__``, dangling asyncio
 #                tasks, unused noqa, ...)
-select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "RUF"]
+select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "LOG", "RUF"]
 ignore = [
     # ARG003 (unused class-method args): too noisy on ABC-subclass signatures
     # where the arg is required by the interface contract.

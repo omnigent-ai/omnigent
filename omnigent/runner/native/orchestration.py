@@ -5244,7 +5244,7 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         JSON error responses. The message is a fixed, client-safe string;
         the raw cause is logged for operators, not surfaced to the caller.
     """
-    _logger.warning("Native %s terminal start failed: %s", runtime_name, exc, exc_info=True)
+    _logger.warning("Native %s terminal start failed: %s", runtime_name, exc, exc_info=exc)
     if IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of "see runner logs".

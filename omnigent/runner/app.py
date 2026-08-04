@@ -307,7 +307,7 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         e.g. ``"harness spawn"``. Appears only in the server log.
     :returns: A fixed, non-sensitive string safe to return to clients.
     """
-    _logger.warning("%s failed: %s", context, exc, exc_info=True)
+    _logger.warning("%s failed: %s", context, exc, exc_info=exc)
     return "Request failed on the runner; see runner logs for details."
 
 
