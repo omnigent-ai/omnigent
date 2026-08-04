@@ -349,9 +349,11 @@ describe("Sidebar session list", () => {
     expect(search).toHaveAttribute("aria-label", "Search");
     expect(search).toHaveAttribute("data-size", "icon-xs");
     expect(search).toHaveClass("size-6");
+    expect(search.querySelector("svg")).toHaveClass("ui-icon");
     expect(settings).toHaveAttribute("aria-label", "Settings");
     expect(settings).toHaveAttribute("data-size", "icon-xs");
     expect(settings).toHaveClass("size-6");
+    expect(settings.querySelector("svg")).toHaveClass("ui-icon");
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6");
@@ -583,8 +585,8 @@ describe("Sidebar session list", () => {
       // (bg-popover surface), not the old wide card.
       expect(tooltip.className).toContain("bg-popover");
       expect(tooltip.className).not.toContain("bg-card-solid");
-      // The title is sized to match the sidebar row name
-      // (`sidebar-compact-text`, 13px at the default), not the larger text-sm.
+      // The title matches sidebar row names through the shared compact class,
+      // which resolves to the same text-ui step as Appearance content.
       const tooltipTitle = tooltip.querySelector("p.sidebar-compact-text");
       expect(tooltipTitle).not.toBeNull();
       expect(tooltipTitle).toHaveTextContent(title);

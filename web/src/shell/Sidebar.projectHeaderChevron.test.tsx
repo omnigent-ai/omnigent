@@ -13,7 +13,7 @@
 //      hover-revealed trailing chevron and does NOT swap an icon.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -127,9 +127,8 @@ describe("project folder header icon/chevron", () => {
     renderSidebar();
     const header = headerButton("My Project");
 
-    // Project folders are real rows, not muted section labels: use a 26px row
-    // (20px line + 3px vertical padding), 8px insets/gap, and regular 13px
-    // foreground text.
+    // Project folders are real rows, not muted section labels: use the shared
+    // text-ui compact treatment with 8px insets/gap and foreground text.
     expect(header).toHaveClass(
       "gap-2",
       "rounded-[var(--radius-otto-button)]",
@@ -176,13 +175,33 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
+  it("centers an empty-project message in an outlined container aligned to the title", () => {
+    renderSidebar();
+    fireEvent.click(headerButton("My Project"));
+
+    const empty = screen.getByText("No sessions");
+    expect(empty).toHaveClass(
+      "ml-8",
+      "mr-2",
+      "min-h-9",
+      "justify-center",
+      "rounded-xl",
+      "border",
+      "border-dashed",
+      "text-center",
+      "text-ui",
+    );
+    expect(empty).not.toHaveClass("text-xs");
+  });
+
   it("leaves iconless section headers with a hover-revealed trailing chevron and no swap", () => {
     renderSidebar();
     // The "Projects" group header carries no leading icon.
     const header = headerButton("Projects");
 
-    // The parent section label remains the compact muted caption tier.
-    expect(header).toHaveClass("gap-1", "pb-2", "pl-2", "text-xs", "leading-4");
+    // The parent section label uses the settings-scaled subtitle tier.
+    expect(header).toHaveClass("gap-1", "pb-2", "pl-2", "text-sm", "font-normal");
+    expect(header).not.toHaveClass("font-medium", "text-caption", "uppercase");
 
     expect(header.querySelector(".lucide-folder")).toBeNull();
 

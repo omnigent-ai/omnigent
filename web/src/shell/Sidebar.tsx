@@ -718,7 +718,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
                     data-testid="sidebar-search-button"
                   >
-                    <SearchIcon className="size-4" />
+                    <SearchIcon className="ui-icon" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Search</TooltipContent>
@@ -735,7 +735,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     {/* No onNavClick: on mobile, entering Settings keeps the
                     drawer open and swaps it to the section list. */}
                     <Link to="/settings" data-testid="settings-button">
-                      <SettingsIcon className="size-4" />
+                      <SettingsIcon className="ui-icon" />
                     </Link>
                   </Button>
                 </TooltipTrigger>
@@ -754,7 +754,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
                     covers the collapsed state). */}
-                    <PanelRightOpenIcon className="size-4" />
+                    <PanelRightOpenIcon className="ui-icon" />
                   </Button>
                 </TooltipTrigger>
                 {/* Bottom placement keeps the tooltip clear of the macOS
@@ -794,7 +794,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   onNavClick(e);
                 }}
               >
-                <SquarePenIcon className="size-3.5 text-muted-foreground" />
+                <SquarePenIcon className="ui-icon text-muted-foreground" />
                 New session
               </Link>
             </Button>
@@ -813,7 +813,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               data-testid="scheduled-tasks-nav"
             >
               <Link to="/tasks" onClick={onNavClick}>
-                <ClockIcon className="size-3.5 text-muted-foreground" />
+                <ClockIcon className="ui-icon text-muted-foreground" />
                 Automations
               </Link>
             </Button>
@@ -828,7 +828,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               data-testid="inbox-button"
             >
               <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon className="size-3.5 text-muted-foreground" />
+                <InboxIcon className="ui-icon text-muted-foreground" />
                 Inbox
                 {inboxCount > 0 && (
                   <span
@@ -1076,9 +1076,9 @@ function ProjectFolder({
         title={name}
         icon={
           expanded ? (
-            <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
+            <FolderOpenIcon className="ui-icon text-muted-foreground" />
           ) : (
-            <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+            <FolderIcon className="ui-icon text-muted-foreground" />
           )
         }
         marker={marker}
@@ -1940,7 +1940,7 @@ function ConversationList({
           a compact card showing the session's title. */}
         <DragOverlay dropAnimation={null}>
           {activeDrag ? (
-            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-sm shadow-lg">
+            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-lg">
               {activeDrag.label}
             </div>
           ) : null}
@@ -2084,7 +2084,7 @@ function SectionHeader({
                 "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
               )} sidebar-compact-text text-foreground`
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
       >
         {icon ? (
@@ -2348,7 +2348,13 @@ function ConversationSection({
         <>
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty (e.g. a project with no loaded chats).
-            <p className={cn("px-2 py-1 text-muted-foreground text-xs", indentRows && "pl-5")}>
+            <p
+              className={cn(
+                indentRows
+                  ? "mt-1 mr-2 ml-8 flex min-h-9 items-center justify-center rounded-xl border border-dashed border-border px-3 py-2 text-center text-ui text-muted-foreground"
+                  : "px-2 py-1 text-xs text-muted-foreground",
+              )}
+            >
               {emptyMessage}
             </p>
           ) : (
@@ -3434,7 +3440,7 @@ function ConversationRow({
                 Optionally clean up the git worktree. These actions are{" "}
                 <span className="font-semibold text-destructive">irreversible</span>.
               </p>
-              <label className="flex cursor-pointer items-start gap-2 text-sm">
+              <label className="flex cursor-pointer items-start gap-2 text-ui">
                 <input
                   type="checkbox"
                   data-testid="delete-branch-checkbox"
@@ -3490,7 +3496,7 @@ function ConversationRow({
             </DialogDescription>
           </DialogHeader>
           {stopSession.isError && (
-            <p className="text-sm text-destructive" role="alert">
+            <p className="text-ui text-destructive" role="alert">
               Couldn't stop the session
               {stopSession.error instanceof Error && stopSession.error.message
                 ? `: ${stopSession.error.message}`
@@ -3591,7 +3597,7 @@ function DeletingRow({
   if (isError) {
     return (
       <div
-        className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-sm"
+        className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-ui"
         data-testid="conversation-delete-failed"
         role="alert"
       >
@@ -3647,7 +3653,7 @@ function DeletingRow({
 function ArchivingRow({ label }: { label: string }) {
   return (
     <div
-      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-sm text-muted-foreground opacity-70"
+      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-ui text-muted-foreground opacity-70"
       data-testid="conversation-archiving"
       aria-live="polite"
     >
@@ -3829,12 +3835,12 @@ function ProjectFolderMenu({
           >
             <input
               autoFocus
-              className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none"
+              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
               value={renameValue}
               onChange={(e) => setRenameValue(e.target.value)}
             />
             {renameProject.isError && (
-              <p className="text-sm text-destructive" role="alert">
+              <p className="text-ui text-destructive" role="alert">
                 {(renameProject.error as Error).message}
               </p>
             )}
@@ -3881,7 +3887,7 @@ function ProjectFolderMenu({
             </DialogDescription>
           </DialogHeader>
           {deleteProject.isError && (
-            <p className="text-sm text-destructive" role="alert">
+            <p className="text-ui text-destructive" role="alert">
               Some sessions couldn't be archived (you may not own them); the rest were archived.
             </p>
           )}
