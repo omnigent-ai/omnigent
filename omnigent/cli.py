@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import copy
 import hashlib
@@ -14,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -7475,6 +7477,15 @@ def _selected_daemon_records(
     return [] if record is None else [record]
 
 
+# Per-process header cache keyed on base_url. _remote_headers() resolves
+# Databricks SDK credentials which can take ~3 s (SDK shelling out to the
+# Databricks CLI). Within a single CLI invocation the token is valid, so
+# resolving once and reusing it is safe. The lock serialises concurrent
+# resolution for the same URL (two threads must not both pay the cost).
+_host_http_headers_cache: dict[str, dict[str, str]] = {}
+_host_http_headers_lock = threading.Lock()
+
+
 def _host_http_json(
     *,
     base_url: str,
@@ -7503,10 +7514,16 @@ def _host_http_json(
 
     from omnigent.chat import _remote_headers
 
+    if base_url not in _host_http_headers_cache:
+        with _host_http_headers_lock:
+            if base_url not in _host_http_headers_cache:
+                _host_http_headers_cache[base_url] = _remote_headers(server_url=base_url)
+    headers = _host_http_headers_cache[base_url]
+
     try:
         with httpx.Client(
             base_url=base_url,
-            headers=_remote_headers(server_url=base_url),
+            headers=headers,
             timeout=timeout_s,
         ) as client:
             resp = client.request(method, path, params=params, json=json_body)
@@ -8173,14 +8190,20 @@ def host_status(
     if server is None:
         server = _host_group_option(ctx, "server")
     records = _selected_daemon_records(server=server, all_targets=all_targets, default_all=True)
-    payloads = [
-        _daemon_status_payload(
+
+    # Build payloads in parallel so HTTP calls to independent servers overlap.
+    # Dead-process records skip the network entirely (see _add_daemon_host_status),
+    # but live ones each take a full auth-resolution + round-trip — parallelising
+    # them saves wall time proportional to the number of live daemons.
+    def _build(record: _HostDaemonRecord) -> _HostPayload:
+        return _daemon_status_payload(
             record,
             include_sessions=sessions,
             connected_sessions_only=True,
         )
-        for record in records
-    ]
+
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        payloads = list(pool.map(_build, records))
     if json_output:
         click.echo(json.dumps({"daemons": payloads}, indent=2, sort_keys=True))
         return
