@@ -732,9 +732,13 @@ async def test_server_relay_resolver_forwards_and_parses() -> None:
             return _Resp()
 
     resolver = make_server_relay_resolver(_Client())
-    decision = await resolver("conv_1", _request())
+    decision = await resolver("conv_1", _request(requested_model=GLM_SERVABLE))
     assert posted[0][0] == "/v1/sessions/conv_1/hooks/route-subagent"
     assert posted[0][1]["harness"] == "claude-native"
+    # Every routing input survives the hop — dropping one here silently
+    # changes the server's verdict (requested_model was once lost this way).
+    assert posted[0][1]["requested_model"] == GLM_SERVABLE
+    assert posted[0][1]["prompt"] == "review the diff"
     assert decision.action == "redirect"
     assert decision.harness == "codex-native"
     assert decision.decision_id == "dec_9"

@@ -1022,6 +1022,7 @@ def make_server_relay_resolver(
             "prompt": req.prompt,
             "fork": req.fork,
             "parent_model": req.parent_model,
+            "requested_model": req.requested_model,
         }
         try:
             resp = await server_client.post(
