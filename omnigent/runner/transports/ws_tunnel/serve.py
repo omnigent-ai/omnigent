@@ -427,13 +427,12 @@ async def serve_tunnel(
                             f"{http_auth_rejection_streak} attempts); "
                             "check remote server authentication"
                         ) from exc
+                    # Invalidate the cached token so the loop-top _refresh_auth_token
+                    # fetches a fresh one on the next attempt. The loop-top call is
+                    # already guarded against transient factory errors (OSError etc.),
+                    # so we don't call the factory directly here.
                     _invalidate_auth_token_factory(auth_token_factory)
-                    fresh = (
-                        await asyncio.to_thread(auth_token_factory) if auth_token_factory else None
-                    )
-                    if fresh is not None:
-                        auth_token = fresh
-                        _logger.info("auth token refreshed after HTTP %d; retrying", http_status)
+                    _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
                     delay_s = _INITIAL_RECONNECT_DELAY_S
                 else:
@@ -530,7 +529,7 @@ async def _handle_refreshable_auth_failure(
     exc: WebSocketException,
 ) -> str | None:
     """
-    Attempt a token refresh after an HTTP 401 or 403 rejection.
+    Attempt a token refresh after an HTTP 302 login-page redirect.
 
     If the factory produces a new token, returns it so the caller
     can retry immediately. If no factory is available or the refresh
@@ -538,7 +537,7 @@ async def _handle_refreshable_auth_failure(
 
     :param factory: Sync callable returning a fresh token.
     :param http_status: The HTTP status that triggered this call,
-        e.g. ``401`` or ``403``.
+        e.g. ``302`` for a login-page redirect.
     :param exc: The original ``WebSocketException``.
     :returns: A refreshed token string.
     :raises RuntimeError: When no factory is available or refresh
