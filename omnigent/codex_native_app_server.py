@@ -1244,11 +1244,29 @@ def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
+    # SPIKE ONLY (in-harness routing S1/S2): a second UserPromptSubmit hook
+    # in the same module (so the policy trust pass covers it) that logs every
+    # invocation and can fire thread/settings/update mid-block.
+    spike_hook = {
+        "type": "command",
+        "command": shlex.join(
+            [
+                python_executable or sys.executable,
+                "-I",
+                "-m",
+                _POLICY_HOOK_MODULE,
+                "spike-userprompt",
+                "--bridge-dir",
+                str(bridge_dir),
+            ]
+        ),
+        "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
+    }
     return {
         "hooks": {
             "PreToolUse": [{"hooks": [hook]}],
             "PostToolUse": [{"hooks": [hook]}],
-            "UserPromptSubmit": [{"hooks": [hook]}],
+            "UserPromptSubmit": [{"hooks": [hook, spike_hook]}],
         }
     }
 

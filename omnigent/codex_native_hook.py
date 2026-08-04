@@ -55,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "spike-userprompt":
+        return _main_spike_userprompt(raw_argv[1:])
     print(
         f"omnigent codex hook: unknown subcommand {raw_argv[:1]!r}",
         file=sys.stderr,
@@ -202,6 +204,115 @@ def _parse_evaluate_policy_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m omnigent.codex_native_hook evaluate-policy")
     parser.add_argument("--bridge-dir", required=True)
     return parser.parse_args(argv)
+
+
+def _main_spike_userprompt(argv: list[str]) -> int:
+    """
+    SPIKE ONLY (in-harness routing S1/S2). Not product code.
+
+    Logs every invocation to ``<bridge_dir>/spike_hook_log.jsonl`` (S2:
+    does codex fire ``UserPromptSubmit`` for app-server ``turn/start``
+    turns?) and, when ``<bridge_dir>/spike_switch_model`` exists, fires
+    ``thread/settings/update`` on the live thread from inside the hook's
+    synchronous window before allowing the prompt (S1: does the
+    just-submitted turn pick up the new model?).
+
+    :param argv: CLI argv after the subcommand.
+    :returns: Always ``0`` (allow).
+    """
+    import time
+
+    parser = argparse.ArgumentParser(prog="python -m omnigent.codex_native_hook spike-userprompt")
+    parser.add_argument("--bridge-dir", required=True)
+    args = parser.parse_args(argv)
+    bridge_dir = Path(args.bridge_dir)
+    log_path = bridge_dir / "spike_hook_log.jsonl"
+
+    raw = sys.stdin.read()
+    record: dict[str, object] = {
+        "ts": time.time(),
+        "iso": time.strftime("%H:%M:%S", time.localtime()),
+        "argv": argv,
+        "cwd": str(Path.cwd()),
+        "raw_stdin": raw[:4000],
+    }
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        payload = {}
+        record["parse_error"] = str(exc)
+    if isinstance(payload, dict):
+        record["payload_keys"] = sorted(payload.keys())
+        record["hook_event_name"] = payload.get("hook_event_name")
+
+    marker = bridge_dir / "spike_switch_model"
+    if marker.exists():
+        target = marker.read_text(encoding="utf-8").strip()
+        record["spike_mode"] = "settings_update"
+        record["spike_target_model"] = target
+        record["model_before"] = read_codex_config_model(bridge_dir)
+        started = time.monotonic()
+        try:
+            record["settings_update_result"] = _spike_settings_update(bridge_dir, target)
+        except Exception as exc:  # noqa: BLE001 - spike diagnostics
+            record["settings_update_error"] = f"{type(exc).__name__}: {exc}"
+        record["settings_update_seconds"] = round(time.monotonic() - started, 3)
+        # One-shot: remove the marker so the next prompt is a clean control.
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+    block_marker = bridge_dir / "spike_block"
+    if block_marker.exists():
+        record["spike_blocked"] = True
+        sys.stdout.write(
+            json.dumps({"decision": "block", "reason": "SPIKE: Smart Routing is picking a model…"})
+        )
+        try:
+            block_marker.unlink()
+        except OSError:
+            pass
+
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, default=str) + "\n")
+    return 0
+
+
+def _spike_settings_update(bridge_dir: Path, target_model: str) -> object:
+    """
+    SPIKE ONLY. Fire ``thread/settings/update`` on the live thread.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param target_model: Model id to switch the thread to.
+    :returns: A JSON-safe summary of the app-server exchange.
+    """
+    import asyncio
+
+    from omnigent.codex_native_app_server import client_for_transport
+
+    state = read_bridge_state(bridge_dir)
+    if state is None:
+        return {"error": "no bridge state"}
+
+    async def _run() -> object:
+        client = client_for_transport(state.socket_path, client_name="omnigent-spike-hook")
+        await client.connect()
+        try:
+            resp = await client.request(
+                "thread/settings/update",
+                {"threadId": state.thread_id, "model": target_model},
+            )
+            return {
+                "thread_id": state.thread_id,
+                "transport": state.socket_path,
+                "active_turn_id": state.active_turn_id,
+                "response": resp,
+            }
+        finally:
+            await client.close()
+
+    return asyncio.run(asyncio.wait_for(_run(), timeout=20))
 
 
 if __name__ == "__main__":
