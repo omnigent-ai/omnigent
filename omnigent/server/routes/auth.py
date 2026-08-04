@@ -818,7 +818,7 @@ def _resolve_oidc_email(
         claims = jwt.decode(
             id_token,
             signing_key.key,
-            algorithms=["RS256", "ES256"],
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
         )

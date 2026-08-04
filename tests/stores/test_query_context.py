@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine, event
@@ -13,6 +15,14 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+_REPOSITORY_ROOT = Path(__file__).parents[2]
+_APPLICATION_STORE_PATHS = [
+    *_REPOSITORY_ROOT.glob("omnigent/stores/*/sqlalchemy_store.py"),
+    _REPOSITORY_ROOT / "omnigent/stores/host_store.py",
+    _REPOSITORY_ROOT / "omnigent/server/accounts_store.py",
+    _REPOSITORY_ROOT / "omnigent/server/device_grant_store.py",
+]
 
 
 @contextmanager
@@ -62,6 +72,44 @@ def test_query_name_scope_rejects_empty_names() -> None:
     with pytest.raises(ValueError, match="query_name must not be empty"):
         with query_name_scope("  "):
             raise AssertionError("empty query name entered its scope")
+
+
+def test_application_store_sessions_require_literal_query_names() -> None:
+    """New store transactions cannot silently bypass semantic query naming."""
+    unnamed_calls: list[str] = []
+    legacy_makers: list[str] = []
+
+    for path in _APPLICATION_STORE_PATHS:
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id == "make_managed_session_maker":
+                legacy_makers.append(f"{path.relative_to(_REPOSITORY_ROOT)}:{node.lineno}")
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id.endswith("session_maker")
+                and not node.args
+            ):
+                unnamed_calls.append(f"{path.relative_to(_REPOSITORY_ROOT)}:{node.lineno}")
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+                and node.func.attr
+                in {"_session", "_session_immediate", "_conv_session", "_conv_session_immediate"}
+            ):
+                continue
+            if not (
+                len(node.args) == 1
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and node.args[0].value.strip()
+            ):
+                unnamed_calls.append(f"{path.relative_to(_REPOSITORY_ROOT)}:{node.lineno}")
+
+    assert legacy_makers == []
+    assert unnamed_calls == []
 
 
 def test_file_store_names_each_application_query(db_uri: str) -> None:

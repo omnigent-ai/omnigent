@@ -1,10 +1,10 @@
 """Tests for the generic-OIDC ``/auth/callback`` email resolution gate.
 
-These drive the *real* callback route end-to-end for a non-GitHub
-(generic OIDC) provider: a genuinely RS256-signed ``id_token`` is fed
-through the production ``jwt.decode`` path (real signature + ``iss`` /
-``aud`` / ``exp`` verification), and the only thing the tests vary is
-the ``email_verified`` claim.
+These drive the *real* generic-OIDC validation path with genuinely signed
+``id_token`` values (real signature + ``iss`` / ``aud`` / ``exp``
+verification). The callback-route tests vary the ``email_verified`` claim;
+the algorithm regression test uses an ES384 key to cover providers that do
+not advertise ES256.
 
 This is the regression coverage for "OIDC login accepts
 unverified email claim (account takeover)". Before the fix the
@@ -28,15 +28,19 @@ from pathlib import Path
 import httpx
 import jwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from jwt.algorithms import RSAAlgorithm
+from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig
-from omnigent.server.routes.auth import _AUTH_STATE_COOKIE_PLAIN, create_auth_router
+from omnigent.server.routes.auth import (
+    _AUTH_STATE_COOKIE_PLAIN,
+    _resolve_oidc_email,
+    create_auth_router,
+)
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 _TEST_SECRET = bytes.fromhex("aa" * 32)
@@ -211,6 +215,35 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
         f"/auth/callback?code=auth-code&state={state}",
         follow_redirects=False,
     )
+
+
+def test_oidc_accepts_es384_id_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Accept a valid token from an IdP that only advertises ES384."""
+    private_key = ec.generate_private_key(ec.SECP384R1())
+    jwk_dict = json.loads(ECAlgorithm.to_jwk(private_key.public_key()))
+    jwk_dict["alg"] = "ES384"
+    signing_key = jwt.PyJWK.from_dict(jwk_dict)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: signing_key,
+    )
+
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": _ISSUER,
+            "aud": _CLIENT_ID,
+            "iat": now,
+            "exp": now + 300,
+            "email": "Alice@Example.com",
+            "email_verified": True,
+        },
+        private_key,
+        algorithm="ES384",
+    )
+
+    assert _resolve_oidc_email({"id_token": token}, _oidc_config()) == "Alice@Example.com"
 
 
 def test_callback_verified_email_mints_session(

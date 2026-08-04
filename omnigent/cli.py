@@ -9071,7 +9071,7 @@ def debug_db_upgrade(url: str) -> None:
 
     URL is a SQLAlchemy database URL, e.g.
     ``sqlite:////absolute/path/to/chat.db`` or
-    ``postgresql://user:pass@host/dbname``.
+    ``postgresql://<user>:<password>@host/dbname``.
 
     \b
     IMPORTANT: schema migrations can be slow and are not guaranteed
@@ -9141,7 +9141,7 @@ def debug_migrate_accounts_to_oidc(
 
     URL is a SQLAlchemy database URL, e.g.
     ``sqlite:////absolute/path/to/chat.db`` or
-    ``postgresql://user:pass@host/dbname``.
+    ``postgresql://<user>:<password>@host/dbname``.
 
     \b
     Examples:

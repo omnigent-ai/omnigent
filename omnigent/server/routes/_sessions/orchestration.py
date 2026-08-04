@@ -1017,6 +1017,7 @@ def _build_session_response(
         status=status,
         background_task_count=background_task_count,
         created_at=conv.created_at,
+        updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
         runner_id=conv.runner_id,

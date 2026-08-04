@@ -99,8 +99,10 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -114,8 +116,10 @@
         "dhruv0811",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -129,8 +133,10 @@
         "dhruv0811",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -145,8 +151,10 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -235,10 +243,12 @@
       ],
       "owners": [
         "bbqiu",
-        "aravind-segu",
         "fanzeyi",
         "dhruv0811",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -250,13 +260,15 @@
       ],
       "owners": [
         "bbqiu",
-        "aravind-segu",
         "fanzeyi",
         "dhruv0811",
         "serena-ruan",
         "daniellok-db",
         "TomeHirata",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -269,9 +281,11 @@
       "owners": [
         "fanzeyi",
         "dhruv0811",
-        "aravind-segu",
         "bbqiu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -286,8 +300,10 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -355,8 +371,10 @@
         "fanzeyi",
         "TomeHirata",
         "bbqiu",
-        "aravind-segu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -372,8 +390,10 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -391,8 +411,10 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu",
         "dbczumar"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -459,9 +481,11 @@
         "omnigent/kimi_native"
       ],
       "owners": [
-        "aravind-segu",
         "dhruv0811",
         "fanzeyi"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {

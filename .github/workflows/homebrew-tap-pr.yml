@@ -14,7 +14,7 @@ name: Homebrew tap PR
 # We trigger on `release: published` (not the tag push) for the same reason as
 # publish-changelog.yml: that's the moment the version is installable from PyPI
 # — the secure-release repo publishes to PyPI before the GitHub Release goes
-# public (see RELEASING.md), so the sdist we pin the formula to actually exists.
+# public (see the maintainer release runbook), so the sdist we pin the formula to actually exists.
 #
 # Cross-repo writes can't use the workflow's own GITHUB_TOKEN (scoped to this
 # repo), so we mint a short-lived token from the omnigent-ci GitHub App scoped to

@@ -2128,11 +2128,17 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     not a green ``Installed`` row that implies the harness is ready to use.
     (Hermes, like Goose, *does* have a config probe now — its ``model`` is read
     from ``~/.hermes/config.yaml`` — so its ready/unconfigured split is covered
-    by ``test_overview_hermes_row_reflects_configured_model`` instead.)
+    by ``test_overview_hermes_row_reflects_configured_model`` instead. Kimi now
+    has a file-based login probe too, so its signed-in split is covered by
+    ``test_overview_kimi_row_reflects_detected_login`` — here we pin the
+    not-signed-in case, so ``kimi_login_detected`` is forced ``False``.)
     """
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
+    # Kimi's row now consults a file-based login probe; force "no login" so the
+    # not-configured assertion is deterministic regardless of the dev machine.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -2140,6 +2146,28 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     assert "[yellow]✗ Not configured[/]" in options[row_index]
     assert "[green]✓ Installed[/]" not in options[row_index]
     assert descriptions[row_index]
+
+
+def test_overview_kimi_row_reflects_detected_login(isolated_config, monkeypatch) -> None:
+    """An installed kimi with a detected ``kimi login`` renders green "Signed in".
+
+    Bug fix: the kimi row was hardcoded to yellow "Not configured" whenever the
+    CLI was installed, so a successful ``kimi login`` never showed. It now
+    consults the subprocess-free file probe ``kimi_login_detected`` and renders
+    a green ready row when a credential is present.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: True)
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    row_index = _overview_row_names(options, selectable).index("Kimi Code")
+    assert "[green]✓ Signed in[/]" in options[row_index]
+    assert "[yellow]✗ Not configured[/]" not in options[row_index]
+    # A ready row carries no next-step hint.
+    assert descriptions[row_index] == ""
 
 
 def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -> None:
@@ -2166,6 +2194,9 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
         lambda family: family != GEMINI_FAMILY,
     )
     monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
+    # Kimi's row consults a file-based login probe; force "no login" so the
+    # "Sign in with `kimi login`" hint is asserted deterministically.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
         lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),

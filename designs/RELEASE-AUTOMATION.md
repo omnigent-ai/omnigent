@@ -27,7 +27,7 @@ suggests. Per release step:
 | Bump main to next `.dev0` | human CLI (or `bump-version.yml` post-release) | 🟡 semi |
 | Draft GH release (prerelease flag for rc, rerun-safe) | `github-release.yml` on tag push | ✅ |
 | CHANGELOG PR + LLM-curated draft notes | `draft-release-notes.yml` via `workflow_run` (final tags only) | ✅ |
-| Secure-repo gates + PyPI publish | manual `gh workflow run omnigent.yml` ×2–3 (dry-run, [test-pypi], pypi) in `databricks/secure-public-registry-releases-eng` | ❌ manual dispatches |
+| Secure-repo gates + PyPI publish | manual `gh workflow run omnigent.yml` ×2–3 (dry-run, [test-pypi], pypi) in the internal secure-release repo | ❌ manual dispatches |
 | Post-publish validation (clean venv install + `--version`) | human CLI recipe | ❌ manual |
 | Publish GH release as Latest | human UI click | ❌ manual (and API publish does **not** set `make_latest` unless told to) |
 | Site release post + `X.Y-docs → main` PR | `publish-changelog.yml` on `release: published` | ✅ |

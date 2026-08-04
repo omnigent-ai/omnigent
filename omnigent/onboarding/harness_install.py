@@ -225,15 +225,17 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
     # npm). ``kimi login`` is the interactive provider login (OAuth or a
     # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
     # no first-class "am I logged in?" exit-code probe — login state is
-    # only inspected interactively. With ``None`` the login path runs every
-    # time the operator asks for it (interactive, so they can cancel if
-    # already authenticated).
+    # inspected file-based via ``kimi_auth.kimi_login_detected`` instead. With
+    # ``None`` the login path runs every time the operator asks for it
+    # (interactive, so they can cancel if already authenticated).
+    # ``logout_args`` is ``None`` because kimi has no ``kimi logout`` subcommand
+    # (verified against kimi CLI v0.29.1 — ``kimi logout`` errors "unknown
+    # command"), so ``harness_logout`` is a no-op for it (same as Qwen / agy).
     KIMI_KEY: HarnessInstallSpec(
         "Kimi",
         "kimi",
         package=None,
         login_args=("login",),
-        logout_args=("logout",),
         install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
         # First kimi-cli release after 2026-06-01. Older builds may lack
         # newer TUI/session wiring needed by the native harness.
