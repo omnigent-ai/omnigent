@@ -53,6 +53,37 @@ class OpenCodeNativeExecutor(NativeServerHarness):
             build_prompt=self._build_prompt_with_model_override,
         )
 
+    def _gate_system_prompt(self, system_prompt: str) -> str | None:
+        """
+        Attach the runner's gated composed prompt to this turn.
+
+        Every OTHER native-server harness DISCARDS this field entirely —
+        see ``NativeServerHarness._gate_system_prompt``'s base
+        implementation, which returns ``None`` unconditionally regardless
+        of what ``system_prompt`` carries. OpenCode accepts a per-prompt
+        ``system`` field, so it is currently the only subclass that
+        overrides the base to actually consume it, per turn.
+        ``system_prompt``
+        here is already the runner's gated ``InstructionComposition.composed``
+        value WHEN the runner positively resolved a spec (attached to the
+        wire ``instructions`` field specifically for this harness — see
+        ``_stream_message_to_harness`` in ``omnigent.runner.app``), not the
+        fallback-including composed-per-turn string every other harness
+        receives; the fabricated ``"You are a helpful assistant."`` literal
+        does not reach this path THROUGH the gate. It is not an absolute
+        guarantee across every call: when the runner could not positively
+        resolve a spec, gating is skipped by design and whatever wire value
+        was already present (which could, in principle, include the
+        fallback) reaches here untouched.
+
+        :param system_prompt: The gated composed value for this turn when
+            the runner resolved a spec (possibly empty, when there is
+            genuinely nothing to send), or an ungated pre-existing wire
+            value when it did not.
+        :returns: The value to attach, or ``None`` to omit the field.
+        """
+        return system_prompt or None
+
     def _build_prompt_with_model_override(self, content: object) -> NativePrompt | None:
         """
         Build a prompt, pinning the resolved model so it governs from turn one.

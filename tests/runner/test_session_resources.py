@@ -2280,3 +2280,344 @@ async def test_claude_terminal_ensure_concurrent_calls_create_once(
         "A value of 2 means both concurrent ensure requests spawned a Claude terminal "
         "(the pre-fix double-forwarder race)."
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Never-retried-because-already-present scenario:
+    ``_session_workspace_cache``
+    used presence-in-dict (``session_id not in _session_workspace_cache``) as
+    its "already resolved" gate, so the FIRST call — even one that hit a
+    failed/transient session-snapshot fetch — permanently pinned
+    ``workspace=None`` for the rest of the process lifetime. A later call,
+    even once the snapshot fetch succeeds, would never ask again because the
+    key was already present. A failed snapshot leaves the workspace cache
+    UNSET, so the next call re-resolves and picks up the session's real,
+    server-reported workspace.
+
+    Exercised via ``GET .../resources/environments/default/changes``, which
+    resolves the session's filesystem registry through
+    ``_resolve_session_fs_registry`` → ``_session_workspace_value`` — the
+    only path (besides ``_ensure_session_registered``) that reads this cache.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+
+    conv = "conv_workspace_retry"
+    runner_ws = tmp_path / "runner-workspace"
+    runner_ws.mkdir()
+    session_ws = tmp_path / "session-workspace"
+    session_ws.mkdir()
+
+    snapshot_count = 0
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Stub Omnigent server: fail the first session snapshot fetch,
+        then report the session's real workspace on every fetch after."""
+        nonlocal snapshot_count
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            snapshot_count += 1
+            if snapshot_count == 1:
+                return httpx.Response(503, json={})
+            return httpx.Response(
+                200,
+                json={"id": conv, "agent_id": None, "workspace": str(session_ws)},
+            )
+        return httpx.Response(200, json={})
+
+    registry_calls: list[Path | None] = []
+
+    class _FakeFilesystemRegistry:
+        """Records the watch_path it was created with; never touches git."""
+
+        def __init__(self, watch_path: Path | None) -> None:
+            self.watch_path = watch_path
+
+        def start(self) -> None:
+            return None
+
+        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
+            del session_id, limit
+            return []
+
+    def _fake_create_filesystem_registry(
+        *, watch_path: Path | None = None
+    ) -> _FakeFilesystemRegistry:
+        registry_calls.append(watch_path)
+        return _FakeFilesystemRegistry(watch_path)
+
+    monkeypatch.setattr(
+        filesystem_registry_mod, "create_filesystem_registry", _fake_create_filesystem_registry
+    )
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+    # No spec_resolver: _require_os_env resolves agent_spec=None without
+    # touching the snapshot, isolating the workspace-cache path under test
+    # from the spec-cache retry behavior, which is a separate concern.
+    app = create_runner_app(
+        runner_workspace=runner_ws,
+        server_client=server_client,
+    )
+    # The shared default registry is created eagerly at app-build time,
+    # watched at the runner root — this is registry_calls[0], not part of
+    # what is read below.
+    assert registry_calls == [runner_ws]
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            first = await c.get(
+                f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+            )
+            second = await c.get(
+                f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+            )
+    finally:
+        await server_client.aclose()
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert snapshot_count >= 2, (
+        f"expected at least a failed + a successful snapshot fetch, got {snapshot_count}"
+    )
+    # A per-session registry, watching the session's REAL (server-reported)
+    # workspace, must be created once the snapshot succeeds — a value of
+    # [runner_ws] only (no session_ws entry) means the failed first fetch
+    # permanently pinned workspace=None and the second call never re-asked.
+    assert session_ws.resolve() in registry_calls, (
+        f"expected a per-session filesystem registry watching {session_ws!r} "
+        f"after the snapshot recovered — got registry_calls={registry_calls!r}. "
+        f"Only the startup entry means the failed first snapshot pinned this "
+        f"session's workspace to None forever."
+    )
+
+
+@pytest.mark.asyncio
+async def test_reset_state_discards_a_snapshot_fill_already_in_flight(
+    tmp_path: Path,
+) -> None:
+    """
+    A snapshot fetch that started before ``/reset-state`` must not write the
+    OLD agent back into the cache after it.
+
+    Eviction alone cannot close this: ``_clear_session_agent_caches`` pops the
+    dict, but a fetch already awaiting the server holds a value resolved under
+    the previous agent and writes it on completion — landing AFTER the pop. The
+    next reader then finds a populated cache, issues no fetch of its own, and
+    resolves the previous agent, which also falsifies reset-state's documented
+    guarantee that the next access re-resolves.
+
+    Driven as the real race: park a fetch inside the server handler, reset
+    while it is parked, rebind the server to agent B, release the fetch, then
+    read again. Closed by the per-session fill generation — the parked fetch
+    captured the pre-reset generation and drops its write.
+
+    :param tmp_path: Temporary runner workspace root.
+    :returns: None.
+    """
+    conv = "conv_reset_inflight"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    snapshot_count = 0
+    first_fetch_started = asyncio.Event()
+    release_first_fetch = asyncio.Event()
+    current_agent_id = "agent_a"
+    resolved_agent_ids: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Park the first session snapshot fetch; report the current binding."""
+        nonlocal snapshot_count
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            snapshot_count += 1
+            if snapshot_count == 1:
+                first_fetch_started.set()
+                await release_first_fetch.wait()
+            return httpx.Response(
+                200,
+                json={
+                    "id": conv,
+                    "agent_id": current_agent_id,
+                    "workspace": str(workspace),
+                },
+            )
+        return httpx.Response(200, json={})
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        resolved_agent_ids.append(agent_id)
+        return AgentSpec(
+            spec_version=1,
+            name=f"spec-for-{agent_id}",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+        )
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+    app = create_runner_app(
+        runner_workspace=workspace,
+        spec_resolver=_spec_resolver,
+        server_client=server_client,
+    )
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            parked = asyncio.create_task(c.get(f"/v1/sessions/{conv}/resources"))
+            await asyncio.wait_for(first_fetch_started.wait(), timeout=5.0)
+
+            reset = await c.post(f"/v1/sessions/{conv}/reset-state")
+            assert reset.status_code == 200, reset.text
+
+            # The switch the reset was announcing.
+            current_agent_id = "agent_b"
+
+            release_first_fetch.set()
+            await parked
+
+            after = await c.get(f"/v1/sessions/{conv}/resources")
+            assert after.status_code == 200, after.text
+    finally:
+        await server_client.aclose()
+
+    assert snapshot_count == 2, (
+        f"the read after reset must re-fetch the snapshot, got "
+        f"{snapshot_count} fetch(es) total. A value of 1 means the in-flight "
+        f"agent_a fetch wrote itself back over the reset and satisfied the "
+        f"next read from cache."
+    )
+    assert resolved_agent_ids[-1] == "agent_b", (
+        f"the read after reset must resolve the new agent — resolver saw "
+        f"{resolved_agent_ids!r}. A trailing 'agent_a' means the pre-reset "
+        f"fill landed after the eviction and pinned the previous agent."
+    )
+
+
+async def test_observe_dead_terminal_evicts_only_that_instance(tmp_path: Path) -> None:
+    """
+    Evicting a terminal found dead must not evict a successor on its key.
+
+    The liveness probe awaits, so a replacement built for the session's
+    current agent can take the key while it runs. Removing by key alone would
+    then terminate that live replacement instead of the dead instance.
+    """
+    import threading
+
+    from omnigent.runner.resource_registry import TerminalLifecycle
+    from omnigent.terminals import TerminalRegistry
+
+    class _Terminal(TerminalInstance):
+        closed: bool = False
+        alive: bool = False
+
+        async def is_alive(self) -> bool:
+            return self.alive
+
+        async def close(self) -> None:
+            self.closed = True
+            self.running = False
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(
+        terminal_registry=terminal_registry,
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+    )
+    dead = _Terminal(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "dead.sock",
+        private_dir=tmp_path / "dead",
+        running=True,
+    )
+    successor = _Terminal(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "live.sock",
+        private_dir=tmp_path / "live",
+        running=True,
+    )
+    successor.alive = True
+    # The successor already holds the key by the time eviction runs.
+    terminal_registry._by_conversation["conv_evict"] = {("claude", "main"): successor}
+    terminal_registry._instance_locks[("conv_evict", "claude", "main")] = threading.Lock()
+
+    with pytest.raises(RuntimeError, match="is not running"):
+        await registry._observe_terminal_with_lifecycle(
+            TerminalLifecycle.AUXILIARY,
+            session_id="conv_evict",
+            terminal_name="claude",
+            session_key="main",
+            instance=dead,
+        )
+
+    assert successor.closed is False, (
+        "the live successor on this key must survive eviction of the dead instance"
+    )
+    assert terminal_registry.get("conv_evict", "claude", "main") is successor
+
+
+async def test_terminal_exit_cleanup_evicts_only_the_exited_instance(tmp_path: Path) -> None:
+    """
+    Exit cleanup must not evict a successor that already took the key.
+
+    The exit callback carries the instance that exited; a replacement may
+    already be registered under the same name by the time cleanup runs.
+    """
+    import threading
+
+    from omnigent.runner.resource_registry import TerminalLifecycle
+    from omnigent.terminals import TerminalRegistry
+
+    class _Terminal(TerminalInstance):
+        closed: bool = False
+
+        async def close(self) -> None:
+            self.closed = True
+            self.running = False
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(
+        terminal_registry=terminal_registry,
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+    )
+    exited = _Terminal(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "exited.sock",
+        private_dir=tmp_path / "exited",
+        running=False,
+    )
+    successor = _Terminal(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "next.sock",
+        private_dir=tmp_path / "next",
+        running=True,
+    )
+    terminal_registry._by_conversation["conv_exit"] = {("claude", "main"): successor}
+    terminal_registry._instance_locks[("conv_exit", "claude", "main")] = threading.Lock()
+
+    terminal_id = terminal_resource_id("claude", "main")
+    registry._terminal_lifecycles[("conv_exit", terminal_id)] = TerminalLifecycle.AUXILIARY
+
+    await registry._handle_terminal_exit(
+        session_id="conv_exit",
+        terminal_name="claude",
+        session_key="main",
+        lifecycle=TerminalLifecycle.AUXILIARY,
+        instance=exited,
+    )
+
+    assert successor.closed is False, (
+        "a successor registered under the same key must survive exit cleanup"
+    )
+    assert terminal_registry.get("conv_exit", "claude", "main") is successor

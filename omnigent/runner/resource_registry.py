@@ -920,7 +920,12 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
         if not getattr(instance, "running", False) or not await instance.is_alive():
-            await self._terminal_registry.close(session_id, terminal_name, session_key)
+            # Scoped to the instance just probed: the liveness check awaits, and
+            # a successor can take this key meanwhile. Closing by key alone
+            # would evict that successor instead of the dead instance.
+            await self._terminal_registry.close(
+                session_id, terminal_name, session_key, expected=instance
+            )
             raise RuntimeError(
                 f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
             )
@@ -1266,9 +1271,19 @@ class SessionResourceRegistry:
         # or never observed → boot failure) stays a failure.
         session_was_idle = self._take_session_status_memo(session_id) == "idle"
 
+        # Scope of the instance matching below: the registry entry and the
+        # exit event are both matched to the instance that exited. The
+        # lifecycle and role entries are NOT — they are popped by key at the
+        # top of this function, before any of this runs, so a successor
+        # registered under the same key has already lost them.
+        superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
             try:
-                await self._terminal_registry.close(session_id, terminal_name, session_key)
+                # Evict the instance that exited, not whatever holds the key
+                # now — a replacement may already have been registered.
+                await self._terminal_registry.close(
+                    session_id, terminal_name, session_key, expected=instance
+                )
             except Exception:
                 _logger.exception(
                     "Error evicting exited terminal: session=%s terminal=%s:%s",
@@ -1276,9 +1291,34 @@ class SessionResourceRegistry:
                     terminal_name,
                     session_key,
                 )
+            else:
+                # Ask what holds the key rather than reading close()'s bool:
+                # that returns False for "superseded", "already closed" and
+                # "never launched" alike, and only the first of those may
+                # silence the exit.
+                current = self._terminal_registry.get(session_id, terminal_name, session_key)
+                if current is not None and instance is not None and current is not instance:
+                    superseded_by = current
 
         publisher = self._terminal_exit_publisher
-        if publisher is not None:
+        if superseded_by is not None:
+            # A different live instance holds this key, so this exit belongs
+            # to a terminal that is already gone. Publishing it deletes the
+            # SUCCESSOR's resource downstream, tearing down the terminal the
+            # session is currently using.
+            #
+            # The check is not atomic with the close above: a successor
+            # registered in between is seen here and silences an exit that
+            # should have published. The event is then missing — that is the
+            # direction this fails in, and a live successor is never torn
+            # down by it.
+            _logger.info(
+                "Skipping exit event for superseded terminal: session=%s terminal=%s:%s",
+                session_id,
+                terminal_name,
+                session_key,
+            )
+        elif publisher is not None:
             publisher(
                 TerminalExitEvent(
                     session_id=session_id,

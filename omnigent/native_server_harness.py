@@ -80,6 +80,14 @@ class NativeServerHarness(Executor):
         # Serialize injection (run_turn vs enqueue) against the one cached
         # executor instance, mirroring the codex-native inject lock.
         self._inject_lock = asyncio.Lock()
+        # The current turn's gated system prompt, for subclasses that opt
+        # into per-turn delivery via :meth:`_gate_system_prompt` (e.g.
+        # OpenCode). Written under ``_inject_lock`` in :meth:`run_turn`,
+        # read under the same lock in :meth:`enqueue_session_message` (which
+        # has no ``system_prompt`` parameter of its own). Always ``None`` for
+        # subclasses that don't override the hook — harmless, matches the
+        # historical discard behavior.
+        self._last_system_prompt: str | None = None
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` — the runner-side forwarder emits output."""
@@ -109,6 +117,34 @@ class NativeServerHarness(Executor):
                 return session_id
         return None
 
+    def _gate_system_prompt(self, system_prompt: str) -> str | None:
+        """
+        Decide what to attach to this turn's :class:`NativePrompt.system_prompt`.
+
+        The default discards ``system_prompt`` entirely (``None``), matching
+        the historical discard-everywhere behavior this class used to have
+        unconditionally. A subclass that genuinely supports per-turn/session
+        system-prompt delivery (currently only OpenCode does) overrides this.
+        The base default keeps every other subclass's discard behavior
+        unchanged — opt-in only.
+
+        :param system_prompt: The runner's gated composed value for this
+            turn (see ``InstructionComposition`` in ``omnigent.runner.app``)
+            WHEN the runner positively resolved a spec to compose from —
+            in that case, never the fabricated ``"You are a helpful
+            assistant."`` fallback fused with real content, and empty when
+            there is genuinely nothing to send. When the runner could not
+            positively resolve a spec (resolution failure, unknown
+            provenance, etc.), gating is skipped by design and this may
+            instead be whatever wire value was already present — including,
+            in principle, the fabricated fallback, if that's what was
+            already there. See ``_stream_message_to_harness`` in
+            ``omnigent.runner.app``.
+        :returns: The value to attach, or ``None`` to omit it.
+        """
+        del system_prompt
+        return None
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -122,12 +158,15 @@ class NativeServerHarness(Executor):
         :param messages: Conversation history; the latest user message is
             delivered.
         :param tools: Omnigent tool schemas (ignored — native owns tools).
-        :param system_prompt: Agent system prompt (ignored — set at
-            session creation).
+        :param system_prompt: Gated composed system prompt for this turn.
+            Discarded by default (see :meth:`_gate_system_prompt`); every
+            ``NativeServerHarness`` subclass except OpenCode discards it —
+            OpenCode is currently the only one that overrides the hook to
+            deliver it per turn.
         :param config: Per-turn config (model override applied if present).
         :returns: Async iterator yielding one terminal event.
         """
-        del tools, system_prompt
+        del tools
         prompt = _latest_user_prompt(messages, self._build_prompt)
         if prompt is None or prompt.is_empty():
             yield ExecutorError(message=f"{self._harness_id} turn had no user input to send")
@@ -136,6 +175,13 @@ class NativeServerHarness(Executor):
             prompt = _with_model(prompt, config.model)
         error_msg: str | None = None
         async with self._inject_lock:
+            gated_system_prompt = self._gate_system_prompt(system_prompt)
+            # Cache-then-clear on every normal turn, even when None, so a
+            # later instruction-free turn can't leave a stale prior value
+            # for enqueue_session_message to pick up.
+            self._last_system_prompt = gated_system_prompt
+            if gated_system_prompt is not None:
+                prompt = _with_system_prompt(prompt, gated_system_prompt)
             session_id = await self._await_session_id()
             if session_id is None:
                 error_msg = f"{self._harness_id} bridge state is missing"
@@ -184,6 +230,13 @@ class NativeServerHarness(Executor):
         if prompt is None or prompt.is_empty():
             return False
         async with self._inject_lock:
+            # Promoted queued messages have no system_prompt of their own —
+            # reuse the value cached by the most recent normal run_turn call
+            # under this same lock. None (no prior normal turn, or the prior
+            # turn's value was itself None) omits the field, matching a
+            # normal turn's own behavior.
+            if self._last_system_prompt is not None:
+                prompt = _with_system_prompt(prompt, self._last_system_prompt)
             session_id = await self._resolve_session_id()
             if session_id is None:
                 return False
@@ -222,3 +275,16 @@ def _with_model(prompt: NativePrompt, model: str) -> NativePrompt:
     import dataclasses
 
     return dataclasses.replace(prompt, model=model)
+
+
+def _with_system_prompt(prompt: NativePrompt, system_prompt: str) -> NativePrompt:
+    """
+    Return a copy of *prompt* with *system_prompt* applied.
+
+    :param prompt: The prompt to copy.
+    :param system_prompt: Gated system prompt to attach.
+    :returns: A new prompt carrying the system prompt.
+    """
+    import dataclasses
+
+    return dataclasses.replace(prompt, system_prompt=system_prompt)

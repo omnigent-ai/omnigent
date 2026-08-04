@@ -5764,10 +5764,12 @@ async def _create_session_from_existing_agent(
         )
 
     # Reject an undeclared sub-agent before persisting the row. Downstream
-    # spec swaps are all guarded by ``if ... is not None`` with no
-    # ``else``, so a name the parent's spec never declares would leave the
-    # parent spec/workdir/harness/instructions in place and boot the child
-    # as a parent clone. Fail loud here instead.
+    # spec swaps warn and keep the parent on a miss, which is right for a
+    # name that once resolved and has since been renamed or removed — but
+    # for a name the parent's spec NEVER declared it would boot the child as
+    # a parent clone for the session's whole life, off a request that was
+    # wrong when it arrived. Reject it while the caller is still here to be
+    # told, and leave the parent-fallback to the cases it fits.
     if body.sub_agent_name:
         await asyncio.to_thread(
             _require_declared_subagent,
@@ -7026,43 +7028,71 @@ async def _get_session_snapshot(
                     loaded = await asyncio.to_thread(
                         agent_cache.load, agent.id, agent.bundle_location
                     )
-                    spec = loaded.spec
+                    resolved_spec: AgentSpec | None = loaded.spec
                     if conv.sub_agent_name:
-                        child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
-                        if child_spec is not None:
-                            spec = child_spec
-                    # Prefer the spec's name over the agent row's: a
-                    # switch-created session-scoped clone is named
-                    # "<builtin> (switch ag_…)" for row disambiguation,
-                    # but clients display agent_name verbatim — the spec
-                    # carries the clean identity (e.g. "claude-native-ui").
-                    if spec.name:
-                        agent_name = spec.name
-                    llm_model = spec.executor.model
+                        _sub_spec = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+                        if _sub_spec is None:
+                            # A recorded sub_agent_name that no longer resolves
+                            # in the spec tree leaves the PARENT spec as this
+                            # snapshot's source: name, model and context window
+                            # below are the parent's. This used to report the
+                            # child's recorded name and suppress model and
+                            # context window entirely.
+                            # ``_require_declared_subagent`` rejects undeclared
+                            # names at create time, so the common way here is a
+                            # name that DID resolve then and has since been
+                            # renamed or removed. It is not the only way: that
+                            # gate skips its check when no agent cache is
+                            # available and on any bundle load failure, so a
+                            # never-declared name can reach this branch too.
+                            # The runner logs an equivalent warning at its own
+                            # spec-swap sites; this one is the server's, and
+                            # they are worded to be greppable together.
+                            _logger.warning(
+                                "Sub-agent %r for session %s did not resolve in the parent "
+                                "spec; snapshot reports the parent's identity. Likely a "
+                                "renamed/removed sub-agent or stale session metadata.",
+                                conv.sub_agent_name,
+                                session_id,
+                            )
+                        else:
+                            resolved_spec = _sub_spec
+                    if resolved_spec is not None:
+                        # Prefer the spec's name over the agent row's: a
+                        # switch-created session-scoped clone is named
+                        # "<builtin> (switch ag_…)" for row disambiguation,
+                        # but clients display agent_name verbatim — the spec
+                        # carries the clean identity (e.g. "claude-native-ui").
+                        if resolved_spec.name:
+                            agent_name = resolved_spec.name
+                        llm_model = resolved_spec.executor.model
 
-                    # Size the context ring against whatever the next turn will
-                    # actually run, using the SAME resolver the runner uses to
-                    # budget compaction. That makes the UI ring and the runner's
-                    # compaction trigger a single source of truth — computed by
-                    # one function — so they can't drift even though they run in
-                    # different processes at different times. (They previously
-                    # each inlined this rule and silently fell out of step;
-                    # sharing the function removes the manual
-                    # sync.) spec.executor.context_window describes only the spec
-                    # model, so an active override bypasses it — the resolver
-                    # makes that decision from the spec model + override.
-                    #
-                    # Offload to a worker thread: an active override (or an
-                    # undeclared window) can trigger a cache-cold provider
-                    # catalog fetch (blocking HTTP / CPU-bound litellm) inside
-                    # the resolver, which would otherwise stall the single-worker
-                    # event loop and serialize every concurrent snapshot.
-                    context_window = await asyncio.to_thread(
-                        resolve_effective_context_window,
-                        spec.executor.context_window,
-                        llm_model,
-                        model_override=conv.model_override,
-                    )
+                        # Size the context ring against whatever the next turn
+                        # will actually run, using the SAME resolver the
+                        # runner uses to budget compaction. That makes the UI
+                        # ring and the runner's compaction trigger a single
+                        # source of truth — computed by one function — so
+                        # they can't drift even though they run in different
+                        # processes at different times. (They previously each
+                        # inlined this rule and silently fell out of step;
+                        # sharing the function removes the manual sync.)
+                        # spec.executor.context_window describes only the
+                        # spec model, so an active override bypasses it — the
+                        # resolver makes that decision from the spec model +
+                        # override.
+                        #
+                        # Offload to a worker thread: an active override (or
+                        # an undeclared window) can trigger a cache-cold
+                        # provider catalog fetch (blocking HTTP / CPU-bound
+                        # litellm) inside the resolver, which would otherwise
+                        # stall the single-worker event loop and serialize
+                        # every concurrent snapshot.
+                        context_window = await asyncio.to_thread(
+                            resolve_effective_context_window,
+                            resolved_spec.executor.context_window,
+                            llm_model,
+                            model_override=conv.model_override,
+                        )
         except Exception:  # noqa: BLE001
             pass
     # Skills are runner-owned: the bound runner discovers them against its

@@ -56,7 +56,7 @@ from omnigent.runner.app import (
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
-from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, SharePolicy
 from tests.runner.helpers import NullServerClient
 
 _TEST_HARNESS_NAME = "runner-test-default"
@@ -226,7 +226,7 @@ async def _drain_failed_status_event(
 
     Mirrors :func:`_drain_published_statuses` but returns the full event
     dict (not just the status string) so a test can assert the carried
-    ``error`` payload. Used to prove a SETUP-phase failure forwards its
+    ``error`` payload. A SETUP-phase failure forwards its
     error message on the terminal ``failed`` event instead of dropping it.
 
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
@@ -305,6 +305,12 @@ class _FakeProcessManager:
         :param harness_client: Optional harness client to return.
         """
         self._harness_client = harness_client
+        # Records (conversation_id, harness_name, env) for every get_client
+        # call: the actual spawn_env the process manager would have launched
+        # the harness subprocess with.
+        self.get_client_calls: list[tuple[str, str, dict[str, str] | None]] = []
+        # Conversation ids passed to release(), in call order.
+        self.release_calls: list[str] = []
 
     async def get_client(
         self,
@@ -322,7 +328,7 @@ class _FakeProcessManager:
         :returns: Configured fake harness client.
         :raises AssertionError: If no fake client was configured.
         """
-        del conversation_id, harness_name, env
+        self.get_client_calls.append((conversation_id, harness_name, env))
         if self._harness_client is None:
             raise AssertionError("get_client should not be called")
         return self._harness_client
@@ -334,6 +340,17 @@ class _FakeProcessManager:
     def clear_in_flight(self, conversation_id: str) -> None:
         """Reaper in-flight clear — no-op for this stub (issue #1414)."""
         del conversation_id
+
+    async def release(self, conversation_id: str) -> None:
+        """Record a release call — real process teardown is a no-op here.
+
+        Both dispatch paths call this on an in-conversation agent switch
+        to force a fresh harness subprocess (a same-harness cache hit
+        would otherwise silently keep serving the PREVIOUS agent's
+        seeded instructions). Recorded so the value actually
+        fires, not just that the code path was reached.
+        """
+        self.release_calls.append(conversation_id)
 
 
 @pytest.fixture
@@ -589,7 +606,7 @@ async def test_runner_resolves_agent_from_server_snapshot_when_msg_lacks_agent_i
     finally:
         await server_client.aclose()
 
-    # The harness came from the snapshot-resolved spec, proving the
+    # The harness came from the snapshot-resolved spec, so the
     # runner fetched agent_id from the server when the message lacked it.
     # Without the fix this is "runner-test-default" (the fallback) and the
     # real turn never dispatches.
@@ -707,7 +724,7 @@ async def test_runner_reloads_full_history_on_cold_cache_after_restart() -> None
     forward): its ``GET /items`` returns the prior turns AND the just-posted
     message (``item_3``), and the forwarded body carries
     ``persisted_item_id="item_3"`` — so the reload drops that exact item by
-    id and appends the runner's copy, proving no duplication.
+    id and appends the runner's copy, with no duplication.
     """
     from omnigent.runner import app as runner_app
 
@@ -1364,6 +1381,2962 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
     assert "stream spec resolver unavailable for ag_stream" not in response.text
 
 
+_INSTRUCTION_WARN_CHUNKS = [
+    'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_iw_1"}}\n\n',
+    (
+        "event: response.completed\ndata: "
+        '{"type":"response.completed","response":{"id":"resp_iw_1","status":"completed"}}\n\n'
+    ),
+]
+
+
+async def _post_stream_message(http: httpx.AsyncClient, conv: str, **body: Any) -> httpx.Response:
+    """POST a minimal ``?stream=true`` message body for the warn-site tests.
+
+    :param http: Test HTTP client bound to the runner app.
+    :param conv: Conversation id.
+    :param body: Extra fields merged into the message body (``harness``,
+        ``harness_override``, ``agent_id``, ...).
+    :returns: The runner's HTTP response.
+    """
+    payload: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "model": "x",
+        "content": [],
+        **body,
+    }
+    return await http.post(f"/v1/sessions/{conv}/events?stream=true", json=payload)
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_fires_once_for_undelivered_harness(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The delivery-gap warning does not re-fire turn over turn.
+
+    ``kimi`` is declared ``NOT_DELIVERED``; an authored spec talking to it
+    must warn on the first turn and stay silent on a second turn in the same
+    conversation. The harness — and so the effective delivery value — is
+    identical across both turns, which under the dedup rule ("at most once
+    per (conversation, harness, delivery value)") is the arm that must stay
+    at exactly one warning. Like its agent-switch sibling, a presence-only
+    marker also satisfies this arm, so it constrains the repeat-turn case
+    rather than the shape of the key.
+    """
+    conv = "conv_instruction_warn_once"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="kimi-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "kimi"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            r1 = await _post_stream_message(http, conv, agent_id="ag_kimi")
+            assert r1.status_code == 200
+            r2 = await _post_stream_message(http, conv, agent_id="ag_kimi")
+            assert r2.status_code == 200
+
+    warnings = [
+        rec for rec in caplog.records if "instructions are not delivered" in rec.getMessage()
+    ]
+    assert len(warnings) == 1, f"expected exactly one warning, got {len(warnings)}: {warnings}"
+    assert "instruction_delivery=not-delivered" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_silent_without_authored_instructions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No author instructions → no warning, even on a non-delivering harness."""
+    conv = "conv_instruction_warn_silent_no_author"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="kimi-agent-no-instructions",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "kimi"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await _post_stream_message(http, conv, agent_id="ag_kimi_no_instr")
+            assert response.status_code == 200
+
+    assert not any("instructions are not delivered" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_silent_for_delivering_harness(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A delivering harness (``codex``, ``composed-per-turn``) never warns."""
+    conv = "conv_instruction_warn_silent_delivering"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="codex-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await _post_stream_message(http, conv, agent_id="ag_codex")
+            assert response.status_code == 200
+
+    assert not any("instructions are not delivered" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_uses_harness_override(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warn check follows ``harness_override``, not the spec's declared harness.
+
+    The spec declares ``codex`` (delivering); the session's
+    ``harness_override`` sends the turn to ``kimi`` (not delivered) instead
+    — the warning must reflect the harness the turn actually ran on.
+    """
+    conv = "conv_instruction_warn_override"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="codex-agent-overridden",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await _post_stream_message(
+                http, conv, agent_id="ag_codex_override", harness_override="kimi"
+            )
+            assert response.status_code == 200
+
+    warnings = [
+        rec for rec in caplog.records if "instructions are not delivered" in rec.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "'kimi'" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_body_harness_override_wins_over_body_harness(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A body with BOTH `harness` and `harness_override` set must let the
+    override win — exercising _stream_message_to_harness's own
+    body.get("harness")-truthy else-branch (not the _resolve_effective_turn
+    harness_override-only path above, which does not
+    depend on body precedence).
+    """
+    conv = "conv_instruction_warn_body_harness_and_override"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="both-harness-fields-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await _post_stream_message(
+                http,
+                conv,
+                agent_id="ag_both_harness_fields",
+                # harness (delivering) AND harness_override (not delivered)
+                # both present in the same body — override must win.
+                harness="codex",
+                harness_override="kimi",
+            )
+            assert response.status_code == 200
+
+    warnings = [
+        rec for rec in caplog.records if "instructions are not delivered" in rec.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f"expected harness_override='kimi' to win over harness='codex'; got {warnings}"
+    )
+    assert "'kimi'" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_canonicalizes_body_harness_alias(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A body-supplied `harness` alias must be canonicalized before capability
+    lookup, matching the alias-inheritance contract in docs/AGENT_YAML_SPEC.md.
+
+    ``acp:custom-agent`` canonicalizes to the base ``acp`` harness, which IS
+    a delivering harness (FIRST_USER_PREFIX). If canonicalization were
+    skipped, ``harness_capabilities().get("acp:custom-agent")`` would miss
+    and fall back to UNKNOWN, firing a spurious warning.
+    """
+    conv = "conv_instruction_warn_body_harness_alias"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="acp-alias-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "acp:custom-agent"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await _post_stream_message(
+                http,
+                conv,
+                agent_id="ag_acp_alias",
+                harness="acp:custom-agent",
+            )
+            assert response.status_code == 200
+
+    assert not any(
+        "instructions are not delivered" in rec.getMessage()
+        or "declares no instruction_delivery capability" in rec.getMessage()
+        for rec in caplog.records
+    ), "acp:custom-agent must canonicalize to the delivering 'acp' harness, not warn as unknown"
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_unknown_capability_fires_undetermined_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A harness with no registered capability declaration fires the actual
+    UNKNOWN-branch warning (undetermined delivery), not the NOT_DELIVERED
+    one — driving the runner's real warning code path end-to-end, not just
+    constructing an ``InstructionDelivery.UNKNOWN`` value in isolation.
+    """
+    conv = "conv_instruction_warn_unknown_capability"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="unregistered-harness-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await _post_stream_message(
+                http,
+                conv,
+                agent_id="ag_unregistered_harness",
+                harness=_TEST_HARNESS_NAME,
+            )
+            assert response.status_code == 200
+
+    warnings = [
+        rec
+        for rec in caplog.records
+        if "declares no instruction_delivery capability" in rec.getMessage()
+    ]
+    assert len(warnings) == 1, f"expected exactly one UNKNOWN-capability warning, got {warnings}"
+    assert "instruction_delivery=unknown" in warnings[0].getMessage()
+    assert "undetermined" in warnings[0].getMessage()
+    assert not any("will not see AgentSpec.instructions" in rec.getMessage() for rec in warnings)
+
+
+class _RecordingHarnessClient:
+    """Fake harness client that records the event body posted to it."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self._chunks = chunks
+        self.posted_bodies: list[dict[str, Any]] = []
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> _FakeHarnessStream:
+        del method, url, timeout
+        self.posted_bodies.append(json)  # type: ignore[arg-type]
+        return _FakeHarnessStream(self._chunks)
+
+
+@pytest.mark.asyncio
+async def test_opencode_native_wire_instructions_use_gated_composed_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """opencode-native gets the gated composed value WITH per-request text in it.
+
+    The harness-conditional swap in ``_stream_message_to_harness`` replaces
+    ``body["instructions"]`` wholesale for this harness, so the composed value
+    it swaps in must already carry this turn's per-request text — otherwise
+    genuine caller instructions are silently dropped whenever the spec
+    resolves, silently dropping caller input at the swap.
+
+    A caller-supplied ``?stream=true`` body carries RAW per-request text, not
+    an internal fallback, so the swap must preserve it rather than discard it.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_opencode_gated_wire"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="opencode-agent",
+            instructions="Be a concise assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        )
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_opencode",
+            # Genuine per-request instructions from the caller. Must compose
+            # with the agent's authored text, not be replaced by it.
+            instructions="Answer only in French.",
+        )
+        assert response.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert recording_client.posted_bodies[0]["instructions"] == (
+        "Be a concise assistant.\n\nAnswer only in French."
+    ), (
+        f"opencode-native must receive the agent's text AND this turn's "
+        f"per-request text — got "
+        f"{recording_client.posted_bodies[0].get('instructions')!r}. A value of "
+        f"'Be a concise assistant.' alone means the gated swap overwrote the "
+        f"caller's instructions instead of composing them."
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_instruction_composition_uses_sub_agent_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Direct ``?stream=true`` instruction composition uses the SUB-AGENT's
+    own spec, not the root/parent's — for a session dispatched with a known
+    harness (so this reaches the "harness already known" else-branch of
+    ``_stream_message_to_harness``, not the ``_resolve_effective_turn`` path
+    that a background turn would take).
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_subagent_composition"
+
+    sub_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Sub-agent-specific instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions — must not be used for this turn.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        sub_agents=[sub_spec],
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    class _SubAgentSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_worker", "sub_agent_name": "worker"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_SubAgentSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_root",
+            harness="opencode-native",
+        )
+        assert response.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert recording_client.posted_bodies[0]["instructions"] == "Sub-agent-specific instructions."
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_instruction_composition_ignores_stale_spec_cache_after_agent_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Direct ``?stream=true`` composition must not use a ``_session_spec_cache``
+    entry left over from a PREVIOUS agent on this same conversation.
+
+    The background-turn twin (``_run_turn_bg_setup_and_stream``) detects an
+    agent switch (dispatched agent_id differs from the previously recorded
+    one) and clears ``_session_spec_cache`` before reading it. This
+    direct-stream path (harness already known, so it reads the cache
+    directly rather than going through ``_resolve_effective_turn``) must
+    apply the same check — the cache is populated here via a real
+    background turn for agent A, then drives a direct-stream turn for a
+    DIFFERENT agent B and asserts B's instructions are used, not A's stale
+    cached spec.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_agent_switch_cache_staleness"
+
+    specs = {
+        "ag_agent_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A's instructions — must not be reused for agent B.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+        "ag_agent_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Background turn for agent A populates _session_spec_cache[conv]
+        # with A's spec (and _session_agent_ids[conv] = "ag_agent_a").
+        bg_resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_agent_a",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert bg_resp.status_code == 202
+        await _await_bg_turn_task(conv)
+
+        # Direct-stream turn for a DIFFERENT agent B, harness already known
+        # (the else-branch that reads _session_spec_cache directly).
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_agent_b",
+            harness="opencode-native",
+        )
+        assert response.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert recording_client.posted_bodies[-1]["instructions"] == "Agent B's instructions."
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_releases_harness_process_on_agent_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A same-harness A->B agent switch on the direct ``?stream=true`` path
+    must release the cached harness subprocess, not just evict the spec/
+    snapshot dicts.
+
+    Regression: ``process_manager.get_client()`` reuses an existing cached
+    subprocess entry regardless of a NEW env/config on that call — it only
+    spawns fresh when no entry exists yet. A stateful harness that seeds
+    its options once from the FIRST system prompt/instructions it ever
+    sees (claude-sdk builds its SDK options from the first spec; Hermes
+    only prefixes gated instructions while no vendor session id exists
+    yet) would silently keep serving agent A's instructions to agent B's
+    turns for the rest of that process's life if only the spec/snapshot
+    caches were invalidated — the composed wire ``instructions`` field
+    would correctly say "B", but the actual subprocess running underneath
+    would still be A's, seeded with A's config. The background dispatch
+    path already calls ``process_manager.release()`` on its own explicit
+    agent-switch branch; this direct-stream path must match it.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_direct_stream_agent_switch_release"
+
+    specs = {
+        "ag_agent_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+        "ag_agent_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    fake_process_manager = _FakeProcessManager(recording_client)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, fake_process_manager),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Turn 1: direct-stream for agent A. No prior recorded agent, so
+        # this is not itself an agent SWITCH — release may or may not fire
+        # here (nothing to release yet); what matters is turn 2 below.
+        first = await _post_stream_message(
+            http, conv, agent_id="ag_agent_a", harness="opencode-native"
+        )
+        assert first.status_code == 200
+        release_calls_after_first_turn = len(fake_process_manager.release_calls)
+
+        # Turn 2: direct-stream for a DIFFERENT agent B on the SAME
+        # conversation, same harness — a genuine same-harness agent
+        # switch. Must release the cached subprocess.
+        second = await _post_stream_message(
+            http, conv, agent_id="ag_agent_b", harness="opencode-native"
+        )
+        assert second.status_code == 200
+
+    assert len(fake_process_manager.release_calls) > release_calls_after_first_turn, (
+        f"Expected process_manager.release({conv!r}) to be called on the "
+        f"A->B agent switch; release_calls={fake_process_manager.release_calls!r}."
+    )
+    assert conv in fake_process_manager.release_calls
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_ignores_spec_cache_with_no_recorded_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_session_spec_cache`` can be populated by a path that never records
+    ``_session_agent_ids`` (e.g. ``_resolve_session_spec_entry``, called by
+    several session-scoped endpoints off a server snapshot's own agent_id) —
+    this is not "stale from a KNOWN prior
+    agent" but "cached with UNKNOWN provenance entirely"
+    (``_session_agent_ids.get(conv_id) is None``). An unset entry must be
+    treated as a cache MISS, not as "no conflict, safe to trust" — an
+    exact-match requirement, not a mismatch-only check.
+
+    Drives this via ``GET /v1/sessions/{id}/resources``, which calls
+    ``_resolve_session_agent_spec`` → ``_resolve_session_spec_entry`` with
+    NO ``agent_id_hint`` (it has no per-turn dispatched agent to pass) — it
+    populates ``_session_spec_cache`` purely from the session snapshot's
+    own agent_id, without ever touching ``_session_agent_ids``. This is
+    genuinely UNKNOWN provenance, distinct from a KNOWN-agent-A-then-B
+    mismatch: the direct-stream cold-boot path itself now writes
+    ``_session_agent_ids`` after resolving (closing an earlier gap), so
+    driving this via two direct-stream turns for A then B would no longer
+    exercise the unknown-provenance branch at all — it would just be an
+    ordinary known switch. The resources endpoint is the one remaining
+    code path that populates the spec cache with no agent-id recording
+    whatsoever, so the scenario stays meaningful.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_no_provenance_cache"
+
+    specs = {
+        "ag_no_prov_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A's instructions — must not leak to agent B.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+        "ag_no_prov_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    class _AgentASnapshotClient(NullServerClient):
+        """Server snapshot always reports agent A — feeds the resources
+        endpoint's ``_resolve_session_agent_spec`` call, which populates
+        ``_session_spec_cache`` WITHOUT touching ``_session_agent_ids``
+        (that's the provenance gap under test)."""
+
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_no_prov_a"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_AgentASnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Populate _session_spec_cache with agent A's spec via a path that
+        # NEVER records _session_agent_ids — genuine unknown provenance,
+        # not a known-A-then-B switch.
+        resources_resp = await http.get(f"/v1/sessions/{conv}/resources")
+        assert resources_resp.status_code == 200
+
+        # Direct-stream turn for agent B — must not reuse the
+        # unknown-provenance cache entry left by the resources call.
+        second = await _post_stream_message(
+            http, conv, agent_id="ag_no_prov_b", harness="opencode-native"
+        )
+        assert second.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert recording_client.posted_bodies[-1]["instructions"] == "Agent B's instructions."
+
+
+@pytest.mark.asyncio
+async def test_background_dispatch_ignores_spec_cache_with_no_recorded_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The BACKGROUND dispatch path (``_run_turn_bg_setup_and_stream``) has its
+    own separate cache-provenance check from the direct-stream path; they do
+    not share one resolver.
+
+    Genuine unknown provenance is populated via ``GET
+    /v1/sessions/{id}/resources``. The direct-stream cold-boot path records
+    ``_session_agent_ids`` after resolving, so a direct-stream turn would be
+    an ordinary known A-then-B switch rather than the unknown-provenance
+    case. Turn 2, for a DIFFERENT agent, goes through the background dispatch
+    path and must not trust that unknown-provenance cache entry.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_bg_no_provenance_cache"
+
+    specs = {
+        "ag_bg_no_prov_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A's instructions — must not leak to agent B.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+        "ag_bg_no_prov_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    class _AgentASnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_bg_no_prov_a"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_AgentASnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Populate _session_spec_cache with agent A's spec via a path that
+        # NEVER records _session_agent_ids — genuine unknown provenance.
+        resources_resp = await http.get(f"/v1/sessions/{conv}/resources")
+        assert resources_resp.status_code == 200
+
+        # BACKGROUND dispatch for a DIFFERENT agent — must not reuse the
+        # unknown-provenance cache entry.
+        bg_resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bg_no_prov_b",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert bg_resp.status_code == 202
+        await _await_bg_turn_task(conv)
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert recording_client.posted_bodies[-1]["instructions"] == "Agent B's instructions."
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_with_no_agent_id_does_not_trust_a_differently_tagged_cache() -> None:
+    """
+    A direct-stream turn dispatched with NO ``agent_id`` at all must not
+    be handed a cache entry tagged for a DIFFERENT, previously-dispatched
+    agent.
+
+    Regression: the composition-site provenance check used to read
+    ``not _agent_id or _session_agent_ids.get(conv_id) == _agent_id`` — an
+    unset/unknown ``_agent_id`` short-circuited the ``or`` to True,
+    treating "we don't know who this turn is for" as automatic "no
+    conflict" and handing back whatever was cached, regardless of who it
+    actually belonged to. Turn 1 dispatches A, turn 2 dispatches B (a real
+    switch), and an unrelated resources call then tags
+    ``_session_spec_cache[conv]`` with B. Turn 3 has NO ``agent_id`` in
+    its body at all — with the bug, it would inherit B's cached
+    instructions merely because "no id" was treated as harmless; the fix
+    treats an entry tagged for a KNOWN agent as a miss when the current
+    turn's agent isn't known, so composition degrades to "unknown"
+    instead of guessing.
+    """
+    conv = "conv_no_agent_id_turn_no_leak"
+
+    specs = {
+        "ag_no_id_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+        "ag_no_id_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B's instructions — must not leak to a no-agent-id turn.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    class _AgentBSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_no_id_b"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_AgentBSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Turn 1: agent A.
+        first = await _post_stream_message(http, conv, agent_id="ag_no_id_a", harness="hermes")
+        assert first.status_code == 200
+
+        # Turn 2: agent B — a real switch, so _session_agent_ids[conv] = B.
+        second = await _post_stream_message(http, conv, agent_id="ag_no_id_b", harness="hermes")
+        assert second.status_code == 200
+
+        # An unrelated resources call tags _session_spec_cache[conv] with B.
+        resources_resp = await http.get(f"/v1/sessions/{conv}/resources")
+        assert resources_resp.status_code == 200
+
+        # Turn 3: NO agent_id at all in the body. Must NOT inherit B's
+        # cached instructions.
+        third = await _post_stream_message(http, conv, harness="hermes")
+        assert third.status_code == 200
+
+    last_body = recording_client.posted_bodies[-1]
+    assert last_body.get("instructions") != (
+        "Agent B's instructions — must not leak to a no-agent-id turn."
+    ), (
+        f"A no-agent-id turn must not be handed B's cached instructions — "
+        f"got instructions={last_body.get('instructions')!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_survives_resources_snapshot_of_different_agent_mid_conversation() -> (
+    None
+):
+    """
+    A B-tagged spec-cache entry must not drive a turn dispatched as A.
+
+    Forces a REAL A-vs-B provenance conflict all the way to the tagged-cache
+    check, with both of the defenses that would otherwise mask it held off:
+
+    - The B-tagged entry is written by real code, not seeded. The
+      ``GET .../resources`` call runs BEFORE this session has dispatched any
+      turn, so ``_session_agent_ids`` holds no marker for it to hint with and
+      ``_resolve_session_spec_entry`` falls back to the session snapshot —
+      which reports agent B — caching B's spec tagged B. Once a marker does
+      exist that endpoint hints with it and the snapshot is never consulted,
+      so this ordering is the only way the conflicting entry can arise.
+    - The marker is then set to A directly. Reaching that state via a real A
+      turn is impossible: a turn whose agent id differs from the marker trips
+      ``_invalidate_session_agent_state`` first, which clears the spec cache
+      outright and masks exactly the check under test. That switch
+      invalidation is a SEPARATE defense with its own tests; this one targets
+      the per-entry provenance tag sitting behind it.
+
+    With the marker reading "A" the A turn is not flagged as a switch at all,
+    so untagged-cache behavior would hand back whatever sits under
+    ``conv_id`` — B's spec, and B's instructions on the wire. The entry's own
+    agent tag is what makes it a clean miss and forces A to be re-resolved.
+    """
+    from omnigent.runner.app import _session_agent_ids_ref
+
+    conv = "conv_resources_snapshot_of_other_agent"
+    resolved_agent_ids: list[str] = []
+
+    specs = {
+        "ag_snap_leak_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+        "ag_snap_leak_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        resolved_agent_ids.append(agent_id)
+        return specs[agent_id]
+
+    class _AgentBSnapshotClient(NullServerClient):
+        """Session snapshot reports agent B — the lagging/independent view
+        the resources endpoint resolves off when it has no marker to hint
+        with."""
+
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_snap_leak_b"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_AgentBSnapshotClient(),  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_test_client(app) as http:
+            # No turn has run, so no marker exists to hint with: this
+            # resolves off the snapshot (agent B) and is the FIRST write to
+            # _session_spec_cache[conv] — B's spec, tagged B.
+            resources_resp = await http.get(f"/v1/sessions/{conv}/resources")
+            assert resources_resp.status_code == 200
+            assert resolved_agent_ids == ["ag_snap_leak_b"], (
+                f"setup failed: the resources call was supposed to resolve the "
+                f"snapshot's agent B and leave a B-tagged cache entry — resolver "
+                f"saw {resolved_agent_ids!r}. Without that entry the assertion "
+                f"below would be vacuous."
+            )
+
+            # Model "this session last dispatched as A" without routing
+            # through a switch that would clear the cache first (see
+            # docstring). This is the state the tagged read must survive.
+            _session_agent_ids_ref[conv] = "ag_snap_leak_a"
+
+            # Not a switch (marker already says A), so nothing evicts the
+            # B-tagged entry before the tagged read keyed on A hits it.
+            turn = await _post_stream_message(
+                http, conv, agent_id="ag_snap_leak_a", harness="hermes"
+            )
+            assert turn.status_code == 200
+    finally:
+        _session_agent_ids_ref.pop(conv, None)
+
+    assert [b["instructions"] for b in recording_client.posted_bodies] == [
+        "Agent A's instructions."
+    ], (
+        f"Wire instructions must be A's — got "
+        f"{[b.get('instructions') for b in recording_client.posted_bodies]!r}. "
+        f"'Agent B's instructions.' means the B-tagged entry the resources "
+        f"call left behind was trusted for a turn dispatched as A."
+    )
+    assert resolved_agent_ids[-1] == "ag_snap_leak_a", (
+        f"the A turn must re-resolve A after missing the B-tagged entry — "
+        f"resolver saw {resolved_agent_ids!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_schemas_cache_retries_after_unresolved_spec_turn() -> None:
+    """
+    Stale-negative-cache scenario: ``_session_tool_schemas``
+    used to cache an empty tool list whenever the read-gate missed,
+    REGARDLESS of whether a spec was actually available to build schemas
+    from. A turn whose spec resolution is transiently unavailable (e.g. the
+    agent hasn't propagated to the spec store yet) permanently pinned this
+    conversation's tool list to empty — even once a LATER turn's spec
+    resolves fine, because ``[] is not None`` reads as a settled cache hit.
+    An unresolved-spec turn leaves the cache UNSET, so the next turn (spec
+    now resolvable) retries and populates real schemas.
+    """
+    conv = "conv_tool_schema_retry"
+    call_count = 0
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec | None:
+        nonlocal call_count
+        del session_id, agent_id
+        call_count += 1
+        if call_count == 1:
+            # Turn 1: spec transiently unavailable — a legitimate "not
+            # resolvable right now" None, not an exception.
+            return None
+        return AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+        )
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        first = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_retry",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert first.status_code == 202
+        await _await_bg_turn_task(conv)
+
+        second = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_retry",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi again"}],
+            },
+        )
+        assert second.status_code == 202
+        await _await_bg_turn_task(conv)
+
+    assert call_count >= 2, (
+        f"expected spec_resolver to be re-invoked on turn 2 (turn 1's None "
+        f"result must not be trusted as final) — got {call_count} calls."
+    )
+    second_tools = recording_client.posted_bodies[-1].get("tools")
+    assert second_tools, (
+        f"turn 2's real spec must produce non-empty tool schemas — got "
+        f"{second_tools!r}. An empty result means turn 1's unresolved-spec "
+        f"empty tool cache was wrongly trusted as final."
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_schemas_mcp_only_partial_result_is_not_cached_as_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A turn where the builtin (``ToolManager``) half fails but MCP resolution
+    succeeds must not cache the MCP-only remainder as the conversation's
+    final tool list.
+
+    The MCP merge reads the builtin half back out of ``_session_tool_schemas``
+    and treats an absent entry as ``[]``, so on a transient ToolManager
+    failure it would cache ``[] + mcp_schemas`` — and stamp the matching MCP
+    spec hash. Both gates then read as settled on every later turn (the tool
+    cache is non-``None``, the hash matches), so the builtin half is never
+    retried and the agent runs the rest of the conversation with MCP tools
+    only. The failed turn caches nothing, and the next turn
+    (ToolManager now working) publishes builtin AND MCP schemas together.
+    """
+    conv = "conv_tool_schema_partial"
+    toolmanager_calls = 0
+
+    class _FakeToolManager:
+        """Fails the first build (transient), succeeds afterwards."""
+
+        def __init__(self, spec: object, workdir: object = None) -> None:
+            nonlocal toolmanager_calls
+            del spec, workdir
+            toolmanager_calls += 1
+            if toolmanager_calls == 1:
+                raise RuntimeError("transient: tool registry unavailable")
+
+        def get_tool_schemas(self) -> list[dict[str, Any]]:
+            return [{"name": "sys_builtin_thing"}]
+
+    class _FakeProxyMcpManager:
+        """MCP half always resolves — the combination under test."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def schemas_for(self, spec: object) -> SimpleNamespace:
+            del spec
+            return SimpleNamespace(schemas=[{"name": "jira__search"}])
+
+    import omnigent.runner.app as runner_app_mod
+    import omnigent.tools.manager as tool_manager_mod
+
+    monkeypatch.setattr(tool_manager_mod, "ToolManager", _FakeToolManager)
+    monkeypatch.setattr(runner_app_mod, "ProxyMcpManager", _FakeProxyMcpManager)
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            mcp_servers=[MCPServerConfig(name="jira", transport="http", url="http://x")],
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+        )
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        for _text in ("hi", "hi again"):
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_partial",
+                    "model": "x",
+                    "content": [{"role": "user", "content": _text}],
+                },
+            )
+            assert resp.status_code == 202
+            await _await_bg_turn_task(conv)
+
+    assert toolmanager_calls >= 2, (
+        f"the builtin half must be retried on turn 2 — ToolManager was built "
+        f"{toolmanager_calls} time(s). Exactly 1 means turn 1's MCP-only "
+        f"partial result was cached as final."
+    )
+    _names = json.dumps(recording_client.posted_bodies[-1].get("tools") or [])
+    assert "sys_builtin_thing" in _names and "jira__search" in _names, (
+        f"turn 2 must publish the builtin AND MCP schemas together — got "
+        f"{_names}. A wire list carrying only 'jira__search' means the "
+        f"MCP-only partial set from turn 1 was trusted as the final tool list."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_switch_closes_and_rebuilds_the_comment_relay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An in-conversation agent switch must close and evict the session's
+    comment relay so the next turn rebuilds it from the new agent's spec.
+
+    The relay is agent-derived — its advertised tool set is
+    ``build_native_relay_tool_schemas(resolved_spec)`` — but it is stored
+    untagged in ``_session_comment_relays`` and ``_ensure_comment_relay_started``
+    gates purely on presence. Native harnesses ignore the wire ``tools`` list,
+    so the relay IS their entire tool surface: left running across a switch,
+    the new agent keeps being served the PREVIOUS agent's gated tools for the
+    life of the session. Switching A -> B closes the A relay
+    and starts a B relay advertising B's tools.
+    """
+    conv = "conv_relay_switch"
+    started_tools: list[list[str]] = []
+    closed = 0
+
+    class _FakeRelay:
+        def close(self) -> None:
+            nonlocal closed
+            closed += 1
+
+    def _fake_start_tool_relay(*, tools: list[dict[str, Any]], **kwargs: object) -> _FakeRelay:
+        del kwargs
+        started_tools.append([t["name"] for t in tools])
+        return _FakeRelay()
+
+    def _fake_build_native_relay_tool_schemas(spec: Any) -> list[dict[str, Any]]:
+        return [{"name": f"relay_for_{getattr(spec, 'name', None)}"}]
+
+    import omnigent.claude_native_bridge as claude_bridge_mod
+    import omnigent.runner.tool_dispatch as tool_dispatch_mod
+
+    monkeypatch.setattr(claude_bridge_mod, "start_tool_relay", _fake_start_tool_relay)
+    monkeypatch.setattr(claude_bridge_mod, "post_tools_changed", lambda _bridge_dir: None)
+    monkeypatch.setattr(
+        tool_dispatch_mod,
+        "build_native_relay_tool_schemas",
+        _fake_build_native_relay_tool_schemas,
+    )
+
+    specs = {
+        "ag_relay_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+        "ag_relay_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        for _agent in ("ag_relay_a", "ag_relay_b"):
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": _agent,
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert resp.status_code == 202
+            await _await_bg_turn_task(conv)
+
+    assert started_tools == [["relay_for_agent-a"], ["relay_for_agent-b"]], (
+        f"the A->B switch must close the A relay and start a B relay carrying "
+        f"B's tool surface — relays started with {started_tools!r}. A single "
+        f"entry means agent B kept being served A's relay tools."
+    )
+    assert closed == 1, (
+        f"the previous agent's relay must be closed on the switch, not just "
+        f"dropped — close() called {closed} time(s)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_session_resources_uses_recorded_agent_id_as_hint() -> None:
+    """
+    Dropped-provenance-hint scenario: ``list_session_resources``
+    (``GET /v1/sessions/{id}/resources``) used to call
+    ``_resolve_session_agent_spec(session_id)`` with no hint, so it always
+    resolved off whatever the session snapshot reported — even once
+    ``_session_agent_ids`` already recorded this session's REAL current
+    agent from a dispatched turn, and the snapshot is lagging (the same
+    in-flight-switch race already closed at other call sites that pass the
+    hint). Once a turn has dispatched agent A, a resources
+    call resolves A's spec via the ``agent_id_hint``, not the snapshot's
+    (stale) agent B.
+    """
+    conv = "conv_resources_hint"
+    resolved_agent_ids: list[str] = []
+
+    specs = {
+        "ag_hint_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+        "ag_hint_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        resolved_agent_ids.append(agent_id)
+        return specs[agent_id]
+
+    class _StaleBSnapshotClient(NullServerClient):
+        """Session snapshot always reports agent B — models a server-side
+        snapshot lagging an in-flight switch to A."""
+
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_hint_b"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_StaleBSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Dispatch turn for agent A. hermes has no cold-boot step, so this
+        # only records _session_agent_ids[conv] = "A" — no spec resolution
+        # yet, so the resources call below is the first _session_spec_cache
+        # write for this conversation.
+        first = await _post_stream_message(http, conv, agent_id="ag_hint_a", harness="hermes")
+        assert first.status_code == 200
+
+        # The resources call has no per-request agent_id of its own; the
+        # session snapshot (stale) reports B. Pre-fix this resolved B's spec.
+        resources_resp = await http.get(f"/v1/sessions/{conv}/resources")
+        assert resources_resp.status_code == 200
+
+    assert "ag_hint_b" not in resolved_agent_ids and "ag_hint_a" in resolved_agent_ids, (
+        f"list_session_resources must resolve the session's recorded agent "
+        f"(A) via agent_id_hint, not the stale snapshot's agent (B) — "
+        f"resolver saw {resolved_agent_ids!r}."
+    )
+
+
+@pytest.mark.parametrize(
+    "harness_name",
+    [
+        pytest.param("claude-native", id="claude-native"),
+        pytest.param("codex-native", id="codex-native"),
+        pytest.param("pi-native", id="pi-native"),
+        pytest.param("cursor-native", id="cursor-native"),
+        pytest.param("opencode-native", id="opencode-native"),
+        pytest.param("kimi-native", id="kimi-native"),
+        pytest.param("runner-test-default", id="repl"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_initialize_session_arms_use_request_agent_id_as_hint(
+    harness_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Every ``_initialize_session`` terminal arm must resolve its spec with the
+    request's own ``agent_id`` as the hint.
+
+    Each arm used to call ``_resolve_session_agent_spec(session_id)`` bare,
+    even though ``agent_id`` is this function's just-validated, authoritative
+    identity for the whole call — already written into ``_session_spec_cache``
+    before the arm runs. Without the hint, resolution falls back to a
+    session-snapshot fetch that can be absent or lagging right after session
+    creation, and the terminal launches with none of the spec-derived inputs.
+
+    The snapshot GET 404s for the whole test, so a bare resolve raises
+    ``OmnigentError`` and every arm degrades to no spec — the
+    ``skills_filter`` can then only arrive via the hint. The
+    resolver is also checked to have seen that exact agent id, and it keys the
+    spec it returns off the id it was handed, so a wrong or dropped id cannot
+    produce this value either.
+
+    :param harness_name: Harness selecting the arm under test.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.runner.app as runner_app_mod
+    from omnigent.errors import OmnigentError
+    from omnigent.terminals import TerminalRegistry
+
+    agent_id = f"ag_hint_{harness_name.replace('-', '_')}"
+    captured: dict[str, Any] = {}
+    resolved_agent_ids: list[str] = []
+
+    async def _capture_kwargs_terminal(*args: object, **kwargs: object) -> None:
+        """Claude / codex / REPL arms hand the resolved spec straight in."""
+        del args
+        if "skills_filter" in kwargs:
+            captured["skills_filter"] = kwargs.get("skills_filter")
+        else:
+            _spec = kwargs.get("agent_spec")
+            captured["skills_filter"] = getattr(_spec, "skills_filter", None)
+
+    async def _capture_launch_native_terminal(
+        _harness: str,
+        _ctx: object,
+        *,
+        ensure_locks: object = None,
+        resolve_agent_spec: Any = None,
+        build_context: Any = None,
+        **_kw: object,
+    ) -> bool:
+        """pi / cursor / opencode / kimi arms pass a resolver callable; the
+        claude / codex arms enrich the launch context instead, so the spec
+        they resolve arrives on the context this returns."""
+        del ensure_locks, _kw
+        if resolve_agent_spec is not None:
+            try:
+                _spec = await resolve_agent_spec()
+            except OmnigentError:
+                _spec = None
+            captured["skills_filter"] = getattr(_spec, "skills_filter", None)
+        if build_context is not None:
+            _built = await build_context(_ctx)
+            _filter = getattr(_built, "skills_filter", None)
+            if _filter is None:
+                _filter = getattr(getattr(_built, "agent_spec", None), "skills_filter", None)
+            captured["skills_filter"] = _filter
+        return True
+
+    async def _no_transfer(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return False
+
+    async def _codex_needs_terminal(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    for _name in (
+        "_auto_create_claude_terminal",
+        "_auto_create_codex_terminal",
+        "_auto_create_repl_terminal",
+    ):
+        monkeypatch.setattr(runner_app_mod, _name, _capture_kwargs_terminal)
+    monkeypatch.setattr(runner_app_mod, "_launch_native_terminal", _capture_launch_native_terminal)
+    monkeypatch.setattr(
+        runner_app_mod, "_claude_native_terminal_arrives_via_transfer", _no_transfer
+    )
+    monkeypatch.setattr(
+        runner_app_mod, "_codex_session_needs_runner_terminal", _codex_needs_terminal
+    )
+    monkeypatch.setattr(
+        runner_app_mod, "_ensure_orchestrator_skills_in_bundle", lambda *a, **k: None
+    )
+
+    conv = f"conv_arm_{harness_name.replace('-', '_')}"
+
+    async def _spec_resolver(resolved_agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Key the returned spec off the id handed in, so a wrong id cannot
+        produce the expected ``skills_filter``."""
+        del session_id
+        resolved_agent_ids.append(resolved_agent_id)
+        return AgentSpec(
+            spec_version=1,
+            name=f"agent-for-{resolved_agent_id}",
+            instructions="Agent instructions.",
+            skills_filter=[f"skill-for-{resolved_agent_id}"],
+            executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
+        )
+
+    class _BrokenSnapshotClient(NullServerClient):
+        """Session snapshot GET fails outright — models a session not yet
+        propagated to the server's read path, the race the hint must survive."""
+
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 404
+
+                def json(self) -> dict[str, object]:
+                    return {"error": "not_found"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(_FakeHarnessClient([]))),
+        spec_resolver=_spec_resolver,
+        server_client=_BrokenSnapshotClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            "/v1/sessions",
+            json={"session_id": conv, "agent_id": agent_id},
+        )
+        assert resp.status_code == 201, resp.text
+
+    assert resolved_agent_ids == [agent_id], (
+        f"the request's exact agent_id must be what reaches the spec resolver "
+        f"— resolver saw {resolved_agent_ids!r}, expected [{agent_id!r}]."
+    )
+    assert captured.get("skills_filter") == [f"skill-for-{agent_id}"], (
+        f"the {harness_name} arm must receive the spec resolved via the "
+        f"request's own agent_id hint, not lose it because the session "
+        f"snapshot GET is broken — captured={captured!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_cache_reset_route_forces_fresh_resolve() -> None:
+    """
+    ``POST /v1/sessions/{id}/agent-cache/reset`` must clear the cached
+    spec so a turn dispatched immediately after re-resolves it (observing
+    whatever the resolver returns NOW) rather than reusing the pre-reset
+    entry.
+
+    Modeled by a resolver that returns a DIFFERENT spec on its second call
+    for the SAME agent id (simulating the agent's definition having
+    changed) — if the cache survived the reset, the post-reset turn would
+    still observe the stale first-call spec. Uses a non-native harness
+    (``claude-sdk``) and background dispatch so each turn resolves the
+    spec exactly once (no cold-boot second resolve to confound the count),
+    keeping the causal chain from "reset happened" to "fresh resolve
+    happened" unambiguous.
+    """
+    conv = "conv_agent_cache_reset_forces_fresh_resolve"
+
+    calls = {"n": 0}
+
+    def _spec_for_call(n: int) -> AgentSpec:
+        return AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions=f"Agent A's instructions v{n}.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        calls["n"] += 1
+        return _spec_for_call(calls["n"])
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        first_resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_reset_prov_a",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert first_resp.status_code == 202
+        await _await_bg_turn_task(conv)
+
+        reset_resp = await http.post(f"/v1/sessions/{conv}/agent-cache/reset", json={})
+        assert reset_resp.status_code == 200
+
+        second_resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_reset_prov_a",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi again"}],
+            },
+        )
+        assert second_resp.status_code == 202
+        await _await_bg_turn_task(conv)
+
+    assert [b["instructions"] for b in recording_client.posted_bodies] == [
+        "Agent A's instructions v1.",
+        "Agent A's instructions v2.",
+    ], (
+        f"Expected a fresh resolve (v2) after the agent-cache reset — got "
+        f"{[b['instructions'] for b in recording_client.posted_bodies]!r}. A "
+        f"repeated 'v1' means the cached spec survived the reset and was "
+        f"trusted for the next turn instead of being re-resolved."
+    )
+
+
+def test_agent_cache_reset_clears_the_agent_id_marker_too() -> None:
+    """
+    ``_clear_session_agent_caches`` (shared by the ``/reset-state`` and
+    ``/agent-cache/reset`` routes, and by ``_invalidate_session_agent_state``
+    on an in-conversation switch) must pop ``_session_agent_ids`` along
+    with the tagged caches it already pops.
+
+    Source-level guard, matching the established pattern for this
+    closure-local, HTTP-unobservable state (see
+    ``test_direct_and_background_switch_sites_share_one_invalidation_routine``
+    above): every tagged cache entry carries its own provenance now, so a
+    stale ``_session_agent_ids`` value can no longer cause a WRONG spec to
+    be trusted — but it can still cause an informational reader (MCP
+    execute, background-title, ``_session_harness_name``, ...) to look up
+    the wrong agent's tag right after a reset. Leaving the reset routes'
+    shared cache-clearing helper without this pop would silently
+    reintroduce that staleness.
+    """
+    import inspect
+
+    import omnigent.runner.app as runner_app_mod
+
+    source = inspect.getsource(runner_app_mod)
+    start = source.index("def _clear_session_agent_caches(")
+    end = source.index("\n    async def _invalidate_session_agent_state(", start)
+    body = source[start:end]
+
+    assert "_session_agent_ids.pop(" in body, (
+        "_clear_session_agent_caches must pop _session_agent_ids(session_id) "
+        "so it doesn't outlive the caches it's supposed to describe."
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_dispatch_warns_and_uses_parent_on_unresolvable_sub_agent_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Background dispatch (``_run_turn_bg_setup_and_stream``) runs the turn on
+    the PARENT spec and warns when the recovered ``sub_agent_name`` (from a
+    session snapshot, via ``_recover_sub_agent_name``) does not resolve in
+    the spec tree.
+
+    This used to raise ``NOT_FOUND`` and publish a ``failed`` status for the
+    turn. Both halves of the replacement are asserted: the warning must be
+    emitted AND the turn must reach the parent's harness — a silent fallback
+    satisfies neither.
+
+    No prior ``POST /v1/sessions`` call here: the cache starts empty, so the
+    background turn's own on-demand ``spec_resolver`` call is the ONLY
+    resolution that happens. Background dispatch calls
+    ``spec_resolver`` only when the cache is empty, so a pre-populated cache
+    would leave that call unmade and the turn would never exercise the
+    no-match path at all.
+
+    :param caplog: Pytest log capture, used to confirm the unresolved
+        sub-agent is reported rather than passed over in silence.
+    """
+    conv = "conv_bg_recovered_sub_agent_gone"
+
+    # A non-native harness: the turn now runs to completion instead of
+    # stopping at the unresolved sub-agent, so it reaches cold boot, and a
+    # native harness would try to launch a vendor CLI that isn't present.
+    root_spec_without_worker = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    calls = {"n": 0}
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        calls["n"] += 1
+        return root_spec_without_worker
+
+    class _SnapshotWithSubAgentName(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_root", "sub_agent_name": "worker"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    pm = _FakeProcessManager(recorder)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=_SnapshotWithSubAgentName(),  # type: ignore[arg-type]
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        async with _runner_test_client(app) as http:
+            bg_resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_root",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert bg_resp.status_code == 202
+            await _await_bg_turn_task(conv)
+            statuses = await _drain_published_statuses(conv, until="idle", timeout=2.0)
+
+    assert "failed" not in statuses, (
+        f"An unresolvable recorded sub_agent_name must not fail the turn; "
+        f"published statuses were {statuses!r}."
+    )
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The unresolved sub-agent must be warned about; got {caplog.text!r}."
+    )
+    assert [harness for _conv, harness, _env in pm.get_client_calls] == ["claude-sdk"], (
+        f"The PARENT's harness must drive the turn; got {pm.get_client_calls!r}."
+    )
+    assert recorder.posted_bodies, "harness never received a request"
+    assert recorder.posted_bodies[-1]["instructions"] == "Root instructions.", (
+        f"The PARENT's authored instructions must compose for the turn; got "
+        f"{recorder.posted_bodies[-1]['instructions']!r}."
+    )
+    assert calls["n"] == 1, (
+        f"Expected exactly one spec_resolver call (the on-demand resolution "
+        f"when the cache is empty); got {calls['n']}. A count of 2+ here "
+        f"would mean the scenario isn't reproducing the real single-resolution "
+        f"code path."
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_dispatch_succeeds_when_cache_already_holds_resolved_child() -> None:
+    """
+    A background turn must succeed using an ALREADY-RESOLVED child spec
+    from the cache — not re-search that child's own descendants for its
+    own name and (mis)report a miss.
+
+    Session creation resolves the "worker" sub_agent_name and caches the
+    CHILD spec directly (not the root) — this is the real, common shape:
+    ``_session_spec_cache[conv]`` holds ``worker``'s own :class:`AgentSpec`
+    after ``POST /v1/sessions``. The first background turn then re-derives
+    ``sub_agent_name="worker"`` (via ``_recover_sub_agent_name``) and must
+    re-resolve it against the cached spec. Regression: ``_find_spec_by_name``
+    used to only search ``spec.sub_agents``, so handing it the already-
+    resolved child looked for "worker" as a grandchild of itself and
+    (falsely) reported a miss, failing the very first real background turn
+    for any session created with a sub_agent_name.
+    """
+    # A non-native harness (no session-create-time terminal auto-launch
+    # adapter) — the subject here is _find_spec_by_name's root self-check,
+    # not opencode's terminal machinery, which needs a real opencode CLI on
+    # PATH and would otherwise fail session-create for an unrelated reason.
+    conv = "conv_bg_cache_already_resolved_child"
+
+    worker_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Worker instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions — must not be used for this turn.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        sub_agents=[worker_spec],
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        create_resp = await http.post(
+            "/v1/sessions",
+            json={
+                "session_id": conv,
+                "agent_id": "ag_root",
+                "sub_agent_name": "worker",
+            },
+        )
+        assert create_resp.status_code == 201
+
+        bg_resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_root",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert bg_resp.status_code == 202
+        await _await_bg_turn_task(conv)
+        statuses = await _drain_published_statuses(conv, until="idle", timeout=2.0)
+
+    assert "failed" not in statuses, (
+        f"Background turn should succeed using the already-resolved cached "
+        f"child spec, not fail as if 'worker' were unresolvable; got "
+        f"statuses={statuses}."
+    )
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert recording_client.posted_bodies[-1]["instructions"] == "Worker instructions."
+
+
+@pytest.mark.asyncio
+async def test_background_dispatch_evicts_rejected_cache_entry_not_just_agent_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A background-path provenance rejection must EVICT the untrusted cache
+    entry, not just update ``_session_agent_ids`` to the current agent.
+
+    Regression: turn 1 (agent B) correctly rejects an unknown-provenance
+    stale cache entry (agent A's spec) for THIS read, but
+    ``_session_agent_ids[conv]`` is unconditionally set to "B" regardless
+    of whether resolution succeeds afterward. If resolution then fails (or
+    is never attempted), the stale agent-A spec is left untouched in
+    ``_session_spec_cache``. Turn 2 (also agent B) recomputes provenance as
+    "prior == dispatched" (both now "B", since turn 1 already wrote that) —
+    vacuously true — and trusts the still-resident agent-A spec as if it
+    were agent B's, laundering stale data back in as soon as the identity
+    record catches up to it.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_bg_provenance_reject_no_evict"
+
+    spec_a = AgentSpec(
+        spec_version=1,
+        name="agent-a",
+        instructions="Agent A's instructions — must never reach agent B's turn.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+    spec_b = AgentSpec(
+        spec_version=1,
+        name="agent-b",
+        instructions="Agent B's instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    resolver_calls_for_b = {"n": 0}
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        if agent_id == "ag_agent_a":
+            return spec_a
+        resolver_calls_for_b["n"] += 1
+        if resolver_calls_for_b["n"] == 1:
+            # Turn 1's on-demand resolution fails — cached_spec stays None
+            # for THIS read (correct degrade), but must not leave the
+            # stale agent-A entry sitting in the cache for turn 2 to find.
+            raise RuntimeError("transient resolver failure")
+        return spec_b
+
+    # The snapshot's reported agent_id tracks whichever agent most recently
+    # dispatched — like a real server, which updates its own conv.agent_id
+    # record BEFORE routing a turn to the runner (so any snapshot GET
+    # issued afterward, e.g. by the post-turn continuation task, correctly
+    # sees the new agent). A snapshot fixed to agent A regardless of what is
+    # dispatched would be an additional, unrealistic staleness source,
+    # separate from the background path's own provenance-rejection handling.
+    current_agent_id = {"id": "ag_agent_a"}
+
+    class _CurrentAgentSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": current_agent_id["id"]}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_CurrentAgentSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Populate _session_spec_cache with agent A's spec, tagged A, and
+        # _session_agent_ids[conv] = "ag_agent_a" — the direct-stream
+        # opencode cold-boot side effect.
+        first = await _post_stream_message(
+            http, conv, agent_id="ag_agent_a", harness="opencode-native"
+        )
+        assert first.status_code == 200
+
+        # A real server updates its own agent_id record before routing a
+        # turn to a different agent — reflect that here before dispatching
+        # for B, so any snapshot-driven resolution from this point on
+        # (e.g. the post-turn continuation task) sees the CURRENT agent,
+        # not a frozen "always agent A".
+        current_agent_id["id"] = "ag_agent_b"
+
+        # Turn 1: BACKGROUND dispatch for agent B. Provenance is rejected
+        # (prior is the KNOWN "ag_agent_a", a real mismatch against B),
+        # resolution then fails — must degrade, not use A's spec, for
+        # THIS turn.
+        bg_first = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_agent_b",
+                "model": "x",
+                "content": [{"role": "user", "content": "one"}],
+            },
+        )
+        assert bg_first.status_code == 202
+        await _await_bg_turn_task(conv)
+
+        # Turn 2: BACKGROUND dispatch for agent B again. Resolution would
+        # now succeed (spec_b) if attempted — the cache must not launder
+        # the still-resident agent-A entry back in as trusted just because
+        # _session_agent_ids now (trivially) matches.
+        bg_second = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_agent_b",
+                "model": "x",
+                "content": [{"role": "user", "content": "two"}],
+            },
+        )
+        assert bg_second.status_code == 202
+        await _await_bg_turn_task(conv)
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert recording_client.posted_bodies[-1]["instructions"] == "Agent B's instructions.", (
+        f"Turn 2 dispatched with the wrong instructions — the stale "
+        f"agent-A cache entry was laundered back in as trusted; got "
+        f"{recording_client.posted_bodies[-1]['instructions']!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_cold_boot_uses_current_agent_spec_after_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The opencode-native cold-boot terminal auto-create must resolve the
+    CURRENT turn's agent spec, not a stale spec left over from a previous
+    agent on the same conversation.
+
+    Cold-boot calls ``_resolve_session_agent_spec(conv_id,
+    agent_id_hint=_early_turn_agent_id)`` — passing THIS turn's already-
+    known agent id directly, rather than letting the resolver fall back to
+    a session-snapshot fetch that can lag an in-flight agent switch.
+    ``_resolve_session_spec_entry`` tags whatever it caches with the agent
+    id it actually resolved for, and every reader (including cold-boot)
+    checks that tag before trusting a hit — so a same-conversation A→B
+    switch correctly hands cold-boot agent B's spec on turn 2, not a
+    leftover A entry.
+    """
+
+    captured_specs: list[Any] = []
+
+    async def _capturing_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args
+        captured_specs.append(kwargs.get("agent_spec"))
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _capturing_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_opencode_cold_boot_agent_switch"
+
+    specs = {
+        "ag_agent_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+        "ag_agent_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    # cold-boot's _resolve_session_agent_spec derives its agent_id from the
+    # SESSION SNAPSHOT (a GET), not from the dispatched turn body — a real
+    # server updates conv.agent_id before routing a turn to a different
+    # agent, so reflect that here (see the sibling background-dispatch
+    # eviction test's identical rationale for a static-mock confound).
+    current_agent_id = {"id": "ag_agent_a"}
+
+    class _CurrentAgentSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": current_agent_id["id"]}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_CurrentAgentSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Turn 1: agent A. Cold-boot fires (no terminal registered yet —
+        # the fake adapter above never registers one, so cold-boot fires
+        # again on every subsequent turn too, matching a resource_registry
+        # with no real terminal backing).
+        first = await _post_stream_message(
+            http, conv, agent_id="ag_agent_a", harness="opencode-native"
+        )
+        assert first.status_code == 200
+
+        # Turn 2: agent B (switch) — update the "server's" record first.
+        current_agent_id["id"] = "ag_agent_b"
+        second = await _post_stream_message(
+            http, conv, agent_id="ag_agent_b", harness="opencode-native"
+        )
+        assert second.status_code == 200
+
+    assert [b["instructions"] for b in recording_client.posted_bodies] == [
+        "Agent A's instructions.",
+        "Agent B's instructions.",
+    ], "Wire instructions did not correctly track the agent switch."
+
+    assert len(captured_specs) == 2, (
+        f"Expected cold-boot to fire on both turns; got {len(captured_specs)} calls."
+    )
+    assert captured_specs[0] is not None and captured_specs[0].name == "agent-a"
+    assert captured_specs[1] is not None and captured_specs[1].name == "agent-b", (
+        f"Turn 2's opencode cold-boot received {getattr(captured_specs[1], 'name', None)!r}'s "
+        f"spec instead of agent B's — it read the stale cache before the "
+        f"per-turn provenance guard was applied."
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_three_turn_switch_does_not_launder_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A->B->B on the direct-stream path must deliver A, B, B — not A, B, A.
+
+    Cold-boot passes THIS turn's already-known agent id as a hint to
+    ``_resolve_session_agent_spec`` instead of falling back to a
+    session-snapshot fetch that can lag an in-flight switch, and every
+    cache entry it writes is tagged with the agent id it actually
+    resolved for — so a same-conversation A→B switch cannot leave a
+    same-session-keyed A entry that a later B turn would mistake for its
+    own. A THIRD turn (still B) runs specifically because two
+    turns (A->B) alone would not surface a laundering bug — it takes a
+    subsequent turn for the SAME agent to expose whether an earlier turn's
+    cold-boot silently re-cached the wrong identity.
+    """
+
+    captured_specs: list[Any] = []
+
+    async def _capturing_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args
+        captured_specs.append(kwargs.get("agent_spec"))
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _capturing_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_direct_stream_three_turn_switch"
+
+    specs = {
+        "ag_agent_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A's instructions — must never resurface after turn 2.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+        "ag_agent_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B's instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    # A session-snapshot GET that LAGS one turn behind the actually
+    # dispatched agent. That is the hazard under test: cold-boot deriving
+    # its own agent identity from a snapshot that has not caught up yet
+    # would bind the turn to the PREVIOUS agent. Cold-boot must not consult
+    # this snapshot at all — it receives the turn's already-known agent id
+    # directly — so the lag here is the hazard itself, not a fixture defect
+    # to be kept in sync.
+    snapshot_agent_id = {"id": "ag_agent_a"}
+
+    class _LaggingSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": snapshot_agent_id["id"]}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_LaggingSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Turn 1: agent A. snapshot_agent_id deliberately left at "A" (not
+        # yet updated) to simulate the server's own record still lagging
+        # at the moment this turn is dispatched.
+        first = await _post_stream_message(
+            http, conv, agent_id="ag_agent_a", harness="opencode-native"
+        )
+        assert first.status_code == 200
+
+        # Turn 2: agent B (switch). snapshot_agent_id is STILL "A" here —
+        # the server hasn't caught up yet either, so if cold-boot consulted
+        # the snapshot (instead of the turn's own dispatched agent id) it
+        # would resolve A's spec for what is actually B's turn.
+        second = await _post_stream_message(
+            http, conv, agent_id="ag_agent_b", harness="opencode-native"
+        )
+        assert second.status_code == 200
+
+        # NOW the snapshot catches up.
+        snapshot_agent_id["id"] = "ag_agent_b"
+
+        # Turn 3: agent B again. Must still see B — not a laundered-back-in
+        # agent-A entry from turn 2's cold-boot.
+        third = await _post_stream_message(
+            http, conv, agent_id="ag_agent_b", harness="opencode-native"
+        )
+        assert third.status_code == 200
+
+    assert [b["instructions"] for b in recording_client.posted_bodies] == [
+        "Agent A's instructions — must never resurface after turn 2.",
+        "Agent B's instructions.",
+        "Agent B's instructions.",
+    ], (
+        f"Wire instructions must be A, B, B — got "
+        f"{[b['instructions'] for b in recording_client.posted_bodies]!r}. A "
+        f"third value of 'Agent A's instructions.' means the stale cache "
+        f"entry was laundered back in as trusted."
+    )
+    assert [getattr(s, "name", None) for s in captured_specs] == [
+        "agent-a",
+        "agent-b",
+        "agent-b",
+    ], (
+        f"Cold-boot must resolve the CURRENT turn's agent on every call — "
+        f"got {[getattr(s, 'name', None) for s in captured_specs]!r}."
+    )
+
+
+def test_direct_and_background_switch_sites_share_one_invalidation_routine() -> None:
+    """
+    Both the direct-stream and background-dispatch agent-switch/
+    provenance-reject sites in ``_stream_message_to_harness`` and
+    ``_run_turn_bg_setup_and_stream`` must call the SAME shared
+    invalidation routine (``_invalidate_session_agent_state``) — not two
+    independently-maintained inline cache-pop lists.
+
+    Regression: the direct-stream site used to inline its own narrower
+    list (spec + snapshot only), while the background site inlined a
+    different, wider list (spec + skills + claude-launch-config + tool
+    schemas + snapshot, but still missing the MCP spec hash that
+    ``_clear_session_agent_caches`` — used elsewhere, e.g. the explicit
+    ``/agent-cache/reset`` route). Three independently
+    maintained enumerations of "the agent-derived cache set" is how a gap
+    like this recurs: a cache added to one list silently isn't added to
+    the others. The check here is structural/source-level rather than
+    runtime behavioural because the caches in question — skills, tool
+    schemas, MCP spec hash, claude launch config — are all closures local
+    to ``create_runner_app``, with no attribute or endpoint exposing them
+    for a test to poke or observe directly; asserting the single shared
+    call site is what actually guards against the divergence: both
+    dispatch paths must route through the one shared invalidation routine
+    rather than each maintaining its own eviction list.
+    """
+    import inspect
+
+    import omnigent.runner.app as runner_app_mod
+
+    source = inspect.getsource(runner_app_mod)
+    direct_stream_start = source.index("async def _stream_message_to_harness(")
+    direct_stream_body = source[direct_stream_start : direct_stream_start + 4000]
+    background_start = source.index("async def _run_turn_bg_setup_and_stream(")
+    background_body = source[background_start : background_start + 4000]
+
+    assert "_invalidate_session_agent_state(" in direct_stream_body, (
+        "_stream_message_to_harness must call the shared "
+        "_invalidate_session_agent_state helper on its switch/provenance-"
+        "reject branch, not an inline cache-pop list of its own."
+    )
+    assert "_invalidate_session_agent_state(" in background_body, (
+        "_run_turn_bg_setup_and_stream must call the shared "
+        "_invalidate_session_agent_state helper on its switch/provenance-"
+        "reject branch, not an inline cache-pop list of its own."
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_composition_uses_parent_and_keeps_caller_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Direct ``?stream=true`` instruction composition (known-harness branch)
+    composes against the PARENT spec, and warns, when the recorded
+    ``sub_agent_name`` no longer resolves in the cached spec tree.
+
+    This used to null the spec out and report the turn as indeterminate, so
+    composition was skipped entirely and the caller's ``instructions``
+    reached the harness verbatim. Composition now runs — but additively:
+    the caller's text is combined with the parent's authored instructions,
+    never replaced by them. All three halves are asserted (warning emitted,
+    parent's authored text present, caller's text still present), so
+    dropping any one of them fails this test.
+
+    :param monkeypatch: Pytest monkeypatch, used to stub terminal creation.
+    :param caplog: Pytest log capture, used to confirm the unresolved
+        sub-agent is reported rather than passed over in silence.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_direct_stream_sub_agent_gone"
+
+    root_spec_with_worker = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions — composed for this turn.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name="worker",
+                instructions="Worker instructions.",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+            )
+        ],
+    )
+    root_spec_without_worker = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions — composed for this turn.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    calls = {"n": 0}
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        calls["n"] += 1
+        # First call: session-create resolves the tree WITH "worker" so
+        # creation succeeds and caches an entry keyed to the creating agent.
+        # Later calls (the direct-stream turn, dispatched as a DIFFERENT
+        # agent so the cache-provenance check misses and this resolver is
+        # consulted again): the tree has since lost "worker".
+        return root_spec_with_worker if calls["n"] == 1 else root_spec_without_worker
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recorder)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        async with _runner_test_client(app) as http:
+            create_resp = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_root_creator",
+                    "sub_agent_name": "worker",
+                },
+            )
+            assert create_resp.status_code == 201
+
+            # Direct-stream turn dispatched as a DIFFERENT agent id than the
+            # session-create call, so the cache-provenance check misses and the
+            # composition path falls through to a fresh resolver call (which now
+            # returns the tree without "worker"). The recorded sub_agent_name
+            # "worker" (session-scoped, not agent-scoped) is still recovered.
+            response = await _post_stream_message(
+                http,
+                conv,
+                agent_id="ag_other",
+                harness="opencode-native",
+                instructions="Caller-supplied instructions must survive.",
+            )
+            assert response.status_code == 200
+
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The unresolved sub-agent must be warned about; got {caplog.text!r}."
+    )
+    assert recorder.posted_bodies, "harness never received a request"
+    _composed = recorder.posted_bodies[-1]["instructions"]
+    assert isinstance(_composed, str)
+    assert "Caller-supplied instructions must survive." in _composed, (
+        f"Caller-supplied instructions must compose additively, not be "
+        f"replaced by the parent's authored text; got {_composed!r}."
+    )
+    assert "Root instructions" in _composed, (
+        f"The PARENT's authored instructions must drive composition once the "
+        f"sub-agent no longer resolves; got {_composed!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_harness_direct_stream_warns_and_derives_harness_from_parent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    ``_resolve_effective_turn`` (the NO-harness direct-stream path) derives
+    harness and spawn_env from the PARENT spec, and warns, when the recorded
+    ``sub_agent_name`` no longer resolves in the spec tree.
+
+    This used to raise ``RuntimeError``, which the route answered with a 503
+    ``spec_resolver_failed``. Both halves are asserted: the warning must be
+    emitted AND the harness the process manager is asked for must be the
+    parent's — a silent fallback satisfies neither.
+
+    :param caplog: Pytest log capture, used to confirm the unresolved
+        sub-agent is reported rather than passed over in silence.
+    """
+    # A non-native parent harness: the turn now runs to completion instead of
+    # stopping at the unresolved sub-agent, so it reaches cold boot, and a
+    # native harness would try to launch a vendor CLI that isn't present.
+    # The declared child keeps a DIFFERENT harness, so "the parent's harness
+    # drove the turn" is observable rather than a coincidence.
+    root_spec_with_worker = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name="worker",
+                instructions="Worker instructions.",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "openai-agents"}),
+            )
+        ],
+    )
+    root_spec_without_worker = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    calls = {"n": 0}
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        calls["n"] += 1
+        return root_spec_with_worker if calls["n"] == 1 else root_spec_without_worker
+
+    conv = "conv_no_harness_direct_stream_sub_agent_gone"
+    pm = _FakeProcessManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        async with _runner_test_client(app) as http:
+            create_resp = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_root_creator",
+                    "sub_agent_name": "worker",
+                },
+            )
+            assert create_resp.status_code == 201
+
+            # No "harness" field → the resolver branch → _resolve_effective_turn.
+            # A different agent id than session-create keeps the cache from
+            # being trusted, forcing a fresh resolver call that no longer has
+            # "worker" in the tree.
+            response = await http.post(
+                f"/v1/sessions/{conv}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_other",
+                    "model": "x",
+                    "content": [],
+                },
+            )
+
+    assert response.status_code == 200, (
+        f"An unresolvable sub_agent_name must not fail the turn; got "
+        f"{response.status_code} with body {response.text!r}."
+    )
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The unresolved sub-agent must be warned about; got {caplog.text!r}."
+    )
+    assert "claude-sdk" in [harness for _conv, harness, _env in pm.get_client_calls], (
+        f"The PARENT's harness must drive the turn, not the declared child's; "
+        f"got {pm.get_client_calls!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_spec_entry_warns_and_caches_parent_spec_entry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    ``_resolve_session_spec_entry`` returns and caches the PARENT entry, and
+    warns, when the session snapshot's ``sub_agent_name`` no longer resolves
+    in the freshly-fetched spec tree. Exercised end-to-end via
+    ``GET /v1/sessions/{id}/resources``, one of the callers with no local
+    ``except OmnigentError``.
+
+    This used to raise ``NOT_FOUND``, which reached the global
+    ``OmnigentError`` handler as a 404 and left the cache empty — nothing
+    was published, because the raise happened before the cache write.
+
+    The LATER request is what this asserts. ``caplog`` is cleared after the
+    first one, so the fresh resolution's warning cannot stand in for the
+    cached read's — reading a combined log would pass even with the cached
+    read silent, which is the defect this covers.
+
+    Both cache-hit returns are exercised: the locked one (no
+    ``agent_id_hint``, reached through the snapshot branch) and the lock-free
+    fast path (``agent_id_hint`` supplied, which nothing else here covers).
+
+    :param caplog: Pytest log capture, read once per request.
+    """
+    conv = "conv_resolve_spec_entry_sub_agent_gone"
+
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        # No sub_agents: the snapshot's "worker" sub_agent_name can't resolve.
+    )
+
+    calls = {"n": 0}
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        calls["n"] += 1
+        return root_spec
+
+    class _SnapshotWithGoneSubAgent(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_root", "sub_agent_name": "worker"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=_SnapshotWithGoneSubAgent(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await http.get(f"/v1/sessions/{conv}/resources")
+        assert response.status_code == 200, (
+            f"An unresolvable sub_agent_name must not fail the request; got "
+            f"{response.status_code} with body {response.text!r}."
+        )
+        assert "did not resolve" in caplog.text, "the fresh resolution should warn"
+
+        # Everything below is about a request served FROM THE CACHE.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            second = await http.get(f"/v1/sessions/{conv}/resources")
+        assert second.status_code == 200
+        assert calls["n"] == 1, (
+            f"The PARENT entry must be published into the session cache, so "
+            f"this request is served from it; spec_resolver ran {calls['n']} "
+            f"times."
+        )
+        assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+            f"A cached PARENT kept after a miss must be reported on the read "
+            f"that returns it, not only on the resolution that produced it. "
+            f"Warnings on this request alone: {caplog.text!r}."
+        )
+        locked_read_warnings = caplog.text
+
+        # The lock-free fast path. ``list_session_resources`` passes
+        # ``agent_id_hint=_session_agent_ids.get(session_id)``, which is unset
+        # above (no session was created), so the reads so far all took the
+        # snapshot branch and the locked return. Creating a session records
+        # the agent id, so the read below returns from the hinted hit instead
+        # — a different return statement, with its own provenance check.
+        created_conv = f"{conv}_created"
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": created_conv,
+                    "agent_id": "ag_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+        assert created.status_code == 201, created.text
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            hinted = await http.get(f"/v1/sessions/{created_conv}/resources")
+        assert hinted.status_code == 200, hinted.text
+        assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+            f"The lock-free cache hit must report the kept parent too; "
+            f"warnings on this request alone: {caplog.text!r} (the locked "
+            f"read reported {locked_read_warnings!r})."
+        )
+
+
+@pytest.mark.asyncio
+async def test_gated_harness_preserves_caller_instructions_on_resolution_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Resolver failure during InstructionComposition must not drop
+    caller-supplied ``instructions`` for a gated-delivery harness.
+
+    Regression: harness is already known (independent of the resolver, per
+    the ``conv_stream_spec_resolver_failed``-shaped case), so
+    ``InstructionComposition``'s own best-effort resolution attempt is the
+    only thing that fails here. That failure must degrade gracefully —
+    composition/warn-check unknown — and must NOT fall through to the
+    harness-conditional wire swap that would otherwise pop/overwrite
+    ``body["instructions"]`` with the (unavailable) gated composed value.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_gated_resolution_failure"
+
+    async def _failing_spec_resolver(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        raise RuntimeError(f"instruction composition resolver unavailable for {agent_id}")
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_failing_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_gated_resolution_failure",
+            harness="opencode-native",
+            instructions="Caller-supplied instructions that must survive.",
+        )
+        assert response.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert (
+        recording_client.posted_bodies[0]["instructions"]
+        == "Caller-supplied instructions that must survive."
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_harness_preserves_caller_instructions_when_resolver_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A resolver returning ``None`` (a valid "no spec found" result, not a
+    raised exception) must ALSO not drop caller-supplied ``instructions``
+    for a gated-delivery harness.
+
+    Companion to the RuntimeError-based resolution failure. If only
+    a *raised* exception set the preservation flag, a resolver that
+    legitimately returns ``None`` would fall straight through to the
+    gated-harness wire swap and had its ``composed`` value (necessarily
+    unavailable, since there's no spec to compose from) pop/overwrite the
+    caller-supplied instructions anyway.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_gated_resolution_none"
+
+    async def _none_returning_spec_resolver(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        del agent_id, session_id
+        return None
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_none_returning_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_gated_resolution_none",
+            harness="opencode-native",
+            instructions="Caller-supplied instructions that must survive a None resolver.",
+        )
+        assert response.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert (
+        recording_client.posted_bodies[0]["instructions"]
+        == "Caller-supplied instructions that must survive a None resolver."
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_harness_preserves_caller_instructions_with_no_agent_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A gated harness with NO ``agent_id`` on the body (and no cache entry)
+    must preserve caller-supplied ``instructions``, not strip them.
+
+    Composition must be marked "unresolved" whenever the spec is genuinely
+    unavailable, not only when BOTH an agent id AND a configured resolver
+    are present. A missing agent id alone would otherwise leave the flag
+    ``False`` and fall straight through to the gated wire-swap, silently
+    stripping instructions the caller already supplied.
+    The fix removed the separate flag: the swap now gates directly on
+    whether a spec was positively resolved, and no agent id means no spec
+    was ever attempted.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_gated_no_agent_id"
+
+    async def _unreached_spec_resolver(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        raise AssertionError("resolver must not be called with no agent_id")
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_unreached_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            # No agent_id at all.
+            harness="opencode-native",
+            instructions="Caller-supplied instructions that must survive a missing agent_id.",
+        )
+        assert response.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert (
+        recording_client.posted_bodies[0]["instructions"]
+        == "Caller-supplied instructions that must survive a missing agent_id."
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_harness_preserves_caller_instructions_with_no_resolver_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A gated harness with an ``agent_id`` but NO configured
+    ``spec_resolver`` at all (``None``) must also preserve caller-supplied
+    ``instructions``, not strip them — the other half of the fall-through
+    the old two-condition flag missed (agent id present, resolver absent).
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_gated_no_resolver"
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_no_resolver_configured",
+            harness="opencode-native",
+            instructions="Caller-supplied instructions that must survive no configured resolver.",
+        )
+        assert response.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert (
+        recording_client.posted_bodies[0]["instructions"]
+        == "Caller-supplied instructions that must survive no configured resolver."
+    )
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_does_not_double_fire_after_agent_switch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An agent switch that does not change the delivery value must not re-warn.
+
+    The dedup is scoped to
+    ``(conversation, harness, delivery value)``. BOTH agents here
+    resolve to the same harness (``kimi``), so the effective value is unchanged
+    across the switch and the conversation must stay at exactly one warning —
+    re-warning would report the same underlying gap twice.
+
+    The dedup marker is therefore popped only at ``delete_session``, never by
+    the in-conversation "agent switch detected" cache-clear block
+    (``_session_spec_cache.pop`` et al. in ``_run_turn_bg_setup_and_stream``);
+    clearing it there would collapse the contract back to per-switch
+    behaviour.
+
+    A presence-only ``set[str]`` marker also emits exactly one warning for
+    a same-delivery switch, so this scenario does not constrain the shape of
+    the key. What does constrain it is
+    ``test_instruction_delivery_warn_refires_when_the_switch_changes_delivery``
+    (a changed value must warn again) and
+    ``test_instruction_delivery_warn_does_not_refire_for_a_recurring_value``
+    (A -> B -> A must not re-warn for A).
+    """
+    conv = "conv_instruction_warn_agent_switch"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return AgentSpec(
+            spec_version=1,
+            name=f"kimi-agent-{agent_id}",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "kimi"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async def _post_bg(agent_id: str) -> None:
+        async with _runner_test_client(app) as http:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": agent_id,
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert resp.status_code == 202
+            await _await_bg_turn_task(conv)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await _post_bg("ag_kimi_a")
+        # Different agent_id on the second turn triggers the
+        # agent-switch-detected cache-clear block.
+        await _post_bg("ag_kimi_b")
+
+    warnings = [
+        rec for rec in caplog.records if "instructions are not delivered" in rec.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f"expected exactly one warning across an agent switch, got {warnings}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hermes_wire_instructions_use_gated_composed_value() -> None:
+    """hermes gets the gated composed value WITH per-request text in it.
+
+    Mirrors the opencode-native case: hermes's executor reads the wire
+    ``instructions`` field via the standard ``system_prompt`` pipeline, so
+    the runner's harness-conditional overwrite must swap in a composed value
+    that already includes this turn's per-request text — discarding the
+    caller's value would drop genuine per-request instructions.
+    """
+    conv = "conv_hermes_gated_wire"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="hermes-agent",
+            instructions="Be a concise assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        )
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_hermes",
+            instructions="Answer only in French.",
+        )
+        assert response.status_code == 200
+
+    assert recording_client.posted_bodies, "harness never received a request"
+    assert recording_client.posted_bodies[0]["instructions"] == (
+        "Be a concise assistant.\n\nAnswer only in French."
+    ), (
+        f"hermes must receive the agent's text AND this turn's per-request "
+        f"text — got {recording_client.posted_bodies[0].get('instructions')!r}."
+    )
+
+
 def test_build_spawn_env_applies_model_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1405,6 +4378,112 @@ def test_build_spawn_env_applies_model_override(
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_genuine_harness_swap_rebuilds_spawn_env_for_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A GENUINE harness swap (different canonical harnesses) must reach the
+    process manager with spawn_env actually rebuilt for the NEW harness —
+    not merely warn correctly or fall back to None. Asserts the real env
+    dict ``process_manager.get_client`` was called with.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+
+    conv = "conv_genuine_harness_swap_spawn_env"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="swap-agent",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": "claude-sdk"},
+                model="gpt-5.4",
+            ),
+        )
+
+    fake_pm = _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, fake_pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_genuine_swap",
+            # harness (claude-sdk) and harness_override (codex) are
+            # genuinely DIFFERENT canonical harnesses — a real swap.
+            harness="claude-sdk",
+            harness_override="codex",
+            # Stale spawn_env shaped for the ORIGINAL (claude-sdk) harness —
+            # must not reach the process for the overridden (codex) one.
+            spawn_env={"HARNESS_CLAUDE_SDK_MODEL": "stale-claude-model"},
+        )
+        assert response.status_code == 200
+
+    assert fake_pm.get_client_calls, "process manager get_client was never called"
+    _conv_id, _harness_name, env = fake_pm.get_client_calls[-1]
+    assert _harness_name == "codex"
+    assert env is not None
+    assert "HARNESS_CLAUDE_SDK_MODEL" not in env, (
+        f"stale claude-sdk spawn_env leaked into the codex process: {env!r}"
+    )
+    assert env.get("HARNESS_CODEX_MODEL") == "gpt-5.4"
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_alias_only_override_does_not_clear_spawn_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``harness_override`` that's merely an ALIAS of the same canonical
+    harness (e.g. harness="opencode-native", harness_override="opencode")
+    is NOT an actual swap and must not clear/rebuild a valid caller-supplied
+    ``spawn_env`` — a raw-string compare would falsely register this as a
+    swap (the two spellings differ as strings) and discard it for no reason.
+    """
+
+    async def _fake_auto_create_opencode_terminal(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_opencode_terminal",
+        _fake_auto_create_opencode_terminal,
+    )
+
+    conv = "conv_alias_only_override_spawn_env"
+
+    fake_pm = _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, fake_pm),
+        spec_resolver=None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(
+            http,
+            conv,
+            agent_id="ag_alias_only_override",
+            harness="opencode-native",
+            # Alias of the SAME canonical harness — not a real swap.
+            harness_override="opencode",
+            spawn_env={"OPENCODE_CALLER_SUPPLIED": "must-survive"},
+        )
+        assert response.status_code == 200
+
+    assert fake_pm.get_client_calls, "process manager get_client was never called"
+    _conv_id, _harness_name, env = fake_pm.get_client_calls[-1]
+    assert _harness_name == "opencode-native"
+    assert env == {"OPENCODE_CALLER_SUPPLIED": "must-survive"}, (
+        f"alias-only override incorrectly cleared/rebuilt spawn_env: {env!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1488,7 +4567,7 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
 
     The fix wraps the setup phase so any pre-stream exception routes through
     ``_on_proxy_stream_end``, which clears the active turn and publishes
-    ``session.status: failed``. This test drives the background-turn path
+    ``session.status: failed``. The background-turn path is driven
     (no ``?stream=true`` — the production path the Omnigent server uses) and
     asserts the ``failed`` status reaches the session SSE stream.
 
@@ -1923,8 +5002,8 @@ async def test_runner_os_env_placeholder_cwd_uses_cli_workspace(
     """Runner-local OS tools map ``cwd: .`` to the CLI workspace.
 
     Remote ``run --server`` uploads the spec to an app server,
-    but the local runner still owns filesystem access. This pins
-    the contract that a placeholder cwd resolves to the local
+    but the local runner still owns filesystem access. A placeholder
+    cwd resolves to the local
     project root the CLI passed into the runner, not to the
     runner-owned temp fallback.
 
@@ -1989,11 +5068,11 @@ async def test_runner_os_env_tools_default_to_conversation_workspace(monkeypatch
 def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
     """Cloning an OSEnvSpec must preserve every sandbox field.
 
-    Regression guard for the same class of bug previously fixed in
-    :func:`omnigent.inner.terminal._clone_sandbox_spec`: hand-enumerated
+    Same class of bug as :func:`omnigent.inner.terminal._clone_sandbox_spec`
+    guards against: hand-enumerated
     field copies silently drop security-critical fields (egress_rules,
     egress_allow_private_destinations, env_passthrough, etc.) when new
-    fields are added to :class:`OSEnvSandboxSpec`. This test asserts the
+    fields are added to :class:`OSEnvSandboxSpec`. Asserts the
     runner-side clone is field-complete by comparing the dataclass dicts
     and verifying list-typed fields are not aliased with the original.
 
@@ -2006,14 +5085,14 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
 
     sandbox = OSEnvSandboxSpec(
         type="darwin_seatbelt",
-        read_paths=["~/.databrickscfg"],
+        read_paths=["~/.examplecfg"],
         write_paths=["."],
         write_files=["~/.ssh/known_hosts"],
         allow_network=True,
         cwd_allow_hidden=[".git", ".venv"],
         cwd_hidden_scan_max_entries=12345,
         cwd_hidden_scan_overflow="warn",
-        env_passthrough=["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
+        env_passthrough=["EXAMPLE_HOST", "EXAMPLE_VALUE"],
         egress_rules=["GET api.github.com/repos/databricks/*/**"],
         egress_allow_private_destinations=True,
     )
@@ -2149,7 +5228,7 @@ def test_effective_runner_os_env_absolute_spec_cwd_used_without_runner_workspace
     Without runner_workspace, an absolute ``os_env.cwd`` in the
     spec is used as-is.
 
-    Pins the no-env-var fallback path so unit tests / pure local
+    The no-env-var fallback path, so unit runs / pure local
     runs that construct an agent spec directly without the env
     var continue to honor whatever the spec declared.
     """
@@ -2243,7 +5322,7 @@ class _StubTerminalInstance:
 
     ``terminal_resource_view`` reads only stable ``TerminalInstance``
     fields; the launch/close tool's ``invoke`` is monkeypatched in
-    these tests so no real tmux instance is created.
+    here so no real tmux instance is created.
 
     :param running: Value surfaced as ``metadata.running`` in the
         resource view.
@@ -2604,7 +5683,7 @@ async def test_runner_dispatches_to_spawned_harness_with_real_llm(
     chunks stream back through harness UDS → runner's proxy_stream
     → test httpx client.
 
-    Successful streaming with the expected event sequence proves:
+    Successful streaming with the expected event sequence means:
     1. The runner package uses the existing HarnessProcessManager
        (no parallel impl).
     2. A real harness subprocess is spawned per (conversation, harness).
@@ -2642,7 +5721,7 @@ async def test_runner_dispatches_to_spawned_harness_with_real_llm(
     events = _parse_sse(body)
     types = [t for t, _ in events]
     # Must START with response.created and END with response.completed —
-    # proves both ends of the harness's emitted stream made it through
+    # both ends of the harness's emitted stream made it through
     # the runner's proxy. A real LLM produces at least one delta in
     # between.
     assert types[0] == "response.created", (
@@ -2658,7 +5737,7 @@ async def test_runner_dispatches_to_spawned_harness_with_real_llm(
     # manager's internal state. (Direct attribute access; the manager
     # is a test-fixture instance so this is fine.)
     assert "conv_runner_e2e_test" in started_manager._entries, (
-        "manager should have a spawned entry for the test conversation; "
+        "manager should have a spawned entry for the scaffold conversation; "
         "if missing, the runner didn't actually dispatch through "
         "HarnessProcessManager.get_client"
     )
@@ -2763,9 +5842,9 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     This catches the duplicate-create regression behind unreliable
     continuation: if the runner POSTs ``/v1/sessions`` despite the existing
-    child row, the test fails and the user would see a duplicate-title server
+    child row, this assertion fails and the user would see a duplicate-title server
     error instead of a continuation. The parameterized ``args`` values also
-    prove the runner preserves the public plain-string contract while accepting
+    the runner preserves the public plain-string contract while accepting
     Nessie's object form.
 
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -3796,7 +6875,7 @@ async def test_sys_session_send_family_guard_runs_before_normalization(
     )
     assert result.output.startswith("Error:"), result.output
     assert "only runs Claude models" in result.output
-    # The error quotes the caller's raw id, proving the guard ran first.
+    # The error quotes the caller's raw id, so the guard ran first.
     assert "'gpt-5-4'" in result.output
     assert result.create_bodies == []
 
@@ -3947,7 +7026,7 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
     """
     A completed async sub-agent turn arrives through ``sys_read_inbox``.
 
-    This proves ``sys_session_send`` no longer inlines the child result in the
+    ``sys_session_send`` does not inline the child result in the
     tool result. If completion delivery is not wired, the drain returns the
     empty-inbox sentinel instead of the child marker.
     """
@@ -4169,10 +7248,10 @@ class _GatedTwoTurnHarnessStream:
     """Per-turn-scripted harness stream that blocks turn 1 mid-flight.
 
     Turn 1 yields ``response.created`` + the intermediate text delta, sets
-    ``started`` (the sync gate so the test knows the turn is live and in
+    ``started`` (the sync gate signalling the turn is live and in
     ``_active_turns``), then awaits ``release`` before yielding
     ``response.completed``. This holds turn 1 active deterministically while
-    the test posts a second message (which buffers a continuation) — no
+    a second message is posted (which buffers a continuation) — no
     sleeps, no polling of runner internals. Turn 2 (and any later turn)
     streams its scripted frames straight through.
 
@@ -4234,8 +7313,8 @@ class _GatedTwoTurnHarnessStream:
         """
         if self._turn_number == 1:
             # Emit created + the intermediate delta, then hand control back to
-            # the test (started) and wait (release) so turn 1 stays the active
-            # turn while the test buffers a continuation message.
+            # the caller (started) and wait (release) so turn 1 stays the
+            # active turn while a continuation message buffers.
             yield self._frames[0]
             yield self._frames[1]
             self._started.set()
@@ -4330,7 +7409,7 @@ async def test_scaffold_subagent_defers_terminal_delivery_while_continuation_buf
     ``delivered`` short-circuit in ``mark_subagent_work_terminal``.
 
     Determinism: turn 1's harness stream blocks (``release``) after emitting
-    its intermediate delta and signals ``started`` so the test can post the
+    its intermediate delta and signals ``started`` so the caller can post the
     second message while turn 1 is provably the active turn (so it buffers a
     continuation). Releasing turn 1 then lets the continuation run to its own
     empty-buffer stream end. No sleeps, no polling of runner internals.
@@ -4346,14 +7425,14 @@ async def test_scaffold_subagent_defers_terminal_delivery_while_continuation_buf
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return a non-native scaffold spec so the success-delivery path runs.
 
-        The test harness name is unknown to ``_build_spawn_env_from_spec``
+        The scaffold harness name is unknown to ``_build_spawn_env_from_spec``
         (no model needed) and is not ``claude-native`` / ``codex-native``, so
         ``_is_native_harness`` is False and the scaffold completion branch in
         ``_on_proxy_stream_end`` is exercised.
 
         :param agent_id: Agent id requested by the runner (unused).
         :param session_id: Session id (unused).
-        :returns: A minimal scaffold spec bound to the test harness.
+        :returns: A minimal scaffold spec bound to the scaffold harness.
         """
         del agent_id, session_id
         return AgentSpec(
@@ -4413,10 +7492,10 @@ async def test_scaffold_subagent_defers_terminal_delivery_while_continuation_buf
                     "content": [{"type": "input_text", "text": "now refine"}],
                 },
             )
-            # 202 with status "buffered" proves the message buffered against the
-            # active turn rather than starting its own turn — the precondition
-            # for the deferral path. If this were "accepted", turn 1 would not
-            # have a continuation pending and the bug wouldn't apply.
+            # 202 with status "buffered" means the message buffered against
+            # the active turn rather than starting its own — the precondition
+            # for the deferral path. "accepted" would mean turn 1 has no
+            # continuation pending, and the deferral path never applies.
             assert resp2.status_code == 202
             assert resp2.json()["status"] == "buffered"
 
@@ -4454,9 +7533,8 @@ async def test_scaffold_subagent_defers_terminal_delivery_while_continuation_buf
     item = delivered_items[0]
     assert item["status"] == "completed"  # success terminal status
     # The delivered output is the FINAL turn's text, not turn 1's intermediate
-    # narration. Before the fix, turn 1's "INTERMEDIATE_NARRATION" was delivered
-    # as the terminal result and the final synthesis was dropped — so this
-    # asserts the exact content that proves the right turn won.
+    # narration. The failure mode is turn 1's "INTERMEDIATE_NARRATION" being
+    # delivered as the terminal result while the final synthesis is dropped.
     assert item["output"] == "FINAL_SYNTHESIS", (
         f"parent must receive the final turn's synthesis, got {item['output']!r}; "
         f"'INTERMEDIATE_NARRATION' here means turn 1 was delivered prematurely."
@@ -5000,12 +8078,11 @@ def test_register_unregister_child_session_roundtrip() -> None:
 # These verify the runner-local handler that makes get_history/list/close
 # work for harness agents (claude-sdk/codex/openai-agents), whose
 # Omnigent tool calls surface as action_required and route through
-# the runner — NOT the in-process inner Session. Confirmed empirically:
-# without this dispatch the runner returns "not in local dispatch
-# table"; with it, a live harness agent reads a sibling's items. The
-# handler calls the Omnigent server's existing REST endpoints, so tests use a
-# real httpx.AsyncClient backed by MockTransport (not a MagicMock) — the
-# code exercises the same request/response objects it sees in production.
+# the runner — NOT the in-process inner Session. Without this dispatch the
+# runner returns "not in local dispatch table"; with it, a harness agent
+# reads a sibling's items. The handler calls the Omnigent server's existing
+# REST endpoints over a real httpx.AsyncClient backed by MockTransport, so
+# the same request/response objects are in play as in production.
 
 
 def _session_query_client(
@@ -5203,7 +8280,7 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
     assert out["agent"] == "researcher"
     assert out["title"] == "auth"
     # Reversed to chronological (user ask first), and message text is
-    # extracted from the content blocks — proves the projection ran.
+    # extracted from the content blocks — the projection ran.
     assert [(i["role"], i["text"]) for i in out["items"]] == [
         ("user", "where is the bug"),
         ("assistant", "found it"),
@@ -5280,7 +8357,7 @@ async def test_session_peek_appends_pending_elicitation_from_snapshot() -> None:
     elicit = items[-1]
     assert elicit["type"] == "pending_elicitation"
     assert elicit["elicitation_id"] == "elicit_bio"
-    # Prompt + fields prove the snapshot payload reached the projector.
+    # Prompt + fields show the snapshot payload reached the projector.
     assert elicit["prompt"] == "Answer 3 questions on human biology"
     assert elicit["fields"] == ["q1", "q2"]
 
@@ -5324,11 +8401,9 @@ async def test_session_close_patches_tombstoned_title() -> None:
     same ``root_conversation_id`` and the target is a sub-agent, so the
     tree-scope gate passes and the PATCH is issued.
     """
-    # _execute_session_query_tool is the runner's REST dispatch entry
-    # point for session-query tools — called directly here because these
-    # tests validate the REST path's tree-scoping (_session_close_via_rest)
-    # specifically, distinct from the in-process path covered in
-    # tests/tools/builtins/test_sys_session.py.
+    # _execute_session_query_tool is the runner's REST dispatch entry point
+    # for session-query tools. Its tree-scoping (_session_close_via_rest) is
+    # distinct from the in-process path's.
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
     patched: dict[str, Any] = {}
@@ -5386,7 +8461,7 @@ async def test_session_close_rejects_out_of_tree_target_without_patch() -> None:
     the in-process path. Here the target's ``root_conversation_id``
     (``conv_other_root``) differs from the caller's (``conv_root``), so
     the tool returns ``session_out_of_tree`` and the tombstone PATCH is
-    never sent — proving the target's title is left intact. Without the
+    never sent — the target's title is left intact. Without the
     gate, edit access alone would let an agent close a sub-agent in one
     of its other, unrelated trees.
     """
@@ -5717,7 +8792,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
     """
     The global ``sessions`` view fetches GET /v1/sessions (forwarding the
     ``agent_name`` filter), projects each row, and annotates
-    ``runner_online`` by checking each UNIQUE runner once. Proves: the
+    ``runner_online`` by checking each UNIQUE runner once: the
     agent_name filter reaches the server; sessions are projected with
     status + parentage; and connectivity is folded in without a
     per-session status fan-out (two sessions share runner r1 → exactly
@@ -5895,7 +8970,7 @@ async def test_sys_agent_download_writes_bundle_to_workspace(tmp_path: Path) -> 
     """
     ``sys_agent_download`` writes the fetched ``.tar.gz`` bytes into the
     agent's os_env cwd (here ``runner_workspace`` = tmp_path) and returns
-    the path. Proves the full path: fetch bytes, derive the default
+    the path. The full path: fetch bytes, derive the default
     filename from the X-Agent-* headers, and persist to the agent-visible
     disk. If the write regressed, the file wouldn't exist or the bytes
     wouldn't match.
@@ -6027,7 +9102,7 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
     """
     ``sys_agent_list`` merges built-ins (GET /v1/agents), session-bound
     agents (GET /v1/sessions), and locally-authored config YAMLs (a scan
-    of the os_env cwd's agent-config subdir). Proves all three sources
+    of the os_env cwd's agent-config subdir). All three sources
     are fetched and projected: a built-in's id/name, a session's
     session_id+agent binding, and a local config's name/path from the
     YAML on disk. If any source were dropped or mis-projected, the
@@ -6255,7 +9330,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
 
     The asserted multipart metadata is the security-critical check
     (child-only, mirroring agent_id mode); the tarball content check
-    proves the local config actually traversed bundling — an empty
+    the local config actually traversed bundling — an empty
     bundle would create a session the server rejects at first turn.
     """
     import io
@@ -6308,7 +9383,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
 
     # The uploaded bundle is a gzipped tar holding the authored config
-    # verbatim — proves the local file traversed materialize → tar.
+    # verbatim — the local file traversed materialize → tar.
     with tarfile.open(fileobj=io.BytesIO(parts["bundle"]), mode="r:gz") as tf:
         names = tf.getnames()
         assert names == ["helper.yaml"]
@@ -6803,7 +9878,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     and folds in live runner connectivity from ``GET
     /v1/runners/{id}/status``.
 
-    Proves the full runner-dispatch path: read the session snapshot,
+    The full runner-dispatch path: read the session snapshot,
     derive the effective model (a per-session ``model_override`` wins
     over the spec's ``llm_model``), count pending approval prompts, and
     attach ``runner_online``. If the projection regressed (dropped a
@@ -6931,7 +10006,7 @@ async def test_sys_session_send_session_id_posts_to_direct_child(
     """
     ``sys_session_send`` in by-session-id mode verifies the target is a
     direct child of the caller, posts the message, and returns a running
-    handle. Proves the unified session_id mode: the message reaches the
+    handle. The unified session_id mode: the message reaches the
     existing child and the handle carries its id with ``status:running``
     (the result is delivered asynchronously via ``sys_read_inbox``).
 
@@ -7115,7 +10190,7 @@ async def test_sys_session_send_rejects_both_session_id_and_named_target() -> No
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         """
-        Fail the test if any server call is made.
+        Raise if any server call is made.
 
         :param request: Any Omnigent request — none should occur on the reject path.
         :returns: A 404 (also records the unexpected call).
@@ -7167,7 +10242,7 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
     ``_session_inboxes`` queue and latches the work entry ``delivered``, which
     makes redelivery short-circuit. If the re-init blindly replaced the queue,
     that already-delivered payload would be orphaned and the parent would drain
-    an empty inbox and hang forever. This test drives the real
+    an empty inbox and hang forever. Drives the real
     ``POST /v1/sessions`` route twice for the same session id and asserts the
     inbox (and a sentinel sitting in it) survives the second call.
 
@@ -7186,8 +10261,8 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
         ),
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    # Fresh-process hygiene: the inbox ref is a module-wide singleton, so clear
-    # any leftover from a prior test before exercising the route.
+    # The inbox ref is a module-wide singleton, so it can carry state from an
+    # earlier session in the same process.
     runner_app._session_inboxes_ref.pop(session_id, None)
     sentinel = {"type": "subagent_result", "marker": "SURVIVE_REINIT"}
     try:
@@ -7196,7 +10271,7 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
                 "/v1/sessions",
                 json={"session_id": session_id, "agent_id": agent_id},
             )
-            # 201 proves create_session ran end-to-end (past the inbox init)
+            # 201 means create_session ran end-to-end (past the inbox init)
             # rather than short-circuiting (400 missing fields / 501 scaffold /
             # 503 spawn failure), so the inbox we inspect next is route-created.
             assert first.status_code == 201, (
@@ -7207,7 +10282,7 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
 
             inbox_after_first = runner_app._session_inboxes_ref.get(session_id)
             # The route must have installed a real inbox queue. If None, the
-            # init path didn't run and the rest of the test would be vacuous.
+            # init path didn't run and everything below would be vacuous.
             assert inbox_after_first is not None, (
                 "POST /v1/sessions did not create a session inbox; the "
                 "inbox-init line in create_session did not run."
@@ -7245,6 +10320,481 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
             )
     finally:
         runner_app._session_inboxes_ref.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_create_session_unknown_sub_agent_name_warns_and_uses_parent_spec(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    ``POST /v1/sessions`` with a ``sub_agent_name`` absent from the spec
+    tree creates the session against the PARENT spec and warns.
+
+    This used to answer 404 ``sub_agent_not_found``. Both halves are
+    asserted: the warning must be emitted AND the harness the process
+    manager is asked for must be the root's, not the declared child's —
+    a silent fallback satisfies neither.
+
+    :param caplog: Pytest log capture, used to confirm the unresolved
+        sub-agent is reported rather than passed over in silence.
+    """
+    sub_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Worker instructions.",
+        # Deliberately a DIFFERENT harness from the root, so "the parent
+        # drove the session" is observable rather than a coincidence.
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="root",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        sub_agents=[sub_spec],
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    pm = _FakeProcessManager(_FakeHarnessClient([]))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": "conv_unknown_sub_agent",
+                    "agent_id": "ag_root",
+                    "sub_agent_name": "does-not-exist",
+                },
+            )
+    assert response.status_code == 201, (
+        f"An unresolvable sub_agent_name must not fail the create; got "
+        f"{response.status_code} with body {response.text!r}."
+    )
+    assert "'does-not-exist'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The unresolved sub-agent must be warned about; got {caplog.text!r}."
+    )
+    assert [harness for _conv, harness, _env in pm.get_client_calls] == ["opencode-native"], (
+        f"The PARENT's harness must drive the session, not the declared "
+        f"child's; got {pm.get_client_calls!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_session_sub_agent_name_matching_root_name_warns_as_unresolved(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    ``POST /v1/sessions`` with a ``sub_agent_name`` equal to the ROOT
+    spec's own name (where the root has no matching CHILD) is a MISS, and
+    is reported as one.
+
+    A coincidental name match at the root is not a resolved sub-agent.
+    ``_find_spec_by_name`` briefly self-matched its own ``spec`` argument
+    against ``name`` before searching children, added to fix an unrelated
+    idempotency bug (re-resolving an ALREADY-RESOLVED cached child spec
+    against itself). That self-match had no way to tell "fresh root that
+    happens to share a name" apart from "already-resolved child", so a
+    top-level coordinator named e.g. "worker" with no "worker" sub-agent
+    resolved as if the child had been found — and reported nothing.
+
+    The session proceeds on the root's spec either way, so the request
+    status alone cannot distinguish the two. The warning is what does:
+    it is emitted for a miss and never for a genuine match.
+
+    :param caplog: Pytest log capture, used to distinguish a reported miss
+        from a self-match that quietly looked like success.
+    """
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Root instructions — must never be treated as the resolved child.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+        # No sub_agents at all: "worker" only coincidentally matches the
+        # ROOT's own name, there is no genuine child by that name.
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    pm = _FakeProcessManager(_FakeHarnessClient([]))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": "conv_root_name_coincidence",
+                    "agent_id": "ag_worker_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+    assert response.status_code == 201, (
+        f"An unresolvable sub_agent_name must not fail the create; got "
+        f"{response.status_code} with body {response.text!r}."
+    )
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"A root whose own name coincidentally matches sub_agent_name, with no "
+        f"genuine child by that name, must be reported as an unresolved "
+        f"sub-agent — not accepted as a silent self-match. Got {caplog.text!r}."
+    )
+    assert [harness for _conv, harness, _env in pm.get_client_calls] == ["opencode-native"], (
+        f"The root's own spec drives the session; got {pm.get_client_calls!r}."
+    )
+
+
+@pytest.mark.parametrize("second_turn", ["background", "known_harness"])
+@pytest.mark.asyncio
+async def test_unresolvable_sub_agent_warns_again_on_later_turns(
+    caplog: pytest.LogCaptureFixture,
+    second_turn: str,
+) -> None:
+    """A parent kept after a miss must not become a resolved child on turn 2.
+
+    Session creation misses on ``sub_agent_name``, warns, and caches the
+    PARENT spec for the session. Later turns read that cache instead of
+    resolving again, and decide "is this the already-resolved child?" by
+    comparing the cached spec's name against the requested name. A root
+    whose own name equals the requested sub-agent satisfies that equality,
+    so the cached parent answers as though it were the child — and the
+    warning that made turn 1 honest never fires again.
+
+    The session is identical on every turn, so the answer must be too:
+    warn, then continue with the parent. Asserted per turn with the create's
+    own warning cleared first, so a single warning at create cannot stand in
+    for the later turn's.
+
+    :param caplog: Pytest log capture, read once per turn.
+    :param second_turn: Which dispatch path drives the turn after create.
+    """
+    conv = f"conv_fallback_second_turn_{second_turn}"
+
+    # The root's own name equals the requested sub-agent and there is no such
+    # child, so the cached parent satisfies a name-equality identity check.
+    # A non-native harness so the turn reaches cold boot without a vendor CLI.
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    pm = _FakeProcessManager(recorder)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+        assert created.status_code == 201, created.text
+        assert "did not resolve" in caplog.text, (
+            f"create should warn on the miss; got {caplog.text!r}"
+        )
+
+        # Everything after this point is about the SECOND turn alone.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            if second_turn == "background":
+                bg = await http.post(
+                    f"/v1/sessions/{conv}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_root",
+                        "model": "x",
+                        "content": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                assert bg.status_code == 202, bg.text
+                await _await_bg_turn_task(conv)
+                statuses = await _drain_published_statuses(conv, until="idle", timeout=2.0)
+                assert "failed" not in statuses, (
+                    f"the later turn must not fail; statuses={statuses!r}"
+                )
+            else:
+                streamed = await _post_stream_message(
+                    http,
+                    conv,
+                    agent_id="ag_root",
+                    harness="claude-sdk",
+                    instructions="Caller-supplied instructions.",
+                )
+                assert streamed.status_code == 200, streamed.text
+
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The {second_turn} turn reused a PARENT kept after a miss and reported "
+        f"nothing. The same session asked the same question and got a silent "
+        f"answer. Warnings seen on this turn: {caplog.text!r}."
+    )
+    assert recorder.posted_bodies, "harness never received a request"
+    composed = recorder.posted_bodies[-1].get("instructions")
+    assert isinstance(composed, str) and "Root instructions." in composed, (
+        f"the PARENT's authored instructions must drive the later turn; got {composed!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_spec_published_before_sub_agent_decision_is_not_served(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spec cached mid-resolution must not answer a concurrent reader.
+
+    Background resolution publishes the freshly resolved PARENT, then awaits
+    the session snapshot to learn which sub-agent the session names. Inside
+    that await the entry exists but the sub-agent question is undecided, and
+    an entry that claims to be decided is handed to any reader that arrives —
+    ``GET /resources`` used to be answered from it, with the parent's spec and
+    no warning at all.
+
+    The reader must not be served from an undecided entry. It waits for the
+    fact instead — joining the same single-flight snapshot fetch — and reports
+    the unresolved sub-agent once that fetch lands.
+
+    :param caplog: Pytest log capture, read during and after the window.
+    """
+    conv = "conv_publish_before_decision"
+    at_snapshot = asyncio.Event()
+    release = asyncio.Event()
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    class _ParkedSnapshot(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+            if url.endswith(f"/v1/sessions/{conv}"):
+                at_snapshot.set()
+                await release.wait()
+
+                class _Resp(NullServerClient._Response):
+                    status_code = 200
+
+                    def json(self) -> dict[str, object]:
+                        return {"agent_id": "ag_root", "sub_agent_name": "worker"}
+
+                return _Resp()
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=_ParkedSnapshot(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            bg = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_root",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert bg.status_code == 202, bg.text
+            await asyncio.wait_for(at_snapshot.wait(), timeout=5.0)
+
+            reader = asyncio.create_task(http.get(f"/v1/sessions/{conv}/resources"))
+            for _ in range(50):
+                await asyncio.sleep(0)
+            assert not reader.done(), (
+                f"the reader was answered from an entry published before the "
+                f"sub-agent decision was made; it returned "
+                f"{reader.result().text!r} while the snapshot fetch was still "
+                f"in flight, having logged {caplog.text!r}."
+            )
+
+            release.set()
+            response = await asyncio.wait_for(reader, timeout=5.0)
+            await _await_bg_turn_task(conv)
+
+    assert response.status_code == 200, response.text
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"once the snapshot lands the unresolved sub-agent must be reported; got {caplog.text!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_sub_agent_recovery_does_not_silence_the_next_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dropped snapshot must not make the session answer silently forever.
+
+    ``_session_snapshot`` reports a failed fetch as a not-ok snapshot whose
+    fields are all ``None`` rather than by raising, so a recovery that reads
+    ``sub_agent_name`` off one cannot tell "this session has no sub-agent"
+    from "the fetch failed". Turn 1 here fails that fetch; the entry it
+    publishes must not claim the sub-agent question was answered.
+
+    Turn 2 recovers the name successfully. It used to take the cached entry as
+    an already-resolved child — the root's own name matches the request — and
+    every later turn stayed silent, off one transient failure.
+
+    :param caplog: Pytest log capture, read once per turn.
+    """
+    conv = "conv_recovery_failure_then_success"
+    snapshot_fails = {"now": True}
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    class _FlakySnapshot(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+            if url.endswith(f"/v1/sessions/{conv}"):
+                if snapshot_fails["now"]:
+                    raise RuntimeError("session snapshot unavailable")
+
+                class _Resp(NullServerClient._Response):
+                    status_code = 200
+
+                    def json(self) -> dict[str, object]:
+                        return {"agent_id": "ag_root", "sub_agent_name": "worker"}
+
+                return _Resp()
+            return await super().get(url)
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recorder)),
+        spec_resolver=_spec_resolver,
+        server_client=_FlakySnapshot(),  # type: ignore[arg-type]
+    )
+    turn = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_root",
+        "model": "x",
+        "content": [{"role": "user", "content": "hi"}],
+    }
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            first = await http.post(f"/v1/sessions/{conv}/events", json=turn)
+            assert first.status_code == 202, first.text
+            await _await_bg_turn_task(conv)
+            await _drain_published_statuses(conv, until="idle", timeout=2.0)
+        assert "did not resolve" not in caplog.text, (
+            f"turn 1 cannot name an unresolved sub-agent — the lookup failed, "
+            f"so nothing is known yet; got {caplog.text!r}."
+        )
+
+        # The snapshot recovers. Everything below is about THIS turn.
+        snapshot_fails["now"] = False
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            second = await http.post(f"/v1/sessions/{conv}/events", json=turn)
+            assert second.status_code == 202, second.text
+            await _await_bg_turn_task(conv)
+            statuses = await _drain_published_statuses(conv, until="idle", timeout=2.0)
+
+    assert "failed" not in statuses, f"the later turn must not fail; got {statuses!r}"
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"the turn that finally learns the sub-agent name must report that it "
+        f"does not resolve. A cache entry left over from the failed lookup "
+        f"answered 'already the child' instead. Warnings on this turn: "
+        f"{caplog.text!r}."
+    )
+    assert recorder.posted_bodies, "harness never received a request"
+    composed = recorder.posted_bodies[-1].get("instructions")
+    assert isinstance(composed, str) and "Root instructions." in composed, (
+        f"the PARENT's authored instructions must drive the turn; got {composed!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_provenance_state_is_not_trusted_by_either_reader() -> None:
+    """A provenance state nobody vouched for must be trusted by nobody.
+
+    Both provenance questions are written as allowlists — they name the
+    states they accept — rather than as "anything but UNDETERMINED". The
+    difference only shows up for a state that exists but is listed by
+    neither: an allowlist rejects it, a denylist admits it silently and
+    hands a caller a spec on evidence no one supplied.
+
+    Both helpers are closures over the runner app, so this asserts the
+    property at the source level rather than by calling them: each must
+    decide by naming the states it accepts, and neither may decide by
+    excluding a state. That is what makes an added state default to
+    untrusted. A regression to ``is not UNDETERMINED`` — which is what these
+    two returns did before, and what admits an unlisted state silently —
+    fails here.
+    """
+    import ast
+    import inspect
+
+    from omnigent.runner import app as runner_app
+
+    tree = ast.parse(inspect.getsource(runner_app))
+    helpers = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_session_spec_is_resolved_child", "_session_spec_provenance_is_settled"}
+    }
+    assert set(helpers) == {
+        "_session_spec_is_resolved_child",
+        "_session_spec_provenance_is_settled",
+    }, f"both provenance allowlists must exist; found {sorted(helpers)}"
+
+    for name, node in helpers.items():
+        for cmp_node in [n for n in ast.walk(node) if isinstance(n, ast.Compare)]:
+            for op in cmp_node.ops:
+                assert not isinstance(op, (ast.IsNot, ast.NotEq)), (
+                    f"{name} decides by EXCLUDING a provenance state. An "
+                    f"allowlist names what it accepts, so a state added later "
+                    f"is untrusted until someone lists it; a negative test "
+                    f"admits it by default, which is how a cached parent "
+                    f"fallback came to be served as a resolved child."
+                )
+        # ...and it must still positively name something, or it accepts nothing.
+        names = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)} | {
+            n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+        }
+        assert "RESOLVED" in names, f"{name} must name the state(s) it accepts"
 
 
 # ── approval-event flattening (elicitation-approval hang regression) ──────
@@ -7591,3 +11141,1363 @@ async def test_spawn_async_tool_phase_tool_call_policy_allow(
     item = inbox.get_nowait()
     assert item["status"] == "completed"
     assert item["output"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_reset_state_evicts_the_session_init_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The session-init envelope must not outlive an agent switch.
+
+    ``_session_init_envelopes`` caches the create-time envelope for a 60s TTL
+    and ``_fresh_session_init_envelope`` hands its ``snapshot.labels`` to
+    native spawn and bridge lookups as ``optional_labels``. The envelope is
+    agent-derived — it carries the agent id it was built for and the labels
+    chosen for that agent's session, bridge id among them — but it was in
+    neither the cache audit nor ``_clear_session_agent_caches``, so a switch
+    left the NEW agent pointed at the PREVIOUS agent's bridge for the rest of
+    the TTL. After ``/reset-state`` a turn dispatched as B
+    resolves its bridge without A's labels.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.claude_native_bridge as claude_bridge_mod
+    import omnigent.runner.app as runner_app_mod
+    import omnigent.runner.tool_dispatch as tool_dispatch_mod
+    from omnigent.claude_native_bridge import BRIDGE_ID_LABEL_KEY
+
+    conv = "conv_init_envelope_reset"
+    seen_labels: list[Any] = []
+
+    async def _fake_bridge_id_with_optional_labels(
+        *, server_client: object, session_id: str, session_labels: Any = None
+    ) -> str:
+        del server_client, session_id
+        seen_labels.append(session_labels)
+        return "bridge-resolved"
+
+    async def _noop_async(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _no_transfer(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return False
+
+    monkeypatch.setattr(
+        runner_app_mod,
+        "_claude_native_bridge_id_with_optional_labels",
+        _fake_bridge_id_with_optional_labels,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _noop_async
+    )
+    monkeypatch.setattr(
+        runner_app_mod, "_claude_native_terminal_arrives_via_transfer", _no_transfer
+    )
+    monkeypatch.setattr(
+        runner_app_mod,
+        "_ensure_orchestrator_skills_in_bundle",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        claude_bridge_mod, "start_tool_relay", lambda **kwargs: SimpleNamespace(close=lambda: None)
+    )
+    monkeypatch.setattr(claude_bridge_mod, "post_tools_changed", lambda _d: None)
+    monkeypatch.setattr(tool_dispatch_mod, "build_native_relay_tool_schemas", lambda _spec: [])
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return AgentSpec(
+            spec_version=1,
+            name=f"agent-{agent_id}",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(_FakeHarnessClient([]))),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        created = await http.post(
+            "/v1/sessions",
+            json={
+                "session_id": conv,
+                "agent_id": "ag_env_a",
+                "sub_agent_name": None,
+                "session_init": {
+                    "protocol_version": 2,
+                    "server_version": "0.6.0.dev0",
+                    "session_id": conv,
+                    "agent_id": "ag_env_a",
+                    "sub_agent_name": None,
+                    "snapshot": {
+                        "created_at": 1234,
+                        "updated_at": 1234,
+                        "workspace": None,
+                        "labels": {BRIDGE_ID_LABEL_KEY: "bridge-A"},
+                    },
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+
+        reset = await http.post(f"/v1/sessions/{conv}/reset-state")
+        assert reset.status_code == 200, reset.text
+
+        turn = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_env_b",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert turn.status_code == 202
+        await _await_bg_turn_task(conv)
+
+    _stale = [labels for labels in seen_labels if (labels or {}).get(BRIDGE_ID_LABEL_KEY)]
+    assert _stale == [], (
+        f"agent B's turn must not be handed agent A's create-time labels — "
+        f"bridge lookups saw {seen_labels!r}. A surviving 'bridge-A' means the "
+        f"session-init envelope outlived the switch and pointed the new agent "
+        f"at the previous agent's bridge."
+    )
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        pytest.param("/resources", id="list_session_resources"),
+        pytest.param("/resources/environments/default", id="get_session_environment"),
+        pytest.param("/models", id="get_session_models"),
+        pytest.param("/skills", id="get_session_skills"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_session_scoped_reads_resolve_the_recorded_agent_not_the_snapshot(
+    endpoint: str,
+) -> None:
+    """
+    Session-scoped REST reads must resolve the session's RECORDED agent.
+
+    Each of these handlers takes only a ``session_id`` path param, so before
+    the fix they resolved off the session snapshot — an independently-lagging
+    source that can still report the PREVIOUS agent while a switch is in
+    flight. ``_session_agent_ids`` already holds what the session last
+    dispatched as, and is passed as ``agent_id_hint``.
+
+    The snapshot here reports B for the whole test while the recorded marker
+    says A, so a handler that drops the hint sends B to the resolver and
+    fails the assertion.
+
+    :param endpoint: Session-scoped path suffix under test.
+    """
+    conv = f"conv_scoped_read_{endpoint.strip('/').replace('/', '_')}"
+    resolved_agent_ids: list[str] = []
+
+    specs = {
+        "ag_scoped_a": AgentSpec(
+            spec_version=1,
+            name="agent-a",
+            instructions="Agent A.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+        "ag_scoped_b": AgentSpec(
+            spec_version=1,
+            name="agent-b",
+            instructions="Agent B.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        resolved_agent_ids.append(agent_id)
+        return specs[agent_id]
+
+    class _StaleBSnapshotClient(NullServerClient):
+        """Snapshot lags on agent B for the whole run."""
+
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": "ag_scoped_b"}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    recording_client = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording_client)),
+        spec_resolver=_spec_resolver,
+        server_client=_StaleBSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Records _session_agent_ids[conv] = A. hermes has no cold-boot step,
+        # so nothing else is cached and the read below is the first resolve.
+        first = await _post_stream_message(http, conv, agent_id="ag_scoped_a", harness="hermes")
+        assert first.status_code == 200
+
+        resp = await http.get(f"/v1/sessions/{conv}{endpoint}")
+        assert resp.status_code == 200, resp.text
+
+    assert "ag_scoped_b" not in resolved_agent_ids, (
+        f"{endpoint} must resolve the session's recorded agent (A) via "
+        f"agent_id_hint, not the lagging snapshot's agent (B) — resolver saw "
+        f"{resolved_agent_ids!r}."
+    )
+    assert "ag_scoped_a" in resolved_agent_ids, (
+        f"{endpoint} was expected to resolve agent A — resolver saw {resolved_agent_ids!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_refires_when_the_switch_changes_delivery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A switch to a harness with a DIFFERENT delivery value must warn again.
+
+    The other half of the rule is a switch where the delivery gap is
+    identical, which stays at one warning per conversation. Both are the
+    same rule — dedup on
+    what the warning was ABOUT — and a presence-only marker can only express
+    the first. With one, agent B's genuinely-undelivered instructions are
+    silently suppressed by the marker agent A left behind, which is the whole
+    point of the warning.
+
+    Here A runs on ``kimi`` (``NOT_DELIVERED``) and B on a harness that
+    declares no capability at all (``UNKNOWN``), so both warnings are
+    warranted and they are distinct messages.
+
+    A presence-only marker keyed on ``conv_id`` alone cannot express this:
+    B's turn would find the conversation already recorded and stay silent,
+    giving one warning where two are warranted.
+
+    :param caplog: Pytest log capture fixture.
+    """
+    conv = "conv_instruction_warn_delivery_changed"
+
+    specs = {
+        "ag_warn_kimi": AgentSpec(
+            spec_version=1,
+            name="kimi-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "kimi"}),
+        ),
+        "ag_warn_unknown": AgentSpec(
+            spec_version=1,
+            name="unknown-capability-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async def _post_bg(agent_id: str) -> None:
+        async with _runner_test_client(app) as http:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": agent_id,
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert resp.status_code == 202
+            await _await_bg_turn_task(conv)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await _post_bg("ag_warn_kimi")
+        await _post_bg("ag_warn_unknown")
+
+    not_delivered = [
+        rec for rec in caplog.records if "instructions are not delivered" in rec.getMessage()
+    ]
+    undetermined = [
+        rec
+        for rec in caplog.records
+        if "declares no instruction_delivery capability" in rec.getMessage()
+    ]
+    assert len(not_delivered) == 1, (
+        f"agent A's not-delivered gap must warn once — got {not_delivered}."
+    )
+    assert len(undetermined) == 1, (
+        f"agent B runs on a harness with a DIFFERENT (unknown) delivery value, so its "
+        f"gap must warn too — got {undetermined}. Zero means the previous agent's "
+        f"marker suppressed a warning about a gap it never applied to."
+    )
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        pytest.param("background_spec", id="background-spec-write"),
+        pytest.param("initialize_session_spec", id="initialize-session-spec-write"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalidate_midflight_drops_the_stale_fill(writer: str) -> None:
+    """
+    A fill parked mid-flight must not publish after the session is invalidated.
+
+    Shared race harness: park the spec resolver inside the fill under test,
+    invalidate via ``/reset-state`` while it is parked, release it, then issue
+    a follow-up read for the SAME agent. Same-agent is the load-bearing
+    detail — it models a spec/MCP edit rather than an agent switch, so the
+    per-entry provenance tag matches and cannot mask the defect. If the parked
+    fill published, the follow-up hits that entry and never calls the resolver
+    again; if it was correctly dropped, the resolver runs a second time.
+
+    Both parametrizations park the SHARED spec resolver, so what they pin is
+    the session-spec write specifically. A writer whose fill parks somewhere
+    else needs its own isolated race — see
+    ``test_skills_fill_parked_past_invalidation_does_not_publish``, which parks
+    in skills discovery rather than here.
+
+    A setter that published unconditionally, without its generation check,
+    would let the parked fill land and both parametrizations would then see
+    exactly one resolver call.
+
+    :param writer: Which writer class parks in this run.
+    """
+    conv = f"conv_race_{writer}"
+    agent_id = "ag_race"
+    resolver_calls: list[str] = []
+    parked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _spec_resolver(resolved_agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        resolver_calls.append(resolved_agent_id)
+        if len(resolver_calls) == 1:
+            parked.set()
+            await release.wait()
+        return AgentSpec(
+            spec_version=1,
+            name=f"spec-{resolved_agent_id}-{len(resolver_calls)}",
+            instructions="Agent instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        )
+
+    class _StableAgentSnapshotClient(NullServerClient):
+        """Snapshot always reports the same agent — this race is a same-agent
+        spec edit, not a switch."""
+
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": agent_id}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(_FakeHarnessClient([]))),
+        spec_resolver=_spec_resolver,
+        server_client=_StableAgentSnapshotClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+
+        async def _start_parked_fill() -> Any:
+            if writer == "background_spec":
+                return await http.post(
+                    f"/v1/sessions/{conv}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": agent_id,
+                        "model": "x",
+                        "content": [{"role": "user", "content": "hi"}],
+                    },
+                )
+            if writer == "initialize_session_spec":
+                return await http.post(
+                    "/v1/sessions",
+                    json={"session_id": conv, "agent_id": agent_id},
+                )
+            raise AssertionError(f"unhandled writer {writer!r}")
+
+        in_flight = asyncio.create_task(_start_parked_fill())
+        await asyncio.wait_for(parked.wait(), timeout=5.0)
+
+        # Invalidate while the fill is parked. Bumps the generation, so the
+        # parked fill's captured generation is now stale.
+        reset = await http.post(f"/v1/sessions/{conv}/reset-state")
+        assert reset.status_code == 200, reset.text
+
+        release.set()
+        await in_flight
+        if writer == "background_spec":
+            await _await_bg_turn_task(conv)
+
+        follow_up = await http.get(f"/v1/sessions/{conv}/models")
+        assert follow_up.status_code == 200, follow_up.text
+
+    assert len(resolver_calls) >= 2, (
+        f"the follow-up read must re-resolve after the mid-flight invalidation "
+        f"— resolver was called {len(resolver_calls)} time(s): {resolver_calls!r}. "
+        f"Exactly one call means the parked fill published its value after the "
+        f"reset and the follow-up was served from that stale entry."
+    )
+
+
+@pytest.mark.asyncio
+async def test_instruction_delivery_warn_does_not_refire_for_a_recurring_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A -> B -> A must warn for A exactly once across the whole sequence.
+
+    The dedup is a LIFETIME rule: at most once per (conversation, harness,
+    delivery value) for as long as the conversation lives. A marker
+    holding only the most recently warned pair satisfies the two-agent cases
+    but not this one — B displaces A's record, so when A recurs it looks
+    unseen and warns a second time for a gap already reported. Membership in
+    the set of pairs already warned for is what the contract actually asks for.
+
+    A marker holding only the last-warned pair cannot express this: the third
+    turn emits a second not-delivered warning for A, because B displaced A's
+    record.
+
+    :param caplog: Pytest log capture fixture.
+    """
+    conv = "conv_instruction_warn_recurring"
+
+    specs = {
+        "ag_recur_a": AgentSpec(
+            spec_version=1,
+            name="kimi-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "kimi"}),
+        ),
+        "ag_recur_b": AgentSpec(
+            spec_version=1,
+            name="unknown-capability-agent",
+            instructions="Be a helpful coding assistant.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        ),
+    }
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return specs[agent_id]
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async def _post_bg(agent_id: str) -> None:
+        async with _runner_test_client(app) as http:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": agent_id,
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert resp.status_code == 202
+            await _await_bg_turn_task(conv)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await _post_bg("ag_recur_a")
+        await _post_bg("ag_recur_b")
+        # A recurs. Its (harness, delivery) pair was already warned for on the
+        # first turn and must not warn again, however many other values have
+        # been seen in between.
+        await _post_bg("ag_recur_a")
+
+    not_delivered = [
+        rec for rec in caplog.records if "instructions are not delivered" in rec.getMessage()
+    ]
+    undetermined = [
+        rec
+        for rec in caplog.records
+        if "declares no instruction_delivery capability" in rec.getMessage()
+    ]
+    assert len(not_delivered) == 1, (
+        f"agent A's not-delivered value must warn exactly once across A->B->A — "
+        f"got {len(not_delivered)}: {[r.getMessage() for r in not_delivered]}. Two "
+        f"means the marker only remembered the LAST value warned for, so A looked "
+        f"unseen once B had displaced it."
+    )
+    assert len(undetermined) == 1, (
+        f"agent B's distinct (unknown) value must warn exactly once — got {len(undetermined)}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_skills_fill_parked_past_invalidation_does_not_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ISOLATED race for the ``_session_skills_cache`` write.
+
+    Parks inside skills DISCOVERY (``resolve_harness_skills``, which runs in a
+    worker thread after the spec is already resolved and cached), not in the
+    shared spec resolver — so the spec write has completed and is not part of
+    what is being tested. Reset while parked, release, then read ``/skills``
+    again: discovery must run a second time. If the parked fill published, the
+    follow-up finds its entry (tagged for the same agent, TTL unexpired) and
+    never discovers again.
+
+    Isolated to the skills guard: the spec cache is evicted by the reset
+    regardless, so discovery would re-run on that account alone.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import threading
+
+    import omnigent.runner.app as runner_app_mod
+
+    conv = "conv_race_skills"
+    agent_id = "ag_race_skills"
+    discover_calls = 0
+    parked = threading.Event()
+    release = threading.Event()
+
+    def _blocking_resolve_harness_skills(ctx: object, harness: object) -> list[Any]:
+        nonlocal discover_calls
+        del ctx, harness
+        discover_calls += 1
+        if discover_calls == 1:
+            parked.set()
+            release.wait(timeout=10.0)
+        return []
+
+    monkeypatch.setattr(runner_app_mod, "resolve_harness_skills", _blocking_resolve_harness_skills)
+
+    async def _spec_resolver(resolved_agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return AgentSpec(
+            spec_version=1,
+            name=f"spec-{resolved_agent_id}",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        )
+
+    class _StableAgentSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": agent_id}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(_FakeHarnessClient([]))),
+        spec_resolver=_spec_resolver,
+        server_client=_StableAgentSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        in_flight = asyncio.create_task(http.get(f"/v1/sessions/{conv}/skills"))
+        await asyncio.get_running_loop().run_in_executor(None, parked.wait, 10.0)
+
+        reset = await http.post(f"/v1/sessions/{conv}/reset-state")
+        assert reset.status_code == 200, reset.text
+
+        release.set()
+        assert (await in_flight).status_code == 200
+
+        follow_up = await http.get(f"/v1/sessions/{conv}/skills")
+        assert follow_up.status_code == 200, follow_up.text
+
+    assert discover_calls >= 2, (
+        f"skills discovery must re-run after the mid-flight invalidation — ran "
+        f"{discover_calls} time(s). Exactly one means the parked skills fill "
+        f"published after the reset and satisfied the follow-up read."
+    )
+
+
+@pytest.mark.asyncio
+async def test_cursor_model_names_fill_parked_past_invalidation_does_not_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ISOLATED race for the ``_session_cursor_model_names`` write.
+
+    Parks inside cursor model DISCOVERY, which runs in a worker thread after
+    the spec is resolved and cached, so the spec write is complete and is not
+    part of the subject. Reset while parked, release, then drive a model
+    change: the confirmation must carry no expected display name. A published
+    mapping survives the reset and confirms against the previous agent's
+    display names.
+
+    Observed at the read site rather than on the container, because the
+    endpoint re-runs discovery on every call — a follow-up request cannot
+    distinguish a dropped write from a republished one.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import threading
+
+    from omnigent import cursor_native, cursor_native_bridge
+
+    conv = "conv_race_cursor_models"
+    agent_id = "ag_race_cursor_models"
+    parked = threading.Event()
+    release = threading.Event()
+    injected: list[tuple[str, str | None]] = []
+
+    def _blocking_list_cursor_cli_model_options() -> list[dict[str, str]]:
+        parked.set()
+        release.wait(timeout=10.0)
+        return [{"id": "sonnet-4-thinking", "displayName": "Sonnet 4 Thinking"}]
+
+    def _inject_model(
+        _bridge_dir: Path,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> None:
+        del timeout_s
+        injected.append((model, expected_display_name))
+
+    monkeypatch.setattr(
+        cursor_native, "list_cursor_cli_model_options", _blocking_list_cursor_cli_model_options
+    )
+    monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _inject_model)
+
+    async def _no_op_auto_create(*args: object, **kwargs: object) -> None:
+        # Terminal launch is unrelated to this race and needs a cursor-agent
+        # CLI this environment does not provide.
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_cursor_terminal", _no_op_auto_create
+    )
+
+    async def _spec_resolver(resolved_agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        return AgentSpec(
+            spec_version=1,
+            name=f"spec-{resolved_agent_id}",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+        )
+
+    class _StableAgentSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": agent_id}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(_FakeHarnessClient([]))),
+        spec_resolver=_spec_resolver,
+        server_client=_StableAgentSnapshotClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        create = await http.post("/v1/sessions", json={"session_id": conv, "agent_id": agent_id})
+        assert create.status_code == 201, create.text
+
+        in_flight = asyncio.create_task(http.get(f"/v1/sessions/{conv}/cursor-model-options"))
+        await asyncio.get_running_loop().run_in_executor(None, parked.wait, 10.0)
+
+        reset = await http.post(f"/v1/sessions/{conv}/reset-state")
+        assert reset.status_code == 200, reset.text
+
+        release.set()
+        assert (await in_flight).status_code == 200
+
+        # Re-establish the spec and dispatched-agent state the reset evicted,
+        # so the model-change event routes to the cursor handler and reaches
+        # the mapping read.
+        recreate = await http.post("/v1/sessions", json={"session_id": conv, "agent_id": agent_id})
+        assert recreate.status_code == 201, recreate.text
+
+        change = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={"type": "model_change", "model": "sonnet-4-thinking"},
+        )
+        assert change.status_code == 204, change.text
+
+    assert injected and injected[-1][1] is None, (
+        f"the model-name mapping resolved before the mid-flight invalidation "
+        f"must not publish after it — confirmation used {injected!r}. A "
+        f"surviving entry confirms against the previous agent's display names."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_marker_parked_past_invalidation_does_not_publish() -> None:
+    """
+    ISOLATED race for the ``_session_agent_ids`` marker write.
+
+    The marker is the identity the provenance-gated cache reads key off, so a
+    stale one re-points later reads at an agent the session has moved off.
+    Parks the direct-stream turn inside spec resolution, resets while it is
+    parked, switches the server snapshot to a DIFFERENT agent, then releases.
+    A ``/models`` read follows: it hints with the marker, so if the parked
+    turn republished its agent the read resolves that agent again and never
+    consults the new snapshot.
+
+    Driven entirely through the public endpoints — the marker itself is a
+    per-app closure local, and the observable consequence is which agent the
+    follow-up read resolves.
+    """
+    conv = "conv_race_agent_marker"
+    resolver_calls: list[str] = []
+    parked = asyncio.Event()
+    release = asyncio.Event()
+    snapshot_agent = {"id": "agent_a"}
+
+    async def _spec_resolver(resolved_agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        resolver_calls.append(resolved_agent_id)
+        if len(resolver_calls) == 1:
+            parked.set()
+            await release.wait()
+        return AgentSpec(
+            spec_version=1,
+            name=f"spec-{resolved_agent_id}",
+            instructions="Agent instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        )
+
+    class _SwitchableSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+            del kwargs
+            current = snapshot_agent["id"]
+
+            class _Resp(NullServerClient._Response):
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {"agent_id": current}
+
+            if url.endswith(f"/v1/sessions/{conv}"):
+                return _Resp()
+            return await super().get(url)
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(_FakeHarnessClient([]))),
+        spec_resolver=_spec_resolver,
+        server_client=_SwitchableSnapshotClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        in_flight = asyncio.create_task(
+            http.post(
+                f"/v1/sessions/{conv}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "agent_a",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+        )
+        await asyncio.wait_for(parked.wait(), timeout=5.0)
+
+        reset = await http.post(f"/v1/sessions/{conv}/reset-state")
+        assert reset.status_code == 200, reset.text
+
+        # The session has moved on to a different agent while the turn above
+        # is parked mid-resolution.
+        snapshot_agent["id"] = "agent_b"
+
+        release.set()
+        await in_flight
+
+        models = await http.get(f"/v1/sessions/{conv}/models")
+        assert models.status_code == 200, models.text
+
+    assert resolver_calls[-1] == "agent_b", (
+        f"the follow-up read must resolve the session's CURRENT agent — "
+        f"resolver saw {resolver_calls!r}. A trailing 'agent_a' means the "
+        f"turn parked before the reset republished its marker, and the read "
+        f"hinted with it instead of consulting the new snapshot."
+    )
+
+
+# ── Cross-path resolution contract ───────────────────────────────────────
+#
+# Three dispatch paths resolve the turn's spec independently:
+#   1. direct ?stream=true with NO harness in the body  -> _resolve_effective_turn
+#   2. direct ?stream=true WITH a known harness         -> _stream_message_to_harness
+#   3. background non-stream POST /events              -> _run_turn_bg_setup_and_stream
+#
+# They are NOT unified, and deliberately so: unification needs nine
+# independently varying behaviour policies, and no zero-behaviour-selection
+# refactor can preserve current semantics, because the paths have observably
+# OPPOSITE outcomes for a missing child and for a raising resolver. That
+# divergence is correct — the three carry different transport contracts (a
+# synchronous error response, a failure arriving asynchronously against an
+# already-sent 202, and deliberate graceful degradation).
+#
+# The real defect was that the divergence was undocumented and unpinned, so any
+# path could drift silently. The table below records it. It deliberately does NOT
+# assert sameness where the semantics differ: asserting sameness would be false
+# and would force a bad unification later. Changing any single path's
+# behaviour makes this table fail, which is the point.
+
+_CONTRACT_PARENT_WITH_CHILD = {
+    "name": "root",
+    "instructions": "Root instructions.",
+    "child": "worker",
+    "child_instructions": "Worker instructions.",
+}
+
+
+def _contract_root_spec(*, with_child: bool) -> AgentSpec:
+    """Build the contract test's parent spec, with or without the child.
+
+    :param with_child: Whether ``worker`` exists in the sub-agent tree.
+    :returns: The root ``AgentSpec``.
+    """
+    return AgentSpec(
+        spec_version=1,
+        name=_CONTRACT_PARENT_WITH_CHILD["name"],
+        instructions=_CONTRACT_PARENT_WITH_CHILD["instructions"],
+        executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        sub_agents=(
+            [
+                AgentSpec(
+                    spec_version=1,
+                    name=_CONTRACT_PARENT_WITH_CHILD["child"],
+                    instructions=_CONTRACT_PARENT_WITH_CHILD["child_instructions"],
+                    executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+                )
+            ]
+            if with_child
+            else []
+        ),
+    )
+
+
+class _ContractSnapshotClient(NullServerClient):
+    """Session snapshot naming the requested sub-agent.
+
+    All three paths recover the sub-agent name from the snapshot
+    (``_recover_sub_agent_name``), so one client drives every adapter and the
+    scenario — not the fixture — is what differs between them.
+    """
+
+    def __init__(self, conv: str) -> None:
+        super().__init__()
+        self._conv = conv
+
+    async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+        del kwargs
+        _conv = self._conv
+
+        class _Resp(NullServerClient._Response):
+            status_code = 200
+
+            def json(self) -> dict[str, object]:
+                return {"agent_id": "ag_contract_root", "sub_agent_name": "worker"}
+
+        if url.endswith(f"/v1/sessions/{_conv}"):
+            return _Resp()
+        return await super().get(url)
+
+
+_CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
+
+
+async def _contract_run_no_harness(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 1: direct ``?stream=true`` with no harness in the body."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events?stream=true",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "model": "x",
+            "content": [],
+        },
+    )
+    return {
+        "status": resp.status_code,
+        "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+async def _contract_run_known_harness(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 2: direct ``?stream=true`` with the harness already known."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events?stream=true",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "harness": "hermes",
+            "model": "x",
+            "content": [],
+            "instructions": _CONTRACT_CALLER_INSTRUCTIONS,
+        },
+    )
+    return {
+        "status": resp.status_code,
+        "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+async def _contract_run_background(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 3: background non-stream dispatch, observed via terminal status.
+
+    The POST is answered 202 before resolution runs, so a failure can only be
+    reported asynchronously — this adapter therefore reports the terminal
+    ``session.status`` rather than an HTTP code.
+    """
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "model": "x",
+            "content": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    await _await_bg_turn_task(conv)
+    statuses = await _drain_published_statuses(conv, until="failed", timeout=1.0)
+    return {
+        "status": resp.status_code,
+        "terminal_status": statuses[-1] if statuses else None,
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+_CONTRACT_ADAPTERS = {
+    "no_harness": _contract_run_no_harness,
+    "known_harness": _contract_run_known_harness,
+    "background": _contract_run_background,
+}
+
+
+def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
+    """Build the scenario's ``spec_resolver``.
+
+    :param scenario: Contract scenario key.
+    :param calls: Mutable list each invocation appends to, so a scenario can
+        assert how many resolutions a path actually performed.
+    :returns: An async resolver matching that scenario's failure mode.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec | None:
+        del session_id
+        calls.append(agent_id)
+        if scenario == "resolver_raises":
+            raise RuntimeError("contract: resolver unavailable")
+        if scenario == "resolver_none":
+            return None
+        return _contract_root_spec(with_child=(scenario != "child_missing"))
+
+    return _resolver
+
+
+@pytest.mark.parametrize(
+    "scenario, path, expected",
+    [
+        # ── Child present: the one scenario where all three genuinely agree.
+        # Each selects the SAME child identity, to the extent its transport
+        # lets us observe it (the two direct paths reach the harness and can be
+        # read off the wire; background does too).
+        pytest.param(
+            "child_present",
+            "no_harness",
+            {"status": 200, "instructions": "Worker instructions."},
+            id="child_present-no_harness",
+        ),
+        pytest.param(
+            "child_present",
+            "known_harness",
+            # Same child selected; the trailing caller text is this adapter's
+            # own per-request instructions composing additively on top (only
+            # the known-harness adapter sends any, because its degradation
+            # rows need something to preserve). The CHILD half is the shared
+            # assertion — the suffix is adapter asymmetry, not divergence.
+            {
+                "status": 200,
+                "instructions": (f"Worker instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+            },
+            id="child_present-known_harness",
+        ),
+        pytest.param(
+            "child_present",
+            "background",
+            {"terminal_status": "idle", "instructions": "Worker instructions."},
+            id="child_present-background",
+        ),
+        # ── Missing child: all three paths AGREE, and the agreement is the
+        # point. A ``sub_agent_name`` that no longer resolves is one question,
+        # and the answer does not depend on which transport asked it: warn,
+        # then run the PARENT's spec. The rows below pin the parent's authored
+        # text on every path, so a path that reverted to erroring — or to
+        # dropping the spec — fails here rather than drifting quietly.
+        # These paths used to answer 503, degrade to no spec, and fail the
+        # turn respectively.
+        pytest.param(
+            "child_missing",
+            "no_harness",
+            {"status": 200, "error": None, "instructions": "Root instructions."},
+            id="child_missing-no_harness-parent",
+        ),
+        pytest.param(
+            "child_missing",
+            "known_harness",
+            # The caller's own per-request text still composes additively on
+            # top of the parent's authored instructions rather than being
+            # replaced by them — the same shape as the child_present row.
+            {
+                "status": 200,
+                "instructions": (f"Root instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+            },
+            id="child_missing-known_harness-parent",
+        ),
+        pytest.param(
+            "child_missing",
+            "background",
+            {"status": 202, "terminal_status": "idle", "instructions": "Root instructions."},
+            id="child_missing-background-parent",
+        ),
+        # ── Resolver raises: same three-way split, different trigger.
+        pytest.param(
+            "resolver_raises",
+            "no_harness",
+            {"status": 503, "error": "spec_resolver_failed"},
+            id="resolver_raises-no_harness-503",
+        ),
+        pytest.param(
+            "resolver_raises",
+            "known_harness",
+            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
+            id="resolver_raises-known_harness-degrades",
+        ),
+        pytest.param(
+            "resolver_raises",
+            "background",
+            {"status": 202, "terminal_status": "failed"},
+            id="resolver_raises-background-async-failure",
+        ),
+        # ── Resolver returns None: a legitimate "no such agent" answer rather
+        # than a transport failure, so the split is NOT the same as above.
+        pytest.param(
+            "resolver_none",
+            "no_harness",
+            # NOT a 503, unlike this path's other two failure rows. A resolver
+            # returning None is a legitimate "no spec" answer rather than a
+            # transport failure, so this path falls back and dispatches with no
+            # composed instructions instead of erroring. This asymmetry within
+            # a single path is exactly the kind of thing that used to be
+            # invisible.
+            {"status": 200, "error": None, "instructions": None},
+            id="resolver_none-no_harness-falls-back",
+        ),
+        pytest.param(
+            "resolver_none",
+            "known_harness",
+            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
+            id="resolver_none-known_harness-continues-unknown-spec",
+        ),
+        pytest.param(
+            "resolver_none",
+            "background",
+            # ``status`` alone asserts nothing here: the adapter hard-asserts
+            # 202 before it waits and always reports it, so a row expecting
+            # only that would pass whether the turn finished, failed async, or
+            # never reached a harness at all. The discriminating keys are the
+            # terminal status and the absence of composed instructions.
+            #
+            # ``resolver_calls == 2`` is pinned deliberately. A None result
+            # is NOT cached — a cached None would serve a stale negative to
+            # later reads — so each consumer re-asks: once in background
+            # setup, once again for composition.
+            # The count documents that consequence; it is not a claim that
+            # resolving twice is desirable.
+            {
+                "status": 202,
+                "terminal_status": "idle",
+                "instructions": None,
+                "resolver_calls": 2,
+            },
+            id="resolver_none-background",
+        ),
+        # ── Cache already holds the effective child. Session-create resolved
+        # and cached "worker" itself; the dispatch must reuse that entry.
+        # ``resolver_calls == 1`` is the load-bearing assertion — it is the
+        # create's own resolution and nothing more, so a second resolve would
+        # mean the shortcut was lost.
+        pytest.param(
+            "cache_holds_child",
+            "background",
+            {
+                "terminal_status": "idle",
+                "instructions": "Worker instructions.",
+                "resolver_calls": 1,
+            },
+            id="cache_holds_child-background-shortcut",
+        ),
+        pytest.param(
+            "cache_holds_child",
+            "known_harness",
+            {
+                "status": 200,
+                "instructions": (f"Worker instructions.\n\n{_CONTRACT_CALLER_INSTRUCTIONS}"),
+                "resolver_calls": 1,
+            },
+            id="cache_holds_child-known_harness-shortcut",
+        ),
+        # Pinned SEPARATELY, and it genuinely differs: this path does
+        # NOT take the cached-child shortcut. It resolves a second time
+        # (``resolver_calls == 2``) and arrives at the same child, so the
+        # observable instructions match while the work done does not. Recorded
+        # as-is rather than "corrected" — whether the extra resolve is worth
+        # removing is a separate question from pinning today's behaviour.
+        pytest.param(
+            "cache_holds_child",
+            "no_harness",
+            {"status": 200, "instructions": "Worker instructions.", "resolver_calls": 2},
+            id="cache_holds_child-no_harness-resolves-again",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cross_path_resolution_contract(
+    scenario: str,
+    path: str,
+    expected: dict[str, Any],
+) -> None:
+    """Pin the resolution behaviour matrix across all three dispatch paths.
+
+    Reading the table: ``child_present`` and ``child_missing`` are the
+    scenarios where all three paths agree, and for ``child_missing`` the
+    agreement is load-bearing — an unresolvable ``sub_agent_name`` gets one
+    answer (warn, then the parent's spec) no matter which transport asked.
+    The remaining scenarios still record transport-driven differences that
+    are intended: a synchronous 503, graceful degradation preserving the
+    caller's own instructions, and an asynchronous terminal ``failed``
+    against a 202 that has already gone out. Those differences come from
+    what each transport can report, not from differing answers.
+
+    If you change one path and a row here starts failing, that is the point:
+    decide whether the contract moved, do not quietly re-align the table.
+
+    :param scenario: Which resolution outcome the fake resolver produces.
+    :param path: Which dispatch path adapter drives the turn.
+    :param expected: Subset of the adapter's normalized result to assert.
+    """
+    conv = f"conv_contract_{scenario}_{path}"
+    calls: list[str] = []
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=_contract_resolver_for(scenario, calls),
+        server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        if scenario == "cache_holds_child":
+            # Session-create resolves "worker" and caches the CHILD spec
+            # directly, which is the common real shape. The dispatch below
+            # must then reuse it rather than resolving again.
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_contract_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+            assert created.status_code == 201, created.text
+            assert len(calls) == 1, f"session-create should resolve once, got {calls!r}"
+        result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
+    result["resolver_calls"] = len(calls)
+
+    for key, want in expected.items():
+        assert result.get(key) == want, (
+            f"cross-path contract drift: scenario={scenario!r} path={path!r} "
+            f"key={key!r} expected {want!r}, got {result.get(key)!r}. "
+            f"Full observed result: {result!r}. If this change is intended, "
+            f"update the matrix deliberately — where paths differ, they differ "
+            f"because their transports report differently, not because they "
+            f"answer the same question differently."
+        )
+
+
+@pytest.mark.parametrize(
+    "caller_instructions, expected",
+    [
+        pytest.param(None, "Agent authored instructions.", id="agent-text-only"),
+        pytest.param(
+            "Answer only in French.",
+            "Agent authored instructions.\n\nAnswer only in French.",
+            id="agent-text-plus-per-request",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_direct_stream_composes_instructions_for_ordinary_harness(
+    caller_instructions: str | None,
+    expected: str,
+) -> None:
+    """A direct ``?stream=true`` turn composes instructions for ORDINARY harnesses.
+
+    The harness-conditional swap only ever wrote the composed value back for
+    the two harnesses whose executors read the wire field directly. Every
+    other delivery harness — codex, copilot, open-responses, openai-agents,
+    pi — kept whatever raw text the caller happened to send, so an agent's own
+    authored instructions never reached them, and a turn carrying no caller
+    text got no ``instructions`` field at all. The background dispatch path
+    has always composed here; this path silently did not.
+
+    Both arms assert the standard additive composition the background path
+    produces: agent text alone, and agent text with the turn's per-request
+    text appended.
+
+    :param caller_instructions: Per-request text on the wire, or ``None``.
+    :param expected: The composed value the harness must receive.
+    """
+    conv = f"conv_ordinary_compose_{'with' if caller_instructions else 'without'}_request"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="codex-agent",
+            instructions="Agent authored instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        )
+
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    _body: dict[str, Any] = {"agent_id": "ag_ordinary", "harness": "codex"}
+    if caller_instructions is not None:
+        _body["instructions"] = caller_instructions
+    async with _runner_test_client(app) as http:
+        response = await _post_stream_message(http, conv, **_body)
+        assert response.status_code == 200
+
+    assert recording.posted_bodies, "harness never received a request"
+    assert recording.posted_bodies[0].get("instructions") == expected, (
+        f"an ordinary harness must receive the composed instructions — got "
+        f"{recording.posted_bodies[0].get('instructions')!r}, expected {expected!r}. "
+        f"A value of {caller_instructions!r} (or None) means the direct path "
+        f"delivered only the caller's raw text and dropped the agent's own."
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_turn_composes_agent_and_per_request_instructions() -> None:
+    """A BACKGROUND (non-stream) turn delivers agent text AND per-request text.
+
+    The direct ``?stream=true`` path threads this separately, and the
+    cross-path background adapter sends no ``instructions`` field at all,
+    leaving the background path's own threading of the raw
+    caller text: it captures it before composition, carries it out-of-band on
+    ``TurnDispatch.per_request_instructions`` (the wire field by then holds the
+    composed string, so the two are not interchangeable), and hands it back to
+    composition downstream. Breaking any link in that chain silently drops the
+    caller's instructions, with nothing else in the turn signalling the loss.
+    """
+    conv = "conv_bg_per_request_instructions"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="hermes-agent",
+            instructions="Agent authored instructions.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        )
+
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bg_per_request",
+                "model": "x",
+                "instructions": "Answer only in French.",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        await _await_bg_turn_task(conv)
+
+    assert recording.posted_bodies, "harness never received a request"
+    _wire = recording.posted_bodies[-1].get("instructions")
+    assert _wire == "Agent authored instructions.\n\nAnswer only in French.", (
+        f"the background path must deliver the agent's text AND this turn's "
+        f"per-request text — got {_wire!r}. 'Agent authored instructions.' "
+        f"alone means the raw caller text was dropped somewhere between the "
+        f"request body and composition."
+    )

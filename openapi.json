@@ -3002,7 +3002,7 @@
               }
             ],
             "default": null,
-            "description": "Per-request system instructions override, or `None`.",
+            "description": "Per-request system instructions composed additively with the agent's own, or `None`.",
             "title": "Instructions"
           },
           "model": {

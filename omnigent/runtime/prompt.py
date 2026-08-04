@@ -71,6 +71,36 @@ def append_framework_instructions(
     return "\n\n".join(parts) if parts else None
 
 
+def _assemble_instruction_parts(
+    spec: AgentSpec,
+    per_request_instructions: str | None,
+    tool_schemas: list[dict[str, Any]],
+) -> list[str]:
+    """Collect the author/per-request/skills-hint parts, before framework text."""
+    parts: list[str] = []
+
+    if spec.instructions and spec.instructions.strip():
+        parts.append(spec.instructions)
+
+    if per_request_instructions and per_request_instructions.strip():
+        parts.append(per_request_instructions)
+
+    # Only mention skills in the system prompt when load_skill is
+    # available as a tool. Executors that handle skills natively
+    # (e.g. Claude SDK with its built-in Skill tool) don't need
+    # this hint — the SDK informs the model about skills itself.
+    has_load_skill = any(
+        schema.get("function", {}).get("name") == "load_skill" for schema in tool_schemas
+    )
+    if spec.skills and has_load_skill:
+        skill_lines = ["Available skills (use the load_skill tool to load one):"]
+        for skill in spec.skills:
+            skill_lines.append(f"- {skill.name}: {skill.description}")
+        parts.append("\n".join(skill_lines))
+
+    return parts
+
+
 def build_instructions(
     spec: AgentSpec,
     per_request_instructions: str | None,
@@ -96,32 +126,58 @@ def build_instructions(
         for this turn, appended after user-authored agent/request instructions.
     :returns: The assembled instructions string.
     """
-    parts: list[str] = []
-
-    if spec.instructions:
-        parts.append(spec.instructions)
-
-    if per_request_instructions:
-        parts.append(per_request_instructions)
-
-    # Only mention skills in the system prompt when load_skill is
-    # available as a tool. Executors that handle skills natively
-    # (e.g. Claude SDK with its built-in Skill tool) don't need
-    # this hint — the SDK informs the model about skills itself.
-    has_load_skill = any(
-        schema.get("function", {}).get("name") == "load_skill" for schema in tool_schemas
-    )
-    if spec.skills and has_load_skill:
-        skill_lines = ["Available skills (use the load_skill tool to load one):"]
-        for skill in spec.skills:
-            skill_lines.append(f"- {skill.name}: {skill.description}")
-        parts.append("\n".join(skill_lines))
-
+    parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
     base_instructions = "\n\n".join(parts) if parts else "You are a helpful assistant."
     return (
         append_framework_instructions(base_instructions, framework_instructions)
         or base_instructions
     )
+
+
+def build_instructions_nullable(
+    spec: AgentSpec,
+    per_request_instructions: str | None,
+    tool_schemas: list[dict[str, Any]],
+    *,
+    framework_instructions: Sequence[str] = (),
+) -> str | None:
+    """Like :func:`build_instructions`, but returns ``None`` instead of seeding
+    the fabricated ``"You are a helpful assistant."`` fallback when there is
+    truly nothing to compose (no author text, no per-request text, no skills
+    hint, no applicable framework instructions).
+
+    Delivery channels that must not leak the fallback literal (e.g. a warn
+    check, or a first-user-turn prefix) call this instead of comparing
+    :func:`build_instructions`'s output against the fallback string — that
+    comparison is unsafe because framework-only instructions are appended on
+    top of the same fallback seed, producing a mixed string that is neither
+    the bare literal nor framework-text-alone.
+
+    :returns: The composed text, or ``None`` when nothing applies.
+    """
+    parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
+    base_instructions = "\n\n".join(parts) if parts else None
+    return append_framework_instructions(base_instructions, framework_instructions)
+
+
+def raw_author_instructions(spec: AgentSpec) -> str | None:
+    """Return ``AgentSpec.instructions`` verbatim, or ``None`` if empty/whitespace.
+
+    Used by startup-additive delivery channels (claude-native's
+    ``--append-system-prompt``, codex-native's ``developer_instructions``)
+    that must receive only the author's own text, never the fully
+    framework-composed per-turn string. Startup is not tied to any one turn,
+    while the composed string is assembled per conversation for the turn
+    about to run, so a startup channel bound to one turn's composition would
+    address every later turn with a value chosen for an earlier one.
+
+    :param spec: The resolved ``AgentSpec``.
+    :returns: The original resolved instructions text, unstripped, or
+        ``None`` when it is absent or whitespace-only.
+    """
+    if spec.instructions and spec.instructions.strip():
+        return spec.instructions
+    return None
 
 
 def _strip_output_annotations(

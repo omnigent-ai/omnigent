@@ -1495,6 +1495,106 @@ class TestSystemMessages(unittest.TestCase):
         _run(_t())
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "claude-sdk is COMPOSED_SESSION_SNAPSHOT: the cached persistent "
+        "client does not rebuild when late-bound framework instructions "
+        "change after client creation, so a live session stays pinned to "
+        "the prompt it was created with. Deferred, with its follow-up "
+        "recorded in docs/AGENT_YAML_SPEC.md. If this test starts passing, "
+        "the client refresh landed — flip claude-sdk's registry row to "
+        "COMPOSED_PER_TURN in the same commit that removes this xfail, do "
+        "not let the two drift apart."
+    ),
+)
+def test_client_does_not_refresh_late_framework_instructions() -> None:
+    """Desired conformance, not the current bug: a framework instruction
+    that activates mid-conversation (e.g. ``shared_message_attribution_
+    enabled()`` flips on between turns) must reach the SDK client on the
+    very next turn. Today the client is constructed once and cached; only
+    ``model`` is refreshed on reuse (see ``_get_or_create_client``), so the
+    composed text a later turn actually sees is turn 1's stale value. This
+    asserts the fix's intended behavior, so it correctly XFAILs now and
+    would XPASS (failing the suite, per ``strict=True``) the moment someone
+    rebuilds the client on a changed composed prompt.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runtime.prompt import SHARED_SESSION_AUTHORSHIP_INSTRUCTION
+
+    class _ResultMessage:
+        def __init__(self, subtype, result):
+            self.subtype = subtype
+            self.result = result
+
+    captured_options = []
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                captured_options.append(options)
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                yield _ResultMessage("default", "ok")
+
+            async def disconnect(self):
+                return None
+
+            async def set_model(self, model):
+                return None
+
+    turn1_instructions = "Base authored instructions."
+    turn2_instructions = f"{turn1_instructions}\n\n{SHARED_SESSION_AUTHORSHIP_INSTRUCTION}"
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    turn1_instructions,
+                )
+            ]
+            # A framework instruction activates between turns; the runner
+            # recomposes and passes the new value on the next call.
+            [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "follow-up"}],
+                    [],
+                    turn2_instructions,
+                )
+            ]
+
+    _run(_t())
+
+    # The contract is over the second-turn options the SDK sees. Client count
+    # is unconstrained: reusing one client and rebuilding it on a changed
+    # composed prompt both satisfy it, so an exact count is an implementation
+    # choice rather than part of the contract.
+    assert len(captured_options) >= 1
+    assert captured_options[-1].system_prompt == turn2_instructions
+
+
 # ---------------------------------------------------------------------------
 # Tests: skills_filter → SDK skills option translation + plugin manifest
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import secrets
 import sys
 import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import tomllib
@@ -335,10 +336,150 @@ def read_codex_config_model(bridge_dir: Path) -> str | None:
     config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
     try:
         data = tomllib.loads(config_path.read_text())
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return None
     model = data.get("model")
     return model if isinstance(model, str) and model else None
+
+
+class DeveloperInstructionsReadState(str, Enum):
+    """Tri-state result of reading ``developer_instructions`` from ``config.toml``.
+
+    Distinguishes "the config genuinely has no instructions configured"
+    (safe to explicitly clear/serialize as ``None``) from "the config
+    couldn't be read right now" (must NOT be treated as absence — a
+    transient read failure must not wipe out live state a caller is trying
+    to preserve across a transition).
+    """
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class DeveloperInstructionsRead:
+    """Tri-state ``developer_instructions`` read result.
+
+    :param state: Which of the three states this read landed in.
+    :param value: The instructions text when ``state is PRESENT``; ``None``
+        otherwise.
+    """
+
+    state: DeveloperInstructionsReadState
+    value: str | None = None
+
+
+def read_codex_config_developer_instructions_state(bridge_dir: Path) -> DeveloperInstructionsRead:
+    """
+    Read the active ``developer_instructions`` from this session's private
+    Codex ``config.toml``, distinguishing absence from unreadability.
+
+    The top-level ``developer_instructions`` key is what
+    ``_sync_codex_developer_instructions`` (``codex_native_app_server.py``)
+    writes/removes; it is the current source of truth for what the running
+    app-server actually has configured, the same role
+    :func:`read_codex_config_model` plays for the model.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :returns: A tri-state read result — see :class:`DeveloperInstructionsReadState`.
+    """
+    return read_codex_config_developer_instructions_state_from_home(
+        codex_home_for_bridge_dir(bridge_dir)
+    )
+
+
+def read_codex_config_developer_instructions_state_from_home(
+    codex_home: Path,
+) -> DeveloperInstructionsRead:
+    """
+    Read the active ``developer_instructions`` given a ``CODEX_HOME`` path
+    directly, distinguishing absence from unreadability.
+
+    Variant of :func:`read_codex_config_developer_instructions_state` for
+    callers that already have the private ``CODEX_HOME`` (e.g.
+    ``CodexNativeBridgeState.codex_home``) rather than the bridge directory
+    it was derived from.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :returns: A tri-state read result — see :class:`DeveloperInstructionsReadState`.
+    """
+    config_path = codex_home / "config.toml"
+    try:
+        data = tomllib.loads(config_path.read_text())
+    except (FileNotFoundError, NotADirectoryError):
+        # No config file is a DEFINITE absence, not an unreadable value.
+        # ``_sync_codex_developer_instructions`` is the only writer of the
+        # key, and it writes it into this file or nowhere — so with the file
+        # gone there is nothing persisted to preserve, and a caller that
+        # sends no instructions overwrites nothing. UNREADABLE is for a value
+        # that might be there and cannot be seen; this is not that.
+        return DeveloperInstructionsRead(DeveloperInstructionsReadState.ABSENT)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        # The file exists but its contents cannot be established — a
+        # permission error, unreadable bytes, or malformed TOML. Whatever it
+        # holds is undeterminable, so it stays UNREADABLE.
+        return DeveloperInstructionsRead(DeveloperInstructionsReadState.UNREADABLE)
+    if "developer_instructions" not in data:
+        return DeveloperInstructionsRead(DeveloperInstructionsReadState.ABSENT)
+    instructions = data["developer_instructions"]
+    if isinstance(instructions, str) and instructions.strip():
+        return DeveloperInstructionsRead(DeveloperInstructionsReadState.PRESENT, instructions)
+    # The key IS present but not a valid non-empty (non-whitespace) string.
+    # The writer
+    # (_sync_codex_developer_instructions in codex_native_app_server.py)
+    # only ever writes a non-empty string or deletes the key outright — it
+    # never writes an empty string or a non-string value — so this shape
+    # can only mean external/manual corruption of the config, not a genuine
+    # "no instructions configured" state. Treating it as ABSENT would let a
+    # plan-mode settings send serialize developer_instructions: null over a
+    # malformed-but-present value instead of refusing an undeterminable one.
+    return DeveloperInstructionsRead(DeveloperInstructionsReadState.UNREADABLE)
+
+
+def read_codex_config_developer_instructions(bridge_dir: Path) -> str | None:
+    """
+    Read the active ``developer_instructions`` from this session's private
+    Codex ``config.toml``, collapsing the tri-state read to ``Optional[str]``.
+
+    Standalone convenience wrapper — no production caller currently uses
+    this collapsed form. Both live production consumers now consume
+    :func:`read_codex_config_developer_instructions_state` directly and
+    handle all three states explicitly, because a collapsed ``Optional[str]``
+    genuinely lost information they each needed: the forwarder
+    (:func:`~omnigent.codex_native_forwarder._refresh_developer_instructions_from_config`)
+    must actively CLEAR its cached value on a confirmed ABSENT read, not
+    merely "never overwrite on falsy" (a collapsed ``None`` can't tell
+    "confirmed absent" apart from "unreadable", so it could only ever no-op,
+    never clear); the runner's plan-mode settings send has no persistent
+    state to fall back to and must refuse (503) on UNREADABLE rather than
+    silently guessing ``None``. Kept for callers that only need "reuse this
+    value or nothing" and are unaffected by collapsing PRESENT/ABSENT/
+    UNREADABLE into one ``None`` — verify that's actually true for a new
+    caller before reaching for this instead of the tri-state form.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :returns: The top-level ``developer_instructions`` string, or ``None``
+        when undeterminable or genuinely absent.
+    """
+    result = read_codex_config_developer_instructions_state(bridge_dir)
+    return result.value
+
+
+def read_codex_config_developer_instructions_from_home(codex_home: Path) -> str | None:
+    """
+    Read the active ``developer_instructions`` given a ``CODEX_HOME`` path
+    directly, collapsing the tri-state read to ``Optional[str]``.
+
+    See :func:`read_codex_config_developer_instructions` for why no current
+    production caller uses this collapsed form.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :returns: The top-level ``developer_instructions`` string, or ``None``
+        when undeterminable or genuinely absent.
+    """
+    result = read_codex_config_developer_instructions_state_from_home(codex_home)
+    return result.value
 
 
 def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
