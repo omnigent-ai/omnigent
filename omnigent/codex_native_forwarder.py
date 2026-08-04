@@ -420,6 +420,11 @@ class _CodexForwarderState:
     # the block finalizes when the turn's assistant message arrives.
     reasoning_stream_item_id: str | None = None
     turn_diff_by_turn: dict[str, str] = field(default_factory=dict)
+    # Whether model output has already settled the synthesized MCP startup
+    # round. The round is seeded once per forwarder connection (never on
+    # thread rotation), so a settled round stays settled and later items
+    # can skip re-reading the bridge file for the life of the session.
+    mcp_startup_settled: bool = False
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -2454,10 +2459,18 @@ async def _handle_event(
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
     # assistant-side output proves startup is over before the idle edge.
-    if not is_child and _is_model_output_item_event(method, params):
+    # Guarded by the state flag so only that first item pays the
+    # bridge-file read; every later item in the session short-circuits.
+    if (
+        not is_child
+        and (forwarder_state is None or not forwarder_state.mcp_startup_settled)
+        and _is_model_output_item_event(method, params)
+    ):
         await _settle_mcp_startup(
             client, session_id=session_id, bridge_dir=bridge_dir, reason="model output observed"
         )
+        if forwarder_state is not None:
+            forwarder_state.mcp_startup_settled = True
     # item/started: register collab-agent children early (before item/completed)
     # so live child events can be routed to the child session immediately.
     # Only meaningful for the parent thread; children don't spawn grandchildren here.

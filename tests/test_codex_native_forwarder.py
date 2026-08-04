@@ -2318,6 +2318,59 @@ async def test_model_output_item_settles_synthesized_round(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_model_output_settles_the_round_only_once(tmp_path: Path) -> None:
+    """
+    Only the first model item pays the settle path; later items skip it.
+
+    The round is seeded once per forwarder connection (never on thread
+    rotation), so once model output settles it the outcome cannot change
+    — every later item in the session would otherwise re-read the bridge
+    file for nothing. The state flag short-circuits them, which this
+    pins by re-populating the map behind the flag: a second item must
+    leave it untouched.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    item_event = {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_1",
+            "item": {"id": "item_1", "type": "agentMessage", "text": "hi"},
+        },
+    }
+
+    async def deliver() -> None:
+        """Feed the model-output item through the forwarder dispatch."""
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=item_event,
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            expected_thread_id="thread_1",
+            forwarder_state=state,
+        )
+
+    await deliver()
+    assert state.mcp_startup_settled is True
+    settle_posts = [p for p in client.posts if p[1]["type"] == "external_mcp_startup"]
+    assert len(settle_posts) == 1
+
+    # Re-populate the map behind the flag: without the short-circuit the
+    # next item would read it, settle again, and post a second time.
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+    await deliver()
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert len([p for p in client.posts if p[1]["type"] == "external_mcp_startup"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_user_message_item_does_not_settle_round(tmp_path: Path) -> None:
     """
     The turn's ``userMessage`` item must not settle the round.
