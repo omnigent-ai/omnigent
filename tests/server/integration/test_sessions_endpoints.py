@@ -7462,6 +7462,177 @@ async def test_patch_collaboration_mode_rejects_non_codex_session(
     assert "collaboration_mode is only supported" in resp.text
 
 
+async def test_patch_permission_mode_persists_label_and_forwards_event(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    PATCH ``permission_mode`` forwards the switch and persists what landed.
+
+    Claude Code's ``--permission-mode`` is launch-only, so the runner has to
+    drive the TUI's shift+tab cycle. The server forwards a
+    ``permission_mode_change`` control event and records the mode the runner
+    reports the pane reached — not the requested one — so a reload shows the
+    session's real mode.
+    """
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Echo the switched mode like the claude-native runner handler."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body: dict[str, Any] | None = None
+        if request.content:
+            body = json.loads(request.content)
+        captured.append(_ForwardedEffort(url=str(request.url), body=body))
+        return httpx.Response(200, json={"permission_mode": "auto"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+        )
+        captured.clear()
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "auto"
+    forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
+    assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
+    assert forwards[0].body == {"type": "permission_mode_change", "permission_mode": "auto"}
+
+
+@pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
+async def test_patch_permission_mode_requires_live_runner_before_persisting(
+    client: httpx.AsyncClient,
+    runner_status: int | None,
+) -> None:
+    """
+    A permission-mode switch must not persist unless the pane really moved.
+
+    The mode lives only in the running TUI. If no runner is reachable, or the
+    runner could not reach the mode (e.g. ``auto`` isn't in this session's
+    shift+tab cycle), persisting the label would make the web UI claim auto
+    mode while Claude still prompts on every edit.
+    """
+    from omnigent.runtime import set_runner_client
+
+    fake_runner: httpx.AsyncClient | None = None
+    if runner_status is not None:
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            """Reject the switch the way an unreachable mode does."""
+            del request
+            return httpx.Response(
+                runner_status,
+                json={
+                    "error": "claude_native_permission_mode_failed",
+                    "detail": "The mode is not available in this session's cycle.",
+                },
+            )
+
+        fake_runner = httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler),
+            base_url="http://runner",
+        )
+
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+            },
+        )
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    finally:
+        if fake_runner is not None:
+            await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 503, resp.text
+    assert "Could not switch to auto mode" in resp.text
+    assert "omnigent.claude_native.permission_mode" not in snapshot["labels"]
+
+
+@pytest.mark.parametrize("bad_mode", ["dontAsk", "bypassPermissions", "nonsense"])
+async def test_patch_permission_mode_rejects_modes_the_cycle_cannot_reach(
+    client: httpx.AsyncClient,
+    bad_mode: str,
+) -> None:
+    """
+    Launch-only modes are rejected rather than forwarded.
+
+    ``dontAsk`` is never in Claude's shift+tab cycle and
+    ``bypassPermissions`` only joins it when the session launched into it, so
+    a live switch toward either would wander through unrelated modes before
+    failing. Reject up front, before touching the runner.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
+    )
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"permission_mode": bad_mode},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "permission_mode must be one of" in resp.text
+
+
+async def test_patch_permission_mode_rejects_non_claude_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``permission_mode`` is rejected for sessions that aren't claude-native.
+
+    Only Claude Code has the shift+tab cycle the switch drives, so accepting
+    the field elsewhere would persist a mode label no runner can honor.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"permission_mode": "auto"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "permission_mode is only supported" in resp.text
+
+
 @pytest.mark.parametrize(
     "native_session,patch_effort,expected_persisted,expected_event_effort",
     [

@@ -27,6 +27,7 @@ import {
   Loader2Icon,
   PaperclipIcon,
   SettingsIcon,
+  ShieldIcon,
   SquareIcon,
   WifiOffIcon,
   XIcon,
@@ -180,6 +181,11 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import {
+  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+  claudePermissionModeLabel,
+  isClaudeNativeSession,
+} from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
@@ -1142,6 +1148,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
@@ -1374,6 +1381,7 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -1450,6 +1458,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -1871,6 +1880,7 @@ function MainAgentSurface({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
+        showClaudePermissionMode={showClaudePermissionMode}
         showGoalControl={showGoalControl}
         showClaudeGoalControl={showClaudeGoalControl}
         showPollyCodexGoalControl={showPollyCodexGoalControl}
@@ -3470,6 +3480,7 @@ interface ComposerProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -3932,6 +3943,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -3951,6 +3963,7 @@ export function Composer({
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
+  const [permissionModeBusy, setPermissionModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
   // opens with matches the reset logic below pre-selects the first item (0)
@@ -4002,6 +4015,7 @@ export function Composer({
   );
 
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
+  const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   // Harness/agent identity shown in the status tray below the card, separate
   // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
@@ -4177,6 +4191,19 @@ export function Composer({
       setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
     } finally {
       setPlanModeBusy(false);
+    }
+  };
+  const selectClaudePermissionMode = async (mode: string) => {
+    if (permissionModeBusy || mode === claudePermissionMode) return;
+    setCommandError(null);
+    setPermissionModeBusy(true);
+    try {
+      await useChatStore.getState().setClaudePermissionMode(mode);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCommandError(`Could not switch to ${claudePermissionModeLabel(mode)} mode: ${message}`);
+    } finally {
+      setPermissionModeBusy(false);
     }
   };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
@@ -5050,6 +5077,51 @@ export function Composer({
               dropdown for Claude, a standalone Switch for other routable
               agents. */}
           <div className="flex min-w-0 items-center gap-0.5">
+            {showClaudePermissionMode && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  {/* Switching drives Claude's shift+tab cycle in the live
+                      pane, so the value only changes once the TUI confirms
+                      it landed there (see setClaudePermissionMode). */}
+                  <Select
+                    value={claudePermissionMode}
+                    onValueChange={(mode) => void selectClaudePermissionMode(mode)}
+                    disabled={isReadOnly || permissionModeBusy}
+                  >
+                    <SelectTrigger
+                      size="sm"
+                      className="h-9 gap-1.5 border-none px-2 text-xs shadow-none md:h-8"
+                      data-testid="claude-permission-mode-select"
+                      aria-label="Permission mode"
+                    >
+                      {permissionModeBusy ? (
+                        <Loader2Icon className="size-3.5 animate-spin" />
+                      ) : (
+                        <ShieldIcon className="size-3.5" />
+                      )}
+                      {/* Bare label, not <SelectValue> — that echoes the
+                          item's description row too, which is too wide here. */}
+                      {claudePermissionModeLabel(claudePermissionMode)}
+                    </SelectTrigger>
+                    <SelectContent>
+                      {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
+                        <SelectItem key={mode.value} value={mode.value}>
+                          <span className="flex flex-col items-start">
+                            <span>{mode.label}</span>
+                            <span className="text-muted-foreground text-xs">
+                              {mode.description}
+                            </span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {`Permission mode: ${claudePermissionModeLabel(claudePermissionMode)}`}
+                </TooltipContent>
+              </Tooltip>
+            )}
             {showCodexPlanMode && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -5460,6 +5532,22 @@ export function shouldShowCodexPlanModeControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
+}
+
+/**
+ * True when the claude-native permission-mode picker should be visible.
+ *
+ * Claude-native sessions only: the switch drives Claude Code's own
+ * shift+tab cycle, which no other harness has.
+ *
+ * :param conv: Session-like object carrying `labels`; a missing session
+ *     or missing labels fails closed.
+ * :returns: True only for sessions running the claude-native wrapper.
+ */
+export function shouldShowClaudePermissionModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isClaudeNativeSession(conv);
 }
 
 /**

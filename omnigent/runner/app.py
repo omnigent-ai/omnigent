@@ -3956,6 +3956,50 @@ def create_runner_app(
                 publish_event=_publish_event,
             )
 
+    async def _handle_claude_native_permission_mode_change(
+        conv_id: str,
+        mode: str | None,
+    ) -> Response:
+        """
+        Switch a live claude-native session's permission mode.
+
+        Claude Code can only set the mode at launch (``--permission-mode``)
+        or from its own shift+tab cycle, so the bridge drives that cycle
+        and verifies the pane landed on *mode*. A 200 carries the mode now
+        rendered, which the Omnigent server persists as the session's
+        current mode.
+        """
+        from omnigent.claude_native_bridge import (
+            bridge_dir_for_bridge_id,
+            set_permission_mode,
+        )
+
+        if mode is None or not mode.strip():
+            return Response(status_code=204)
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        try:
+            settled = await asyncio.to_thread(
+                set_permission_mode,
+                bridge_dir,
+                mode=mode.strip(),
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_permission_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="claude-native permission mode change"
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"permission_mode": settled})
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -6190,6 +6234,24 @@ def create_runner_app(
                 return await _handle_codex_native_plan_mode_change(
                     conversation_id,
                     enabled=enabled,
+                )
+            return Response(status_code=204)
+
+        if body_type == "permission_mode_change":
+            harness = _session_harness_name(conversation_id)
+            if harness == "claude-native":
+                mode = body.get("permission_mode") if isinstance(body, dict) else None
+                if mode is not None and not isinstance(mode, str):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_input",
+                            "detail": "Body 'permission_mode' must be a string or null",
+                        },
+                    )
+                return await _handle_claude_native_permission_mode_change(
+                    conversation_id,
+                    mode,
                 )
             return Response(status_code=204)
 

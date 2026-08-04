@@ -181,6 +181,21 @@ _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE: str = "external_codex_approval_mode_c
 _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
 
 
+# Current permission mode of a live claude-native session.
+# ``terminal_launch_args`` records only the launch mode, so this label is what
+# the web UI reads back after a reload.
+_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode"
+
+
+# Permission modes switchable on a running session — the ones Claude
+# Code's shift+tab cycle can reach. Mirrors
+# ``claude_native_bridge.CYCLEABLE_PERMISSION_MODES``; ``dontAsk`` and
+# ``bypassPermissions`` are launch-only and rejected on PATCH.
+_CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
+    {"default", "acceptEdits", "plan", "auto"}
+)
+
+
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 
 
@@ -723,6 +738,8 @@ __all__ = [
     "_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S",
     "_CLAUDE_NATIVE_MODEL",
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
+    "_CLAUDE_NATIVE_PERMISSION_MODES",
+    "_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",

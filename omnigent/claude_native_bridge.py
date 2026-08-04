@@ -167,6 +167,27 @@ _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
+# Mode footer Claude Code renders below its input box, keyed by
+# ``--permission-mode`` value. There is no non-interactive mode command, so
+# a live switch cycles with shift+tab and reads this footer to know where it
+# landed. The prompting mode is ``default`` on the CLI, "manual" on screen.
+_PERMISSION_MODE_FOOTERS: dict[str, str] = {
+    "default": "manual mode on",
+    "acceptEdits": "accept edits on",
+    "plan": "plan mode on",
+    "auto": "auto mode on",
+}
+# Modes shift+tab can reach. ``dontAsk`` is never in the cycle and
+# ``bypassPermissions`` only joins it when launched into, so both are
+# rejected up front.
+CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS)
+# Cap on shift+tab presses. The cycle is 3-5 modes wide depending on which
+# optional modes are enabled, so a full lap plus slack proves the target is
+# unreachable rather than slow.
+_MODE_CYCLE_MAX_PRESSES = 8
+# Wait for the footer to repaint after a shift+tab before reading it.
+_MODE_FOOTER_SETTLE_TIMEOUT_S = 2.0
+_MODE_FOOTER_POLL_INTERVAL_S = 0.1
 # When Claude Code's input prompt never renders (it failed to boot), the
 # readiness gate attaches the tail of the captured pane to its error so
 # the real cause — often Claude Code's own startup crash, e.g. a
@@ -2825,6 +2846,132 @@ def inject_slash_command(
         # prompt and gets dropped.
         time.sleep(0.3)
         _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+
+
+def _permission_mode_from_pane(pane: str) -> str | None:
+    """
+    Read Claude Code's current permission mode off a captured pane.
+
+    Scans the tail for the mode footer Claude renders below its input
+    box (``⏵⏵ auto mode on``, ``⏸ plan mode on``, ...). Only the tail is
+    considered so a mode name echoed earlier in the transcript can't be
+    mistaken for the live footer.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The ``--permission-mode`` value for the rendered footer,
+        e.g. ``"auto"``, or ``None`` when no footer is visible (the
+        pane is mid-repaint, or the mode is one with no footer).
+    """
+    lines = [line for line in pane.splitlines() if line.strip()]
+    for line in reversed(lines[-_PROMPT_SCAN_TAIL_LINES:]):
+        for mode, footer in _PERMISSION_MODE_FOOTERS.items():
+            if footer in line:
+                return mode
+    return None
+
+
+def _read_settled_permission_mode(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    previous: str | None = None,
+) -> str | None:
+    """
+    Poll the pane until its permission-mode footer settles.
+
+    A shift+tab repaints the footer asynchronously, so an immediate
+    capture can read nothing — or, worse, still read the PREVIOUS mode
+    and make the cycler believe the keystroke did nothing. Passing
+    *previous* waits for the footer to actually change.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param previous: Mode read before the keystroke that prompted this
+        read, e.g. ``"plan"``. The pane keeps rendering it until the TUI
+        repaints, so a read that returns it is treated as not-yet-settled
+        and retried; ``None`` accepts the first mode seen (the initial
+        read, where there is nothing to change from).
+    :returns: The rendered mode, or ``None`` if none appeared — or the
+        footer never moved off *previous* — before
+        :data:`_MODE_FOOTER_SETTLE_TIMEOUT_S`.
+    """
+    deadline = time.monotonic() + _MODE_FOOTER_SETTLE_TIMEOUT_S
+    while True:
+        mode = _permission_mode_from_pane(_capture_pane(socket_path, tmux_target))
+        if mode is not None and mode != previous:
+            return mode
+        if time.monotonic() >= deadline:
+            # Timed out: report the last mode seen so a pane that legitimately
+            # stayed put is distinguished from one with no footer at all.
+            return mode
+        time.sleep(_MODE_FOOTER_POLL_INTERVAL_S)
+
+
+def set_permission_mode(
+    bridge_dir: Path,
+    *,
+    mode: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> str:
+    """
+    Switch the running Claude terminal to *mode* by cycling shift+tab.
+
+    Claude Code has no non-interactive way to set a live session's mode
+    (``--permission-mode`` is launch-only, ``/permissions`` is an interactive
+    dialog, settings load at startup), so this drives the TUI's shift+tab
+    cycle, reading the mode footer after each press. The cycle is walked
+    rather than computed: its width varies with which optional modes are
+    enabled, so a fixed press count could land on the wrong mode.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :param mode: Target ``--permission-mode`` value, one of
+        :data:`CYCLEABLE_PERMISSION_MODES`, e.g. ``"auto"``.
+    :param timeout_s: Seconds to wait for ``tmux.json`` to be
+        advertised by the runner, e.g. ``30.0``.
+    :returns: The mode now rendered in the pane (== *mode*).
+    :raises ValueError: If *mode* is not cycle-reachable.
+    :raises RuntimeError: If the tmux target is not advertised in time,
+        a ``tmux`` invocation fails, the pane never renders a mode
+        footer, or the target is not reached within
+        :data:`_MODE_CYCLE_MAX_PRESSES` presses (the mode is not in
+        this session's cycle).
+    """
+    if mode not in CYCLEABLE_PERMISSION_MODES:
+        raise ValueError(
+            f"permission mode {mode!r} cannot be switched on a running session; "
+            f"expected one of {sorted(CYCLEABLE_PERMISSION_MODES)}"
+        )
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    # The footer only renders once the input box is mounted; without
+    # this gate a shift+tab sent mid-boot is dropped and the read below
+    # reports a mode the keystroke never reached.
+    _wait_for_claude_prompt_ready(socket_path, tmux_target, timeout_s=timeout_s)
+    current = _read_settled_permission_mode(socket_path, tmux_target)
+    if current is None:
+        pane = _capture_pane(socket_path, tmux_target)
+        raise RuntimeError(
+            "Claude Code did not render a permission-mode footer, so its current "
+            f"mode could not be read.{_format_terminal_failure_tail(pane)}"
+        )
+    seen = [current]
+    for _ in range(_MODE_CYCLE_MAX_PRESSES):
+        if current == mode:
+            return current
+        # No ``-l``: tmux must interpret ``BTab`` as the shift+tab key.
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BTab")
+        settled = _read_settled_permission_mode(socket_path, tmux_target, previous=current)
+        if settled is not None:
+            current = settled
+            seen.append(current)
+    if current == mode:
+        return current
+    raise RuntimeError(
+        f"Could not switch Claude Code to {mode!r} mode: cycled shift+tab "
+        f"{_MODE_CYCLE_MAX_PRESSES} times and only reached {sorted(set(seen))}. "
+        "The mode is not available in this session's cycle."
+    )
 
 
 def display_cost_approval_popup(

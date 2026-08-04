@@ -3394,6 +3394,58 @@ def _require_collaboration_mode_forward(
         )
 
 
+def _require_permission_mode_forward(
+    session_id: str,
+    mode: str,
+    runner_result: _RunnerForwardResult | None,
+) -> str:
+    """
+    Fail when a live claude-native permission-mode switch wasn't applied.
+
+    The mode lives in the running TUI, so persisting the label without a
+    confirmed 2xx forward would let the UI claim auto mode while Claude still
+    prompts on every edit. Returns the mode the runner actually reached, so
+    the caller stores what the pane shows rather than what was asked for.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param mode: Requested permission mode, e.g. ``"auto"``.
+    :param runner_result: HTTP result returned by the runner, or ``None``
+        when no runner could be reached.
+    :returns: The mode the runner reports the pane is now in — the
+        requested *mode* when the runner didn't echo one back.
+    :raises OmnigentError: If no runner was reachable or the runner could
+        not switch the session into *mode*.
+    """
+    if runner_result is None:
+        raise OmnigentError(
+            f"Could not switch to {mode} mode: no live Claude runner is available "
+            f"for session {session_id!r}. Reconnect the session and try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    if not 200 <= runner_result.status_code < 300:
+        # The runner's body carries why the cycle failed (e.g. the mode
+        # isn't in this session's cycle); surface it so the UI banner
+        # explains the failure instead of showing a bare status code.
+        detail = ""
+        try:
+            payload = json.loads(runner_result.body)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = f" {payload['detail']}"
+        raise OmnigentError(
+            f"Could not switch to {mode} mode for session {session_id!r}.{detail}",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    try:
+        body = json.loads(runner_result.body)
+    except (TypeError, ValueError):
+        return mode
+    settled = body.get("permission_mode") if isinstance(body, dict) else None
+    return settled if isinstance(settled, str) and settled else mode
+
+
 def _publish_status(
     session_id: str,
     status: str,
@@ -8869,6 +8921,7 @@ __all__ = [
     "_require_declared_subagent",
     "_require_external_status_forward",
     "_require_host_conn_for_worktree",
+    "_require_permission_mode_forward",
     "_reset_runner_resources_after_switch",
     "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",
