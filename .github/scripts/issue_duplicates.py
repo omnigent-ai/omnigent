@@ -13,12 +13,11 @@ MAX_CANDIDATES = 10
 MAX_SEARCH_QUERIES = 4
 MAX_EXPLICIT_REFERENCES = 5
 MAX_SIMILAR_ISSUES = 3
-MAX_REASON_LENGTH = 360
-MIN_TRUSTED_TITLE_TOKENS = 4
-MIN_TRUSTED_DOCUMENT_TOKENS = 8
-MIN_TRUSTED_TITLE_JACCARD = 0.8
-MIN_TRUSTED_DOCUMENT_JACCARD = 0.25
-MIN_TRUSTED_DOCUMENT_CONTAINMENT = 0.5
+MIN_CLOSE_TITLE_TOKENS = 4
+MIN_CLOSE_DOCUMENT_TOKENS = 8
+MIN_CLOSE_TITLE_JACCARD = 0.8
+MIN_CLOSE_DOCUMENT_JACCARD = 0.25
+MIN_CLOSE_DOCUMENT_CONTAINMENT = 0.5
 
 _STOP_WORDS = {
     "a",
@@ -78,6 +77,9 @@ _SHORT_TECH_TERMS = {"ci", "db", "go", "os", "ui"}
 
 def build_search_queries(issue: dict[str, Any], limit: int = MAX_SEARCH_QUERIES) -> list[str]:
     """Build short phrase queries spread across an issue title."""
+    if limit <= 0:
+        return []
+
     title = str(issue.get("title") or "")
     body = str(issue.get("body") or "")[:1000]
     title_tokens = _query_tokens(title)
@@ -91,6 +93,8 @@ def build_search_queries(issue: dict[str, Any], limit: int = MAX_SEARCH_QUERIES)
     pairs = list(
         dict.fromkeys(" ".join(tokens[index : index + 2]) for index in range(len(tokens) - 1))
     )
+    if limit == 1:
+        return pairs[:1]
     if len(pairs) <= limit:
         return pairs
 
@@ -99,7 +103,9 @@ def build_search_queries(issue: dict[str, Any], limit: int = MAX_SEARCH_QUERIES)
 
 
 def extract_issue_references(
-    issue: dict[str, Any], limit: int = MAX_EXPLICIT_REFERENCES
+    issue: dict[str, Any],
+    repository: str | None = None,
+    limit: int = MAX_EXPLICIT_REFERENCES,
 ) -> list[int]:
     """Extract older issue references from title and body text."""
     issue_number = issue.get("number")
@@ -108,7 +114,21 @@ def extract_issue_references(
 
     text = f"{issue.get('title') or ''}\n{issue.get('body') or ''}"
     references = []
-    for value in re.findall(r"(?:#|/issues/)(\d{1,10})\b", text):
+    if repository:
+        repository_pattern = re.escape(repository)
+        reference_pattern = re.compile(
+            rf"(?<![\w/-])#(\d{{1,10}})\b|"
+            rf"(?:https://github\.com/)?{repository_pattern}(?:/issues/|#)(\d{{1,10}})\b",
+            re.IGNORECASE,
+        )
+        values = (
+            next(value for value in match.groups() if value)
+            for match in reference_pattern.finditer(text)
+        )
+    else:
+        values = re.findall(r"(?:#|/issues/)(\d{1,10})\b", text)
+
+    for value in values:
         number = int(value)
         if number < issue_number and number not in references:
             references.append(number)
@@ -195,19 +215,16 @@ def parse_triage_output(raw: str) -> dict[str, Any]:
     return result
 
 
-def trusted_duplicate_match(issue: dict[str, Any], candidate: dict[str, Any]) -> bool:
-    """Require strong deterministic lexical agreement before auto-closing."""
+def deterministic_duplicate_match(issue: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """Require strong lexical agreement before auto-closing."""
     issue_title = set(_similarity_tokens(str(issue.get("title") or "")))
     candidate_title = set(_similarity_tokens(str(candidate.get("title") or "")))
-    if (
-        len(issue_title) < MIN_TRUSTED_TITLE_TOKENS
-        or len(candidate_title) < MIN_TRUSTED_TITLE_TOKENS
-    ):
+    if len(issue_title) < MIN_CLOSE_TITLE_TOKENS or len(candidate_title) < MIN_CLOSE_TITLE_TOKENS:
         return False
 
     title_union = issue_title | candidate_title
     title_jaccard = len(issue_title & candidate_title) / len(title_union)
-    if title_jaccard < MIN_TRUSTED_TITLE_JACCARD:
+    if title_jaccard < MIN_CLOSE_TITLE_JACCARD:
         return False
 
     issue_document = set(
@@ -219,8 +236,8 @@ def trusted_duplicate_match(issue: dict[str, Any], candidate: dict[str, Any]) ->
         )
     )
     if (
-        len(issue_document) < MIN_TRUSTED_DOCUMENT_TOKENS
-        or len(candidate_document) < MIN_TRUSTED_DOCUMENT_TOKENS
+        len(issue_document) < MIN_CLOSE_DOCUMENT_TOKENS
+        or len(candidate_document) < MIN_CLOSE_DOCUMENT_TOKENS
     ):
         return False
 
@@ -228,8 +245,8 @@ def trusted_duplicate_match(issue: dict[str, Any], candidate: dict[str, Any]) ->
     document_jaccard = len(shared_document) / len(issue_document | candidate_document)
     document_containment = len(shared_document) / min(len(issue_document), len(candidate_document))
     return (
-        document_jaccard >= MIN_TRUSTED_DOCUMENT_JACCARD
-        and document_containment >= MIN_TRUSTED_DOCUMENT_CONTAINMENT
+        document_jaccard >= MIN_CLOSE_DOCUMENT_JACCARD
+        and document_containment >= MIN_CLOSE_DOCUMENT_CONTAINMENT
     )
 
 
@@ -258,11 +275,9 @@ def validate_duplicate_decision(
         else None
     )
     similar_issues = _validated_issue_numbers(result.get("similar_issues"), candidate_numbers)
-    reason = result.get("duplicate_reasoning")
-
     decision = "none"
     if requested_decision == "duplicate" and duplicate_of is not None:
-        if confidence >= auto_close_confidence and trusted_duplicate_match(
+        if confidence >= auto_close_confidence and deterministic_duplicate_match(
             issue, candidates_by_number[duplicate_of]
         ):
             decision = "duplicate"
@@ -271,23 +286,19 @@ def validate_duplicate_decision(
             decision = "similar"
             similar_issues = _deduplicate([duplicate_of, *similar_issues])[:MAX_SIMILAR_ISSUES]
             duplicate_of = None
-            if confidence >= auto_close_confidence:
-                reason = None
     elif requested_decision == "similar" and similar_issues:
         decision = "similar"
         duplicate_of = None
     else:
         duplicate_of = None
         similar_issues = []
-        if requested_decision != "none":
-            reason = None
 
     return {
         "duplicate_decision": decision,
         "duplicate_of": duplicate_of,
         "similar_issues": similar_issues,
         "duplicate_confidence": confidence,
-        "duplicate_reasoning": _sanitize_reason(reason, decision),
+        "duplicate_reasoning": _duplicate_reason(decision),
     }
 
 
@@ -407,20 +418,12 @@ def _deduplicate(numbers: list[int]) -> list[int]:
     return list(dict.fromkeys(numbers))
 
 
-def _sanitize_reason(value: Any, decision: str) -> str:
-    fallbacks = {
+def _duplicate_reason(decision: str) -> str:
+    return {
         "duplicate": "The reports describe the same behavior and expected outcome.",
         "similar": (
-            "The reports overlap, but the available details do not establish that "
-            "they are the same issue."
+            "The reports overlap, but automatic checks do not establish that they "
+            "are the same issue."
         ),
         "none": "The available candidates do not describe the same underlying problem.",
-    }
-    if not isinstance(value, str):
-        return fallbacks[decision]
-
-    reason = re.sub(r"https?://\S+", "[link omitted]", value)
-    reason = " ".join(reason.split())
-    reason = reason.translate(str.maketrans({"@": "＠", "#": "＃", "<": "", ">": ""}))
-    reason = reason[:MAX_REASON_LENGTH].strip()
-    return reason or fallbacks[decision]
+    }[decision]

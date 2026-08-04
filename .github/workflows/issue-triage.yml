@@ -146,13 +146,14 @@ jobs:
 
           PYTHONPATH=.github/scripts python3 <<'PYEOF'
           import json
+          import os
           import pathlib
 
           from issue_duplicates import build_search_queries, extract_issue_references
 
           issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
           queries = build_search_queries(issue)
-          references = extract_issue_references(issue)
+          references = extract_issue_references(issue, os.environ["REPO"])
           pathlib.Path("/tmp/search-queries.json").write_text(json.dumps(queries))
           pathlib.Path("/tmp/issue-references.json").write_text(
               json.dumps(references)
@@ -387,6 +388,7 @@ jobs:
 
       - name: Run triage agent
         if: steps.creds.outputs.available == 'true'
+        id: triage_agent
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         # NOTE: GH_TOKEN is intentionally NOT passed to this step.
@@ -408,7 +410,10 @@ jobs:
           set -e
           echo "::$stop_token::"
           if [ "$triage_status" -ne 0 ]; then
+            echo "succeeded=false" >> "$GITHUB_OUTPUT"
             echo "::warning::Triage agent exited non-zero"
+          else
+            echo "succeeded=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Redact secrets from logs
@@ -436,10 +441,20 @@ jobs:
             sed 's/^/triage stderr | /' triage-stderr.log
           fi
 
+      - name: Stop after triage agent failure
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          steps.triage_agent.outputs.succeeded != 'true'
+        run: |
+          echo "::error::Triage agent failed; refusing to apply its output."
+          exit 1
+
       # ── Trusted label application (LLM cannot influence these) ───────
 
       - name: Apply triage labels
-        if: steps.creds.outputs.available == 'true'
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          steps.triage_agent.outputs.succeeded == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -628,23 +643,16 @@ jobs:
             "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- omnigent-duplicate-check -->"))) | .id' \
             | sed -n '1p')
-          issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
-            --json state --jq '.state')
-          if [ "$issue_state" != "OPEN" ] && [ -n "$comment_id" ]; then
-            echo "Issue is already closed and has a duplicate-check result; skipping rerun."
+          if [ -n "$comment_id" ]; then
+            echo "Duplicate-check result already exists; preserving any human override."
             exit 0
           fi
 
           # Execute the validated label changes.
           bash /tmp/triage_commands.sh
 
-          if [ -n "$comment_id" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" \
-              -F body=@/tmp/duplicate_comment.md --silent
-          else
-            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
-              --body-file /tmp/duplicate_comment.md
-          fi
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
+            --body-file /tmp/duplicate_comment.md
 
           # Refresh state after labeling/commenting so closure and assignment do
           # not rely on the earlier read.
@@ -738,7 +746,9 @@ jobs:
           fi
 
       - name: Upload logs on failure
-        if: failure()
+        if: >-
+          failure() ||
+          steps.triage_agent.outputs.succeeded == 'false'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: triage-logs-${{ github.run_id }}

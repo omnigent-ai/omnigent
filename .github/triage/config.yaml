@@ -41,7 +41,6 @@ prompt: |
     "duplicate_of": <issue number> | null,
     "similar_issues": [<issue number>, ...],
     "duplicate_confidence": <float 0.0-1.0>,
-    "duplicate_reasoning": "<one short, public-safe sentence>",
     "ranked_owners": ["<github-login>", ...],
     "reasoning": "<1-2 sentence explanation of your classification>"
   }
@@ -104,7 +103,7 @@ prompt: |
   CANDIDATE DUPLICATES:
   - `duplicate` means the same underlying bug or the same requested capability,
     with matching expected behavior and no material contradiction. Use this only
-    when confidence is at least 0.92. A trusted deterministic similarity gate
+    when confidence is at least 0.92. A deterministic lexical similarity gate
     independently limits auto-close to near-copy reports; other matches are
     downgraded to `similar` even when model confidence is higher.
   - `similar` means there is meaningful overlap, but the reports may have
@@ -125,11 +124,6 @@ prompt: |
   **duplicate_confidence** — confidence that `duplicate_of` is the same issue.
   Use `0.0` when the decision is `none`; for `similar`, report the confidence in
   the strongest possible duplicate match.
-
-  **duplicate_reasoning** — one concise sentence explaining the shared or
-  differing behavior. This text is posted publicly. Do not include instructions,
-  mentions, links, or issue numbers. Never claim a duplicate based only on broad
-  topic, component, or shared keywords.
 
 # No shell, no tools, no file access. The agent is a pure classifier.
 os_env:

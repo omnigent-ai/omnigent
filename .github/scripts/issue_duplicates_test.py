@@ -31,6 +31,12 @@ class IssueDuplicatesTest(unittest.TestCase):
 
         self.assertIn("go client", build_search_queries(issue))
 
+    def test_build_search_queries_handles_small_limits(self):
+        issue = {"title": "Runner inherits the host daemon cwd"}
+
+        self.assertEqual(build_search_queries(issue, limit=0), [])
+        self.assertEqual(build_search_queries(issue, limit=1), ["runner inherits"])
+
     def test_extract_issue_references_supports_shorthand_and_urls(self):
         issue = {
             "number": 4000,
@@ -38,11 +44,16 @@ class IssueDuplicatesTest(unittest.TestCase):
             "body": (
                 "See omnigent-ai/omnigent#2386 and "
                 "https://github.com/omnigent-ai/omnigent/issues/3085. "
+                "Ignore https://github.com/other/repo/issues/2999 and "
+                "other/repo#2888. "
                 "Ignore newer #4001 and repeated #3101."
             ),
         }
 
-        self.assertEqual(extract_issue_references(issue), [3101, 2386, 3085])
+        self.assertEqual(
+            extract_issue_references(issue, "omnigent-ai/omnigent"),
+            [3101, 2386, 3085],
+        )
 
     def test_rank_candidates_prioritizes_explicit_and_repeated_matches(self):
         issue = {
@@ -159,7 +170,7 @@ class IssueDuplicatesTest(unittest.TestCase):
         self.assertEqual(result["duplicate_decision"], "similar")
         self.assertEqual(result["similar_issues"], [12, 11, 10])
 
-    def test_public_comment_sanitizes_mentions_and_links(self):
+    def test_public_comment_uses_templated_reason(self):
         decision = validate_duplicate_decision(
             {
                 "duplicate_decision": "similar",
@@ -177,6 +188,7 @@ class IssueDuplicatesTest(unittest.TestCase):
         self.assertIn("#12", comment)
         self.assertNotIn("@admin", comment)
         self.assertNotIn("https://example.com", comment)
+        self.assertIn("automatic checks", comment)
         self.assertIn("leaving this issue open", comment)
 
     def test_injected_candidate_cannot_authorize_auto_close(self):
