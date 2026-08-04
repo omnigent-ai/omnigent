@@ -130,6 +130,103 @@ IS_LINUX = sys.platform.startswith("linux")
 #: True on macOS specifically (the seatbelt sandbox platform).
 IS_DARWIN = sys.platform == "darwin"
 
+#: Windows console code page for UTF-8 (``chcp 65001``).
+_WINDOWS_UTF8_CP = 65001
+
+
+def _stream_is_tty(stream: object) -> bool:
+    """Return whether *stream* is attached to an interactive terminal."""
+    try:
+        return bool(stream.isatty())  # type: ignore[attr-defined]
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _set_windows_console_output_utf8() -> None:
+    """Switch the attached Windows console output code page to UTF-8 temporarily."""
+    import atexit
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    previous_cp = int(kernel32.GetConsoleOutputCP())
+    if previous_cp <= 0 or previous_cp == _WINDOWS_UTF8_CP:
+        return
+    if kernel32.SetConsoleOutputCP(_WINDOWS_UTF8_CP):
+        atexit.register(_restore_windows_console_output_cp, previous_cp)
+
+
+def _restore_windows_console_output_cp(previous_cp: int) -> None:
+    """Restore *previous_cp* when Omnigent still owns the UTF-8 console setting."""
+    import ctypes
+
+    with suppress(Exception):
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        if int(kernel32.GetConsoleOutputCP()) == _WINDOWS_UTF8_CP:
+            kernel32.SetConsoleOutputCP(previous_cp)
+
+
+def configure_unicode_safe_stdio() -> bool:
+    """Make CLI stdout/stderr safe for Unicode on legacy Windows code pages.
+
+    Chinese/Japanese Windows consoles often default to GBK (``cp936``). Writing
+    emoji or ``✓``/``✗`` then raises :exc:`UnicodeEncodeError`, which can crash
+    ``omnigent setup`` / ``config list`` and tear down the host tunnel reconnect
+    loop. On native Windows this reconfigures terminal streams to UTF-8 and
+    redirected streams to replacement-safe output without changing their
+    encoding, and switches the console output code page when possible.
+
+    Idempotent and best-effort: failures are swallowed so a weird redirected
+    stream never blocks CLI startup. No-op on POSIX (including WSL).
+
+    :returns: ``True`` when running on native Windows (configuration attempted),
+        ``False`` otherwise.
+    """
+    if not IS_WINDOWS:
+        return False
+    has_console_stream = False
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        is_console = _stream_is_tty(stream)
+        has_console_stream = has_console_stream or is_console
+        with suppress(Exception):
+            if is_console:
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
+    if has_console_stream:
+        with suppress(Exception):
+            _set_windows_console_output_utf8()
+    return True
+
+
+def safe_console_print(
+    message: str,
+    *,
+    file: object | None = None,
+    flush: bool = True,
+) -> None:
+    """Print *message* without letting :exc:`UnicodeEncodeError` escape.
+
+    Long-lived loops (the host tunnel) must not reconnect-loop because a
+    success/failure banner used a glyph the active code page cannot encode.
+    Falls back to a replacement-encoded line when the primary write fails.
+
+    :param message: Text to print (may include emoji / box-drawing glyphs).
+    :param file: Stream to write to; defaults to :data:`sys.stdout`.
+    :param flush: Forwarded to :func:`print`.
+    """
+    stream = sys.stdout if file is None else file
+    try:
+        print(message, file=stream, flush=flush)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        fallback = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        with suppress(Exception):
+            print(fallback, file=stream, flush=flush)
+
+
 #: Non-sensitive Windows environment variables that a spawned omnigent
 #: subprocess needs to function, for env-passthrough allowlists that otherwise
 #: assume POSIX names. Python uppercases env keys on Windows, so these match

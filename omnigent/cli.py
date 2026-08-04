@@ -28,7 +28,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
+from omnigent._platform import IS_WINDOWS, configure_unicode_safe_stdio, resolve_repo_symlink
 from omnigent.cli_common import (
     RESUME_PICKER_SENTINEL as _RESUME_PICKER_SENTINEL,
 )
@@ -1723,6 +1723,11 @@ def main() -> None:
     so unhandled exceptions are captured even when the user didn't
     enable ``--log`` or ``--debug-events``.
     """
+    # Windows GBK consoles raise UnicodeEncodeError on emoji / ✓ / ✗ and can
+    # tear down setup/config/host. Do this before any user-facing print
+    # (crash handler, Rich, click). No-op on POSIX.
+    configure_unicode_safe_stdio()
+
     # Friendly crash handler: replaces Python's raw traceback with a
     # calm, branded crash screen + a one-tap path to file a GitHub issue
     # (browser opens the repo's pre-filled bug-report template with the
@@ -2817,6 +2822,9 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST or key.startswith(daemon_env_prefixes)
         }
+    # The daemon owns this binary log file. Keep raw stdout/stderr aligned with
+    # the UTF-8 logging handler instead of mixing locale-encoded print output.
+    env["PYTHONIOENCODING"] = "utf-8:replace"
     return env
 
 
@@ -10716,4 +10724,4 @@ _register_native_commands(cli)
 
 
 if __name__ == "__main__":
-    cli()
+    main()
