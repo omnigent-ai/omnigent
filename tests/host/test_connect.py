@@ -3322,6 +3322,88 @@ async def test_connected_host_retries_login_redirects_indefinitely(
     assert spy.call_count == 6
 
 
+@pytest.mark.parametrize("status", [401, 403])
+async def test_connected_host_retries_auth_rejection_indefinitely(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """401/403 after a successful connect never turns fatal.
+
+    A host that already completed an upgrade proved its credentials and
+    authorization are valid. A later 401/403 is almost always a dropped
+    VPN whose corporate proxy answers the upgrade before it reaches the
+    server — killing the host would drop its live runners and force a
+    manual ``omnigent host`` restart once the VPN reconnects. It must keep
+    retrying past the fresh-host fatal threshold instead.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    rejection = _invalid_status(status)
+    # Accepted upgrade first (None), then several rejections (more than the
+    # fresh-host login-redirect fatal threshold of 3 to prove there is no
+    # cap), then a cancel to end the test.
+    spy = _ConnectSpy([None, rejection, rejection, rejection, rejection, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: if the post-connect rejections were still treated as
+    # fatal this would raise HostConnectError on the first one (call_count 2).
+    await host.run()
+
+    # 6 = accepted connect + 4 retried rejections + the ending cancel.
+    assert spy.call_count == 6
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_connected_host_auth_rejection_prints_notice_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: int,
+) -> None:
+    """The first auth rejection of an outage warns on stderr, exactly once.
+
+    ``_logger.warning`` goes to the CLI log file, so a foreground
+    ``omnigent host`` would sit silent while it retried a dropped VPN. The
+    terminal notice must name the cause and mention VPN/network, and must
+    print only once per outage (not on every retry) so it doesn't spam
+    stderr while connectivity is down.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    rejection = _invalid_status(status)
+    spy = _ConnectSpy([None, rejection, rejection, rejection, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # The cause reached the terminal, naming the transient network hint.
+    assert f"HTTP {status}" in err
+    assert "VPN" in err
+    # Printed once for the whole outage, not once per retry — three
+    # consecutive rejections must yield a single notice line.
+    assert err.count(f"HTTP {status}") == 1
+
+
+async def test_fresh_host_still_fails_loud_on_auth_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-connected host still fails loud on 401/403.
+
+    The connected-host retry keys on a prior successful upgrade. A host
+    that has NEVER connected and is rejected with 401/403 is genuinely
+    unauthenticated / unauthorized — it must still raise HostConnectError
+    on the first attempt (→ exit 1 with the fix printed), not loop.
+    """
+    spy = _ConnectSpy([_invalid_status(403)])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError):
+        await host.run()
+
+    # Exactly one attempt → no silent retry for the fresh-host case.
+    assert spy.call_count == 1
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [
