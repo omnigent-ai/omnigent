@@ -272,7 +272,9 @@ uv run python deploy/databricks/deploy.py --no-otel ...
 > `--no-otel` auto-switches the default `--target prod` to `prod-no-otel`.
 > If you deploy to a custom `--target`, add the OTel-off variable overrides
 > (`app_command`, `app_env`, `otel_export_destinations`) to that target too
-> — see the `prod-no-otel` block in `databricks.yml` for the template.
+> — see the `prod-no-otel` block in `databricks.yml` for the template. The
+> deploy warns when `--no-otel` is paired with a target that lacks those
+> overrides, since OTel then stays on.
 
 ## Troubleshooting
 

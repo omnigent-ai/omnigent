@@ -34,6 +34,7 @@ import sys
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -50,7 +51,13 @@ _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
 # silently route us to the wrong workspace, or upload code under the
 # wrong account. The deploy must use --profile / DATABRICKS_HOST +
 # DATABRICKS_CLIENT_ID explicitly.
+#
+# DATABRICKS_HOST is only cleared when --profile names the workspace (see
+# _host_env_keep): both the SDK and `databricks auth env` honour an ambient
+# host, so a stale export would otherwise outrank the profile. Without
+# --profile it is a legitimate auth input and stays.
 _ENV_VARS_TO_CLEAR = (
+    "DATABRICKS_HOST",
     "DATABRICKS_TOKEN",
     "ANTHROPIC_API_KEY",
     "CODEX",
@@ -568,6 +575,30 @@ def _assert_clean_tree(skip: bool) -> None:
     _log(f"clean tree at origin/main {head[:12]}")
 
 
+# Variables a target must override for --no-otel to actually take effect;
+# `prod-no-otel` in databricks.yml is the reference implementation.
+_OTEL_OFF_VARS = ("app_command", "app_env", "otel_export_destinations")
+
+
+def _target_overrides_otel_vars(target: str) -> bool | None:
+    """Whether ``target`` overrides every OTel-off variable in databricks.yml.
+
+    Returns ``None`` when the bundle can't be inspected (no PyYAML, unreadable
+    or malformed file) so callers warn rather than assert either way.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        bundle = yaml.safe_load((Path(__file__).parent / "databricks.yml").read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    targets = (bundle or {}).get("targets") or {}
+    variables = (targets.get(target) or {}).get("variables") or {}
+    return all(name in variables for name in _OTEL_OFF_VARS)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -594,15 +625,6 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "UC Volume full name (catalog.schema.volume) for artifact storage, "
             "e.g. 'main.omnigent.artifacts'."
-        ),
-    )
-    parser.add_argument(
-        "--admins",
-        default="",
-        help=(
-            "Comma-separated identities to grant admin on login, e.g. "
-            "'alice@example.com'. Empty keeps the runtime admin-list file / "
-            "DB flag as the only admin sources."
         ),
     )
     parser.add_argument(
@@ -657,8 +679,9 @@ def _parse_args() -> argparse.Namespace:
             "(DATABRICKS_HOST + DATABRICKS_TOKEN) for the SDK and CLI instead "
             "of profile auth. Use when the SDK's forced token refresh fails "
             "in a spawned subprocess (macOS keychain write denied, "
-            "'cache update: exit status 161'). The token comes from the same "
-            "--profile, so it cannot route to a different workspace."
+            "'cache update: exit status 161'). Host and token are both read "
+            "from --profile after any ambient DATABRICKS_HOST/_TOKEN is "
+            "cleared, so it cannot route to a different workspace."
         ),
     )
     parser.add_argument(
@@ -713,11 +736,20 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     # --no-otel selects the tracer-off DAB target (same workspace + state as
     # `prod`, OTel variables overridden off). Only auto-switch the default
-    # target so an explicit --target still wins; if a caller pairs --no-otel
-    # with a custom --target, that target must define the OTel-off overrides
-    # itself.
-    if args.no_otel and args.target == "prod":
-        args.target = "prod-no-otel"
+    # target so an explicit --target still wins — but then the flag is a no-op
+    # unless that target defines the OTel-off overrides itself, so say so
+    # instead of silently deploying with OTel on.
+    if args.no_otel:
+        if args.target == "prod":
+            args.target = "prod-no-otel"
+        elif _target_overrides_otel_vars(args.target) is not True:
+            _log(
+                f"warning: --no-otel has no effect on --target {args.target!r}: it "
+                f"only swaps the default 'prod' target for 'prod-no-otel'. That "
+                f"target does not override {', '.join(_OTEL_OFF_VARS)}, so OTel "
+                "stays ON for this deploy — copy the overrides from the "
+                "prod-no-otel block in databricks.yml, or drop --target."
+            )
     return args
 
 
@@ -729,6 +761,16 @@ def _clear_env_vars(keep: Iterable[str] = ()) -> None:
         if name in os.environ:
             _log(f"unsetting {name} to avoid leaking into the SDK")
             del os.environ[name]
+
+
+def _host_env_keep(args: argparse.Namespace) -> set[str]:
+    """Env vars _clear_env_vars must preserve for this invocation.
+
+    With --profile the profile is authoritative, so an ambient
+    DATABRICKS_HOST is cleared. Without one, DATABRICKS_HOST (+
+    DATABRICKS_CLIENT_ID/_SECRET) *is* the auth input and must survive.
+    """
+    return set() if args.profile else {"DATABRICKS_HOST"}
 
 
 # A deploy (build → wheel upload → bundle deploy → run → smoke check) can run
@@ -747,13 +789,21 @@ def _setup_profile_token_auth(profile: str) -> None:
     a spawned subprocess ("cache update: exit status 161"). Reading the
     *cached* token (no ``--force-refresh``) succeeds, and exporting it as
     ``DATABRICKS_TOKEN`` makes both the SDK and the CLI use bearer auth,
-    skipping the refresh entirely. The token is scoped to ``profile``, so
-    it cannot authenticate against a different workspace.
+    skipping the refresh entirely.
+
+    Both the host and the token are read from ``profile``, so this cannot
+    authenticate against a different workspace — but only because any ambient
+    ``DATABRICKS_HOST``/``DATABRICKS_TOKEN`` is dropped *first*: ``databricks
+    auth env`` echoes an ambient host back instead of the profile's, which
+    would pin the wrong workspace for every later CLI/SDK call.
 
     The captured token is NOT refreshed for the rest of the deploy, so this
     fails fast when its remaining runway (``_MIN_TOKEN_RUNWAY_S``) can't cover
     a full deploy — re-run ``databricks auth login --profile <p>`` first.
     """
+    for name in ("DATABRICKS_HOST", "DATABRICKS_TOKEN"):
+        if os.environ.pop(name, None) is not None:
+            _log(f"--profile-token-auth: unsetting ambient {name}; {profile} decides")
     token_data = json.loads(
         subprocess.run(
             ["databricks", "auth", "token", "--profile", profile],
@@ -788,9 +838,13 @@ def _assert_token_runway(expiry: str | None, profile: str) -> None:
     if not expiry:
         _log("--profile-token-auth: token has no expiry field; skipping runway check")
         return
-    from datetime import datetime, timezone
-
-    remaining = (datetime.fromisoformat(expiry) - datetime.now(timezone.utc)).total_seconds()
+    expires_at = datetime.fromisoformat(expiry)
+    if expires_at.tzinfo is None:
+        # The CLI emits an RFC3339 offset, but a naive timestamp would make the
+        # subtraction below raise TypeError instead of a usable error; the CLI
+        # mints these in UTC, so assume UTC.
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
     if remaining < _MIN_TOKEN_RUNWAY_S:
         raise SystemExit(
             f"cached token for {profile!r} has {int(remaining)}s left "
@@ -914,13 +968,6 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
-        # The Apps spec validator rejects an env entry whose `value:` is the
-        # empty string ("Must specify environment variable source"). When no
-        # admins are set, pass a single space so the entry is a valid non-empty
-        # value; the app parses OMNIGENT_ADMINS on `,` and strips each token,
-        # so a whitespace-only value yields an empty admin roster all the same.
-        "--var",
-        f"admins={args.admins or ' '}",
     ]
 
 
@@ -953,14 +1000,12 @@ def _ensure_app_sp_uc_traversal(
     catalog, schema_only, _ = parts
     schema_fqn = f"{catalog}.{schema_only}"
 
-    import json as _json
-
     for kind, fqn, priv in (
         ("catalog", catalog, "USE_CATALOG"),
         ("schema", schema_fqn, "USE_SCHEMA"),
     ):
         _log(f"granting {priv} on {kind} {fqn} → app SP {app_sp}")
-        payload = _json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
+        payload = json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
         try:
             subprocess.run(
                 [
@@ -986,20 +1031,20 @@ def _ensure_app_sp_uc_traversal(
 
 def main() -> int:
     args = _parse_args()
+    # Clear ambient auth vars *before* any Databricks call so a stale
+    # DATABRICKS_HOST can't pin the wrong workspace — including inside
+    # _setup_profile_token_auth, which shells out to `databricks auth`.
+    _clear_env_vars(keep=_host_env_keep(args))
     if args.profile_token_auth:
         if not args.profile:
             raise SystemExit("--profile-token-auth requires --profile")
+        # Re-populates DATABRICKS_HOST + DATABRICKS_TOKEN from the profile.
+        # Both stay set for the rest of the deploy on purpose: feeding them to
+        # the SDK *and* the `databricks` CLI subprocesses is the whole point of
+        # this mode. That does hand a live workspace token to every child
+        # (build.sh, uv, git) — the accepted cost of dodging the keychain
+        # refresh; don't "fix" it by re-clearing the token.
         _setup_profile_token_auth(args.profile)
-        # Deliberately keep DATABRICKS_TOKEN: this mode's whole point is to feed
-        # the cached bearer token to the SDK *and* the `databricks` CLI
-        # subprocesses via the env. That does hand a live workspace token to
-        # every child (build.sh, uv, git) — the accepted cost of dodging the
-        # keychain refresh; don't "fix" it by re-clearing the token. The
-        # matching DATABRICKS_HOST _setup wrote is also a legit auth var (see
-        # the env-based auth path), so it's fine to leave set.
-        _clear_env_vars(keep={"DATABRICKS_TOKEN"})
-    else:
-        _clear_env_vars()
     _assert_clean_tree(skip=args.allow_dirty)
 
     base_version = _read_base_version()

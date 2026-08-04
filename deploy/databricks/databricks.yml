@@ -21,12 +21,6 @@ variables:
       UC schema (catalog.schema) holding the OTel destination tables.
       The platform writes to <schema>.otel_logs, otel_metrics, otel_spans.
     default: main.omnigent_logs
-  admins:
-    description: >
-      Comma-separated identities to grant admin (users.is_admin) on login,
-      e.g. "alice@example.com,bob@example.com". Empty = no declarative
-      admins; promote via the runtime admin-list file or the DB instead.
-    default: ""
   # OTel plumbing is gated on these three complex variables so a workspace
   # without an OTel collector / UC OTel tables can deploy cleanly. deploy.py
   # sets the OTel-off values when run with --no-otel; the defaults keep the
@@ -50,8 +44,6 @@ variables:
         value_from: postgres
       - name: AP_ARTIFACT_VOLUME_PATH
         value_from: artifact_volume
-      - name: OMNIGENT_ADMINS
-        value: ${var.admins}
       - name: OTEL_TRACES_SAMPLER
         value: 'always_on'
   otel_export_destinations:
@@ -142,7 +134,5 @@ targets:
             value_from: postgres
           - name: AP_ARTIFACT_VOLUME_PATH
             value_from: artifact_volume
-          - name: OMNIGENT_ADMINS
-            value: ${var.admins}
       otel_export_destinations:
         default: []
