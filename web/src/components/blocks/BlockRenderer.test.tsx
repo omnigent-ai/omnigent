@@ -539,6 +539,58 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
     });
 
+    it("never folds the last assistant bubble while the session is running", async () => {
+      // A mid-turn (re)connect can miss the edge that names the turn, so
+      // the LIVE turn's lifecycle reads "completed" — folding it made the
+      // trace collapse and reopen as its tail alternated between text and
+      // tools (the codex flicker). While the session runs, the last
+      // bubble stays expanded; the terminal status edge folds it.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Found it.", final: true },
+      ];
+      const view = (status: "running" | "idle") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus={status}
+            turnLifecycle="completed"
+            isLastAssistant
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender } = render(view("running"));
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Checking the CLI.")).toBeDefined();
+
+      // The session's terminal edge lands → the fold forms.
+      rerender(view("idle"));
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      await waitFor(() => expect(screen.queryByText("Checking the CLI.")).toBeNull());
+    });
+
+    it("folds an earlier (non-last) settled bubble even while the session runs", () => {
+      // Only the LAST bubble can be the live turn; prior turns fold as
+      // usual while a later turn streams.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Old narration.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Old answer.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus="running"
+            turnLifecycle="completed"
+            isLastAssistant={false}
+          />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+    });
+
     it("folds a turn whose reasoning burst lands after the answer", () => {
       // Codex opens a reasoning section as the turn ends, so the item
       // arrives AFTER the final message. Reasoning is process, never the

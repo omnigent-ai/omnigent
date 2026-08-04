@@ -1541,6 +1541,13 @@ function MainAgentSurface({
     () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
     [bubbles, pendingElicitations.length],
   );
+  // While the session runs, the last assistant bubble is (or may be) the
+  // live turn even if its lifecycle reads settled — BlockRenderer keeps
+  // its "Worked for" fold suppressed until a terminal status edge lands.
+  const lastAssistantIndex = useMemo(
+    () => streamBubbles.findLastIndex((b) => b.kind === "assistant"),
+    [streamBubbles],
+  );
 
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
   // own unmodified ArrowUp/Down history-recall still works.
@@ -1750,8 +1757,13 @@ function MainAgentSurface({
               <>
                 {/* Older pages prepend here while their request is in flight. */}
                 {loadingMoreHistory && <HistoryLoadingIndicator />}
-                {streamBubbles.map((bubble) => (
-                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
+                {streamBubbles.map((bubble, bubbleIndex) => (
+                  <BubbleView
+                    key={bubbleKey(bubble)}
+                    bubble={bubble}
+                    canApprove={canApprove}
+                    isLastAssistant={bubbleIndex === lastAssistantIndex}
+                  />
                 ))}
                 {/* Pending elicitation cards, floated to the bottom of the
                     chat so an outstanding question stays in view (stick-to-
@@ -3180,7 +3192,15 @@ function CompactionLoadingIndicator() {
 // markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
 // the user-bubble markdown render tests.
 export const BubbleView = memo(
-  function BubbleView({ bubble, canApprove = true }: { bubble: Bubble; canApprove?: boolean }) {
+  function BubbleView({
+    bubble,
+    canApprove = true,
+    isLastAssistant = false,
+  }: {
+    bubble: Bubble;
+    canApprove?: boolean;
+    isLastAssistant?: boolean;
+  }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator />;
@@ -3196,9 +3216,14 @@ export const BubbleView = memo(
         />
       );
     }
-    return <AssistantBubble bubble={bubble} canApprove={canApprove} />;
+    return (
+      <AssistantBubble bubble={bubble} canApprove={canApprove} isLastAssistant={isLastAssistant} />
+    );
   },
-  (prev, next) => prev.canApprove === next.canApprove && bubblesEqual(prev.bubble, next.bubble),
+  (prev, next) =>
+    prev.canApprove === next.canApprove &&
+    (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
+    bubblesEqual(prev.bubble, next.bubble),
 );
 
 /**
@@ -3417,9 +3442,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
 function AssistantBubble({
   bubble,
   canApprove,
+  isLastAssistant = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   canApprove: boolean;
+  isLastAssistant?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one
   // assistant-side block exists, so `items` is non-empty here in the
@@ -3458,6 +3485,7 @@ function AssistantBubble({
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
             continued={bubble.continued}
+            isLastAssistant={isLastAssistant}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (

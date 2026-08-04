@@ -324,6 +324,17 @@ interface BlockRendererProps {
    * no trailing answer of its own.
    */
   continued?: boolean;
+  /**
+   * This bubble is the LAST assistant bubble in the transcript. While
+   * the session is running, the last bubble never folds even when its
+   * lifecycle reads settled: on a mid-turn (re)connect the client can
+   * miss the edge that names the turn, misreading the live turn as
+   * "completed" — folding it then made the trace collapse and reopen
+   * as its tail alternated between text and tools (the codex flicker).
+   * The fold forms when the session's own terminal status edge lands,
+   * which is the natural moment anyway.
+   */
+  isLastAssistant?: boolean;
 }
 
 type ToolRunFragment =
@@ -344,6 +355,7 @@ export function BlockRenderer({
   turnLifecycle,
   workedForS,
   continued = false,
+  isLastAssistant = false,
 }: BlockRendererProps) {
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
   const isTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
@@ -362,6 +374,11 @@ export function BlockRenderer({
   // "Worked" row with nothing behind it.
   const showFold =
     !isTurnLive &&
+    // The last assistant bubble in a RUNNING session is (or may be) the
+    // live turn even when its lifecycle reads settled — a mid-turn
+    // (re)connect can miss the edge that names the turn. Never fold it
+    // while the session runs; the terminal status edge folds it.
+    !(isLastAssistant && sessionStatus === "running") &&
     !isProvisionalTrace(items) &&
     process.length > 0 &&
     (final.length > 0 || (continued && process.some(isToolItem)));

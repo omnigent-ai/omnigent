@@ -1658,6 +1658,7 @@ describe("buildBubbles — continued turns (sub-agent await)", () => {
       type: "tool_group",
       ctx: ctx({ itemId: `${rid}_g`, responseId: rid }),
       executions: [mkExec("Agent", `${rid}_c1`), mkExec("Agent", `${rid}_c2`)],
+      iteration: 0,
     },
   ];
   const answer = (rid: string): AnyBlock => ({
@@ -1758,5 +1759,74 @@ describe("buildBubbles — continued turns (sub-agent await)", () => {
     const before = buildBubbles(narrationThenTools("resp_1"), null);
     const after = buildBubbles([...narrationThenTools("resp_1"), answer("resp_2")], null);
     expect(bubblesEqual(before[0]!, after[0]!)).toBe(false);
+  });
+});
+
+describe("buildBubbles — anonymous blocks join the surrounding turn", () => {
+  const textDone = (itemId: string | null, rid: string, text: string): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, responseId: rid }),
+    fullText: text,
+    hasCodeBlocks: false,
+  });
+  const reasoning = (rid: string): AnyBlock => ({
+    type: "reasoning_chunk",
+    ctx: ctx({ itemId: null, responseId: rid }),
+    text: "thinking",
+  });
+  const assistants = (bubbles: Bubble[]) =>
+    bubbles.filter((b): b is Extract<Bubble, { kind: "assistant" }> => b.kind === "assistant");
+
+  it("keeps a turn whole across id-less reasoning and live previews", () => {
+    // Native harnesses emit reasoning before the edge that names the turn
+    // (rid "") and stream text as `live:` previews. Splitting on those
+    // rendered one turn as several fragment bubbles live but one bubble on
+    // reload — the codex fold flicker.
+    const bubbles = buildBubbles(
+      [
+        textDone("m1", "codex_t1", "Checking the CLI."),
+        reasoning(""),
+        textDone("m2", "codex_t1", "Found the subcommand."),
+        textDone("live:m3", "live:m3", "Starting it now…"),
+        textDone("m4", "codex_t1", "Started."),
+      ],
+      null,
+    );
+    expect(assistants(bubbles)).toHaveLength(1);
+    expect(assistants(bubbles)[0]!.responseId).toBe("codex_t1");
+    expect(assistants(bubbles)[0]!.items.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("adopts the first real id when the group opens on anonymous blocks", () => {
+    // Codex opens reasoning ~2s before the turn is named, so the group can
+    // START anonymous; it must become the turn's bubble, not its own.
+    const bubbles = buildBubbles(
+      [
+        reasoning(""),
+        textDone("live:m1", "live:m1", "Working on it…"),
+        textDone("m2", "codex_t1", "Done."),
+      ],
+      null,
+    );
+    expect(assistants(bubbles)).toHaveLength(1);
+    expect(assistants(bubbles)[0]!.responseId).toBe("codex_t1");
+  });
+
+  it("still splits on a genuinely different real response id", () => {
+    const bubbles = buildBubbles(
+      [textDone("m1", "resp_a", "turn A"), textDone("m2", "resp_b", "turn B")],
+      null,
+    );
+    expect(assistants(bubbles)).toHaveLength(2);
+  });
+
+  it("does not key the bubble off a transient live: preview id", () => {
+    // The authoritative item replaces the preview in place; keying off the
+    // preview id would remount the bubble at the swap.
+    const bubbles = buildBubbles(
+      [textDone("live:m1", "live:m1", "streaming…"), textDone("m2", "codex_t1", "Done.")],
+      null,
+    );
+    expect(assistants(bubbles)[0]!.stableId).toBe("m2");
   });
 });

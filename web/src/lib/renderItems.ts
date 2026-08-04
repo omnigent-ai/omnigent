@@ -19,6 +19,7 @@
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
 import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import { LIVE_ITEM_PREFIX } from "./blocks";
 import { isSystemUserContent } from "./systemMessage";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
@@ -338,6 +339,15 @@ function markContinuedTurns(bubbles: Bubble[], activeResponse: ActiveResponse | 
   return out ?? bubbles;
 }
 
+/**
+ * Whether a block's response id doesn't identify a real turn: `""`
+ * (emitted before the turn was named) or a `live:` preview id. Such
+ * blocks belong to the turn around them, never to a turn of their own.
+ */
+function isAnonymousRid(rid: string): boolean {
+  return rid === "" || rid.startsWith(LIVE_ITEM_PREFIX);
+}
+
 /** Whether a later assistant bubble continues the turn started at `from`. */
 function hasAssistantContinuation(bubbles: Bubble[], from: number): boolean {
   for (let i = from + 1; i < bubbles.length; i += 1) {
@@ -530,10 +540,17 @@ function walkBubbles(
 
     // Open an assistant bubble. Collect all subsequent blocks that
     // share this `responseId` and are not themselves user/compaction
-    // boundaries. Out-of-band blocks with a different responseId
-    // (shouldn't happen in well-formed streams, but be defensive)
-    // close the bubble.
-    const groupResponseId = b.ctx.responseId;
+    // boundaries. Out-of-band blocks with a different REAL responseId
+    // close the bubble; ANONYMOUS blocks never do. A live-streamed
+    // block often doesn't know its turn yet — native harnesses emit
+    // reasoning before the edge that names the turn (rid ""), and text
+    // previews carry a synthetic `live:` id until their authoritative
+    // item replaces them — and splitting on those rendered one turn as
+    // several fragment bubbles live that merged into one on reload
+    // (the codex fold flicker). Anonymous blocks belong to whatever
+    // turn surrounds them, and a group that OPENED on one adopts the
+    // first real rid that arrives.
+    let groupResponseId = b.ctx.responseId;
     const groupStart = i;
     while (i < blocks.length) {
       const cur = blocks[i]!;
@@ -556,7 +573,11 @@ function walkBubbles(
       // A bare tool_result never renders standalone (it folds into its
       // call's card by callId) — don't let a backdated one split the
       // open bubble.
-      if (cur.ctx.responseId !== groupResponseId && cur.type !== "tool_result") break;
+      const curRid = cur.ctx.responseId;
+      if (cur.type !== "tool_result" && !isAnonymousRid(curRid) && curRid !== groupResponseId) {
+        if (!isAnonymousRid(groupResponseId)) break;
+        groupResponseId = curRid;
+      }
       i += 1;
     }
     const groupBlocks = blocks.slice(groupStart, i).filter(isAssistantSideBlock);
@@ -576,9 +597,16 @@ function walkBubbles(
     const subIndex = subIndexByResp.get(groupResponseId) ?? 0;
     subIndexByResp.set(groupResponseId, subIndex + 1);
     // Absorbed tool_results don't key the bubble: a backdated one would flip stableId mid-stream.
+    // Skip `live:` preview ids for keying — the authoritative item
+    // replaces the preview in place, and keying off the transient id
+    // would remount the whole bubble at that swap.
     const firstItemId =
-      groupBlocks.find((bk) => bk.type !== "tool_result" && bk.ctx.itemId !== null)?.ctx.itemId ??
-      null;
+      groupBlocks.find(
+        (bk) =>
+          bk.type !== "tool_result" &&
+          bk.ctx.itemId !== null &&
+          !bk.ctx.itemId.startsWith(LIVE_ITEM_PREFIX),
+      )?.ctx.itemId ?? null;
     const stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
 
     lastBubbleStart = groupStart;
