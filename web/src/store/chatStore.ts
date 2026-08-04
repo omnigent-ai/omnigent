@@ -53,6 +53,7 @@ import type {
   ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
+import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
@@ -3270,10 +3271,6 @@ export type StreamEndReason = "aborted" | "switched" | "server_closed" | "droppe
  *     clear `abortController`; the loop owns lifecycle so a transient
  *     drop doesn't flash a failure or trigger a redundant rebind.
  */
-// Item-id prefix marking a provisional, in-flight assistant-text block —
-// a live-streaming preview that lives in `blocks` until its authoritative
-// `text_done` replaces it. Never a real server item id.
-const LIVE_ITEM_PREFIX = "live:";
 
 /** Whether a block is a provisional live-streaming text preview. */
 function isLiveProvisionalBlock(b: AnyBlock): boolean {

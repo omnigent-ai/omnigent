@@ -32,6 +32,7 @@ import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import type { RenderItem } from "@/lib/renderItems";
@@ -361,6 +362,7 @@ export function BlockRenderer({
   // "Worked" row with nothing behind it.
   const showFold =
     !isTurnLive &&
+    !isProvisionalTrace(items) &&
     process.length > 0 &&
     (final.length > 0 || (continued && process.some(isToolItem)));
 
@@ -528,6 +530,23 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
 
 function isPendingElicitation(item: RenderItem): boolean {
   return item.kind === "elicitation" && item.status === "pending";
+}
+
+/**
+ * Whether a bubble is made ONLY of streaming artifacts: reasoning
+ * chunks (no item id until their item is finalized) and `live:` text
+ * previews (replaced in place when the authoritative item lands). Such
+ * a bubble is a fragment of the turn still arriving, not a finished
+ * turn — but its synthetic response id never matches `activeResponse`,
+ * so the walker labels it "completed" and it would otherwise fold.
+ *
+ * That is what made the fold flicker on codex: a reasoning burst plus a
+ * narration preview folded mid-turn, then the fold vanished when the
+ * preview merged into the real bubble. A genuine turn always carries at
+ * least one server-assigned item id.
+ */
+function isProvisionalTrace(items: RenderItem[]): boolean {
+  return items.every((item) => item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX));
 }
 
 /**

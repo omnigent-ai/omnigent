@@ -539,6 +539,26 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
     });
 
+    it("never folds a bubble made only of streaming artifacts", () => {
+      // Codex splits an in-flight turn into fragments: a reasoning burst
+      // (no item id yet) plus a `live:` narration preview. Their
+      // synthetic response id never matches activeResponse, so the
+      // walker labels them "completed" and this one folded mid-turn —
+      // then the fold vanished when the authoritative item replaced the
+      // preview. That flicker is what oscillated on screen.
+      const items: RenderItem[] = [
+        { kind: "reasoning", itemId: null, text: "Planning server startup", duration: 1 },
+        { kind: "text", itemId: "live:msg_1", text: "I'll check the CLI shape.", final: false },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="running" turnLifecycle="completed" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("I'll check the CLI shape.")).toBeDefined();
+    });
+
     it("leaves a continued fragment that ran nothing expanded", () => {
       // Streaming splits a turn into fragments (a reasoning burst, a
       // narration preview) that are `continued` by the rest of the turn.

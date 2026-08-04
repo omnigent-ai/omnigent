@@ -493,3 +493,10 @@ export type AnyBlock =
   | ElicitationBlock
   | PolicyDeniedBlock
   | ResponseEndBlock;
+
+/**
+ * Item-id prefix marking a provisional, in-flight assistant-text block —
+ * a live-streaming preview that lives in `blocks` until its authoritative
+ * `text_done` replaces it. Never a real server item id.
+ */
+export const LIVE_ITEM_PREFIX = "live:";
