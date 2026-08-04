@@ -56,17 +56,21 @@ def _launch_env(bug_url: str) -> dict[str, str]:
     not in its allowlist, and the ``DATABRICKS_`` prefix survives only the
     CLI→daemon hop — so we also name the key in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
     (itself allowlisted), which tells the runner env-build to forward it the rest
-    of the way. Only kicks in for Linear URLs; if the key is unset we warn rather
-    than fail (the agent stops with ``needs_more_info`` and names the missing key).
+    of the way. Maintainers usually export the plain ``LINEAR_API_KEY`` locally,
+    so mirror that into the ``DATABRICKS_`` name when only the plain one is set.
+    Only kicks in for Linear URLs; if neither is set we warn rather than fail (the
+    agent stops with ``needs_more_info`` and names the missing key).
     """
     env = os.environ.copy()
     if "linear.app" not in bug_url:
         return env
+    if not env.get("DATABRICKS_LINEAR_API_KEY") and env.get("LINEAR_API_KEY"):
+        env["DATABRICKS_LINEAR_API_KEY"] = env["LINEAR_API_KEY"]
     if not env.get("DATABRICKS_LINEAR_API_KEY"):
         print(
-            "warning: Linear URL but DATABRICKS_LINEAR_API_KEY is not set — the "
-            "agent won't be able to read the ticket (it will stop with "
-            "needs_more_info).",
+            "warning: Linear URL but neither LINEAR_API_KEY nor "
+            "DATABRICKS_LINEAR_API_KEY is set — the agent won't be able to read "
+            "the ticket (it will stop with needs_more_info).",
             file=sys.stderr,
         )
         return env
