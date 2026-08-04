@@ -405,6 +405,41 @@ Every process-truth row is ⬜ until **R10** runs.
 | Hostless degrade when the server has not seen this host              | R10 before the host daemon registers | `known_host_id` returns `None`, the create omits `host_id`/`workspace`, and routing still runs over whatever it can resolve                                       | ✅ evidence (unit) / ⬜ live      | 2026-08-01 / cd9fdccb  |
 | `--smart-routing --harness kiro-native` (prompt-capable, outside the routed pair) | R10 with `--harness kiro-native` | preflight passes (no `gateway_inference` entry ⇒ unknown), the server's create-time gate declines, launch proceeds behind the "did not pick a model" notice        | ⬜ known gap — `CUJ_IMPLEMENTATION.md` §6.6d, §7 | —      |
 
+### 2.11 Bundle-agent Smart Routing (debby / polly)
+
+Bundle agents run a `claude-sdk` **brain** that orchestrates sub-agents
+(`examples/debby/config.yaml`, `examples/polly/config.yaml`). They reach Smart
+Routing only through the **brain-harness override** in the gear config
+(`NewChatDialog.tsx` — `brainDefault` / `AUTO_HARNESS_ID`), a different code
+path from the native-harness Model row (`smartRoutingEligible` gates on
+claude-native/codex-native). New surface per Bryan, 2026-08-03; had zero test
+coverage before this section.
+
+| Check                                                                    | How to run                                                              | Ground-truth signal                                                                                                  | Status                                     | Last verified |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ------------- |
+| Smart Routing selectable on a bundle agent's gear config                 | R0, pick debby (or polly) in the new-chat dialog, open the gear          | The config modal offers Smart Routing via the brain-harness override; title/labels read correctly                     | ⬜ needs user eyeball                       | —             |
+| Config menu renders right with Smart Routing ON                          | Same, toggle Smart Routing on                                            | Model control shows "Smart Routing", Effort greys out, the harness/brain picker still offers the routable choices     | ⬜ vitest coverage in flight + user eyeball | —             |
+| The routed model/harness actually apply on a bundle session's first turn | Create the debby/polly session with routing on, send a prompt (composer) | R1 decision row for the session; the brain (and any spawned children) land the routed arm; `session_overrides` carries the override + `cost_control_mode_override` | ⬜                                          | —             |
+
+### 2.12 Codex GLM subagents
+
+ucode PR 251 explicitly skips GLM for codex subagents
+(`GLM_SUBAGENT_SKIP_MESSAGE`). We aim to support it. Three known blockers
+(2026-08-03): glm absent from the static codex spawn candidates
+(`infer_models` — fixing this also fixes the §2.1 create-path C1 arrow);
+unnamed spawns route on the placeholder → always the floor arm (glm reachable
+via named spawns and `sys_session_create` children — the latter already
+verified in §2.5); and the effort wall — glm rejects `xhigh`, so a spawned
+subagent inheriting the session default 400s (the root-turn clamps in
+`reasoning_effort.py` do not cover the spawn path). Implementation in flight.
+
+| Check                                                       | How to run                                                                       | Ground-truth signal                                                                                              | Status                    | Last verified |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------- | ------------- |
+| glm offered in codex spawn candidates                        | unit: `candidate_models("codex-native", …)` with no live catalog                  | `system.ai.glm-5-2` in the candidate set (servable-alias spelling)                                                  | ⬜ fix in flight            | —             |
+| A glm-routed spawn resolves in-family, exact                 | unit: `resolve_subagent_route` with a delegate-class task + glm in candidates     | `action="rewrite"`, `model="system.ai.glm-5-2"`, no false raw_model arrow                                           | ⬜                          | —             |
+| A live glm subagent RUNS (the effort wall)                   | R0 codex Smart Routing session, named spawn whose task routes delegate→glm        | The spawned turn completes — no `reasoning.effort` 400; rollout/audit shows the glm spelling                        | ⬜ the crux                 | —             |
+| `sys_session_create` child on glm still works (regression)   | §2.5 recipe: codex parent, child prompt whose route is glm                        | `child_session` decision row with a glm arm; child's `config.toml` clamped to a glm-safe effort (launch-pin clamp)  | ✅ evidence (§2.5, pre-fix) | 2026-07-31    |
+
 ---
 
 ## 3. Pre-manual-test round — status (2026-07-31 / `c0b08f68`)
