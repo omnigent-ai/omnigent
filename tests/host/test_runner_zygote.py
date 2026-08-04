@@ -9,6 +9,7 @@ daemon's Popen fallback are all covered.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -249,3 +250,124 @@ def test_unstarted_manager_reports_not_running() -> None:
     mgr = ZygoteManager()
     assert not mgr.is_running()
     assert mgr.pid is None
+
+
+# ── Harness-fork path (fork_harness) ──────────────────────────────
+#
+# The zygote also forks HARNESS children on request, sharing the harness import
+# graph copy-on-write. In production the request arrives on a per-runner control
+# socket (minted by a runner fork); the zygote handles ``fork_harness`` on any
+# socket, so these tests drive it over the manager's daemon socket directly.
+
+
+def _control_exchange(manager: ZygoteManager, request: dict) -> dict:
+    """Send one request on the manager's control socket and read one reply.
+
+    :param manager: A started manager (its ``_sock`` is the daemon control end).
+    :param request: The protocol request.
+    :returns: The decoded reply.
+    """
+    sock = manager._sock
+    assert sock is not None
+    sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
+    buf = bytearray()
+    while b"\n" not in buf:
+        chunk = sock.recv(65536)
+        assert chunk, "zygote closed the control socket"
+        buf.extend(chunk)
+    return json.loads(bytes(buf).partition(b"\n")[0])
+
+
+def _wait_harness_exit(manager: ZygoteManager, pid: int, timeout: float = 10.0) -> int:
+    """Poll the zygote for a forked harness's exit code.
+
+    :param manager: The started manager.
+    :param pid: The forked harness pid.
+    :param timeout: Max seconds to wait.
+    :returns: The observed exit code.
+    :raises AssertionError: If it does not exit in time.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        reply = _control_exchange(manager, {"cmd": "poll", "pid": pid})
+        if reply.get("returncode") is not None:
+            return reply["returncode"]
+        time.sleep(0.05)
+    raise AssertionError("forked harness did not exit in time")
+
+
+def test_fork_harness_reports_pid_and_reaps(manager: ZygoteManager, tmp_path) -> None:
+    """fork_harness forks a child, returns its pid, and the zygote reaps it.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "harness.log"),
+    }
+    reply = _control_exchange(
+        manager,
+        {"cmd": "fork_harness", "argv": ["--harness", "x", "--conversation-id", "c"], "env": env},
+    )
+    assert isinstance(reply.get("pid"), int)
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+
+
+def test_fork_harness_nonzero_exit_is_reported(manager: ZygoteManager, tmp_path) -> None:
+    """A non-zero harness child exit surfaces through poll().
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "9",
+        "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "harness.log"),
+    }
+    reply = _control_exchange(
+        manager,
+        {"cmd": "fork_harness", "argv": ["--harness", "x", "--conversation-id", "c"], "env": env},
+    )
+    assert _wait_harness_exit(manager, reply["pid"]) == 9
+
+
+def test_fork_harness_argv_round_trips_to_child(manager: ZygoteManager, tmp_path) -> None:
+    """The harness child runs with the argv the request carried.
+
+    The test-seam harness child echoes its argv to its log, proving the payload
+    reached ``_runner.main(argv)`` intact.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    log = tmp_path / "harness.log"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(log),
+    }
+    argv = ["--harness", "claude-native", "--conversation-id", "conv-42"]
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": argv, "env": env})
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+    assert f"harness_argv={' '.join(argv)}" in log.read_text()
+
+
+def test_zygote_still_serves_daemon_after_harness_fork(manager: ZygoteManager, tmp_path) -> None:
+    """A ping still round-trips after a harness fork — the multiplexer survives.
+
+    Guards the selectors loop: forking a harness must not disturb the daemon
+    socket registration.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "harness.log"),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
+    assert _wait_harness_exit(manager, reply["pid"]) == 0
+    assert _control_exchange(manager, {"cmd": "ping"}).get("pong") is True
