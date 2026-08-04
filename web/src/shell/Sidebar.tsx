@@ -182,7 +182,7 @@ const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover
 // Active highlight also wins on hover so active items don't lose their
 // background and flash when the mouse enters them.
 const SIDEBAR_ACTIVE_HIGHLIGHT =
-  "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
+  "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 // Maps a first-class project id → its name, provided once at the list level so
@@ -883,14 +883,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   <TabsTrigger
                     value="mine"
                     data-testid="sidebar-tab-mine"
-                    className="sidebar-compact-text min-w-0 font-normal hover:bg-muted hover:text-foreground data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none dark:hover:bg-muted/50"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-muted hover:text-foreground data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none dark:hover:bg-muted/50 dark:data-active:hover:bg-[var(--sidebar-active)] dark:data-active:hover:text-[var(--sidebar-active-foreground)]"
                   >
                     <span className="min-w-0 truncate">My sessions</span>
                   </TabsTrigger>
                   <TabsTrigger
                     value="shared"
                     data-testid="sidebar-tab-shared"
-                    className="sidebar-compact-text min-w-0 font-normal hover:bg-muted hover:text-foreground data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none dark:hover:bg-muted/50"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-muted hover:text-foreground data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none dark:hover:bg-muted/50 dark:data-active:hover:bg-[var(--sidebar-active)] dark:data-active:hover:text-[var(--sidebar-active-foreground)]"
                   >
                     <span className="min-w-0 truncate">Shared with me</span>
                   </TabsTrigger>

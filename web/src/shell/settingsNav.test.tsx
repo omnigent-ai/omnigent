@@ -153,6 +153,8 @@ describe("SettingsSidebarBody", () => {
       "font-normal",
       "bg-[var(--sidebar-active)]",
       "text-[var(--sidebar-active-foreground)]",
+      "dark:hover:bg-[var(--sidebar-active)]",
+      "dark:hover:text-[var(--sidebar-active-foreground)]",
     );
     expect(selected).not.toHaveClass("bg-muted", "font-semibold");
     expect(unselected).toHaveClass("sidebar-row", "font-normal");

@@ -262,7 +262,7 @@ export function SettingsSidebarBody({
                     SIDEBAR_ROW,
                     "w-full justify-start border-0 font-normal",
                     selected &&
-                      "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]",
+                      "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
                     item.hideOnMobile && "max-md:hidden",
                   )}
                 >

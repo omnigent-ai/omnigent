@@ -449,8 +449,10 @@ describe("Sidebar session list", () => {
     // Active/selected state uses the SAME shared active-highlight as the sibling
     // nav rows (New session / Inbox) — the `--sidebar-active` pill, not an
     // ad-hoc bg-muted.
-    expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
+    expect(screen.getByTestId("scheduled-tasks-nav")).toHaveClass(
       "bg-[var(--sidebar-active)]",
+      "dark:hover:bg-[var(--sidebar-active)]",
+      "dark:hover:text-[var(--sidebar-active-foreground)]",
     );
   });
 
