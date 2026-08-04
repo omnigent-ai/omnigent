@@ -364,6 +364,12 @@ class _InitialAuthTokenFactory:
                 return None
             return self._fallback_factory()
 
+    @property
+    def declined(self) -> bool:
+        """True when the inner fallback factory has definitively declined."""
+        with self._lock:
+            return getattr(self._fallback_factory, "declined", False)
+
     def invalidate(self) -> bool:
         """Discard the host bearer so the next call resolves local auth."""
         with self._lock:
@@ -691,8 +697,14 @@ class _ManagedMintTokenFactory:
             if response.status_code in (400, 404) or (
                 response.is_redirect and _is_login_redirect_or_unauthorized(response)
             ):
-                self.declined = True
-                return None
+                # Only treat as a definitive refusal if we have never
+                # successfully minted. A 400/404 mid-session (e.g. during an
+                # IP ACL flip) is transient — the server already proved it
+                # mints for this runner.
+                if self._cached_token is None:
+                    self.declined = True
+                    return None
+                return self._still_valid_cached_token(now)
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
             # Transient mint failure: keep serving the cached token while
