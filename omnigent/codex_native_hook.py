@@ -242,6 +242,7 @@ def _main_route_turn(argv: list[str]) -> int:
         HOOK_REQUEST_TIMEOUT_S,
         MARKER_FILE,
         ROUTE_PATH_TEMPLATE,
+        trace_turn_routing,
     )
 
     parser = argparse.ArgumentParser(prog="python -m omnigent.codex_native_hook route-turn")
@@ -250,28 +251,37 @@ def _main_route_turn(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     bridge_dir = Path(args.bridge_dir)
 
+    # Every prompt submit is traced, including the ones that fall open. A
+    # session that "just never routed" is otherwise indistinguishable from
+    # one the harness never fired the hook for at all.
+    raw = sys.stdin.read()
     if (bridge_dir / MARKER_FILE).exists():
+        trace_turn_routing(bridge_dir, "skip", "marker present")
         return 0
 
-    raw = sys.stdin.read()
     try:
         payload = json.loads(raw or "{}")
     except json.JSONDecodeError:
+        trace_turn_routing(bridge_dir, "fail-open", "malformed hook payload")
         return 0
     if not isinstance(payload, dict):
+        trace_turn_routing(bridge_dir, "fail-open", "hook payload is not an object")
         return 0
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
+        trace_turn_routing(bridge_dir, "skip", "no prompt text on this submit")
         return 0
 
     from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 
     endpoint = read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE)
     if endpoint is None:
+        trace_turn_routing(bridge_dir, "fail-open", f"no usable {ADVERTISEMENT_FILE}")
         return 0
     state = read_bridge_state(bridge_dir)
     session_id = endpoint.session_id or (state.session_id if state is not None else None)
     if not session_id:
+        trace_turn_routing(bridge_dir, "fail-open", "no session id to route")
         return 0
 
     body = {
@@ -286,9 +296,17 @@ def _main_route_turn(argv: list[str]) -> int:
     )
     decision = _post_json(url, endpoint.token, body, HOOK_REQUEST_TIMEOUT_S)
     if decision is None:
+        trace_turn_routing(bridge_dir, "fail-open", f"no verdict from {endpoint.url}")
         return 0
     model = decision.get("model")
     if decision.get("action") != "route" or not isinstance(model, str) or not model:
+        rationale = decision.get("rationale")
+        trace_turn_routing(
+            bridge_dir,
+            "allow",
+            f"{rationale if isinstance(rationale, str) else ''} "
+            f"(terminal={bool(decision.get('terminal'))})",
+        )
         if decision.get("terminal"):
             # Nothing will route this session again, so stop asking.
             _write_marker(bridge_dir / MARKER_FILE)
@@ -299,6 +317,7 @@ def _main_route_turn(argv: list[str]) -> int:
         # tells the runner to replay it. Writing one here would replay a
         # prompt that already ran. The server-side pin still keeps the
         # next prompt from re-routing.
+        trace_turn_routing(bridge_dir, "fail-open", f"could not switch to {model}")
         print(
             f"omnigent codex route-turn hook: could not switch to {model}; "
             "letting the prompt run on the current model",
@@ -309,7 +328,9 @@ def _main_route_turn(argv: list[str]) -> int:
     # both "the routed model is applied" and "this prompt was dropped, you
     # owe it a replay".
     if not _write_marker(bridge_dir / MARKER_FILE):
+        trace_turn_routing(bridge_dir, "fail-open", "could not write the block marker")
         return 0
+    trace_turn_routing(bridge_dir, "route", f"blocked and switched to {model}")
     sys.stdout.write(
         json.dumps(
             {

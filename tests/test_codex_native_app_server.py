@@ -851,6 +851,55 @@ def test_write_codex_policy_hooks_file_merges_router_hooks(tmp_path: Path) -> No
     assert hooks["Stop"][0]["hooks"][0]["command"] == "echo bye"
 
 
+def test_user_prompt_submit_carries_the_route_turn_hook(tmp_path: Path) -> None:
+    """First-message routing rides the UserPromptSubmit entry codex trusts.
+
+    Pins the launch-path invariant a UI-created terminal session depends on:
+    the ``route-turn`` command is registered, points at the SAME bridge dir
+    the runner advertises ``turn_router.json`` in, and lives under the
+    policy-hook module so the trust handshake covers it. A hook codex loads
+    but never trusts is a silent fail-open, and one pointed at a different
+    directory finds no advertisement and falls open too.
+    """
+    from omnigent.codex_native_app_server import (
+        _POLICY_HOOK_MODULE,
+        _our_policy_hooks_from_list,
+        _write_codex_policy_hooks_file,
+    )
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text(
+        '{"hooks": {"UserPromptSubmit": [{"hooks": '
+        '[{"type": "command", "command": "echo mine"}]}]}}'
+    )
+
+    _write_codex_policy_hooks_file(
+        codex_home,
+        bridge_dir,
+        sys.executable,
+        user_hooks_source=user_hooks,
+    )
+
+    hooks = json.loads((codex_home / "hooks.json").read_text())["hooks"]
+    commands = [h for entry in hooks["UserPromptSubmit"] for h in entry["hooks"]]
+    routing = [h for h in commands if "route-turn" in h["command"]]
+    assert len(routing) == 1
+    assert f"--bridge-dir {bridge_dir}" in routing[0]["command"]
+    assert "--harness codex-native" in routing[0]["command"]
+    assert routing[0]["timeout"] == HARNESS_HOOK_TIMEOUT_S
+    # Trust is filtered by module, so route-turn must ride the policy one.
+    assert _POLICY_HOOK_MODULE in routing[0]["command"]
+    listed = {"result": {"data": [{"cwd": "/repo", "hooks": commands}]}}
+    assert len(_our_policy_hooks_from_list(listed, "/repo")) == 2
+    # The user's own prompt hook survives the merge.
+    assert any(h["command"] == "echo mine" for h in commands)
+
+
 async def test_missing_hook_raises() -> None:
     """
     No discovered Omnigent hook fails loud (anti fail-open).

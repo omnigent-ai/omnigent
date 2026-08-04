@@ -21,10 +21,13 @@ from omnigent.runner.turn_routing import (
     TurnRouteRequest,
     ensure_session_turn_router,
     make_server_relay_resolver,
+    read_pending_replay,
     resolve_turn_route,
+    schedule_pending_replay_recovery,
     schedule_replay,
     shutdown_session_turn_router,
     start_turn_router,
+    write_pending_replay,
 )
 
 ROUTED_MODEL = "gpt-5.6-luna"
@@ -352,7 +355,7 @@ async def test_loopback_endpoint_allows_when_the_resolver_errors(tmp_path: Path)
 async def test_ensure_session_turn_router_skips_unsupported_harnesses(tmp_path: Path) -> None:
     assert (
         ensure_session_turn_router(
-            "conv_x", bridge_dir=tmp_path, server_client=object(), harness="claude-native"
+            "conv_x", bridge_dir=tmp_path, server_client=object(), harness="cursor-native"
         )
         is None
     )
@@ -363,6 +366,25 @@ async def test_ensure_session_turn_router_skips_unsupported_harnesses(tmp_path: 
         is None
     )
     assert not (tmp_path / ADVERTISEMENT_FILE).exists()
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
+async def test_ensure_session_turn_router_serves_both_hook_harnesses(
+    tmp_path: Path, harness: str
+) -> None:
+    router = ensure_session_turn_router(
+        f"conv_{harness}",
+        bridge_dir=tmp_path,
+        server_client=_FakeServerClient(),
+        harness=harness,
+    )
+    assert router is not None
+    try:
+        advertised = json.loads((tmp_path / ADVERTISEMENT_FILE).read_text(encoding="utf-8"))
+        assert advertised["url"] == router.url
+        assert advertised["session_id"] == f"conv_{harness}"
+    finally:
+        shutdown_session_turn_router(f"conv_{harness}", router)
 
 
 async def test_ensure_session_turn_router_is_idempotent(tmp_path: Path) -> None:
@@ -403,6 +425,8 @@ class _FakeServerClient:
     verdict: dict[str, Any] = field(default_factory=lambda: {"action": "allow", "rationale": ""})
     posts: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     fail: bool = False
+    items: list[dict[str, Any]] | None = None
+    items_fail: bool = False
 
     async def post(self, url: str, *, json: dict[str, Any], timeout: float) -> _FakeResponse:
         del timeout
@@ -410,6 +434,12 @@ class _FakeServerClient:
         if self.fail:
             raise RuntimeError("server unreachable")
         return _FakeResponse(self.verdict)
+
+    async def get(self, url: str, *, params: dict[str, Any], timeout: float) -> _FakeResponse:
+        del url, params, timeout
+        if self.items_fail:
+            raise RuntimeError("server unreachable")
+        return _FakeResponse({"object": "list", "data": self.items or []})
 
 
 async def test_server_relay_failure_allows_the_turn(tmp_path: Path) -> None:
@@ -495,6 +525,57 @@ async def test_replay_delivers_the_prompt_through_the_events_path(
     ]
 
 
+async def test_a_routed_replay_carries_the_model_in_band(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The routed model rides the replayed turn.
+
+    Claude's hook cannot switch the model — no hook output carries one and
+    there is no channel into a running TUI — so the switch has to arrive
+    with the replayed turn, where the executor types ``/model`` before the
+    message. Without this the replay lands on the launch model and the
+    session shows a routing chip it never honoured.
+    """
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
+    monkeypatch.setattr(turn_routing, "REPLAY_IDLE_GRACE_S", 0.05)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    client = _FakeServerClient()
+    await schedule_replay(
+        "conv_1",
+        prompt="hello there",
+        bridge_dir=tmp_path,
+        blocked_turn_id=None,
+        server_client=client,
+        model=ROUTED_MODEL,
+        idle=lambda _turn: True,
+    )
+    assert client.posts[0][1]["model_override"] == ROUTED_MODEL
+
+
+async def test_the_relay_records_and_replays_the_model_it_routed_to(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    armed: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        turn_routing,
+        "schedule_replay",
+        lambda session_id, **kwargs: armed.append(kwargs),
+    )
+    client = _FakeServerClient(
+        verdict={"action": "route", "model": ROUTED_MODEL, "rationale": "x", "terminal": True}
+    )
+    await make_server_relay_resolver(client, bridge_dir=tmp_path)("c1", _request())
+    assert armed[0]["model"] == ROUTED_MODEL
+    # The crash-recovery record carries it too, so a relaunched runner still
+    # delivers the prompt on the routed model rather than the launch one.
+    pending = turn_routing.read_pending_replay(tmp_path)
+    assert pending is not None
+    assert pending.model == ROUTED_MODEL
+
+
 async def test_replay_waits_for_the_blocked_turn_to_clear(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -542,3 +623,185 @@ async def test_replay_delivers_even_if_the_turn_never_clears(
         idle=lambda _turn: False,
     )
     assert len(client.posts) == 1
+
+
+# ── Pending-replay record + crash recovery ──────────────────────────
+
+
+def _fast_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 0.2)
+    monkeypatch.setattr(turn_routing, "REPLAY_IDLE_WAIT_S", 0.5)
+    monkeypatch.setattr(turn_routing, "REPLAY_IDLE_GRACE_S", 0.02)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+
+
+async def test_a_routed_verdict_records_the_pending_replay(tmp_path: Path) -> None:
+    """The prompt must be on disk before the hook can block it away."""
+    client = _FakeServerClient(
+        verdict={"action": "route", "model": ROUTED_MODEL, "rationale": "x", "terminal": True}
+    )
+    await make_server_relay_resolver(client, bridge_dir=tmp_path)("conv_1", _request())
+    pending = read_pending_replay(tmp_path)
+    assert pending is not None
+    assert pending.session_id == "conv_1"
+    assert pending.prompt == _request().prompt
+
+
+async def test_a_delivered_replay_clears_the_pending_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fast_replay(monkeypatch)
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id="t1",
+        server_client=_FakeServerClient(),
+        idle=lambda _turn: True,
+    )
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_a_failed_delivery_keeps_the_record_for_the_next_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The routed model is applied but the prompt is not lost."""
+    _fast_replay(monkeypatch)
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id="t1",
+        server_client=_FakeServerClient(fail=True),
+        idle=lambda _turn: True,
+    )
+    pending = read_pending_replay(tmp_path)
+    assert pending is not None and pending.prompt == "hello"
+
+
+async def test_a_hook_that_fell_open_clears_the_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No marker means the prompt already ran, so nothing is owed."""
+    _fast_replay(monkeypatch)
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
+    client = _FakeServerClient()
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id="t1",
+        server_client=client,
+        idle=lambda _turn: True,
+    )
+    assert client.posts == []
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_recovery_replays_a_prompt_a_dead_launch_never_delivered(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
+    client = _FakeServerClient(items=[])
+    task = schedule_pending_replay_recovery(
+        "conv_1",
+        bridge_dir=tmp_path,
+        server_client=client,
+        ready=lambda: True,
+    )
+    assert task is not None
+    await task
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_1/events",
+            {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+    ]
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_recovery_does_not_redeliver_a_prompt_that_already_ran(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
+    client = _FakeServerClient(
+        items=[{"type": "message", "content": [{"type": "input_text", "text": "hello"}]}]
+    )
+    task = schedule_pending_replay_recovery(
+        "conv_1",
+        bridge_dir=tmp_path,
+        server_client=client,
+        ready=lambda: True,
+    )
+    assert task is not None
+    await task
+    assert client.posts == []
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_recovery_keeps_the_record_when_it_cannot_check_the_session(
+    tmp_path: Path,
+) -> None:
+    """An unreadable session is 'unknown' — a double-run is worse than a retry."""
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
+    client = _FakeServerClient(items_fail=True)
+    task = schedule_pending_replay_recovery(
+        "conv_1",
+        bridge_dir=tmp_path,
+        server_client=client,
+        ready=lambda: True,
+    )
+    assert task is not None
+    await task
+    assert client.posts == []
+    assert read_pending_replay(tmp_path) is not None
+
+
+async def test_recovery_is_a_no_op_without_a_record_or_marker(tmp_path: Path) -> None:
+    client = _FakeServerClient(items=[])
+    assert (
+        schedule_pending_replay_recovery(
+            "conv_1", bridge_dir=tmp_path, server_client=client, ready=lambda: True
+        )
+        is None
+    )
+    # A record with no marker means the hook fell open: drop it, send nothing.
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
+    assert (
+        schedule_pending_replay_recovery(
+            "conv_1", bridge_dir=tmp_path, server_client=client, ready=lambda: True
+        )
+        is None
+    )
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_recovery_ignores_another_session_sharing_the_bridge_dir(
+    tmp_path: Path,
+) -> None:
+    """A fork inherits the parent's bridge id; its prompt is not ours to send."""
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    write_pending_replay(tmp_path, session_id="conv_other", prompt="hello", blocked_turn_id="t1")
+    assert (
+        schedule_pending_replay_recovery(
+            "conv_1",
+            bridge_dir=tmp_path,
+            server_client=_FakeServerClient(items=[]),
+            ready=lambda: True,
+        )
+        is None
+    )
+    assert read_pending_replay(tmp_path) is not None

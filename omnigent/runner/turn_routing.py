@@ -34,6 +34,14 @@ therefore blocks the prompt, applies the switch, and this module replays
 the captured prompt as a normal user turn — which then runs routed. The
 ordering handshake is documented on :func:`schedule_replay`.
 
+Once the hook blocks, the prompt exists **only** in the replay, and the
+block marker stops any later hook from asking again — so a replay that
+never lands loses the prompt for good and leaves the session with a
+routing chip and no turn. :data:`PENDING_FILE` is the durability half:
+the prompt is recorded before the block and cleared once it is delivered,
+and :func:`schedule_pending_replay_recovery` drains whatever a dead
+launch left behind.
+
 **Timeout budget.** Four hops wait on each other, so each one's budget is
 strictly larger than the hop it waits on — otherwise an inner hop's
 fail-open branch can never run. Canonical values, outermost first:
@@ -54,6 +62,7 @@ import contextlib
 import json
 import logging
 import secrets
+import sys
 import threading
 import time
 import urllib.parse
@@ -79,6 +88,21 @@ ADVERTISEMENT_FILE = "turn_router.json"
 #: network), and the runner reads it as "this prompt was blocked, you owe it
 #: a replay". Absent means the hook let the prompt run.
 MARKER_FILE = "turn_routing_done"
+
+#: Bridge-dir file holding the prompt a routed verdict still owes a replay.
+#: Written before the hook blocks and removed once the prompt is delivered
+#: (or once the hook is known to have fallen open), so a runner that dies
+#: mid-handshake can still deliver it on the next launch. Without it the
+#: prompt lives only in an in-memory task and the marker guarantees no hook
+#: will ever ask again — the blocked prompt is silently lost forever.
+PENDING_FILE = "turn_replay_pending.json"
+
+#: Bridge-dir file every hook invocation appends one line to, whatever it
+#: decides. A hook that falls open before its POST is invisible otherwise —
+#: the harness discards its stdout and the runner never hears from it — so
+#: "the session never routed" and "the harness never fired the hook" read
+#: identically in the logs. This file separates them.
+TRACE_FILE = "turn_routing.log"
 
 #: Path served by the loopback relay.
 ROUTE_PATH_TEMPLATE = "/v1/sessions/{session_id}/route-turn"
@@ -118,6 +142,15 @@ REPLAY_POLL_S = 0.1
 #: may simply not have caught up yet).
 REPLAY_IDLE_GRACE_S = 2.0
 
+#: Seconds a recovered replay waits for the relaunched harness to publish a
+#: thread it can be delivered to.
+RECOVERY_READY_WAIT_S = 120.0
+
+#: Items read back when checking whether a recovered prompt already ran.
+#: The replay is always the session's first user turn, so the oldest page
+#: is the only one that can contain it.
+RECOVERY_ITEM_SCAN = 100
+
 #: Scope recorded on the decision chip. The same value the server's
 #: composer turn gate uses, so the UI treats both triggers alike.
 _SCOPE = "turn"
@@ -131,6 +164,42 @@ _PROMPT_CAP = 4000
 RouteTurnFn = Callable[[str | None, str], Awaitable[tuple[str | None, dict[str, Any] | None]]]
 
 Resolver = Callable[[str, "TurnRouteRequest"], Awaitable["TurnRouteDecision"]]
+
+
+# ── Hook-side trace ────────────────────────────────────────────────────────
+
+
+def trace_turn_routing(bridge_dir: Path, outcome: str, detail: str = "") -> None:
+    """Append one line describing what a hook invocation decided.
+
+    Called from harness hook subprocesses, which have no logger and whose
+    stdout is the hook protocol. Every exit path traces, so a session that
+    did not route always says which gate it stopped at — the alternative is
+    the state this seam shipped in, where an absent endpoint, a rejected
+    advertisement and a harness that never fired the hook were all
+    indistinguishable from the outside.
+
+    Never raises and never blocks the prompt: a trace that cannot be
+    written is less bad than a wedged turn.
+
+    :param bridge_dir: Session bridge directory holding :data:`TRACE_FILE`.
+    :param outcome: Short verdict tag — ``"route"``, ``"allow"``,
+        ``"skip"`` or ``"fail-open"``.
+    :param detail: One-line reason, e.g. ``"no usable turn_router.json"``.
+    :returns: None.
+    """
+    line = json.dumps(
+        {"at": time.time(), "outcome": outcome, "detail": detail},
+        separators=(",", ":"),
+    )
+    try:
+        with (bridge_dir / TRACE_FILE).open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+    # Also on stderr: the harness keeps hook stderr in its own logs, which
+    # outlive a bridge dir the session teardown removes.
+    print(f"omnigent route-turn hook: {outcome}: {detail}", file=sys.stderr)
 
 
 # ── Wire types ─────────────────────────────────────────────────────────────
@@ -572,16 +641,120 @@ def make_server_relay_resolver(
             return _allow("unreadable verdict from routing server")
         decision = TurnRouteDecision.from_payload(payload)
         if decision.action == "route":
+            # On disk before the verdict is handed back, so the record is
+            # already there when the hook blocks the prompt: from that
+            # moment the prompt exists nowhere else.
+            write_pending_replay(
+                bridge_dir,
+                session_id=session_id,
+                prompt=req.prompt,
+                blocked_turn_id=req.turn_id,
+                model=decision.model,
+            )
             schedule_replay(
                 session_id,
                 prompt=req.prompt,
                 bridge_dir=bridge_dir,
                 blocked_turn_id=req.turn_id,
                 server_client=server_client,
+                model=decision.model,
             )
         return decision
 
     return _resolve
+
+
+# ── Pending-replay record ──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PendingReplay:
+    """A blocked prompt that has not been confirmed delivered.
+
+    :param session_id: Session the prompt belongs to.
+    :param prompt: The captured prompt text.
+    :param blocked_turn_id: Harness turn id it was submitted on, when known.
+    :param model: The routed model the replay must run on.
+    """
+
+    session_id: str
+    prompt: str
+    blocked_turn_id: str | None = None
+    model: str | None = None
+
+
+def write_pending_replay(
+    bridge_dir: Path,
+    *,
+    session_id: str,
+    prompt: str,
+    blocked_turn_id: str | None,
+    model: str | None = None,
+) -> bool:
+    """Record that *prompt* is owed a replay.
+
+    :param bridge_dir: Session bridge directory.
+    :param session_id: Session/conversation identifier.
+    :param prompt: The captured prompt text.
+    :param blocked_turn_id: Harness turn id the prompt was submitted on.
+    :param model: The routed model the replay must carry.
+    :returns: ``True`` when the record is on disk. A failure is logged and
+        degrades to the pre-existing in-memory-only behaviour rather than
+        declining the route.
+    """
+    path = bridge_dir / PENDING_FILE
+    body = {
+        "session_id": session_id,
+        "prompt": prompt,
+        "blocked_turn_id": blocked_turn_id,
+        "model": model,
+        "written_at": time.time(),
+    }
+    try:
+        path.write_text(json.dumps(body), encoding="utf-8")
+    except OSError:
+        _logger.warning(
+            "route-turn: could not record the pending replay for session=%s; "
+            "a runner restart before the replay lands would drop the prompt",
+            session_id,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def read_pending_replay(bridge_dir: Path) -> PendingReplay | None:
+    """Read the bridge dir's pending-replay record.
+
+    :param bridge_dir: Session bridge directory.
+    :returns: The record, or ``None`` when absent or unreadable.
+    """
+    try:
+        raw = json.loads((bridge_dir / PENDING_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    session_id = _opt_str(raw.get("session_id"))
+    prompt = raw.get("prompt")
+    if session_id is None or not isinstance(prompt, str) or not prompt.strip():
+        return None
+    return PendingReplay(
+        session_id=session_id,
+        prompt=prompt,
+        blocked_turn_id=_opt_str(raw.get("blocked_turn_id")),
+        model=_opt_str(raw.get("model")),
+    )
+
+
+def clear_pending_replay(bridge_dir: Path) -> None:
+    """Drop the pending-replay record. Idempotent.
+
+    :param bridge_dir: Session bridge directory.
+    :returns: None.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / PENDING_FILE).unlink()
 
 
 # ── The replay ─────────────────────────────────────────────────────────────
@@ -594,6 +767,7 @@ def schedule_replay(
     bridge_dir: Path,
     blocked_turn_id: str | None,
     server_client: Any,
+    model: str | None = None,
     idle: Callable[[str | None], bool] | None = None,
 ) -> asyncio.Task[None]:
     """Arm the replay of a prompt the hook is about to block.
@@ -622,12 +796,20 @@ def schedule_replay(
     re-checks the routing gate and finds ``model_override`` pinned, so it
     routes nothing and records no second decision.
 
+    The delivery carries the routed model as the event's own
+    ``model_override``. That is what makes claude route: its hook cannot
+    switch the model, so the switch has to ride the replayed turn, where
+    the executor types ``/model`` under its inject lock before the message.
+    Codex has already switched its own thread by then, and re-asserting the
+    same model there is a no-op.
+
     :param session_id: Session/conversation identifier.
     :param prompt: The captured prompt text to re-deliver.
     :param bridge_dir: Session bridge directory (marker + bridge state).
     :param blocked_turn_id: Harness turn id the blocked prompt was
         submitted on. ``None`` falls back to waiting for no active turn.
     :param server_client: Runner→server client used to deliver the prompt.
+    :param model: The routed model, carried in-band on the replayed turn.
     :param idle: Override for the "is the blocked turn gone?" probe, taking
         the blocked turn id. ``None`` reads the codex-native bridge state.
     :returns: The scheduled task (tests await it; callers ignore it).
@@ -639,6 +821,7 @@ def schedule_replay(
             bridge_dir=bridge_dir,
             blocked_turn_id=blocked_turn_id,
             server_client=server_client,
+            model=model,
             idle=idle,
         ),
         name=f"turn-routing-replay-{session_id}",
@@ -652,6 +835,7 @@ async def _replay(
     bridge_dir: Path,
     blocked_turn_id: str | None,
     server_client: Any,
+    model: str | None,
     idle: Callable[[str | None], bool] | None,
 ) -> None:
     """Run the replay handshake and deliver the prompt. See
@@ -665,6 +849,9 @@ async def _replay(
             session_id,
             REPLAY_MARKER_WAIT_S,
         )
+        # The prompt ran on the old model, so nothing is owed — leaving the
+        # record would make a later launch deliver it a second time.
+        clear_pending_replay(bridge_dir)
         return
     if not await _wait_for_cleared(turn_cleared, blocked_turn_id):
         _logger.warning(
@@ -673,27 +860,199 @@ async def _replay(
             blocked_turn_id,
             session_id,
         )
+    if not await _deliver_prompt(
+        session_id, prompt=prompt, server_client=server_client, model=model
+    ):
+        _logger.warning(
+            "route-turn: the routed model is applied for session=%s but the prompt "
+            "was not delivered; it stays recorded for the next launch to replay",
+            session_id,
+        )
+        return
+    clear_pending_replay(bridge_dir)
+    _logger.info("route-turn: replayed the routed prompt for session=%s", session_id)
+
+
+async def _deliver_prompt(
+    session_id: str,
+    *,
+    prompt: str,
+    server_client: Any,
+    model: str | None = None,
+) -> bool:
+    """POST *prompt* as a normal user turn on the events path.
+
+    :param session_id: Session/conversation identifier.
+    :param prompt: Prompt text to deliver.
+    :param server_client: Runner→server client.
+    :param model: Routed model sent as the event's ``model_override``, so a
+        harness whose hook could not switch applies it on this turn.
+    :returns: ``True`` when the server accepted the delivery.
+    """
+    body: dict[str, Any] = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+        },
+    }
+    if model:
+        body["model_override"] = model
     try:
         resp = await server_client.post(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": prompt}],
-                },
-            },
+            json=body,
             timeout=60.0,
         )
         resp.raise_for_status()
     except Exception:
-        _logger.exception(
-            "route-turn: replay delivery failed for session=%s; the routed model is "
-            "applied but the prompt was dropped",
+        _logger.exception("route-turn: replay delivery failed for session=%s", session_id)
+        return False
+    return True
+
+
+# ── Crash recovery for a replay that never landed ──────────────────────────
+
+
+def schedule_pending_replay_recovery(
+    session_id: str,
+    *,
+    bridge_dir: Path,
+    server_client: Any,
+    ready: Callable[[], bool] | None = None,
+) -> asyncio.Task[None] | None:
+    """Deliver a blocked prompt a previous launch never got to replay.
+
+    The replay itself is an in-memory task, so a runner that exits between
+    the hook's block and the delivery leaves the prompt nowhere: the block
+    already consumed it, the marker stops any hook from asking again, and
+    the session just sits there with a routing chip and no turn. This drains
+    the on-disk record instead, once per launch.
+
+    Skipped unless the block marker is also present — a record without one
+    means the hook fell open and the prompt already ran.
+
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Session bridge directory.
+    :param server_client: Runner→server client. ``None`` skips recovery.
+    :param ready: Override for the "harness can take a turn" probe. ``None``
+        waits for the codex bridge state to publish a thread.
+    :returns: The scheduled task, or ``None`` when there is nothing to do.
+    """
+    if server_client is None:
+        return None
+    pending = read_pending_replay(bridge_dir)
+    if pending is None:
+        return None
+    if pending.session_id != session_id:
+        # A bridge dir shared with another session (a fork inherits the
+        # parent's bridge id); that session's prompt is not ours to send.
+        return None
+    if not (bridge_dir / MARKER_FILE).exists():
+        clear_pending_replay(bridge_dir)
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    return loop.create_task(
+        _recover_pending_replay(
+            session_id,
+            pending=pending,
+            bridge_dir=bridge_dir,
+            server_client=server_client,
+            ready=ready,
+        ),
+        name=f"turn-routing-replay-recovery-{session_id}",
+    )
+
+
+async def _recover_pending_replay(
+    session_id: str,
+    *,
+    pending: PendingReplay,
+    bridge_dir: Path,
+    server_client: Any,
+    ready: Callable[[], bool] | None,
+) -> None:
+    """Wait for the harness, confirm the prompt never ran, then deliver it."""
+    probe = ready if ready is not None else _bridge_thread_probe(bridge_dir)
+    if not await _wait_for(probe, RECOVERY_READY_WAIT_S):
+        _logger.warning(
+            "route-turn: no live thread for session=%s within %.0fs; the recovered "
+            "prompt stays recorded for the next launch",
+            session_id,
+            RECOVERY_READY_WAIT_S,
+        )
+        return
+    already = await _prompt_already_ran(session_id, pending.prompt, server_client)
+    if already is None:
+        # Cannot tell, so do not guess: a duplicate turn is worse than one
+        # more launch spent trying.
+        _logger.warning(
+            "route-turn: could not read session=%s items to check the recovered "
+            "prompt; leaving it recorded rather than risk a double-run",
             session_id,
         )
         return
-    _logger.info("route-turn: replayed the routed prompt for session=%s", session_id)
+    if already:
+        _logger.info(
+            "route-turn: recovered prompt for session=%s already ran; dropping the record",
+            session_id,
+        )
+        clear_pending_replay(bridge_dir)
+        return
+    if not await _deliver_prompt(
+        session_id,
+        prompt=pending.prompt,
+        server_client=server_client,
+        model=pending.model,
+    ):
+        return
+    clear_pending_replay(bridge_dir)
+    _logger.info(
+        "route-turn: recovered and replayed a prompt a previous launch blocked "
+        "but never delivered for session=%s",
+        session_id,
+    )
+
+
+async def _prompt_already_ran(session_id: str, prompt: str, server_client: Any) -> bool | None:
+    """Report whether *prompt* is already a turn on the session.
+
+    :param session_id: Session/conversation identifier.
+    :param prompt: The recovered prompt text.
+    :param server_client: Runner→server client.
+    :returns: ``True`` / ``False``, or ``None`` when the check itself failed.
+    """
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/items",
+            params={"limit": RECOVERY_ITEM_SCAN, "order": "asc"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:  # noqa: BLE001 — an unreadable session is "unknown"
+        _logger.debug("route-turn: item scan failed for session=%s", session_id, exc_info=True)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    # A blocked prompt is persisted nowhere, so finding the text at all means
+    # the replay (or the user re-typing it) already landed.
+    return prompt in json.dumps(payload.get("data", []))
+
+
+def _bridge_thread_probe(bridge_dir: Path) -> Callable[[], bool]:
+    """Build the "codex has published a thread to deliver to" probe."""
+
+    def _ready() -> bool:
+        from omnigent.codex_native_bridge import read_bridge_state
+
+        state = read_bridge_state(bridge_dir)
+        return state is not None and bool(state.thread_id)
+
+    return _ready
 
 
 def _bridge_turn_probe(bridge_dir: Path) -> Callable[[str | None], bool]:
@@ -751,9 +1110,8 @@ _session_routers: dict[str, TurnRouter] = {}
 _lifecycle_lock = threading.Lock()
 
 # Harnesses whose ``UserPromptSubmit`` hook reads a turn-router
-# advertisement. Codex-native only for now: claude's actuator needs a
-# session-scoped ``/model`` first (design plan §3d.2).
-_TURN_HOOK_HARNESSES = frozenset({"codex-native"})
+# advertisement.
+_TURN_HOOK_HARNESSES = frozenset({"codex-native", "claude-native"})
 
 
 def ensure_session_turn_router(

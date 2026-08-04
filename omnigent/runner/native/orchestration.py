@@ -557,6 +557,38 @@ def _start_turn_router_for_native_session(
     )
 
 
+def _recover_pending_turn_replay(
+    session_id: str,
+    *,
+    bridge_dir: Path,
+    server_client: httpx.AsyncClient | None,
+) -> None:
+    """Redeliver a routed prompt a previous launch blocked but never replayed.
+
+    Fire-and-forget and best effort: no pending record (the normal case) is
+    a no-op, and a recovery that cannot run must never fail a launch.
+
+    :param session_id: Session/conversation identifier.
+    :param bridge_dir: Session bridge directory holding the pending record.
+    :param server_client: Runner→server client the prompt is delivered on.
+    :returns: None.
+    """
+    from omnigent.runner.turn_routing import schedule_pending_replay_recovery
+
+    try:
+        schedule_pending_replay_recovery(
+            session_id,
+            bridge_dir=bridge_dir,
+            server_client=server_client,
+        )
+    except Exception:  # noqa: BLE001 - a recovery must not take the launch down
+        _logger.warning(
+            "turn-routing replay recovery could not start for session=%s",
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _shutdown_session_turn_router_async(
     session_id: str, router: TurnRouter | None = None
 ) -> None:
@@ -4072,6 +4104,15 @@ async def _auto_create_codex_terminal(
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
 
+    # A prompt a previous launch blocked for routing but never got to replay
+    # exists nowhere else: the block consumed it and the marker stops the hook
+    # from ever asking again. Drain it once this launch's thread is live.
+    _recover_pending_turn_replay(
+        session_id,
+        bridge_dir=bridge_dir,
+        server_client=server_client,
+    )
+
     # Start the relay now (into codex's serve-mcp bridge dir) so tool_relay.json
     # is on disk and the relay recorded before codex connects on its first turn:
     # the first-turn `_ensure_comment_relay_started` then fast-paths, avoiding
@@ -6236,6 +6277,16 @@ async def _auto_create_claude_terminal(
     # the three Omnigent tools that carry out the re-route. A pinned session's
     # argv must stay byte-identical.
     routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(launch_metadata.auto_harness)
+    # First-message model routing: the UserPromptSubmit hook reads the
+    # advertisement from the same bridge dir, so a prompt typed straight into
+    # the TUI on a bare launch still gets routed. Always installed — the
+    # endpoint decides per prompt whether anything routes.
+    _turn_router = _start_turn_router_for_native_session(
+        session_id,
+        bridge_dir=bridge_dir,
+        harness="claude-native",
+        server_client=server_client,
+    )
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -6248,6 +6299,7 @@ async def _auto_create_claude_terminal(
         subagent_router_dir=subagent_router_dir,
         append_system_prompt=routed_spawn_note,
         allowed_tools=routed_spawn_tools,
+        turn_router_dir=bridge_dir if _turn_router is not None else None,
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
@@ -6403,6 +6455,7 @@ async def _auto_create_claude_terminal(
             )
         finally:
             await _shutdown_session_router_async(session_id, _subagent_router)
+            await _shutdown_session_turn_router_async(session_id, _turn_router)
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),

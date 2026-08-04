@@ -816,3 +816,65 @@ def test_route_turn_no_ops_when_the_endpoint_is_unreachable(
     assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
     assert capsys.readouterr().out == ""
     assert not (bridge_dir / MARKER_FILE).exists()
+
+
+@pytest.mark.parametrize(
+    "advertise",
+    [False, True],
+    ids=["no_advertisement", "unreachable_endpoint"],
+)
+def test_route_turn_traces_every_fall_open(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    advertise: bool,
+) -> None:
+    """A session that did not route always records which gate stopped it.
+
+    Without this the two ways first-message routing goes quiet — the hook
+    fell open, or the harness never fired it at all — are indistinguishable
+    from the logs, which is exactly how a reported "it never routed" ends
+    up unattributable.
+    """
+    from omnigent.runner.turn_routing import TRACE_FILE
+
+    if advertise:
+        _advertise_turn_router(bridge_dir)
+        monkeypatch.setattr(codex_native_hook, "_post_json", lambda *args, **kwargs: None)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+
+    traced = [
+        json.loads(line)
+        for line in (bridge_dir / TRACE_FILE).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [entry["outcome"] for entry in traced] == ["fail-open"]
+    assert traced[0]["detail"]
+
+
+def test_route_turn_traces_the_route_it_applied(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from omnigent.runner.turn_routing import TRACE_FILE
+
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *args, **kwargs: {
+            "action": "route",
+            "model": "gpt-5.6-luna",
+            "terminal": True,
+        },
+    )
+    monkeypatch.setattr(codex_native_hook, "_apply_thread_model", lambda *args: True)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+    traced = [
+        json.loads(line)
+        for line in (bridge_dir / TRACE_FILE).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [entry["outcome"] for entry in traced] == ["route"]
+    assert "gpt-5.6-luna" in traced[0]["detail"]
