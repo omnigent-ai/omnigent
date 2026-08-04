@@ -30,6 +30,12 @@ describe("normalizeExplicitMathDelimiters — dollar handling", () => {
     );
   });
 
+  it("escapes a single-char braced reference but not a bare single char", () => {
+    // Braces disambiguate `${A}` as a variable; bare `$A …` stays inline math.
+    expect(normalizeExplicitMathDelimiters("value ${A} here")).toBe("value \\${A} here");
+    expect(normalizeExplicitMathDelimiters("the $A + B$ span")).toBe("the $A + B$ span");
+  });
+
   it("leaves genuine inline math intact", () => {
     expect(normalizeExplicitMathDelimiters("the value $x + y$ holds")).toBe(
       "the value $x + y$ holds",

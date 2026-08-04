@@ -1,7 +1,9 @@
 // A lone `$` reads as a shell-style variable reference — `$VAR_NAME` or
-// `${VAR_NAME}` — when followed by a SCREAMING_CASE identifier of 2+ chars (an
-// env-var convention), so it's treated as literal text rather than a math
-// opener. Anchored at the `$`, which the caller has already matched.
+// `${VAR_NAME}` — when followed by a SCREAMING_CASE identifier (an env-var
+// convention), so it's treated as literal text rather than a math opener. The
+// braces already disambiguate `${A}`, so a single char is enough there; the
+// bare form requires 2+ chars so a lone `$X …` still reads as inline math.
+// Anchored at the `$`, which the caller has already matched.
 const SHELL_VAR_RE = /^\$(?:\{[A-Z_][A-Z0-9_]*\}|[A-Z_][A-Z0-9_]+)/;
 
 // Optional 1–3 space indent + a fence run, per CommonMark. Matching the full
