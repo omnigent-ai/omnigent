@@ -1,6 +1,6 @@
 name: Lint
 
-# Runs the project's pre-commit hooks (ruff, Pyrefly, TypeScript lint, custom
+# Runs the project's pre-commit hooks (ruff, Pyrefly, TypeScript lint/type-check, custom
 # anti-pattern grep hooks, etc.) on every non-draft PR and on push to main.
 # Surfaces as the `Pre-commit checks` check, a REQUIRED gate entry in
 # merge-ready.yml. Draft PRs are skipped; `ready_for_review` refires so the

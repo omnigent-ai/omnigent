@@ -101,6 +101,7 @@ typecheck-python: _ensure-uv
 lint-ts:
     pnpm install --frozen-lockfile --filter web
     pnpm --filter web run lint
+    pnpm --filter web run type-check
 
 # --- Lockfile maintenance ---
 
