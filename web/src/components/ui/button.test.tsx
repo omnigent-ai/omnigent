@@ -74,6 +74,30 @@ describe("buttonVariants icon geometry", () => {
   });
 });
 
+describe("Button radius scale", () => {
+  it("maps default, small, and extra-small buttons to 8px, 6px, and 4px tokens", () => {
+    render(
+      <>
+        <Button data-testid="button-md">Medium</Button>
+        <Button size="sm" data-testid="button-sm">
+          Small
+        </Button>
+        <Button size="xs" data-testid="button-xs">
+          Extra small
+        </Button>
+        <Button size="icon-xs" aria-label="Compact icon" data-testid="button-icon-xs">
+          <svg aria-hidden />
+        </Button>
+      </>,
+    );
+
+    expect(screen.getByTestId("button-md")).toHaveClass("rounded-lg");
+    expect(screen.getByTestId("button-sm")).toHaveClass("rounded-[var(--radius-md)]");
+    expect(screen.getByTestId("button-xs")).toHaveClass("rounded-[var(--radius-sm)]");
+    expect(screen.getByTestId("button-icon-xs")).toHaveClass("rounded-[var(--radius-md)]");
+  });
+});
+
 describe("Button loading state", () => {
   it("keeps the label in the DOM so the button width doesn't collapse or grow", () => {
     // The label must stay rendered (just hidden) — replacing it with the

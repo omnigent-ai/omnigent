@@ -138,11 +138,36 @@ describe("SettingsSidebarBody", () => {
     );
   });
 
+  it("uses the shared row geometry with normal-weight labels", () => {
+    renderBody();
+    const selected = screen.getByTestId("settings-nav-appearance");
+    const unselected = screen.getByTestId("settings-nav-git");
+    expect(selected).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
+      "gap-2",
+      "px-2",
+      "py-1",
+      "rounded-[var(--radius-otto-button)]",
+      "font-normal",
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+    );
+    expect(selected).not.toHaveClass("bg-muted", "font-semibold");
+    expect(unselected).toHaveClass("sidebar-row", "font-normal");
+    expect(selected.querySelector("svg")).toHaveClass("text-[var(--sidebar-active-foreground)]");
+    expect(selected.querySelector("svg")).not.toHaveClass("text-muted-foreground");
+    expect(unselected.querySelector("svg")).toHaveClass("text-muted-foreground");
+  });
+
   it("renders group subtitles in sentence case at the text-sm tier", () => {
     renderBody();
     const heading = screen.getByRole("heading", { name: "General" });
     expect(heading).toHaveClass("text-sm", "font-normal");
     expect(heading).not.toHaveClass("font-medium", "uppercase");
+    expect(heading.parentElement).toHaveClass("gap-0");
+    expect(heading.parentElement).not.toHaveClass("gap-0.5");
   });
 
   it("marks the Keyboard shortcuts nav item hidden on mobile via max-md:hidden", () => {

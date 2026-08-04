@@ -29,6 +29,7 @@ import { isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
+import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "appearance"
@@ -247,7 +248,7 @@ export function SettingsSidebarBody({
       </div>
       <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
         {groups.map((group) => (
-          <div key={group.title} className="flex flex-col gap-0.5">
+          <div key={group.title} className="flex flex-col gap-0">
             <h2 className="px-2 py-1 text-sm font-normal text-muted-foreground">{group.title}</h2>
             {group.items.map((item) => {
               const Icon = item.icon;
@@ -258,8 +259,10 @@ export function SettingsSidebarBody({
                   asChild
                   variant="ghost"
                   className={cn(
-                    "w-full justify-start gap-2 text-ui",
-                    selected && "bg-muted font-semibold",
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal",
+                    selected &&
+                      "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]",
                     item.hideOnMobile && "max-md:hidden",
                   )}
                 >
@@ -269,7 +272,14 @@ export function SettingsSidebarBody({
                     data-testid={`settings-nav-${item.id}`}
                     aria-current={selected ? "page" : undefined}
                   >
-                    <Icon className="ui-icon text-muted-foreground" />
+                    <Icon
+                      className={cn(
+                        "ui-icon",
+                        selected
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
                     {item.label}
                   </Link>
                 </Button>

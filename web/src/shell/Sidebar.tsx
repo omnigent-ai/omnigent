@@ -168,6 +168,7 @@ import {
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
+import { SIDEBAR_ROW } from "./sidebarStyles";
 
 // Positioning for a row's trailing session-state badge. On desktop the badge
 // fades out on hover/focus so the pin + kebab controls can take its place; on
@@ -175,13 +176,9 @@ import {
 const SESSION_STATE_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-2 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
-// Highlight applied to a drop target while a draggable session hovers it: a
-// subtle background tint — no border, no shadow. Keyed on --primary like the
-// row-selection highlight in this file, at /5 (half the original /10) so it's a
-// gentler gray in light mode (a gentler glow in dark mode) and reads as "active
-// area" without the heavy fill. Pair with `transition-colors` so it eases in.
-const SIDEBAR_HOVER_HIGHLIGHT =
-  "hover:bg-[var(--sidebar-hover)] hover:text-[var(--sidebar-active-foreground)]";
+// Match the Settings sidebar's ghost-button hover treatment across every home
+// sidebar row.
+const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
 // Active highlight also wins on hover so active items don't lose their
 // background and flash when the mouse enters them.
 const SIDEBAR_ACTIVE_HIGHLIGHT =
@@ -687,7 +684,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
       ) : (
         <>
-          <div className="flex h-12 shrink-0 translate-y-0.5 items-center justify-between px-4">
+          <div className="flex h-12 shrink-0 translate-y-0.5 items-center justify-between pr-3 pl-5">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -715,7 +712,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon-xs"
                     aria-label="Search"
                     onClick={() => onOpenSearch?.()}
-                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+                    className="size-6 text-muted-foreground hover:text-foreground"
                     data-testid="sidebar-search-button"
                   >
                     <SearchIcon className="ui-icon" />
@@ -730,7 +727,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     variant="ghost"
                     size="icon-xs"
                     aria-label="Settings"
-                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+                    className="size-6 text-muted-foreground hover:text-foreground"
                   >
                     {/* No onNavClick: on mobile, entering Settings keeps the
                     drawer open and swaps it to the section list. */}
@@ -749,7 +746,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon-xs"
                     aria-label="Close sidebar"
                     onClick={onClose}
-                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+                    className="size-6 text-muted-foreground hover:text-foreground"
                   >
                     {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
@@ -764,7 +761,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+          <div className="flex flex-col gap-0 px-3 pt-2 pb-0" data-testid="sidebar-primary-nav">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -777,7 +774,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // headers and project folders. border-0 drops the Button base's
                 // transparent 1px border so the icon lands exactly on that
                 // column, flush with the Inbox row and folder rows.
-                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
+                SIDEBAR_ROW,
+                "w-full justify-start border-0 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -794,7 +792,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   onNavClick(e);
                 }}
               >
-                <SquarePenIcon className="ui-icon text-muted-foreground" />
+                <SquarePenIcon
+                  className={cn(
+                    "ui-icon",
+                    isNewChatPage
+                      ? "text-[var(--sidebar-active-foreground)]"
+                      : "text-muted-foreground",
+                  )}
+                />
                 New session
               </Link>
             </Button>
@@ -805,7 +810,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // Same shared nav-row construct as "New session" / "Inbox" so
                 // the active-pill, hover, insets, icon column, and text weight
                 // all match post-refactor.
-                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
+                SIDEBAR_ROW,
+                "w-full justify-start border-0 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -813,7 +819,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               data-testid="scheduled-tasks-nav"
             >
               <Link to="/tasks" onClick={onNavClick}>
-                <ClockIcon className="ui-icon text-muted-foreground" />
+                <ClockIcon
+                  className={cn(
+                    "ui-icon",
+                    isTasksPage
+                      ? "text-[var(--sidebar-active-foreground)]"
+                      : "text-muted-foreground",
+                  )}
+                />
                 Automations
               </Link>
             </Button>
@@ -821,14 +834,22 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               asChild
               variant="ghost"
               className={cn(
-                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
+                SIDEBAR_ROW,
+                "w-full justify-start border-0 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
               data-testid="inbox-button"
             >
               <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon className="ui-icon text-muted-foreground" />
+                <InboxIcon
+                  className={cn(
+                    "ui-icon",
+                    isInboxPage
+                      ? "text-[var(--sidebar-active-foreground)]"
+                      : "text-muted-foreground",
+                  )}
+                />
                 Inbox
                 {inboxCount > 0 && (
                   <span
@@ -862,14 +883,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   <TabsTrigger
                     value="mine"
                     data-testid="sidebar-tab-mine"
-                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-muted hover:text-foreground data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none dark:hover:bg-muted/50"
                   >
                     <span className="min-w-0 truncate">My sessions</span>
                   </TabsTrigger>
                   <TabsTrigger
                     value="shared"
                     data-testid="sidebar-tab-shared"
-                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-muted hover:text-foreground data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none dark:hover:bg-muted/50"
                   >
                     <span className="min-w-0 truncate">Shared with me</span>
                   </TabsTrigger>
@@ -882,7 +903,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            className="relative flex-1 overflow-y-auto px-3 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -1734,7 +1755,7 @@ function ConversationList({
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
-            className="flex flex-col gap-4 pr-1"
+            className="flex flex-col gap-4"
             data-testid="sidebar-conversation-list"
             // Freeze the sort order while the pointer is over the list so rows
             // never move under the cursor. The frozen-keys map is cleared by the
@@ -2080,10 +2101,11 @@ function SectionHeader({
         onClick={onToggleCollapsed}
         className={
           icon
-            ? `${cn(
-                "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
+            ? cn(
+                SIDEBAR_ROW,
+                "group flex w-full items-center border-0 text-left text-foreground transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
-              )} sidebar-compact-text text-foreground`
+              )
             : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
       >
@@ -2349,11 +2371,14 @@ function ConversationSection({
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty (e.g. a project with no loaded chats).
             <p
-              className={cn(
+              className={
                 indentRows
-                  ? "mt-1 mr-2 ml-8 flex min-h-9 items-center justify-center rounded-xl border border-dashed border-border px-3 py-2 text-center text-ui text-muted-foreground"
-                  : "px-2 py-1 text-xs text-muted-foreground",
-              )}
+                  ? cn(
+                      SIDEBAR_ROW,
+                      "mt-1 mr-2 ml-8 flex items-center justify-center border border-dashed border-border text-center text-ui text-muted-foreground",
+                    )
+                  : "px-2 py-1 text-xs text-muted-foreground"
+              }
             >
               {emptyMessage}
             </p>
@@ -3161,7 +3186,8 @@ function ConversationRow({
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
       className={cn(
-        "sidebar-compact-text relative flex h-8 flex-col justify-center rounded-[var(--radius-otto-sm)] py-1 pl-2 text-left text-foreground transition-colors",
+        SIDEBAR_ROW,
+        "relative flex flex-col justify-center text-left text-foreground transition-colors",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -3626,11 +3652,10 @@ function DeletingRow({
     );
   }
   return (
-    // Match the interactive row's box metrics (h-7, font-size, radius) so the
-    // swap only changes color/opacity — otherwise the row visibly grows and
-    // shifts the list while a delete is in flight.
+    // Match the interactive row's shared 28px metrics so the swap only changes
+    // color/opacity rather than shifting the list.
     <div
-      className="sidebar-compact-text flex h-7 w-full items-center gap-1.5 rounded-[var(--radius-otto-sm)] px-2 text-muted-foreground opacity-70"
+      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
       data-testid="conversation-deleting"
       aria-live="polite"
     >
@@ -3653,7 +3678,7 @@ function DeletingRow({
 function ArchivingRow({ label }: { label: string }) {
   return (
     <div
-      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-ui text-muted-foreground opacity-70"
+      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
       data-testid="conversation-archiving"
       aria-live="polite"
     >

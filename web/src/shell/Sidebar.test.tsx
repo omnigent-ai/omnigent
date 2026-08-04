@@ -342,21 +342,23 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
-    expect(headerActions.parentElement).toHaveClass("h-12");
+    expect(headerActions.parentElement).toHaveClass("h-12", "pl-5", "pr-3");
+    expect(headerActions.parentElement).not.toHaveClass("px-4");
     const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
 
     expect(search).toHaveAttribute("aria-label", "Search");
     expect(search).toHaveAttribute("data-size", "icon-xs");
-    expect(search).toHaveClass("size-6");
+    expect(search).toHaveClass("size-6", "rounded-[var(--radius-md)]");
+    expect(search).not.toHaveClass("rounded-sm");
     expect(search.querySelector("svg")).toHaveClass("ui-icon");
     expect(settings).toHaveAttribute("aria-label", "Settings");
     expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6");
+    expect(settings).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(settings.querySelector("svg")).toHaveClass("ui-icon");
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
-    expect(collapse).toHaveClass("size-6");
+    expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
   });
 
@@ -366,11 +368,26 @@ describe("Sidebar session list", () => {
 
     const primaryNav = screen.getByTestId("sidebar-primary-nav");
     const inbox = within(primaryNav).getByTestId("inbox-button");
+    const newChat = within(primaryNav).getByTestId("new-chat-button");
 
-    expect(primaryNav).toHaveClass("px-2", "pt-2", "pb-0");
+    expect(primaryNav).toHaveClass("px-3", "pt-2", "pb-0");
     expect(primaryNav).not.toHaveClass("-mt-0.5");
     expect(inbox).toHaveAttribute("href", "/inbox");
-    expect(inbox).toHaveClass("h-8", "w-full", "justify-start");
+    expect(inbox).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
+      "w-full",
+      "justify-start",
+      "gap-2",
+      "px-2",
+      "py-1",
+    );
+    expect(inbox).toHaveClass("hover:bg-muted", "hover:text-foreground", "dark:hover:bg-muted/50");
+    expect(inbox.className).not.toContain("sidebar-hover");
+    expect(inbox).not.toHaveClass("h-8");
+    expect(newChat.querySelector("svg")).toHaveClass("text-[var(--sidebar-active-foreground)]");
+    expect(inbox.querySelector("svg")).toHaveClass("text-muted-foreground");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
     expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
@@ -611,8 +628,8 @@ describe("Sidebar session list", () => {
     const plainRow = screen.getByText("Plain session").closest("a")!;
     const worktreeRow = screen.getByText("Worktree session").closest("a")!;
 
-    expect(plainRow).toHaveClass("h-8", "justify-center");
-    expect(worktreeRow).toHaveClass("h-8", "justify-center");
+    expect(plainRow).toHaveClass("sidebar-row", "h-auto", "min-h-0", "justify-center");
+    expect(worktreeRow).toHaveClass("sidebar-row", "h-auto", "min-h-0", "justify-center");
     expect(within(worktreeRow).queryByText("fix/sidebar-row-height")).toBeNull();
   });
 
