@@ -37,7 +37,7 @@
 
 **2b** CUJ B is the Smart Routing harness. It keeps `_resolve_native_smart_routing`, the pre-session catalogs, `smart_routing_message`, and the harness row with its persistence. It is the only harness that allows cross-family subagents, and 3c states how a cross-family need is met. It runs the codex machinery underneath when it resolves to codex, so it inherits the whole codex apply layer, including the glm gateway route.
 
-**2c** CUJ C is routed subagent spawns. It keeps the hook scripts, the loopback relay, and the server policy (`resolve_subagent_route`). It also keeps the family constraints and the per-session override with its Inherit row. It also keeps the codex `hooks.json` generation, the trust handshake, and `python -I`.
+**2c** CUJ C is routed subagent spawns. It keeps the hook scripts, the loopback relay, and the server policy (`resolve_subagent_route`). It also keeps the family constraints, the two-state per-session override with its create-time stamp, and its two-option gear row. It also keeps the codex `hooks.json` generation, the trust handshake, and `python -I`.
 
 **2d** The CLI is the new workstream, and it must survive the rewrite. It keeps `smart_routing_cli.py` and the `--smart-routing`/`-p` flags. It also keeps the tier-2/3 commits, which are now merged. `8f3c0c60` (merge `6f2893d9`) is the server half: create-time MODEL routing for a create pinned to one *fixed* native harness. The turn gate can never reach that case, because a TUI's turns originate in the pane. `8d7c9cb2` is the CLI half: the flags, `smart_routing_cli.py`, the dispatch-spec `prompt_param`, and both dispatch tiers. `b10a7239` fixes the `CLAUDE_NATIVE_AGENT_NAME` import against this branch's `harness_plugins` layout. `CUJ_IMPLEMENTATION.md` §6 holds the mechanics. `CUJ_STATUS.md` §2.10 holds the registry rows.
 
@@ -122,7 +122,7 @@ It also publishes the file partition (4f).
 
 1. Routing core and the seam: the client, the arm menus, the resolution chain, and the family fallback.
 2. The routing backend selection: the per-request flag evaluation, the AI Gateway path, and the LLM-judge path (2f).
-3. Decision persistence: the decision record's writer and reader, and the `model_override` / `harness_override` / `cost_control_mode_override` keys inside the existing `session_overrides` blob. The `subagent_routing_override` key belongs to wave-2 stream 4, and its Inherit row belongs to wave-2 stream 5.
+3. Decision persistence: the decision record's writer and reader, and the `model_override` / `harness_override` / `cost_control_mode_override` keys inside the existing `session_overrides` blob. The `subagent_routing_override` key belongs to wave-2 stream 4 (with the create-time stamp that makes it two-state), and its gear row belongs to wave-2 stream 5.
 4. The gateway-inference signal: the host-side check, the host frames, the server surface, and the columns inside wave 0's empty migration (3f). The web half of the gate belongs to wave 2, stream 5.
 5. The claude apply layer: the alias vocabulary, the alias pins, and `/model` injection. It owns both claude executors, the native one and the SDK one; the claude hook script belongs to wave-2 stream 3.
 6. The codex model apply: the settings push, the config mirror, forwarder precedence, and the glm gateway route.

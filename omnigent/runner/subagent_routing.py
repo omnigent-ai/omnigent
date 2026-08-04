@@ -141,8 +141,8 @@ def routing_enabled(
     the per-session toggle (its own, or its parent's for a spawned child
     — the server routes children of a routed parent), and, where a
     ``RuntimeCaps`` is in reach, a configured routing client. Subagent
-    spawns read :func:`subagent_routing_enabled`, which layers the
-    per-session subagent override on top of this.
+    spawns read :func:`subagent_routing_enabled`, an independent
+    two-state switch stamped at create.
 
     :param cost_control_mode: The session's ``cost_control_mode_override``,
         e.g. ``"on"``.
@@ -161,36 +161,20 @@ def routing_enabled(
     return getattr(caps, "routing_client", None) is not None
 
 
-def subagent_routing_enabled(
-    subagent_routing_override: str | None,
-    *,
-    cost_control_mode: str | None,
-    parent_cost_control_mode: str | None = None,
-) -> bool:
+def subagent_routing_enabled(subagent_routing_override: str | None) -> bool:
     """Report whether subagent spawns are routed for one session.
 
-    Read per spawn (not at launch) so the setting can be flipped at any
-    point in a session and take effect on the next spawn. ``"on"`` /
-    ``"off"`` win outright; unset inherits the session's main routing
-    state, so a session started on Smart Routing routes its
-    subagents and one started on a manual model does not.
+    Two-state: ``"on"`` routes spawns, and anything else (``"off"`` or
+    unset) leaves them to the harness. Sessions that start on Smart
+    Routing are stamped ``"on"`` at create, so unset genuinely means
+    Default rather than "ask somewhere else". Read per spawn (not at
+    launch) so a mid-session flip takes effect on the next spawn.
 
     :param subagent_routing_override: The session's
-        ``subagent_routing_override`` — ``"on"``, ``"off"``, or ``None``
-        to inherit.
-    :param cost_control_mode: The session's ``cost_control_mode_override``.
-    :param parent_cost_control_mode: The parent session's value for a
-        spawned child. ``None`` for a top-level session.
+        ``subagent_routing_override`` — ``"on"``, ``"off"``, or ``None``.
     :returns: ``True`` when subagent spawns should be routed.
     """
-    if subagent_routing_override == "on":
-        return True
-    if subagent_routing_override == "off":
-        return False
-    return routing_enabled(
-        cost_control_mode,
-        parent_cost_control_mode=parent_cost_control_mode,
-    )
+    return subagent_routing_override == "on"
 
 
 # ── Wire types ─────────────────────────────────────────────────────────────

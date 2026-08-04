@@ -84,11 +84,11 @@ describe("isSessionScopedDecision", () => {
 });
 
 describe("showsRoutingDecisionChip", () => {
-  // A spawn chip is only honest about a setting the user chose: "Inherit" (and
-  // an explicit "off") never advertises per-spawn routing, even though the
-  // spawns of an inheriting session are still routed server-side. Everything
-  // else — the session's own turn decisions and child-session decisions, which
-  // follow the session's Smart Routing switch — renders regardless.
+  // The switch is two-state, so this gate mirrors behavior exactly: an unset or
+  // "off" session's spawns are not routed, and a chip claiming a per-spawn pick
+  // would be describing something that never happened. Everything else — the
+  // session's own turn decisions and child-session decisions, which follow the
+  // session's Smart Routing switch — renders regardless.
   it.each([
     ["native_subagent", "on", true],
     ["native_subagent", "off", false],

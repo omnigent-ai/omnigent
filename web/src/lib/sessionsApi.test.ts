@@ -545,7 +545,7 @@ describe("runner binding", () => {
     expect(session.subagentRoutingOverride).toBe("on");
   });
 
-  it("PATCHes an explicit null to clear subagentRoutingOverride (back to inherit)", async () => {
+  it("PATCHes an explicit null to clear subagentRoutingOverride", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -560,8 +560,8 @@ describe("runner binding", () => {
     await updateSession("conv_abc", { subagentRoutingOverride: null });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    // "off" is a real value here too, so the clear signal is a JSON null —
-    // which the server reads as "inherit the session's own routing state".
+    // "off" is a real value here too, so the clear signal is a JSON null. The
+    // cleared session reads as Default, the same place "off" lands.
     expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: null });
   });
 

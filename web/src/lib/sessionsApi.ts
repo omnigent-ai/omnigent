@@ -148,7 +148,7 @@ interface SessionResponseWire {
   model_override?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
-  /** Sub-agent routing switch; `null`/absent = inherit the session's own state. */
+  /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
   subagent_routing_override?: "on" | "off" | null;
   context_window?: number | null;
   last_total_tokens?: number | null;
@@ -642,7 +642,8 @@ export async function launchRunner(
  * default``). `null` on `costControlModeOverride` /
  * `subagentRoutingOverride` is sent as a JSON ``null`` — for those fields
  * "off" is a real value, so explicit null (not an alias) is the server's
- * clear signal (sub-agent routing then falls back to inheriting).
+ * clear signal. Clearing sub-agent routing lands the session on Default,
+ * the same place ``"off"`` does.
  *
  * `silent: true` persists without firing the claude-native tmux
  * forward — use for bind-time auto-apply (e.g. the sticky-pref

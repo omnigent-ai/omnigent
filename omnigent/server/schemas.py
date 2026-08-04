@@ -1337,8 +1337,10 @@ class SessionCreateRequest(BaseModel):
     :param subagent_routing_override: Optional per-session
         subagent-routing switch to persist at create time: ``"on"``
         routes subagent spawns, ``"off"`` leaves them unrouted.
-        ``None`` (the default) inherits the session's main routing
-        state. Mutable mid-session via ``PATCH /v1/sessions/{id}``.
+        ``None`` (the default) lets the create route stamp ``"on"``
+        when the session starts on Smart Routing, and otherwise leaves
+        the session on Default. An explicit value always wins. Mutable
+        mid-session via ``PATCH /v1/sessions/{id}``.
     :param harness_override: Optional per-session brain-harness
         override to persist at create time, e.g. ``"pi"`` or
         ``"openai-agents"``. Set by the web UI's new-chat harness
@@ -1721,11 +1723,12 @@ class SessionResponse(BaseModel):
         ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle); read by the cost-control advisor pipeline.
     :param subagent_routing_override: Per-session subagent-routing
-        switch: ``"on"`` routes subagent spawns, ``"off"`` leaves them
-        unrouted. ``None`` means the session inherits its main routing
-        state (own or parent ``cost_control_mode_override == "on"``) —
-        the value the in-session "Subagent routing" row renders as
-        "Default". Set via ``PATCH /v1/sessions/{id}``.
+        switch, two-state: ``"on"`` routes subagent spawns, and ``"off"``
+        or ``None`` (unset) both leave them unrouted — the in-session
+        "Subagent routing" row renders either as "Default". ``None`` on
+        a row created before this became explicit inherits nothing.
+        Stamped ``"on"`` at create for Smart Routing sessions; also set
+        via ``PATCH /v1/sessions/{id}``.
     :param context_window: The model's context window size in tokens
         as looked up server-side from litellm's registry (or from the
         ``AP_CONTEXT_WINDOW_OVERRIDE`` env var), e.g. ``200_000``.
@@ -1963,11 +1966,12 @@ class UpdateSessionRequest(BaseModel):
         alias — is the clear signal, unlike ``model_override``).
     :param subagent_routing_override: Per-session subagent-routing
         switch: ``"on"`` routes subagent spawns, ``"off"`` leaves them
-        unrouted. Explicit JSON ``null`` clears the override so the
-        session inherits its main routing state again; omitting the
-        field leaves it unchanged (same presence-is-the-clear-signal
-        rule as ``cost_control_mode_override``). Effective on the next
-        spawn, so it can be changed at any point in a session.
+        unrouted. Explicit JSON ``null`` clears the override, which lands
+        the session on Default (the same behavior as ``"off"`` — nothing
+        is inherited); omitting the field leaves it unchanged (same
+        presence-is-the-clear-signal rule as
+        ``cost_control_mode_override``). Effective on the next spawn, so
+        it can be changed at any point in a session.
     :param external_session_id: Runtime-native session id captured
         by a wrapper bridge (e.g. Claude Code's session uuid for
         ``omnigent claude`` sessions). Idempotent on same-value

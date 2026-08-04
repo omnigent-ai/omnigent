@@ -627,8 +627,9 @@ _MAX_TERMINAL_LAUNCH_ARG_LEN = 4096
 COST_CONTROL_OVERRIDE_VALUES = frozenset({"on", "off"})
 
 
-# Per-session subagent-routing switch; ``None`` (absent) inherits the
-# session's main routing state instead of forcing either way.
+# Per-session subagent-routing switch. Two-state: only ``"on"`` routes
+# spawns, and ``"off"`` / absent both read as Default. Creates that start
+# on Smart Routing are stamped ``"on"``, so absent is never an inherit.
 SUBAGENT_ROUTING_OVERRIDE_VALUES = frozenset({"on", "off"})
 
 

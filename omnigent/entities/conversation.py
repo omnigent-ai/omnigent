@@ -119,12 +119,13 @@ class Conversation:
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
     :param subagent_routing_override: Per-session subagent-routing
-        switch: ``"on"`` routes native/SDK subagent spawns, ``"off"``
-        leaves them on the parent's model, and ``None`` (the default)
-        inherits the session's main routing state (its own — or its
-        parent's — ``cost_control_mode_override == "on"``). Mutable via
-        ``PATCH /v1/sessions/{id}`` at any time; read per spawn by the
-        route-subagent relay, so a change takes effect on the next spawn.
+        switch, two-state: ``"on"`` routes native/SDK subagent spawns,
+        and ``"off"`` or ``None`` (unset) both leave them on the parent's
+        model. A session created on Smart Routing is stamped ``"on"`` by
+        the create route, so unset reads as Default and inherits nothing.
+        Mutable via ``PATCH /v1/sessions/{id}`` at any time; read per
+        spawn by the route-subagent relay, so a change takes effect on
+        the next spawn.
     :param harness_override: Per-session harness override for the
         bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
         ``None`` means use the harness declared in the agent spec

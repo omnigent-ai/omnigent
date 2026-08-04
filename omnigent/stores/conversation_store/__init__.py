@@ -803,8 +803,8 @@ class ConversationStore(ABC):
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_subagent_routing_override: When ``True``, set
             ``subagent_routing_override`` to ``None`` regardless of the
-            ``subagent_routing_override`` param value — back to
-            inheriting the session's main routing state.
+            ``subagent_routing_override`` param value. Unset reads as
+            Default (the switch is two-state; nothing is inherited).
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged. No ``_unset``
             variant — the override is set once at session create and

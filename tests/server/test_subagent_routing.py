@@ -876,34 +876,17 @@ def test_routing_enabled_requires_a_client_when_caps_are_given(
 
 
 @pytest.mark.parametrize(
-    ("override", "cost_control_mode", "parent_mode", "expected"),
+    ("override", "expected"),
     [
-        # No override: subagent routing follows the session's routing state,
-        # falling back to the parent's when the session's is unset.
-        (None, "on", None, True),
-        (None, "off", None, False),
-        (None, None, None, False),
-        (None, None, "on", True),
-        # An explicit override wins over whatever was inherited.
-        ("off", "on", None, False),
-        ("on", None, None, True),
-        ("off", None, "on", False),
+        # Two-state: only an explicit "on" routes spawns. A routed create is
+        # stamped "on", so unset is Default and reads exactly like "off".
+        ("on", True),
+        ("off", False),
+        (None, False),
     ],
 )
-def test_subagent_routing_enabled_override_beats_the_inherited_state(
-    override: str | None,
-    cost_control_mode: str | None,
-    parent_mode: str | None,
-    expected: bool,
-) -> None:
-    assert (
-        subagent_routing_enabled(
-            override,
-            cost_control_mode=cost_control_mode,
-            parent_cost_control_mode=parent_mode,
-        )
-        is expected
-    )
+def test_subagent_routing_enabled_is_two_state(override: str | None, expected: bool) -> None:
+    assert subagent_routing_enabled(override) is expected
 
 
 def test_router_dir_for_session_is_owner_only(tmp_path: Path) -> None:

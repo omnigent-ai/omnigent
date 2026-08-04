@@ -1340,9 +1340,11 @@ def register_hooks_routes(
         contract; every routed verdict also lands as a
         ``routing_decision`` transcript item.
 
-        The session's subagent-routing setting is re-read on every call
-        (it is togglable mid-session), so a session whose routing is off
-        gets its spawn allowed unchanged without calling the router.
+        The session's subagent-routing switch is two-state and re-read on
+        every call (it is togglable mid-session): only an explicit ``"on"``
+        routes, and every other session gets its spawn allowed unchanged
+        without calling the router. Sessions that start on Smart Routing
+        are stamped ``"on"`` at create, so nothing is inherited here.
         Candidate models stay inside the session's own harness family
         unless the session started in auto-harness mode.
 
@@ -1398,14 +1400,7 @@ def register_hooks_routes(
             parent = await asyncio.to_thread(
                 conversation_store.get_conversation, conv.parent_conversation_id
             )
-        parent_cost_control_mode = (
-            parent.cost_control_mode_override if parent is not None else None
-        )
-        if conv is None or not subagent_routing_enabled(
-            conv.subagent_routing_override,
-            cost_control_mode=conv.cost_control_mode_override,
-            parent_cost_control_mode=parent_cost_control_mode,
-        ):
+        if conv is None or not subagent_routing_enabled(conv.subagent_routing_override):
             # Allowed unchanged, and deliberately not persisted: an
             # unrouted spawn is not a decision worth a transcript item.
             _logger.info(

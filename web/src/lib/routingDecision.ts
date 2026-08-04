@@ -90,11 +90,10 @@ export function isSessionScopedDecision(scope: RoutingScope | null | undefined):
  * ``subagent_routing_override``.
  *
  * An in-harness spawn decision (`native_subagent`) shows only while the
- * session explicitly opted its sub-agents into routing. On "Inherit" the
- * user never asked for sub-agent routing, so chips advertising per-spawn
- * picks read as a setting they didn't choose. Display gate only — the
- * decision rows stay persisted as the audit trail, and the spawns of an
- * inheriting session are still routed server-side.
+ * session's two-state switch is ``"on"``. That is now an exact mirror of
+ * behavior rather than a display policy: an unstamped session's spawns
+ * genuinely are not routed, so there is no per-spawn pick to advertise.
+ * Historic rows stay persisted as the audit trail either way.
  *
  * Session/turn decisions and child-session decisions are unaffected: those
  * follow the session's own Smart Routing switch, not this override.

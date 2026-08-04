@@ -15,6 +15,7 @@ never sees the first message pre-inference and the turn gate would never fire.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
@@ -22,7 +23,9 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+import sqlalchemy as sa
 
+from omnigent.db.db_models import SqlConversation
 from omnigent.db.utils import generate_agent_id
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, ROUTING_DECISION_LABEL_KEY
 from omnigent.server.routes._sessions.orchestration import (
@@ -615,6 +618,143 @@ async def test_a_non_auto_opt_in_value_is_rejected(client: httpx.AsyncClient) ->
     created = await _create_opt_in_session(client, str(agent["id"]))
     assert created.status_code == 400, created.text
     assert "smart_routing_harness" in created.text
+
+# ── Create-time subagent-routing stamp ──────────────────────────────────────
+#
+# The spawn gate is two-state: only an explicit ``"on"`` routes. A session that
+# starts on Smart Routing is therefore stamped once, at create, so no gate has
+# to re-derive routing from this session's (or its parent's) state later.
+
+_WRAPPER = "__wrapper__"
+_BUNDLE = "__bundle__"
+
+
+@pytest.mark.parametrize(
+    ("case", "body", "parent_cost_control", "expected"),
+    [
+        # Every shape that starts on Smart Routing is stamped, whichever seam
+        # decided the harness.
+        (
+            "top-level-auto",
+            {
+                "agent_id": _WRAPPER,
+                "harness_override": "auto",
+                "cost_control_mode_override": "on",
+                "smart_routing_message": ROUTING_MESSAGE,
+            },
+            None,
+            "on",
+        ),
+        (
+            "bundle-auto",
+            {
+                "agent_id": _BUNDLE,
+                "harness_override": "auto",
+                "cost_control_mode_override": "on",
+                "smart_routing_message": ROUTING_MESSAGE,
+            },
+            None,
+            "on",
+        ),
+        (
+            "fixed-harness-cost-control-on",
+            {
+                "agent_id": _WRAPPER,
+                "cost_control_mode_override": "on",
+                "smart_routing_message": ROUTING_MESSAGE,
+            },
+            None,
+            "on",
+        ),
+        # Not routed: nothing is written, so the blob stays as small as it was.
+        (
+            "cost-control-off",
+            {"agent_id": _WRAPPER, "cost_control_mode_override": "off"},
+            None,
+            None,
+        ),
+        ("cost-control-omitted", {"agent_id": _WRAPPER}, None, None),
+        # A child carries its own stamp copied from the parent at create; the
+        # gate never re-reads the parent.
+        ("child-of-routed-parent", {"agent_id": _BUNDLE}, "on", "on"),
+        ("child-of-unrouted-parent", {"agent_id": _BUNDLE}, None, None),
+        # An explicit caller value always wins over the stamp.
+        (
+            "explicit-off-beside-cost-control-on",
+            {
+                "agent_id": _WRAPPER,
+                "cost_control_mode_override": "on",
+                "subagent_routing_override": "off",
+                "smart_routing_message": ROUTING_MESSAGE,
+            },
+            None,
+            "off",
+        ),
+        (
+            "explicit-on-without-cost-control",
+            {"agent_id": _WRAPPER, "subagent_routing_override": "on"},
+            None,
+            "on",
+        ),
+    ],
+)
+async def test_create_stamps_subagent_routing_for_routed_sessions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    case: str,
+    body: dict[str, Any],  # type: ignore[explicit-any]
+    parent_cost_control: str | None,
+    expected: str | None,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    bundle = await create_test_agent(client, name=f"stamp-{case}")
+    agent_ids = {_WRAPPER: wrappers["claude-native"], _BUNDLE: str(bundle["id"])}
+    payload = {**body, "agent_id": agent_ids[body["agent_id"]]}
+
+    if parent_cost_control is not None or case.startswith("child-of"):
+        parent_body: dict[str, Any] = {"agent_id": str(bundle["id"])}
+        if parent_cost_control is not None:
+            parent_body["cost_control_mode_override"] = parent_cost_control
+        parent = await client.post("/v1/sessions", json=parent_body)
+        assert parent.status_code == 201, parent.text
+        payload["parent_session_id"] = parent.json()["id"]
+
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        created = await client.post("/v1/sessions", json=payload)
+    assert created.status_code == 201, created.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    assert conv.subagent_routing_override == expected
+    # The stamp is a real row write, so a client reading the session back sees it
+    # without a PATCH of its own.
+    snapshot = await client.get(f"/v1/sessions/{created.json()['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["subagent_routing_override"] == expected
+
+
+async def test_unrouted_create_writes_no_subagent_routing_key(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    # Only "on" is ever stamped: writing "off" on every ordinary create would
+    # grow the fixed-width overrides blob for no change in behavior.
+    agent = await create_test_agent(client, name="stamp-absent-key")
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "reasoning_effort": "high"},
+    )
+    assert created.status_code == 201, created.text
+
+    store = SqlAlchemyConversationStore(db_uri)
+    with store._engine.connect() as conn:
+        blob = conn.execute(
+            sa.select(SqlConversation.session_overrides).where(
+                SqlConversation.id == created.json()["id"]
+            )
+        ).scalar_one()
+    assert json.loads(blob) == {"reasoning_effort": "high"}
 
 
 async def test_native_candidates_impose_no_family_constraint() -> None:

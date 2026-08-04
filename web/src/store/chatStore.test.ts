@@ -8011,7 +8011,7 @@ describe("chatStore — setSubagentRouting", () => {
   it("optimistically writes, PATCHes the wire field, and keeps the server's value", async () => {
     seedSession("conv_sr", []);
     await useChatStore.getState().switchTo("conv_sr");
-    // Fresh session: unset → sub-agents inherit the session's routing state.
+    // Fresh session: unset, which reads as Default (sub-agents unrouted).
     expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
 
     const settled = useChatStore.getState().setSubagentRouting("on");
@@ -8049,7 +8049,7 @@ describe("chatStore — setSubagentRouting", () => {
     });
 
     await expect(useChatStore.getState().setSubagentRouting("on")).rejects.toThrow();
-    // Back to inherit: the row must not claim a state the server never persisted.
+    // Back to unset: the row must not claim a state the server never persisted.
     expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
   });
 
@@ -8062,7 +8062,7 @@ describe("chatStore — setSubagentRouting", () => {
     expect(useChatStore.getState().subagentRoutingOverride).toBe("off");
 
     await useChatStore.getState().switchTo("conv_sr5");
-    // Session-scoped: a session with no override reads back as inherit.
+    // Session-scoped: a session with no override reads back as unset.
     expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
   });
 
@@ -8078,7 +8078,7 @@ describe("chatStore — setSubagentRouting", () => {
 
 // Nothing pushes a routing-switch change to the client, so a control that only
 // ever read the bind-time snapshot would keep showing a stale value (the
-// "Inherit shown while 'on' is stored" mismatch). These pin the re-read.
+// "Default shown while 'on' is stored" mismatch). These pin the re-read.
 describe("chatStore — refreshSessionOverrides", () => {
   it("re-reads both routing switches from the server", async () => {
     seedSession("conv_ro", []);

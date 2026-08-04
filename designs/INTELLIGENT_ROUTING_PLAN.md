@@ -681,18 +681,19 @@ shipped on `routing-mvp`; decision 5 is in flight.
    per-session **Subagent routing** setting (decision 5), which *is* meaningful
    mid-flight because it only affects future spawns.
 
-5. **New per-session setting `subagent_routing_override` (`"on"` / `"off"` /
-   `null`).**  The in-session gear for Claude Code, Codex (native + SDK) and
-   Auto sessions gains a "Subagent routing: Intelligent Routing / Default" row,
-   toggleable at any time and effective on the next spawn. `null` (default)
-   **inherits the session-start choice**: an IR main agent routes its subagents,
-   a manually pinned model does not. Implementation consequences: the §5.1 relay
-   gate must re-check the setting **per call** rather than at launch — this also
-   fixes a launch-time lock-in bug where a routed session enforced subagent
-   routing forever — and the §4 P3/P4 hooks must be installed whenever the
-   server has routing capability, since a session that starts unrouted can be
-   toggled on later. **SHIPPED** (per-call gate + web row with explicit
-   Inherit option; evidence in CUJ_STATUS §2.5, last re-verified 2026-07-31).
+5. **New per-session setting `subagent_routing_override` (two-state: `"on"` or
+   anything else).**  The in-session gear for Claude Code, Codex (native + SDK)
+   and Auto sessions gains a "Subagent routing: Smart Routing / Default" row,
+   toggleable at any time and effective on the next spawn. Only `"on"` routes;
+   `"off"` and unset both mean Default. The **create route stamps `"on"`** on
+   sessions that start on Smart Routing (including a child of a routed parent),
+   so nothing is inherited at spawn time. Implementation consequences: the §5.1
+   relay gate must re-check the setting **per call** rather than at launch —
+   this also fixes a launch-time lock-in bug where a routed session enforced
+   subagent routing forever — and the §4 P3/P4 hooks must be installed whenever
+   the server has routing capability, since a session that starts unrouted can
+   be toggled on later. **SHIPPED** (per-call gate + create stamp + two-option
+   web row; evidence in CUJ_STATUS §2.5, last re-verified 2026-07-31).
 
 6. **Closes the Jul 28 meeting-note requirement** "toggle for subagent routing
    as well as main agent routing", which the CUJ audit flagged as unimplemented:
@@ -1124,9 +1125,10 @@ extends.
 14. **Subagent routing needed a per-call gate, not a launch-time install.**
     §5.1's relay read the enforcement decision once, at launch, which locked a
     routed session into enforcing subagent routing forever and made a mid-session
-    toggle impossible. Shipped: `subagent_routing_override` (`on`/`off`/`null`)
-    on the session, `null` inheriting the session-start choice; the relay
-    re-reads the session (and parent) **per call**; hooks install whenever a
+    toggle impossible. Shipped: `subagent_routing_override` on the session as a
+    two-state switch (`"on"` routes, everything else does not), stamped `"on"`
+    at create for Smart Routing sessions; the relay re-reads it **per call**;
+    hooks install whenever a
     server client exists so toggling on mid-session works; the change emits
     `omnigent.routing.subagent_override_changed` (`0fb7ea95`, web `1d030f22`,
     sticky per-harness default `2a415cf4`). Verified live in both directions

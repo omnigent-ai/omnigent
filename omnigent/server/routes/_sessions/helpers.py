@@ -7176,9 +7176,12 @@ def _validated_subagent_routing_override(value: str | None) -> str | None:
     """
     Validate a caller-supplied per-session subagent-routing switch.
 
+    Two-state: ``"on"`` routes subagent spawns and ``"off"`` / unset both
+    read as Default. ``None`` from a PATCH clears the stored value, which
+    lands the session on Default rather than inheriting anything.
+
     :param value: The candidate value, e.g. ``"on"``, or ``None`` when
-        the caller did not set / wants to clear the override (inherit
-        the session's main routing state).
+        the caller did not set / wants to clear the override.
     :returns: The value unchanged when valid, or ``None``.
     :raises OmnigentError: 400 (``invalid_input``) when *value* is
         anything other than ``"on"``, ``"off"``, or ``None``.

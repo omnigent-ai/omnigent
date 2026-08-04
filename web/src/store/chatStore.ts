@@ -384,9 +384,10 @@ export interface ChatState {
   costControlModeOverride: "on" | "off" | null;
   /**
    * Routing switch for the sub-agents the active session spawns: ``"on"``
-   * routes them, ``"off"`` runs them on the default model, ``null``
-   * inherits the session's own routing state. Session-scoped: hydrated
-   * from the snapshot on bind and written through `setSubagentRouting`.
+   * routes them, and ``"off"`` runs them on the default model. ``null``
+   * comes back for a session created before the switch became explicit and
+   * reads the same as ``"off"``. Session-scoped: hydrated from the snapshot
+   * on bind and written through `setSubagentRouting`.
    */
   subagentRoutingOverride: "on" | "off" | null;
   /**
@@ -641,10 +642,10 @@ export interface ChatState {
   /**
    * Set the active session's sub-agent routing switch — optimistic local
    * write, then PATCH; the server's canonical value (or a rollback on
-   * failure) settles the state. ``null`` clears back to inheriting the
-   * session's own routing state. No-ops when there is no active conversation.
+   * failure) settles the state. Two-state: ``"off"`` is the way back to
+   * unrouted sub-agents. No-ops when there is no active conversation.
    */
-  setSubagentRouting: (mode: "on" | "off" | null) => Promise<void>;
+  setSubagentRouting: (mode: "on" | "off") => Promise<void>;
   /**
    * Re-read the active session's routing switches (cost control + sub-agent
    * routing) from the server and apply them.

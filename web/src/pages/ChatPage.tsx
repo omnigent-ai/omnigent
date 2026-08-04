@@ -518,12 +518,11 @@ export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
   return result ?? bubbles;
 }
 
-// Hide the sub-agent spawn chips of a session that never opted its sub-agents
-// into routing: on "Inherit" (or an explicit "off") a `native_subagent`
-// decision chip would advertise a Smart Routing setting the user didn't
-// choose. The rows stay persisted (audit trail) and the session's own
-// session/turn chips are untouched. Returns the input array unchanged when
-// nothing is hidden, so the memo stays stable.
+// Hide the sub-agent spawn chips of a session whose sub-agent routing is not
+// "on": those spawns aren't routed, so a `native_subagent` decision chip would
+// advertise a per-spawn pick that isn't happening. Historic rows stay persisted
+// (audit trail) and the session's own session/turn chips are untouched. Returns
+// the input array unchanged when nothing is hidden, so the memo stays stable.
 export function stripGatedSubagentRoutingChips(
   bubbles: Bubble[],
   subagentRoutingOverride: "on" | "off" | null,
@@ -5721,15 +5720,6 @@ function formatEffortLabel(effort: string): string {
 /** Gear-modal row governing the routing of sub-agents the session spawns. */
 const SUBAGENT_ROUTING_LABEL = "Subagent routing";
 const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session spawns";
-/** Description shown while no override is persisted (the value is inherited). */
-const SUBAGENT_ROUTING_INHERITED_DESCRIPTION = "Following this session's model setting";
-/**
- * Sentinel for "no override persisted". A Select can't hold `null`, and Radix
- * fires no `onValueChange` when the displayed value is re-picked — so inherit
- * has to be its own option rather than a value the effective state collapses
- * onto, otherwise picking the shown value would silently persist nothing.
- */
-const SUBAGENT_ROUTING_INHERIT = "__inherit__";
 
 /**
  * In-session run-config modal opened from the composer's gear icon. The
@@ -5798,15 +5788,14 @@ function SessionConfigModal({
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
-  // `undefined` means "untouched", so the row mirrors the live stored value
-  // (`null` = inherit, no override persisted) for as long as the user hasn't
-  // chosen anything. A draft seeded once per open would keep showing the value
-  // the session had when the modal opened — and Save would write that stale
-  // value back — if the stored one changed underneath (a bind/refresh landing,
-  // or another client's PATCH).
-  const [pickedSubagentRouting, setPickedSubagentRouting] = useState<
-    "on" | "off" | null | undefined
-  >(undefined);
+  // `undefined` means "untouched", so the row mirrors the live stored value for
+  // as long as the user hasn't chosen anything. A draft seeded once per open
+  // would keep showing the value the session had when the modal opened — and
+  // Save would write that stale value back — if the stored one changed
+  // underneath (a bind/refresh landing, or another client's PATCH).
+  const [pickedSubagentRouting, setPickedSubagentRouting] = useState<"on" | "off" | undefined>(
+    undefined,
+  );
   useEffect(() => {
     if (!open) return;
     setDraftModelId(resolvedModelId);
@@ -5843,16 +5832,13 @@ function SessionConfigModal({
     }
   };
 
-  // With no override persisted, sub-agents inherit the session's own routing
-  // state — which the client can't always name (a spec-default-routed session
-  // routes with `costControlModeOverride` still null), so the row offers
-  // "Inherit" as its own option instead of collapsing onto "on"/"off".
-  // Untouched (`undefined`) reads through to the stored value, so what the row
-  // shows is always what is persisted until the user picks something else.
+  // Two-state row. A row stored before the switch became explicit carries no
+  // value, and that reads as Default — the same thing "off" means — so the
+  // trigger never shows a third state. Untouched (`undefined`) reads through
+  // to the stored value, so what the row shows is always what is persisted.
   const effectiveSubagentRouting =
     pickedSubagentRouting === undefined ? subagentRoutingOverride : pickedSubagentRouting;
-  const subagentRoutingInherited = effectiveSubagentRouting === null;
-  const subagentRoutingValue = effectiveSubagentRouting ?? SUBAGENT_ROUTING_INHERIT;
+  const subagentRoutingValue = effectiveSubagentRouting === "on" ? "on" : "off";
 
   const save = () => {
     // Commit the changed knobs SEQUENTIALLY, awaiting each PATCH before the
@@ -5890,11 +5876,12 @@ function SessionConfigModal({
         // plain PATCH with no slash-command injection, so ordering is free.
         // Only an explicit pick is written, and only when it still differs from
         // what the session has now: an untouched row must never persist a value
-        // the user didn't choose.
+        // the user didn't choose, and an unset store value already means "off",
+        // so picking Default on such a session writes nothing.
         if (
           subagentRoutingEligible &&
           pickedSubagentRouting !== undefined &&
-          pickedSubagentRouting !== store.subagentRoutingOverride
+          pickedSubagentRouting !== (store.subagentRoutingOverride ?? "off")
         )
           await store.setSubagentRouting(pickedSubagentRouting);
       } catch {
@@ -5993,23 +5980,14 @@ function SessionConfigModal({
           )}
           {/* Sub-agent routing. The only routing control native Claude/Codex
           sessions get: their own model is baked at launch, but each sub-agent
-          they spawn is routed per spawn. "Inherit" is the persisted no-override
-          state, so what the trigger shows is always what's stored. */}
+          they spawn is routed per spawn. Two options — a session that started
+          on Smart Routing was stamped "on" at create, so an unset value is
+          Default and the trigger always shows what's stored. */}
           {subagentRoutingEligible && (
-            <ConfigRow
-              label={SUBAGENT_ROUTING_LABEL}
-              description={
-                subagentRoutingInherited
-                  ? SUBAGENT_ROUTING_INHERITED_DESCRIPTION
-                  : SUBAGENT_ROUTING_DESCRIPTION
-              }
-            >
+            <ConfigRow label={SUBAGENT_ROUTING_LABEL} description={SUBAGENT_ROUTING_DESCRIPTION}>
               <Select
                 value={subagentRoutingValue}
-                onValueChange={(v) => {
-                  if (v === SUBAGENT_ROUTING_INHERIT) setPickedSubagentRouting(null);
-                  else setPickedSubagentRouting(v === "on" ? "on" : "off");
-                }}
+                onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
               >
                 <SelectTrigger
                   className="w-full"
@@ -6019,9 +5997,6 @@ function SessionConfigModal({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  <SelectItem value={SUBAGENT_ROUTING_INHERIT} data-subagent-routing="inherit">
-                    Inherit
-                  </SelectItem>
                   <SelectItem value="on" data-subagent-routing="on">
                     {SMART_ROUTING_LABEL}
                   </SelectItem>

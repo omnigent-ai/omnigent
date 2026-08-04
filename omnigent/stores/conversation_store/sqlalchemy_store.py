@@ -2658,8 +2658,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param subagent_routing_override: Per-session subagent-routing
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_subagent_routing_override: When ``True``, clear
-            ``subagent_routing_override`` to ``None`` (back to
-            inheriting the session's main routing state).
+            ``subagent_routing_override`` to ``None``, which reads as
+            Default (the switch is two-state; nothing is inherited).
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged.
         :param _unset_harness_override: When ``True``, clear

@@ -6720,6 +6720,7 @@ async def _create_session_from_existing_agent(
     # keep the harness they were created with and are routed in-family (see
     # the child-routing call in ``_forward_event_to_runner``).
     _force_auto_for_child = False
+    _parent_for_routing: Conversation | None = None
     if body.parent_session_id is not None:
         _parent_for_routing = await asyncio.to_thread(
             conversation_store.get_conversation, body.parent_session_id
@@ -6736,6 +6737,22 @@ async def _create_session_from_existing_agent(
                 # Non-omnigent agent (e.g. a native wrapper) — can't route
                 # harness; leave the orchestrator's choice untouched.
                 _force_auto_for_child = False
+
+    # A session that starts on Smart Routing routes the subagents it spawns.
+    # Stamped here, once, so the spawn gate reads one explicit switch instead
+    # of re-deriving it from this session's (or its parent's) routing state.
+    # Only "on" is written: unset already means Default, so stamping "off" on
+    # every ordinary create would grow the overrides blob and cost a write for
+    # no change in behavior. An explicit caller value always wins.
+    if subagent_routing_override is None and (
+        cost_control_mode_override == "on"
+        or _native_smart_routing
+        or (
+            _parent_for_routing is not None
+            and _parent_for_routing.cost_control_mode_override == "on"
+        )
+    ):
+        subagent_routing_override = "on"
 
     # Validated against the loaded spec (known harness + omnigent
     # executor type) before any row exists, mirroring the CLI's

@@ -297,12 +297,14 @@ async def _session_with_routing_flags(
 
 
 @pytest.mark.parametrize(
-    ("case", "cost_control", "subagent_routing", "routed"),
+    ("case", "cost_control", "subagent_routing", "routed", "stored"),
     [
-        ("inherit-on", "on", None, True),
-        ("inherit-off", None, None, False),
-        ("override-off", "on", "off", False),
-        ("override-on", None, "on", True),
+        # A Smart Routing create is stamped "on" server-side, so the two-state
+        # gate reads one explicit switch and the GET snapshot reports it.
+        ("stamped-on", "on", None, True, "on"),
+        ("unstamped", None, None, False, None),
+        ("override-off", "on", "off", False, "off"),
+        ("override-on", None, "on", True, "on"),
     ],
 )
 async def test_subagent_gate_follows_the_session_setting(
@@ -312,6 +314,7 @@ async def test_subagent_gate_follows_the_session_setting(
     cost_control: str | None,
     subagent_routing: str | None,
     routed: bool,
+    stored: str | None,
 ) -> None:
     session_id = await _session_with_routing_flags(
         client,
@@ -319,6 +322,11 @@ async def test_subagent_gate_follows_the_session_setting(
         cost_control=cost_control,
         subagent_routing=subagent_routing,
     )
+    # An explicit "off" sent alongside cost control survives the create stamp:
+    # the stamp only fills an unset value.
+    snapshot = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["subagent_routing_override"] == stored
     routing_client = FakeRoutingClient(
         RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
     )
@@ -344,30 +352,68 @@ async def test_subagent_gate_follows_the_session_setting(
         assert _routing_decisions(conv_store, session_id) == []
 
 
-async def test_child_inherits_the_parents_routing_state(
+async def test_routed_create_routes_its_first_spawn_without_a_patch(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    _parent, child, conv_store = await _parent_and_child(
-        client, db_uri, agent_name="routing-gate-child-inherit"
+    """A Smart Routing create is routable immediately, with no client PATCH."""
+    agent = await create_test_agent(client, name="routing-gate-create-then-spawn")
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
     )
+    assert created.status_code == 201, created.text
     routing_client = FakeRoutingClient(
         RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
     )
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         resp = await client.post(
-            f"/v1/sessions/{child.id}/hooks/route-subagent",
+            f"/v1/sessions/{created.json()['id']}/hooks/route-subagent",
+            json=SPAWN_PAYLOAD,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["action"] == "rewrite"
+    assert resp.json()["model"] == ROUTED_MODEL
+
+
+async def test_child_of_a_routed_parent_is_stamped_at_create(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client, name="routing-gate-child-stamp")
+    parent_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert parent_resp.status_code == 201, parent_resp.text
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "parent_session_id": parent_resp.json()["id"]},
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    child_id = str(child_resp.json()["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    # Stamped from the parent at create — the gate never re-reads the parent, so
+    # a child of a routed parent carries its own switch.
+    assert conv_store.get_conversation(child_id).subagent_routing_override == "on"
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep reasoning", harness="claude_code")
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
         )
     assert resp.status_code == 200, resp.text
     assert resp.json()["action"] == "rewrite"
     assert len(routing_client.calls) == 1
 
-    # The child's own "off" wins over the parent's routed state.
-    conv_store.update_conversation(child.id, subagent_routing_override="off")
+    # The child's own "off" wins over the stamp it was created with.
+    conv_store.update_conversation(child_id, subagent_routing_override="off")
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         second = await client.post(
-            f"/v1/sessions/{child.id}/hooks/route-subagent",
+            f"/v1/sessions/{child_id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
         )
     assert second.status_code == 200, second.text
@@ -392,7 +438,7 @@ async def test_patch_round_trips_the_subagent_setting_and_rejects_junk(
         snapshot = await client.get(f"/v1/sessions/{session_id}")
         assert snapshot.json()["subagent_routing_override"] == value
 
-    # Explicit null clears it back to inheriting the main routing state.
+    # Explicit null clears the stored value; the session then reads as Default.
     cleared = await client.patch(
         f"/v1/sessions/{session_id}",
         json={"subagent_routing_override": None},
@@ -543,6 +589,9 @@ async def test_auto_session_and_its_children_keep_cross_harness_picks(
         parent_conversation_id=session_id,
         agent_id=agent["id"],
     )
+    # Created through the store, so it misses the create route's stamp; apply the
+    # value that route would have copied from the routed parent.
+    conv_store.update_conversation(child.id, subagent_routing_override="on")
 
     routing_client = FakeRoutingClient(
         RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")

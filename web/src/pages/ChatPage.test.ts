@@ -604,10 +604,10 @@ describe("stripGatedSubagentRoutingChips", () => {
     expect(stripGatedSubagentRoutingChips(bubbles, "on")).toBe(bubbles);
   });
 
-  it("hides spawn chips on Inherit but keeps the session's own decisions", () => {
-    // The reported bug: an inheriting session advertised per-spawn Smart
-    // Routing it was never explicitly asked for. Its own session/turn verdicts
-    // (and legacy rows with no scope) still belong on screen.
+  it("hides spawn chips on an unset switch but keeps the session's own decisions", () => {
+    // An unset switch means the spawns were not routed, so a per-spawn chip
+    // would describe a pick that never happened. The session's own session/turn
+    // verdicts (and legacy rows with no scope) still belong on screen.
     const bubbles = [
       routingChip("rd_session", "session"),
       routingChip("rd_turn", "turn"),
