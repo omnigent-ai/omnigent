@@ -59,6 +59,12 @@ When touching `web/`:
 cd web && pnpm install && pnpm run lint && pnpm run type-check && pnpm run build
 ```
 
+When touching `editors/vscode/`:
+
+```bash
+cd editors/vscode && pnpm install && pnpm run type-check && pnpm run test && pnpm run build
+```
+
 ## Running locally
 
 Start with the smallest relevant automated test described in [Tests](#tests).
