@@ -77,7 +77,10 @@ Drive the running app through that journey and **observe the failure yourself**:
 
 - **UI bugs** — use the browser tools to navigate the app, click/type through the
   reconstructed steps, and `browser_snapshot` the state that shows the failure
-  (e.g. a missing picker, a wrong value, an error toast).
+  (e.g. a missing picker, a wrong value, an error toast). The browser tools drive
+  the desktop app's embedded browser, so a UI-journey reproduction expects a
+  desktop / embedded-browser context; if you have no browser pane to drive, say
+  so and fall back to the backend path or `needs_more_info`.
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.

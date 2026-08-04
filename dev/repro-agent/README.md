@@ -31,6 +31,22 @@ omnigent run dev/repro-agent --server http://localhost:6767 \
 The `-p` payload is the input contract — `bug_url` (required) plus an optional
 `ref` (the version the bug was reported on; informational).
 
+### Driver script (isolated worktree)
+
+`dev/repro.py` wraps the above: it prompts for the bug URL (or takes it as an
+argument), creates an **isolated git worktree** (`repro/<slug>` branch, off your
+current HEAD) so the authored test lands on its own branch without dirtying your
+checkout, and runs the agent from there.
+
+```bash
+python dev/repro.py                     # prompts for the bug URL
+python dev/repro.py https://github.com/omnigent-ai/omnigent/issues/1234
+python dev/repro.py OMNI-1234 --server http://localhost:6767 --ref v1.2.3
+```
+
+It always keeps the worktree and prints its path + branch at the end; remove it
+with `git worktree remove <path>` when done.
+
 ## What it does
 
 1. Reconstructs the user journey from the linked bug report.
