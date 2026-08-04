@@ -355,8 +355,12 @@
   --sidebar-dot-color: rgba(255, 255, 255, 0.12);
 }
 
+/* Sidebar body rows — 13px on an 18px line (the design's body step). The size
+ * rides the root font-size via --sidebar-font-size (mobile bump + the
+ * Appearance setting); the unitless ratio keeps the line at 18/13 of it. */
 .sidebar-compact-text {
   font-size: var(--sidebar-font-size);
+  line-height: 1.3846;
 }
 
 /* App-shell canvas — the transparent <main> shows it through. Light: flat
