@@ -144,6 +144,7 @@ async def test_real_codex_usage_and_model_override_cross_boundary(
         "output_tokens": 7,
         "total_tokens": 18,
         "cache_read_input_tokens": 3,
+        "model": "mock-model-override",
     }
     assert sidecar.requests(min_count=1)[0]["body"]["model"] == "mock-model-override"
 

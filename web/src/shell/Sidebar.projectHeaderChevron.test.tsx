@@ -27,7 +27,13 @@ vi.mock("@/hooks/useConversations", () => ({
     isPending: false,
     isError: false,
   }),
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
@@ -36,7 +42,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopSession: () => ({ mutate: vi.fn() }),
   // One project so a folder header renders. Empty projects are not filtered
   // out, so no conversations are needed to exercise the header layout.
-  useProjects: () => ({ data: ["My Project"] }),
+  useProjects: () => ({ data: [{ id: "p_my", name: "My Project" }] }),
   useProjectSessions: () => ({
     data: undefined,
     isLoading: false,
@@ -46,6 +52,10 @@ vi.mock("@/hooks/useConversations", () => ({
   }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -117,8 +127,21 @@ describe("project folder header icon/chevron", () => {
     renderSidebar();
     const header = headerButton("My Project");
 
+    // Project folders are real rows, not muted section labels: use a 26px row
+    // (20px line + 3px vertical padding), 8px insets/gap, and regular 13px
+    // foreground text.
+    expect(header).toHaveClass(
+      "gap-2",
+      "rounded-[var(--radius-otto-button)]",
+      "px-2",
+      "py-[3px]",
+      "sidebar-compact-text",
+      "text-foreground",
+    );
+
     const folder = header.querySelector(".lucide-folder") as HTMLElement;
     expect(folder).not.toBeNull();
+    expect(folder).toHaveClass("text-muted-foreground");
 
     // The folder icon sits in a wrapper that fades out on desktop hover/focus.
     const folderWrapper = folder.parentElement as HTMLElement;
@@ -157,6 +180,9 @@ describe("project folder header icon/chevron", () => {
     renderSidebar();
     // The "Projects" group header carries no leading icon.
     const header = headerButton("Projects");
+
+    // The parent section label remains the compact muted caption tier.
+    expect(header).toHaveClass("gap-1", "pb-2", "pl-2", "text-xs", "leading-4");
 
     expect(header.querySelector(".lucide-folder")).toBeNull();
 

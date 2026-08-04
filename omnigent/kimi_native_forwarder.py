@@ -68,8 +68,9 @@ class KimiWireItem:
     role: str
     text: str
     response_id: str
-    # "message" (a user/assistant turn → external_conversation_item) or
-    # "reasoning" (a think block → external_output_reasoning_delta).
+    # "message" (a user/assistant turn → external_conversation_item),
+    # "reasoning" (a think block → external_output_reasoning_delta), or
+    # "turn_end" (an ``end_turn`` step → external_session_status: idle).
     kind: str = "message"
 
 
@@ -209,7 +210,24 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
         )
     if row_type == "context.append_loop_event":
         event = row.get("event")
-        if not isinstance(event, dict) or event.get("type") != "content.part":
+        if not isinstance(event, dict):
+            return None
+        event_type = event.get("type")
+        if event_type == "step.end":
+            # kimi's agent loop keeps stepping while a step stops for ``tool_use``;
+            # ``end_turn`` is the only finish reason that ends the turn. Without
+            # this edge a native sub-agent never reports terminal status, so a
+            # parent orchestrator waits on it forever.
+            if event.get("finishReason") != "end_turn":
+                return None
+            return KimiWireItem(
+                line_no=line_no,
+                role="assistant",
+                text="",
+                response_id=f"kimi:turn_end:{line_no}",
+                kind="turn_end",
+            )
+        if event_type != "content.part":
             return None
         part = event.get("part")
         if not isinstance(part, dict):
@@ -305,6 +323,34 @@ async def _post_conversation_item(
     resp.raise_for_status()
 
 
+async def _post_external_session_status(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    status: str,
+    output: str,
+) -> None:
+    """POST one ``external_session_status`` event to the Sessions API.
+
+    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
+    completion that wakes the parent orchestrator's inbox — the SAME contract
+    claude-/codex-/opencode-/cursor-native use. ``output`` carries the turn's
+    final assistant text, since the runner delivers an empty result when an idle
+    edge forwards none.
+
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(
+        url,
+        headers=headers,
+        json={"type": "external_session_status", "data": {"status": status, "output": output}},
+    )
+    resp.raise_for_status()
+
+
 async def _post_reasoning_item(
     client: httpx.AsyncClient,
     *,
@@ -348,6 +394,9 @@ async def forward_kimi_wire_to_session(
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0
+    # Final assistant text of the turn in flight, forwarded on the ``end_turn``
+    # edge so the parent's inbox gets the real result instead of an empty one.
+    last_assistant_text = ""
     async with httpx.AsyncClient(timeout=15.0) as client:
         while True:
             if wire_path is None or not wire_path.exists():
@@ -362,7 +411,17 @@ async def forward_kimi_wire_to_session(
                 items = await asyncio.to_thread(read_kimi_wire_items, wire_path, last_line)
                 for item in items:
                     try:
-                        if item.kind == "reasoning":
+                        if item.kind == "turn_end":
+                            await _post_external_session_status(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                status="idle",
+                                output=last_assistant_text,
+                            )
+                            last_assistant_text = ""
+                        elif item.kind == "reasoning":
                             await _post_reasoning_item(
                                 client,
                                 base_url=base_url,
@@ -379,6 +438,8 @@ async def forward_kimi_wire_to_session(
                                 item=item,
                                 agent_name=agent_name,
                             )
+                            if item.role == "assistant":
+                                last_assistant_text = item.text
                     except httpx.HTTPError as exc:
                         _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
                         break

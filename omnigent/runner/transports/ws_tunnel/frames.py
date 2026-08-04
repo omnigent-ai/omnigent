@@ -23,7 +23,9 @@ import base64
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import cast
+
+from omnigent.json_types import JsonObject as _JsonObject
 
 
 class FrameKind(str, Enum):
@@ -296,7 +298,7 @@ def decode_frame(text: str) -> Frame:
     return _decode_known_frame(kind, msg)
 
 
-def _parse_frame_object(text: str) -> dict[str, Any]:
+def _parse_frame_object(text: str) -> _JsonObject:
     """Parse a JSON frame object.
 
     :param text: Raw JSON frame text.
@@ -304,15 +306,17 @@ def _parse_frame_object(text: str) -> dict[str, Any]:
     :raises ValueError: If the payload is not a JSON object.
     """
     try:
-        msg = json.loads(text)
+        value: object = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"frame is not valid JSON: {exc}") from exc
-    if not isinstance(msg, dict):
-        raise ValueError(f"frame must be a JSON object, got {type(msg).__name__}")
-    return msg
+    if not isinstance(value, dict):
+        raise ValueError(f"frame must be a JSON object, got {type(value).__name__}")
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError("frame object keys must be strings")
+    return cast("_JsonObject", value)
 
 
-def _parse_frame_kind(msg: dict[str, Any]) -> FrameKind:
+def _parse_frame_kind(msg: _JsonObject) -> FrameKind:
     """Parse the frame kind discriminator.
 
     :param msg: Decoded frame object.
@@ -328,7 +332,7 @@ def _parse_frame_kind(msg: dict[str, Any]) -> FrameKind:
         raise ValueError(f"unknown frame kind: {kind!r}") from exc
 
 
-def _decode_known_frame(kind: FrameKind, msg: dict[str, Any]) -> Frame:
+def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
     """Decode a frame with a validated kind.
 
     :param kind: Parsed frame kind.
@@ -363,7 +367,7 @@ def _decode_known_frame(kind: FrameKind, msg: dict[str, Any]) -> Frame:
     raise ValueError(f"unhandled frame kind: {kind.value!r}")  # pragma: no cover
 
 
-def _decode_hello(msg: dict[str, Any]) -> HelloFrame:
+def _decode_hello(msg: _JsonObject) -> HelloFrame:
     """Decode a hello frame.
 
     :param msg: Decoded frame object.
@@ -378,7 +382,7 @@ def _decode_hello(msg: dict[str, Any]) -> HelloFrame:
     )
 
 
-def _decode_request(msg: dict[str, Any]) -> RequestFrame:
+def _decode_request(msg: _JsonObject) -> RequestFrame:
     """Decode a request frame.
 
     :param msg: Decoded frame object.
@@ -396,7 +400,7 @@ def _decode_request(msg: dict[str, Any]) -> RequestFrame:
     )
 
 
-def _decode_response_head(msg: dict[str, Any]) -> ResponseHeadFrame:
+def _decode_response_head(msg: _JsonObject) -> ResponseHeadFrame:
     """Decode a response-head frame.
 
     :param msg: Decoded frame object.
@@ -409,7 +413,7 @@ def _decode_response_head(msg: dict[str, Any]) -> ResponseHeadFrame:
     )
 
 
-def _decode_response_body(msg: dict[str, Any]) -> ResponseBodyFrame:
+def _decode_response_body(msg: _JsonObject) -> ResponseBodyFrame:
     """Decode a response-body frame.
 
     :param msg: Decoded frame object.
@@ -422,7 +426,7 @@ def _decode_response_body(msg: dict[str, Any]) -> ResponseBodyFrame:
     )
 
 
-def _decode_request_cancel(msg: dict[str, Any]) -> RequestCancelFrame:
+def _decode_request_cancel(msg: _JsonObject) -> RequestCancelFrame:
     """Decode a request-cancel frame.
 
     :param msg: Decoded frame object.
@@ -434,7 +438,7 @@ def _decode_request_cancel(msg: dict[str, Any]) -> RequestCancelFrame:
     )
 
 
-def _decode_ws_open(msg: dict[str, Any]) -> WSOpenFrame:
+def _decode_ws_open(msg: _JsonObject) -> WSOpenFrame:
     """Decode a WebSocket-open frame.
 
     :param msg: Decoded frame object.
@@ -447,7 +451,7 @@ def _decode_ws_open(msg: dict[str, Any]) -> WSOpenFrame:
     )
 
 
-def _decode_ws_frame(msg: dict[str, Any]) -> WSFrame:
+def _decode_ws_frame(msg: _JsonObject) -> WSFrame:
     """Decode a WebSocket data frame.
 
     :param msg: Decoded frame object.
@@ -460,7 +464,7 @@ def _decode_ws_frame(msg: dict[str, Any]) -> WSFrame:
     )
 
 
-def _decode_ws_close(msg: dict[str, Any]) -> WSCloseFrame:
+def _decode_ws_close(msg: _JsonObject) -> WSCloseFrame:
     """Decode a WebSocket-close frame.
 
     :param msg: Decoded frame object.
@@ -473,21 +477,21 @@ def _decode_ws_close(msg: dict[str, Any]) -> WSCloseFrame:
     )
 
 
-def _required_str(msg: dict[str, Any], key: str) -> str:
+def _required_str(msg: _JsonObject, key: str) -> str:
     val = msg.get(key)
     if not isinstance(val, str):
         raise ValueError(f"frame missing required string field: {key!r}")
     return val
 
 
-def _required_int(msg: dict[str, Any], key: str) -> int:
+def _required_int(msg: _JsonObject, key: str) -> int:
     val = msg.get(key)
     if not isinstance(val, int) or isinstance(val, bool):
         raise ValueError(f"frame missing required int field: {key!r}")
     return val
 
 
-def _optional_str(msg: dict[str, Any], key: str, default: str) -> str:
+def _optional_str(msg: _JsonObject, key: str, default: str) -> str:
     """Return an optional string field.
 
     :param msg: Decoded frame object.
@@ -502,7 +506,7 @@ def _optional_str(msg: dict[str, Any], key: str, default: str) -> str:
     return val
 
 
-def _optional_bool(msg: dict[str, Any], key: str, default: bool) -> bool:
+def _optional_bool(msg: _JsonObject, key: str, default: bool) -> bool:
     """Return an optional boolean field.
 
     :param msg: Decoded frame object.
@@ -517,7 +521,7 @@ def _optional_bool(msg: dict[str, Any], key: str, default: bool) -> bool:
     return val
 
 
-def _optional_int(msg: dict[str, Any], key: str, default: int) -> int:
+def _optional_int(msg: _JsonObject, key: str, default: int) -> int:
     """Return an optional integer field.
 
     :param msg: Decoded frame object.
@@ -532,7 +536,7 @@ def _optional_int(msg: dict[str, Any], key: str, default: int) -> int:
     return val
 
 
-def _optional_body(msg: dict[str, Any]) -> str | None:
+def _optional_body(msg: _JsonObject) -> str | None:
     """Return an optional request body field.
 
     :param msg: Decoded request frame object.
@@ -545,7 +549,7 @@ def _optional_body(msg: dict[str, Any]) -> str | None:
     return val
 
 
-def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
+def _optional_str_list(msg: _JsonObject, key: str) -> list[str]:
     """Return an optional list of strings.
 
     :param msg: Decoded frame object.
@@ -559,7 +563,7 @@ def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
     return list(val)
 
 
-def _optional_headers(msg: dict[str, Any]) -> list[list[str]]:
+def _optional_headers(msg: _JsonObject) -> list[list[str]]:
     """Return optional HTTP headers.
 
     :param msg: Decoded request or response-head frame object.

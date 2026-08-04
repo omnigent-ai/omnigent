@@ -148,7 +148,7 @@ function AddDefaultPolicyDialog({
         onOpenChange(next);
       }}
     >
-      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-md">
+      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Add Global Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply globally to all sessions.</DialogDescription>
@@ -172,7 +172,6 @@ function AddDefaultPolicyDialog({
                     onChange={(e) => setFilter(e.target.value)}
                     placeholder="Filter policies..."
                     className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
-                    // eslint-disable-next-line jsx-a11y/no-autofocus
                     autoFocus
                   />
                   <div className="flex max-h-52 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
@@ -256,7 +255,7 @@ function AddDefaultPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="break-all text-[11px] text-muted-foreground">
+                      <p className="break-words text-[11px] text-muted-foreground">
                         {prop.description}
                       </p>
                     )}

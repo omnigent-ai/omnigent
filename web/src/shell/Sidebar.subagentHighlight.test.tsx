@@ -5,7 +5,7 @@
 // omitted. ConversationRow highlights the row whose id matches the active
 // route param. When the user clicks a sub-agent the URL becomes
 // `/c/<childId>`, which matches no sidebar row, so the parent row lost its
-// `bg-muted` highlight. The fix resolves the active conversation's
+// neutral sidebar-active highlight. The fix resolves the active conversation's
 // top-level root (via useActiveRootSessionId, walking parentSessionId) and
 // highlights against that, so the parent stays selected while viewing any
 // descendant.
@@ -13,6 +13,8 @@
 // We mock the conversations list (top-level only, as in production) and the
 // per-session snapshot API so the REAL useSession / useRootSessionId chain
 // resolves the child up to its root.
+
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
@@ -30,13 +32,23 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: [] }),
   useProjectSessions: () => ({ data: undefined, isLoading: false, isError: false, error: null }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -45,7 +57,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 // The snapshot API feeds the real useSession / useRootSessionId walk: the
 // child reports its parent, the parent reports null (top-level).
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/sessionsApi")>()),
+  ...(await importOriginal<typeof SessionsApiModule>()),
   getSessionSlim: vi.fn(),
 }));
 
@@ -132,6 +144,25 @@ function rowFor(id: string): HTMLElement {
 }
 
 describe("sidebar highlight while viewing a sub-agent", () => {
+  it("renders the official Omnigent wordmark instead of styled text", () => {
+    mockConversations([]);
+    renderAt("/");
+
+    const wordmark = screen.getByTestId("sidebar-wordmark");
+    expect(wordmark).toHaveAttribute("alt", "Omnigent");
+    expect(wordmark).toHaveClass("h-[15px]", "dark:invert");
+    expect(wordmark.getAttribute("src")).toContain("omnigent-wordmark");
+  });
+
+  it("sits flush to the window edge, no floating margin or border", () => {
+    mockConversations([]);
+    renderAt("/");
+
+    const sidebar = screen.getByRole("complementary", { name: "Conversations" });
+    expect(sidebar).toHaveClass("md:m-0");
+    expect(sidebar).not.toHaveClass("md:m-2", "md:rounded-[var(--radius-otto-md)]", "md:border");
+  });
+
   it("highlights the top-level parent row when the active session is its child", async () => {
     mockConversations([topLevelConv("conv_root"), topLevelConv("conv_other")]);
     // conv_child is a sub-agent of conv_root and is NOT in the sidebar list.
@@ -145,8 +176,8 @@ describe("sidebar highlight while viewing a sub-agent", () => {
     renderAt("/c/conv_child");
 
     // Once the parent walk resolves, the root's row carries the highlight.
-    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-muted"));
-    expect(rowFor("conv_other")).not.toHaveClass("bg-muted");
+    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-[var(--sidebar-active)]"));
+    expect(rowFor("conv_other")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("still highlights a top-level session viewed directly", async () => {
@@ -157,7 +188,7 @@ describe("sidebar highlight while viewing a sub-agent", () => {
 
     // A top-level session resolves to itself; highlight lands immediately and
     // doesn't bleed onto siblings.
-    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-muted"));
-    expect(rowFor("conv_other")).not.toHaveClass("bg-muted");
+    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-[var(--sidebar-active)]"));
+    expect(rowFor("conv_other")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 });

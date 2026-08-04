@@ -7,6 +7,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -19,25 +20,43 @@ const {
   projectsMock,
   moveToProjectSpy,
   deleteProjectSpy,
+  renameProjectSpy,
+  createProjectSpy,
   fetchProjectSessionIdsMock,
   conversationsRef,
+  pinnedIdsRef,
   projectSessionsMock,
+  useHostsMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
-  // Server-side "ids in this project" check that gates the remove
-  // confirmation. Defaults to "no other sessions"; tests override per case.
+  renameProjectSpy: vi.fn(),
+  createProjectSpy: vi.fn(),
+  // Stub for the exported fetchProjectSessionIds helper (kept so the module
+  // mock stays complete). Remove-from-project no longer gates on a
+  // last-session check, so nothing in these tests depends on its value.
   fetchProjectSessionIdsMock: vi.fn(() => Promise.resolve([] as string[])),
   // Latest conversations handed to the global-list mock. The useProjectSessions
   // mock derives each folder's rows from this by label, mirroring the server's
   // ?project= filter — so tests that seed project sessions via the global list
   // keep working without a separate per-project fixture.
-  conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  conversationsRef: {
+    current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
+  },
+  // Server-authoritative pinned ids. Kept in a ref (not the legacy localStorage
+  // key, which the one-time migration clears on mount) so a seeded pin survives
+  // the first render. `seedPins` sets it; the toggle mock mutates it.
+  pinnedIdsRef: { current: [] as string[] },
   // Per-project override: when a test sets projectSessionsMock[name], the folder
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
+  useHostsMock: vi.fn(),
+}));
+
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: useHostsMock,
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
@@ -50,13 +69,41 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversationBackfill: () => [],
+  // Pins are server-authoritative now. Derive the pinned set from the seeded
+  // ref intersected with the loaded conversations, so tests that seed via
+  // `seedPins` exercise the Pinned section without a separate fixture.
+  usePinnedConversations: () => {
+    const idSet = new Set(pinnedIdsRef.current);
+    return {
+      data: {
+        conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
+        filterHonored: true,
+      },
+      isSuccess: true,
+    };
+  },
+  // Reflect the toggle into the seeded ref so a test that clicks quick-pin then
+  // re-renders sees the updated Pinned set.
+  useTogglePinnedConversation: () => ({
+    mutate: ({ id, pinned }: { id: string; pinned: boolean }) => {
+      const ids = pinnedIdsRef.current;
+      pinnedIdsRef.current = pinned
+        ? [id, ...ids.filter((x) => x !== id)]
+        : ids.filter((x) => x !== id);
+    },
+  }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   // Project feature: the sidebar reads the project list to build project
   // sections, and rows fire useMoveToProject from the kebab menu. Both must
   // be stubbed or the Sidebar throws on render.
-  useProjects: () => ({ data: projectsMock }),
+  // Tests push project NAMES into projectsMock; expose them as first-class
+  // {id, name} folders (synthetic id per name) to match useProjects' shape.
+  useProjects: () => ({
+    data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
+  }),
   // Each project folder fetches its own sessions (server-side ?project=). Derive
   // them from the global-list fixture by label so existing tests keep seeding
   // project sessions there. Single page, no pagination, in this mock.
@@ -66,7 +113,7 @@ vi.mock("@/hooks/useConversations", () => ({
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
+          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
         ));
     return {
       data: enabled
@@ -85,6 +132,10 @@ vi.mock("@/hooks/useConversations", () => ({
   },
   useMoveToProject: () => ({ mutate: moveToProjectSpy }),
   useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: fetchProjectSessionIdsMock,
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -104,6 +155,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
+import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -177,8 +229,24 @@ function showSharedTab() {
   fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
 }
 
+/** Open the Projects header kebab (expand-all / revert / select sessions). */
+function openProjectsMenu() {
+  fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+    button: 0,
+    ctrlKey: false,
+  });
+}
+
+/** Close an open dropdown menu (Radix marks the rest of the tree aria-hidden
+    while open, so folder buttons aren't queryable until it closes). */
+function closeProjectsMenu() {
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+}
+
 beforeEach(() => {
   useConvMock.mockReset();
+  useHostsMock.mockReset();
+  useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
@@ -186,12 +254,42 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockReset();
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
+  pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
+  // The bound session's startup signal (send in flight / PTY pending) feeds
+  // the row's "starting" badge; reset so one test's state can't leak.
+  useChatStore.setState({ conversationId: null, status: "idle", terminalPending: false });
 });
+
+/** Seed the server-authoritative pinned set (replaces the old localStorage seed). */
+function seedPins(ids: string[]) {
+  pinnedIdsRef.current = ids;
+}
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
+  it("keeps the session list scrollable without visible scrollbar chrome", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
+    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
+    expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
+    expect(scroller.className).not.toContain("scrollbar-gutter");
+  });
+
+  it("uses balanced title padding until row actions are revealed", () => {
+    mockConversations([conv("conv_balanced", "Codex", { title: "Balanced row title" })]);
+    renderSidebar();
+
+    const row = screen.getByText("Balanced row title").closest("a")!;
+    expect(row).toHaveClass("pr-28", "md:pr-2");
+    expect(row.className).toContain("md:group-hover:pr-14");
+    expect(row.className).toContain("md:group-focus-within:pr-14");
+    expect(row.className).not.toMatch(/(?:^|\s)md:pr-14(?:\s|$)/);
+  });
+
   it("renders no filter funnel and requests the list with archived included", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -239,19 +337,102 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("renders the footer Settings as an icon-only floating control on mobile", () => {
+  it("renders Search, Settings, and Collapse as compact header actions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
+    const headerActions = screen.getByTestId("sidebar-header-actions");
+    expect(headerActions.parentElement).toHaveClass("h-12");
+    const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
-    // Accessible name survives even though the label is visually dropped on
-    // mobile (the icon stands alone there).
+
+    expect(search).toHaveAttribute("aria-label", "Search");
+    expect(search).toHaveAttribute("data-size", "icon-xs");
+    expect(search).toHaveClass("size-6");
     expect(settings).toHaveAttribute("aria-label", "Settings");
-    // Mobile: compact square icon button, out of flow at the bottom-left.
-    expect(settings.className).toContain("max-md:size-9");
-    // The text label is desktop-only.
-    const label = within(settings).getByText("Settings");
-    expect(label.className).toContain("max-md:hidden");
+    expect(settings).toHaveAttribute("data-size", "icon-xs");
+    expect(settings).toHaveClass("size-6");
+    const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
+    expect(collapse).toHaveAttribute("data-size", "icon-xs");
+    expect(collapse).toHaveClass("size-6");
+    expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
+  });
+
+  it("renders Inbox as its own primary navigation row", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const primaryNav = screen.getByTestId("sidebar-primary-nav");
+    const inbox = within(primaryNav).getByTestId("inbox-button");
+
+    expect(primaryNav).toHaveClass("px-2", "pt-2", "pb-0");
+    expect(primaryNav).not.toHaveClass("-mt-0.5");
+    expect(inbox).toHaveAttribute("href", "/inbox");
+    expect(inbox).toHaveClass("h-8", "w-full", "justify-start");
+    expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
+    expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
+  });
+
+  it("reveals session selection as an icon action on the Sessions header", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const sessionsSection = screen.getByText("Sessions").closest("section");
+    expect(sessionsSection).not.toBeNull();
+
+    const selectSessions = within(sessionsSection!).getByRole("button", {
+      name: "Select sessions",
+    });
+    expect(selectSessions).toHaveAttribute("data-testid", "toggle-selection-mode");
+    expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
+    expect(selectSessions).not.toHaveTextContent("Select sessions");
+    expect(selectSessions.parentElement).toHaveClass(
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:group-focus-within/header:opacity-100",
+    );
+
+    fireEvent.click(selectSessions);
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+    expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
+  });
+
+  it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const scheduled = screen.getByTestId("scheduled-tasks-nav");
+    // Full-width nav ROW (a link), labeled "Automations", pointing at /tasks —
+    // not the old top-right icon button.
+    expect(scheduled).toHaveAttribute("href", "/tasks");
+    expect(scheduled).toHaveTextContent("Automations");
+    // The removed icon-button version must be gone.
+    expect(screen.queryByTestId("scheduled-tasks-button")).toBeNull();
+
+    // It sits in the primary nav group right after "New session" and before
+    // the "Inbox" row. Compare document order. (The search box now renders
+    // above this nav group upstream, so we anchor to New session + Inbox — the
+    // two items actually adjacent to Scheduled — rather than the search box.)
+    const newSession = screen.getByTestId("new-chat-button");
+    const inbox = screen.getByTestId("inbox-button");
+    expect(newSession.compareDocumentPosition(scheduled) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(scheduled.compareDocumentPosition(inbox) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("marks the 'Automations' nav row active when on /tasks", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/tasks");
+
+    // Active/selected state uses the SAME shared active-highlight as the sibling
+    // nav rows (New session / Inbox) — the `--sidebar-active` pill, not an
+    // ad-hoc bg-muted.
+    expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
+      "bg-[var(--sidebar-active)]",
+    );
   });
 
   it("does NOT close the sidebar when the footer Settings is tapped", () => {
@@ -288,7 +469,7 @@ describe("Sidebar session list", () => {
     // Active sessions still render in the Sessions list.
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
-    // The footer Settings link points at the settings page.
+    // The header Settings link points at the settings page.
     expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
   });
 
@@ -319,9 +500,9 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("shows the session-state badge OR the timestamp, never both", () => {
-    // Fresh updated_at → relativeTime renders "now", reproducing the
-    // reported bug: a status marker AND "now" side by side.
+  it("shows session-state badges without rendering session timestamps", () => {
+    // Fresh updated_at would render "now" if timestamps leaked back into
+    // session rows.
     const freshSeconds = Math.floor(Date.now() / 1000);
     mockConversations([
       conv("conv_working", "Codex", { status: "running", updated_at: freshSeconds }),
@@ -333,9 +514,7 @@ describe("Sidebar session list", () => {
     ]);
     renderSidebar();
 
-    // Working row: the running dot takes the time-marker slot and the
-    // redundant "now" is suppressed. Both appearing = the either/or rule
-    // regressed.
+    // Working rows keep their lifecycle badge without a timestamp.
     const workingRow = screen.getByRole("link", { name: /conv_working/ }).closest("li")!;
     expect(within(workingRow).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
@@ -343,8 +522,7 @@ describe("Sidebar session list", () => {
     );
     expect(within(workingRow).queryByText("now")).toBeNull();
 
-    // Awaiting row: same rule for the "Needs response" tag — any non-null
-    // session state replaces the timestamp, not just the working dot.
+    // Awaiting rows keep the "Needs response" badge without a timestamp.
     const awaitingRow = screen.getByRole("link", { name: /conv_awaiting/ }).closest("li")!;
     expect(within(awaitingRow).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
@@ -352,10 +530,163 @@ describe("Sidebar session list", () => {
     );
     expect(within(awaitingRow).queryByText("now")).toBeNull();
 
-    // Idle row: no badge, so the timestamp must still render — suppressing
-    // it everywhere would be an over-broad fix.
+    // Idle rows render neither a lifecycle badge nor a timestamp.
     const idleRow = screen.getByRole("link", { name: /conv_idle/ }).closest("li")!;
-    expect(within(idleRow).getByText("now")).toBeInTheDocument();
+    expect(within(idleRow).queryByTestId("session-state-badge")).toBeNull();
+    expect(within(idleRow).queryByText("now")).toBeNull();
+  });
+
+  it("shows a starting spinner on the bound session while a send is waking it", () => {
+    // The launch/relaunch window: the user sent a message (local status
+    // "streaming") but the server hasn't confirmed `running` — a cold boot or
+    // a send waking a disconnected runner. The row's server status is stale
+    // ("failed" after a runner disconnect), yet the sidebar must show the
+    // session is coming up, matching the chat's "Starting up…" indicator.
+    mockConversations([
+      conv("conv_waking", "Claude Code", { status: "failed" }),
+      conv("conv_other", "Claude Code"),
+    ]);
+    useChatStore.setState({ conversationId: "conv_waking", status: "streaming" });
+
+    renderSidebar();
+
+    const wakingRow = screen.getByRole("link", { name: /conv_waking/ }).closest("li")!;
+    expect(within(wakingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+    // Only the bound session reads the store signal — other rows stay bare.
+    const otherRow = screen.getByRole("link", { name: /conv_other/ }).closest("li")!;
+    expect(within(otherRow).queryByTestId("session-state-badge")).toBeNull();
+  });
+
+  it("shows the full session title in a styled tooltip on hover", async () => {
+    const title = "A long session title that is truncated in the compact sidebar row";
+    const now = new Date("2026-07-23T00:00:00Z").getTime();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    mockConversations([
+      conv("conv_tooltip", "Codex", {
+        title,
+        updated_at: (now - 2 * 24 * 60 * 60 * 1000) / 1000,
+      }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: title });
+    expect(row).not.toHaveAttribute("title");
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    await waitFor(() => {
+      const tooltip = screen.getByTestId("session-tooltip-content");
+      expect(tooltip).toHaveTextContent(title);
+      // The tooltip mirrors the pinned-project flyout's compact HoverCard look
+      // (bg-popover surface), not the old wide card.
+      expect(tooltip.className).toContain("bg-popover");
+      expect(tooltip.className).not.toContain("bg-card-solid");
+      // The title is sized to match the sidebar row name
+      // (`sidebar-compact-text`, 13px at the default), not the larger text-sm.
+      const tooltipTitle = tooltip.querySelector("p.sidebar-compact-text");
+      expect(tooltipTitle).not.toBeNull();
+      expect(tooltipTitle).toHaveTextContent(title);
+      expect(tooltip).toHaveTextContent("2d");
+      expect(within(tooltip).getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(
+        "Local machine",
+      );
+    });
+    nowSpy.mockRestore();
+  });
+
+  it("keeps title-only and worktree session rows the same centered height", () => {
+    mockConversations([
+      conv("conv_plain", "Codex", { title: "Plain session" }),
+      conv("conv_worktree", "Codex", {
+        title: "Worktree session",
+        git_branch: "fix/sidebar-row-height",
+      }),
+    ]);
+    renderSidebar();
+
+    const plainRow = screen.getByText("Plain session").closest("a")!;
+    const worktreeRow = screen.getByText("Worktree session").closest("a")!;
+
+    expect(plainRow).toHaveClass("h-8", "justify-center");
+    expect(worktreeRow).toHaveClass("h-8", "justify-center");
+    expect(within(worktreeRow).queryByText("fix/sidebar-row-height")).toBeNull();
+  });
+
+  it("reveals git branch metadata in the session tooltip on hover", async () => {
+    const branch = "fix/sidebar-row-height";
+    mockConversations([
+      conv("conv_branch_tooltip", "Codex", {
+        title: "Worktree session",
+        git_branch: branch,
+      }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByText("Worktree session").closest("a")!;
+    expect(within(row).queryByText(branch)).toBeNull();
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    await waitFor(() => {
+      expect(screen.getAllByTestId("session-tooltip-branch")[0]).toHaveTextContent(branch);
+    });
+  });
+
+  it("shares one hosts observer across multiple ordinary session rows", () => {
+    const observerMounted = vi.fn();
+    useHostsMock.mockImplementation(() => {
+      useEffect(() => {
+        observerMounted();
+      }, []);
+      return { data: [] };
+    });
+    mockConversations([
+      conv("conv_one", "Codex", { host_id: "host_one" }),
+      conv("conv_two", "Claude Code", { host_id: "host_two" }),
+      conv("conv_three", "Codex", { host_id: "host_three" }),
+    ]);
+
+    renderSidebar();
+
+    expect(screen.getByRole("link", { name: "conv_one" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "conv_two" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "conv_three" })).toBeInTheDocument();
+    expect(observerMounted).toHaveBeenCalledTimes(1);
+    expect(useHostsMock).toHaveBeenCalledWith({ includeSandbox: true });
+  });
+
+  it.each([
+    {
+      title: "resolved remote host name",
+      hostId: "host_remote",
+      hosts: [{ host_id: "host_remote", name: "Build Mac", sandbox_provider: null }],
+      expected: "Build Mac",
+    },
+    {
+      title: "sandbox provider label",
+      hostId: "host_sandbox",
+      hosts: [{ host_id: "host_sandbox", name: "Managed host", sandbox_provider: "modal" }],
+      expected: "Modal Sandbox",
+    },
+    {
+      title: "unknown host fallback",
+      hostId: "host_missing",
+      hosts: [],
+      expected: "host_missing",
+    },
+  ])("shows the $title in the session tooltip", async ({ hostId, hosts, expected }) => {
+    useHostsMock.mockReturnValue({ data: hosts });
+    mockConversations([conv("conv_location", "Codex", { host_id: hostId })]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_location" }), {
+      pointerType: "mouse",
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(expected);
+    });
   });
 });
 
@@ -451,7 +782,7 @@ describe("Sidebar tabs", () => {
       conv("conv_mine", "Claude Code"),
       conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_shared"]));
+    seedPins(["conv_shared"]);
     renderSidebar();
 
     // My sessions tab: owned session is unpinned (no Pinned section), and the
@@ -695,6 +1026,28 @@ describe("Sidebar project sections", () => {
     expect(within(projectSection).getByText("conv_far_2")).toBeInTheDocument();
   });
 
+  it("shows a window member inside the folder even when the folder's own fetch lacks it", () => {
+    // The optimistic-move frame: the row already carries the folder's
+    // first-class id in the loaded window (useMoveToProject's overlay), but
+    // the folder's own fetch answered before the PATCH committed and lacks
+    // it. The folder body unions both sources, so the just-moved row is
+    // visible immediately instead of waiting out the PATCH + refetch chain.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_unfiled", "Claude Code"),
+      conv("conv_moved", "Claude Code", { project_id: "p_Customer X" }),
+    ]);
+    projectSessionsMock.current["Customer X"] = [];
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const projectSection = screen.getByText("Customer X").closest("section")!;
+    expect(within(projectSection).getByText("conv_moved")).toBeInTheDocument();
+    // Grouped out of the flat Sessions list, not duplicated there.
+    const recentSection = screen.getByText("Sessions").closest("section")!;
+    expect(within(recentSection).queryByText("conv_moved")).toBeNull();
+  });
+
   it("offers a pencil that starts a new session pre-filed under the project", () => {
     projectsMock.push("Customer X");
     mockConversations([
@@ -784,7 +1137,7 @@ describe("Sidebar project sections", () => {
       conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     // Pin one of the filed sessions via localStorage (client-side pins).
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    seedPins(["conv_pinned"]);
     renderSidebar();
 
     // Pinned takes precedence over Project: the pinned session leaves the
@@ -826,11 +1179,14 @@ describe("Sidebar project sections", () => {
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
 
     // Open just one folder, then expand all → every folder opens and the
-    // control flips to "revert".
+    // control flips to "revert". Expand-all / revert live in the Projects
+    // header kebab, so open it before clicking the menu item.
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    openProjectsMenu();
     fireEvent.click(screen.getByTestId("expand-all-projects"));
     expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "true");
+    openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
 
     // Revert to last state → restores exactly the set that was open before
@@ -852,8 +1208,10 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     // Open every folder by hand → the control is revert (not expand-all).
+    // Expand-all / revert live in the Projects header kebab; open it to check.
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
     fireEvent.click(screen.getByRole("button", { name: /^Beta/ }));
+    openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
     expect(screen.getByTestId("revert-projects")).toBeInTheDocument();
 
@@ -864,14 +1222,18 @@ describe("Sidebar project sections", () => {
       "false",
     );
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+    openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+    closeProjectsMenu();
 
     // After expand-all, a manual collapse of one folder retires the snapshot, so
     // the next full manual expansion reverts to collapse-all (not the stale set).
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    openProjectsMenu();
     fireEvent.click(screen.getByTestId("expand-all-projects")); // snapshot = [Alpha]
     fireEvent.click(screen.getByRole("button", { name: /^Beta/ })); // manual toggle clears it
     fireEvent.click(screen.getByRole("button", { name: /^Beta/ })); // back to all open by hand
+    openProjectsMenu();
     fireEvent.click(screen.getByTestId("revert-projects"));
     expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
       "aria-expanded",
@@ -890,17 +1252,40 @@ describe("Sidebar project sections", () => {
     ]);
     renderSidebar();
 
-    // Offered while the group is expanded (default).
+    // Offered (in the header kebab) while the group is expanded (default).
+    openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+    closeProjectsMenu();
 
-    // Collapse the "Projects" group → control disappears.
+    // Collapse the "Projects" group → control disappears from the kebab.
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
     expect(screen.queryByTestId("revert-projects")).toBeNull();
+    closeProjectsMenu();
 
     // Re-expanding the group brings it back.
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+  });
+
+  it("enters session-selection mode from the Projects header kebab", () => {
+    projectsMock.push("Alpha");
+    mockConversations([
+      conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_loose", "Claude Code"),
+    ]);
+    renderSidebar();
+
+    // Not selecting yet: the bulk-action bar's exit control is absent.
+    expect(screen.queryByRole("button", { name: "Exit selection mode" })).toBeNull();
+
+    // "Select sessions" in the Projects kebab flips the whole sidebar into
+    // selection mode (same mode the Sessions-header trigger opens).
+    openProjectsMenu();
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
   });
 
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {
@@ -918,10 +1303,37 @@ describe("Sidebar project sections", () => {
     fireEvent.click(await screen.findByTestId("delete-project"));
 
     // The confirmation makes clear it removes every session, then fires the
-    // delete with the project name.
+    // delete with the folder's { id, name }.
     expect(screen.getByText(/all of its sessions/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
-    expect(deleteProjectSpy).toHaveBeenCalledWith("Customer X", expect.anything());
+    expect(deleteProjectSpy).toHaveBeenCalledWith(
+      { id: "p_Customer X", name: "Customer X" },
+      expect.anything(),
+    );
+  });
+
+  it("folds the new-session pencil into the kebab on mobile", async () => {
+    // The pencil is desktop-only (max-md:hidden); on mobile the same action is
+    // offered as a md:hidden "New session" kebab item pre-filed under the
+    // project (same ?project= link as the pencil).
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    // Pencil stays in the tree but is hidden below the md breakpoint.
+    expect(screen.getByTestId("project-new-session")).toHaveClass("max-md:hidden");
+
+    // Open the kebab → a mobile-only "New session" item linking to the same
+    // pre-filed composer.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    const menuItem = await screen.findByTestId("project-new-session-menu");
+    expect(menuItem).toHaveClass("md:hidden");
+    expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 });
 
@@ -978,7 +1390,7 @@ describe("Sidebar collapsed project marker", () => {
 // persists across reloads.
 describe("Sidebar default section collapse", () => {
   it("expands Pinned and Sessions by default when there is no stored preference", () => {
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
+    seedPins(["conv_pin"]);
     mockConversations([conv("conv_pin", "Claude Code"), conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
@@ -1011,9 +1423,22 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     localStorage.setItem("omnigent:collapsed-sidebar-sections", JSON.stringify(["Pinned"]));
     // Start with one already-pinned session (so the Pinned section renders) and
     // one unpinned session to pin.
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    seedPins(["conv_pinned"]);
     mockConversations([conv("conv_pinned", "Claude Code"), conv("conv_plain", "Claude Code")]);
-    renderSidebar();
+    // A stable tree so the rerender keeps the same Sidebar instance — the
+    // auto-expand effect compares against the PREVIOUS pinned set, which only
+    // works if the component (and its ref) survive the pinned-set change.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree());
 
     // Collapsed to start: the header reports collapsed and the pinned row hides.
     expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute(
@@ -1021,9 +1446,11 @@ describe("Sidebar auto-expand Pinned on pin", () => {
       "false",
     );
 
-    // Pin the plain row via its quick-pin control.
-    const plainRow = screen.getByRole("link", { name: /conv_plain/ }).closest("li")!;
-    fireEvent.click(within(plainRow).getByTestId("quick-pin-conversation"));
+    // A new session becomes pinned server-side (as if the toggle landed and the
+    // pinned query refetched); re-render the same tree so the effect sees the
+    // transition and auto-expands.
+    seedPins(["conv_pinned", "conv_plain"]);
+    rerender(tree());
 
     // The Pinned section auto-expands so the freshly-pinned session is visible,
     // and the expansion is persisted (dropped from the collapsed list).
@@ -1041,7 +1468,7 @@ describe("Sidebar auto-expand Pinned on pin", () => {
 describe("Sidebar pin marker visibility", () => {
   it("hover-reveals an unpin control on a pinned row (no persistent marker)", () => {
     mockConversations([conv("conv_pin", "Claude Code")]);
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
+    seedPins(["conv_pin"]);
     renderSidebar();
 
     const pinned = screen.getByText("Pinned").closest("section")!;
@@ -1085,16 +1512,17 @@ describe("Sidebar move-to-project action", () => {
     expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_move", project: "Sprint 42" });
   });
 
-  it("confirms removal only when it's the project's last session", async () => {
+  it("removes a session from its project immediately, with no confirmation", async () => {
+    // A first-class project persists when emptied, so removing a session never
+    // deletes anything — it just unfiles, even if it's the last member. No
+    // last-session check, no confirmation dialog.
     projectsMock.push("Sprint 42");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
     ]);
-    // Server reports this is the only session in the project.
-    fetchProjectSessionIdsMock.mockResolvedValue(["conv_filed"]);
     renderSidebar();
 
-    // Expand the project folder, open the filed row's kebab → Change project.
+    // Expand the project folder, open the filed row's kebab → project submenu.
     fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
     const row = screen.getByRole("link", { name: /conv_filed/ }).closest("li")!;
     fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
@@ -1103,40 +1531,8 @@ describe("Sidebar move-to-project action", () => {
     });
     fireEvent.click(await screen.findByTestId("move-to-project"));
 
-    // Last session → "Remove from <project>" opens a confirmation that says the
-    // project will be removed too; it does NOT remove immediately.
+    // "Remove from <project>" unfiles immediately (project: "") — no dialog.
     fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from Sprint 42/ }));
-    expect(await screen.findByText(/the project will be removed as well/i)).toBeInTheDocument();
-    expect(moveToProjectSpy).not.toHaveBeenCalled();
-
-    // Confirming fires the removal with an empty project (server deletes the
-    // label; the implicit project vanishes with its last session).
-    fireEvent.click(screen.getByRole("button", { name: "Remove from project" }));
-    expect(moveToProjectSpy).toHaveBeenCalledWith(
-      { id: "conv_filed", project: "" },
-      expect.anything(),
-    );
-  });
-
-  it("removes without confirmation when other sessions remain in the project", async () => {
-    projectsMock.push("Sprint 42");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
-    ]);
-    // Server reports another session is still in the project.
-    fetchProjectSessionIdsMock.mockResolvedValue(["conv_filed", "conv_other"]);
-    renderSidebar();
-
-    fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
-    const row = screen.getByRole("link", { name: /conv_filed/ }).closest("li")!;
-    fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("move-to-project"));
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from Sprint 42/ }));
-
-    // Not the last session → removes straight away, no confirmation dialog.
     await waitFor(() =>
       expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" }),
     );

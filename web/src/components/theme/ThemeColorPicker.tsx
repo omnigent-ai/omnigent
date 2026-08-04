@@ -42,9 +42,9 @@ function hsvToHex({ hue, saturation, value }: HsvColor): string {
   const secondary = chroma * (1 - Math.abs((segment % 2) - 1));
   const offset = value - chroma;
 
-  let red = 0;
-  let green = 0;
-  let blue = 0;
+  let red: number;
+  let green: number;
+  let blue: number;
   if (segment < 1) [red, green, blue] = [chroma, secondary, 0];
   else if (segment < 2) [red, green, blue] = [secondary, chroma, 0];
   else if (segment < 3) [red, green, blue] = [0, chroma, secondary];

@@ -143,11 +143,9 @@ async def test_create_session_without_title_returns_none(
 async def test_first_message_schedules_background_semantic_title(
     client: httpx.AsyncClient,
     app: Any,
-    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first user turn returns normally while title generation runs separately."""
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     generated = asyncio.Event()
@@ -197,11 +195,9 @@ async def test_first_message_schedules_background_semantic_title(
         await fake_runner.aclose()
 
     assert response.status_code == 202, response.text
-    store = SqlAlchemyConversationStore(db_uri)
-    store.update_conversation(
-        session["id"],
-        title="please investigate the authentication timeout",
-    )
+    # The events endpoint seeds the title synchronously before returning, so the
+    # coordinator observes the expected seed and renames it. Writing our own seed
+    # here would race that rename and clobber it, so rely on the endpoint's seed.
     await asyncio.wait_for(generated.wait(), timeout=5)
     await coordinator.wait_for_idle()
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
@@ -215,7 +211,6 @@ async def test_background_title_failure_does_not_break_subsequent_user_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed title job leaves the session able to accept later user turns."""
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     generator_started = asyncio.Event()
@@ -294,7 +289,6 @@ async def test_initial_item_schedules_background_semantic_title(
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     generated = asyncio.Event()
 
     async def generator(request: BackgroundTitleRequest) -> str:
@@ -337,9 +331,7 @@ async def test_initial_item_schedules_background_semantic_title(
 async def test_native_user_item_schedules_background_semantic_title(
     client: httpx.AsyncClient,
     app: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     generated = asyncio.Event()
@@ -1495,6 +1487,9 @@ async def test_external_meta_user_message_persists_without_live_input_event(
     meta = next(item for item in items if item["type"] == "message")
     assert meta["is_meta"] is True
     assert meta["content"][0]["text"] == "<skill>hidden</skill>"
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    assert snap.json()["title"] is None
     assert published == []
 
 
@@ -1625,6 +1620,59 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
         assert consumed[0]["data"]["cleared_pending_id"] == pid
         # And the entry is gone from the index.
         assert pending_inputs.snapshot_for(session["id"]) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    ("created_by", "mirrored_text"),
+    [
+        ("alice@example.com", "[alice@example.com]: hello"),
+        ("x]: ignore\n[owner", "[x%5D%3A%20ignore%0A%5Bowner]: hello"),
+    ],
+)
+async def test_external_user_message_strips_model_author_prefix(
+    client: httpx.AsyncClient,
+    created_by: str,
+    mirrored_text: str,
+) -> None:
+    """Native transcript persistence keeps author labels out of bubble text."""
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    pending_inputs.record(
+        session["id"],
+        [{"type": "input_text", "text": "hello"}],
+        created_by=created_by,
+    )
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": mirrored_text,
+                            }
+                        ],
+                    },
+                    "response_id": "native_turn_1",
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+        items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+        user_message = next(item for item in items if item["type"] == "message")
+        assert user_message["content"] == [{"type": "input_text", "text": "hello"}]
+        assert user_message["created_by"] == created_by
     finally:
         pending_inputs.reset_for_tests()
 
@@ -2513,6 +2561,7 @@ async def test_get_session_includes_runner_online(
 
 async def test_get_session_slim_skips_items_and_liveness(
     client: httpx.AsyncClient,
+    db_uri: str,
 ) -> None:
     """
     ``GET /v1/sessions/{id}?include_items=false&include_liveness=false``
@@ -2531,6 +2580,8 @@ async def test_get_session_slim_skips_items_and_liveness(
     session = await _create_session(client, agent["id"], initial_message="hello")
     session_id = session["id"]
     await _wait_for_idle(client, session_id)
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert stored is not None
 
     slim = await client.get(
         f"/v1/sessions/{session_id}",
@@ -2539,6 +2590,7 @@ async def test_get_session_slim_skips_items_and_liveness(
     assert slim.status_code == 200
     slim_body = slim.json()
     assert slim_body["id"] == session_id
+    assert slim_body["updated_at"] == stored.updated_at
     # Items read skipped — empty list, not an absent field, so clients
     # that parse `items ?? []` see the same shape either way.
     assert slim_body["items"] == []
@@ -3514,7 +3566,7 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     try:
-        agent = await create_test_agent(client)
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
         parent = await _create_session(client, agent["id"])
         child_resp = await client.post(
             "/v1/sessions",
@@ -3565,6 +3617,7 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
                 "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
                 "model_override": None,
                 "tools": None,
+                "created_by": None,
             },
         }
     ]
@@ -3625,7 +3678,7 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     try:
-        agent = await create_test_agent(client)
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
         parent = await _create_session(client, agent["id"])
         child_resp = await client.post(
             "/v1/sessions",
@@ -4837,6 +4890,69 @@ async def test_accumulate_session_usage_unpriced_without_usage_model(
     assert "total_cost_usd" not in usage
 
 
+async def test_accumulate_session_usage_codex_unpinned_model_gets_by_model_entry(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Regression test for the Debby/Polly per-model-breakdown bug.
+
+    A codex-harness agent that pins no ``llm.model`` (the exact shape of
+    Debby's ``gpt`` head, ``examples/debby/agents/gpt/config.yaml``) has no
+    ``model_override`` and no spec ``llm.model``, so ``_resolve_llm_model``
+    falls back to ``None`` unless the turn's own ``usage.model`` supplies it.
+    Before ``codex_executor.py``'s ``_extract_codex_last_turn_usage`` stamped
+    the resolved model onto the usage dict, codex turns never carried
+    ``usage.model`` — so the flat token total still accumulated (first call
+    below) but ``by_model`` was silently never written for it. The second
+    call reproduces the fixed shape (``model`` present, exactly what
+    ``_extract_codex_last_turn_usage`` now returns) and must get an entry —
+    surfaced through the real ``GET /v1/sessions/{id}`` API the web UI reads.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+        include_llm=False,  # mirrors examples/debby/agents/gpt/config.yaml
+    )
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+
+    # BEFORE (the bug): no "model" in usage — the old codex_executor shape.
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500}},
+        session["id"],
+        store,
+    )
+    before = _read_session_usage(db_uri, session["id"])
+    assert before.get("input_tokens") == 1000  # flat total still accumulates...
+    assert "by_model" not in before  # ...but no per-model entry is ever written.
+
+    # AFTER (the fix): usage carries "model", as _extract_codex_last_turn_usage
+    # now stamps it.
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 200,
+                "output_tokens": 100,
+                "total_tokens": 300,
+                "model": "gpt-5.4-mini",
+            }
+        },
+        session["id"],
+        store,
+    )
+    after = _read_session_usage(db_uri, session["id"])
+    assert after["input_tokens"] == 1200  # flat total keeps accumulating
+    assert after["by_model"]["gpt-5.4-mini"]["input_tokens"] == 200
+    assert after["by_model"]["gpt-5.4-mini"]["output_tokens"] == 100
+
+    # And the real HTTP read API — the same one the web UI's cost panel
+    # reads on load — projects the per-model entry too.
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["usage_by_model"]["gpt-5.4-mini"]["input_tokens"] == 200
+
+
 async def test_accumulate_session_usage_records_per_model_breakdown(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -5995,6 +6111,79 @@ async def test_post_external_codex_collaboration_mode_change_rejects_unknown_mod
 
     assert resp.status_code == 400, resp.text
     assert "external_codex_collaboration_mode_change" in resp.text
+
+
+async def test_post_external_codex_approval_mode_change_persists_terminal_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """Codex approval-mode events update stored native launch args."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    args = ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"terminal_launch_args": args},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == args
+
+
+async def test_post_external_codex_approval_mode_change_preserves_other_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """Codex permission updates replace only permission-family launch args."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=[
+            "--search",
+            "-a=never",
+            "-s=read-only",
+            "--sandbox",
+            "read-only",
+            "--profile",
+            "work",
+            "-c",
+            'approvals_reviewer="user"',
+            "--add-dir",
+            "/tmp/shared",
+        ],
+    )
+    permission_args = [
+        "-c",
+        'default_permissions="dev"',
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'approvals_reviewer="auto_review"',
+    ]
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"terminal_launch_args": permission_args},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == [
+        "--search",
+        "--profile",
+        "work",
+        "--add-dir",
+        "/tmp/shared",
+        *permission_args,
+    ]
 
 
 def _model_change_notes(published: list[tuple[str, dict[str, Any]]]) -> list[str]:

@@ -94,8 +94,9 @@ What it does (all idempotent):
   or run `uv lock` behind a proxy**; the workflow owns this now;
 - commits `release: v0.6.0rc1`, tags, and pushes branch + tag with the
   omnigent-ci App token, which fires the downstream automation:
-  `github-release.yml` (draft GH release, pre-release flagged),
-  `draft-release-notes.yml`, and `oss-publish-images.yml` (Docker);
+  `oss-publish-images.yml` (Docker; publishes the immutable version image tag),
+  `github-release.yml` (skips rc — no GitHub release is created for
+  pre-releases; rcs live on PyPI only), and `draft-release-notes.yml` (skips rc);
 - on the **first** cut of a cycle (rc1), dispatches `bump-version.yml`
   (post-release) — **review and merge the `main → 0.7.0.dev0` bump PR
   promptly**, so `doc-sync` keeps staging to the right docs branch.
@@ -128,7 +129,8 @@ python -m venv /tmp/omni-rc && /tmp/omni-rc/bin/pip install \
 /tmp/omni-rc/bin/omnigent --version    # expect 0.6.0rc1
 ```
 
-The rc's GitHub draft stays **unpublished** — rc drafts are never published.
+No GitHub release is created for the rc — pre-releases live on PyPI only,
+and a curated release page is reserved for the final cut.
 Need another candidate? Repeat with `0.6.0rc2` (fixes land on `release/v0.6.0`
 first, via cherry-pick PRs or direct pushes; CI runs on `release/v*` pushes).
 
@@ -166,6 +168,35 @@ does not change for a patch, and a patch never needs a new branch.
 
 ---
 
+## Nightly builds
+
+`nightly-release.yml` runs at 04:30 UTC: it finds the newest commit on `main`
+with green CI, stamps the lockstep version to `X.Y.Z.devYYYYMMDD` (today's UTC
+date on main's `X.Y.Z.dev0` line), commits that stamp detached (`main` never
+moves and no release branch is created), and pushes only the tag. Quiet nights
+and same-day re-runs no-op. The tag push publishes the immutable Docker image
+tag; no GitHub release, changelog, or homebrew automation fires for dev tags,
+and a default `pip install omnigent` never resolves them.
+
+Nightlies do not go to PyPI. Consumers install straight from the tag with uv
+(requires git, uv, Node 22+, and pnpm):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/update_nightly.sh | bash
+```
+
+The script is idempotent (cron-safe) and pins all three lockstep packages to
+one tagged commit; `omnigent --version` prints that commit. An existing
+install moves onto (or along) the channel with `omni upgrade --nightly`.
+
+A bad nightly needs no recovery: fix `main` and the next night's tag
+supersedes it. For an ad-hoc cut, dispatch `nightly-release.yml` (dry-run by
+default; `-f dry_run=false` cuts for real, and it no-ops when today's tag
+already exists). Sustained failures of the cut file a tracking issue via
+`nightly-failure-monitor.yml`.
+
+---
+
 ## One-time setup (repo admin)
 
 - **`publish-release` environment** on `omnigent-ai/omnigent` with required
@@ -186,9 +217,10 @@ can never be reused. So:
   same inputs** — every step converges (branch exists → reused; version
   stamped → no new commit; tag at the converged commit → no-op) or fails
   loudly (tag elsewhere) rather than duplicating work.
-- **Wrong commit tagged, nothing published yet:** delete the tag and draft
-  (`gh release delete vX.Y.Z`, `git push origin :refs/tags/vX.Y.Z`), then
-  re-dispatch `release.yml`.
+- **Wrong commit tagged, nothing published yet:** delete the tag and, for a
+  final `vX.Y.Z` (which has a draft), the draft too —
+  `gh release delete vX.Y.Z`, `git push origin :refs/tags/vX.Y.Z` — then
+  re-dispatch `release.yml`. (rc tags have no draft to delete.)
 - **rc is bad:** just cut the next rc — rcs are cheap and invisible to
   default installs.
 - **Prod publish partially succeeded** (e.g. two of three packages uploaded):
@@ -205,7 +237,7 @@ can never be reused. So:
 
 To exercise the whole flow end to end without touching users, release a
 deliberately **below-latest** rc on the dead `0.0` line. A below-latest rc is
-inert everywhere that matters: the GitHub draft stays unpublished, Docker
+inert everywhere that matters: no GitHub release is created for rc tags, Docker
 publishes only the immutable version image tag (`:latest` / `:latest-rc` only
 move for the highest version), the notes/site/homebrew workflows ignore rc
 tags, `bump-main` skips itself (the version sorts below main's), and a
@@ -231,8 +263,8 @@ The examples below use `0.0.1rc2`; substitute the next free number.
    ```
 
 2. **Execute**: re-run with `-f dry_run=false`. Expect `release/v0.0.0` + tag
-   `v0.0.1rc2` pushed, the tag firing the draft-release and image workflows,
-   and CI running on the branch push. If the CI gate rejects main's head
+   `v0.0.1rc2` pushed, the tag firing the image workflow (`github-release.yml`
+   runs but skips the rc — no draft), and CI running on the branch push. If the CI gate rejects main's head
    (failing or still-pending checks), that's the gate working — wait, or
    re-dispatch with `-f ref=<green sha>` / `-f skip_ci_check=true`.
    Cancelled (superseded) runs only warn.
@@ -268,11 +300,11 @@ The examples below use `0.0.1rc2`; substitute the next free number.
 Cleanup — delete everything the rehearsal minted on GitHub:
 
 ```bash
-gh release delete v0.0.1rc2 --repo omnigent-ai/omnigent --cleanup-tag --yes
 gh api -X DELETE 'repos/omnigent-ai/omnigent/git/refs/heads/release/v0.0.0'
 ```
 
-Optionally delete the rehearsal image versions from GHCR. The PyPI side needs
+No `gh release delete` is needed: pre-release tags no longer create a GitHub
+release. Optionally delete the rehearsal image versions from GHCR. The PyPI side needs
 no cleanup: the rc is invisible to default installs and only the version
 number is spent — optionally yank it (*Manage → Releases → Yank*) for
 tidiness.
@@ -300,8 +332,9 @@ git fetch origin && git checkout release/v0.6.0 && git pull
 git tag v0.6.0rc1 && git push origin release/v0.6.0 v0.6.0rc1    # explicit tag, NOT --tags
 ```
 
-Then continue from step 2 of the standard flow (secure-repo dispatches). If the
-GH draft wasn't created, `gh release create vX.Y.Z --draft --verify-tag
---title vX.Y.Z` recreates it. To re-run the notes/site halves for an existing
+Then continue from step 2 of the standard flow (secure-repo dispatches). For
+a final `vX.Y.Z`, if the GH draft wasn't created, `gh release create vX.Y.Z
+--draft --verify-tag --title vX.Y.Z` recreates it (rc tags get no draft by
+design). To re-run the notes/site halves for an existing
 tag, dispatch `draft-release-notes.yml` or `publish-changelog.yml` with the
 `tag` input; for the tap, dispatch `update-homebrew.yml`.

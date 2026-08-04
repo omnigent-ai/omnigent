@@ -130,3 +130,90 @@ describe("index.css bg-card glass rule selector", () => {
     aside.remove();
   });
 });
+
+/* Regression test for the "table link column collapses to ~2ch" bug.
+ *
+ * Streamdown styles links with `wrap-anywhere`, which also drops the
+ * element's min-content width to one character. Inside its auto-layout
+ * table that let a link-only column ("#3090") be squeezed to ~2ch and
+ * stack one character per line. index.css narrows links in table cells
+ * back to `break-word`; this pins the selector so the override keeps
+ * applying to cells only, and never leaks into prose links.
+ */
+describe("index.css table link wrapping rule", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) => block.includes('[data-streamdown="table-cell"]') && /overflow-wrap\s*:/.test(block),
+  );
+
+  // Derived lazily: a missing rule must fail the assertions below with a
+  // readable message, not crash at collection time.
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  it("has the rule this test exists to protect", () => {
+    expect(rule, "the table-cell link wrapping rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/overflow-wrap\s*:\s*break-word/);
+  });
+
+  function makeLink(cellAttr: string | null): HTMLElement {
+    const host = document.createElement("div");
+    if (cellAttr) host.setAttribute("data-streamdown", cellAttr);
+    const link = document.createElement("a");
+    link.setAttribute("data-streamdown", "link");
+    link.className = "wrap-anywhere";
+    host.appendChild(link);
+    document.body.appendChild(host);
+    return link;
+  }
+
+  it.each(["table-cell", "table-header-cell"])("targets links inside a %s", (cellAttr) => {
+    const link = makeLink(cellAttr);
+    expect(link.matches(selector)).toBe(true);
+    link.parentElement?.remove();
+  });
+
+  it("leaves links outside table cells on Streamdown's wrap-anywhere", () => {
+    // Prose links must keep `anywhere` so a bare overlong URL in a
+    // paragraph still breaks mid-token instead of overflowing.
+    const link = makeLink(null);
+    expect(link.matches(selector)).toBe(false);
+    link.parentElement?.remove();
+  });
+});
+
+/* Regression test for the "mobile sidebar is see-through" bug.
+ *
+ * Below md the sidebar is a full-screen overlay on top of the chat. The
+ * per-theme `.conversations-sidebar` rules paint its canvas with the
+ * `background` SHORTHAND, which resets background-color to transparent — and
+ * the dark stack is entirely translucent, so the conversation showed straight
+ * through. A later media-query rule restores an opaque fill under the
+ * gradients. It only works if it keeps matching the theme rules' specificity
+ * (they'd win the tie otherwise) and stays declared after them.
+ */
+describe("index.css mobile sidebar opacity", () => {
+  const mobileRule = cssSource.match(
+    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
+  )?.[0];
+
+  it("keeps an opaque fill for the mobile sidebar overlay", () => {
+    expect(mobileRule, "the mobile sidebar background-color rule is gone").toBeDefined();
+    expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+  });
+
+  it("declares it after the per-theme canvas rules so it wins the cascade", () => {
+    // Equal specificity — the shorthand in the theme rules would otherwise
+    // keep background-color transparent.
+    const light = cssSource.indexOf("html:not(.dark) .conversations-sidebar {");
+    const dark = cssSource.indexOf(".dark .conversations-sidebar {");
+    const mobile = cssSource.indexOf(mobileRule!);
+    expect(light).toBeGreaterThan(-1);
+    expect(dark).toBeGreaterThan(-1);
+    expect(mobile).toBeGreaterThan(Math.max(light, dark));
+    // Both themes must be covered, or one of them goes transparent again.
+    expect(mobileRule).toContain("html:not(.dark) .conversations-sidebar");
+    expect(mobileRule).toContain(".dark .conversations-sidebar");
+  });
+});

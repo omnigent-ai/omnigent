@@ -3,21 +3,22 @@
 // `ChatPage`, not as an inline render item — no case for it here.
 //
 // Tool-call collapsing: within a contiguous run of tool / native_tool
-// items, older tools fold into a single "See N steps" line (rendered
-// by `ToolGroupSummary`). The trailing `STREAMING_TAIL` tools (any
-// state) stay outside the group ONLY when (a) the session is still
-// running and (b) the very last item in the transcript is a tool —
-// meaning the agent hasn't produced any text/reasoning after this
-// run yet, so these tools are the live activity. Once the agent
-// emits anything else after a tool run (or once the session is
-// idle), the run collapses except for still-in-progress spinners and
-// durable routing/fan-out cards.
+// items, tools fold into a single summary line describing what's
+// hidden ("Read 2 files", rendered by `ToolGroupSummary`). While the
+// run is the live activity — the session is running and the run is
+// the last thing in the transcript — the trailing `STREAMING_TAIL`
+// tools stay visible as individual rows so the user can watch recent
+// steps; once the agent emits anything after the run (or the session
+// goes idle), the whole run folds into the one expandable line, like
+// the terminal's collapsed past turns. Still-in-progress spinners and
+// durable routing/fan-out cards never fold regardless of position.
 
 import type { ReactNode } from "react";
 import { useMemo } from "react";
 import type React from "react";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
+import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
@@ -143,8 +144,8 @@ function ZoomableMarkdownImage({ src, alt, ...props }: React.ComponentProps<"img
   return <ZoomableImage {...props} src={resolvedSrc} alt={alt ?? ""} />;
 }
 
-// Stable module-level override map so MessageResponse's memo (which ignores
-// `components` changes) never sees a new identity.
+// Stable module-level override map so MessageResponse's shallow prop compare
+// never sees a new `components` identity and re-parses needlessly.
 const FILE_PATH_AWARE_COMPONENTS = {
   inlineCode: WorkspacePathInlineCode,
   img: ZoomableMarkdownImage,
@@ -262,10 +263,11 @@ export function FilePathAwareMessageResponse({
   // streaming path. The hook must be called unconditionally (rules of hooks), so
   // non-string children (none today) pass an inert "" and bypass the result.
   const isString = typeof children === "string";
-  const throttledText = useThrottledValue(
-    isString ? (children as string) : "",
-    STREAM_MARKDOWN_THROTTLE_MS,
+  const normalizedText = useMemo(
+    () => (isString ? normalizeExplicitMathDelimiters(children as string) : ""),
+    [isString, children],
   );
+  const throttledText = useThrottledValue(normalizedText, STREAM_MARKDOWN_THROTTLE_MS);
 
   // Defense-in-depth: a string child that is huge or carries a
   // giant unbroken token (e.g. a base64 data URL serialized into the text
@@ -292,13 +294,13 @@ const STREAMING_TAIL = 3;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
+  canApprove?: boolean;
 }
 
 type ToolRunFragment =
   | {
       kind: "group";
       tools: RenderItem[];
-      count?: number;
     }
   | {
       kind: "standalone";
@@ -306,7 +308,7 @@ type ToolRunFragment =
       index: number;
     };
 
-export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
+export function BlockRenderer({ items, sessionStatus, canApprove = true }: BlockRendererProps) {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
@@ -329,28 +331,24 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
       const run = items.slice(runStart, i);
       i -= 1; // outer loop will i += 1
 
-      // Only the run at `streamingRunStart` (when set) is treated as
-      // "currently streaming". Earlier runs, and any run followed by
-      // assistant text/reasoning, collapse the same way they would
-      // when idle.
+      // Only the run at `streamingRunStart` (when set) keeps a visible
+      // tail. Earlier runs, and any run followed by assistant
+      // text/reasoning, fold entirely the same way they would when idle.
       const isStreamingRun = runStart === streamingRunStart;
       const fragments = partitionToolRun(run, isStreamingRun);
 
       if (isStreamingRun && fragments[0]?.kind === "group") {
         const [group, ...tail] = fragments;
-        // Wrap (group + trailing tail) in a single MessageContent child
-        // so the message column's `gap-2` only applies AROUND this
-        // pair, not BETWEEN them — the tail's `peer-data-[state=open]:mt-0`
-        // can then truly bring the two bordered blocks flush when the
-        // group is expanded.
+        // Wrap (fold line + trailing tail) in a single MessageContent
+        // child so the message column's `gap-2` only applies AROUND the
+        // run, not BETWEEN its rows. The tail rows sit at the same
+        // indent as the fold line — they're peers in one flat run, like
+        // the terminal's step list; only the fold's expanded contents
+        // are nested (inside `ToolGroupSummary`).
         rendered.push(
-          <div key={`tool-group-with-tail:${runStart}`}>
-            <ToolGroupSummary tools={group.tools} count={group.count} />
-            {tail.length > 0 && (
-              <div className="mt-1 ml-2 space-y-1 border-l pl-3 py-1 peer-data-[state=open]:mt-0">
-                {tail.map((fragment, idx) => renderToolRunFragment(fragment, runStart, idx))}
-              </div>
-            )}
+          <div key={`tool-group-with-tail:${runStart}`} className="space-y-1">
+            <ToolGroupSummary tools={group.tools} />
+            {tail.map((fragment, idx) => renderToolRunFragment(fragment, runStart, idx))}
           </div>,
         );
       } else {
@@ -363,53 +361,26 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
     }
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
-    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText));
+    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText, canApprove));
     previousRenderedItemWasText = item.kind === "text";
   }
 
-  return <>{rendered}</>;
+  return rendered;
 }
 
 /**
  * Split a contiguous tool run into the part that folds into the
- * "See N steps" group versus the part rendered individually.
+ * collapsed summary group versus the part rendered individually.
  *
  * For the live-streaming run, the trailing `STREAMING_TAIL` tools
  * (regardless of state) stay outside the group so the user can watch
- * the most recent activity. For any other run — older runs in the
- * transcript, or any run once the loop is idle — only still-in-progress
- * tools and persistent routing plan cards stay outside; everything else
- * folds.
+ * the most recent activity; any other run folds entirely. In-progress
+ * spinners and persistent routing plan cards never fold, so a routing
+ * judgement isn't swallowed mid-fan-out when later spawns push it past
+ * the tail window.
  */
 function partitionToolRun(run: RenderItem[], isStreamingRun: boolean): ToolRunFragment[] {
-  if (isStreamingRun) {
-    const tailStart = Math.max(0, run.length - STREAMING_TAIL);
-    const fragments: ToolRunFragment[] = [];
-    let group: RenderItem[] = [];
-    // The "See N steps" count reflects the WHOLE run (folded head + visible
-    // tail), so a folded head doesn't read "See 2 steps" with more visible.
-    const flushGroup = () => {
-      if (group.length === 0) return;
-      fragments.push({ kind: "group", tools: group, count: run.length });
-      group = [];
-    };
-    for (let index = 0; index < run.length; index += 1) {
-      const item = run[index]!;
-      // The trailing tail is the live edge; in-progress spinners and durable
-      // routing/fan-out cards never fold (mirrors the idle branch below), so a
-      // routing judgement isn't swallowed mid-fan-out when later spawns push
-      // it past the tail window.
-      if (index >= tailStart || isInProgressTool(item) || isPersistentToolCard(item)) {
-        flushGroup();
-        fragments.push({ kind: "standalone", tool: item, index });
-      } else {
-        group.push(item);
-      }
-    }
-    flushGroup();
-    return fragments;
-  }
-
+  const tailStart = isStreamingRun ? Math.max(0, run.length - STREAMING_TAIL) : run.length;
   const fragments: ToolRunFragment[] = [];
   let group: RenderItem[] = [];
   const flushGroup = () => {
@@ -417,10 +388,9 @@ function partitionToolRun(run: RenderItem[], isStreamingRun: boolean): ToolRunFr
     fragments.push({ kind: "group", tools: group });
     group = [];
   };
-
   for (let index = 0; index < run.length; index += 1) {
     const item = run[index]!;
-    if (isInProgressTool(item) || isPersistentToolCard(item)) {
+    if (index >= tailStart || isInProgressTool(item) || isPersistentToolCard(item)) {
       flushGroup();
       fragments.push({ kind: "standalone", tool: item, index });
     } else {
@@ -438,23 +408,19 @@ function renderToolRunFragment(
 ): ReactNode {
   if (fragment.kind === "group") {
     return (
-      <ToolGroupSummary
-        key={`tool-group:${runStart}:${fragmentIndex}`}
-        tools={fragment.tools}
-        count={fragment.count}
-      />
+      <ToolGroupSummary key={`tool-group:${runStart}:${fragmentIndex}`} tools={fragment.tools} />
     );
   }
   return renderItem(fragment.tool, runStart + fragment.index, false);
 }
 
-const _ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
-const _SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
+const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
+const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
 
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (_ADVISE_MODELS_NAMES.has(item.execution.name) || _SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
   );
 }
 
@@ -491,6 +457,7 @@ function renderItem(
   index: number,
   isReasoningStreaming: boolean,
   followsText = false,
+  canApprove = true,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -516,7 +483,7 @@ function renderItem(
     case "tool":
       // Intelligent routing's fan-out sizing gets a structured plan card
       // instead of the generic name(json) row + raw-JSON expansion.
-      if (_ADVISE_MODELS_NAMES.has(item.execution.name)) {
+      if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
         return (
           <SmartRoutingCard
             key={key}
@@ -587,7 +554,7 @@ function renderItem(
         />
       );
     case "elicitation":
-      return <ElicitationCard key={key} item={item} />;
+      return <ElicitationCard key={key} item={item} canApprove={canApprove} />;
   }
 }
 

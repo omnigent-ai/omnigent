@@ -68,17 +68,18 @@ describe("ConnectionIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("shows the host-offline reconnect affordance", () => {
-    // WHY: a host_offline session is unreachable — the only way back is the
-    // clickable reconnect banner with the host-specific copy.
-    render(
+  it("renders nothing for a non-terminal-first host_offline session (badge owns the affordance)", () => {
+    // WHY: the reconnect prompt for host_offline moved up into the composer's
+    // host badge (ComposerStatusLine), where the host is already named — so
+    // this band suppresses itself for a non-terminal-first session. The badge
+    // renders the clickable "Host is offline — click to reconnect" instead.
+    const { container } = render(
       <ConnectionIndicator
         liveness={{ kind: "host_offline", isOwner: true }}
         onShowReconnectHelp={onShowReconnectHelp}
       />,
     );
-    const btn = screen.getByTestId("disconnected-indicator");
-    expect(btn).toHaveTextContent(/Host is offline/);
+    expect(container).toBeEmptyDOMElement();
   });
 
   it("shows agent-disconnected copy for a local-stranded runner", () => {
@@ -198,6 +199,14 @@ describe("BubbleView dispatch", () => {
     expect(bubble).toHaveAttribute("data-role", "assistant");
     expect(bubble).toHaveTextContent("the answer is 42");
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+  });
+
+  it("uses full-width layout for assistant display math", () => {
+    render(<BubbleView bubble={assistantText(String.raw`$$d = \sqrt{x^2 + y^2}$$`)} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
   });
 
   it("marks a cancelled assistant turn as Interrupted", () => {

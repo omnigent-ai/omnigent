@@ -63,6 +63,9 @@ class UcodeWorkspaceState:
         :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) to the
         newer Sonnet generation, offered as an opt-in alongside the default
         ``"sonnet"`` tier, for workspaces that serve both side by side.
+    :param fable_enabled: Whether the user opted into ucode's premium Fable
+        family. Live refreshes preserve this policy instead of exposing Fable
+        merely because the workspace advertises it.
     :param codex_models: Ordered list of Codex model ids available on this
         workspace, e.g. ``["databricks-gpt-5-5"]``.
     :param base_urls: Mapping of tool name to base URL,
@@ -76,6 +79,7 @@ class UcodeWorkspaceState:
 
     workspace_url: str
     claude_models: dict[str, str] = field(default_factory=dict)
+    fable_enabled: bool = False
     codex_models: list[str] = field(default_factory=list)
     base_urls: dict[str, str] = field(default_factory=dict)
     available_tools: list[str] = field(default_factory=list)
@@ -162,18 +166,24 @@ def read_ucode_state(workspace_url: str) -> UcodeWorkspaceState | None:
 
     normalized = workspace_url.rstrip("/")
     ws_key: str | None = None
-    ws_data: dict | None = None
+    ws_data: dict[str, object] | None = None
     for key, value in workspaces.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
         if key.rstrip("/") == normalized:
             ws_key = key.rstrip("/")
             ws_data = value
             break
 
-    if ws_key is None or ws_data is None or not isinstance(ws_data, dict):
+    if ws_key is None or ws_data is None:
         return None
 
     claude_models_raw = ws_data.get("claude_models", {})
     claude_models = claude_models_raw if isinstance(claude_models_raw, dict) else {}
+    fable_enabled_raw = ws_data.get("fable_enabled")
+    fable_enabled = (
+        fable_enabled_raw if isinstance(fable_enabled_raw, bool) else "fable" in claude_models
+    )
 
     codex_models_raw = ws_data.get("codex_models", [])
     codex_models = codex_models_raw if isinstance(codex_models_raw, list) else []
@@ -190,6 +200,7 @@ def read_ucode_state(workspace_url: str) -> UcodeWorkspaceState | None:
     return UcodeWorkspaceState(
         workspace_url=str(ws_data.get("workspace") or ws_key),
         claude_models={str(k): str(v) for k, v in claude_models.items()},
+        fable_enabled=fable_enabled,
         codex_models=[str(m) for m in codex_models],
         base_urls={str(k): str(v) for k, v in base_urls.items()},
         available_tools=[str(t) for t in available_tools],

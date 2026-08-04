@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +59,69 @@ class TestPromptExtraction(unittest.TestCase):
             "Second question",
         )
 
+    def test_resumed_session_includes_all_trailing_user_messages(self):
+        """Batched buffered steers: all trailing user messages must reach the SDK.
+
+        When the runner collapses several buffered steered messages into one
+        continuation turn, history ends in >1 consecutive user message the SDK
+        has never seen. Sending only the last silently drops the earlier ones
+        (the two-steer "second message ignored" bug). All trailing user
+        messages must be concatenated into the prompt.
+        """
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "steer one"},
+            {"role": "user", "content": "steer two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("steer one", prompt)
+        self.assertIn("steer two", prompt)
+        # Prior turns are SDK-cached on resume — not replayed.
+        self.assertNotIn("First question", prompt)
+
+    def test_resumed_session_trailing_run_stops_at_assistant(self):
+        """Only the trailing run of user messages (after the last non-user) is sent."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "old one"},
+            {"role": "user", "content": "old two"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "new one"},
+            {"role": "user", "content": "new two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("new one", prompt)
+        self.assertIn("new two", prompt)
+        self.assertNotIn("old one", prompt)
+        self.assertNotIn("old two", prompt)
+
+    def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
+        """A multimodal message in the trailing run keeps structured blocks for all."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "describe this"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,aGVsbG8=",
+                    },
+                    {"type": "input_text", "text": "and this too"},
+                ],
+            },
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIsInstance(prompt, list)
+        types = [b.get("type") for b in prompt]
+        self.assertIn("image", types)
+        joined = " ".join(b.get("text", "") for b in prompt if b.get("type") == "text")
+        self.assertIn("describe this", joined)
+        self.assertIn("and this too", joined)
+
     def test_empty_messages(self):
         executor = self._make_executor()
         self.assertEqual(executor._build_prompt([], resume_session=False), "")
@@ -84,7 +148,35 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("ZEBRA-99", prompt)
         self.assertIn("Summarize our conversation.", prompt)
 
-    def test_historical_image_data_uri_is_replaced_with_compact_placeholder(self):
+    def test_history_unresolved_file_id_becomes_visible_marker(self):
+        # A prior-turn attachment the content resolver never inlined must
+        # not be serialized as raw block JSON — the model reads that as if
+        # the attachment were present and hallucinates its content.
+        executor = self._make_executor()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": "file_img", "filename": "photo.png"},
+                    {"type": "input_text", "text": "look at this image"},
+                ],
+            },
+            {"role": "assistant", "content": "A photo."},
+            {"role": "user", "content": "What did I show you?"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=False)
+        self.assertIn("[Attachment photo.png could not be loaded]", prompt)
+        self.assertNotIn("file_id", prompt)
+        self.assertIn("look at this image", prompt)
+
+    def _text_of(self, prompt):
+        """Join the text blocks of a structured prompt for framing assertions."""
+        return "\n".join(block["text"] for block in prompt if block.get("type") == "text")
+
+    def test_cold_reload_replays_historical_image_as_structured_block(self):
+        # A restarted/fresh SDK client must be able to *look at* an image from
+        # an earlier turn. Flattening it into a text marker leaves the model
+        # describing an attachment it cannot see.
         executor = self._make_executor()
         image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
         image_data_uri = f"data:image/png;base64,{image_payload}"
@@ -106,19 +198,26 @@ class TestPromptExtraction(unittest.TestCase):
 
         prompt = executor._build_prompt(messages, resume_session=False)
 
-        self.assertIsInstance(prompt, str)
-        self.assertNotIn("data:", prompt)
-        self.assertNotIn(image_payload, prompt)
-        self.assertIn(
-            "[image: screenshot.png, image/png, 28 base64 chars]",
-            prompt,
+        self.assertIsInstance(prompt, list)
+        images = [block for block in prompt if block.get("type") == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(
+            images[0]["source"],
+            {"type": "base64", "media_type": "image/png", "data": image_payload},
         )
-        self.assertIn("What is shown here?", prompt)
+        # The bytes travel as a structured block, never as prompt text.
+        text = self._text_of(prompt)
+        self.assertNotIn(image_payload, text)
+        self.assertNotIn("data:", text)
+        # Framing and ordering survive around the replayed image.
+        self.assertIn("Conversation so far:", text)
+        self.assertIn("What is shown here?", text)
+        self.assertIn("Respond to the latest user message", text)
+        self.assertIn("Summarize our conversation.", text)
 
-    def test_historical_file_data_uri_is_replaced_with_compact_placeholder(self):
-        # The blowup hits ALL attachments, not just images: the runner resolves a
-        # non-image file_id block to ``file_data = data:...;base64,...`` too. This
-        # locks in the field-name-independent redaction fallback for file_data.
+    def test_cold_reload_replays_historical_file_as_structured_document(self):
+        # The same fidelity requirement applies to non-image attachments: a
+        # resolved PDF must reach the SDK as a document block, not a marker.
         executor = self._make_executor()
         file_payload = base64.b64encode(b"synthetic pdf bytes").decode("ascii")
         file_data_uri = f"data:application/pdf;base64,{file_payload}"
@@ -140,14 +239,52 @@ class TestPromptExtraction(unittest.TestCase):
 
         prompt = executor._build_prompt(messages, resume_session=False)
 
-        self.assertIsInstance(prompt, str)
-        self.assertNotIn("data:", prompt)
-        self.assertNotIn(file_payload, prompt)
-        self.assertIn(
-            f"[attachment: doc.pdf, application/pdf, {len(file_payload)} base64 chars]",
-            prompt,
+        self.assertIsInstance(prompt, list)
+        documents = [block for block in prompt if block.get("type") == "document"]
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(
+            documents[0]["source"],
+            {"type": "base64", "media_type": "application/pdf", "data": file_payload},
         )
-        self.assertIn("What does this document say?", prompt)
+        text = self._text_of(prompt)
+        self.assertNotIn(file_payload, text)
+        self.assertIn("What does this document say?", text)
+
+    def test_cold_reload_keeps_unresolved_history_attachment_visible(self):
+        # A resolved and an unresolved attachment in the same history: the
+        # resolved one becomes real bytes, the unresolved one must still say
+        # so out loud rather than vanish from the structured prompt.
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{image_payload}",
+                        "filename": "resolved.png",
+                    },
+                    {
+                        "type": "input_image",
+                        "file_id": "file_missing",
+                        "filename": "lost.png",
+                    },
+                    {"type": "input_text", "text": "two attachments"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "What did I send?"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 1)
+        text = self._text_of(prompt)
+        self.assertIn("[Attachment lost.png could not be loaded]", text)
+        self.assertNotIn("file_id", text)
+        self.assertIn("two attachments", text)
 
 
 # ---------------------------------------------------------------------------
@@ -474,10 +611,7 @@ class TestConstructor(unittest.TestCase):
         generic-provider gateway path never does this (see
         ``test_neutral_gateway_no_model_does_not_inject_databricks_default``).
         """
-        from omnigent.inner.claude_sdk_executor import (
-            _DATABRICKS_CLAUDE_DEFAULT_MODEL,
-            ClaudeSDKExecutor,
-        )
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
 
         async def _t():
@@ -491,21 +625,33 @@ class TestConstructor(unittest.TestCase):
                 executor = ClaudeSDKExecutor(gateway=True)
 
             captured: dict[str, str | None] = {}
+            event_loop_thread = threading.get_ident()
+
+            def _resolve_model(provider_name: str, *, family: str) -> SimpleNamespace:
+                self.assertNotEqual(threading.get_ident(), event_loop_thread)
+                self.assertEqual((provider_name, family), ("databricks", "claude"))
+                return SimpleNamespace(model_id="catalog-databricks-claude-default")
 
             async def fake_get_or_create_client(sdk, *, session_key, options, model):
                 captured["model"] = model
                 raise RuntimeError("stop after model resolution")
 
-            with patch.object(
-                executor,
-                "_get_or_create_client",
-                side_effect=fake_get_or_create_client,
+            with (
+                patch(
+                    "omnigent.model_catalog.resolve_catalog_model",
+                    side_effect=_resolve_model,
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
             ):
                 with self.assertRaises(RuntimeError):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
-            self.assertEqual(captured["model"], _DATABRICKS_CLAUDE_DEFAULT_MODEL)
+            self.assertEqual(captured["model"], "catalog-databricks-claude-default")
 
         _run(_t())
 
@@ -2759,20 +2905,26 @@ def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> 
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd
     — so the sandbox root matches the tmux terminal and never falls back
-    to ``$HOME``. Absolute paths are honored verbatim."""
+    to ``$HOME``. Absolute paths keep their root and are resolved by
+    ``Path.resolve(strict=False)``."""
     from omnigent.inner.claude_sdk_executor import _resolve_sandbox_cwd
 
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/bobby/code/agents")
     monkeypatch.chdir("/tmp")
 
-    assert str(_resolve_sandbox_cwd(".")) == "/home/bobby/code/agents"
-    assert str(_resolve_sandbox_cwd(None)) == "/home/bobby/code/agents"
-    assert str(_resolve_sandbox_cwd("src")) == "/home/bobby/code/agents/src"
-    assert str(_resolve_sandbox_cwd("/etc/foo")) == "/etc/foo"
+    # ``_resolve_sandbox_cwd`` ends in ``Path.resolve(strict=False)``. On macOS,
+    # these literal paths route through firmlinks (``/home`` -> the automounter,
+    # ``/tmp`` -> ``/private/tmp``), so compare against the same resolution
+    # instead of literal strings. On Linux both sides are identical.
+    workspace = Path("/home/bobby/code/agents").resolve(strict=False)
+    assert _resolve_sandbox_cwd(".") == workspace
+    assert _resolve_sandbox_cwd(None) == workspace
+    assert _resolve_sandbox_cwd("src") == (workspace / "src").resolve(strict=False)
+    assert _resolve_sandbox_cwd("/etc/foo") == Path("/etc/foo").resolve(strict=False)
 
     # No workspace set → falls back to the process cwd (prior behavior).
     monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
-    assert str(_resolve_sandbox_cwd(".")) == "/tmp"
+    assert _resolve_sandbox_cwd(".") == Path("/tmp").resolve(strict=False)
 
 
 @pytest.mark.parametrize("env_value", ["1", "true", "yes"])
@@ -3219,6 +3371,100 @@ async def test_result_message_usage_populates_turn_complete_usage() -> None:
         "TurnComplete.usage is missing the 'model' key — the server cost path "
         "relies on it to price relay turns whose spec pins no llm.model."
     )
+
+
+@pytest.mark.asyncio
+async def test_result_message_is_error_yields_executor_error() -> None:
+    """``ResultMessage`` with ``is_error=True`` must surface as ``ExecutorError``.
+
+    When the SDK signals a harness-level failure (e.g. expired login, not logged
+    in), ``is_error`` is ``True`` and ``result`` carries the failure text.  The
+    executor must route this into an ``ExecutorError`` — not store it as the
+    assistant's response.
+
+    Regression guard: before the fix, ``result`` was assigned to ``response_text``
+    unconditionally, so the failure appeared as an assistant message with no error
+    item and no log line.
+    """
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError, TurnComplete
+
+    class _Sentinel:
+        pass
+
+    sdk_result = SDKResultMessage(
+        subtype="success",  # subtype is unreliable — is_error is the real signal
+        session_id="s1",
+        result="Not logged in · Please run /login",
+        total_cost_usd=0.0,
+        duration_ms=100,
+        duration_api_ms=80,
+        is_error=True,
+        num_turns=1,
+        usage=None,
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [sdk_result]
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    executor = ClaudeSDKExecutor()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+            )
+        ]
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors, (
+        "Expected at least one ExecutorError for is_error=True ResultMessage, got none. "
+        "The failure text must not be stored as assistant content."
+    )
+    assert "Not logged in" in errors[0].message, (
+        f"ExecutorError.message {errors[0].message!r} does not contain the failure text."
+    )
+
+    # Must not also appear as assistant content
+    turns = [e for e in events if isinstance(e, TurnComplete)]
+    for t in turns:
+        assert "Not logged in" not in (t.response or ""), (
+            "Failure text must not appear in TurnComplete.response"
+            " — it leaked as assistant content."
+        )
 
 
 @pytest.mark.asyncio
@@ -4197,3 +4443,44 @@ def test_find_system_claude_delegates_to_shared_resolver(monkeypatch) -> None:
     monkeypatch.setattr(cse, "resolve_cli_binary", fake_resolve)
     assert cse._find_system_claude() == "/opt/homebrew/bin/claude"
     assert captured == {"name": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
+
+
+def test_claude_sdk_does_not_claim_live_message_queue() -> None:
+    """ClaudeSDKExecutor must not advertise live message queue support.
+
+    query() queues a new turn on stdin rather than injecting into the active
+    turn, so returning True from enqueue_session_message caused a permanent
+    one-turn-behind desync (issue #3472). The executor must return False from
+    both methods so the adapter keeps the message buffered and delivers it as
+    a continuation turn after the active turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    assert executor.supports_live_message_queue() is False
+
+
+@pytest.mark.asyncio
+async def test_enqueue_session_message_returns_false_without_queuing() -> None:
+    """enqueue_session_message must return False and never call query().
+
+    Calling query() while a turn is active queues a new turn, not an
+    in-turn injection, which produces the desync from issue #3472.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    query_called = False
+
+    class _FakeClient:
+        async def query(self, *args, **kwargs):
+            nonlocal query_called
+            query_called = True
+
+    # Inject a fake client state so the session key is known.
+    executor._clients["s1"] = SimpleNamespace(client=_FakeClient())
+
+    result = await executor.enqueue_session_message("s1", "hello")
+
+    assert result is False
+    assert not query_called, "query() must not be called during enqueue"

@@ -216,3 +216,106 @@ def test_community_namespace_imports_external_harness_package(
 
     module = importlib.import_module("omnigent.community.harness.foo")
     assert module.VALUE == "ok"
+
+
+def test_builtin_background_title_generators_are_registered() -> None:
+    generators = hp.background_title_generators()
+
+    assert set(generators) >= {
+        "claude-sdk",
+        "claude-native",
+        "codex",
+        "codex-native",
+    }
+    assert generators["claude-sdk"].generator.endswith("sdk:generate_background_title")
+    assert generators["codex"].generator == generators["claude-sdk"].generator
+    assert generators["claude-native"].resolver_harness == "claude-sdk"
+    assert generators["codex-native"].resolver_harness is None
+
+
+def test_community_harness_can_register_background_title_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _contribution() -> hp.HarnessContribution:
+        return hp.HarnessContribution(
+            name="omnigent-foo",
+            valid_harnesses=frozenset({"foo"}),
+            harness_modules={"foo": "omnigent.community.harness.foo.inner.foo_harness"},
+            background_title_generators={
+                "foo": hp.BackgroundTitleGeneratorSpec(
+                    "omnigent.community.harness.foo.background_titles:generate"
+                )
+            },
+        )
+
+    _install_entry_points(monkeypatch, _EntryPoint("foo", _contribution))
+
+    generator = hp.background_title_generators()["foo"]
+    assert generator.generator == ("omnigent.community.harness.foo.background_titles:generate")
+
+
+def test_builtin_native_providers_cover_every_native_agent() -> None:
+    """Every native agent has exactly one provider row keyed by the same key."""
+    agent_keys = sorted(agent.key for agent in hp.native_agents())
+    provider_keys = sorted(provider.key for provider in hp.native_providers())
+    assert provider_keys == agent_keys
+    # No duplicate provider keys.
+    assert len(provider_keys) == len(set(provider_keys))
+
+
+def test_native_provider_for_key_lookup() -> None:
+    assert hp.native_provider_for_key("claude") is not None
+    assert hp.native_provider_for_key("claude").key == "claude"
+    assert hp.native_provider_for_key("does-not-exist") is None
+
+
+def test_builtin_native_providers_have_required_hooks() -> None:
+    """run_native, auto_create_terminal, and spawn_env_builder are mandatory."""
+    for provider in hp.native_providers():
+        assert provider.run_native, provider.key
+        assert provider.auto_create_terminal, provider.key
+        assert provider.spawn_env_builder, provider.key
+
+
+def test_builtin_native_provider_paths_resolve() -> None:
+    """Every populated built-in provider hook resolves to a real callable.
+
+    This is the guard that keeps the provider rows honest: a typo'd import path
+    or a renamed run_<x>_native symbol fails here rather than at dispatch time.
+    """
+    from omnigent import native_dispatch
+
+    for provider in hp.native_providers():
+        for hook in (
+            "run_native",
+            "auto_create_terminal",
+            "spawn_env_builder",
+            "materialize_agent_spec",
+        ):
+            resolved = native_dispatch.resolve_hook(provider, hook)
+            assert callable(resolved), f"{provider.key}.{hook} did not resolve to a callable"
+
+
+def test_builtin_native_provider_bridge_id_label_keys_match_constants() -> None:
+    """The derived bridge_id_label_key equals each harness's real constant.
+
+    ``harness_plugins`` derives the label key from the uniform
+    ``omnigent.<key>_native.bridge_id`` pattern rather than importing the bridge
+    modules (which would break its import-light contract). Pin the derivation
+    against the actual constants so a rename can't silently diverge.
+    """
+    from omnigent.antigravity_native_bridge import ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.opencode_native_bridge import OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY
+
+    expected = {
+        "codex": CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+        "opencode": OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
+        "antigravity": ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    }
+    for provider in hp.native_providers():
+        if provider.key in expected:
+            assert provider.bridge_id_label_key == expected[provider.key]
+        else:
+            # Bare builders and claude (resolved via a runner helper) carry no key.
+            assert provider.bridge_id_label_key is None, provider.key

@@ -69,6 +69,7 @@ from pathlib import Path
 import httpx
 
 from omnigent import hermes_native_status
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -92,6 +93,10 @@ _DISCOVERY_SKEW_S = 10.0
 
 _STATE_FILE = "hermes_forwarder.json"
 
+#: Event type for a one-shot reasoning (thinking) mirror, matching the
+#: codex-/opencode-native forwarders' transient reasoning contract.
+_EXTERNAL_OUTPUT_REASONING_DELTA = "external_output_reasoning_delta"
+
 # A sibling session's persisted claim (naming the same ``hermes_session_id``)
 # counts as a LIVE owner only if its heartbeat was refreshed within this window;
 # an older claim is treated as a dead session and may be taken over. Generous
@@ -114,10 +119,10 @@ def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
     _logger.warning("hermes forwarder sqlite error during %s: %s", context, exc)
 
 
-# The executor injects ``[Attached: <path>]`` markers for web-UI attachments
-# before pasting into the TUI; strip them from the mirrored bubble (the path is
-# an internal bridge detail).
-_ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
+# The executor injects ``[Attached: <path>]`` (or the could-not-load marker
+# from native_attachments) for web-UI attachments before pasting into the TUI;
+# strip them from the mirrored bubble (internal bridge details).
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
 
 # Hermes injects skill content as a user message prefixed with this marker.
 # The full skill prompt is not useful in the web UI — replace it with a
@@ -361,12 +366,30 @@ def _connect_ro(db_path: Path) -> sqlite3.Connection | None:
     via the ``-shm``; a plain connection is the fallback for the rare window where
     ``-shm`` is momentarily absent. Only SELECTs are issued.
     """
-    for uri, kw in ((f"file:{db_path}?mode=ro", {"uri": True}), (str(db_path), {})):
+    for uri, use_uri in ((f"file:{db_path}?mode=ro", True), (str(db_path), False)):
         try:
-            return sqlite3.connect(uri, timeout=5.0, **kw)
+            if use_uri:
+                return sqlite3.connect(uri, timeout=5.0, uri=True)
+            return sqlite3.connect(uri, timeout=5.0)
         except sqlite3.Error:
             continue
     return None
+
+
+def _table_columns(con: sqlite3.Connection, table: str) -> frozenset[str]:
+    """Return the set of column names on *table*, or empty on any error.
+
+    Hermes' ``state.db`` schema drifts across versions (e.g. schema_version 11
+    dropped ``sessions.cwd`` and ``messages.active`` / ``messages.compacted``
+    that older builds carried). The forwarder introspects the live schema and
+    adapts its SELECTs instead of assuming a fixed column set — otherwise a
+    single ``no such column`` error aborts discovery / mirroring and the chat
+    goes silent even though Hermes itself is working (visible in the terminal).
+    """
+    try:
+        return frozenset(str(r[1]) for r in con.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:
+        return frozenset()
 
 
 def _discover_session_id(
@@ -396,11 +419,25 @@ def _discover_session_id(
     if con is None:
         return None
     floor_s = launch_epoch_s - _DISCOVERY_SKEW_S
+    # Newer Hermes (schema_version >= 11) no longer records ``sessions.cwd``.
+    # Select it only when present; otherwise treat every row as cwd-less and
+    # rely on the started_at-since-launch fallback below (the newest lone
+    # session started after this terminal launched is this terminal's session).
+    has_cwd = "cwd" in _table_columns(con, "sessions")
     try:
-        rows = con.execute(
-            "SELECT id, cwd FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
-            (floor_s,),
-        ).fetchall()
+        if has_cwd:
+            rows = con.execute(
+                "SELECT id, cwd FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
+                (floor_s,),
+            ).fetchall()
+        else:
+            rows = [
+                (sid, None)
+                for (sid,) in con.execute(
+                    "SELECT id FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
+                    (floor_s,),
+                ).fetchall()
+            ]
     except sqlite3.Error as exc:
         _warn_sqlite_once("session discovery", exc)
         return None
@@ -482,13 +519,17 @@ def _message_to_items(
     tool_calls: object,
     tool_call_id: object,
     tool_name: object,  # noqa: ARG001 — reserved for future use (e.g. logging)
+    reasoning_content: object,
+    reasoning: object,
     agent_name: str,
 ) -> list[_MirrorItem]:
     """Convert one ``messages`` row to mirror items.
 
-    An assistant row with ``tool_calls`` emits a ``function_call`` item per
-    call, followed by a ``message`` item if it also has prose content. A tool
-    row emits a ``function_call_output`` item. Returns an empty list to skip.
+    An assistant row with reasoning emits a one-shot
+    ``external_output_reasoning_delta`` item first, then a ``function_call``
+    item per call, followed by a ``message`` item if it also has prose content.
+    A tool row emits a ``function_call_output`` item. Returns an empty list to
+    skip.
     """
     if not isinstance(role, str):
         return []
@@ -516,6 +557,24 @@ def _message_to_items(
 
     if role == "assistant":
         items: list[_MirrorItem] = []
+        # Hermes persists completed reasoning rows rather than deltas, so mirror
+        # the first available reasoning field as one event before the response.
+        thinking = ""
+        for raw in (reasoning_content, reasoning):
+            if isinstance(raw, str):
+                stripped = _ATTACHMENT_MARKER_RE.sub("", raw).strip()
+                if stripped:
+                    thinking = stripped
+                    break
+        if thinking:
+            items.append(
+                _MirrorItem(
+                    msg_id=msg_id,
+                    item_type=_EXTERNAL_OUTPUT_REASONING_DELTA,
+                    item_data={"delta": thinking, "started": True},
+                    response_id=response_id,
+                )
+            )
         # Emit the prose FIRST, then the tool calls. An assistant row's text is
         # the model's preamble ("I'll run X…") that precedes the calls it makes
         # in the same step, so the natural order is message → function_call(s).
@@ -594,11 +653,24 @@ def _read_new_items(
     con = _connect_ro(db_path)
     if con is None:
         return []
+    # ``messages.active`` (compaction soft-delete flag) was dropped in newer
+    # Hermes schemas; only filter on it when present.
+    cols = _table_columns(con, "messages")
+    active_filter = " AND active = 1" if "active" in cols else ""
+    # ``reasoning_content`` / ``reasoning`` were added in newer schemas; SELECT
+    # them only when present so a v11 (or other older) DB does not raise
+    # ``no such column``.
+    reasoning_cols = ""
+    if "reasoning_content" in cols:
+        reasoning_cols += ", reasoning_content"
+    if "reasoning" in cols:
+        reasoning_cols += ", reasoning"
     try:
         rows = con.execute(
             "SELECT id, role, content, tool_calls, tool_call_id, tool_name "
+            f"{reasoning_cols} "
             "FROM messages "
-            "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id",
+            f"WHERE session_id = ? AND id > ?{active_filter} ORDER BY id",
             (hermes_session_id, last_id),
         ).fetchall()
     except sqlite3.Error as exc:
@@ -607,9 +679,22 @@ def _read_new_items(
     finally:
         con.close()
     items: list[_MirrorItem] = []
-    for msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val in rows:
+    for row in rows:
+        # The trailing reasoning_content / reasoning columns are present
+        # only when the live schema carries them; unpack positionally.
+        msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val = row[:6]
+        reasoning_content = row[6] if len(row) > 6 and "reasoning_content" in cols else None
+        reasoning = row[-1] if len(row) > 6 and "reasoning" in cols else None
         converted = _message_to_items(
-            msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val, agent_name
+            msg_id,
+            role,
+            content,
+            tool_calls_json,
+            tool_call_id,
+            tool_name_val,
+            reasoning_content,
+            reasoning,
+            agent_name,
         )
         if converted:
             items.extend(converted)
@@ -807,7 +892,22 @@ async def _post_external_session_status(
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
 ) -> None:
-    """POST one mirrored item as an ``external_conversation_item`` event."""
+    """POST one mirrored item as the appropriate session event.
+
+    Reasoning items post a transient ``external_output_reasoning_delta`` (the
+    web finalizes the block when the assistant message lands); all others post
+    an ``external_conversation_item``.
+    """
+    if item.item_type == _EXTERNAL_OUTPUT_REASONING_DELTA:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": _EXTERNAL_OUTPUT_REASONING_DELTA,
+                "data": item.item_data,
+            },
+        )
+        resp.raise_for_status()
+        return
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -826,6 +926,11 @@ def _has_new_compaction(db_path: Path, hermes_session_id: str) -> bool:
     """Check if hermes has compacted messages for this session."""
     con = _connect_ro(db_path)
     if con is None:
+        return False
+    # ``messages.compacted`` was dropped in newer Hermes schemas; without it we
+    # cannot detect a compaction boundary here (safe: no boundary item posted).
+    if "compacted" not in _table_columns(con, "messages"):
+        con.close()
         return False
     try:
         row = con.execute(
@@ -858,10 +963,10 @@ async def _persist_hermes_compaction_item(
     compacted_messages = None
     con = _connect_ro(db_path)
     if con is not None:
+        _active = " AND active = 1" if "active" in _table_columns(con, "messages") else ""
         try:
             rows = con.execute(
-                "SELECT role, content FROM messages "
-                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                f"SELECT role, content FROM messages WHERE session_id = ?{_active} ORDER BY id",
                 (hermes_session_id,),
             ).fetchall()
             msgs = []

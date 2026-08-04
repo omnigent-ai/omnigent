@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any
 
 # Default wait budget for a UI verdict, in seconds. Held at one day
 # (86400s) — matching the deciding policy's default ``ask_timeout``: an ASK
@@ -139,7 +138,7 @@ async def wait_for_user_approval(
     *,
     elicitation_id: str,
     conversation_id: str,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
 ) -> bool:
     """

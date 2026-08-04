@@ -2,12 +2,16 @@
 // to break by removing a case — neither the walker nor the
 // individual card tests catch that. Drive it directly here.
 
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { BlockRenderer } from "./BlockRenderer";
 
 afterEach(cleanup);
@@ -19,6 +23,16 @@ const FILE_VIEWER_NOOP = {
   workspaceRoot: null,
   workspaceHome: null,
 };
+
+const renderMarkdownText = (text: string) =>
+  render(
+    <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+      <BlockRenderer
+        items={[{ kind: "text", itemId: "t1", text, final: true }]}
+        sessionStatus="idle"
+      />
+    </FileViewerContext.Provider>,
+  );
 
 describe("BlockRenderer dispatch", () => {
   it("renders a slash_command RenderItem via SlashCommandCard", () => {
@@ -221,11 +235,10 @@ describe("BlockRenderer dispatch", () => {
     expect(sections[1]!).not.toHaveClass("mt-2");
   });
 
-  it("'See N steps' counts the whole tool run, including the streaming tail", () => {
-    // While streaming, the most-recent tools render as a visible tail
-    // OUTSIDE the fold. The "See N steps" label must count the whole run
-    // (5), not just the folded part — else it reads "See 2 steps" with 3
-    // more tool cards visible below (the reported miscount).
+  it("labels the fold with only the hidden count while the tail streams", () => {
+    // The most-recent tools render as a visible tail OUTSIDE the fold, so
+    // the fold line describes only what's hidden ("Called 2 tools") — a
+    // whole-run count would double-count the tool cards visible below.
     const tool = (n: number): RenderItem => ({
       kind: "tool",
       itemId: `fc_${n}`,
@@ -252,15 +265,196 @@ describe("BlockRenderer dispatch", () => {
       tool(5),
     ];
     render(<BlockRenderer items={items} sessionStatus="running" />);
-    expect(screen.getByText("See 5 steps")).toBeDefined();
-    expect(screen.queryByText("See 2 steps")).toBeNull();
-    // The label counts the WHOLE run, but the recent tools must still be
-    // visible as a tail OUTSIDE the collapsed group — the most-recent tool
-    // renders (the collapsed group's content is unmounted), while an older
-    // one stays folded. Guards against a regression that folds everything
-    // (the count would still read 5, but the live tail would vanish).
+    expect(screen.getByText("Called 2 tools")).toBeDefined();
+    expect(screen.queryByText("Called 5 tools")).toBeNull();
+    // The recent tools must be visible as a tail OUTSIDE the collapsed
+    // group — the most-recent tool renders (the collapsed group's content
+    // is unmounted), while an older one stays folded. Guards against a
+    // regression that folds everything.
     expect(screen.getByText(/tool_5/)).toBeDefined();
     expect(screen.queryByText(/tool_1/)).toBeNull();
+  });
+
+  it("folds the whole run into one labeled row once the session is idle", () => {
+    // Mirrors the terminal's collapsed past turns: after a run
+    // completes, every step folds into a single expandable summary
+    // line labeled with the run's actions.
+    const tool = (n: number, name = `tool_${n}`): RenderItem => ({
+      kind: "tool",
+      itemId: `fc_${n}`,
+      execution: {
+        name,
+        arguments: {},
+        argsSummary: "",
+        callId: `c_${n}`,
+        agentName: "nessie",
+        executedBy: "server",
+        output: "ok",
+      },
+      output: "ok",
+      state: "output-available",
+      startedAt: null,
+      duration: undefined,
+    });
+    const items: RenderItem[] = [
+      tool(1, "Bash"),
+      tool(2, "Bash"),
+      tool(3),
+      tool(4),
+      tool(5),
+      { kind: "text", itemId: "m1", text: "Done.", final: true },
+    ];
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    // The whole run folds; the label describes all five steps.
+    expect(screen.getByText("Ran 2 shell commands, called 3 other tools")).toBeDefined();
+    expect(screen.queryByText(/tool_5/)).toBeNull();
+    expect(screen.queryByText(/Bash/)).toBeNull();
+  });
+
+  describe("math rendering", () => {
+    it("normalizes explicit TeX delimiters outside code", () => {
+      expect(normalizeExplicitMathDelimiters(String.raw`中文 \(\sqrt{x}\) 文本`)).toBe(
+        String.raw`中文 $\sqrt{x}$ 文本`,
+      );
+      expect(normalizeExplicitMathDelimiters(String.raw`\[\sqrt{x}\]`)).toBe(
+        String.raw`$$\sqrt{x}$$`,
+      );
+      expect(normalizeExplicitMathDelimiters(String.raw`\`\(\sqrt{x}\)\``)).toBe(
+        String.raw`\`\(\sqrt{x}\)\``,
+      );
+      expect(
+        normalizeExplicitMathDelimiters(["```", String.raw`\(\sqrt{x}\)`, "```"].join("\n")),
+      ).toBe(["```", String.raw`\(\sqrt{x}\)`, "```"].join("\n"));
+    });
+
+    it("leaves LaTeX line breaks inside existing display math untouched", () => {
+      // `\\[1em]` is a spaced line break, not an explicit display-math opener;
+      // converting its `\[` to `$$` would corrupt the already-`$$`-delimited block.
+      const aligned = String.raw`$$\begin{aligned} a &= b \\[1em] c &= d \end{aligned}$$`;
+      expect(normalizeExplicitMathDelimiters(aligned)).toBe(aligned);
+    });
+
+    it("does not convert delimiters already inside a dollar-math span", () => {
+      const inline = String.raw`$\[x\]$`;
+      expect(normalizeExplicitMathDelimiters(inline)).toBe(inline);
+    });
+
+    it("skips normalization inside multi-backtick inline code", () => {
+      const doubleTick = "``" + String.raw`\(x\)` + "``";
+      expect(normalizeExplicitMathDelimiters(doubleTick)).toBe(doubleTick);
+    });
+
+    it("escapes currency dollar amounts so prose isn't parsed as inline math", () => {
+      // With single-dollar math enabled, "it costs $5 or $10" would otherwise
+      // parse "5 or " as inline math. Escaping the digit-led `$` renders literal
+      // dollar figures and stops the run from flipping the math toggle.
+      expect(normalizeExplicitMathDelimiters("it costs $5 or $10")).toBe(
+        String.raw`it costs \$5 or \$10`,
+      );
+      // Delimiters after the currency text still normalize — the toggle didn't flip.
+      expect(normalizeExplicitMathDelimiters(String.raw`$5 then \(x\)`)).toBe(
+        String.raw`\$5 then $x$`,
+      );
+    });
+
+    it("does not double-escape an already-escaped dollar", () => {
+      expect(normalizeExplicitMathDelimiters(String.raw`\$5`)).toBe(String.raw`\$5`);
+    });
+
+    it("detects indented code fences per CommonMark", () => {
+      const indentedFence = ["   ```", String.raw`\(\sqrt{x}\)`, "   ```"].join("\n");
+      expect(normalizeExplicitMathDelimiters(indentedFence)).toBe(indentedFence);
+    });
+
+    it("keeps a mismatched fence marker inside a code block as literal text", () => {
+      // A `~~~` line inside a ``` block does not close it (CommonMark requires
+      // the same fence char), so delimiters there must stay verbatim.
+      const block = ["```", "~~~", String.raw`\(\sqrt{x}\)`, "```"].join("\n");
+      expect(normalizeExplicitMathDelimiters(block)).toBe(block);
+    });
+
+    it("loads required Streamdown and KaTeX styles at the app entrypoint", () => {
+      // KaTeX's DOM is mostly positioned spans. Without its stylesheet, radicals
+      // and fractions can leave only the root bar/outer shell visible while the
+      // radicand appears missing. Keep this as a source-level guard because
+      // jsdom cannot catch visual CSS layout failures. Resolve relative to this
+      // file (not process.cwd()) so the test is independent of the runner's dir.
+      const srcDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+      const entrypoints = ["main.tsx", "embed.tsx"].map((file) =>
+        readFileSync(path.join(srcDir, file), "utf8"),
+      );
+      const indexCss = readFileSync(path.join(srcDir, "index.css"), "utf8");
+
+      for (const source of entrypoints) {
+        expect(source).toContain('import "katex/dist/katex.min.css"');
+        expect(source).toContain('import "streamdown/styles.css"');
+      }
+      expect(indexCss).toContain('@source "../node_modules/streamdown/dist/*.js"');
+    });
+
+    it("renders radicals, fractions, and superscripts without dropping the radicand", async () => {
+      const { container } = renderMarkdownText(
+        String.raw`$$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$`,
+      );
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+
+      expect(katex.querySelector(".mfrac")).not.toBeNull();
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.querySelector(".vlist")).not.toBeNull();
+      expect(katex.textContent).toContain("b");
+      expect(katex.textContent).toContain("2");
+      expect(katex.textContent).toContain("4");
+      expect(katex.textContent).toContain("a");
+      expect(katex.textContent).toContain("c");
+    });
+
+    it("renders multi-term square roots used by distance formulas", async () => {
+      const { container } = renderMarkdownText(
+        String.raw`$$d = \sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2}$$`,
+      );
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.textContent).toContain("x");
+      expect(katex.textContent).toContain("y");
+      expect(katex.textContent).toContain("1");
+      expect(katex.textContent).toContain("2");
+    });
+
+    it("keeps invalid math visible instead of swallowing the message", async () => {
+      const { container } = renderMarkdownText(String.raw`$$\sqrt{$$`);
+
+      await waitFor(() => {
+        expect(container.textContent).toContain("\\sqrt");
+      });
+      expect(container.textContent).not.toBe("");
+    });
+
+    it("recovers from an incomplete streamed radical to the final KaTeX output", async () => {
+      const streamingItem = (text: string): RenderItem[] => [
+        { kind: "text", itemId: null, text, final: false },
+      ];
+      const renderStreamingMath = (text: string) => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={streamingItem(text)} sessionStatus="running" />
+        </FileViewerContext.Provider>
+      );
+
+      const { container, rerender } = render(renderStreamingMath(String.raw`$$\sqrt{`));
+      await waitFor(() => expect(container.textContent).toContain("\\sqrt"));
+
+      rerender(renderStreamingMath(String.raw`$$\sqrt{x + 1}$$`));
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.textContent).toContain("x");
+      expect(katex.textContent).toContain("1");
+    });
   });
 
   // Proves the markdown throttle is actually wired into the render path (not
@@ -460,6 +654,30 @@ const NOT_FOUND_RESPONSE = {
   json: async () => ({ error: { code: "not_found" } }),
 } as unknown as Response;
 
+interface TestFileViewerContext {
+  openFile: (path: string) => void;
+  isChangedPath: (path: string) => boolean;
+  conversationId: string | undefined;
+  workspaceRoot: string | null;
+  workspaceHome: string | null;
+}
+
+function TestProviders({
+  children,
+  queryClient,
+  fileViewerContext,
+}: {
+  children: ReactNode;
+  queryClient: QueryClient;
+  fileViewerContext: TestFileViewerContext;
+}) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <FileViewerContext.Provider value={fileViewerContext}>{children}</FileViewerContext.Provider>
+    </QueryClientProvider>
+  );
+}
+
 function renderMessage(
   text: string,
   ctx: {
@@ -470,7 +688,7 @@ function renderMessage(
     workspaceHome?: string | null;
   },
 ) {
-  const fullCtx = {
+  const fullCtx: TestFileViewerContext = {
     workspaceRoot: null,
     workspaceHome: null,
     ...ctx,
@@ -479,17 +697,10 @@ function renderMessage(
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 0 } },
   });
-  function Wrap({ children }: { children: ReactNode }) {
-    return (
-      <QueryClientProvider client={qc}>
-        <FileViewerContext.Provider value={fullCtx}>{children}</FileViewerContext.Provider>
-      </QueryClientProvider>
-    );
-  }
   return render(
-    <Wrap>
+    <TestProviders queryClient={qc} fileViewerContext={fullCtx}>
       <BlockRenderer items={items} sessionStatus="idle" />
-    </Wrap>,
+    </TestProviders>,
   );
 }
 

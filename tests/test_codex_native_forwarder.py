@@ -343,6 +343,79 @@ async def test_sync_codex_collaboration_mode_change_posts_and_dedupes() -> None:
     assert state.posted_collaboration_mode == "plan"
 
 
+@pytest.mark.asyncio
+async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
+    """Codex ``/permissions`` changes mirror to terminal_launch_args once."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "auto_review",
+                "sandboxPolicy": {"type": "danger-full-access"},
+                "activePermissionProfile": {"id": "dev", "extends": ":workspace"},
+            }
+        }
+    )
+
+    await fwd._sync_codex_approval_mode_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+    await fwd._sync_codex_approval_mode_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {
+                    "terminal_launch_args": [
+                        "-c",
+                        'default_permissions="dev"',
+                        "-c",
+                        'approval_policy="never"',
+                        "-c",
+                        'approvals_reviewer="auto_review"',
+                    ]
+                },
+            },
+        )
+    ]
+    assert state.posted_terminal_launch_args == [
+        "-c",
+        'default_permissions="dev"',
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'approvals_reviewer="auto_review"',
+    ]
+
+
+def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
+    """Legacy settings without an active profile keep approval and sandbox."""
+    assert fwd._codex_terminal_launch_args_from_settings(
+        {
+            "approvalPolicy": "on-failure",
+            "approvalsReviewer": "user",
+            "sandboxPolicy": {"type": "workspace-write"},
+        }
+    ) == [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-failure",
+        "-c",
+        'approvals_reviewer="user"',
+    ]
+
+
 @pytest.mark.parametrize(
     "content,expected",
     [

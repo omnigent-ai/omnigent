@@ -49,6 +49,7 @@ from pathlib import Path
 import httpx
 
 from omnigent._native_post_delivery import post_external_session_status
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -91,10 +92,10 @@ def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
     _logger.warning("goose forwarder sqlite error during %s: %s", context, exc)
 
 
-# The executor injects ``[Attached: <path>]`` markers for web-UI attachments
-# before pasting into the TUI; strip them from the mirrored bubble (the path is
-# an internal bridge detail).
-_ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
+# The executor injects ``[Attached: <path>]`` (or the could-not-load marker
+# from native_attachments) for web-UI attachments before pasting into the TUI;
+# strip them from the mirrored bubble (internal bridge details).
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
 
 
 def default_sessions_db() -> Path:
@@ -167,9 +168,11 @@ def _connect_ro(db_path: Path) -> sqlite3.Connection | None:
     read via the ``-shm``; a plain connection is the fallback for the rare window
     where ``-shm`` is momentarily absent. Only SELECTs are issued.
     """
-    for uri, kw in ((f"file:{db_path}?mode=ro", {"uri": True}), (str(db_path), {})):
+    for uri, use_uri in ((f"file:{db_path}?mode=ro", True), (str(db_path), False)):
         try:
-            return sqlite3.connect(uri, timeout=5.0, **kw)
+            if use_uri:
+                return sqlite3.connect(uri, timeout=5.0, uri=True)
+            return sqlite3.connect(uri, timeout=5.0)
         except sqlite3.Error:
             continue
     return None

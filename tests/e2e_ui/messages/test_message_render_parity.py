@@ -66,6 +66,39 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
+# The header Chat/Terminal switcher is a Radix dropdown whose trigger *toggles*
+# on pointer-down. On a busy page (a live terminal stream plus the trigger's own
+# hover-driven tooltip re-rendering onto the same node) a lone click can net back
+# to closed, leaving the menu shut. Reopen until the target item is on screen
+# instead of asserting a single click landed.
+_VIEW_MENU_OPEN_ATTEMPTS = 5
+_VIEW_MENU_OPEN_TIMEOUT_MS = 5_000
+
+
+def _select_view_mode(page: Page, option: str) -> None:
+    """Open the header Chat/Terminal switcher and select *option*.
+
+    Clicks the ``view-mode-toggle`` trigger and waits for the ``option`` radio
+    item; a Radix toggle-trigger click can be swallowed on a busy page, so retry
+    the open before selecting rather than trusting one click.
+
+    :param page: The Playwright page, on the session's chat surface.
+    :param option: The menu item label, e.g. ``"Chat"`` or ``"Terminal"``.
+    """
+    toggle = page.get_by_test_id("view-mode-toggle")
+    expect(toggle).to_be_visible(timeout=30_000)
+    item = page.get_by_role("menuitemradio", name=option)
+    for attempt in range(_VIEW_MENU_OPEN_ATTEMPTS):
+        toggle.click()
+        try:
+            expect(item).to_be_visible(timeout=_VIEW_MENU_OPEN_TIMEOUT_MS)
+            break
+        except AssertionError:
+            if attempt == _VIEW_MENU_OPEN_ATTEMPTS - 1:
+                raise
+    item.click()
+
+
 def _ensure_chat_view(page: Page) -> None:
     """Switch a terminal-first (native) session to its chat bubble view.
 
@@ -76,12 +109,9 @@ def _ensure_chat_view(page: Page) -> None:
 
     :param page: The Playwright page, on the session's chat surface.
     """
-    view_mode = page.get_by_role("group", name="View mode")
-    if view_mode.count() == 0:
+    if page.get_by_test_id("view-mode-toggle").count() == 0:
         return
-    chat_button = view_mode.get_by_role("button", name="Chat")
-    expect(chat_button).to_be_visible(timeout=30_000)
-    chat_button.click()
+    _select_view_mode(page, "Chat")
 
 
 def _turn_prompt(index: int, user_marker: str, assistant_token: str) -> str:
@@ -326,3 +356,37 @@ def test_custom_agent_message_render_parity(
 # is owned by the native-harness CI enablement work; until that lands, this
 # suite covers the render-parity / no-duplicate logic via the custom
 # openai-agents agent above.
+
+
+@pytest.mark.timeout(300)
+def test_tool_run_fold_semantic_label(
+    page: Page,
+    tool_fold_session: tuple[str, str],
+) -> None:
+    """A completed tool run folds into a semantic action summary, like the TUI.
+
+    The ``tool_fold_probe`` agent deterministically runs
+    ``sys_os_shell("ls")`` then ``sys_os_read("README.md")`` before
+    replying. Once the turn settles, the chat view must collapse that run
+    into a single summary row labeled with the actions taken — "Listed 1
+    directory, read 1 file" (``formatToolRunLabel`` in
+    ``web/src/lib/toolTitle.ts``) — matching the native CLIs' step
+    one-liners, not a generic "See N steps" count. Expanding the row must
+    reveal the individual tool cards.
+    """
+    base_url, session_id = tool_fold_session
+    page.goto(f"{base_url}/c/{session_id}")
+    _ensure_chat_view(page)
+    _send(page, "Inspect the workspace.")
+
+    # The fold only forms once the wrap-up text lands (a live run keeps its
+    # streaming tail visible), so waiting for the label covers the turn.
+    fold = page.get_by_text("Listed 1 directory, read 1 file", exact=True)
+    expect(fold).to_be_visible(timeout=_CUSTOM_TURN_TIMEOUT_MS)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)
+
+    # Expanding reveals the individual per-tool rows (toolTitle.ts titles:
+    # the raw command for shell, "Read <path>" for reads).
+    fold.click()
+    expect(page.get_by_text("ls", exact=True).first).to_be_visible()
+    expect(page.get_by_text("README.md").first).to_be_visible()

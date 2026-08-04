@@ -203,6 +203,10 @@ object NativeBridgeScript {
 
           window.omnigentNative = Object.freeze({
             kind: "android",
+            setColorScheme(scheme) {
+              if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
+              post({ method: "setColorScheme", scheme });
+            },
             setBadgeCount(count, options) {
               // Note: unlike iOS, the native side ignores count <= 0 — Android has
               // no badge-clear API, so a previously-set badge can't be cleared

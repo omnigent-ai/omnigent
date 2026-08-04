@@ -12,7 +12,7 @@ available (absent / ``true``). This PR makes the picker render that distinction:
   (``new-chat-landing-harness-warning``):
   ``"<agent> needs Codex authentication on <host> — run codex login on that
   machine."`` — shown for any selected Codex agent (native or brain harness).
-* the **needs-auth badge** (``new-chat-landing-harness-warning-codex``,
+* the **needs-setup badge** (``new-chat-landing-harness-warning-codex``,
   text ``"needs auth"``) on the Codex row inside a bundle agent's per-entry
   "Agent Harness" config submenu.
 
@@ -335,6 +335,11 @@ async def _drive_codex_badge(base_url: str) -> None:
             await _open_entry_config(page, "ag_polly_e2e")
             badge = page.get_by_test_id("new-chat-landing-harness-warning-codex").first
             await expect(badge).to_be_visible(timeout=30_000)
+            # This test doesn't enable OMNIGENT_HARNESS_INSTALL_ENABLED, so the
+            # picker runs on the feature-OFF default — where the badge keeps the
+            # original per-reason text ("needs auth"). (With the feature ON the
+            # badge collapses to a single "needs setup" and the reason moves into
+            # the setup dialog.)
             await expect(badge).to_contain_text("needs auth")
         finally:
             await browser.close()

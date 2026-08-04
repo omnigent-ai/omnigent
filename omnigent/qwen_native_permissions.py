@@ -41,12 +41,19 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 import httpx
 
 from omnigent.qwen_native_bridge import events_file_path, submit_confirmation
 
 _logger = logging.getLogger(__name__)
+
+
+class _PendingApproval(TypedDict):
+    elicitation_id: str
+    task: asyncio.Task[None]
+
 
 #: Event-file poll cadence. Matches the transcript forwarder so a pending
 #: approval surfaces in the web UI within a step of the terminal prompt.
@@ -251,7 +258,7 @@ async def supervise_qwen_approval_mirror(
     except OSError:
         offset = 0
     # request_id -> {"elicitation_id": str, "task": asyncio.Task}
-    pending: dict[str, dict[str, object]] = {}
+    pending: dict[str, _PendingApproval] = {}
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
