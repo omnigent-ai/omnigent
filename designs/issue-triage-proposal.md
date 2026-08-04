@@ -45,7 +45,7 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 3. **Assigns priority** - one of `P0-critical`, `P1-high`, `P2-medium`, `P3-low`
 4. **Routes to contributors** - adds `good-first-issue` for well-scoped, self-contained issues; `help-wanted` for issues needing community help with more context
 5. **Flags incomplete issues** - adds `needs-info` if repro steps are missing or description is too vague (replaces priority label)
-6. **Detects duplicates** - unions several short title searches with explicitly referenced issues, ranks the candidates, and comments with exact, similar, or no-match results; adds `duplicate` and closes with GitHub's native duplicate link only when a validated candidate reaches at least 0.92 confidence and passes an independent deterministic lexical near-copy gate
+6. **Detects duplicates** - unions several short title searches with explicitly referenced issues, ranks the candidates, and comments with exact, similar, or no-match results; adds `duplicate` when a validated candidate reaches at least 0.92 confidence and passes an independent deterministic lexical near-copy gate, then closes with GitHub's native duplicate link only when the rollout flag is enabled
 
 **What the bot does NOT do:**
 - Post suggestions or verbose responses beyond the duplicate-check result
@@ -58,7 +58,7 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 
 | Issue state | What happens | Human needed? |
 |---|---|---|
-| **Duplicate** | Comment with the canonical issue → close at ≥0.92 confidence plus deterministic lexical near-copy validation | No |
+| **Duplicate** | Comment and label with the canonical issue; leave open by default, or close when the rollout flag is enabled | No |
 | **Similar issue** | Comment with up to three related issues → leave open | No |
 | **`needs-info`**, reporter responds | Bot removes `needs-info`, re-adds `needs-triage`, bot re-triages | No |
 | **`needs-info`**, no response 14d | Marked `stale` → closed after 7 more days | No |
@@ -122,7 +122,9 @@ Use `omnigent run .github/triage/` as the triage engine — a tool-less Claude S
 
 ### Decision: High-confidence duplicate closure
 
-Duplicates close immediately only when the classifier selects a prefetched candidate, reports at least 0.92 confidence, and a deterministic lexical check finds strong title and document overlap. The lexical gate is intentionally conservative but is not a prompt-injection boundary: issue text remains attacker-controlled. Model confidence alone cannot authorize a destructive action, and any match that fails the gate is linked as similar and left open. Public reasons are fixed templates rather than model-authored prose. A prior bot comment vetoes reruns so a maintainer reopening an issue is durable.
+Duplicates become eligible for immediate closure only when the classifier selects a prefetched candidate, reports at least 0.92 confidence, and a deterministic lexical check finds strong title and document overlap. The lexical gate is intentionally conservative but is not a prompt-injection boundary: issue text remains attacker-controlled. Model confidence alone cannot authorize a destructive action, and any match that fails the gate is linked as similar and left open. Public reasons are fixed templates rather than model-authored prose. A prior bot comment vetoes reruns so a maintainer reopening an issue is durable.
+
+Automatic closure is additionally controlled by the repository variable `ISSUE_TRIAGE_CLOSE_DUPLICATES`. It defaults to `false`, so validated duplicates are labeled, linked, and left open while maintainers measure precision and blast radius. Set the variable to the exact string `true` to enable native duplicate closure without another code change. Classification and comments are identical in both modes except that the disposition sentence says whether the issue was left open or closed.
 
 **Why:** Duplicate detection is high-ROI automation, but false positives erode trust. Candidate allowlisting, a conservative confidence threshold, an independent lexical near-copy gate, downgrade-to-similar behavior, strict single-object JSON parsing, clean-exit gating, templated public reasons, and a durable human-override veto keep auto-closure narrow and reviewable even when issue content is adversarial.
 

@@ -105,7 +105,9 @@ prompt: |
     with matching expected behavior and no material contradiction. Use this only
     when confidence is at least 0.92. A deterministic lexical similarity gate
     independently limits auto-close to near-copy reports; other matches are
-    downgraded to `similar` even when model confidence is higher.
+    downgraded to `similar` even when model confidence is higher. Repository
+    configuration may temporarily leave validated duplicates open for rollout
+    observation; classify them as `duplicate` regardless.
   - `similar` means there is meaningful overlap, but the reports may have
     different causes, requirements, environments, or expected outcomes. Also use
     this whenever a possible duplicate is below 0.92 confidence.

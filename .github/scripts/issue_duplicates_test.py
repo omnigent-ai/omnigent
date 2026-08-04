@@ -182,7 +182,7 @@ class IssueDuplicatesTest(unittest.TestCase):
             [{"number": 12}],
         )
 
-        comment = build_duplicate_comment(decision)
+        comment = build_duplicate_comment(decision, close_issue=False)
 
         self.assertIn("<!-- omnigent-duplicate-check -->", comment)
         self.assertIn("#12", comment)
@@ -190,6 +190,22 @@ class IssueDuplicatesTest(unittest.TestCase):
         self.assertNotIn("https://example.com", comment)
         self.assertIn("automatic checks", comment)
         self.assertIn("leaving this issue open", comment)
+
+    def test_duplicate_comment_reflects_closure_flag(self):
+        decision = {
+            "duplicate_decision": "duplicate",
+            "duplicate_of": 12,
+            "similar_issues": [],
+            "duplicate_confidence": 1.0,
+            "duplicate_reasoning": "The reports describe the same behavior.",
+        }
+
+        observe_comment = build_duplicate_comment(decision, close_issue=False)
+        close_comment = build_duplicate_comment(decision, close_issue=True)
+
+        self.assertIn("closure is currently disabled", observe_comment)
+        self.assertIn("leaving this issue open", observe_comment)
+        self.assertIn("I’m closing this issue", close_comment)
 
     def test_injected_candidate_cannot_authorize_auto_close(self):
         issue = {

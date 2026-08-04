@@ -24,7 +24,7 @@ name: Issue Triage
 #   4. Routes to contributors — `good-first-issue` or `help-wanted`
 #   5. Flags incomplete issues — `needs-info` (replaces priority label)
 #   6. Comments with duplicate-check results on every issue
-#   7. Closes only validated high-confidence duplicates
+#   7. Optionally closes validated high-confidence duplicates (disabled by default)
 #   8. Assigns P0/P1 issues to a maintainer via round-robin
 
 on:
@@ -48,6 +48,7 @@ env:
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
+  CLOSE_DUPLICATE_ISSUES: ${{ vars.ISSUE_TRIAGE_CLOSE_DUPLICATES || 'false' }}
 
 jobs:
   triage:
@@ -501,6 +502,10 @@ jobs:
           )
           candidates = json.loads(pathlib.Path("/tmp/duplicates.json").read_text())
           duplicate = validate_duplicate_decision(result, issue_data, candidates)
+          close_duplicate_issue = (
+              duplicate["duplicate_decision"] == "duplicate"
+              and os.environ.get("CLOSE_DUPLICATE_ISSUES", "").strip().lower() == "true"
+          )
 
           labels_add = []
           labels_remove = []
@@ -591,6 +596,7 @@ jobs:
               "components": valid_components,
               "ranked_owners": ranked_owners,
               **duplicate,
+              "close_duplicate_issue": close_duplicate_issue,
               # Left as None while Databricks owns scoring.
               "priority": valid_priority,
               "needs_info": bool(result.get("needs_info")),
@@ -602,7 +608,7 @@ jobs:
           }
           pathlib.Path("/tmp/triage_result.json").write_text(json.dumps(output))
           pathlib.Path("/tmp/duplicate_comment.md").write_text(
-              build_duplicate_comment(duplicate)
+              build_duplicate_comment(duplicate, close_issue=close_duplicate_issue)
           )
 
           # Build a shell script with properly escaped arguments — no eval.
@@ -664,12 +670,17 @@ jobs:
 
           duplicate_decision=$(jq -r '.duplicate_decision' /tmp/triage_result.json)
           if [ "$duplicate_decision" = "duplicate" ]; then
-            duplicate_of=$(jq -r '.duplicate_of' /tmp/triage_result.json)
-            issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
-              --json state --jq '.state')
-            if [ "$issue_state" = "OPEN" ]; then
-              gh issue close "$ISSUE_NUMBER" --repo "$REPO" \
-                --duplicate-of "$duplicate_of"
+            close_duplicate_issue=$(jq -r '.close_duplicate_issue' /tmp/triage_result.json)
+            if [ "$close_duplicate_issue" = "true" ]; then
+              duplicate_of=$(jq -r '.duplicate_of' /tmp/triage_result.json)
+              issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
+                --json state --jq '.state')
+              if [ "$issue_state" = "OPEN" ]; then
+                gh issue close "$ISSUE_NUMBER" --repo "$REPO" \
+                  --duplicate-of "$duplicate_of"
+              fi
+            else
+              echo "Duplicate closure disabled; leaving issue open."
             fi
             exit 0
           fi

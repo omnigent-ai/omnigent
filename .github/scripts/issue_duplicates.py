@@ -302,20 +302,29 @@ def validate_duplicate_decision(
     }
 
 
-def build_duplicate_comment(decision: dict[str, Any]) -> str:
+def build_duplicate_comment(decision: dict[str, Any], *, close_issue: bool) -> str:
     """Build the public, idempotently identifiable bot comment."""
     marker = "<!-- omnigent-duplicate-check -->"
     reason = decision["duplicate_reasoning"]
 
     if decision["duplicate_decision"] == "duplicate":
         issue_number = decision["duplicate_of"]
+        if close_issue:
+            disposition = (
+                f"I’m closing this issue so discussion stays in #{issue_number}. "
+                "If this report is materially different, please leave a comment and "
+                "a maintainer can reopen it."
+            )
+        else:
+            disposition = (
+                "Automatic duplicate closure is currently disabled, so I’m leaving "
+                "this issue open for maintainers to evaluate."
+            )
         message = (
             f"Thanks for reporting this. This appears to be a high-confidence "
             f"duplicate of #{issue_number}.\n\n"
             f"Reason: {reason}\n\n"
-            f"I’m closing this issue so discussion stays in #{issue_number}. "
-            "If this report is materially different, please leave a comment and "
-            "a maintainer can reopen it."
+            f"{disposition}"
         )
     elif decision["duplicate_decision"] == "similar":
         references = ", ".join(f"#{number}" for number in decision["similar_issues"])
