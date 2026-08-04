@@ -486,3 +486,96 @@ def _proc_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+# ── Malformed-request robustness ──────────────────────────────────
+#
+# The zygote is a single-threaded forkserver shared by every session, so an
+# unhandled exception in its dispatch loop would tear down all runners and
+# harnesses forked from it. Each bad request must answer with an error and
+# leave the server serving.
+
+
+def _raw_exchange(manager: ZygoteManager, raw: bytes) -> dict:
+    """Send raw bytes on the control socket and read one reply.
+
+    :param manager: A started manager (its ``_sock`` is the daemon control end).
+    :param raw: Exact bytes to write, including the trailing newline.
+    :returns: The decoded reply.
+    """
+    sock = manager._sock
+    assert sock is not None
+    sock.sendall(raw)
+    buf = bytearray()
+    while b"\n" not in buf:
+        chunk = sock.recv(65536)
+        assert chunk, "zygote closed the control socket"
+        buf.extend(chunk)
+    return json.loads(bytes(buf).partition(b"\n")[0])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(b"[]\n", "must be a JSON object", id="json-list"),
+        pytest.param(b"5\n", "must be a JSON object", id="json-scalar"),
+        pytest.param(b'"str"\n', "must be a JSON object", id="json-string"),
+        pytest.param(b'{"cmd":"poll","pid":[]}\n', "integer pid", id="pid-list"),
+        pytest.param(b'{"cmd":"poll","pid":"abc"}\n', "integer pid", id="pid-string"),
+        pytest.param(b"{oops\n", "malformed request", id="undecodable"),
+    ],
+)
+def test_malformed_request_errors_without_killing_zygote(
+    manager: ZygoteManager, raw: bytes, expected: str
+) -> None:
+    """A bad request replies with an error and the forkserver keeps serving.
+
+    Without the guard, ``json.loads`` returning a non-dict makes ``.get()``
+    raise (and a non-int ``pid`` makes ``int()`` raise), killing the shared
+    zygote and every session forked from it.
+
+    :param manager: The started manager fixture.
+    :param raw: The malformed request bytes.
+    :param expected: Substring the error reply must contain.
+    """
+    reply = _raw_exchange(manager, raw)
+    assert expected in reply["error"]
+    # The decisive assertion: the server is still alive and answering.
+    assert _raw_exchange(manager, b'{"cmd":"ping"}\n').get("pong") is True
+    assert manager.is_running()
+
+
+def test_zygote_still_forks_after_a_malformed_request(manager: ZygoteManager, tmp_path) -> None:
+    """A bad request does not poison the fork path that follows it.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the child's log.
+    """
+    assert "error" in _raw_exchange(manager, b"[]\n")
+    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+    assert _wait_exit(proc) == 0
+
+
+def test_polled_harness_pid_is_released_from_its_owner(manager: ZygoteManager, tmp_path) -> None:
+    """A successful poll drops the harness pid from the runner-ownership map.
+
+    Left in place, the set grows unbounded and — once the OS recycles that pid
+    for a new harness under a different runner — the stale owner's teardown
+    would orphan the reused pid and discard the new harness's real exit code,
+    hanging its legitimate owner's poll forever.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the harness child's log.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR: "0",
+        "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "harness.log"),
+    }
+    reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": [], "env": env})
+    pid = reply["pid"]
+    # The poll that returns the code must also release ownership.
+    assert _wait_harness_exit(manager, pid) == 0
+    # Re-polling is None (code popped) and the zygote is still healthy.
+    assert _control_exchange(manager, {"cmd": "poll", "pid": pid})["returncode"] is None
+    assert _control_exchange(manager, {"cmd": "ping"}).get("pong") is True

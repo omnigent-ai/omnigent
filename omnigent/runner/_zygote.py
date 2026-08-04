@@ -326,6 +326,33 @@ class _ZygoteServer:
         """Drop all tracking state for a pid that is no longer reapable."""
         self._live.discard(pid)
         self._orphaned.discard(pid)
+        self._release_harness_pid(pid)
+
+    def _release_harness_pid(self, pid: int) -> None:
+        """Drop *pid* from whichever runner's harness-ownership set holds it.
+
+        Ownership must end the moment the pid is fully accounted for, because
+        the OS is then free to reuse it. A pid left in a stale owner set would
+        be re-orphaned by that runner's :meth:`_drop_runner` after the number
+        was recycled for an unrelated harness, discarding the new harness's real
+        exit code and hanging its legitimate owner's poll forever.
+
+        :param pid: The harness pid to release.
+        """
+        for owned in self._runner_harness_pids.values():
+            owned.discard(pid)
+
+    def _take_exit_code(self, pid: int) -> int | None:
+        """Pop *pid*'s exit code, releasing its harness ownership with it.
+
+        :param pid: The child pid being polled.
+        :returns: The exit code if the child has been reaped, else ``None``.
+        """
+        if pid not in self._exit_codes:
+            return None
+        code = self._exit_codes.pop(pid)
+        self._release_harness_pid(pid)
+        return code
 
     def _on_readable(self, conn: socket.socket, role: str) -> bool:
         """Drain a readable socket, dispatching each newline-delimited request.
@@ -350,7 +377,14 @@ class _ZygoteServer:
             line, _, rest = buf.partition(b"\n")
             del buf[:]
             buf.extend(rest)
-            self._dispatch(conn, bytes(line))
+            # Last-resort guard: this is a single-threaded forkserver shared by
+            # every session, so an unhandled exception from one malformed
+            # request would tear down all runners and harnesses forked from it.
+            # Answer with an error and keep serving instead.
+            try:
+                self._dispatch(conn, bytes(line))
+            except Exception as exc:  # noqa: BLE001 — must not kill the server
+                _send(conn, {"error": f"request failed: {exc}"})
         return True
 
     def _dispatch(self, conn: socket.socket, line: bytes) -> None:
@@ -367,13 +401,21 @@ class _ZygoteServer:
         except json.JSONDecodeError:
             _send(conn, {"error": "malformed request"})
             return
+        # json.loads happily returns a list/scalar; .get() would raise on those.
+        if not isinstance(request, dict):
+            _send(conn, {"error": "request must be a JSON object"})
+            return
         cmd = request.get("cmd")
         if cmd == "ping":
             _send(conn, {"pong": True})
         elif cmd == "poll":
             self._reap()
-            pid = int(request.get("pid", 0))
-            code = self._exit_codes.pop(pid, None) if pid in self._exit_codes else None
+            try:
+                pid = int(request.get("pid", 0))
+            except (TypeError, ValueError):
+                _send(conn, {"error": "poll requires an integer pid"})
+                return
+            code = self._take_exit_code(pid)
             _send(conn, {"returncode": code})
         elif cmd == "fork":
             self._handle_fork(conn, request)

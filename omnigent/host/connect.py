@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
+from typing import Any, Literal, Protocol, SupportsIndex, SupportsInt, cast
 
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
@@ -1215,9 +1216,20 @@ class HostProcess:
         )
 
         # Spawning blocks (log-file open, plus the zygote's one-time import on
-        # first launch), so run it off the event loop.
+        # first launch), so run it off the event loop. Shielded so a
+        # cancellation mid-spawn cannot abandon a live runner: the handle is
+        # only registered in ``self._runners`` after this returns, so an
+        # abandoned fork would never be watched, stopped, or reaped, and the
+        # zygote would retain its exit status forever. On cancellation we let
+        # the spawn land and then tear that runner down.
+        spawn = asyncio.ensure_future(
+            asyncio.to_thread(self._spawn_runner_proc, env, _session_slug)
+        )
         try:
-            proc, log_path = await asyncio.to_thread(self._spawn_runner_proc, env, _session_slug)
+            proc, log_path = await asyncio.shield(spawn)
+        except asyncio.CancelledError:
+            spawn.add_done_callback(self._discard_abandoned_spawn)
+            raise
         except OSError as exc:
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1332,6 +1344,32 @@ class HostProcess:
             return proc, log_path
         finally:
             log_fh.close()
+
+    def _discard_abandoned_spawn(self, spawn: asyncio.Future[Any]) -> None:
+        """Tear down a runner whose launch was cancelled before registration.
+
+        ``_handle_launch`` shields the spawn, so a cancellation still lets the
+        fork land — but nothing registered it in ``self._runners``, so it would
+        never be watched, stopped, or reaped (and the zygote would hold its exit
+        status forever). Kill it off the loop, since for a zygote-forked runner
+        the terminate/wait round-trips are blocking control-socket exchanges.
+
+        :param spawn: The completed spawn future.
+        """
+        if spawn.cancelled():
+            return
+        if spawn.exception() is not None:
+            return  # spawn failed; nothing was created
+        proc, _log_path = spawn.result()
+        _logger.warning(
+            "Launch cancelled after runner spawn (pid=%s); terminating the orphan",
+            proc.pid,
+        )
+        with contextlib.suppress(RuntimeError):
+            # No running loop during interpreter shutdown — best effort.
+            asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(self._stop_runner_proc, proc)
+            )
 
     async def _handle_stop(
         self,

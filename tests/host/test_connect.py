@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -3477,3 +3478,65 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
+    tmp_path: Path,
+) -> None:
+    """Cancelling a launch mid-spawn tears the runner down instead of leaking it.
+
+    ``_handle_launch`` registers the handle in ``_runners`` only after the spawn
+    thread returns, so a cancellation in that window used to leave a live runner
+    that was never watched, stopped, or reaped (and whose exit status the zygote
+    would retain forever). The spawn is shielded and the abandoned process is
+    terminated.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+    spawn_started = threading.Event()
+
+    def _slow_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a long-lived process, signalling once it exists.
+
+        :param args: Command args (ignored — a real sleep stands in).
+        :param kwargs: Popen kwargs (ignored).
+        :returns: A real subprocess handle.
+        """
+        proc = original_popen(
+            ["sleep", "60"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        spawned.append(proc)
+        spawn_started.set()
+        return proc
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_cancel",
+        binding_token="tok_cancel",
+        workspace=str(workspace),
+    )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_slow_popen):
+        task = asyncio.create_task(host._handle_launch(frame))
+        # Cancel only once the spawn thread has actually created the process,
+        # so we exercise the real leak window rather than a pre-spawn cancel.
+        await asyncio.to_thread(spawn_started.wait, 10.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert spawned, "the spawn thread should have created a process"
+    # Never registered (that is the leak window) ...
+    assert not host._runners
+    # ... but also not left running: the shield's done-callback terminates it.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and spawned[0].poll() is None:
+        await asyncio.sleep(0.05)
+    assert spawned[0].poll() is not None, "abandoned runner was leaked, still alive"
