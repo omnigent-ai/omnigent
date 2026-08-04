@@ -1563,6 +1563,107 @@ def _build_upgrade_suggestion(
     )
 
 
+# Canonical public repo for nightly builds. Nightlies are git tags consumed
+# straight from GitHub (they never reach an index), so the channel lives
+# upstream by definition: fork installs also upgrade onto upstream nightlies.
+_NIGHTLY_REPO_URL = "https://github.com/omnigent-ai/omnigent"
+
+
+def _newest_nightly_version(ls_remote_output: str) -> str | None:
+    """Pick the newest nightly version from ``git ls-remote --tags`` output.
+
+    Nightly tags are strictly ``vX.Y.Z.devYYYYMMDD``; the 8-digit datestamp
+    requirement screens out legacy ``.dev0``-style tags, and rc/final tags
+    and annotated-tag peel lines (``^{}``) never match. Ordering is PEP 440,
+    so the first nightly after a main version bump outranks all older ones.
+
+    :param ls_remote_output: Raw ``git ls-remote`` stdout (tab-separated
+        ``<sha> refs/tags/<name>`` lines).
+    :returns: The newest nightly version without the leading ``v`` (e.g.
+        ``"0.8.0.dev20260804"``), or ``None`` when no nightly tag exists.
+    """
+    import re
+
+    from packaging.version import InvalidVersion, Version
+
+    pattern = re.compile(r"^v(\d+\.\d+\.\d+\.dev\d{8})$")
+    versions: list[Version] = []
+    for line in ls_remote_output.splitlines():
+        match = pattern.match(line.rpartition("refs/tags/")[2].strip())
+        if match is None:
+            continue
+        with contextlib.suppress(InvalidVersion):
+            versions.append(Version(match.group(1)))
+    return str(max(versions)) if versions else None
+
+
+def _latest_nightly_version(repo_url: str = _NIGHTLY_REPO_URL) -> str | None:
+    """Resolve the newest nightly version from the repo's tags, or ``None``.
+
+    Best-effort ``git ls-remote`` with a tight timeout, like
+    ``_remote_git_head``: any failure (offline, missing ``git``, no nightly
+    tags yet) yields ``None`` so the caller prints an actionable message
+    instead of crashing.
+
+    :param repo_url: Repo to list tags from; defaults to the canonical repo.
+    :returns: e.g. ``"0.8.0.dev20260804"``, or ``None``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--tags", repo_url, "refs/tags/v*.dev*"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return _newest_nightly_version(result.stdout)
+
+
+def _build_nightly_upgrade_suggestion(
+    info: _InstalledWheelInfo,
+    nightly_version: str,
+    *,
+    extra_overrides: tuple[str, ...] = (),
+) -> _UpgradeSuggestion:
+    """Build the command that moves this install onto a nightly tag.
+
+    Nightlies are git tags, not index releases, so every installer gets a
+    git-pinned spec for the canonical repo. That includes registry installs
+    (this is how an index install hops onto the nightly channel) and VCS
+    installs of a fork (nightly tags only exist upstream). Extras follow
+    the same union rule as :func:`_build_upgrade_suggestion`; the CLI
+    refuses the registry install shapes that cannot record extras (pip /
+    ``uv pip``) before building.
+
+    :param info: Metadata from ``_read_installed_wheel_info``.
+    :param nightly_version: Target version without the leading ``v``.
+    :param extra_overrides: Extras supplied with ``omni upgrade --extra``.
+    :returns: See :func:`_build_upgrade_suggestion`.
+    """
+    extras = sorted(set(info.extras) | set(extra_overrides))
+    spec = f"git+{_NIGHTLY_REPO_URL}@v{nightly_version}"
+    if extras:
+        # Same egg-fragment shape the VCS upgrade path uses for extras.
+        spec = f"{spec}#egg={_package_spec(extras=extras)}"
+    installer = info.detected_installer or info.installer
+    if installer == "uv":
+        # --force: replacing a registry install with a git-sourced one (or
+        # hopping between tags) is an overwrite, not an upgrade, in uv's model.
+        return _UpgradeSuggestion(command=f"uv tool install --force {spec}", runnable=True)
+    if installer == "pipx":
+        return _UpgradeSuggestion(command=f"pipx install --force {spec}", runnable=True)
+    if installer == "pip" or (installer is None and info.vcs_url is not None):
+        return _UpgradeSuggestion(
+            command=f"{_pip_invocation()} install --force-reinstall {spec}", runnable=True
+        )
+    if installer == "poetry":
+        return _UpgradeSuggestion(command=f"poetry add --force {spec}", runnable=True)
+    # Unknown installer on a registry install: don't guess the tool.
+    return _UpgradeSuggestion(command=f"install {_DIST_NAME} from {spec}", runnable=False)
+
+
 def _run_upgrade_command(command: str, console: Console) -> int:
     """Run the upgrade command in a foreground subprocess.
 

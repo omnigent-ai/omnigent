@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 from tests.e2e._harness_probes import (
@@ -225,6 +226,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
+    for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
+    spawn env carries no gateway/profile probe vars for this matrix to drive.
+    Their shared wiring is covered by ``tests/test_acp_cli_harnesses.py`` and
+    the ``tests/inner/test_acp_executor.py`` suite.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "acp",
@@ -246,5 +253,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        *ACP_CLI_HARNESSES,
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

@@ -2367,11 +2367,12 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s
         callbacks["on_exit"] = on_exit
         callbacks["replace"] = replace
 
@@ -2508,11 +2509,12 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -2701,11 +2703,12 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]

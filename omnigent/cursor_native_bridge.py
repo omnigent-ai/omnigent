@@ -21,16 +21,16 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING
 
 import click
 
 from omnigent._platform import stable_user_id
+from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.cursor_native import CursorModelOption
 
-_JsonObject: TypeAlias = dict[str, object]
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"

@@ -175,7 +175,6 @@ const MARKDOWN_COMPONENTS: Components = {
       width: px(width) ?? style?.width,
       height: px(height) ?? style?.height,
     };
-    // eslint-disable-next-line jsx-a11y/alt-text -- alt is forwarded via props
     return <img {...props} style={sized} />;
   },
 };
@@ -537,7 +536,7 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]);
 
   // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
   // native find widget to `searchOpen` (open when set, close when cleared). This
@@ -601,7 +600,7 @@ export function CodeViewer({
     };
     container.addEventListener("mouseup", handleMouseUp);
     return () => container.removeEventListener("mouseup", handleMouseUp);
-  }, [rawLines]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [rawLines]);
 
   // Dismiss the floating buttons on any mousedown outside of them, or on any
   // scroll. Both the "Add comment" and "Attach to agent" buttons must be

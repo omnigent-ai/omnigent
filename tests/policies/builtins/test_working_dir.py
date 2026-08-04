@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.policies.builtins._shell import SHELL_TOOLS
 from omnigent.policies.builtins.working_dir import block_working_dir_changes
 from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.registry import get_registry, load_registry, validate_factory_params
@@ -72,6 +73,22 @@ def test_cd_family_denied_by_default(command: str) -> None:
     """
     policy = block_working_dir_changes()
     result = policy(_sh(command))
+    assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize("tool", sorted(SHELL_TOOLS))
+def test_shell_surface_covers_every_harness(tool: str) -> None:
+    """Every harness's shell tool is inspected by default, not just sys_os_shell/Bash.
+
+    The old default omitted Cursor's ``Shell``, Pi's ``bash``, Hermes's
+    ``terminal`` and Goose's ``developer__shell``, so the worktree confinement
+    was silently inert on those sessions. An ALLOW here means one of them is
+    uninspected again.
+
+    :param tool: A shell tool name from the shared default set.
+    """
+    policy = block_working_dir_changes()
+    result = policy(tc(tool, {"command": "cd /etc"}))
     assert result is not None and result["result"] == "DENY"
 
 

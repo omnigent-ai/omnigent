@@ -66,6 +66,7 @@ from omnigent.host.local_server import (
 )
 from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
 
@@ -515,7 +516,6 @@ _HostJsonValue: TypeAlias = (
 _HostJsonObject: TypeAlias = dict[str, _HostJsonValue]
 _HostSessionRow: TypeAlias = dict[str, _HostJsonValue]
 _HostPayload: TypeAlias = dict[str, _HostJsonValue]
-_JsonObject: TypeAlias = dict[str, object]
 
 
 def _effective_global_config_path() -> Path:
@@ -1617,6 +1617,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "cursor",
         "debby",
         "debug",
+        "diagnose",
         "doctor",
         "goose",
         "hermes",
@@ -3168,7 +3169,7 @@ def _start_cli_runner_process(
         env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
     try:
         with child_logging_popen_kwargs(env) as logging_kwargs:
-            runner_proc = subprocess.Popen(
+            runner_proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [sys.executable, "-m", "omnigent.runner._entry"],
                 env=env,
                 stdout=log_fh,
@@ -3745,7 +3746,6 @@ def server(
     # a clean shutdown doesn't leave a stale record.
     if _is_canonical_local_server:
         from omnigent.host.local_server import (
-            clear_local_server_record,
             register_local_server,
         )
 
@@ -3820,6 +3820,8 @@ def server(
         pass
     finally:
         if _is_canonical_local_server:
+            from omnigent.host.local_server import clear_local_server_record
+
             clear_local_server_record()
 
 
@@ -4069,6 +4071,50 @@ def _internal_write_ledger(from_env: bool) -> None:
 
     ledger = write_install_ledger_from_env()
     click.echo(json.dumps({"path": str(ledger_path()), "source": ledger.ledger_source}))
+
+
+@cli.command("diagnose")
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Trusted server URL to read the server version and auth mode from "
+        "(GET /v1/info). Stored/ambient credentials may be attached to the "
+        "request, so point it only at a server you trust."
+    ),
+)
+@click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
+def diagnose(server: str | None, json_output: bool) -> None:
+    """Print a read-only environment snapshot for bug reports.
+
+    Reports the CLI version, OS/Python, and the server auth mode. Pass
+    ``--server <url>`` to also read the server version and its real auth mode
+    (so version skew between CLI and server is visible). The output contains no
+    secrets — safe to paste into an issue. ``--server`` should point only at a
+    server you trust: reaching a managed server may attach your stored/ambient
+    credentials to the request (the same behavior as ``session export`` / ``run
+    --server``).
+    """
+    from omnigent.diagnostics import collect_snapshot
+
+    # Resolve a server URL the same way `session export` does: explicit flag,
+    # else the configured server; leave unset (local-only) when neither exists.
+    resolved = _resolve_attach_server(server, _load_effective_config().get("server"))
+    snap = collect_snapshot(server_url=resolved)
+
+    if json_output:
+        click.echo(json.dumps(snap, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"cli     {snap['cli_version']}")
+    server_line = snap["server_version"] or (
+        "(pass --server to report)" if snap["server_url"] is None else "(unreachable)"
+    )
+    click.echo(f"server  {server_line}")
+    click.echo(f"url     {snap['server_url'] or '(none)'}")
+    click.echo(f"auth    {snap['auth_source']} ({snap['auth_source_origin']})")
+    click.echo(f"os      {snap['os']}")
+    click.echo(f"python  {snap['python']}")
 
 
 @cli.command("doctor")
@@ -4394,6 +4440,142 @@ def _upgrade_vcs_install(
     click.echo("Re-pulled the git ref. Run `omni upgrade --check` to confirm.")
 
 
+def _upgrade_to_nightly(
+    info: _InstalledWheelInfo,
+    *,
+    check_only: bool,
+    force: bool,
+    extra_overrides: tuple[str, ...],
+    dry_run: bool,
+) -> None:
+    """Move this install onto the newest nightly build (``--nightly``).
+
+    Nightlies are ``vX.Y.Z.devYYYYMMDD`` git tags cut from the newest green
+    commit on main; they never reach the package index. So "is there
+    something newer" is answered by the repo's tags, and the upgrade is a
+    git-pinned reinstall regardless of how omnigent was first installed:
+    a registry install hops onto the channel, an older nightly moves
+    forward, and a same-version rerun no-ops. The registry shapes that
+    cannot record extras (pip / ``uv pip``) are refused with a manual
+    command, mirroring the index upgrade path.
+
+    :param info: Installed-distribution metadata.
+    :param check_only: Only report; exit non-zero when running without
+        ``--check`` would change the install.
+    :param force: Stop in-flight sessions immediately instead of draining.
+    :param extra_overrides: Extras supplied by ``omni upgrade --extra``.
+    :param dry_run: Print the command and exit without running it.
+    """
+    import importlib.metadata
+
+    from packaging.version import InvalidVersion, Version
+
+    from omnigent.update_check import (
+        _NIGHTLY_REPO_URL,
+        _build_nightly_upgrade_suggestion,
+        _latest_nightly_version,
+        _probe_installed_distribution,
+        _run_upgrade_command,
+        _uv_tool_receipt_path,
+    )
+
+    current = importlib.metadata.version("omnigent")
+    target = _latest_nightly_version()
+    if target is None:
+        raise click.ClickException(
+            "Couldn't find a nightly tag. Check your connection to github.com "
+            "(nightlies are git tags, not index releases); if the nightly lane "
+            "only just landed, the first tag appears after the next 04:30 UTC cut."
+        )
+
+    try:
+        up_to_date = Version(current) == Version(target)
+    except InvalidVersion:
+        up_to_date = current == target
+    if up_to_date:
+        click.echo(f"omnigent is already on the newest nightly (v{current}).")
+        return
+
+    click.echo(f"Newest nightly: v{target} (currently v{current}).")
+    if check_only:
+        # Non-zero means "running --nightly would change the install", the
+        # same contract as the release path's --check. SystemExit rather than
+        # ctx.exit for the standalone_mode=False reason documented there.
+        raise SystemExit(1)
+
+    # Same safety rule as the index path: pip / `uv pip` do not record which
+    # extras were requested, so a nightly hop cannot preserve them. Only
+    # registry shapes are refused; a VCS install's recorded URL is already
+    # the source of truth (matching _build_upgrade_suggestion's split).
+    if info.vcs_url is None:
+        manual = f"git+{_NIGHTLY_REPO_URL}@v{target}"
+        if info.detected_installer == "pip":
+            click.echo(
+                "omnigent was installed with pip, and pip does not record which "
+                "extras were requested. `omni upgrade --nightly` cannot preserve "
+                "them safely, so install the nightly manually:\n\n"
+                f"    pip install --force-reinstall '{manual}'\n"
+                "    # or, if you need extras:\n"
+                f"    pip install --force-reinstall '{manual}#egg=omnigent[your,extras,here]'"
+            )
+            raise SystemExit(0)
+        if info.detected_installer == "uv" and _uv_tool_receipt_path() is None:
+            click.echo(
+                "omnigent was installed with `uv pip`, not `uv tool install`. "
+                "`uv pip` does not record which extras were requested, so "
+                "`omni upgrade --nightly` cannot preserve them safely. Install "
+                "the nightly manually:\n\n"
+                f"    uv pip install --force-reinstall '{manual}'\n"
+                "    # or, if you need extras:\n"
+                f"    uv pip install --force-reinstall '{manual}#egg=omnigent[your,extras,here]'"
+            )
+            raise SystemExit(0)
+
+    suggestion = _build_nightly_upgrade_suggestion(info, target, extra_overrides=extra_overrides)
+    if not suggestion.runnable:
+        raise click.ClickException(
+            f"No automatic upgrade command is known for this install. {suggestion.command}."
+        )
+
+    if dry_run:
+        extras = sorted(set(extra_overrides or info.extras))
+        click.echo(
+            f"Detected installer: {info.detected_installer or info.installer}\n"
+            f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
+            f"Would run: {suggestion.command}"
+        )
+        return
+
+    _drain_and_stop_local_server(force=force)
+
+    console = Console()
+    code = _run_upgrade_command(suggestion.command, console)
+    if code != 0:
+        raise click.ClickException(
+            f"Upgrade command exited with status {code}; your previous install is intact."
+        )
+
+    # Same trust-the-disk verification as the release path: re-read the
+    # version in a fresh subprocess instead of believing the exit code.
+    new_version, _ = _probe_installed_distribution()
+    if new_version == target:
+        click.echo(
+            f"✓ Upgraded to nightly v{target}. Re-run your command; the local "
+            "server will start on the new version."
+        )
+        return
+    if new_version is None:
+        click.echo(
+            "Ran the upgrade command, but couldn't confirm the installed version. "
+            "Run `omni upgrade --nightly --check` to verify."
+        )
+        return
+    raise click.ClickException(
+        f"The upgrade command ran but omnigent is still v{new_version} (expected "
+        f"v{target}). Try the command directly: {suggestion.command}"
+    )
+
+
 @cli.command("upgrade")
 @click.option(
     "--check",
@@ -4413,6 +4595,13 @@ def _upgrade_vcs_install(
     is_flag=True,
     help="Consider pre-releases (e.g. release candidates), and pass the "
     "installer's allow-pre-releases flag. Useful for validating a TestPyPI rc.",
+)
+@click.option(
+    "--nightly",
+    is_flag=True,
+    help="Upgrade to the newest nightly build: a vX.Y.Z.devYYYYMMDD git tag "
+    "installed straight from GitHub with your installer (needs git, plus "
+    "Node 22 and pnpm to build the web UI). Skips the package index.",
 )
 @click.option(
     "--extra",
@@ -4435,6 +4624,7 @@ def upgrade(
     check_only: bool,
     force: bool,
     pre: bool,
+    nightly: bool,
     extra_overrides: tuple[str, ...],
     target_version: str | None,
     dry_run: bool,
@@ -4451,6 +4641,11 @@ def upgrade(
     stop them immediately. Pass ``--pre`` to consider pre-releases (rc /
     beta). Pass ``--extra`` to keep or add extras that the installer did not
     record. Use ``--target-version`` when validating a specific release.
+    Pass ``--nightly`` to move onto the newest nightly build instead:
+    nightlies are git tags that never reach the index, so that path
+    reinstalls from GitHub pinned to the newest nightly tag (``--extra``,
+    ``--dry-run``, and ``--check`` compose with it; ``--pre`` and
+    ``--target-version`` do not apply).
 
     Requires the install to have come from a tool that records extras:
     ``uv tool install`` or ``pipx install``. ``pip`` does not record
@@ -4462,6 +4657,8 @@ def upgrade(
         with status 1 when a newer release exists.
     :param force: Stop in-flight sessions immediately rather than draining.
     :param pre: Consider pre-releases and allow the installer to fetch them.
+    :param nightly: Upgrade to the newest nightly git tag instead of the
+        latest index release.
     :param extra_overrides: Extras requested via ``--extra``.
     :param target_version: Pin the upgrade to this version.
     :param dry_run: Print the command and exit without running it.
@@ -4481,6 +4678,14 @@ def upgrade(
         fetch_latest_version,
     )
 
+    if nightly and target_version:
+        raise click.UsageError(
+            "--nightly and --target-version are mutually exclusive: --nightly "
+            "always tracks the newest nightly tag. To install a specific "
+            "nightly, run your installer against that tag directly, e.g. "
+            "`uv tool install --force git+https://github.com/omnigent-ai/omnigent@v0.8.0.dev20260801`."
+        )
+
     # Source checkout / editable install — there's no released wheel to
     # swap in place; the correct update path is git, not a reinstall.
     if _find_repo_root() is not None:
@@ -4497,6 +4702,20 @@ def upgrade(
         raise click.ClickException(
             "This is an editable install — update it with `git pull`, not `omni upgrade`."
         )
+
+    # Nightly channel: resolved from git tags, not the index, and applies to
+    # every install shape, so it dispatches before the VCS-vs-registry split
+    # (a VCS install pinned to an older nightly tag must move tags, not
+    # re-pull its pinned ref).
+    if nightly:
+        _upgrade_to_nightly(
+            info,
+            check_only=check_only,
+            force=force,
+            extra_overrides=extra_overrides,
+            dry_run=dry_run,
+        )
+        return
 
     # A git/VCS install tracks a moving git ref, not a PyPI release. Its
     # version string (a frozen ``0.1.0`` on an unbumped ``main``, say) is NOT
@@ -6760,6 +6979,19 @@ def attach(
     ),
 )
 @click.option(
+    "--profile",
+    "databricks_profile",
+    default=None,
+    metavar="NAME",
+    help=(
+        "Databricks config profile (~/.databrickscfg) to authenticate a "
+        "remote --server with. Sets DATABRICKS_CONFIG_PROFILE so the SDK "
+        "credential chain (service-principal M2M, PAT, OAuth) resolves that "
+        "profile. Use for headless service-principal access to a Databricks "
+        "App without a prior `omnigent login`."
+    ),
+)
+@click.option(
     "--debug-events",
     "debug_events",
     is_flag=True,
@@ -6794,6 +7026,7 @@ def run(
     ephemeral: bool,
     log: bool,
     server: str | None,
+    databricks_profile: str | None,
     debug_events: bool,
     register_host: bool,
 ) -> None:
@@ -6818,7 +7051,16 @@ def run(
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
       omnigent run --server http://localhost:6767
       omnigent run examples/databricks_coding_agent.yaml --server https://<app>.databricksapps.com
+      omnigent run --server https://<app>.databricksapps.com --profile my-sp -p "hi"
     """
+    # A remote --server authenticated via a named Databricks profile: point the
+    # SDK credential chain (used by every remote-auth path in this process) at
+    # that profile. Explicit here so the profile resolves without a prior
+    # `omnigent login` — the headless service-principal path. Only mutates this
+    # CLI process's env, not the shell. An explicit --profile wins over any
+    # ambient DATABRICKS_CONFIG_PROFILE.
+    if databricks_profile:
+        os.environ["DATABRICKS_CONFIG_PROFILE"] = databricks_profile
     # Apply config defaults for any value the user did not pass explicitly.
     # Explicit CLI args always take precedence; project-local config overrides
     # global config, which provides user-level defaults.
@@ -7540,6 +7782,10 @@ def _add_daemon_host_status(
 
     :param payload: Payload from :func:`_base_daemon_status_payload`.
     """
+    # A dead process cannot have an online tunnel — skip the round-trip.
+    if payload.get("process") != "online":
+        payload["host_status"] = "offline"
+        return
     base_url = payload.get("server_url")
     host_id = payload.get("host_id")
     if not isinstance(base_url, str):

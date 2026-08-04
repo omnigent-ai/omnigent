@@ -154,14 +154,13 @@ describe("sidebar highlight while viewing a sub-agent", () => {
     expect(wordmark.getAttribute("src")).toContain("omnigent-wordmark");
   });
 
-  it("uses the same Otto structural-container radius as the workspace rail", () => {
+  it("sits flush to the window edge, no floating margin or border", () => {
     mockConversations([]);
     renderAt("/");
 
-    expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass(
-      "md:rounded-[var(--radius-otto-md)]",
-      "md:m-2",
-    );
+    const sidebar = screen.getByRole("complementary", { name: "Conversations" });
+    expect(sidebar).toHaveClass("md:m-0");
+    expect(sidebar).not.toHaveClass("md:m-2", "md:rounded-[var(--radius-otto-md)]", "md:border");
   });
 
   it("highlights the top-level parent row when the active session is its child", async () => {

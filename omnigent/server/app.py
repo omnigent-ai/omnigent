@@ -1337,7 +1337,7 @@ def create_app(
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=True)
+            _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
@@ -1375,7 +1375,7 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=True)
+        _logger.error("Database error: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1400,7 +1400,7 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=True)
+        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1654,8 +1654,13 @@ def create_app(
         # Missing ids default to reachable / no-host, matching the bulk
         # lookup's own missing-row terminal.
         _missing = SessionLiveness(runner_online=True, host_online=None)
+
+        def _liveness_or_missing(sid: str) -> SessionLiveness:
+            found = liveness.get(sid)
+            return found if found is not None else _missing
+
         if session_id is not None:
-            single = liveness.get(session_id, _missing)
+            single = _liveness_or_missing(session_id)
             result["session"] = {
                 "id": session_id,
                 "runner_online": single.runner_online,
@@ -1665,7 +1670,7 @@ def create_app(
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
-                    "runner_online": (sl := liveness.get(sid, _missing)).runner_online,
+                    "runner_online": (sl := _liveness_or_missing(sid)).runner_online,
                     "host_online": sl.host_online,
                     "host_version": sl.host_version,
                 }

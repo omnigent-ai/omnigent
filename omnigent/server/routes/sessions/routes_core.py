@@ -96,13 +96,66 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_UI_LABEL_KEY,
+    _CLAUDE_NATIVE_UI_LABEL_VALUE,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODES,
+    _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _logger,
+    _managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    SessionLiveness,
+    _agent_carries_cursor_fork_history,
+    _agent_carries_native_fork_history,
+    _announce_session_added,
+    _apply_liveness_to_items,
+    _authorize_bundled_parent_and_inherit_runner,
+    _codex_plan_mode_enabled,
+    _discovery_key,
+    _forward_session_change_to_runner,
+    _get_runner_client,
+    _invalidate_runner_backed_snapshot_state,
+    _multipart_missing_detail,
+    _notify_runner_of_bundled_child,
+    _parse_session_create_metadata,
+    _permission_level_from_grants,
+    _presentation_labels_for_agent,
+    _prune_session_read_state,
+    _publish_collaboration_mode,
+    _publish_sandbox_status,
+    _publish_terminal_pending,
+    _reject_reserved_cost_control_label_seed,
+    _reject_server_reserved_label_seed,
+    _require_collaboration_mode_forward,
+    _require_cost_control_label_authority,
+    _reset_runner_resources_after_switch,
+    _same_provider_family,
+    _session_status_from_cache,
+    _set_read_state,
+    _title_content_from_item,
+    _validate_terminal_launch_args,
+    _validated_cost_control_mode_override,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _best_effort_stop,
+    _build_session_list_item,
+    _build_session_response,
+    _create_session_from_bundle,
+    _create_session_from_existing_agent,
+    _ensure_runner_relay_ready,
+    _get_session_snapshot,
+    _is_native_terminal_session,
+    _labels_for_viewer,
+    _persist_model_change_note,
+    _publish_runner_recovered_status,
+    _run_managed_launch,
+    _spawn_archive_stop,
+)
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -1469,8 +1522,6 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
-        if body.archived is True:
-            await _best_effort_stop(session_id, conversation_store, runner_router)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -1709,6 +1760,18 @@ def register_core_routes(
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True:
             _prune_session_read_state(session_id)
+            # Stop the session now that the flag is committed, so a request
+            # rejected after this point can't leave a stopped-but-unarchived
+            # session. Detached, not awaited: the response must not wait out
+            # the stop's per-runner timeouts (seconds against a wedged or
+            # asleep runner). Archive has no client-side stop, so this also
+            # carries the host-runner teardown.
+            _spawn_archive_stop(
+                session_id,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+            )
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries
         # (today: claude-native, whose ``claude`` binary has
@@ -2023,6 +2086,18 @@ def register_core_routes(
             else None
         )
 
+        # Keep the fork filed in the source's first-class project, but only
+        # when the forker owns that project — projects are owner-private, so
+        # a fork of a shared session filed in someone else's project stays
+        # unfiled (a foreign project id would show in no folder view).
+        fork_project_id = None
+        if source.project_id is not None and project_store is not None:
+            owned = await asyncio.to_thread(
+                project_store.get, source.project_id, owner_user_id=user_id
+            )
+            if owned is not None:
+                fork_project_id = source.project_id
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -2043,6 +2118,7 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                project_id=fork_project_id,
             )
         except LookupError as exc:
             raise OmnigentError(

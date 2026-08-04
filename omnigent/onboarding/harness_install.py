@@ -47,6 +47,7 @@ from typing import NamedTuple
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.opencode_native_client import (
@@ -360,6 +361,14 @@ _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
     QWEN_KEY: QWEN_KEY,
 }
 
+# Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) with an npm package
+# are one-click installable; rows shipping via curl/shell installers stay out,
+# like cursor/kimi above.
+for _acp_name, _acp_row in ACP_CLI_HARNESSES.items():
+    if _acp_row.install.package is not None:
+        for _acp_spelling in (_acp_name, *_acp_row.aliases):
+            _UI_INSTALLABLE_HARNESS_TO_KEY[_acp_spelling] = _acp_name
+
 
 # Family keys the UI may install, derived once from the allowlist so the
 # executor-spelling fallback in ``ui_install_key`` can't admit a non-installable
@@ -510,6 +519,20 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
         status_key=None,
     ),
 }
+
+# Builtin ACP CLI harnesses own their credentials (vendor CLI login), so each
+# row with a login command gets a run-on-host auth step, untracked like qwen's.
+for _acp_name, _acp_row in ACP_CLI_HARNESSES.items():
+    _acp_login = _acp_row.login_command
+    if _acp_login is not None:
+        _UI_AUTH_STEP_BY_KEY[_acp_name] = SetupStep(
+            kind="auth",
+            title=f"Sign in to {_acp_row.label}",
+            detail=f"{_acp_row.label} manages its own credentials; sign in on the host.",
+            action="command",
+            command=_acp_login,
+            status_key=None,
+        )
 
 
 def ui_setup_steps(harness: str) -> list[SetupStep]:

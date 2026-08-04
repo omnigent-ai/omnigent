@@ -7,7 +7,11 @@
 /* Streamdown ships utility classes pre-compiled in its dist; this @source
  * pragma tells Tailwind v4 to scan those files so the classes survive the
  * production build. Required by ai-elements/MessageResponse, which uses
- * Streamdown to render markdown (code blocks, math, GFM, mermaid). */
+ * Streamdown to render markdown (code blocks, math, GFM, mermaid).
+ *
+ * Runtime styles for Streamdown and KaTeX are imported in each app entrypoint.
+ * Keep those imports there so package-required CSS is loaded independently of
+ * app theme customization in this file. */
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
@@ -21,11 +25,15 @@
     ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol",
     "Noto Color Emoji";
   --font-mono: "Geist Mono Variable", "JetBrains Mono", ui-monospace, monospace;
-  /* 13px/20px text step between text-xs (12px) and text-sm (14px) —
-     * generates the `text-13` utility. Used for compact UI chrome like
-     * the composer footer selectors and slash-command menu rows. */
+  /* 13px/18px text step between text-xs (12px) and text-sm (14px) —
+     * generates the `text-13` utility. Body and chat-thread text (both
+     * 13/18), plus compact UI chrome like the composer footer selectors
+     * and slash-command menu rows. */
   --text-13: 13px;
-  --text-13--line-height: 20px;
+  --text-13--line-height: 18px;
+  /* Caption step — sidebar section subtitles (Projects/Sessions) et al. */
+  --text-caption: 12px;
+  --text-caption--line-height: 16px;
   /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
      * with a slightly larger 32px face on the same 36px line. */
   --text-3xl: 32px;
@@ -46,6 +54,8 @@
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
+  /* Weaker panel border for low-contrast dividers. */
+  --color-border-weak: var(--border-weak);
   /* Stronger border for higher-contrast dividers/outlines. */
   --color-border-strong: var(--border-strong);
   /* Neutral border specifically for buttons (lighter than --border-strong). */
@@ -71,6 +81,8 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
+  /* Tertiary text for lighter/disabled labels. */
+  --color-foreground-tertiary: var(--foreground-tertiary);
   --color-muted: var(--muted);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-secondary: var(--secondary);
@@ -180,11 +192,13 @@
      * The auth pages (outside the gradient shell) use this as their
      * full-page canvas. */
   --background: #fff;
-  --foreground: #11171c;
+  --foreground: #27272a;
+  /* Tertiary gray for lighter/disabled/placeholder text. */
+  --foreground-tertiary: #a1a1aa;
   --card: #fff;
   /* Light --card is already opaque; the solid form only diverges in dark. */
   --card-solid: #fff;
-  --card-foreground: #11171c;
+  --card-foreground: #27272a;
   /* Tray surface (composer footer tray): white, applied translucently
      * via opacity modifiers so the page gradient shows through. */
   --tray: #fff;
@@ -197,9 +211,9 @@
   /* Light grey fill so secondary badges/headers read as surfaces (a
      * fully-transparent value left them as bare floating text). */
   --secondary: #eceef1;
-  --secondary-foreground: #11171c;
+  --secondary-foreground: #27272a;
   --muted: #0000000f;
-  --muted-foreground: #6f6f6f;
+  --muted-foreground: #71717a;
   /* Dedicated chip background for inline code — a hair darker than the
      * white card so the chip reads as a tile. Kept separate from --muted
      * (now a translucent black wash reused for hover/quote surfaces). */
@@ -217,12 +231,14 @@
      * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
      * with strong contrast on the white card surface. */
   --session-active: #2f7fd4;
-  --border: #e8ecf0;
+  --border: #e4e4e7;
+  /* Weaker panel border for low-contrast dividers. */
+  --border-weak: #ececee;
   /* Stronger divider/outline + a dedicated neutral button border. */
-  --border-strong: #a3b1bf;
+  --border-strong: #a1a1aa;
   --button-border: #d6d6d6;
-  --button-icon-hover-color: #11171c;
-  --input: #e8ecf0;
+  --button-icon-hover-color: #27272a;
+  --input: #e4e4e7;
   /* Focus ring matches --primary. */
   --ring: #11171c;
   /* Brand pink — reserved for brand moments, not status. */
@@ -251,13 +267,16 @@
      * message copy button) blend into the canvas rather than painting
      * a lavender band. */
   --sidebar: #fdfafa;
-  --sidebar-foreground: #11171c;
+  --sidebar-foreground: #27272a;
   --sidebar-primary: #2272b4;
   --sidebar-primary-foreground: #fff;
   --sidebar-accent: #d7edfe;
   --sidebar-accent-foreground: #04355d;
-  --sidebar-border: #e8ecf0;
+  --sidebar-border: #e4e4e7;
   --sidebar-ring: #2272b4;
+  /* Faint dot-grid tint on the light-mode sidebar canvas (see the
+     * html:not(.dark) .conversations-sidebar rule). Tunable. */
+  --sidebar-dot-color: #8e537333;
   --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 3%, transparent);
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
@@ -265,20 +284,18 @@
 
 .dark {
   /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter */
-  --background: #0d1218;
+  --background: #0e1013;
   --foreground: oklch(0.965 0.003 240);
-  --card: rgba(40, 34, 58, 0.6);
+  --card: rgba(31, 39, 45, 0.6);
   /* Opaque stand-in for the glass --card. The composer card uses this
      * instead of --card: its trays tuck their square corners behind the
      * card (negative-margin overlap), and a translucent card lets the
-     * tucked strip ghost through its edges. Not --card's raw RGB
-     * (#28223a) — full-alpha that read lighter than the neighboring
-     * glass surfaces; this approximates the glass card's perceived
-     * color: 60% of #28223a composited over the dark canvas gradient. */
-  --card-solid: #201c30;
+     * tucked strip ghost through its edges. Approximates the glass card's
+     * perceived color on the dark canvas. */
+  --card-solid: #181f25;
   --card-foreground: oklch(0.965 0.003 240);
   /* Dark counterpart of the tray surface — semi-transparent for glass effect */
-  --tray: rgba(40, 34, 58, 0.6);
+  --tray: rgba(31, 39, 45, 0.6);
   --popover: rgba(26, 33, 41, 0.8);
   --popover-foreground: oklch(0.965 0.003 240);
   --primary: #e8ecf0;
@@ -286,11 +303,10 @@
   --secondary: #1f272d;
   --secondary-foreground: #e8ecf0;
   /* Active/selected states, hover backgrounds, subtle containers. */
-  /* Opaque base (#28223a is var(--card)'s solid form — the dark-mode --card
-       itself is translucent). bg-muted backs ~160 solid utility surfaces (code
-       blocks, badges, hover rows) that must not let the canvas gradient bleed
-       through; the frosted look is reserved for the .dark .bg-card rule. */
-  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #28223a);
+  /* Opaque slate base: bg-muted backs ~160 solid utility surfaces (code
+       blocks, badges, hover rows) that must stay opaque; the frosted look is
+       reserved for the .dark .bg-card rule. */
+  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #262f36);
   --muted-foreground: #92a4b3;
   --code-bg: oklch(0.38 0.005 240);
   --accent: #04355d;
@@ -324,11 +340,8 @@
   --chart-3: oklch(0.68 0.15 145);
   --chart-4: oklch(0.75 0.16 70);
   --chart-5: oklch(0.65 0.008 240);
-  /* bg-sidebar surfaces blend into the dark .app-shell gradient — a 45°
-     * diagonal sweeping green (rgb 17,24,28) → purple (rgb 19,13,33);
-     * --sidebar sits in the green-dominant region and stays translucent
-     * so it tracks the canvas underneath (a flat color can't match a
-     * diagonal everywhere). Mirrors the light-mode treatment. */
+  /* Translucent so the sidebar's own layers (see .dark .conversations-sidebar)
+     * and the canvas read through it. */
   --sidebar: rgba(17, 23, 28, 0.75);
   --sidebar-foreground: oklch(0.965 0.003 240);
   --sidebar-primary: oklch(0.64 0.22 254);
@@ -338,45 +351,63 @@
   --sidebar-border: oklch(0.28 0.005 240);
   --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
   --tooltip-bg: #2a2440;
+  /* White dot-grid tint for the dark sidebar (see .dark .conversations-sidebar). */
+  --sidebar-dot-color: rgba(255, 255, 255, 0.12);
 }
 
+/* Sidebar body rows — the design's body step: 13px on an 18px line. Both in
+ * `rem` so they ride the root font-size (mobile bump + Appearance setting). */
 .sidebar-compact-text {
   font-size: var(--sidebar-font-size);
+  line-height: 1.125rem;
 }
 
-/* App-shell canvas gradient. Copied verbatim from the brand mock
- * (agentic-ux-2026, "modern-1" layout): a near-white 45° gradient with the
- * faintest warm/pink drift, painted over the lavender --background. The
- * lavender base is effectively never seen (the opaque gradient covers it),
- * exactly as on the mock — it remains the fallback. The white sidebar /
- * workspace cards float on this near-white canvas, delineated by their
- * border + shadow rather than background contrast. --sidebar is set to the
- * gradient's near-white so bg-sidebar chrome stays invisible against this
- * canvas. */
+/* App-shell canvas — the transparent <main> shows it through. Light: flat
+ * white. Dark: purple-tinted near-black, two faint radial blooms over a 145°
+ * gradient (from the agentic-ux-2026 mock). The rails paint their own layers
+ * (below) and are excluded from the .dark glass rule, so they read as canvas,
+ * not frosted cards. */
 .app-shell {
-  background: linear-gradient(
-    45deg,
-    rgb(253, 250, 250),
-    rgb(253, 249, 251) 8%,
-    rgb(253, 249, 251) 17%,
-    rgb(253, 249, 252) 25%,
-    rgb(254, 248, 253) 33%,
-    rgb(254, 248, 252) 42%,
-    rgb(254, 251, 252) 50%,
-    rgb(254, 251, 251) 58%,
-    rgb(254, 251, 251) 67%,
-    rgb(254, 251, 251) 75%,
-    rgb(254, 251, 251) 83%,
-    rgb(254, 251, 251) 92%,
-    rgb(254, 253, 253)
-  );
+  background: var(--background);
 }
 .dark .app-shell {
   background:
-    radial-gradient(ellipse at 20% 50%, rgba(100, 40, 180, 0.15) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 20%, rgba(80, 30, 140, 0.1) 0%, transparent 45%),
-    radial-gradient(ellipse at 60% 80%, rgba(140, 30, 100, 0.08) 0%, transparent 40%),
-    linear-gradient(145deg, #1e1035 0%, #11171c 50%, #161020 100%);
+    radial-gradient(rgba(100, 40, 180, 0.12), transparent 50%),
+    radial-gradient(at 80% 20%, rgba(80, 30, 140, 0.08), transparent 45%),
+    linear-gradient(145deg, #1a0e2d, #0e1418, #130e1b);
+}
+
+/* Left sidebar canvas — a 20px dot-grid (--sidebar-dot-color, themed) over a
+ * themed base. Light: the near-white brand gradient + a pink corner glow,
+ * lifted by an inset edge shadow. Dark: transparent base (the canvas shows) +
+ * a purple bottom wash + the diagonal white sheen. */
+html:not(.dark) .conversations-sidebar {
+  background:
+    radial-gradient(var(--sidebar-dot-color) 0.6px, transparent 0.8px) 0 0 / 20px 20px,
+    radial-gradient(104% 74% at 112% 108%, rgba(248, 177, 215, 0.16), transparent 66%),
+    linear-gradient(
+      45deg,
+      rgb(253, 250, 250),
+      rgb(253, 249, 251) 8%,
+      rgb(253, 249, 251) 17%,
+      rgb(253, 249, 252) 25%,
+      rgb(254, 248, 253) 33%,
+      rgb(254, 248, 252) 42%,
+      rgb(254, 251, 252) 50%,
+      rgb(254, 251, 251) 58%,
+      rgb(254, 251, 251) 67%,
+      rgb(254, 251, 251) 75%,
+      rgb(254, 251, 251) 83%,
+      rgb(254, 251, 251) 92%,
+      rgb(254, 253, 253)
+    );
+  box-shadow: rgba(0, 0, 0, 0.05) -12px 0 24px -14px inset;
+}
+.dark .conversations-sidebar {
+  background:
+    radial-gradient(var(--sidebar-dot-color) 0.6px, transparent 0.8px) 0 0 / 20px 20px,
+    linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%);
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat
@@ -419,9 +450,7 @@
 }
 
 /* Elevated surfaces — frosted glass effect with backdrop blur.
- * Targets top-level cards only, including responsive card surfaces like
- * the workspace panel's md:bg-card (so its chrome matches the sidebar's
- * glass border in dark mode). A bg-card nested inside another bg-card
+ * Targets top-level cards only. A bg-card nested inside another bg-card
  * (e.g. FilesPanel inside the workspace panel, toolbars inside the
  * composer) is an interior fill, and re-decorating it with its own
  * border/shadow visually carves the parent card into pieces.
@@ -432,11 +461,13 @@
  * aria-hidden: Radix's modal a11y hiding sets aria-hidden="true" on open
  * panels while a menu/dialog is up, and dropping this rule's 1px border
  * then reflowed every sidebar row 2px wider. Not [inert] either: this
- * React version drops the boolean inert attribute from the DOM.) */
+ * React version drops the boolean inert attribute from the DOM.)
+ * Both rails (Workspace, Conversations) are excluded — they paint their own
+ * canvas layers above, not a glass card. */
 .dark
   :is(.bg-card, [class*="md:bg-card"]):not(
     :is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])
-  ):not([data-collapsed]) {
+  ):not([data-collapsed]):not([aria-label="Workspace"]):not([aria-label="Conversations"]) {
   /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
    * build) collapses the pair and keeps only the last declaration. */
   -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
@@ -461,6 +492,17 @@
   border-right: none !important;
   border-top: none !important;
   border-bottom: none !important;
+}
+
+/* Right rail (workspace panel) in dark: blends into the canvas, keeping only
+ * its left divider. Excluded from the glass rule above, so this just clears
+ * the rail's md:bg-card fill and the bg-card fills its panel contents paint
+ * (FilesPanel/TerminalsPanel/SubagentsPanel + the graph surface). */
+.dark aside[aria-label="Workspace"],
+.dark
+  aside[aria-label="Workspace"]
+  :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+  background: transparent !important;
 }
 
 /* Popovers/menus — same glass treatment */
@@ -635,10 +677,6 @@
     padding-bottom: 0.25rem;
   }
 
-  [data-ios-native] .terminal-first-switcher-container {
-    padding-bottom: calc(0.35rem + var(--omnigent-safe-bottom));
-  }
-
   /* Reserve room for the native Liquid Glass switcher that floats over the web
      view (the in-page pill is suppressed in the iOS shell). Height is the
      shared bottom inset — the native bar footprint (sourced from the shell, see
@@ -650,70 +688,6 @@
   [data-ios-native] .omnigent-native-bottom-spacer--chat {
     height: var(--omnigent-inset-bottom);
     flex: none;
-  }
-
-  [data-ios-native] .terminal-first-switcher {
-    min-height: 46px;
-    gap: 0.25rem;
-    padding: 0.25rem;
-    border-color: color-mix(in srgb, var(--border) 72%, transparent);
-    background: color-mix(in srgb, var(--card) 88%, transparent);
-    -webkit-backdrop-filter: saturate(180%) blur(18px);
-    backdrop-filter: saturate(180%) blur(18px);
-    box-shadow:
-      0 12px 28px rgb(0 0 0 / 0.13),
-      0 1px 0 rgb(255 255 255 / 0.55) inset;
-    font-size: 16px;
-    line-height: 1;
-  }
-
-  [data-ios-native] .terminal-first-switcher > div {
-    gap: 0.25rem;
-  }
-
-  [data-ios-native] .terminal-first-switcher-option {
-    min-height: 38px;
-    gap: 0.45rem;
-    padding: 0 0.85rem;
-    font-size: 16px;
-    font-weight: 500;
-    letter-spacing: 0;
-    transition:
-      background-color 160ms ease,
-      color 160ms ease,
-      box-shadow 160ms ease,
-      transform 160ms ease;
-  }
-
-  [data-ios-native] .terminal-first-switcher-option:active:not(:disabled) {
-    transform: scale(0.97);
-  }
-
-  [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
-    background: color-mix(in srgb, var(--background) 82%, white 18%);
-    box-shadow:
-      0 3px 10px rgb(0 0 0 / 0.1),
-      0 1px 0 rgb(255 255 255 / 0.72) inset;
-  }
-
-  [data-ios-native] .terminal-first-switcher-option svg {
-    width: 1.15rem;
-    height: 1.15rem;
-  }
-
-  .dark [data-ios-native] .terminal-first-switcher {
-    border-color: color-mix(in srgb, var(--border) 82%, transparent);
-    background: color-mix(in srgb, var(--card) 78%, transparent);
-    box-shadow:
-      0 14px 30px rgb(0 0 0 / 0.35),
-      0 1px 0 rgb(255 255 255 / 0.1) inset;
-  }
-
-  .dark [data-ios-native] .terminal-first-switcher-option[aria-pressed="true"] {
-    background: color-mix(in srgb, var(--muted) 82%, white 6%);
-    box-shadow:
-      0 3px 12px rgb(0 0 0 / 0.28),
-      0 1px 0 rgb(255 255 255 / 0.12) inset;
   }
 
   :is([data-ios-native], [data-android-native])
@@ -894,6 +868,20 @@
 :is([data-streamdown="table-cell"], [data-streamdown="table-header-cell"])
   [data-streamdown="link"] {
   overflow-wrap: break-word;
+}
+
+/* KaTeX lays out radicals/fractions with positioned spans. Wide display math
+ * gets its own horizontal scroll surface instead of relying on the surrounding
+ * chat bubble to clip or wrap it. (No overflow-y override: with overflow-x
+ * non-visible the browser forces overflow-y to compute as auto anyway.) */
+.katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  padding-block: 0.25rem;
+}
+
+.katex {
+  max-width: 100%;
 }
 
 /* Flatten Streamdown's loud heading ramp (text-3xl..xl) to em sizes proportional to body. */

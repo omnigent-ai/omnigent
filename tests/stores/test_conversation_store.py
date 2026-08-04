@@ -3278,6 +3278,23 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+def test_fork_conversation_files_into_project(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``project_id=`` files the fork; the default leaves it unfiled even
+    when the source itself is filed (the route resolves ownership)."""
+    project_id = "b" * 32
+    source = conversation_store.create_conversation(title="src")
+    conversation_store.set_conversation_project(source.id, project_id)
+
+    filed_fork = conversation_store.fork_conversation(source.id, project_id=project_id)
+    assert filed_fork.project_id == project_id
+    assert conversation_store.get_conversation(filed_fork.id).project_id == project_id
+
+    unfiled_fork = conversation_store.fork_conversation(source.id)
+    assert unfiled_fork.project_id is None
+
+
 def test_fork_copies_terminal_launch_args_by_default(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

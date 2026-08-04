@@ -90,7 +90,10 @@ def _model_section() -> dict[str, object]:
     path = hermes_config_path()
     try:
         import yaml
+    except ImportError:
+        return {}
 
+    try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
         return {}

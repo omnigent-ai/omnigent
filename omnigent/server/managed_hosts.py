@@ -744,7 +744,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
     if not isinstance(raw, dict):
         raise ValueError("server config 'sandbox' must be a mapping")
     provider = raw.get("provider")
-    if provider not in SUPPORTED_SANDBOX_PROVIDERS:
+    if not isinstance(provider, str) or provider not in SUPPORTED_SANDBOX_PROVIDERS:
         supported = ", ".join(sorted(SUPPORTED_SANDBOX_PROVIDERS))
         raise ValueError(
             f"server config 'sandbox.provider' must be one of: {supported} (got {provider!r})"
@@ -2545,6 +2545,7 @@ async def resume_managed_host(
     config: ManagedSandboxConfig | None,
     *,
     force: bool = False,
+    on_stage: Callable[[str], None] | None = None,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -2574,6 +2575,12 @@ async def resume_managed_host(
         the ``sandbox:`` section has been removed since launch.
     :param force: Skip the DB-liveness no-op gate when the caller has local
         evidence that the tunnel is gone.
+    :param on_stage: Progress observer forwarded to the launcher's
+        ``start_host`` (via :func:`_start_sandbox_host`), so a wake reports the
+        launch-pipeline ``"starting"`` stage to the caller's progress surface
+        exactly like a fresh launch (:func:`_arm_and_start_host`) — without it a
+        wake shows a single frozen ``"provisioning"`` band for its whole
+        duration. ``None`` disables progress reporting.
     :raises HTTPException: 502 when the resume or host restart fails.
     """
     if config is None:
@@ -2632,6 +2639,7 @@ async def resume_managed_host(
                 repo_branch=None,
                 repo_name=None,
                 host_config=config.host_config,
+                on_stage=on_stage,
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:

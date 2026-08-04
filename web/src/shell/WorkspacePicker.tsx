@@ -558,8 +558,7 @@ export function WorkspacePicker({
             <FolderPlusIcon className="size-4 shrink-0 text-muted-foreground" />
             <input
               type="text"
-              // eslint-disable-next-line jsx-a11y/no-autofocus -- focus belongs on
-              // the field the user just opened; the picker is already a focus trap.
+              // Focus belongs on the field the user just opened; the picker is already a focus trap.
               autoFocus
               value={newFolderName}
               onChange={(e) => {

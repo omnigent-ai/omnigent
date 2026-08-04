@@ -485,6 +485,20 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
     setSelectionMode(true);
   }, []);
 
+  // Switch the visible scope tab. Selection is a single global set while the
+  // tabs show disjoint, ownership-scoped slices, so leaving selection mode on
+  // switch keeps the bulk-action count honest with the visible tab (the viewer
+  // re-enters per tab) instead of carrying stale rows across. Every path that
+  // changes the tab must go through here — not a bare setActiveTab — or the
+  // selection cleanup is skipped (e.g. the "New session" snap-back below).
+  const switchTab = useCallback(
+    (tab: SidebarTab) => {
+      if (selectionMode) exitSelectionMode();
+      setActiveTab(tab);
+    },
+    [selectionMode, exitSelectionMode],
+  );
+
   // One paginated session list — sessions are no longer split by
   // connection state, so the sidebar fetches a single undifferentiated
   // list. Archived sessions are included (`includeArchived: true`) and
@@ -634,15 +648,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // and gated to mobile so the desktop floating card is unaffected.
         "max-md:transition-transform max-md:duration-200 max-md:ease-out",
         effectiveOpen ? "translate-x-0" : "-translate-x-full",
-        // Desktop: a floating card. Detached from the window edges by a
-        // margin, rounded, and lifted off the bg-sidebar canvas with a
-        // full border + shadow. Width (the user-resizable variable) animates
-        // →0 to push main; when closed the margin/border collapse too so
-        // nothing lingers.
+        // Desktop: a full-height panel flush to the window edge, carrying
+        // the brand gradient canvas (see html:not(.dark) .conversations-sidebar
+        // in index.css) and separated from the white content by a right
+        // divider — no outer margin or rounding. Width (the user-resizable
+        // variable) animates →0 to push main; when closed the border
+        // collapses too so nothing lingers.
         "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
-        open
-          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-[var(--radius-otto-md)] md:border md:border-border"
-          : "md:m-0 md:w-0 md:border-0",
+        open ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
       )}
       style={
         {
@@ -751,7 +764,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="flex flex-col gap-0 px-2 pt-0 pb-3" data-testid="sidebar-primary-nav">
+          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -764,7 +777,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // headers and project folders. border-0 drops the Button base's
                 // transparent 1px border so the icon lands exactly on that
                 // column, flush with the Inbox row and folder rows.
-                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -777,7 +790,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               <Link
                 to="/"
                 onClick={(e) => {
-                  setActiveTab("mine");
+                  switchTab("mine");
                   onNavClick(e);
                 }}
               >
@@ -792,7 +805,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // Same shared nav-row construct as "New session" / "Inbox" so
                 // the active-pill, hover, insets, icon column, and text weight
                 // all match post-refactor.
-                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -808,7 +821,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               asChild
               variant="ghost"
               className={cn(
-                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -836,13 +849,13 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
           {/* Session-scope tabs: split the viewer's own sessions ("My
           sessions") from ones shared with them ("Shared with me"). Sits above
           the scrolling list (non-scrolling) so it stays put while the list
-          scrolls. Hidden during selection mode to keep the strip quiet while
-          the bulk-action bar sits under the Sessions header. */}
-          {multiUser && !selectionMode && (
+          scrolls. Stays visible during selection mode so the viewer can still
+          switch scopes while bulk-selecting. */}
+          {multiUser && (
             <div className="px-2 pb-2">
               <Tabs
                 value={activeTab}
-                onValueChange={(v) => setActiveTab(v as SidebarTab)}
+                onValueChange={(v) => switchTab(v as SidebarTab)}
                 className="w-full"
               >
                 <TabsList className="w-full">
@@ -869,7 +882,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -2071,7 +2084,7 @@ function SectionHeader({
                 "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
               )} sidebar-compact-text text-foreground`
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
         }
       >
         {icon ? (
@@ -2151,50 +2164,55 @@ function ProjectHeaderActions({
   const showExpandControls = !collapsed && projectNames.length > 0;
   const allExpanded =
     projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
+  // The kebab only carries the expand/collapse and "Select sessions" items; with
+  // neither applicable (e.g. no projects yet) it would open empty, so hide it.
+  const showMenu = showExpandControls || hasProjectSessions;
 
   return (
     <div className="flex items-center gap-0.5">
       <NewProjectButton onCreated={onProjectCreated} />
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Project list actions"
-            data-testid="project-list-actions"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <MoreHorizontalIcon className="size-3.5" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
-          {showExpandControls &&
-            (allExpanded ? (
-              <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
-                <Minimize2Icon className="size-3.5" />
-                Collapse to previous
-              </DropdownMenuItem>
-            ) : (
-              <DropdownMenuItem
-                data-testid="expand-all-projects"
-                onSelect={() => onExpandAll(projectNames)}
-              >
-                <Maximize2Icon className="size-3.5" />
-                Expand all
-              </DropdownMenuItem>
-            ))}
-          {hasProjectSessions && (
-            <DropdownMenuItem
-              data-testid="projects-select-sessions"
-              onSelect={() => onEnterSelectionMode()}
+      {showMenu && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Project list actions"
+              data-testid="project-list-actions"
+              onClick={(event) => event.stopPropagation()}
             >
-              <ListChecksIcon className="size-3.5" />
-              Select sessions
-            </DropdownMenuItem>
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
+              <MoreHorizontalIcon className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+            {showExpandControls &&
+              (allExpanded ? (
+                <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
+                  <Minimize2Icon className="size-3.5" />
+                  Collapse to previous
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem
+                  data-testid="expand-all-projects"
+                  onSelect={() => onExpandAll(projectNames)}
+                >
+                  <Maximize2Icon className="size-3.5" />
+                  Expand all
+                </DropdownMenuItem>
+              ))}
+            {hasProjectSessions && (
+              <DropdownMenuItem
+                data-testid="projects-select-sessions"
+                onSelect={() => onEnterSelectionMode()}
+              >
+                <ListChecksIcon className="size-3.5" />
+                Select sessions
+              </DropdownMenuItem>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
     </div>
   );
 }
@@ -2244,7 +2262,7 @@ function SectionGroup({
         )}
       </div>
       {afterHeader}
-      {!collapsed && <div className="flex flex-col gap-0.5">{children}</div>}
+      {!collapsed && <div className="flex flex-col gap-0">{children}</div>}
     </section>
   );
 }
@@ -2335,7 +2353,7 @@ function ConversationSection({
             </p>
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0.5")}>
+            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -2843,14 +2861,9 @@ function ConversationRow({
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
   const moveToProject = useMoveToProject();
-  // Archive stops the runner first (resource hygiene): a hidden session
-  // shouldn't keep a runner alive. This is NOT the user-facing Stop action
-  // (the kebab's "Stop session" item below, backed by its own mutation) —
-  // it's an internal step of archiving. Unarchive + a message relaunches
-  // on the live host under the non-sticky-stop model.
-  const stopForArchive = useStopSession();
-  // The kebab's user-facing "Stop session" action — separate mutation
-  // instance so its pending/error state can't bleed into archiving's.
+  // The kebab's user-facing "Stop session" action. Archiving does NOT go
+  // through here — the server stops the session itself once the archived
+  // flag commits, so a hidden session never keeps a runner alive.
   const stopSession = useStopSession();
   const isArchived = conversation.archived === true;
   const [isEditing, setIsEditing] = useState(false);
@@ -2987,13 +3000,12 @@ function ConversationRow({
   useEffect(() => {
     const was = wasDraggingRef.current;
     wasDraggingRef.current = isDragging;
-    if (was && !isDragging) {
-      justDraggedRef.current = true;
-      const timer = setTimeout(() => {
-        justDraggedRef.current = false;
-      }, 0);
-      return () => clearTimeout(timer);
-    }
+    if (!was || isDragging) return undefined;
+    justDraggedRef.current = true;
+    const timer = setTimeout(() => {
+      justDraggedRef.current = false;
+    }, 0);
+    return () => clearTimeout(timer);
   }, [isDragging]);
   // Merge the drag node ref with the row ref used for scroll-into-view.
   const setRowRef = useCallback(
@@ -3048,8 +3060,9 @@ function ConversationRow({
     );
   }
 
-  // Archiving runs stop→archive (see runArchive); show a status row for
-  // the whole span instead of leaving the row looking idle. On success
+  // Archiving is a single PATCH (see runArchive); show a
+  // status row for the span instead of leaving the row looking idle. On
+  // success
   // the list refetches and the row drops out of the default view (or
   // flips to its archived state under "Show archived"); on failure the
   // flag clears and the interactive row returns so the user can retry.
@@ -3091,26 +3104,22 @@ function ConversationRow({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
-    // Archiving runs stop→archive: stop the runner first (best-effort) so a
-    // hidden session doesn't leave a runner orphaned, then flip the flag.
-    // Show "Archiving…" for the whole span; cleared on the archive's settle
-    // (success → row leaves the default list or shows archived; failure →
-    // interactive row returns for a retry). The stop is best-effort — an
-    // already-offline / wedged runner must not block the archive.
+    // Archiving sends only the PATCH: the server stops the session (and
+    // tears down a host-spawned runner) in the background once the flag is
+    // committed. Sending a client stop too would race that one against the
+    // same runner, and the loser gets a 503 from the already-killed pane.
+    // "Archiving…" shows until the archive settles (success → row leaves
+    // the default list; failure → interactive row returns for a retry).
     setIsArchiving(true);
-    stopForArchive.mutate(conversation.id, {
-      onSettled: () => {
-        archive.mutate(
-          { id: conversation.id, archived: true },
-          {
-            // Point the user at where the session went — it's no longer in
-            // the sidebar list, so surface its new home in Settings.
-            onSuccess: showArchivedToast,
-            onSettled: () => setIsArchiving(false),
-          },
-        );
+    archive.mutate(
+      { id: conversation.id, archived: true },
+      {
+        // Point the user at where the session went — it's no longer in
+        // the sidebar list, so surface its new home in Settings.
+        onSuccess: showArchivedToast,
+        onSettled: () => setIsArchiving(false),
       },
-    });
+    );
   }
 
   // Shared by the kebab dropdown and the right-click context menu so the two
@@ -3144,8 +3153,9 @@ function ConversationRow({
   const rowLink = (
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
+      componentId="sidebar.conversation_switcher"
       className={cn(
-        "sidebar-compact-text relative flex h-7 flex-col justify-center rounded-[var(--radius-otto-sm)] py-0.5 pl-2 text-left text-foreground transition-colors",
+        "sidebar-compact-text relative flex h-8 flex-col justify-center rounded-[var(--radius-otto-sm)] py-1 pl-2 text-left text-foreground transition-colors",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -3159,7 +3169,7 @@ function ConversationRow({
         !selectionMode && "md:group-hover:pr-14 md:group-focus-within:pr-14",
         !selectionMode && menuOpen && "md:pr-14",
         selectionMode && "pr-2 pl-8",
-        isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+        !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
       onClick={(e) => {
@@ -3629,7 +3639,7 @@ function DeletingRow({
 
 /**
  * In-flight status row shown while a session is being archived (the
- * stop→archive sequence in ConversationRow.runArchive). Mirrors the
+ * archive PATCH in ConversationRow.runArchive). Mirrors the
  * non-error arm of {@link DeletingRow}; archive failures fall back to
  * the interactive row rather than a persistent error state, so there's
  * no retry/dismiss affordance here.
@@ -4190,7 +4200,7 @@ function BulkActionBar({
   return (
     <>
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
-        <div className="flex h-7 items-center gap-2 rounded-lg border border-border bg-background px-2">
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-background p-1.5">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button

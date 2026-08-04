@@ -2304,6 +2304,35 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     assert resolved is not None and resolved.host_id == first.host_id
 
 
+async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
+    """A wake reports launch-pipeline stages through ``on_stage``.
+
+    Parity with the fresh-launch path (``_arm_and_start_host``): base
+    ``start_host`` emits ``"starting"`` before it execs the host, so a wake
+    with an observer must surface at least that stage rather than leaving the
+    caller on a single frozen ``"provisioning"`` band for the whole resume.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+
+    stages: list[str] = []
+    await resume_managed_host(first.host_id, host_store, config, on_stage=stages.append)
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert "starting" in stages
+
+
 async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> None:
     """A local missing-tunnel wake can bypass stale cross-replica DB freshness."""
     host_store = HostStore(db_uri)

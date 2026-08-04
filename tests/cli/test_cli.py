@@ -3104,6 +3104,85 @@ def test_run_from_openclaw_forwards_server(
     assert run_chat.call_args.kwargs["server_url"] == "https://example.com"
 
 
+def _capture_profile_env_at_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, str | None]:
+    """Patch ``run``'s collaborators and capture ``DATABRICKS_CONFIG_PROFILE``.
+
+    Returns a dict whose ``"value"`` key is set to the env var as seen at
+    ``_dispatch_run`` time — i.e. after ``run`` applies ``--profile``.
+    """
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+
+    def _fake_dispatch(**_: object) -> None:
+        seen["value"] = os.environ.get("DATABRICKS_CONFIG_PROFILE")
+
+    monkeypatch.setattr("omnigent.cli._dispatch_run", _fake_dispatch)
+    return seen
+
+
+def test_run_profile_sets_databricks_config_profile_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--profile`` exports ``DATABRICKS_CONFIG_PROFILE`` for the auth chain.
+
+    The remote-auth paths (``_remote_headers`` / ``_server_auth`` /
+    ``_DatabricksTokenAuth``) resolve credentials through the Databricks SDK's
+    env-based profile selection, so ``run`` must set the env var before
+    dispatch for a headless service-principal ``--server`` login to resolve.
+    """
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://example.com", "--profile", "my-sp", "-p", "hi"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["value"] == "my-sp"
+
+
+def test_run_profile_wins_over_preset_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``--profile`` overrides an ambient ``DATABRICKS_CONFIG_PROFILE``.
+
+    A CLI flag is a stronger signal of intent than an inherited env var; the
+    flag must not be a silent no-op when the env var is already set.
+    """
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "preset")
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://example.com", "--profile", "my-sp", "-p", "hi"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["value"] == "my-sp"
+
+
+def test_run_without_profile_leaves_preset_env_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting ``--profile`` preserves an ambient ``DATABRICKS_CONFIG_PROFILE``.
+
+    Users who export the env var themselves keep working without the flag.
+    """
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "preset")
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://example.com", "-p", "hi"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["value"] == "preset"
+
+
 def test_materialize_harness_launcher_file_kimi_gets_os_env() -> None:
     """``run --harness kimi`` bakes a caller-process ``os_env`` so the SDK kimi
     operates in the user's current directory, matching claude-sdk.

@@ -365,10 +365,10 @@ describe("Sidebar session list", () => {
     const primaryNav = screen.getByTestId("sidebar-primary-nav");
     const inbox = within(primaryNav).getByTestId("inbox-button");
 
-    expect(primaryNav).toHaveClass("px-2", "pt-0", "pb-3");
+    expect(primaryNav).toHaveClass("px-2", "pt-2", "pb-0");
     expect(primaryNav).not.toHaveClass("-mt-0.5");
     expect(inbox).toHaveAttribute("href", "/inbox");
-    expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
+    expect(inbox).toHaveClass("h-8", "w-full", "justify-start");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
     expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
@@ -609,8 +609,8 @@ describe("Sidebar session list", () => {
     const plainRow = screen.getByText("Plain session").closest("a")!;
     const worktreeRow = screen.getByText("Worktree session").closest("a")!;
 
-    expect(plainRow).toHaveClass("h-7", "justify-center");
-    expect(worktreeRow).toHaveClass("h-7", "justify-center");
+    expect(plainRow).toHaveClass("h-8", "justify-center");
+    expect(worktreeRow).toHaveClass("h-8", "justify-center");
     expect(within(worktreeRow).queryByText("fix/sidebar-row-height")).toBeNull();
   });
 

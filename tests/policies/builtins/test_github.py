@@ -26,7 +26,13 @@ from typing import Any
 
 import pytest
 
+from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins.github import _DEFAULT_SHELL_TOOLS as _github_default_shell_tools
 from omnigent.policies.builtins.github import github_policy
+from omnigent.policies.builtins.orchestration import _SHELL_TOOLS as _orchestration_shell_tools
+from omnigent.policies.builtins.working_dir import (
+    _DEFAULT_SHELL_TOOLS as _working_dir_default_shell_tools,
+)
 from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.registry import get_registry, load_registry, validate_factory_params
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
@@ -332,6 +338,34 @@ def test_shell_push_to_url_repo_denied() -> None:
     policy = github_policy(write_repos=[_REPO])
     result = policy(_sh("git push https://github.com/octo/secret main"))
     assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize("tool", sorted(SHELL_TOOLS))
+def test_shell_surface_covers_every_harness(tool: str) -> None:
+    """Every harness's shell tool is inspected by default, not just sys_os_shell.
+
+    Most ``git push`` runs on a native harness, so a default of
+    ``("sys_os_shell",)`` left this policy inspecting nothing at all on the
+    sessions that matter: an admin setting ``write_repos`` got an enforcement
+    boundary that silently did not exist. An ALLOW here means that harness's
+    shell surface is uninspected again.
+
+    :param tool: A shell tool name from the shared default set.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(tc(tool, {"command": "git push https://github.com/octo/secret main"}))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_shell_tool_defaults_match_sibling_policies() -> None:
+    """The three shell-surface policies must gate the same tool names.
+
+    They each carried their own literal and drifted: blast_radius covered all
+    six, working_dir two, github one. Fails if any of them is narrowed again.
+    """
+    assert _github_default_shell_tools is SHELL_TOOLS
+    assert _working_dir_default_shell_tools is SHELL_TOOLS
+    assert _orchestration_shell_tools is SHELL_TOOLS
 
 
 def test_shell_push_bad_branch_denied() -> None:
@@ -861,6 +895,88 @@ def test_shell_gh_non_delete_write_unaffected() -> None:
     policy = github_policy(write_repos=["octo/hello"])
     assert policy(_sh("gh pr create --repo octo/hello --base main")) is None
     assert policy(_sh("gh issue create --repo octo/hello")) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Layer 1 — force-push protection
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_force_push_denied_by_default() -> None:
+    """git push --force is denied by default even to an allowed repo+branch."""
+    policy = github_policy(write_repos=["octo/hello"], write_branches=["main"])
+    result = policy(_sh("git push --force https://github.com/octo/hello main"))
+    assert result is not None and result["result"] == "DENY"
+    assert "force" in result.get("reason", "").lower()
+
+
+def test_force_push_short_flag_denied() -> None:
+    """git push -f is denied (short flag form)."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push -f https://github.com/octo/hello main"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_force_with_lease_denied_by_default() -> None:
+    """git push --force-with-lease is also denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push --force-with-lease https://github.com/octo/hello main"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_force_push_allowed_when_opt_out() -> None:
+    """deny_force_push=False lets force pushes through normal repo/branch gating."""
+    policy = github_policy(write_repos=["octo/hello"], deny_force_push=False)
+    assert policy(_sh("git push --force https://github.com/octo/hello main")) is None
+
+
+def test_force_push_alias_denied() -> None:
+    """Force push to an alias is DENY (not ASK), regardless of repo resolution."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push --force origin main"))
+    assert result is not None and result["result"] == "DENY"
+    assert "force" in result.get("reason", "").lower()
+
+
+def test_non_force_push_still_allowed() -> None:
+    """A normal push to an allowed repo is not affected by force-push protection."""
+    policy = github_policy(write_repos=["octo/hello"])
+    assert policy(_sh("git push https://github.com/octo/hello main")) is None
+
+
+def test_force_push_wrapped_in_bash_denied() -> None:
+    """bash -c wrapper does not bypass force-push detection."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh('bash -c "git push --force https://github.com/octo/hello main"'))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_force_push_plus_refspec_denied() -> None:
+    """git push origin +main (force via +refspec) is denied by default."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello +main"))
+    assert result is not None and result["result"] == "DENY"
+    assert "force" in result.get("reason", "").lower()
+
+
+def test_force_push_plus_refspec_with_dest_denied() -> None:
+    """git push origin +src:dst (force via +refspec with destination) is denied."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello +main:main"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_force_push_bundled_short_flags_denied() -> None:
+    """git push -uf (bundled short flags containing f) is denied."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push -uf https://github.com/octo/hello main"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_force_push_plus_refspec_allowed_when_opt_out() -> None:
+    """deny_force_push=False lets +refspec through normal gating."""
+    policy = github_policy(write_repos=["octo/hello"], deny_force_push=False)
+    assert policy(_sh("git push https://github.com/octo/hello +main")) is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

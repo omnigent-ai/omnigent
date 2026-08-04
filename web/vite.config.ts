@@ -315,6 +315,7 @@ export default defineConfig({
           if (normalized.includes("/shiki") || normalized.includes("/@shikijs/")) {
             return "shiki";
           }
+          return undefined;
         },
       },
     },

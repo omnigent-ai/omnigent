@@ -24,7 +24,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeAlias
 
 import click
 import httpx
@@ -43,6 +42,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -58,8 +58,6 @@ from omnigent.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native_terminal import url_component
-
-_JsonObject: TypeAlias = dict[str, object]
 
 _DEFAULT_HERMES_COMMAND = "hermes"
 _HERMES_PATH_ENV = "OMNIGENT_HERMES_PATH"

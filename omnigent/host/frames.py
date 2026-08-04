@@ -22,9 +22,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypeAlias
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.json_types import JsonObject as _JsonObject
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -33,7 +33,10 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # ``ErrorCode.HARNESS_NOT_CONFIGURED``), and tests.
 HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 
-_JsonObject: TypeAlias = dict[str, object]
+# when the host refuses a launch because the session's workspace directory
+# does not exist on the host (e.g. the worktree was deleted). Shared by the
+# daemon (producer) and server (consumer) so both can handle it structurally.
+WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
 
 class HostFrameKind(str, Enum):

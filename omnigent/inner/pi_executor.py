@@ -51,6 +51,8 @@ from urllib.parse import urlparse as _urlparse
 from omnigent import model_catalog
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
+from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.json_types import JsonValue
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
@@ -126,11 +128,6 @@ NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
     [str, dict[str, Any]],
     Awaitable[dict[str, Any]] | dict[str, Any],
 ]
-
-# Plain JSON value — recursive union used by ``_check_blocked`` to walk
-# parsed Pi tool-result payloads.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
-_JsonObject: TypeAlias = dict[str, object]
 
 
 class _PiProviderConfig(TypedDict):
@@ -772,6 +769,11 @@ def _build_models_json(
                 "baseUrl": openai_base_url,
                 "apiKey": token,
                 "api": "openai-completions",
+                # Generic (non-Databricks) OpenAI-compatible gateways expect
+                # ``Authorization: Bearer <token>``; the Databricks workspace
+                # endpoint uses a different auth scheme so authHeader is omitted
+                # on the native path.
+                **({"authHeader": True} if is_generic_provider else {}),
                 "compat": _openai_responses_compat,
                 "models": provider_models["databricks"],
             },
@@ -805,6 +807,8 @@ def _build_models_json(
                 "baseUrl": openai_base_url,
                 "apiKey": token,
                 "api": "openai-completions",
+                # Same rationale as the "databricks" entry above.
+                **({"authHeader": True} if is_generic_provider else {}),
                 "compat": {
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
