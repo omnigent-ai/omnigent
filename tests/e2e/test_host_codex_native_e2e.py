@@ -745,31 +745,31 @@ def test_codex_native_spawn_creates_child_session(
         "OMNIGENT_E2E_CODEX_NATIVE=1 to run"
     ),
 )
-def test_codex_native_user_message_streams_before_assistant_delta(
+def test_codex_native_user_message_streams_before_assistant_output(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
 ) -> None:
     """
-    The user message streams to the web client BEFORE the assistant text.
+    The user message streams to the web client before assistant output.
 
     Regression for the TRANSIENT render bug: on a fresh codex thread the
     live ``userMessage`` event can be missed, so the forwarder recovers it
     via a resume. If recovery waited for the assistant's ``item/completed``,
-    the assistant's ``response.output_text.delta`` events would reach the
-    web SSE stream first and render a transient assistant bubble ABOVE the
+    the assistant's reasoning/text events would reach the web SSE stream
+    first and render a transient assistant bubble ABOVE the
     still-pending user bubble until the turn reconciled. The forwarder
     recovers at the assistant's ``item/started`` instead, so the user
     message's ``session.input.consumed`` event reaches the stream before
-    the first assistant delta.
+    the first assistant output event.
 
     The durable ``items`` API (asserted in
     ``test_codex_native_builtin_session_round_trip``) cannot catch this —
     it never contains the transient deltas. This asserts the live SSE
     event order the web UI actually renders from. With the
     ``item/started`` recovery removed (leaving only the ``item/completed``
-    backstop), the first delta precedes ``session.input.consumed`` and
-    this fails.
+    backstop), the first reasoning/text event precedes
+    ``session.input.consumed`` and this fails.
 
     :param live_server: Test server URL.
     :param http_client: HTTP client pointed at the test server.
@@ -800,7 +800,7 @@ def test_codex_native_user_message_streams_before_assistant_delta(
             subscriber slot registers — so the caller posts the turn only
             once the subscription is live (the stream replays no history).
             Sets ``both_seen`` once both the user-consumed event and an
-            assistant text delta have arrived, so the caller waits
+            assistant output event have arrived, so the caller waits
             event-driven (no polling).
 
             :returns: None.
@@ -815,9 +815,14 @@ def test_codex_native_user_message_streams_before_assistant_delta(
                     if line.startswith("event:"):
                         event_types.append(line[len("event:") :].strip())
                         connected.set()
-                        if (
-                            "session.input.consumed" in event_types
-                            and "response.output_text.delta" in event_types
+                        assistant_output_types = {
+                            "response.reasoning.started",
+                            "response.reasoning_text.delta",
+                            "response.reasoning_summary_text.delta",
+                            "response.output_text.delta",
+                        }
+                        if "session.input.consumed" in event_types and any(
+                            event_type in assistant_output_types for event_type in event_types
                         ):
                             both_seen.set()
                             return
@@ -847,22 +852,31 @@ def test_codex_native_user_message_streams_before_assistant_delta(
         )
 
         # Event-driven wait: the consumer sets this once both the user
-        # message and the first assistant delta have streamed.
+        # message and the first assistant output event have streamed.
         both_seen.wait(timeout=180.0)
         stop.set()
 
         assert "session.input.consumed" in event_types, (
             f"user message never streamed to the web client; saw: {event_types}"
         )
-        assert "response.output_text.delta" in event_types, (
-            "assistant text never streamed as deltas; the prompt did not "
-            f"produce streamed output. saw: {event_types}"
+        assistant_output_types = {
+            "response.reasoning.started",
+            "response.reasoning_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.output_text.delta",
+        }
+        assert any(event_type in assistant_output_types for event_type in event_types), (
+            f"assistant output never streamed; saw: {event_types}"
         )
         consumed_idx = event_types.index("session.input.consumed")
-        first_delta_idx = event_types.index("response.output_text.delta")
-        assert consumed_idx < first_delta_idx, (
-            "assistant text delta streamed BEFORE the user message "
-            f"(consumed at index {consumed_idx}, first delta at {first_delta_idx}) "
+        first_output_idx = next(
+            index
+            for index, event_type in enumerate(event_types)
+            if event_type in assistant_output_types
+        )
+        assert consumed_idx < first_output_idx, (
+            "assistant output streamed BEFORE the user message "
+            f"(consumed at index {consumed_idx}, first output at {first_output_idx}) "
             "— the web UI would render the reply above the question. "
             f"event order: {event_types}"
         )
