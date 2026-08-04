@@ -8076,6 +8076,59 @@ describe("chatStore — setSubagentRouting", () => {
   });
 });
 
+// Nothing pushes a routing-switch change to the client, so a control that only
+// ever read the bind-time snapshot would keep showing a stale value (the
+// "Inherit shown while 'on' is stored" mismatch). These pin the re-read.
+describe("chatStore — refreshSessionOverrides", () => {
+  it("re-reads both routing switches from the server", async () => {
+    seedSession("conv_ro", []);
+    await useChatStore.getState().switchTo("conv_ro");
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+    expect(useChatStore.getState().costControlModeOverride).toBeNull();
+
+    // Changed out of band (another tab / the CLI), so the store is now stale.
+    sessionSubagentRoutingOverrides.set("conv_ro", "on");
+    sessionCostControlOverrides.set("conv_ro", "on");
+    await useChatStore.getState().refreshSessionOverrides();
+
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("on");
+    expect(useChatStore.getState().costControlModeOverride).toBe("on");
+  });
+
+  it("reads a cleared override back as inherit", async () => {
+    seedSession("conv_ro2", []);
+    sessionSubagentRoutingOverrides.set("conv_ro2", "off");
+    await useChatStore.getState().switchTo("conv_ro2");
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("off");
+
+    sessionSubagentRoutingOverrides.delete("conv_ro2");
+    await useChatStore.getState().refreshSessionOverrides();
+
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+
+  it("keeps the current values when the snapshot fetch fails", async () => {
+    seedSession("conv_ro3", []);
+    sessionSubagentRoutingOverrides.set("conv_ro3", "on");
+    await useChatStore.getState().switchTo("conv_ro3");
+
+    fetchMock.mockImplementationOnce(() =>
+      mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 }),
+    );
+    await useChatStore.getState().refreshSessionOverrides();
+
+    // A blip must not read as "no override" — that would silently flip the
+    // row to Inherit and let a Save write it back.
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("on");
+  });
+
+  it("no-ops without an active conversation", async () => {
+    useChatStore.setState({ conversationId: null });
+    await useChatStore.getState().refreshSessionOverrides();
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+});
+
 // Elicitations are keyed by elicitationId, never itemId (they are not
 // persisted conversation items), so neither the reconnect item backfill
 // nor the itemId dedupe can see them. These tests cover the dedicated

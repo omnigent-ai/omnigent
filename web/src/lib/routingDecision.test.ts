@@ -3,6 +3,7 @@ import {
   isSessionScopedDecision,
   routingExtras,
   routingExtrasFromWire,
+  showsRoutingDecisionChip,
   subagentScopeLabel,
 } from "./routingDecision";
 
@@ -79,5 +80,26 @@ describe("isSessionScopedDecision", () => {
     ["child_session", false],
   ] as const)("scope %s is session-scoped: %s", (scope, expected) => {
     expect(isSessionScopedDecision(scope)).toBe(expected);
+  });
+});
+
+describe("showsRoutingDecisionChip", () => {
+  // A spawn chip is only honest about a setting the user chose: "Inherit" (and
+  // an explicit "off") never advertises per-spawn routing, even though the
+  // spawns of an inheriting session are still routed server-side. Everything
+  // else — the session's own turn decisions and child-session decisions, which
+  // follow the session's Smart Routing switch — renders regardless.
+  it.each([
+    ["native_subagent", "on", true],
+    ["native_subagent", "off", false],
+    ["native_subagent", null, false],
+    ["native_subagent", undefined, false],
+    ["child_session", null, true],
+    ["session", null, true],
+    ["turn", null, true],
+    [null, null, true],
+    [undefined, null, true],
+  ] as const)("scope %s with override %s shows: %s", (scope, override, expected) => {
+    expect(showsRoutingDecisionChip(scope, override)).toBe(expected);
   });
 });

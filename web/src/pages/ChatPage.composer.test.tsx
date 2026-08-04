@@ -1582,6 +1582,8 @@ describe("Composer config gear", () => {
       nativeVendorOwnsModel: false,
       selectedEffort: null,
       costControlModeOverride: null,
+      // Opening the gear re-reads the routing switches; stub the fetch away.
+      refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
     });
   });
 
@@ -2018,6 +2020,9 @@ describe("Composer config gear — subagent routing", () => {
       selectedEffort: null,
       costControlModeOverride: null,
       subagentRoutingOverride: null,
+      // Opening the gear re-reads the switches from the server; stub it so
+      // these renders don't reach the network.
+      refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
     });
   });
 
@@ -2164,6 +2169,88 @@ describe("Composer config gear — subagent routing", () => {
     fireEvent.click(document.querySelector('[data-subagent-routing="on"]') as Element);
     fireEvent.click(screen.getByTestId("composer-config-cancel"));
     expect(setSubagentRouting).not.toHaveBeenCalled();
+  });
+
+  // Display side of the round-trip for all three stored states: `null` (unset)
+  // must present as Inherit, never collapse onto "on"/"off".
+  it.each([
+    { stored: null, shown: "Inherit" },
+    { stored: "on", shown: "Smart Routing" },
+    { stored: "off", shown: "Default" },
+  ] as const)("shows $shown for stored $stored", async ({ stored, shown }) => {
+    useChatStore.setState({ subagentRoutingOverride: stored });
+    await openNativeModal();
+    expect(row()!.textContent).toContain(shown);
+  });
+
+  // Write side of the same round-trip: every (stored, picked) pair. A pick that
+  // differs persists exactly itself — including `null` for Inherit — and
+  // re-picking what is already stored writes nothing.
+  it.each([
+    { stored: null, option: "inherit", written: null },
+    { stored: null, option: "on", written: "on" },
+    { stored: null, option: "off", written: "off" },
+    { stored: "on", option: "inherit", written: null },
+    { stored: "on", option: "on", written: "on" },
+    { stored: "on", option: "off", written: "off" },
+    { stored: "off", option: "inherit", written: null },
+    { stored: "off", option: "on", written: "on" },
+    { stored: "off", option: "off", written: "off" },
+  ] as const)(
+    "stored $stored + pick $option writes $written",
+    async ({ stored, option, written }) => {
+      const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: stored });
+      await openNativeModal();
+      fireEvent.click(row()!);
+      fireEvent.click(document.querySelector(`[data-subagent-routing="${option}"]`) as Element);
+      fireEvent.click(screen.getByTestId("composer-config-save"));
+      await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
+      if (written === stored) expect(setSubagentRouting).not.toHaveBeenCalled();
+      else expect(setSubagentRouting).toHaveBeenCalledWith(written);
+    },
+  );
+
+  // The mismatch this pins: the row must not keep showing the value the session
+  // had when the modal opened. Nothing pushes a routing-switch change to the
+  // client, so the stored value can land (bind snapshot, another tab's PATCH)
+  // while the modal sits open — and a Save then wrote the stale value back.
+  it("follows the stored value when it changes under an open, untouched row", async () => {
+    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: null });
+    await openNativeModal();
+    expect(row()!.textContent).toContain("Inherit");
+
+    // The real stored value arrives (the snapshot the store was missing).
+    useChatStore.setState({ subagentRoutingOverride: "on" });
+    await waitFor(() => expect(row()!.textContent).toContain("Smart Routing"));
+
+    // Untouched → Save writes nothing; the session keeps what it has.
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
+    expect(setSubagentRouting).not.toHaveBeenCalled();
+  });
+
+  it("keeps the user's pick when the stored value changes under it", async () => {
+    const setSubagentRouting = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setSubagentRouting, subagentRoutingOverride: null });
+    await openNativeModal();
+    fireEvent.click(row()!);
+    fireEvent.click(document.querySelector('[data-subagent-routing="off"]') as Element);
+
+    // A late snapshot must not overwrite what the user just chose.
+    useChatStore.setState({ subagentRoutingOverride: "on" });
+    expect(row()!.textContent).toContain("Default");
+
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(setSubagentRouting).toHaveBeenCalledWith("off"));
+  });
+
+  it("re-reads the stored switches when the modal opens", async () => {
+    const refreshSessionOverrides = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ refreshSessionOverrides });
+    await openNativeModal();
+    expect(refreshSessionOverrides).toHaveBeenCalled();
   });
 });
 

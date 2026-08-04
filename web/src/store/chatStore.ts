@@ -646,6 +646,19 @@ export interface ChatState {
    */
   setSubagentRouting: (mode: "on" | "off" | null) => Promise<void>;
   /**
+   * Re-read the active session's routing switches (cost control + sub-agent
+   * routing) from the server and apply them.
+   *
+   * Both are hydrated on bind only — no SSE event carries them and the
+   * ``["session", id]`` query never goes stale — so a change made elsewhere
+   * (another tab, the CLI, a collaborator) would otherwise stay invisible for
+   * the life of the tab, and a control seeded from that stale state would show
+   * a value the session no longer has. Callers re-read before showing the
+   * switches. Best-effort: a failed fetch or a session switch mid-flight
+   * leaves the current state alone.
+   */
+  refreshSessionOverrides: () => Promise<void>;
+  /**
    * Toggle Codex Plan mode for the active session. No-ops when there is no
    * active conversation.
    */
@@ -1836,6 +1849,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
       throw err;
     }
+  },
+
+  refreshSessionOverrides: async () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    let session: Session;
+    try {
+      session =
+        queryClient !== null
+          ? await queryClient.fetchQuery({
+              queryKey: ["session", conversationId],
+              queryFn: () => getSessionSlim(conversationId),
+              staleTime: 0,
+              retry: false,
+            })
+          : await getSessionSlim(conversationId);
+    } catch {
+      // Transient (server/runner blip) — keep what we have rather than
+      // resetting the switches to their defaults.
+      return;
+    }
+    if (get().conversationId !== conversationId) return;
+    set({
+      costControlModeOverride: session.costControlModeOverride ?? null,
+      subagentRoutingOverride: session.subagentRoutingOverride ?? null,
+    });
   },
 
   setCodexPlanMode: async (enabled) => {

@@ -86,6 +86,31 @@ export function isSessionScopedDecision(scope: RoutingScope | null | undefined):
 }
 
 /**
+ * Whether a routing-decision chip may render, given the session's
+ * ``subagent_routing_override``.
+ *
+ * An in-harness spawn decision (`native_subagent`) shows only while the
+ * session explicitly opted its sub-agents into routing. On "Inherit" the
+ * user never asked for sub-agent routing, so chips advertising per-spawn
+ * picks read as a setting they didn't choose. Display gate only — the
+ * decision rows stay persisted as the audit trail, and the spawns of an
+ * inheriting session are still routed server-side.
+ *
+ * Session/turn decisions and child-session decisions are unaffected: those
+ * follow the session's own Smart Routing switch, not this override.
+ *
+ * @param scope - Decision scope, or null/undefined on legacy rows.
+ * @param subagentRoutingOverride - The session's stored override.
+ * @returns True when the chip should render.
+ */
+export function showsRoutingDecisionChip(
+  scope: RoutingScope | null | undefined,
+  subagentRoutingOverride: "on" | "off" | null | undefined,
+): boolean {
+  return scope !== "native_subagent" || subagentRoutingOverride === "on";
+}
+
+/**
  * Badge text for a sub-agent-scoped decision, e.g. `"subagent: researcher"`.
  *
  * @param scope - Decision scope; only the sub-agent scopes get a badge.

@@ -154,6 +154,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
+import { showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
   DialogContent,
@@ -517,6 +518,25 @@ export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
   return result ?? bubbles;
 }
 
+// Hide the sub-agent spawn chips of a session that never opted its sub-agents
+// into routing: on "Inherit" (or an explicit "off") a `native_subagent`
+// decision chip would advertise a Smart Routing setting the user didn't
+// choose. The rows stay persisted (audit trail) and the session's own
+// session/turn chips are untouched. Returns the input array unchanged when
+// nothing is hidden, so the memo stays stable.
+export function stripGatedSubagentRoutingChips(
+  bubbles: Bubble[],
+  subagentRoutingOverride: "on" | "off" | null,
+): Bubble[] {
+  if (subagentRoutingOverride === "on") return bubbles;
+  const shown = bubbles.filter(
+    (b) =>
+      b.kind !== "routing_decision" ||
+      showsRoutingDecisionChip(b.routing?.scope, subagentRoutingOverride),
+  );
+  return shown.length === bubbles.length ? bubbles : shown;
+}
+
 // Whether a user bubble should carry the author's avatar badge (and the
 // author-tinted background): only in a shared session, only when a human
 // author is attached (agent/tool/system output and pre-attribution
@@ -760,6 +780,9 @@ export function ChatPage() {
   const { data: boundAgentBySession } = useSessionAgent(urlConvId ?? null);
   const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
+  // Gates the sub-agent spawn chips: only a session that explicitly turned
+  // sub-agent routing on shows them (see stripGatedSubagentRoutingChips).
+  const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
 
   // Build bubbles once per blocks/activeResponse change. Memo here so
   // unrelated store updates (status, loading flags) don't re-walk.
@@ -777,8 +800,11 @@ export function ChatPage() {
     // consumed message lands in `blocks` AFTER the card
     // (`reorderCommittedRequestElicitations` swaps the card below it).
     // Both keep the prompt on top across the pending → approved flip.
-    const committed = reorderCommittedRequestElicitations(
-      buildBubbles(blocks, activeResponse, bubbleCacheRef.current, interruptedResponseIds),
+    const committed = stripGatedSubagentRoutingChips(
+      reorderCommittedRequestElicitations(
+        buildBubbles(blocks, activeResponse, bubbleCacheRef.current, interruptedResponseIds),
+      ),
+      subagentRoutingOverride,
     );
     // claude-native live previews are NOT trailing bubbles — they live in
     // `blocks` as provisional `live:*` text blocks at their streamed
@@ -790,7 +816,13 @@ export function ChatPage() {
       committed,
       buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
     );
-  }, [blocks, activeResponse, interruptedResponseIds, pendingUserMessages]);
+  }, [
+    blocks,
+    activeResponse,
+    interruptedResponseIds,
+    pendingUserMessages,
+    subagentRoutingOverride,
+  ]);
 
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
   // so the pick survives sidebar clicks; resets on full page reload.
@@ -5737,6 +5769,7 @@ function SessionConfigModal({
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
+  const conversationId = useChatStore((s) => s.conversationId);
   const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
 
@@ -5764,20 +5797,30 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
-  // `null` = inherit (no override persisted); the row then displays the
-  // inherited value with a "following the session" description.
-  const [draftSubagentRouting, setDraftSubagentRouting] = useState<"on" | "off" | null>(
-    subagentRoutingOverride,
-  );
+  // The sub-agent row is stored as a PICK, not a pre-seeded draft:
+  // `undefined` means "untouched", so the row mirrors the live stored value
+  // (`null` = inherit, no override persisted) for as long as the user hasn't
+  // chosen anything. A draft seeded once per open would keep showing the value
+  // the session had when the modal opened — and Save would write that stale
+  // value back — if the stored one changed underneath (a bind/refresh landing,
+  // or another client's PATCH).
+  const [pickedSubagentRouting, setPickedSubagentRouting] = useState<
+    "on" | "off" | null | undefined
+  >(undefined);
   useEffect(() => {
     if (!open) return;
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
-    setDraftSubagentRouting(subagentRoutingOverride);
-    // Seed once per open from the current live values.
+    setPickedSubagentRouting(undefined);
+    // Nothing pushes a routing-switch change to the client (no SSE event, and
+    // the session query never goes stale), so re-read them here — otherwise the
+    // switches show whatever they were at bind time.
+    void useChatStore.getState().refreshSessionOverrides();
+    // Seed once per open from the current live values, and re-seed if the bound
+    // session changes under an open modal (its drafts describe the old one).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, conversationId]);
 
   // The Select value: the router sentinel when routing is drafted on, else the
   // drafted model, else the "Default" sentinel (no override).
@@ -5804,8 +5847,12 @@ function SessionConfigModal({
   // state — which the client can't always name (a spec-default-routed session
   // routes with `costControlModeOverride` still null), so the row offers
   // "Inherit" as its own option instead of collapsing onto "on"/"off".
-  const subagentRoutingInherited = draftSubagentRouting === null;
-  const subagentRoutingValue = draftSubagentRouting ?? SUBAGENT_ROUTING_INHERIT;
+  // Untouched (`undefined`) reads through to the stored value, so what the row
+  // shows is always what is persisted until the user picks something else.
+  const effectiveSubagentRouting =
+    pickedSubagentRouting === undefined ? subagentRoutingOverride : pickedSubagentRouting;
+  const subagentRoutingInherited = effectiveSubagentRouting === null;
+  const subagentRoutingValue = effectiveSubagentRouting ?? SUBAGENT_ROUTING_INHERIT;
 
   const save = () => {
     // Commit the changed knobs SEQUENTIALLY, awaiting each PATCH before the
@@ -5841,8 +5888,15 @@ function SessionConfigModal({
           await store.setEffort(draftEffort);
         // Sub-agent routing is independent of this session's own model — a
         // plain PATCH with no slash-command injection, so ordering is free.
-        if (subagentRoutingEligible && draftSubagentRouting !== subagentRoutingOverride)
-          await store.setSubagentRouting(draftSubagentRouting);
+        // Only an explicit pick is written, and only when it still differs from
+        // what the session has now: an untouched row must never persist a value
+        // the user didn't choose.
+        if (
+          subagentRoutingEligible &&
+          pickedSubagentRouting !== undefined &&
+          pickedSubagentRouting !== store.subagentRoutingOverride
+        )
+          await store.setSubagentRouting(pickedSubagentRouting);
       } catch {
         // Individual setters already roll back their optimistic state; a failed
         // PATCH shouldn't wedge the modal open.
@@ -5953,8 +6007,8 @@ function SessionConfigModal({
               <Select
                 value={subagentRoutingValue}
                 onValueChange={(v) => {
-                  if (v === SUBAGENT_ROUTING_INHERIT) setDraftSubagentRouting(null);
-                  else setDraftSubagentRouting(v === "on" ? "on" : "off");
+                  if (v === SUBAGENT_ROUTING_INHERIT) setPickedSubagentRouting(null);
+                  else setPickedSubagentRouting(v === "on" ? "on" : "off");
                 }}
               >
                 <SelectTrigger
