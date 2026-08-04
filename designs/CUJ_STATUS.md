@@ -424,7 +424,14 @@ coverage before this section.
 ### 2.12 Codex GLM subagents
 
 ucode PR 251 explicitly skips GLM for codex subagents
-(`GLM_SUBAGENT_SKIP_MESSAGE`). We aim to support it. Three known blockers
+(`GLM_SUBAGENT_SKIP_MESSAGE`). We aim to support it.
+
+**Spawn-family policy (Bryan, 2026-08-03):** subagent spawning is restricted to
+the parent's harness — claude sessions spawn only claude subagents, codex
+sessions only codex subagents — and **GLM counts as codex-family**: with smart
+routing enabled, all codex subagents (nested spawns included) may spawn both
+gpt and glm arms. The smart-routing (auto) harness is the one exception and may
+spawn any subagent cross-family. Three known blockers
 (2026-08-03): glm absent from the static codex spawn candidates
 (`infer_models` — fixing this also fixes the §2.1 create-path C1 arrow);
 unnamed spawns route on the placeholder → always the floor arm (glm reachable
