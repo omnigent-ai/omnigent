@@ -2073,3 +2073,30 @@
     animation: none;
   }
 }
+/* The summary row grows in over the same beat as the trace shrinks.
+   Inserting it at full height first jolted the bubble ~40px TALLER
+   before the collapse began, which read as two separate motions; row
+   expanding + trace shrinking nets one monotonic shrink. */
+@keyframes turn-fold-row-in {
+  from {
+    grid-template-rows: 0fr;
+  }
+  to {
+    grid-template-rows: 1fr;
+  }
+}
+.turn-fold-row-enter {
+  display: grid;
+  grid-template-rows: 0fr;
+  animation: turn-fold-row-in 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+.turn-fold-row-enter > * {
+  min-height: 0;
+  overflow: hidden;
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-fold-row-enter {
+    grid-template-rows: 1fr;
+    animation: none;
+  }
+}

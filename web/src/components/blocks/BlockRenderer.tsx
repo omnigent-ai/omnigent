@@ -347,34 +347,36 @@ export function BlockRenderer({
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
   const isTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
 
-  // Did this turn settle under the user's eyes on THIS render (rather
-  // than mounting already-settled from history)? Only then is there a
-  // visible trace to animate away — see `TurnWorkedFold`.
-  const wasLiveRef = useRef(isTurnLive);
-  const justSettled = wasLiveRef.current && !isTurnLive;
+  // Fold a turn that did work AND either answered here or continues in a
+  // later bubble: the trace collapses behind the "Worked for" row, exempt
+  // cards stay visible after it, and the answer (when this bubble carries
+  // one) renders last at full style. A turn that did no work, or that
+  // dead-ends with no answer anywhere, renders expanded — there is
+  // nothing to demarcate.
+  const { process, exempt, final, finalStart } = partitionTurn(items);
+  const showFold = !isTurnLive && process.length > 0 && (final.length > 0 || continued);
+
+  // Animate only when the fold APPEARS on an already-mounted bubble —
+  // the turn settled, or its continuation landed, while the user was
+  // looking. Mounting settled history shows it closed with no motion.
+  const mountedRef = useRef(false);
+  const foldShownRef = useRef(showFold);
+  const animateCollapse = showFold && mountedRef.current && !foldShownRef.current;
   useEffect(() => {
-    wasLiveRef.current = isTurnLive;
+    mountedRef.current = true;
+    foldShownRef.current = showFold;
   });
 
-  if (!isTurnLive) {
-    const { process, exempt, final, finalStart } = partitionTurn(items);
-    // Fold a turn that did work AND either answered here or continues in
-    // a later bubble: the trace collapses behind the "Worked for" row,
-    // exempt cards stay visible after it, and the answer (when this
-    // bubble carries one) renders last at full style. A turn that did no
-    // work, or that dead-ends with no answer anywhere, renders expanded —
-    // there is nothing to demarcate.
-    if (process.length > 0 && (final.length > 0 || continued)) {
-      return (
-        <>
-          <TurnWorkedFold workedForS={workedForS} animateCollapse={justSettled}>
-            {renderSequence(process, { liveEdge: false, canApprove })}
-          </TurnWorkedFold>
-          {exempt.map(({ item, index }) => renderItem(item, index, false, false, canApprove))}
-          {renderSequence(final, { liveEdge: false, canApprove, indexBase: finalStart })}
-        </>
-      );
-    }
+  if (showFold) {
+    return (
+      <>
+        <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
+          {renderSequence(process, { liveEdge: false, canApprove })}
+        </TurnWorkedFold>
+        {exempt.map(({ item, index }) => renderItem(item, index, false, false, canApprove))}
+        {renderSequence(final, { liveEdge: false, canApprove, indexBase: finalStart })}
+      </>
+    );
   }
 
   return renderSequence(items, { liveEdge: isTurnLive, canApprove });
@@ -527,13 +529,18 @@ function isPendingElicitation(item: RenderItem): boolean {
  * is unambiguously where reading starts. Expanding replays the trace
  * inline.
  *
- * `animateCollapse` marks the render where the turn settled while the
+ * `animateCollapse` marks the render where the fold appeared while the
  * user was watching. The fold then MOUNTS OPEN — showing exactly the
  * trace that was already on screen — and closes on the next frame, so
  * the steps visibly fold into the summary row. Swapping straight to the
  * collapsed row instead made a tall block vanish in one frame, which
  * read as a partial page reload. Settled history mounts closed: there
  * was never an expanded trace to animate away.
+ *
+ * The summary row grows in over the same beat rather than being
+ * inserted at full height, because inserting it jolted the bubble ~40px
+ * TALLER before the collapse started — read as two separate motions.
+ * Row expanding + trace shrinking nets a single monotonic shrink.
  */
 function TurnWorkedFold({
   workedForS,
@@ -562,16 +569,22 @@ function TurnWorkedFold({
       className="group/turn-fold not-prose w-full"
       data-testid="turn-worked-fold"
     >
-      <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
-        <span className="shrink-0">{label}</span>
-        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
-        <span aria-hidden className="ml-1 flex-1 border-border border-t" />
-      </CollapsibleTrigger>
+      <div className={animateCollapse ? "turn-fold-row-enter" : undefined}>
+        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
+          <span className="shrink-0">{label}</span>
+          <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
+          <span aria-hidden className="ml-1 flex-1 border-border border-t" />
+        </CollapsibleTrigger>
+      </div>
       {/* Height animation lives in index.css (it needs Radix's measured
           --radix-collapsible-content-height) and is disabled under
           prefers-reduced-motion. */}
+      {/* No padding/border on the animated element: any chrome here is
+          height that appears before the collapse starts, i.e. the jolt
+          this animation exists to remove. Expanded spacing comes from
+          the row's hairline above and the message column's gap below. */}
       <CollapsibleContent className="turn-fold-content">
-        <div className="flex flex-col gap-2 border-border border-b py-2">{children}</div>
+        <div className="flex flex-col gap-2">{children}</div>
       </CollapsibleContent>
     </Collapsible>
   );
